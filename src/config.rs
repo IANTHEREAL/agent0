@@ -63,14 +63,16 @@ impl Db9AuthMode {
     }
 }
 
+static DB9_AUTH_MODE: OnceLock<Db9AuthMode> = OnceLock::new();
+
 pub(crate) fn db9_auth_mode() -> Db9AuthMode {
-    match env_string("DB9_AUTH_MODE") {
+    *DB9_AUTH_MODE.get_or_init(|| match env_string("DB9_AUTH_MODE") {
         Some(raw) => Db9AuthMode::parse(&raw).unwrap_or_else(|| {
             tracing::warn!("Invalid DB9_AUTH_MODE value '{raw}', falling back to 'password'");
             Db9AuthMode::Password
         }),
         None => Db9AuthMode::Password,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

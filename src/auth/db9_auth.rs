@@ -3,13 +3,18 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::config;
+use anyhow::Result as AnyhowResult;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use tikv_client::Transaction;
 use tokio::sync::Mutex;
+
+use super::{AuthManager, User};
 
 const KEYSPACE_PREFIX: &str = "db9_tenant_";
 const DEFAULT_AUDIENCE: &str = "db9-server";
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Db9AuthMaterialKind {
@@ -27,6 +32,76 @@ pub(crate) fn classify_db9_auth_material(secret: &str) -> Db9AuthMaterialKind {
         return Db9AuthMaterialKind::Jwt;
     }
     Db9AuthMaterialKind::Password
+}
+
+#[derive(Debug)]
+pub(crate) enum Db9AuthDispatchFailure {
+    TokenRequired,
+    JwtFailed(Db9AuthError),
+    JwtUserNotFound,
+    ConnectKeyFailed(Db9AuthError),
+    ConnectKeyUserNotFound,
+}
+
+pub(crate) async fn dispatch_db9_auth(
+    auth_manager: &AuthManager,
+    txn: &mut Transaction,
+    auth_mode: config::Db9AuthMode,
+    keyspace: &str,
+    username: &str,
+    password: &str,
+) -> AnyhowResult<(Option<User>, Option<Db9AuthDispatchFailure>)> {
+    match auth_mode {
+        config::Db9AuthMode::Password => Ok((
+            auth_manager.authenticate(txn, username, password).await?,
+            None,
+        )),
+        config::Db9AuthMode::Both | config::Db9AuthMode::Token => {
+            let require_token = auth_mode == config::Db9AuthMode::Token;
+            let material_kind = classify_db9_auth_material(password);
+            let token_material = password.trim();
+
+            match material_kind {
+                Db9AuthMaterialKind::Password => {
+                    if require_token {
+                        return Ok((None, Some(Db9AuthDispatchFailure::TokenRequired)));
+                    }
+
+                    Ok((
+                        auth_manager.authenticate(txn, username, password).await?,
+                        None,
+                    ))
+                }
+                Db9AuthMaterialKind::Jwt => {
+                    match verify_jwt_connect_token(token_material, keyspace, username).await {
+                        Ok(()) => {
+                            let user = auth_manager.get_user(txn, username).await?;
+                            if user.is_none() {
+                                return Ok((None, Some(Db9AuthDispatchFailure::JwtUserNotFound)));
+                            }
+                            Ok((user, None))
+                        }
+                        Err(err) => Ok((None, Some(Db9AuthDispatchFailure::JwtFailed(err)))),
+                    }
+                }
+                Db9AuthMaterialKind::ConnectKey => {
+                    match verify_connect_key(token_material, keyspace, username).await {
+                        Ok(()) => {
+                            let user = auth_manager.get_user(txn, username).await?;
+                            if user.is_none() {
+                                return Ok((
+                                    None,
+                                    Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound),
+                                ));
+                            }
+                            Ok((user, None))
+                        }
+                        Err(err) => Ok((None, Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)))),
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn tenant_id_from_keyspace(keyspace: &str) -> Option<&str> {
@@ -121,6 +196,10 @@ struct Jwk {
     n: Option<String>,
     #[serde(default)]
     e: Option<String>,
+    #[serde(default)]
+    x: Option<String>,
+    #[serde(default)]
+    y: Option<String>,
 }
 
 struct JwksCacheEntry {
@@ -237,7 +316,10 @@ pub(crate) async fn verify_jwt_connect_token(
     let audience =
         config::env_string("DB9_AUTH_AUDIENCE").unwrap_or_else(|| DEFAULT_AUDIENCE.to_string());
 
-    let mut validation = Validation::new(Algorithm::RS256);
+    let algorithms = jwt_algorithms_from_env();
+    let mut validation =
+        Validation::new(algorithms.first().copied().unwrap_or(DEFAULT_JWT_ALGORITHM));
+    validation.algorithms = algorithms;
     validation.set_audience(&[audience]);
     if let Some(iss) = issuer.as_deref() {
         validation.set_issuer(&[iss]);
@@ -280,6 +362,7 @@ pub(crate) async fn verify_connect_key(
 
     #[derive(serde::Serialize)]
     struct IntrospectRequest<'a> {
+        // Some backends expect `key`, others `connect_key`; send both for compatibility.
         connect_key: &'a str,
         key: &'a str,
     }
@@ -414,17 +497,39 @@ async fn fetch_and_parse_jwks(
     let mut keys_by_kid = HashMap::new();
     let mut singleton: Option<Arc<DecodingKey>> = None;
     for key in jwks.keys {
-        if key.kty != "RSA" {
-            continue;
-        }
-        let (Some(n), Some(e)) = (key.n, key.e) else {
-            continue;
-        };
-        let decoding_key = Arc::new(DecodingKey::from_rsa_components(&n, &e).map_err(|err| {
-            Db9AuthError::JwksParseFailed {
-                reason: err.to_string(),
+        let decoding_key = match key.kty.as_str() {
+            "RSA" => {
+                let (Some(n), Some(e)) = (key.n, key.e) else {
+                    continue;
+                };
+                Arc::new(DecodingKey::from_rsa_components(&n, &e).map_err(|err| {
+                    Db9AuthError::JwksParseFailed {
+                        reason: err.to_string(),
+                    }
+                })?)
             }
-        })?);
+            "EC" => {
+                let (Some(x), Some(y)) = (key.x, key.y) else {
+                    continue;
+                };
+                Arc::new(DecodingKey::from_ec_components(&x, &y).map_err(|err| {
+                    Db9AuthError::JwksParseFailed {
+                        reason: err.to_string(),
+                    }
+                })?)
+            }
+            "OKP" => {
+                let Some(x) = key.x else {
+                    continue;
+                };
+                Arc::new(DecodingKey::from_ed_components(&x).map_err(|err| {
+                    Db9AuthError::JwksParseFailed {
+                        reason: err.to_string(),
+                    }
+                })?)
+            }
+            _ => continue,
+        };
         if let Some(kid) = key.kid {
             keys_by_kid.insert(kid, decoding_key);
         } else if singleton.is_none() {
@@ -447,6 +552,53 @@ fn normalize_pem(raw: &str) -> String {
         raw.replace("\\n", "\n")
     } else {
         raw.to_string()
+    }
+}
+
+fn jwt_algorithms_from_env() -> Vec<Algorithm> {
+    let Some(raw) = config::env_string("DB9_AUTH_JWT_ALGORITHM") else {
+        return vec![DEFAULT_JWT_ALGORITHM];
+    };
+
+    let mut algorithms = Vec::new();
+    for part in raw.split(',') {
+        let candidate = part.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+
+        let parsed = match candidate.to_ascii_uppercase().parse::<Algorithm>() {
+            Ok(alg) => alg,
+            Err(_) => {
+                tracing::warn!(
+                    "Invalid DB9_AUTH_JWT_ALGORITHM value '{candidate}', falling back to '{DEFAULT_JWT_ALGORITHM:?}'"
+                );
+                return vec![DEFAULT_JWT_ALGORITHM];
+            }
+        };
+
+        if matches!(
+            parsed,
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+        ) {
+            tracing::warn!(
+                "Unsupported DB9_AUTH_JWT_ALGORITHM value '{candidate}' (HMAC is not allowed), falling back to '{DEFAULT_JWT_ALGORITHM:?}'"
+            );
+            return vec![DEFAULT_JWT_ALGORITHM];
+        }
+
+        if !algorithms.contains(&parsed) {
+            algorithms.push(parsed);
+        }
+    }
+
+    if algorithms.is_empty() {
+        tracing::warn!(
+            "Empty DB9_AUTH_JWT_ALGORITHM value '{raw}', falling back to '{DEFAULT_JWT_ALGORITHM:?}'"
+        );
+        vec![DEFAULT_JWT_ALGORITHM]
+    } else {
+        algorithms
     }
 }
 

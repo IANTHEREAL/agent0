@@ -80,6 +80,7 @@
 |---|---|---|---|
 | `DB9_AUTH_JWKS_URL` | unset | `src/auth/db9_auth.rs` | JWT verification via remote JWKS (preferred). |
 | `DB9_AUTH_JWT_PUBLIC_KEY` | unset | `src/auth/db9_auth.rs` | JWT verification via RSA public key (PEM). |
+| `DB9_AUTH_JWT_ALGORITHM` | `RS256` | `src/auth/db9_auth.rs` | Allowed JWT algorithms (comma-separated). Default: `RS256`. |
 | `DB9_AUTH_ISSUER` | unset | `src/auth/db9_auth.rs` | Optional JWT issuer constraint. |
 | `DB9_AUTH_AUDIENCE` | `db9-server` | `src/auth/db9_auth.rs` | JWT audience constraint. |
 | `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | unset | `src/auth/db9_auth.rs` | Connect-key introspection endpoint URL. |

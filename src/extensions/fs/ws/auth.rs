@@ -2,10 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::auth::{
-    classify_db9_auth_material, verify_connect_key, verify_jwt_connect_token, AuthManager,
-    Db9AuthMaterialKind,
-};
+use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
 use crate::extensions::fs::backend::FsBackend;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
@@ -25,9 +22,30 @@ pub(crate) async fn handle_auth(
     username: &str,
     password: &str,
     pool: &TikvClientPool,
+    is_secure: bool,
 ) -> Result<WsSession, WsResponse> {
     let (parsed_keyspace, actual_user) = parse_tenant_username(username);
     let keyspace = parsed_keyspace.unwrap_or_else(|| "default".to_string());
+
+    let auth_mode = config::db9_auth_mode();
+    let dev_mode = config::env_bool("DB9_DEV");
+    let insecure_mode = config::env_bool("DB9_INSECURE");
+    if matches!(
+        auth_mode,
+        config::Db9AuthMode::Both | config::Db9AuthMode::Token
+    ) && !is_secure
+        && !dev_mode
+        && !insecure_mode
+    {
+        return Err(WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!(
+                "TLS is required for token authentication (DB9_AUTH_MODE={}). Reconnect using WSS and ensure server TLS is configured (PG_TLS_CERT/PG_TLS_KEY).",
+                auth_mode.canonical_name()
+            ),
+        ));
+    }
 
     let tenant_handle = pool.acquire(Some(keyspace.clone())).await.map_err(|err| {
         WsResponse::error(id, WsErrorCode::Eio, format!("pool acquire failed: {err}"))
@@ -70,90 +88,24 @@ pub(crate) async fn handle_auth(
         WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
     })?;
 
-    let auth_mode = config::db9_auth_mode();
-    let material_kind = classify_db9_auth_material(password);
-
-    let user: Option<crate::auth::User> = match auth_mode {
-        config::Db9AuthMode::Password => auth_manager
-            .authenticate(&mut auth_txn, &actual_user, password)
-            .await
-            .map_err(|err| {
-                WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("authentication query failed: {err}"),
-                )
-            })?,
-        config::Db9AuthMode::Both | config::Db9AuthMode::Token => {
-            let require_token = auth_mode == config::Db9AuthMode::Token;
-            match material_kind {
-                Db9AuthMaterialKind::Password => {
-                    if require_token {
-                        let _ = auth_txn.rollback().await;
-                        return Err(WsResponse::error(
-                            id,
-                            WsErrorCode::Eauth,
-                            "token authentication required (DB9_AUTH_MODE=token)",
-                        ));
-                    }
-                    auth_manager
-                        .authenticate(&mut auth_txn, &actual_user, password)
-                        .await
-                        .map_err(|err| {
-                            WsResponse::error(
-                                id,
-                                WsErrorCode::Eio,
-                                format!("authentication query failed: {err}"),
-                            )
-                        })?
-                }
-                Db9AuthMaterialKind::Jwt => {
-                    if let Err(err) =
-                        verify_jwt_connect_token(password, &keyspace, &actual_user).await
-                    {
-                        let _ = auth_txn.rollback().await;
-                        return Err(WsResponse::error(
-                            id,
-                            WsErrorCode::Eauth,
-                            format!(
-                                "token authentication failed for user \"{actual_user}\": {err}"
-                            ),
-                        ));
-                    }
-                    auth_manager
-                        .get_user(&mut auth_txn, &actual_user)
-                        .await
-                        .map_err(|err| {
-                            WsResponse::error(
-                                id,
-                                WsErrorCode::Eio,
-                                format!("authentication query failed: {err}"),
-                            )
-                        })?
-                }
-                Db9AuthMaterialKind::ConnectKey => {
-                    if let Err(err) = verify_connect_key(password, &keyspace, &actual_user).await {
-                        let _ = auth_txn.rollback().await;
-                        return Err(WsResponse::error(
-                            id,
-                            WsErrorCode::Eauth,
-                            format!(
-                                "connect-key authentication failed for user \"{actual_user}\": {err}"
-                            ),
-                        ));
-                    }
-                    auth_manager
-                        .get_user(&mut auth_txn, &actual_user)
-                        .await
-                        .map_err(|err| {
-                            WsResponse::error(
-                                id,
-                                WsErrorCode::Eio,
-                                format!("authentication query failed: {err}"),
-                            )
-                        })?
-                }
-            }
+    let (user, failure) = match dispatch_db9_auth(
+        &auth_manager,
+        &mut auth_txn,
+        auth_mode,
+        &keyspace,
+        &actual_user,
+        password,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = auth_txn.rollback().await;
+            return Err(WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("authentication query failed: {err}"),
+            ));
         }
     };
 
@@ -161,11 +113,29 @@ pub(crate) async fn handle_auth(
         Some(user) => user,
         None => {
             let _ = auth_txn.rollback().await;
-            return Err(WsResponse::error(
-                id,
-                WsErrorCode::Eauth,
-                format!("authentication failed for user \"{actual_user}\""),
-            ));
+            let response = match failure {
+                Some(Db9AuthDispatchFailure::TokenRequired) => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    "token authentication required (DB9_AUTH_MODE=token)",
+                ),
+                Some(Db9AuthDispatchFailure::JwtFailed(err)) => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    format!("token authentication failed for user \"{actual_user}\": {err}"),
+                ),
+                Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    format!("connect-key authentication failed for user \"{actual_user}\": {err}"),
+                ),
+                _ => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    format!("authentication failed for user \"{actual_user}\""),
+                ),
+            };
+            return Err(response);
         }
     };
 

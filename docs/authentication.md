@@ -19,7 +19,13 @@ db9-server implements PostgreSQL-compatible authentication and role-based access
 - `both`: password auth + token/connect-key auth (if the provided secret looks like a JWT / `db9ck_` connect-key, it must validate; no fallback to password on validation failure).
 - `token`: token/connect-key only (password auth is rejected).
 
-When token auth is enabled (`both` / `token`), pgwire requires TLS unless `DB9_DEV=1` or `DB9_INSECURE=1`.
+When token auth is enabled (`both` / `token`), db9-server requires TLS unless `DB9_DEV=1` or `DB9_INSECURE=1`.
+
+### Security & Migration Notes
+
+- `DB9_AUTH_MODE=both` requires TLS for **all** pgwire connections (including legacy password clients): the server cannot know whether the client will send a token or a password until it receives the auth secret.
+- In `both` mode, passwords that look like tokens (JWT-like strings or any password starting with `db9ck_`) will be treated as token material; if token validation fails, there is **no fallback** to password auth. Rotate such passwords before enabling `both`.
+- fs9 WebSocket authentication follows the same TLS requirement when token auth is enabled.
 
 ## Token Authentication (psql)
 
@@ -28,6 +34,8 @@ JWT connect-token (JWKS URL preferred):
 ```bash
 export DB9_AUTH_MODE=token
 export DB9_AUTH_JWKS_URL=https://example.com/.well-known/jwks.json
+# Optional: set if your tokens use a non-RS256 alg (comma-separated, e.g. RS384,ES256)
+# export DB9_AUTH_JWT_ALGORITHM=RS256
 
 PGPASSWORD="<JWT_CONNECT_TOKEN>" psql -h 127.0.0.1 -p 5433 -U "<tenant>.admin" -d postgres
 ```

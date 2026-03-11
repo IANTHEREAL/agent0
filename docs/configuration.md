@@ -18,6 +18,7 @@ This document is a convenience overview. The authoritative list of config keys +
 | `DB9_AUTH_MODE` | `password` | Authentication mode: `password` (legacy), `both` (password + token), `token` (token only) |
 | `DB9_AUTH_JWKS_URL` | (unset) | JWT verification via remote JWKS (preferred) |
 | `DB9_AUTH_JWT_PUBLIC_KEY` | (unset) | JWT verification via RSA public key (PEM) |
+| `DB9_AUTH_JWT_ALGORITHM` | `RS256` | Allowed JWT algorithms (comma-separated). Default: `RS256`. |
 | `DB9_AUTH_ISSUER` | (unset) | Optional JWT issuer constraint |
 | `DB9_AUTH_AUDIENCE` | `db9-server` | JWT audience constraint |
 | `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | (unset) | Connect-key introspection endpoint URL |

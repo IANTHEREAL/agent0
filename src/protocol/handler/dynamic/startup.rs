@@ -4,10 +4,7 @@
 //! [`StartupHandler`] trait implementation.
 
 use super::{AuthenticatedState, DynamicPgHandler};
-use crate::auth::{
-    classify_db9_auth_material, verify_connect_key, verify_jwt_connect_token, AuthManager,
-    Db9AuthMaterialKind,
-};
+use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
 use crate::observability;
 use crate::sql::{Executor, Session};
@@ -283,98 +280,52 @@ impl DynamicPgHandler {
             .context("Failed to begin transaction")?;
 
         let auth_mode = config::db9_auth_mode();
-        let material_kind = classify_db9_auth_material(password);
-
         let auth_outcome: Result<(Option<crate::auth::User>, Option<String>), anyhow::Error> =
-            match auth_mode {
-                config::Db9AuthMode::Password => {
-                    let user = auth_manager
-                        .authenticate(&mut txn, username, password)
-                        .await?;
-                    Ok((user, None))
-                }
-                config::Db9AuthMode::Both | config::Db9AuthMode::Token => {
-                    let require_token = auth_mode == config::Db9AuthMode::Token;
-                    match material_kind {
-                        Db9AuthMaterialKind::Password => {
-                            if require_token {
-                                Ok((
-                                    None,
-                                    Some(
-                                        "Token authentication required (DB9_AUTH_MODE=token)"
-                                            .to_string(),
-                                    ),
-                                ))
-                            } else {
-                                let user = auth_manager
-                                    .authenticate(&mut txn, username, password)
-                                    .await?;
-                                Ok((user, None))
+            dispatch_db9_auth(
+                &auth_manager,
+                &mut txn,
+                auth_mode,
+                &ks_name,
+                username,
+                password,
+            )
+            .await
+            .and_then(|(user, failure)| {
+                if let Some(user) = user.as_ref() {
+                    if !user.can_login {
+                        return Err(
+                            crate::sql::error::SqlError::InvalidAuthorizationSpecification {
+                                message: format!(
+                                    "role \"{}\" is not permitted to log in",
+                                    username
+                                ),
                             }
-                        }
-                        Db9AuthMaterialKind::Jwt => {
-                            match verify_jwt_connect_token(password, &ks_name, username).await {
-                                Ok(()) => {
-                                    let user = auth_manager.get_user(&mut txn, username).await?;
-                                    match user {
-                                        Some(user) => {
-                                            if !user.can_login {
-                                                return Err(crate::sql::error::SqlError::InvalidAuthorizationSpecification {
-                                                    message: format!("role \"{}\" is not permitted to log in", username),
-                                                }
-                                                .into());
-                                            }
-                                            Ok((Some(user), None))
-                                        }
-                                        None => Ok((
-                                            None,
-                                            Some(format!(
-                                                "Token authentication failed for user \"{username}\""
-                                            )),
-                                        )),
-                                    }
-                                }
-                                Err(err) => Ok((
-                                    None,
-                                    Some(format!(
-                                        "Token authentication failed for user \"{username}\": {err}"
-                                    )),
-                                )),
-                            }
-                        }
-                        Db9AuthMaterialKind::ConnectKey => {
-                            match verify_connect_key(password, &ks_name, username).await {
-                                Ok(()) => {
-                                    let user = auth_manager.get_user(&mut txn, username).await?;
-                                    match user {
-                                        Some(user) => {
-                                            if !user.can_login {
-                                                return Err(crate::sql::error::SqlError::InvalidAuthorizationSpecification {
-                                                    message: format!("role \"{}\" is not permitted to log in", username),
-                                                }
-                                                .into());
-                                            }
-                                            Ok((Some(user), None))
-                                        }
-                                        None => Ok((
-                                            None,
-                                            Some(format!(
-                                                "Connect-key authentication failed for user \"{username}\""
-                                            )),
-                                        )),
-                                    }
-                                }
-                                Err(err) => Ok((
-                                    None,
-                                    Some(format!(
-                                        "Connect-key authentication failed for user \"{username}\": {err}"
-                                    )),
-                                )),
-                            }
-                        }
+                            .into(),
+                        );
                     }
                 }
-            };
+
+                let failure_reason = match failure {
+                    Some(Db9AuthDispatchFailure::TokenRequired) => {
+                        Some("Token authentication required (DB9_AUTH_MODE=token)".to_string())
+                    }
+                    Some(Db9AuthDispatchFailure::JwtFailed(err)) => Some(format!(
+                        "Token authentication failed for user \"{username}\": {err}"
+                    )),
+                    Some(Db9AuthDispatchFailure::JwtUserNotFound) => Some(format!(
+                        "Token authentication failed for user \"{username}\""
+                    )),
+                    Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => Some(format!(
+                        "Connect-key authentication failed for user \"{username}\": {err}"
+                    )),
+                    Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => Some(format!(
+                        "Connect-key authentication failed for user \"{username}\""
+                    )),
+                    None => None,
+                };
+
+                Ok((user, failure_reason))
+            });
 
         match auth_outcome {
             Ok((Some(user), _)) => {

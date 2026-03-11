@@ -15,7 +15,7 @@
 - **[Stable] Authentication mechanism**
   - db9 uses cleartext-password startup auth (`PasswordMessage`) as the transport for authentication material.
   - Authentication mode is controlled by `DB9_AUTH_MODE` (`password|both|token`).
-  - When token auth is enabled (`both|token`), db9 interprets `PasswordMessage` as DB9 auth material (JWT connect-token or `db9ck_` connect-key) and requires TLS unless `DB9_DEV=1` or `DB9_INSECURE=1`.
+  - When token auth is enabled (`both|token`), db9 interprets `PasswordMessage` as DB9 auth material (JWT connect-token or `db9ck_` connect-key) and requires TLS at startup (applies to all clients) unless `DB9_DEV=1` or `DB9_INSECURE=1`.
   - Non-TLS connections are rejected when `PG_REQUIRE_TLS=1`; otherwise non-loopback cleartext auth is rejected unless `DB9_INSECURE=1` or `DB9_DEV=1`.
   - Evidence: `src/protocol/handler/dynamic/startup.rs`, `src/config.rs`, `src/auth/db9_auth.rs`, `src/main.rs`.
 
