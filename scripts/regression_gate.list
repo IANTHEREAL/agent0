@@ -215,6 +215,8 @@ tests/298_pg_get_serial_sequence_empty_name.sql
 tests/1662_set_local_reserved_guc.sql
 # #1685 – UDT array type resolution across DDL and analyzer
 tests/249_enum_array_validation.sql
+# #1599 – non-ASCII COPY QUOTE/ESCAPE/DELIMITER returns 0A000 instead of 42601
+tests/1599_copy_non_ascii_quote_escape.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
@@ -225,5 +227,3 @@ orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
 orm-tests/typeorm/schema.test.ts
-# #1599 – non-ASCII COPY QUOTE/ESCAPE/DELIMITER returns 0A000 instead of 42601
-tests/1599_copy_non_ascii_quote_escape.sql
