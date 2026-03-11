@@ -37,7 +37,7 @@ pub(super) fn classify_guc(name: &str) -> GucKind {
 pub(crate) fn check_reserved_guc_write(name: &str) -> Result<()> {
     match classify_guc(name) {
         GucKind::ReadOnlyPseudo => Err(SqlError::CantChangeRuntimeParam {
-            message: "parameter \"is_superuser\" cannot be changed".to_string(),
+            message: format!("parameter \"{}\" cannot be changed", name),
         }
         .into()),
         // session_authorization is handled per-callsite via check_session_auth_write
@@ -235,6 +235,22 @@ mod tests {
         check_reserved_guc_write("session_authorization").unwrap();
 
         check_reserved_guc_reset("session_authorization").unwrap();
+    }
+
+    /// Verify that `check_reserved_guc_write` uses the actual parameter name
+    /// in its error message, not a hardcoded value (regression test for #1724).
+    #[test]
+    fn reserved_guc_write_error_uses_actual_parameter_name() {
+        use crate::sql::error::SqlError;
+
+        let err = check_reserved_guc_write("is_superuser").unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(
+            msg, "parameter \"is_superuser\" cannot be changed",
+            "error message must include the target parameter name"
+        );
+        let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
+        assert_eq!(sql_err.sqlstate(), "55P02");
     }
 
     #[test]
