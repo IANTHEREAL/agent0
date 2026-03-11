@@ -495,7 +495,8 @@ async fn fetch_and_parse_jwks(
     })?;
 
     let mut keys_by_kid = HashMap::new();
-    let mut singleton: Option<Arc<DecodingKey>> = None;
+    let mut singleton_candidate: Option<Arc<DecodingKey>> = None;
+    let mut usable_key_count: usize = 0;
     for key in jwks.keys {
         let decoding_key = match key.kty.as_str() {
             "RSA" => {
@@ -530,19 +531,19 @@ async fn fetch_and_parse_jwks(
             }
             _ => continue,
         };
+        usable_key_count += 1;
         if let Some(kid) = key.kid {
             keys_by_kid.insert(kid, decoding_key);
-        } else if singleton.is_none() {
-            singleton = Some(decoding_key);
+        } else if singleton_candidate.is_none() {
+            singleton_candidate = Some(decoding_key);
         }
     }
 
-    if keys_by_kid.len() == 1 && singleton.is_none() {
-        singleton = keys_by_kid.values().next().cloned();
-    } else if singleton.is_some() && !keys_by_kid.is_empty() {
-        // More than one key exists, so only allow singleton fallback if it's truly a singleton.
-        singleton = None;
-    }
+    let singleton = if usable_key_count == 1 {
+        singleton_candidate.or_else(|| keys_by_kid.values().next().cloned())
+    } else {
+        None
+    };
 
     Ok((keys_by_kid, singleton))
 }
@@ -605,10 +606,14 @@ fn jwt_algorithms_from_env() -> Vec<Algorithm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
     use std::sync::Mutex as StdMutex;
     use std::sync::OnceLock;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn test_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -634,6 +639,27 @@ mod tests {
         let prev = std::env::var(key).ok();
         std::env::set_var(key, value);
         EnvVarGuard { key, prev }
+    }
+
+    async fn start_jwks_server(jwks_body: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    jwks_body.as_bytes().len(),
+                    jwks_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (format!("http://{addr}/jwks"), handle)
     }
 
     const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -739,6 +765,39 @@ JwIDAQAB
             .await
             .unwrap_err();
         assert!(matches!(err, Db9AuthError::RoleMismatch { .. }));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_no_kid_multi_key_is_rejected() {
+        let _guard = test_lock().lock().unwrap();
+        *jwks_cache().lock().await = None;
+
+        let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let x2 = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let jwks_body =
+            format!(r#"{{"keys":[{{"kty":"OKP","x":"{x1}"}},{{"kty":"OKP","x":"{x2}"}}]}}"#);
+        let (jwks_url, server_task) = start_jwks_server(jwks_body).await;
+
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let result = jwks_decoding_key(&token, &jwks_url).await;
+        assert!(matches!(result, Err(Db9AuthError::JwksKidMissing)));
+
+        server_task.await.unwrap();
     }
 
     #[test]
