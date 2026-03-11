@@ -311,6 +311,16 @@ pub(crate) async fn start_file_stream(
     header: Option<bool>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     let backend = backend::get_backend(tenant).await?;
+    start_file_stream_for_backend(backend, path, format, delimiter, header).await
+}
+
+async fn start_file_stream_for_backend(
+    backend: Box<dyn backend::FsBackend>,
+    path: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     let info = backend.stat(path).await?;
     if info.is_dir {
         return Ok(None);
@@ -445,6 +455,17 @@ pub(crate) async fn start_file_stream(
     };
 
     Ok(Some((schema, rx)))
+}
+
+#[cfg(test)]
+async fn start_file_stream_for_test_backend(
+    backend: Box<dyn backend::FsBackend>,
+    path: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
+    start_file_stream_for_backend(backend, path, format, delimiter, header).await
 }
 
 pub(crate) async fn start_glob_stream(
@@ -798,7 +819,8 @@ mod tests {
 
     use super::{
         execute_table_function, execute_table_function_with_budget_for_test_backend,
-        infer_table_function_schema, list_directory_entries, start_file_stream, start_glob_stream,
+        infer_table_function_schema, list_directory_entries, start_file_stream,
+        start_file_stream_for_test_backend, start_glob_stream,
         start_glob_stream_with_budget_for_test_backend, Fs9Mode,
     };
     use crate::extensions::fs::backend::{FsBackend, FsFileInfo, FsWriteStream};
@@ -1355,6 +1377,69 @@ mod tests {
             vec!["value1"],
             "malformed CSV must charge bytes against budget; d.csv should be skipped"
         );
+
+        cleanup(&dir);
+    }
+
+    /// #1418 regression: start_file_stream must reject files exceeding
+    /// MAX_BYTES_PER_FILE (the cap enforced by PR #1412 in the non-glob path).
+    #[tokio::test]
+    async fn test_file_stream_rejects_oversized_file() {
+        let dir = unique_base("file-stream-oversize");
+        let big_path = dir.join("big.txt");
+        let big_file = std::fs::File::create(&big_path).expect("create big.txt");
+        big_file
+            .set_len((super::MAX_BYTES_PER_FILE + 1) as u64)
+            .expect("set big.txt size");
+
+        let path_str = big_path.to_string_lossy().to_string();
+        let result = start_file_stream_for_test_backend(
+            Box::new(TestLocalBackend),
+            &path_str,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "oversized file must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("file too large"),
+            "expected 'file too large' error, got: {err_msg}"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// #1418 regression: start_file_stream must succeed for files within
+    /// MAX_BYTES_PER_FILE and stream their content correctly.
+    #[tokio::test]
+    async fn test_file_stream_accepts_normal_file() {
+        let dir = unique_base("file-stream-normal");
+        let file_path = dir.join("hello.txt");
+        fs::write(&file_path, "hello\nworld\n").expect("write hello.txt");
+
+        let path_str = file_path.to_string_lossy().to_string();
+        let (_schema, mut rx) = start_file_stream_for_test_backend(
+            Box::new(TestLocalBackend),
+            &path_str,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("start file stream")
+        .expect("expected streaming result");
+
+        let mut lines = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        assert_eq!(lines, vec!["hello", "world"]);
 
         cleanup(&dir);
     }
