@@ -652,7 +652,7 @@ mod tests {
 
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    jwks_body.as_bytes().len(),
+                    jwks_body.len(),
                     jwks_body
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
