@@ -16,7 +16,7 @@ id|name
 id|name
 2|Bob
 (1 row)
-ERROR:  syntax error: at or near "*"
+ERROR:  syntax error at or near "*"
 id|name
 2|Bob
 (1 row)

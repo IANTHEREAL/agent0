@@ -659,7 +659,7 @@ pub(super) fn rewrite_table_shorthand(sql: &str) -> Result<String, String> {
         // P1: TABLE ONLY <relation> * is a syntax error in PostgreSQL —
         // ONLY and * are mutually exclusive inheritance modifiers.
         if has_only && has_star {
-            return Err("at or near \"*\"".to_string());
+            return Err("syntax error at or near \"*\"".to_string());
         }
 
         // P2: Validate tail grammar — only TABLE-valid clauses are allowed
@@ -691,7 +691,7 @@ pub(super) fn rewrite_table_shorthand(sql: &str) -> Result<String, String> {
                 _ => false,
             };
             if !valid_tail {
-                return Err(format!("at or near \"{}\"", tail_tok.text));
+                return Err(format!("syntax error at or near \"{}\"", tail_tok.text));
             }
         }
 
