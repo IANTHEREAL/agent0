@@ -1,4 +1,4 @@
-is of type INTEGER but expression is of type JSONB
+is of type integer but expression is of type jsonb
 after_bad_insert_count|0
 after_bad_update_value|1
 after_bad_upsert_value|1
