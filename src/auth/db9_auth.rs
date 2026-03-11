@@ -177,15 +177,28 @@ pub(crate) async fn verify_connect_key(
     }
 
     #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum TimeValue {
+        Seconds(i64),
+        String(String),
+    }
+
+    #[derive(Debug, Deserialize)]
     struct IntrospectResponse {
-        #[serde(alias = "tenantId", alias = "tid")]
-        tenant_id: String,
-        #[serde(alias = "usr", alias = "user")]
-        role: String,
-        #[serde(default, alias = "expiresAt")]
-        expires_at: Option<i64>,
-        #[serde(default, alias = "revokedAt")]
-        revoked_at: Option<i64>,
+        #[serde(default)]
+        active: Option<bool>,
+        #[serde(default)]
+        revoked: Option<bool>,
+        #[serde(default)]
+        expired: Option<bool>,
+        #[serde(default, alias = "tenantId", alias = "tid", alias = "tenant_id")]
+        tenant_id: Option<String>,
+        #[serde(default, alias = "usr", alias = "user", alias = "role")]
+        role: Option<String>,
+        #[serde(default, alias = "expiresAt", alias = "expires_at")]
+        expires_at: Option<TimeValue>,
+        #[serde(default, alias = "revokedAt", alias = "revoked_at")]
+        revoked_at: Option<TimeValue>,
     }
 
     let mut req = http_client()
@@ -222,30 +235,68 @@ pub(crate) async fn verify_connect_key(
             reason: format!("introspection parse failed: {err}"),
         })?;
 
-    if let Some(revoked_at) = info.revoked_at {
+    if matches!(info.active, Some(false)) {
         return Err(Db9AuthError::InvalidConnectKey {
-            reason: format!("revoked at {revoked_at}"),
+            reason: "inactive".to_string(),
         });
     }
+
+    if matches!(info.revoked, Some(true)) {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "revoked".to_string(),
+        });
+    }
+
+    if matches!(info.expired, Some(true)) {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "expired".to_string(),
+        });
+    }
+
+    if info.revoked_at.is_some() {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "revoked".to_string(),
+        });
+    }
+
     if let Some(expires_at) = info.expires_at {
-        let now = chrono::Utc::now().timestamp();
-        if expires_at <= now {
+        let now = chrono::Utc::now();
+        let is_expired = match expires_at {
+            TimeValue::Seconds(ts) => ts <= now.timestamp(),
+            TimeValue::String(raw) => {
+                chrono::DateTime::parse_from_rfc3339(&raw).map_err(|err| {
+                    Db9AuthError::InvalidConnectKey {
+                        reason: format!("invalid expires_at: {err}"),
+                    }
+                })? < now
+            }
+        };
+        if is_expired {
             return Err(Db9AuthError::InvalidConnectKey {
                 reason: "expired".to_string(),
             });
         }
     }
 
-    if info.tenant_id != tenant_id {
+    let actual_tenant_id = info
+        .tenant_id
+        .ok_or_else(|| Db9AuthError::InvalidConnectKey {
+            reason: "missing tenant_id".to_string(),
+        })?;
+    let actual_role = info.role.ok_or_else(|| Db9AuthError::InvalidConnectKey {
+        reason: "missing role".to_string(),
+    })?;
+
+    if actual_tenant_id != tenant_id {
         return Err(Db9AuthError::TenantMismatch {
             expected: tenant_id.to_string(),
-            actual: info.tenant_id,
+            actual: actual_tenant_id,
         });
     }
-    if info.role != expected_role {
+    if actual_role != expected_role {
         return Err(Db9AuthError::RoleMismatch {
             expected: expected_role.to_string(),
-            actual: info.role,
+            actual: actual_role,
         });
     }
 
@@ -461,6 +512,7 @@ JwIDAQAB
         exp: usize,
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_happy_path() {
         let _guard = test_lock().lock().unwrap();
@@ -490,6 +542,7 @@ JwIDAQAB
             .unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_role_mismatch() {
         let _guard = test_lock().lock().unwrap();
