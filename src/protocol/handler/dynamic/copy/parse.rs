@@ -103,6 +103,13 @@ impl DynamicPgHandler {
                 {
                     return Ok(Some(parsed));
                 }
+                // sqlparser's parse_literal_char() uses byte length (s.len() != 1)
+                // instead of character count, so non-ASCII single characters like 'é'
+                // (2+ UTF-8 bytes) cause a parser error instead of reaching semantic
+                // validation. Detect this case and return the correct 0A000 error.
+                if let Some(semantic_err) = detect_non_ascii_copy_option(&query_with_semi) {
+                    return Err(semantic_err);
+                }
                 return Err(error_info("42601", first_err.to_string()));
             }
         };
@@ -607,6 +614,49 @@ fn parse_copy_from_stdin_with_legacy_header_fallback(
     Ok(Some((table_name, columns, copy_opts)))
 }
 
+/// When sqlparser fails on a COPY statement, check if the failure is caused by
+/// non-ASCII characters in QUOTE, ESCAPE, or DELIMITER option values.
+/// sqlparser's `parse_literal_char()` rejects multi-byte UTF-8 characters
+/// (e.g. 'é') because it checks `s.len() != 1` (byte length) instead of
+/// character count.  Return the correct semantic error (SQLSTATE 0A000) when
+/// such a value is detected.
+fn detect_non_ascii_copy_option(query: &str) -> Option<ErrorInfo> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, query).tokenize().ok()?;
+    let tokens: Vec<_> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+
+    for (i, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = token else {
+            continue;
+        };
+        if word.quote_style.is_some() {
+            continue;
+        }
+        let option_name = match word.value.to_ascii_uppercase().as_str() {
+            "QUOTE" => "quote",
+            "ESCAPE" => "escape",
+            "DELIMITER" => "delimiter",
+            _ => continue,
+        };
+        if let Some(Token::SingleQuotedString(s)) = tokens.get(i + 1) {
+            if s.chars().count() == 1 && s.chars().next().is_some_and(|c| !c.is_ascii()) {
+                return Some(error_info(
+                    "0A000",
+                    format!(
+                        "COPY {} must be a single one-byte character, got: '{}'",
+                        option_name, s
+                    ),
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CopyOptionKind {
     Format,
@@ -884,5 +934,104 @@ mod tests {
             "unexpected message: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn non_ascii_quote_returns_semantic_error() {
+        let err = DynamicPgHandler::parse_copy_command_with_options(
+            "COPY t FROM STDIN WITH (FORMAT CSV, QUOTE 'é')",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "0A000",
+            "expected SQLSTATE 0A000, got {}",
+            err.code
+        );
+        assert!(
+            err.message
+                .contains("COPY quote must be a single one-byte character"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn non_ascii_escape_returns_semantic_error() {
+        let err = DynamicPgHandler::parse_copy_command_with_options(
+            "COPY t FROM STDIN WITH (FORMAT CSV, ESCAPE 'ñ')",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "0A000",
+            "expected SQLSTATE 0A000, got {}",
+            err.code
+        );
+        assert!(
+            err.message
+                .contains("COPY escape must be a single one-byte character"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn non_ascii_delimiter_returns_semantic_error() {
+        let err = DynamicPgHandler::parse_copy_command_with_options(
+            "COPY t FROM STDIN WITH (DELIMITER '€')",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "0A000",
+            "expected SQLSTATE 0A000, got {}",
+            err.code
+        );
+        assert!(
+            err.message
+                .contains("COPY delimiter must be a single one-byte character"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn ascii_quote_still_works() {
+        let (_, _, opts) = DynamicPgHandler::parse_copy_command_with_options(
+            "COPY t FROM STDIN WITH (FORMAT CSV, QUOTE '|')",
+        )
+        .unwrap()
+        .expect("COPY should parse");
+        assert_eq!(opts.quote, b'|');
+    }
+
+    #[test]
+    fn detect_non_ascii_copy_option_returns_none_for_ascii() {
+        assert!(detect_non_ascii_copy_option("COPY t FROM STDIN WITH (QUOTE '\"');").is_none());
+    }
+
+    #[test]
+    fn detect_non_ascii_copy_option_finds_quote() {
+        let err = detect_non_ascii_copy_option("COPY t FROM STDIN WITH (QUOTE 'é');").unwrap();
+        assert_eq!(err.code, "0A000");
+        assert!(err
+            .message
+            .contains("COPY quote must be a single one-byte character"));
+    }
+
+    #[test]
+    fn detect_non_ascii_copy_option_finds_escape() {
+        let err = detect_non_ascii_copy_option("COPY t FROM STDIN WITH (ESCAPE 'ñ');").unwrap();
+        assert_eq!(err.code, "0A000");
+        assert!(err
+            .message
+            .contains("COPY escape must be a single one-byte character"));
+    }
+
+    #[test]
+    fn detect_non_ascii_copy_option_finds_delimiter() {
+        let err = detect_non_ascii_copy_option("COPY t FROM STDIN WITH (DELIMITER '€');").unwrap();
+        assert_eq!(err.code, "0A000");
+        assert!(err
+            .message
+            .contains("COPY delimiter must be a single one-byte character"));
     }
 }

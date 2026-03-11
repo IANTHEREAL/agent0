@@ -1,0 +1,3 @@
+COPY quote must be a single one-byte character, got: 'é'
+COPY escape must be a single one-byte character, got: 'ñ'
+COPY delimiter must be a single one-byte character, got: '€'
