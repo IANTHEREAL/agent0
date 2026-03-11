@@ -1,0 +1,26 @@
+transaction_deferrable
+off
+(1 row)
+default_transaction_deferrable
+off
+(1 row)
+transaction_deferrable
+off
+(1 row)
+default_transaction_deferrable
+off
+(1 row)
+ERROR: parameter "transaction_deferrable" cannot be changed (DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported)
+ERROR: parameter "default_transaction_deferrable" cannot be changed (DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported)
+WARNING: SET LOCAL can only be used in transaction blocks
+ERROR: parameter "transaction_deferrable" cannot be changed (DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported)
+WARNING: SET LOCAL can only be used in transaction blocks
+ERROR: parameter "default_transaction_deferrable" cannot be changed (DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported)
+ERROR: parameter "transaction_deferrable" cannot be changed (DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported)
+ERROR: parameter "default_transaction_deferrable" cannot be changed (DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported)
+transaction_deferrable
+off
+(1 row)
+default_transaction_deferrable
+off
+(1 row)

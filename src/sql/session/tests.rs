@@ -428,6 +428,62 @@ mod tests {
             .is_err());
     }
 
+    /// #1529: transaction_deferrable and default_transaction_deferrable must
+    /// SHOW as "off" and reject SET (deferrable requires SERIALIZABLE which
+    /// db9 does not support).
+    #[test]
+    fn test_transaction_deferrable_show_and_reject_set() {
+        let settings = SessionSettings::new();
+
+        // SHOW returns "off" for both.
+        assert_eq!(
+            settings.show_value("transaction_deferrable").as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            settings
+                .show_value("default_transaction_deferrable")
+                .as_deref(),
+            Some("off")
+        );
+
+        // boot_default_show_value also returns "off".
+        assert_eq!(
+            SessionSettings::boot_default_show_value("transaction_deferrable"),
+            "off"
+        );
+        assert_eq!(
+            SessionSettings::boot_default_show_value("default_transaction_deferrable"),
+            "off"
+        );
+
+        // SET must be rejected with SQLSTATE 55P02.
+        let mut settings = SessionSettings::new();
+        let err = settings
+            .set_known_setting("transaction_deferrable", "on".to_string())
+            .unwrap_err();
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "55P02");
+
+        let err = settings
+            .set_known_setting("default_transaction_deferrable", "on".to_string())
+            .unwrap_err();
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "55P02");
+
+        // SHOW must still be "off" after rejected SET.
+        assert_eq!(
+            settings.show_value("transaction_deferrable").as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            settings
+                .show_value("default_transaction_deferrable")
+                .as_deref(),
+            Some("off")
+        );
+    }
+
     #[test]
     fn test_session_settings_reset_setting() {
         let mut settings = SessionSettings::new();

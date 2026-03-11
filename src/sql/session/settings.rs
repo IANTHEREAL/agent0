@@ -122,6 +122,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: None,
     },
     GucMeta {
+        name: "default_transaction_deferrable",
+        immutable: true,
+        description: "DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported",
+        static_default: Some("off"),
+    },
+    GucMeta {
         name: "default_transaction_isolation",
         immutable: true,
         description: "",
@@ -306,6 +312,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         immutable: false,
         description: "",
         static_default: None,
+    },
+    GucMeta {
+        name: "transaction_deferrable",
+        immutable: true,
+        description: "DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported",
+        static_default: Some("off"),
     },
     GucMeta {
         name: "transaction_isolation",
@@ -821,6 +833,17 @@ impl SessionSettings {
                     .into())
                 }
             }
+            "transaction_deferrable" | "default_transaction_deferrable" => {
+                Err(SqlError::CantChangeRuntimeParam {
+                    message: format!(
+                        "parameter \"{}\" cannot be changed \
+                         (DEFERRABLE transactions require SERIALIZABLE isolation, \
+                         which is not supported)",
+                        name
+                    ),
+                }
+                .into())
+            }
             "transaction_isolation" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
@@ -1096,6 +1119,7 @@ impl SessionSettings {
             "row_security" => "on".to_string(),
             "default_tablespace" => String::new(),
             "default_table_access_method" => "heap".to_string(),
+            "transaction_deferrable" | "default_transaction_deferrable" => "off".to_string(),
             "transaction_isolation" => "repeatable read".to_string(),
             "default_transaction_read_only" => "off".to_string(),
             // Immutable / computed GUCs.
@@ -1268,6 +1292,7 @@ impl SessionSettings {
                     .unwrap_or("heap")
                     .to_string(),
             ),
+            "transaction_deferrable" | "default_transaction_deferrable" => Some("off".to_string()),
             // `transaction.isolation.level` alias is canonicalized above.
             "transaction_isolation" => Some(
                 self.transaction_isolation
@@ -1501,7 +1526,9 @@ impl SessionSettings {
         "row_security",
         "default_tablespace",
         "default_table_access_method",
+        "transaction_deferrable",
         "transaction_isolation",
+        "default_transaction_deferrable",
         "default_transaction_isolation",
         "default_transaction_read_only",
         "hnsw.ef_search",
