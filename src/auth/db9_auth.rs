@@ -1,0 +1,530 @@
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::config;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::Deserialize;
+use tokio::sync::Mutex;
+
+const KEYSPACE_PREFIX: &str = "db9_tenant_";
+const DEFAULT_AUDIENCE: &str = "db9-server";
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Db9AuthMaterialKind {
+    Jwt,
+    ConnectKey,
+    Password,
+}
+
+pub(crate) fn classify_db9_auth_material(secret: &str) -> Db9AuthMaterialKind {
+    let secret = secret.trim();
+    if secret.starts_with("db9ck_") {
+        return Db9AuthMaterialKind::ConnectKey;
+    }
+    if secret.split('.').count() == 3 && decode_header(secret).is_ok() {
+        return Db9AuthMaterialKind::Jwt;
+    }
+    Db9AuthMaterialKind::Password
+}
+
+pub(crate) fn tenant_id_from_keyspace(keyspace: &str) -> Option<&str> {
+    keyspace.strip_prefix(KEYSPACE_PREFIX)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Db9AuthError {
+    #[error("token mode requires tenant-qualified username (<tenant>.<role>)")]
+    MissingTenantInUsername,
+
+    #[error(
+        "token verification is not configured (set DB9_AUTH_JWKS_URL or DB9_AUTH_JWT_PUBLIC_KEY)"
+    )]
+    TokenVerificationNotConfigured,
+
+    #[error("JWT validation failed: {reason}")]
+    InvalidJwt { reason: String },
+
+    #[error("connect key validation is not configured (set DB9_AUTH_CONNECT_KEY_INTROSPECT_URL)")]
+    ConnectKeyNotConfigured,
+
+    #[error("connect key validation failed: {reason}")]
+    InvalidConnectKey { reason: String },
+
+    #[error("token tenant mismatch: expected '{expected}', got '{actual}'")]
+    TenantMismatch { expected: String, actual: String },
+
+    #[error("token role mismatch: expected '{expected}', got '{actual}'")]
+    RoleMismatch { expected: String, actual: String },
+
+    #[error("failed to fetch JWKS: {reason}")]
+    JwksFetchFailed { reason: String },
+
+    #[error("failed to parse JWKS: {reason}")]
+    JwksParseFailed { reason: String },
+
+    #[error("JWKS does not contain key for kid '{kid}'")]
+    JwksKidNotFound { kid: String },
+
+    #[error("JWT header missing kid but JWKS contains multiple keys")]
+    JwksKidMissing,
+
+    #[error("invalid public key for JWT verification: {reason}")]
+    InvalidJwtPublicKey { reason: String },
+}
+
+#[derive(Debug, Deserialize)]
+struct Db9ConnectTokenClaims {
+    tid: String,
+    usr: String,
+    #[allow(dead_code)] // Required by JWT spec; validated by jsonwebtoken.
+    exp: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Jwk {
+    kty: String,
+    #[serde(default)]
+    kid: Option<String>,
+    #[serde(default)]
+    n: Option<String>,
+    #[serde(default)]
+    e: Option<String>,
+}
+
+struct JwksCacheEntry {
+    jwks_url: String,
+    fetched_at: Instant,
+    keys_by_kid: HashMap<String, Arc<DecodingKey>>,
+    singleton_key: Option<Arc<DecodingKey>>,
+}
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static JWKS_CACHE: OnceLock<Mutex<Option<JwksCacheEntry>>> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn jwks_cache() -> &'static Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) async fn verify_jwt_connect_token(
+    token: &str,
+    expected_keyspace: &str,
+    expected_role: &str,
+) -> Result<(), Db9AuthError> {
+    let tenant_id =
+        tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
+    let key = jwt_decoding_key(token).await?;
+
+    let issuer = config::env_string("DB9_AUTH_ISSUER");
+    let audience =
+        config::env_string("DB9_AUTH_AUDIENCE").unwrap_or_else(|| DEFAULT_AUDIENCE.to_string());
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[audience]);
+    if let Some(iss) = issuer.as_deref() {
+        validation.set_issuer(&[iss]);
+    }
+
+    let data =
+        decode::<Db9ConnectTokenClaims>(token, key.as_ref(), &validation).map_err(|err| {
+            Db9AuthError::InvalidJwt {
+                reason: err.to_string(),
+            }
+        })?;
+
+    let claims = data.claims;
+    if claims.tid != tenant_id {
+        return Err(Db9AuthError::TenantMismatch {
+            expected: tenant_id.to_string(),
+            actual: claims.tid,
+        });
+    }
+    if claims.usr != expected_role {
+        return Err(Db9AuthError::RoleMismatch {
+            expected: expected_role.to_string(),
+            actual: claims.usr,
+        });
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn verify_connect_key(
+    connect_key: &str,
+    expected_keyspace: &str,
+    expected_role: &str,
+) -> Result<(), Db9AuthError> {
+    let tenant_id =
+        tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
+    let introspect_url = config::env_string("DB9_AUTH_CONNECT_KEY_INTROSPECT_URL")
+        .ok_or(Db9AuthError::ConnectKeyNotConfigured)?;
+    let api_key = config::env_string("DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY");
+
+    #[derive(serde::Serialize)]
+    struct IntrospectRequest<'a> {
+        connect_key: &'a str,
+        key: &'a str,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct IntrospectResponse {
+        #[serde(alias = "tenantId", alias = "tid")]
+        tenant_id: String,
+        #[serde(alias = "usr", alias = "user")]
+        role: String,
+        #[serde(default, alias = "expiresAt")]
+        expires_at: Option<i64>,
+        #[serde(default, alias = "revokedAt")]
+        revoked_at: Option<i64>,
+    }
+
+    let mut req = http_client()
+        .post(&introspect_url)
+        .json(&IntrospectRequest {
+            connect_key,
+            key: connect_key,
+        });
+    if let Some(api_key) = api_key.as_deref() {
+        req = req.header("X-API-Key", api_key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|err| Db9AuthError::InvalidConnectKey {
+            reason: format!("introspection request failed: {err}"),
+        })?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| Db9AuthError::InvalidConnectKey {
+            reason: format!("introspection response read failed: {err}"),
+        })?;
+    if !status.is_success() {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: format!("introspection HTTP {}", status.as_u16()),
+        });
+    }
+
+    let info: IntrospectResponse =
+        serde_json::from_str(&body).map_err(|err| Db9AuthError::InvalidConnectKey {
+            reason: format!("introspection parse failed: {err}"),
+        })?;
+
+    if let Some(revoked_at) = info.revoked_at {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: format!("revoked at {revoked_at}"),
+        });
+    }
+    if let Some(expires_at) = info.expires_at {
+        let now = chrono::Utc::now().timestamp();
+        if expires_at <= now {
+            return Err(Db9AuthError::InvalidConnectKey {
+                reason: "expired".to_string(),
+            });
+        }
+    }
+
+    if info.tenant_id != tenant_id {
+        return Err(Db9AuthError::TenantMismatch {
+            expected: tenant_id.to_string(),
+            actual: info.tenant_id,
+        });
+    }
+    if info.role != expected_role {
+        return Err(Db9AuthError::RoleMismatch {
+            expected: expected_role.to_string(),
+            actual: info.role,
+        });
+    }
+
+    Ok(())
+}
+
+async fn jwt_decoding_key(token: &str) -> Result<Arc<DecodingKey>, Db9AuthError> {
+    if let Some(jwks_url) = config::env_string("DB9_AUTH_JWKS_URL") {
+        return jwks_decoding_key(token, &jwks_url).await;
+    }
+
+    let raw_pem = config::env_string("DB9_AUTH_JWT_PUBLIC_KEY")
+        .ok_or(Db9AuthError::TokenVerificationNotConfigured)?;
+    let pem = normalize_pem(&raw_pem);
+
+    let key = DecodingKey::from_rsa_pem(pem.as_bytes()).map_err(|err| {
+        Db9AuthError::InvalidJwtPublicKey {
+            reason: err.to_string(),
+        }
+    })?;
+    Ok(Arc::new(key))
+}
+
+async fn jwks_decoding_key(token: &str, jwks_url: &str) -> Result<Arc<DecodingKey>, Db9AuthError> {
+    let header = decode_header(token).map_err(|err| Db9AuthError::InvalidJwt {
+        reason: err.to_string(),
+    })?;
+    let kid = header.kid;
+
+    // Try cache first (if fresh and for same URL).
+    {
+        let cache = jwks_cache().lock().await;
+        if let Some(entry) = cache.as_ref() {
+            if entry.jwks_url == jwks_url && entry.fetched_at.elapsed() < JWKS_CACHE_TTL {
+                if let Some(kid) = kid.as_deref() {
+                    if let Some(key) = entry.keys_by_kid.get(kid) {
+                        return Ok(Arc::clone(key));
+                    }
+                } else if let Some(key) = entry.singleton_key.as_ref() {
+                    return Ok(Arc::clone(key));
+                }
+            }
+        }
+    }
+
+    // Cache miss / stale / rotated. Refresh JWKS and try again.
+    let (keys_by_kid, singleton_key) = fetch_and_parse_jwks(jwks_url).await?;
+    {
+        let mut cache = jwks_cache().lock().await;
+        *cache = Some(JwksCacheEntry {
+            jwks_url: jwks_url.to_string(),
+            fetched_at: Instant::now(),
+            keys_by_kid: keys_by_kid.clone(),
+            singleton_key: singleton_key.clone(),
+        });
+    }
+
+    match kid {
+        Some(kid) => keys_by_kid
+            .get(&kid)
+            .cloned()
+            .ok_or(Db9AuthError::JwksKidNotFound { kid }),
+        None => singleton_key.ok_or(Db9AuthError::JwksKidMissing),
+    }
+}
+
+async fn fetch_and_parse_jwks(
+    jwks_url: &str,
+) -> Result<(HashMap<String, Arc<DecodingKey>>, Option<Arc<DecodingKey>>), Db9AuthError> {
+    let resp =
+        http_client()
+            .get(jwks_url)
+            .send()
+            .await
+            .map_err(|err| Db9AuthError::JwksFetchFailed {
+                reason: err.to_string(),
+            })?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| Db9AuthError::JwksFetchFailed {
+            reason: err.to_string(),
+        })?;
+    if !status.is_success() {
+        return Err(Db9AuthError::JwksFetchFailed {
+            reason: format!("HTTP {} from JWKS endpoint", status.as_u16()),
+        });
+    }
+
+    let jwks: Jwks = serde_json::from_str(&body).map_err(|err| Db9AuthError::JwksParseFailed {
+        reason: err.to_string(),
+    })?;
+
+    let mut keys_by_kid = HashMap::new();
+    let mut singleton: Option<Arc<DecodingKey>> = None;
+    for key in jwks.keys {
+        if key.kty != "RSA" {
+            continue;
+        }
+        let (Some(n), Some(e)) = (key.n, key.e) else {
+            continue;
+        };
+        let decoding_key = Arc::new(DecodingKey::from_rsa_components(&n, &e).map_err(|err| {
+            Db9AuthError::JwksParseFailed {
+                reason: err.to_string(),
+            }
+        })?);
+        if let Some(kid) = key.kid {
+            keys_by_kid.insert(kid, decoding_key);
+        } else if singleton.is_none() {
+            singleton = Some(decoding_key);
+        }
+    }
+
+    if keys_by_kid.len() == 1 && singleton.is_none() {
+        singleton = keys_by_kid.values().next().cloned();
+    } else if singleton.is_some() && !keys_by_kid.is_empty() {
+        // More than one key exists, so only allow singleton fallback if it's truly a singleton.
+        singleton = None;
+    }
+
+    Ok((keys_by_kid, singleton))
+}
+
+fn normalize_pem(raw: &str) -> String {
+    if raw.contains("\\n") && !raw.contains('\n') {
+        raw.replace("\\n", "\n")
+    } else {
+        raw.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde::Serialize;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::OnceLock;
+
+    fn test_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn set_env(key: &'static str, value: &str) -> EnvVarGuard {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        EnvVarGuard { key, prev }
+    }
+
+    const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCvjVk3qWFad3bQ
+HsXmiT5i6g3SEDk+VwmfOgNEwBwW/xjpMog9K8RPe3b7S4XSDh8vmDOh20flJQs+
+T4QahMtaD75nsG7a3uJAQvBxAsNdlF6r/9swga07/gXl/UaIYYbym7DGNitvOPL3
+QfCzcR3yO0ZKGBVfVbYjtQNPc3WbJvPhHWZV+8icY5v6yL9Y0p8p8RxndFdoHHdI
+oIJqkSGy6vJ26iHZA5MJ+kTN1AzW0K/yLSll/4+4HWxYQy48RXNKqh6/Kn5HPJ0c
+aZKmOHnrWBIisAeION+5lwj6n9HQvMzPJK46TEAMvTevnLWjnYUboKTf6au4+Whv
+7+X13REnAgMBAAECggEAA2Qlnw+kk8zO/MI7bHKmQ97lmXM6x9uCkhLa0U8su7z9
+zDNvsk7QIgDukXgqA57GN3MnPC8yOlj22KNMl/6MtxaqxPIBkjTQBhHE90noYDxn
+f8cXgt5ebFRB5Ol5nVTU+IbNaWbOe/2Lo/8gGTdMLsu6VeAVOZw8QoBSqgw+71pP
+EjdjUUNAayE1om/86QlmtK1+9uci7Jam+8Kvy527lIjCQdwR8kT0Kv8AM89EuAGp
+FhdnF146YVBYTzR21drUERNh2oCaTzRdRrTYGZICH7qLnhufojI7Qp6QODgr5U1r
+Y8UGyC7XpCh4cklP0/FZA0AXqVcY8h0TdMs28ZYPMQKBgQDizkZKKIRW9DPxhZkC
+Uy2pju70LhKtLBtBoCDzkZyIVnJtVeQnRpDwMTr5eDFojDWFpwf8VuIpE78QybW+
+5rIllszKaOE+B+W8P+zIIKjI21Ag3KOazwrmAq5lplCvT3Rhy36CDpjZSC7LYVqT
+Jw1damg8YA9sJdcoA6TkR4ij7QKBgQDGJijl2nHYtTP1wHxOaEK8kNtno1HtbJ8F
+csbTicit7s2xfZHy0cKfnxUxsSRa1T8j33g/gbRNQYrrn2G/wAG6G4IlcoDlsg8y
+viGh/t3Oo4KdbQbQpwIA0nH46KdGmuZoWOX1u8Bg51BsjpxMSvxY6TYzonq/IK11
+1U6zD5fO4wKBgG2QLf5nAj8rKuiSnC62VcmiJabJlvYW53fVTfW7sr1d3VsZ8eRT
+P3L4pT+cI2oYyUYuQTpSEmC7jEIk3upAcXCdH4LsFVss33sH+m9W75JP965YR6Ri
+PiaMxwiNxk5Z+KPBdPSI7qeQKiLPfby2Uct9uqrn0KtywDQxRneMYuKlAoGAI+aS
+DmMvsVXTXjlLzGDzhnqwZeyfUWcWwMP05irWozzbI8dehCIhIw6Npn0z2wk78WHx
+xX/YjQ7M/rfX3AgLyA5n3CUM2ZETU9xC97jXszLI3YD9dRxtLnzyjWiJti8mg81n
+jMhBqM0AM0r7Yo9LfUhzu5M6rhpbkzfclHDEzoUCgYAeiCs36dfsvLN63aXtyViw
+1KuUAX7ZOH/OE9AW4LXZ0SPV5xhaodEm+MiQD+0T8nI3kJ2aPLf8xct6wiEPDkRF
+734vA43+3iME3SGkkH3Zucz0Xu5zg8OtM78XVW5WmBYZrxCcDnLmu8QJRhhzUI/a
+KXdAckHRwyP3Ce69EGCPqw==
+-----END PRIVATE KEY-----"#;
+
+    const TEST_RSA_PUBLIC_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr41ZN6lhWnd20B7F5ok+
+YuoN0hA5PlcJnzoDRMAcFv8Y6TKIPSvET3t2+0uF0g4fL5gzodtH5SULPk+EGoTL
+Wg++Z7Bu2t7iQELwcQLDXZReq//bMIGtO/4F5f1GiGGG8puwxjYrbzjy90Hws3Ed
+8jtGShgVX1W2I7UDT3N1mybz4R1mVfvInGOb+si/WNKfKfEcZ3RXaBx3SKCCapEh
+suryduoh2QOTCfpEzdQM1tCv8i0pZf+PuB1sWEMuPEVzSqoevyp+RzydHGmSpjh5
+61gSIrAHiDjfuZcI+p/R0LzMzySuOkxADL03r5y1o52FG6Ck3+mruPlob+/l9d0R
+JwIDAQAB
+-----END PUBLIC KEY-----"#;
+
+    #[derive(Debug, Serialize)]
+    struct Claims<'a> {
+        iss: &'a str,
+        aud: &'a str,
+        tid: &'a str,
+        usr: &'a str,
+        exp: usize,
+    }
+
+    #[tokio::test]
+    async fn verify_jwt_connect_token_happy_path() {
+        let _guard = test_lock().lock().unwrap();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
+        let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
+
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("k1".to_string());
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_jwt_connect_token_role_mismatch() {
+        let _guard = test_lock().lock().unwrap();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_jwt_connect_token(&token, "db9_tenant_t1", "readonly")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Db9AuthError::RoleMismatch { .. }));
+    }
+
+    #[test]
+    fn classify_db9_auth_material_basic() {
+        assert_eq!(
+            classify_db9_auth_material("db9ck_abc"),
+            Db9AuthMaterialKind::ConnectKey
+        );
+        assert_eq!(
+            classify_db9_auth_material("secret123"),
+            Db9AuthMaterialKind::Password
+        );
+    }
+}

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use crate::auth::{AuthManager, GrantedPrivilege, Privilege, PrivilegeObject, User};
+use crate::config;
 use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
 
@@ -24,6 +25,13 @@ pub async fn execute_create_role(
     create_db: &Option<bool>,
     create_role: &Option<bool>,
 ) -> Result<ExecuteResult> {
+    if config::db9_auth_mode() == config::Db9AuthMode::Token && password.is_some() {
+        return Err(SqlError::Unsupported(
+            "PASSWORD is not allowed when DB9_AUTH_MODE=token (passwordless auth)".into(),
+        )
+        .into());
+    }
+
     for name in names {
         let role_name = name
             .0
@@ -116,6 +124,17 @@ pub async fn execute_alter_role(
             }
         }
         AlterRoleOperation::WithOptions { options } => {
+            if config::db9_auth_mode() == config::Db9AuthMode::Token
+                && options
+                    .iter()
+                    .any(|opt| matches!(opt, sqlparser::ast::RoleOption::Password(_)))
+            {
+                return Err(SqlError::Unsupported(
+                    "PASSWORD is not allowed when DB9_AUTH_MODE=token (passwordless auth)".into(),
+                )
+                .into());
+            }
+
             let contains_nosuperuser = options
                 .iter()
                 .any(|opt| matches!(opt, sqlparser::ast::RoleOption::SuperUser(false)));
