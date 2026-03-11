@@ -57,6 +57,19 @@ spec:
           value: "/pg-tls/tls.crt"
         - name: PG_TLS_KEY
           value: "/pg-tls/tls.key"
+        - name: EMBEDDING_PROVIDER
+          value: "bedrock"
+        - name: EMBEDDING_ENDPOINT
+          value: "https://bedrock-runtime.us-west-2.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-west-2%3A841162690310%3Aapplication-inference-profile%2Fj29i75sa39rj/invoke"
+        - name: EMBEDDING_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: db9-embedding-secret
+              key: EMBEDDING_API_KEY
+        - name: EMBEDDING_MODEL
+          value: "text-embedding-v4"
+        - name: EMBEDDING_DIMENSIONS
+          value: "1024"
         volumeMounts:
         - name: tikv-tls
           mountPath: /tls
