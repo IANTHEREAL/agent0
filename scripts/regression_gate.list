@@ -191,14 +191,12 @@ tests/297_aggregate_order_by.sql
 # #1572 – DISTINCT aggregate ORDER BY validation
 tests/294_string_agg_order_by.sql
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
-tests/271_jsonb_order_by.sql
+tests/295_order_by_null_placement.sql
 # Stored Generated Column (GENERATED ALWAYS AS ... STORED)
 tests/1588_generated_stored_column.sql
 # #1580 – pg_get_serial_sequence(int, int) returns correct error
 # #1661 – pg_catalog-qualified pg_get_serial_sequence includes schema in error
 tests/293_pg_get_serial_sequence.sql
-# #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
-tests/295_order_by_null_placement.sql
 # #1628 – to_regclass(text) relation existence check
 tests/1628_to_regclass.sql
 # #1629 – computed generated columns parity (CREATE TABLE + ALTER TABLE ADD COLUMN)
