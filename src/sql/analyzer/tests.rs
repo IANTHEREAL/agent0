@@ -238,7 +238,7 @@ fn analyze_bigint_literal() {
 #[test]
 fn analyze_float_literal() {
     let expr = analyze_expr_with_users("3.14e2").unwrap();
-    assert_eq!(expr.data_type, DataType::Float64);
+    assert!(matches!(expr.data_type, DataType::Numeric { .. }));
 }
 
 #[test]

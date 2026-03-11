@@ -242,14 +242,21 @@ impl<'a> Analyzer<'a> {
         match val {
             ast::Value::Number(n, _) => {
                 if n.contains(['e', 'E']) {
-                    let f: f64 = n.parse().map_err(|_| AnalyzerError::InvalidLiteral {
-                        value: n.clone(),
-                        target_type: DataType::Float64,
-                        parse_error: "invalid float".to_string(),
-                    })?;
+                    let d =
+                        Decimal::from_scientific(n).map_err(|e| AnalyzerError::InvalidLiteral {
+                            value: n.clone(),
+                            target_type: DataType::Numeric {
+                                precision: None,
+                                scale: None,
+                            },
+                            parse_error: e.to_string(),
+                        })?;
                     Ok(TypedExpr::new(
-                        TypedExprKind::Constant(Value::Float64(f)),
-                        DataType::Float64,
+                        TypedExprKind::Constant(Value::Numeric(d)),
+                        DataType::Numeric {
+                            precision: None,
+                            scale: None,
+                        },
                     ))
                 } else if n.contains('.') {
                     let d = Decimal::from_str(n).map_err(|e| AnalyzerError::InvalidLiteral {

@@ -116,7 +116,7 @@ ERROR:  function lastval(numeric) does not exist
 ERROR:  function lastval(boolean) does not exist
 ERROR:  lastval is not yet defined in this session
 ERROR:  function lastval(bigint) does not exist
-ERROR:  function lastval(double precision) does not exist
+ERROR:  function lastval(numeric) does not exist
 nextval
 1
 (1 row)
