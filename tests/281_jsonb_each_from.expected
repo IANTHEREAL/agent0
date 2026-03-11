@@ -86,3 +86,29 @@ NOTICE:  table "jtest" does not exist, skipping
  test
 (3 rows)
 
+ value
+-------
+ 1
+ 2
+ 3
+(3 rows)
+
+ value
+-------
+ 10
+ 20
+(2 rows)
+
+ value
+-------
+ a
+ b
+(2 rows)
+
+ elem
+------
+ 1
+ 2
+(2 rows)
+
+

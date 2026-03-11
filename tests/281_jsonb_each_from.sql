@@ -51,4 +51,16 @@ ORDER BY j.id, kv.key;
 -- 14. jsonb_array_elements_text in FROM
 SELECT * FROM jsonb_array_elements_text('["hello", "world", "test"]'::jsonb);
 
+-- 15. jsonb_array_elements with table alias (issue #1552)
+SELECT * FROM jsonb_array_elements('[1, 2, 3]'::jsonb) AS t;
+
+-- 16. json_array_elements with table alias (issue #1552)
+SELECT * FROM json_array_elements('[10, 20]'::json) AS t;
+
+-- 17. jsonb_array_elements_text with table alias (issue #1552)
+SELECT * FROM jsonb_array_elements_text('["a", "b"]'::jsonb) AS t;
+
+-- 18. jsonb_array_elements with table alias and explicit column rename (issue #1552)
+SELECT * FROM jsonb_array_elements('[1, 2]'::jsonb) AS t(elem);
+
 DROP TABLE jtest;

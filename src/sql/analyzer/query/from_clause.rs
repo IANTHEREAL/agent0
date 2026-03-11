@@ -282,7 +282,7 @@ impl<'a> Analyzer<'a> {
                             if !ta.columns.is_empty() {
                                 crate::sql::names::normalize_ident(&ta.columns[0])
                             } else {
-                                crate::sql::names::normalize_ident(&ta.name)
+                                "value".to_string()
                             }
                         } else {
                             "value".to_string()
@@ -300,7 +300,7 @@ impl<'a> Analyzer<'a> {
                             if !ta.columns.is_empty() {
                                 crate::sql::names::normalize_ident(&ta.columns[0])
                             } else {
-                                crate::sql::names::normalize_ident(&ta.name)
+                                "value".to_string()
                             }
                         } else {
                             "value".to_string()
