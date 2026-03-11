@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use tracing::warn;
 
 pub(crate) mod backend;
+pub(crate) mod channel_reader;
 pub(crate) mod decoders;
 pub(crate) mod embedded;
 pub(crate) mod glob;
@@ -316,6 +317,50 @@ pub(crate) async fn start_file_stream(
     }
 
     let fmt = decoders::detect_format(path, format);
+
+    // Parquet uses a full read_file (parquet needs random access), so skip
+    // spawning a streaming reader that would race on the inode atime key.
+    #[cfg(feature = "parquet")]
+    if fmt == "parquet" {
+        let data = backend
+            .read_file(
+                path,
+                crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
+            )
+            .await?;
+        let reader =
+            crate::extensions::parquet::fs9_reader::Fs9ParquetReader::new(bytes::Bytes::from(data));
+        let (parquet_schema, row_stream) =
+            crate::extensions::parquet::reader::open_row_stream_from_reader(reader, 8192)
+                .await
+                .map_err(|e| anyhow!("fs9: parquet stream error: {e}"))?;
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            futures::pin_mut!(row_stream);
+            while let Some(values) = futures::StreamExt::next(&mut row_stream).await {
+                match values {
+                    Ok(vals) => {
+                        if tx.send(crate::model::Row::new(vals)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("fs9: parquet streaming error: {}", err);
+                        break;
+                    }
+                }
+            }
+        });
+        return Ok(Some((parquet_schema, rx)));
+    }
+
+    #[cfg(not(feature = "parquet"))]
+    if fmt == "parquet" {
+        return Err(anyhow!(
+            "fs9: parquet format requires the parquet extension (compile with --features parquet)"
+        ));
+    }
+
     let reader = backend.read_file_stream(path, MAX_BYTES_PER_FILE).await?;
 
     let (schema, rx) = match fmt {
@@ -373,44 +418,6 @@ pub(crate) async fn start_file_stream(
                 }
             });
             (schema, rx)
-        }
-        #[cfg(feature = "parquet")]
-        "parquet" => {
-            let data = backend
-                .read_file(
-                    path,
-                    crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
-                )
-                .await?;
-            let reader = crate::extensions::parquet::fs9_reader::Fs9ParquetReader::new(
-                bytes::Bytes::from(data),
-            );
-            let (parquet_schema, row_stream) =
-                crate::extensions::parquet::reader::open_row_stream_from_reader(reader, 8192)
-                    .await
-                    .map_err(|e| anyhow!("fs9: parquet stream error: {e}"))?;
-            let (tx, rx) = mpsc::channel(256);
-            tokio::spawn(async move {
-                futures::pin_mut!(row_stream);
-                while let Some(values) = futures::StreamExt::next(&mut row_stream).await {
-                    match values {
-                        Ok(vals) => {
-                            if tx.send(crate::model::Row::new(vals)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!("fs9: parquet streaming error: {}", err);
-                            break;
-                        }
-                    }
-                }
-            });
-            (parquet_schema, rx)
-        }
-        #[cfg(not(feature = "parquet"))]
-        "parquet" => {
-            return Err(anyhow!("fs9: parquet format requires the parquet extension (compile with --features parquet)"));
         }
         _ => {
             let mut decoder = streaming::StreamingTextDecoder::new(reader, path.to_string());
@@ -794,7 +801,7 @@ mod tests {
         infer_table_function_schema, list_directory_entries, start_file_stream, start_glob_stream,
         start_glob_stream_with_budget_for_test_backend, Fs9Mode,
     };
-    use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
+    use crate::extensions::fs::backend::{FsBackend, FsFileInfo, FsWriteStream};
     use crate::model::Value;
 
     struct TestLocalBackend;
@@ -896,6 +903,10 @@ mod tests {
         }
 
         async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn begin_write_stream(&self, _path: &str) -> Result<Box<dyn FsWriteStream>> {
             anyhow::bail!("not implemented for test backend")
         }
 

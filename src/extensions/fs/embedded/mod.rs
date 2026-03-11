@@ -2,7 +2,7 @@ pub(crate) mod keys;
 pub(crate) mod pagefs;
 pub(crate) mod types;
 
-use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
+use crate::extensions::fs::backend::{FsBackend, FsFileInfo, FsWriteStream};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use pagefs::EmbeddedPageFs;
@@ -61,8 +61,7 @@ impl FsBackend for EmbeddedFsBackend {
         path: &str,
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
-        let data = self.read_file(path, max_bytes).await?;
-        Ok(Box::new(std::io::Cursor::new(data)))
+        self.pagefs.read_file_stream(path, max_bytes).await
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
@@ -79,6 +78,10 @@ impl FsBackend for EmbeddedFsBackend {
 
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
         self.pagefs.write_file(path, data).await
+    }
+
+    async fn begin_write_stream(&self, path: &str) -> Result<Box<dyn FsWriteStream>> {
+        self.pagefs.begin_write_stream(path).await
     }
 
     async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {

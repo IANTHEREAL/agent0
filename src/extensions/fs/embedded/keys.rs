@@ -10,6 +10,8 @@
 //! - Directory prefix: `_fs_D` + parent_inode (big-endian u64) + `:`
 //! - Page: `_fs_P` + inode_id (big-endian u64) + `:` + page_num (big-endian u64)
 //! - Page prefix: `_fs_P` + inode_id (big-endian u64) + `:`
+//! - Staging write marker: `_fs_T` + inode_id (big-endian u64)
+//! - Orphan cleanup marker: `_fs_O` + inode_id (big-endian u64)
 
 /// Superblock key: `_fs_S`
 ///
@@ -67,6 +69,34 @@ pub(crate) fn page_prefix(inode_id: u64) -> Vec<u8> {
     key.extend_from_slice(&inode_id.to_be_bytes());
     key.push(b':');
     key
+}
+
+/// Staging write marker key: `_fs_T` + inode_id (big-endian u64)
+///
+/// Marks an upload staging inode that is not yet published at a filesystem path.
+pub(crate) fn staging_write_key(inode_id: u64) -> Vec<u8> {
+    let mut key = b"_fs_T".to_vec();
+    key.extend_from_slice(&inode_id.to_be_bytes());
+    key
+}
+
+/// Prefix for scanning staging write markers.
+pub(crate) fn staging_write_prefix() -> Vec<u8> {
+    b"_fs_T".to_vec()
+}
+
+/// Orphan cleanup marker key: `_fs_O` + inode_id (big-endian u64)
+///
+/// Marks a file inode that has been unpublished and is waiting for page cleanup.
+pub(crate) fn orphan_inode_key(inode_id: u64) -> Vec<u8> {
+    let mut key = b"_fs_O".to_vec();
+    key.extend_from_slice(&inode_id.to_be_bytes());
+    key
+}
+
+/// Prefix for scanning orphan cleanup markers.
+pub(crate) fn orphan_inode_prefix() -> Vec<u8> {
+    b"_fs_O".to_vec()
 }
 
 #[cfg(test)]
@@ -158,6 +188,22 @@ mod tests {
     }
 
     #[test]
+    fn test_staging_write_key() {
+        let key = staging_write_key(42);
+        assert_eq!(&key[0..5], b"_fs_T");
+        assert_eq!(&key[5..13], &42u64.to_be_bytes());
+        assert_eq!(key.len(), 13);
+    }
+
+    #[test]
+    fn test_orphan_inode_key() {
+        let key = orphan_inode_key(99);
+        assert_eq!(&key[0..5], b"_fs_O");
+        assert_eq!(&key[5..13], &99u64.to_be_bytes());
+        assert_eq!(key.len(), 13);
+    }
+
+    #[test]
     fn test_key_namespace_isolation() {
         // Verify that all keys start with _fs_ to avoid collision
         assert!(superblock_key().starts_with(b"_fs_"));
@@ -166,6 +212,8 @@ mod tests {
         assert!(dir_prefix(1).starts_with(b"_fs_"));
         assert!(page_key(1, 0).starts_with(b"_fs_"));
         assert!(page_prefix(1).starts_with(b"_fs_"));
+        assert!(staging_write_key(1).starts_with(b"_fs_"));
+        assert!(orphan_inode_key(1).starts_with(b"_fs_"));
     }
 
     #[test]

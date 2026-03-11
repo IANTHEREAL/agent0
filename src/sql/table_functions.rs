@@ -353,6 +353,13 @@ pub(crate) async fn infer_fs9_table_function_schema(
             anyhow::bail!("not implemented for test backend")
         }
 
+        async fn begin_write_stream(
+            &self,
+            _path: &str,
+        ) -> AnyResult<Box<dyn crate::extensions::fs::backend::FsWriteStream>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
         async fn read_file_at(
             &self,
             _path: &str,

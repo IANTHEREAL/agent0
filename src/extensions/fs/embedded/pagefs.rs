@@ -1,11 +1,101 @@
+use crate::extensions::fs::backend::FsWriteStream;
+use crate::extensions::fs::channel_reader::ChunkReceiverReader;
 use crate::extensions::fs::embedded::keys;
 use crate::extensions::fs::embedded::types::*;
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use std::sync::Arc;
 use tikv_client::{CheckLevel, Transaction, TransactionClient, TransactionOptions};
+use tokio::io::AsyncBufRead;
+use tokio::sync::mpsc;
+use tracing::warn;
 
+#[derive(Clone)]
 pub(crate) struct EmbeddedPageFs {
     client: Arc<TransactionClient>,
+}
+
+const STREAM_READ_CHUNK_BYTES: usize = 64 * 1024;
+const WRITE_STREAM_FLUSH_BYTES: usize = PAGE_SIZE * 16;
+const STALE_WRITE_STREAM_SECS: i64 = 60 * 60;
+const STAGING_REFRESH_INTERVAL_SECS: i64 = 5 * 60;
+
+struct EmbeddedPageWriteStream {
+    fs: EmbeddedPageFs,
+    path: String,
+    staging_inode_id: u64,
+    buffered: Vec<u8>,
+    committed_bytes: u64,
+    last_staging_refresh: i64,
+}
+
+impl EmbeddedPageWriteStream {
+    async fn flush_buffer(&mut self) -> Result<()> {
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+
+        self.fs
+            .flush_staged_write_chunk(self.staging_inode_id, self.committed_bytes, &self.buffered)
+            .await?;
+        self.committed_bytes = self
+            .committed_bytes
+            .checked_add(self.buffered.len() as u64)
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("stream write overflow")))?;
+        self.buffered.clear();
+        self.last_staging_refresh = current_unix_timestamp();
+        Ok(())
+    }
+
+    async fn maybe_refresh_staging_marker(&mut self) -> Result<()> {
+        let now = current_unix_timestamp();
+        if now - self.last_staging_refresh >= STAGING_REFRESH_INTERVAL_SECS {
+            self.fs.touch_staging_write(self.staging_inode_id).await?;
+            self.last_staging_refresh = now;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl FsWriteStream for EmbeddedPageWriteStream {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        self.buffered.extend_from_slice(chunk);
+        if self.buffered.len() >= WRITE_STREAM_FLUSH_BYTES {
+            self.flush_buffer().await?;
+        } else {
+            self.maybe_refresh_staging_marker().await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<usize> {
+        if let Err(err) = self.flush_buffer().await {
+            let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
+            return Err(err);
+        }
+
+        match self
+            .fs
+            .publish_staged_write(&self.path, self.staging_inode_id)
+            .await
+        {
+            Ok(written) => Ok(written),
+            Err(err) => {
+                let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn abort(self: Box<Self>) -> Result<()> {
+        let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
+        Ok(())
+    }
 }
 
 impl EmbeddedPageFs {
@@ -33,17 +123,17 @@ impl EmbeddedPageFs {
             save_inode(&mut txn, &root).await?;
 
             txn.commit().await?;
-            return Ok(());
-        }
-
-        if load_inode(&mut txn, ROOT_INODE).await?.is_none() {
+        } else if load_inode(&mut txn, ROOT_INODE).await?.is_none() {
             let root = Inode::new_directory(ROOT_INODE, 0o755);
             save_inode(&mut txn, &root).await?;
             txn.commit().await?;
-            return Ok(());
+        } else {
+            let _ = txn.rollback().await;
         }
 
-        let _ = txn.rollback().await;
+        if let Err(err) = self.cleanup_pending_write_recovery().await {
+            warn!("embedded fs recovery cleanup failed: {err}");
+        }
         Ok(())
     }
 
@@ -81,23 +171,12 @@ impl EmbeddedPageFs {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
 
-        let mut data = Vec::new();
-        for page_num in 0..inode.page_count {
-            if let Some(page_data) = read_page(&mut txn, inode_id, page_num).await? {
-                data.extend_from_slice(&page_data);
-            } else {
-                data.extend(std::iter::repeat_n(0u8, PAGE_SIZE));
-            }
-        }
-
         let file_len = usize::try_from(inode.size).map_err(|_| {
             anyhow!(EmbeddedFsError::internal(
                 "file size exceeds addressable memory"
             ))
         })?;
-        if data.len() > file_len {
-            data.truncate(file_len);
-        }
+        let data = read_file_range_from_txn(&mut txn, inode_id, inode.size, 0, file_len).await?;
 
         inode.touch_atime();
         save_inode(&mut txn, &inode).await?;
@@ -124,35 +203,7 @@ impl EmbeddedPageFs {
             return Ok(Vec::new());
         }
 
-        let requested_len = u64::try_from(length)
-            .map_err(|_| anyhow!(EmbeddedFsError::internal("requested length exceeds u64")))?;
-        let actual_len_u64 = requested_len.min(inode.size - offset);
-        let actual_len = usize::try_from(actual_len_u64).map_err(|_| {
-            anyhow!(EmbeddedFsError::internal(
-                "requested length exceeds addressable memory"
-            ))
-        })?;
-
-        let file_end = offset
-            .checked_add(actual_len_u64)
-            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("read range overflow")))?;
-
-        let mut data = Vec::with_capacity(actual_len);
-        if let Some((start_page, end_page)) = page_range(offset, actual_len_u64) {
-            for page_num in start_page..=end_page {
-                let page_data = match read_page(&mut txn, inode_id, page_num).await? {
-                    Some(mut page) => {
-                        if page.len() < PAGE_SIZE {
-                            page.resize(PAGE_SIZE, 0);
-                        }
-                        page
-                    }
-                    None => vec![0u8; PAGE_SIZE],
-                };
-                let (start, end) = page_byte_range(page_num, offset, file_end);
-                data.extend_from_slice(&page_data[start..end]);
-            }
-        }
+        let data = read_file_range_from_txn(&mut txn, inode_id, inode.size, offset, length).await?;
 
         inode.touch_atime();
         save_inode(&mut txn, &inode).await?;
@@ -160,47 +211,84 @@ impl EmbeddedPageFs {
         Ok(data)
     }
 
+    pub(crate) async fn read_file_stream(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+        let inode = self.stat(path).await?;
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        let file_len = usize::try_from(inode.size).map_err(|_| {
+            anyhow!(EmbeddedFsError::internal(
+                "file size exceeds addressable memory"
+            ))
+        })?;
+        if file_len > max_bytes {
+            return Err(anyhow!(
+                "fs9: file too large: {path} (exceeded max {max_bytes} bytes)"
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        let stream_path = path.to_string();
+        let fs = self.clone();
+        let err_sender = tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = fs.stream_file_into_channel(stream_path, tx).await {
+                let _ = err_sender
+                    .send(Err(std::io::Error::other(err.to_string())))
+                    .await;
+            }
+        });
+
+        Ok(Box::new(ChunkReceiverReader::new(rx)))
+    }
+
+    async fn cleanup_pending_write_recovery(&self) -> Result<()> {
+        self.cleanup_marked_orphans().await?;
+        self.cleanup_stale_staging_writes().await
+    }
+
     pub(crate) async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
         let mut txn = self.begin().await?;
-
-        // Auto-create parent directories (matching FsBackend trait contract)
-        ensure_parents(&mut txn, path).await?;
-
-        let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
-
-        let inode_id;
-        let mut inode;
-
-        if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
-            let existing_inode = load_inode(&mut txn, existing_inode_id)
-                .await?
-                .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
-
-            if existing_inode.is_directory() {
-                return Err(anyhow!(EmbeddedFsError::is_directory(path)));
-            }
-
-            delete_pages(&mut txn, existing_inode_id).await?;
-            inode_id = existing_inode_id;
-            inode = existing_inode;
-        } else {
-            let new_inode_id = alloc_inode(&mut txn).await?;
-            inode_id = new_inode_id;
-            inode = Inode::new_file(new_inode_id, 0o644);
-            link(&mut txn, parent_inode, &name, new_inode_id).await?;
-        }
-
-        for (page_num, chunk) in data.chunks(PAGE_SIZE).enumerate() {
-            write_page(&mut txn, inode_id, page_num as u64, chunk).await?;
-        }
-
-        inode.size = data.len() as u64;
-        inode.page_count = pages_needed(inode.size);
+        let (inode_id, mut inode) = prepare_replace_file_txn(&mut txn, path).await?;
+        write_file_chunk_to_txn(&mut txn, inode_id, &mut inode, 0, data).await?;
         inode.touch_mtime();
         save_inode(&mut txn, &inode).await?;
 
         txn.commit().await?;
         Ok(data.len())
+    }
+
+    pub(crate) async fn begin_write_stream(&self, path: &str) -> Result<Box<dyn FsWriteStream>> {
+        let mut txn = self.begin().await?;
+        match resolve_path(&mut txn, path).await {
+            Ok((_, inode)) if inode.is_directory() => {
+                return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+            }
+            Ok(_) => {}
+            Err(err) if !is_not_found_error(&err) => return Err(err),
+            Err(_) => {}
+        }
+
+        let inode_id = alloc_inode(&mut txn).await?;
+        let mut inode = Inode::new_file(inode_id, 0o644);
+        inode.nlink = 0;
+        save_inode(&mut txn, &inode).await?;
+        mark_staging_write(&mut txn, inode_id, current_unix_timestamp()).await?;
+        txn.commit().await?;
+
+        Ok(Box::new(EmbeddedPageWriteStream {
+            fs: self.clone(),
+            path: normalize_path(path),
+            staging_inode_id: inode_id,
+            buffered: Vec::with_capacity(WRITE_STREAM_FLUSH_BYTES),
+            committed_bytes: 0,
+            last_staging_refresh: current_unix_timestamp(),
+        }))
     }
 
     pub(crate) async fn write_file_at(
@@ -214,70 +302,8 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-
-        ensure_parents(&mut txn, path).await?;
-
-        let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
-
-        let inode_id;
-        let mut inode;
-
-        if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
-            let existing_inode = load_inode(&mut txn, existing_inode_id)
-                .await?
-                .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
-
-            if existing_inode.is_directory() {
-                return Err(anyhow!(EmbeddedFsError::is_directory(path)));
-            }
-
-            inode_id = existing_inode_id;
-            inode = existing_inode;
-        } else {
-            let new_inode_id = alloc_inode(&mut txn).await?;
-            inode_id = new_inode_id;
-            inode = Inode::new_file(new_inode_id, 0o644);
-            save_inode(&mut txn, &inode).await?;
-            link(&mut txn, parent_inode, &name, new_inode_id).await?;
-        }
-
-        let write_len = u64::try_from(data.len())
-            .map_err(|_| anyhow!(EmbeddedFsError::internal("write length exceeds u64")))?;
-        let write_end = offset
-            .checked_add(write_len)
-            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("write range overflow")))?;
-
-        if let Some((start_page, end_page)) = page_range(offset, write_len) {
-            let mut data_offset = 0usize;
-            for page_num in start_page..=end_page {
-                let (page_start, page_end) = page_byte_range(page_num, offset, write_end);
-                let chunk_len = page_end - page_start;
-                let next_offset = data_offset + chunk_len;
-                let chunk = &data[data_offset..next_offset];
-
-                let is_partial = page_start != 0 || page_end != PAGE_SIZE;
-                if is_partial {
-                    let mut page_data = match read_page(&mut txn, inode_id, page_num).await? {
-                        Some(mut page) => {
-                            if page.len() < PAGE_SIZE {
-                                page.resize(PAGE_SIZE, 0);
-                            }
-                            page
-                        }
-                        None => vec![0u8; PAGE_SIZE],
-                    };
-                    page_data[page_start..page_end].copy_from_slice(chunk);
-                    write_page(&mut txn, inode_id, page_num, &page_data).await?;
-                } else {
-                    write_page(&mut txn, inode_id, page_num, chunk).await?;
-                }
-
-                data_offset = next_offset;
-            }
-        }
-
-        inode.size = inode.size.max(write_end);
-        inode.page_count = pages_needed(inode.size);
+        let (inode_id, mut inode) = prepare_write_at_file_txn(&mut txn, path).await?;
+        write_file_chunk_to_txn(&mut txn, inode_id, &mut inode, offset, data).await?;
         inode.touch_mtime();
         save_inode(&mut txn, &inode).await?;
 
@@ -531,6 +557,241 @@ impl EmbeddedPageFs {
         txn.commit().await?;
         Ok(())
     }
+
+    async fn stream_file_into_channel(
+        &self,
+        path: String,
+        sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
+    ) -> Result<()> {
+        let mut txn = self.begin().await?;
+        let (inode_id, mut inode) = resolve_path(&mut txn, &path).await?;
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(&path)));
+        }
+
+        let mut offset = 0u64;
+        let file_size = inode.size;
+        while offset < file_size {
+            let remaining = file_size - offset;
+            let chunk_len = usize::try_from(remaining.min(STREAM_READ_CHUNK_BYTES as u64))
+                .map_err(|_| anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize")))?;
+            let chunk =
+                read_file_range_from_txn(&mut txn, inode_id, file_size, offset, chunk_len).await?;
+
+            if sender.send(Ok(chunk)).await.is_err() {
+                break;
+            }
+
+            offset = offset
+                .checked_add(chunk_len as u64)
+                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("stream offset overflow")))?;
+        }
+
+        inode.touch_atime();
+        save_inode(&mut txn, &inode).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn flush_staged_write_chunk(
+        &self,
+        staging_inode_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self.begin().await?;
+        let mut inode = load_inode(&mut txn, staging_inode_id)
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("staging inode missing")))?;
+        if inode.nlink != 0 {
+            return Err(anyhow!(EmbeddedFsError::internal(
+                "staging inode already published"
+            )));
+        }
+
+        write_file_chunk_to_txn(&mut txn, staging_inode_id, &mut inode, offset, data).await?;
+        save_inode(&mut txn, &inode).await?;
+        mark_staging_write(&mut txn, staging_inode_id, current_unix_timestamp()).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn touch_staging_write(&self, staging_inode_id: u64) -> Result<()> {
+        let mut txn = self.begin().await?;
+        mark_staging_write(&mut txn, staging_inode_id, current_unix_timestamp()).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn publish_staged_write(&self, path: &str, staging_inode_id: u64) -> Result<usize> {
+        let mut txn = self.begin().await?;
+        ensure_parents(&mut txn, path).await?;
+        let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
+
+        let mut staging_inode = load_inode(&mut txn, staging_inode_id)
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("staging inode missing")))?;
+        if staging_inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        let orphan_inode_id =
+            if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
+                let mut existing_inode = load_inode(&mut txn, existing_inode_id)
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
+                if existing_inode.is_directory() {
+                    return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+                }
+
+                existing_inode.nlink = 0;
+                save_inode(&mut txn, &existing_inode).await?;
+                mark_orphan_inode(&mut txn, existing_inode_id).await?;
+                Some(existing_inode_id)
+            } else {
+                None
+            };
+
+        staging_inode.nlink = 1;
+        staging_inode.touch_mtime();
+        save_inode(&mut txn, &staging_inode).await?;
+        link(&mut txn, parent_inode, &name, staging_inode_id).await?;
+        clear_staging_write(&mut txn, staging_inode_id).await?;
+        txn.commit().await?;
+
+        if let Some(inode_id) = orphan_inode_id {
+            self.spawn_orphan_cleanup(inode_id);
+        }
+
+        usize::try_from(staging_inode.size)
+            .map_err(|_| anyhow!(EmbeddedFsError::internal("staging size exceeds usize")))
+    }
+
+    async fn abort_staged_write(&self, staging_inode_id: u64) -> Result<()> {
+        self.cleanup_staging_inode(staging_inode_id).await
+    }
+
+    async fn cleanup_marked_orphans(&self) -> Result<()> {
+        let mut txn = self.begin().await?;
+        let orphan_inode_ids = list_orphan_inodes(&mut txn).await?;
+        let _ = txn.rollback().await;
+
+        for inode_id in orphan_inode_ids {
+            self.cleanup_orphan_inode(inode_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_stale_staging_writes(&self) -> Result<()> {
+        let cutoff = current_unix_timestamp().saturating_sub(STALE_WRITE_STREAM_SECS);
+        let mut txn = self.begin().await?;
+        let staging_inode_ids = list_stale_staging_writes(&mut txn, cutoff).await?;
+        let _ = txn.rollback().await;
+
+        for inode_id in staging_inode_ids {
+            self.cleanup_staging_inode(inode_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_staging_inode(&self, inode_id: u64) -> Result<()> {
+        let mut txn = self.begin().await?;
+        clear_staging_write(&mut txn, inode_id).await?;
+
+        if let Some(inode) = load_inode(&mut txn, inode_id).await? {
+            // Guard: if the inode has been published (nlink > 0), it is live data.
+            // This can happen when publish_staged_write commits in TiKV but the
+            // client observes a timeout and triggers abort. Deleting it would
+            // corrupt the published file.
+            if inode.nlink != 0 {
+                let _ = txn.rollback().await;
+                return Ok(());
+            }
+            if !inode.is_directory() {
+                delete_pages(&mut txn, inode_id).await?;
+            }
+            delete_inode(&mut txn, inode_id).await?;
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn cleanup_orphan_inode(&self, inode_id: u64) -> Result<()> {
+        let mut txn = self.begin().await?;
+        clear_orphan_inode(&mut txn, inode_id).await?;
+
+        if let Some(inode) = load_inode(&mut txn, inode_id).await? {
+            if !inode.is_directory() {
+                delete_pages(&mut txn, inode_id).await?;
+            }
+            delete_inode(&mut txn, inode_id).await?;
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+
+    fn spawn_orphan_cleanup(&self, inode_id: u64) {
+        let fs = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = fs.cleanup_orphan_inode(inode_id).await {
+                warn!("embedded fs orphan cleanup failed for inode {inode_id}: {err}");
+            }
+        });
+    }
+}
+
+async fn prepare_replace_file_txn(txn: &mut Transaction, path: &str) -> Result<(u64, Inode)> {
+    ensure_parents(txn, path).await?;
+    let (parent_inode, name) = resolve_parent(txn, path).await?;
+
+    if let Some(existing_inode_id) = lookup(txn, parent_inode, &name).await? {
+        let mut inode = load_inode(txn, existing_inode_id)
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
+
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        delete_pages(txn, existing_inode_id).await?;
+        inode.size = 0;
+        inode.page_count = 0;
+        Ok((existing_inode_id, inode))
+    } else {
+        let inode_id = alloc_inode(txn).await?;
+        let inode = Inode::new_file(inode_id, 0o644);
+        link(txn, parent_inode, &name, inode_id).await?;
+        Ok((inode_id, inode))
+    }
+}
+
+async fn prepare_write_at_file_txn(txn: &mut Transaction, path: &str) -> Result<(u64, Inode)> {
+    ensure_parents(txn, path).await?;
+    let (parent_inode, name) = resolve_parent(txn, path).await?;
+
+    if let Some(existing_inode_id) = lookup(txn, parent_inode, &name).await? {
+        let inode = load_inode(txn, existing_inode_id)
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
+
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        Ok((existing_inode_id, inode))
+    } else {
+        let inode_id = alloc_inode(txn).await?;
+        let inode = Inode::new_file(inode_id, 0o644);
+        save_inode(txn, &inode).await?;
+        link(txn, parent_inode, &name, inode_id).await?;
+        Ok((inode_id, inode))
+    }
 }
 
 fn scan_end_key(prefix: &[u8]) -> Vec<u8> {
@@ -644,6 +905,188 @@ async fn list_dir(txn: &mut Transaction, parent_inode: u64) -> Result<Vec<(Strin
 async fn read_page(txn: &mut Transaction, inode_id: u64, page_num: u64) -> Result<Option<Vec<u8>>> {
     let data = txn.get(keys::page_key(inode_id, page_num)).await?;
     Ok(data)
+}
+
+async fn read_file_range_from_txn(
+    txn: &mut Transaction,
+    inode_id: u64,
+    file_size: u64,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    if offset >= file_size || length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let requested_len = u64::try_from(length)
+        .map_err(|_| anyhow!(EmbeddedFsError::internal("requested length exceeds u64")))?;
+    let actual_len_u64 = requested_len.min(file_size - offset);
+    let actual_len = usize::try_from(actual_len_u64).map_err(|_| {
+        anyhow!(EmbeddedFsError::internal(
+            "requested length exceeds addressable memory"
+        ))
+    })?;
+
+    let file_end = offset
+        .checked_add(actual_len_u64)
+        .ok_or_else(|| anyhow!(EmbeddedFsError::internal("read range overflow")))?;
+
+    let mut data = Vec::with_capacity(actual_len);
+    if let Some((start_page, end_page)) = page_range(offset, actual_len_u64) {
+        for page_num in start_page..=end_page {
+            let page_data = match read_page(txn, inode_id, page_num).await? {
+                Some(mut page) => {
+                    if page.len() < PAGE_SIZE {
+                        page.resize(PAGE_SIZE, 0);
+                    }
+                    page
+                }
+                None => vec![0u8; PAGE_SIZE],
+            };
+            let (start, end) = page_byte_range(page_num, offset, file_end);
+            data.extend_from_slice(&page_data[start..end]);
+        }
+    }
+
+    Ok(data)
+}
+
+async fn write_file_chunk_to_txn(
+    txn: &mut Transaction,
+    inode_id: u64,
+    inode: &mut Inode,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let write_len = u64::try_from(data.len())
+        .map_err(|_| anyhow!(EmbeddedFsError::internal("write length exceeds u64")))?;
+    let write_end = offset
+        .checked_add(write_len)
+        .ok_or_else(|| anyhow!(EmbeddedFsError::internal("write range overflow")))?;
+
+    if let Some((start_page, end_page)) = page_range(offset, write_len) {
+        let mut data_offset = 0usize;
+        for page_num in start_page..=end_page {
+            let (page_start, page_end) = page_byte_range(page_num, offset, write_end);
+            let chunk_len = page_end - page_start;
+            let next_offset = data_offset + chunk_len;
+            let chunk = &data[data_offset..next_offset];
+
+            let is_partial = page_start != 0 || page_end != PAGE_SIZE;
+            if is_partial {
+                let mut page_data = match read_page(txn, inode_id, page_num).await? {
+                    Some(mut page) => {
+                        if page.len() < PAGE_SIZE {
+                            page.resize(PAGE_SIZE, 0);
+                        }
+                        page
+                    }
+                    None => vec![0u8; PAGE_SIZE],
+                };
+                page_data[page_start..page_end].copy_from_slice(chunk);
+                write_page(txn, inode_id, page_num, &page_data).await?;
+            } else {
+                write_page(txn, inode_id, page_num, chunk).await?;
+            }
+
+            data_offset = next_offset;
+        }
+    }
+
+    inode.size = inode.size.max(write_end);
+    inode.page_count = pages_needed(inode.size);
+    Ok(())
+}
+
+async fn mark_staging_write(txn: &mut Transaction, inode_id: u64, updated_at: i64) -> Result<()> {
+    txn.put(
+        keys::staging_write_key(inode_id),
+        updated_at.to_be_bytes().to_vec(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn clear_staging_write(txn: &mut Transaction, inode_id: u64) -> Result<()> {
+    txn.delete(keys::staging_write_key(inode_id)).await?;
+    Ok(())
+}
+
+async fn mark_orphan_inode(txn: &mut Transaction, inode_id: u64) -> Result<()> {
+    txn.put(keys::orphan_inode_key(inode_id), Vec::new())
+        .await?;
+    Ok(())
+}
+
+async fn clear_orphan_inode(txn: &mut Transaction, inode_id: u64) -> Result<()> {
+    txn.delete(keys::orphan_inode_key(inode_id)).await?;
+    Ok(())
+}
+
+async fn list_orphan_inodes(txn: &mut Transaction) -> Result<Vec<u64>> {
+    let prefix = keys::orphan_inode_prefix();
+    let end = scan_end_key(&prefix);
+    let pairs = txn.scan(prefix.clone()..end, u32::MAX).await?;
+
+    let mut inode_ids = Vec::new();
+    for pair in pairs {
+        let key: Vec<u8> = pair.0.into();
+        if let Some(inode_id) = parse_marked_inode_id(&prefix, &key) {
+            inode_ids.push(inode_id);
+        }
+    }
+    Ok(inode_ids)
+}
+
+async fn list_stale_staging_writes(txn: &mut Transaction, cutoff: i64) -> Result<Vec<u64>> {
+    let prefix = keys::staging_write_prefix();
+    let end = scan_end_key(&prefix);
+    let pairs = txn.scan(prefix.clone()..end, u32::MAX).await?;
+
+    let mut inode_ids = Vec::new();
+    for pair in pairs {
+        let key: Vec<u8> = pair.0.into();
+        let value = pair.1;
+        let Some(inode_id) = parse_marked_inode_id(&prefix, &key) else {
+            continue;
+        };
+        let Some(updated_at) = parse_staging_write_timestamp(&value) else {
+            continue;
+        };
+        if updated_at <= cutoff {
+            inode_ids.push(inode_id);
+        }
+    }
+    Ok(inode_ids)
+}
+
+fn parse_marked_inode_id(prefix: &[u8], key: &[u8]) -> Option<u64> {
+    let suffix = key.strip_prefix(prefix)?;
+    let bytes: [u8; 8] = suffix.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
+fn parse_staging_write_timestamp(value: &[u8]) -> Option<i64> {
+    let bytes: [u8; 8] = value.try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<EmbeddedFsError>(),
+        Some(EmbeddedFsError::NotFound(_))
+    )
 }
 
 async fn write_page(
@@ -839,6 +1282,7 @@ async fn remove_inode_recursive(txn: &mut Transaction, inode_id: u64, inode: Ino
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     // normalize_path tests
     #[test]
@@ -1167,7 +1611,7 @@ mod tests {
 
     async fn make_fs() -> EmbeddedPageFs {
         let pd = std::env::var("PD_ENDPOINTS").unwrap_or("127.0.0.1:2379".into());
-        let config = tikv_client::Config::default();
+        let config = tikv_client::Config::default().with_default_keyspace();
         let client = TransactionClient::new_with_config(vec![pd], config)
             .await
             .expect("TiKV connection required for behavioral tests");
@@ -1227,6 +1671,104 @@ mod tests {
 
         assert!(fs.stat(old).await.is_err());
         assert_eq!(fs.read_file(new).await.unwrap(), b"cross");
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_read_file_stream_behavioral_matches_read_file() {
+        let fs = make_fs().await;
+        let base = "/test_read_file_stream";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let path = &format!("{base}/large.bin");
+        let data: Vec<u8> = (0..(PAGE_SIZE * 6 + 123))
+            .map(|idx| (idx % 251) as u8)
+            .collect();
+        fs.write_file(path, &data).await.unwrap();
+
+        let mut reader = fs.read_file_stream(path, data.len()).await.unwrap();
+        let mut streamed = Vec::new();
+        reader.read_to_end(&mut streamed).await.unwrap();
+
+        assert_eq!(streamed, data);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_begin_write_stream_behavioral_matches_write_file() {
+        let fs = make_fs().await;
+        let base = "/test_begin_write_stream";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let path = &format!("{base}/streamed.bin");
+        let data: Vec<u8> = (0..(PAGE_SIZE * 5 + 77))
+            .map(|idx| (idx % 239) as u8)
+            .collect();
+
+        let mut writer = fs.begin_write_stream(path).await.unwrap();
+        for chunk in data.chunks(11_111) {
+            writer.write_chunk(chunk).await.unwrap();
+        }
+        let written = writer.finish().await.unwrap();
+
+        assert_eq!(written, data.len());
+        assert_eq!(fs.read_file(path).await.unwrap(), data);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_begin_write_stream_abort_preserves_existing_file() {
+        let fs = make_fs().await;
+        let base = "/test_begin_write_stream_abort";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let path = &format!("{base}/stable.bin");
+        let original = b"stable-before-abort".to_vec();
+        fs.write_file(path, &original).await.unwrap();
+
+        let mut writer = fs.begin_write_stream(path).await.unwrap();
+        writer
+            .write_chunk(b"new-data-that-must-not-commit")
+            .await
+            .unwrap();
+        writer.abort().await.unwrap();
+
+        assert_eq!(fs.read_file(path).await.unwrap(), original);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_begin_write_stream_replaces_existing_file() {
+        let fs = make_fs().await;
+        let base = "/test_begin_write_stream_replace";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let path = &format!("{base}/replace.bin");
+        fs.write_file(path, b"old-data").await.unwrap();
+
+        let new_data: Vec<u8> = (0..(PAGE_SIZE * 4 + 19))
+            .map(|idx| (idx % 251) as u8)
+            .collect();
+        let mut writer = fs.begin_write_stream(path).await.unwrap();
+        for chunk in new_data.chunks(8192) {
+            writer.write_chunk(chunk).await.unwrap();
+        }
+        let written = writer.finish().await.unwrap();
+
+        assert_eq!(written, new_data.len());
+        assert_eq!(fs.read_file(path).await.unwrap(), new_data);
 
         cleanup(&fs, base).await;
     }
@@ -1426,6 +1968,55 @@ mod tests {
             fs.read_file(src).await.unwrap(),
             b"stable",
             "failed rename must not move source file"
+        );
+
+        cleanup(&fs, base).await;
+    }
+
+    /// Regression test for P0 data-loss bug (#1680):
+    /// If publish_staged_write commits at TiKV Raft level but the client
+    /// observes a timeout, finish() calls abort_staged_write on the
+    /// now-published inode. Without the nlink guard, this deletes the
+    /// live file's pages and inode.
+    #[tokio::test]
+    #[ignore]
+    async fn test_cleanup_staging_inode_skips_published_file() {
+        let fs = make_fs().await;
+        let base = "/test_nlink_guard";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let path = &format!("{base}/published.bin");
+        let data = b"important-data-must-survive";
+
+        // 1. Allocate a staging inode (nlink=0) and write data into it.
+        let mut txn = fs.begin().await.unwrap();
+        let inode_id = alloc_inode(&mut txn).await.unwrap();
+        let mut inode = Inode::new_file(inode_id, 0o644);
+        inode.nlink = 0;
+        save_inode(&mut txn, &inode).await.unwrap();
+        mark_staging_write(&mut txn, inode_id, current_unix_timestamp())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        fs.flush_staged_write_chunk(inode_id, 0, data)
+            .await
+            .unwrap();
+
+        // 2. Publish the staging inode to the target path (sets nlink=1).
+        let written = fs.publish_staged_write(path, inode_id).await.unwrap();
+        assert_eq!(written, data.len());
+
+        // 3. Simulate abort-after-ambiguous-commit: call cleanup_staging_inode
+        //    on the now-published inode. The nlink guard must prevent deletion.
+        fs.cleanup_staging_inode(inode_id).await.unwrap();
+
+        // 4. The published file must still be fully readable.
+        let readback = fs.read_file(path).await.unwrap();
+        assert_eq!(
+            readback, data,
+            "cleanup_staging_inode must not delete a published file (nlink > 0)"
         );
 
         cleanup(&fs, base).await;

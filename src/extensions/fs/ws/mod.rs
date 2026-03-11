@@ -11,7 +11,8 @@ use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncWrite};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
@@ -19,6 +20,7 @@ use tokio_tungstenite::tungstenite::{Error as WsIoError, Message};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tracing::{debug, info, warn};
 
+use crate::extensions::fs::backend::FsWriteStream;
 use crate::extensions::fs::ws::auth::{WsConnectionTracker, WsSession};
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, StreamEnd, StreamStartResponse, StreamWriteReady, WsErrorCode,
@@ -62,10 +64,11 @@ pub(crate) async fn start_ws_server(
 
 struct StreamingWriteState {
     request_id: String,
-    path: String,
     stream_id: u64,
     expected_size: Option<u64>,
-    buffer: Vec<u8>,
+    bytes_written: u64,
+    hasher: Sha256,
+    writer: Box<dyn FsWriteStream>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,7 +196,13 @@ where
     loop {
         let msg = match timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), ws_stream.next()).await {
             Ok(Some(Ok(msg))) => msg,
-            Ok(Some(Err(err))) => return Err(err),
+            Ok(Some(Err(err))) => {
+                // Abort any in-flight streaming write before propagating WS error
+                if let Some(state) = streaming_write.take() {
+                    abort_streaming_write(state).await;
+                }
+                return Err(err);
+            }
             Ok(None) => break,
             Err(_) => {
                 debug!("fs9 ws idle timeout for {peer_addr}");
@@ -213,14 +222,15 @@ where
                             MAX_JSON_FRAME_BYTES
                         ),
                     );
-                    send_response(&mut ws_stream, &resp).await?;
+                    let _ = send_response(&mut ws_stream, &resp).await;
                     break;
                 }
 
-                if let Some(state) = streaming_write.as_mut() {
+                if let Some(state) = streaming_write.take() {
                     let end = match parse_stream_end_request(&text) {
                         Ok(end) => end,
                         Err(resp) => {
+                            abort_streaming_write(state).await;
                             send_response(&mut ws_stream, &resp).await?;
                             break;
                         }
@@ -232,6 +242,7 @@ where
                             WsErrorCode::Eproto,
                             "expected stream end frame",
                         );
+                        abort_streaming_write(state).await;
                         send_response(&mut ws_stream, &resp).await?;
                         break;
                     }
@@ -245,6 +256,7 @@ where
                                 state.stream_id, end.stream_id
                             ),
                         );
+                        abort_streaming_write(state).await;
                         send_response(&mut ws_stream, &resp).await?;
                         break;
                     }
@@ -256,39 +268,44 @@ where
                                 WsErrorCode::Eproto,
                                 "stream end id mismatch",
                             );
+                            abort_streaming_write(state).await;
                             send_response(&mut ws_stream, &resp).await?;
                             break;
                         }
                     }
 
                     if let Some(expected_size) = state.expected_size {
-                        if state.buffer.len() as u64 != expected_size {
+                        if state.bytes_written != expected_size {
                             let resp = WsResponse::error(
                                 &state.request_id,
                                 WsErrorCode::Einval,
                                 format!(
                                     "stream size mismatch: expected {expected_size}, got {}",
-                                    state.buffer.len()
+                                    state.bytes_written
                                 ),
                             );
+                            abort_streaming_write(state).await;
                             send_response(&mut ws_stream, &resp).await?;
                             break;
                         }
                     }
 
                     if let Some(expected_checksum) = end.checksum.as_deref() {
-                        if !stream::verify_checksum(&state.buffer, expected_checksum) {
+                        let actual_checksum =
+                            format!("sha256:{}", hex::encode(state.hasher.clone().finalize()));
+                        if actual_checksum != expected_checksum {
                             let resp = WsResponse::error(
                                 &state.request_id,
                                 WsErrorCode::Eio,
                                 "checksum mismatch",
                             );
+                            abort_streaming_write(state).await;
                             send_response(&mut ws_stream, &resp).await?;
                             break;
                         }
                     }
 
-                    let write_result = session.backend.write_file(&state.path, &state.buffer).await;
+                    let write_result = state.writer.finish().await;
                     let response = match write_result {
                         Ok(written) => {
                             WsResponse::success(&state.request_id, json!({ "written": written }))
@@ -299,7 +316,6 @@ where
                         }
                     };
                     send_response(&mut ws_stream, &response).await?;
-                    streaming_write = None;
                     continue;
                 }
 
@@ -323,57 +339,17 @@ where
                         offset,
                         length,
                         streaming,
-                    } if *streaming => {
-                        let data =
-                            match streaming_read_data(&session, id, path, *offset, *length).await {
-                                Ok(data) => data,
-                                Err(resp) => {
-                                    send_response(&mut ws_stream, &resp).await?;
-                                    continue;
-                                }
-                            };
-
-                        if data.len() >= STREAMING_THRESHOLD {
-                            let stream_id = stream::next_stream_id();
-                            let start = StreamStartResponse {
-                                streaming: true,
-                                stream_id,
-                                size: data.len() as u64,
-                                chunk_size: DEFAULT_CHUNK_SIZE,
-                            };
-
-                            let start_resp = WsResponse::success(
-                                id,
-                                serde_json::to_value(start).unwrap_or_else(|_| json!({})),
-                            );
-                            send_response(&mut ws_stream, &start_resp).await?;
-
-                            for chunk in data.chunks(DEFAULT_CHUNK_SIZE) {
-                                let frame = stream::encode_binary_frame(stream_id, chunk);
-                                ws_stream.send(Message::Binary(frame)).await?;
-                            }
-
-                            let end = StreamEnd {
-                                stream: "end".to_string(),
-                                stream_id,
-                                checksum: Some(stream::compute_checksum(&data)),
-                            };
-                            let end_resp = WsResponse::success(
-                                id,
-                                serde_json::to_value(end).unwrap_or_else(|_| json!({})),
-                            );
-                            send_response(&mut ws_stream, &end_resp).await?;
-                        } else {
-                            let inline_resp = WsResponse::success(
-                                id,
-                                json!({
-                                    "content": STANDARD.encode(&data),
-                                    "size": data.len(),
-                                    "encoding": "base64"
-                                }),
-                            );
-                            send_response(&mut ws_stream, &inline_resp).await?;
-                        }
+                    } => {
+                        handle_ws_read(
+                            &mut ws_stream,
+                            &session,
+                            id,
+                            path,
+                            *offset,
+                            *length,
+                            *streaming,
+                        )
+                        .await?;
                     }
                     WsRequest::Write {
                         id,
@@ -414,6 +390,16 @@ where
                             }
                         }
 
+                        let writer = match session.backend.begin_write_stream(path).await {
+                            Ok(writer) => writer,
+                            Err(err) => {
+                                let (code, message) = map_fs_error(&err);
+                                let resp = WsResponse::error(id, code, message);
+                                send_response(&mut ws_stream, &resp).await?;
+                                continue;
+                            }
+                        };
+
                         let stream_id = stream::next_stream_id();
                         let ready = StreamWriteReady {
                             ready: true,
@@ -424,18 +410,18 @@ where
                             id,
                             serde_json::to_value(ready).unwrap_or_else(|_| json!({})),
                         );
-                        send_response(&mut ws_stream, &ready_resp).await?;
-
-                        let capacity = size
-                            .and_then(|v| usize::try_from(v).ok())
-                            .unwrap_or(DEFAULT_CHUNK_SIZE)
-                            .min(MAX_BYTES_PER_FILE);
+                        if send_response(&mut ws_stream, &ready_resp).await.is_err() {
+                            // Writer exists but is not in streaming_write yet — abort directly
+                            let _ = writer.abort().await;
+                            break;
+                        }
                         streaming_write = Some(StreamingWriteState {
                             request_id: id.clone(),
-                            path: path.clone(),
                             stream_id,
                             expected_size: *size,
-                            buffer: Vec::with_capacity(capacity),
+                            bytes_written: 0,
+                            hasher: Sha256::new(),
+                            writer,
                         });
                     }
                     _ => {
@@ -445,7 +431,7 @@ where
                 }
             }
             Message::Binary(data) => {
-                let Some(state) = streaming_write.as_mut() else {
+                let Some(mut state) = streaming_write.take() else {
                     let resp = WsResponse::error(
                         "",
                         WsErrorCode::Eproto,
@@ -461,6 +447,7 @@ where
                         WsErrorCode::Eproto,
                         "invalid binary frame",
                     );
+                    abort_streaming_write(state).await;
                     send_response(&mut ws_stream, &resp).await?;
                     break;
                 };
@@ -474,12 +461,13 @@ where
                             state.stream_id, stream_id
                         ),
                     );
+                    abort_streaming_write(state).await;
                     send_response(&mut ws_stream, &resp).await?;
                     break;
                 }
 
-                let next_size = state.buffer.len().saturating_add(chunk.len());
-                if next_size > MAX_BYTES_PER_FILE {
+                let next_size = state.bytes_written.saturating_add(chunk.len() as u64);
+                if next_size > MAX_BYTES_PER_FILE as u64 {
                     let resp = WsResponse::error(
                         &state.request_id,
                         WsErrorCode::Efbig,
@@ -488,14 +476,27 @@ where
                             next_size, MAX_BYTES_PER_FILE
                         ),
                     );
+                    abort_streaming_write(state).await;
                     send_response(&mut ws_stream, &resp).await?;
                     break;
                 }
 
-                state.buffer.extend_from_slice(chunk);
+                if let Err(err) = state.writer.write_chunk(chunk).await {
+                    let (code, message) = map_fs_error(&err);
+                    let resp = WsResponse::error(&state.request_id, code, message);
+                    abort_streaming_write(state).await;
+                    send_response(&mut ws_stream, &resp).await?;
+                    break;
+                }
+
+                state.bytes_written = next_size;
+                state.hasher.update(chunk);
+                streaming_write = Some(state);
             }
             Message::Ping(payload) => {
-                ws_stream.send(Message::Pong(payload)).await?;
+                if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                    break; // cleanup at end of loop will abort streaming_write
+                }
             }
             Message::Pong(_) => {}
             Message::Close(_) => break,
@@ -503,9 +504,17 @@ where
         }
     }
 
+    if let Some(state) = streaming_write.take() {
+        abort_streaming_write(state).await;
+    }
+
     let _ = ws_stream.close(None).await;
     info!("fs9 ws connection closed from {peer_addr}");
     Ok(())
+}
+
+async fn abort_streaming_write(state: StreamingWriteState) {
+    let _ = state.writer.abort().await;
 }
 
 fn parse_auth_request(message: Message) -> Result<WsRequest, WsResponse> {
@@ -580,31 +589,310 @@ fn tenant_from_keyspace(keyspace: &str) -> String {
         .to_string()
 }
 
-async fn streaming_read_data(
+async fn handle_ws_read<S>(
+    ws_stream: &mut WebSocketStream<S>,
     session: &WsSession,
     id: &str,
     path: &str,
     offset: Option<u64>,
     length: Option<usize>,
-) -> Result<Vec<u8>, WsResponse> {
+    requested_streaming: bool,
+) -> Result<(), WsIoError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if let Err((code, msg)) = validate_path(path) {
-        return Err(WsResponse::error(id, code, msg));
+        send_response(ws_stream, &WsResponse::error(id, code, msg)).await?;
+        return Ok(());
     }
 
-    let result = match (offset, length) {
-        (Some(off), Some(len)) => session.backend.read_file_at(path, off, len).await,
-        (None, None) => session.backend.read_file(path, MAX_BYTES_PER_FILE).await,
-        _ => {
-            return Err(WsResponse::error(
-                id,
-                WsErrorCode::Einval,
-                "offset and length must be provided together",
-            ));
+    let file_info = match session.backend.stat(path).await {
+        Ok(info) => info,
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            send_response(ws_stream, &WsResponse::error(id, code, msg)).await?;
+            return Ok(());
         }
     };
 
-    result.map_err(|err| {
-        let (code, msg) = map_fs_error(&err);
-        WsResponse::error(id, code, msg)
-    })
+    if file_info.is_dir {
+        send_response(
+            ws_stream,
+            &WsResponse::error(id, WsErrorCode::Eisdir, format!("Is a directory: {path}")),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let actual_size = match compute_read_size(id, file_info.size, offset, length) {
+        Ok(size) => size,
+        Err(resp) => {
+            send_response(ws_stream, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    if actual_size > MAX_BYTES_PER_FILE as u64 {
+        send_response(
+            ws_stream,
+            &WsResponse::error(
+                id,
+                WsErrorCode::Efbig,
+                format!(
+                    "file too large: {} bytes exceeds limit {}",
+                    actual_size, MAX_BYTES_PER_FILE
+                ),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let should_stream = should_stream_read(requested_streaming, actual_size);
+    if !should_stream || actual_size == 0 {
+        let data = match (offset, length) {
+            (Some(off), Some(len)) => session.backend.read_file_at(path, off, len).await,
+            (None, None) => session.backend.read_file(path, MAX_BYTES_PER_FILE).await,
+            _ => unreachable!("read size validation already checked offset/length pairing"),
+        };
+        let response = match data {
+            Ok(data) => WsResponse::success(
+                id,
+                json!({
+                    "content": STANDARD.encode(&data),
+                    "size": data.len(),
+                    "encoding": "base64"
+                }),
+            ),
+            Err(err) => {
+                let (code, msg) = map_fs_error(&err);
+                WsResponse::error(id, code, msg)
+            }
+        };
+        send_response(ws_stream, &response).await?;
+        return Ok(());
+    }
+
+    let stream_id = stream::next_stream_id();
+    let start = StreamStartResponse {
+        streaming: true,
+        stream_id,
+        size: actual_size,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+    };
+
+    match (offset, length) {
+        (None, None) => {
+            let reader = match session
+                .backend
+                .read_file_stream(path, MAX_BYTES_PER_FILE)
+                .await
+            {
+                Ok(reader) => reader,
+                Err(err) => {
+                    let (code, msg) = map_fs_error(&err);
+                    send_response(ws_stream, &WsResponse::error(id, code, msg)).await?;
+                    return Ok(());
+                }
+            };
+
+            send_response(
+                ws_stream,
+                &WsResponse::success(
+                    id,
+                    serde_json::to_value(start).unwrap_or_else(|_| json!({})),
+                ),
+            )
+            .await?;
+            stream_whole_file(ws_stream, id, stream_id, actual_size, reader).await?;
+        }
+        (Some(off), Some(_)) => {
+            send_response(
+                ws_stream,
+                &WsResponse::success(
+                    id,
+                    serde_json::to_value(start).unwrap_or_else(|_| json!({})),
+                ),
+            )
+            .await?;
+            stream_file_range(ws_stream, session, id, path, stream_id, off, actual_size).await?;
+        }
+        _ => unreachable!("read size validation already checked offset/length pairing"),
+    }
+
+    Ok(())
+}
+
+fn compute_read_size(
+    id: &str,
+    file_size: u64,
+    offset: Option<u64>,
+    length: Option<usize>,
+) -> Result<u64, WsResponse> {
+    match (offset, length) {
+        (None, None) => Ok(file_size),
+        (Some(off), Some(len)) => {
+            if len == 0 || off >= file_size {
+                return Ok(0);
+            }
+
+            let requested_len = u64::try_from(len)
+                .map_err(|_| WsResponse::error(id, WsErrorCode::Einval, "length exceeds u64"))?;
+            Ok(requested_len.min(file_size - off))
+        }
+        _ => Err(WsResponse::error(
+            id,
+            WsErrorCode::Einval,
+            "offset and length must be provided together",
+        )),
+    }
+}
+
+fn should_stream_read(requested_streaming: bool, actual_size: u64) -> bool {
+    requested_streaming || actual_size >= STREAMING_THRESHOLD as u64
+}
+
+async fn stream_whole_file<S>(
+    ws_stream: &mut WebSocketStream<S>,
+    id: &str,
+    stream_id: u64,
+    expected_size: u64,
+    mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+) -> Result<(), WsIoError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut sent = 0u64;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; DEFAULT_CHUNK_SIZE];
+
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|err| ws_io_error(format!("stream read failed: {err}")))?;
+        if read == 0 {
+            break;
+        }
+
+        sent += read as u64;
+        hasher.update(&chunk[..read]);
+        ws_stream
+            .send(Message::Binary(stream::encode_binary_frame(
+                stream_id,
+                &chunk[..read],
+            )))
+            .await?;
+    }
+
+    if sent != expected_size {
+        return Err(ws_io_error(format!(
+            "streamed size mismatch: expected {expected_size}, sent {sent}"
+        )));
+    }
+
+    send_stream_end(ws_stream, id, stream_id, hasher).await
+}
+
+async fn stream_file_range<S>(
+    ws_stream: &mut WebSocketStream<S>,
+    session: &WsSession,
+    id: &str,
+    path: &str,
+    stream_id: u64,
+    offset: u64,
+    expected_size: u64,
+) -> Result<(), WsIoError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut current_offset = offset;
+    let mut remaining = expected_size;
+    let mut hasher = Sha256::new();
+
+    while remaining > 0 {
+        let chunk_len = usize::try_from(remaining.min(DEFAULT_CHUNK_SIZE as u64))
+            .map_err(|_| ws_io_error("range stream chunk exceeds usize"))?;
+        let chunk = session
+            .backend
+            .read_file_at(path, current_offset, chunk_len)
+            .await
+            .map_err(|err| ws_io_error(format!("range stream read failed: {err}")))?;
+        if chunk.is_empty() {
+            return Err(ws_io_error(format!(
+                "range stream ended early at offset {current_offset}"
+            )));
+        }
+
+        hasher.update(&chunk);
+        ws_stream
+            .send(Message::Binary(stream::encode_binary_frame(
+                stream_id, &chunk,
+            )))
+            .await?;
+
+        current_offset = current_offset
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| ws_io_error("range stream offset overflow"))?;
+        remaining = remaining.saturating_sub(chunk.len() as u64);
+    }
+
+    send_stream_end(ws_stream, id, stream_id, hasher).await
+}
+
+async fn send_stream_end<S>(
+    ws_stream: &mut WebSocketStream<S>,
+    id: &str,
+    stream_id: u64,
+    hasher: Sha256,
+) -> Result<(), WsIoError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let end = StreamEnd {
+        stream: "end".to_string(),
+        stream_id,
+        checksum: Some(format!("sha256:{}", hex::encode(hasher.finalize()))),
+    };
+    let end_resp = WsResponse::success(id, serde_json::to_value(end).unwrap_or_else(|_| json!({})));
+    send_response(ws_stream, &end_resp).await
+}
+
+fn ws_io_error(message: impl Into<String>) -> WsIoError {
+    WsIoError::Io(std::io::Error::other(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_read_size_full_file() {
+        assert_eq!(compute_read_size("r1", 4096, None, None).unwrap(), 4096);
+    }
+
+    #[test]
+    fn test_compute_read_size_range_trims_to_eof() {
+        assert_eq!(
+            compute_read_size("r2", 1024, Some(900), Some(512)).unwrap(),
+            124
+        );
+    }
+
+    #[test]
+    fn test_compute_read_size_rejects_partial_range_spec() {
+        let err = compute_read_size("r3", 1024, Some(0), None).unwrap_err();
+        assert_eq!(err.error.unwrap().code, WsErrorCode::Einval);
+    }
+
+    #[test]
+    fn test_should_stream_read_for_explicit_request() {
+        assert!(should_stream_read(true, 1));
+    }
+
+    #[test]
+    fn test_should_stream_read_for_large_file() {
+        assert!(should_stream_read(false, STREAMING_THRESHOLD as u64));
+        assert!(!should_stream_read(false, (STREAMING_THRESHOLD - 1) as u64));
+    }
 }

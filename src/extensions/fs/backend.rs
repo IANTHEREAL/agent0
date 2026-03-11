@@ -15,6 +15,13 @@ pub(crate) struct FsFileInfo {
 }
 
 #[async_trait]
+pub(crate) trait FsWriteStream: Send {
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
+    async fn finish(self: Box<Self>) -> Result<usize>;
+    async fn abort(self: Box<Self>) -> Result<()>;
+}
+
+#[async_trait]
 pub(crate) trait FsBackend: Send + Sync {
     async fn stat(&self, path: &str) -> Result<FsFileInfo>;
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>>;
@@ -28,6 +35,7 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn remove_recursive(&self, path: &str) -> Result<u64>;
     async fn mkdir(&self, path: &str, recursive: bool) -> Result<()>;
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize>;
+    async fn begin_write_stream(&self, path: &str) -> Result<Box<dyn FsWriteStream>>;
     async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>>;
     async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize>;
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize>;

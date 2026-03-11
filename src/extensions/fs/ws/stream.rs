@@ -1,3 +1,4 @@
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -29,6 +30,7 @@ pub(crate) fn decode_binary_frame(data: &[u8]) -> Option<(u64, &[u8])> {
 
 /// Verify a SHA-256 checksum against data.
 /// Expected format: "sha256:<hex>"
+#[cfg(test)]
 pub(crate) fn verify_checksum(data: &[u8], expected: &str) -> bool {
     if let Some(expected_hex) = expected.strip_prefix("sha256:") {
         let mut hasher = Sha256::new();
@@ -43,6 +45,7 @@ pub(crate) fn verify_checksum(data: &[u8], expected: &str) -> bool {
 
 /// Compute SHA-256 checksum of data.
 /// Returns "sha256:<hex>"
+#[cfg(test)]
 pub(crate) fn compute_checksum(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);

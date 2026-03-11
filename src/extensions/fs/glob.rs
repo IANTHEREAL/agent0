@@ -220,7 +220,7 @@ mod tests {
 
     use tokio::io::AsyncBufRead;
 
-    use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
+    use crate::extensions::fs::backend::{FsBackend, FsFileInfo, FsWriteStream};
 
     use super::*;
 
@@ -304,6 +304,10 @@ mod tests {
         }
 
         async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn begin_write_stream(&self, _path: &str) -> Result<Box<dyn FsWriteStream>> {
             anyhow::bail!("not implemented for test backend")
         }
 
