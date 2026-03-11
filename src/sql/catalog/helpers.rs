@@ -297,17 +297,9 @@ pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Date => "date",
         DataType::Interval => "interval",
         DataType::Uuid => "uuid",
-        DataType::Array(inner) => match inner.as_ref() {
-            DataType::Int32 => "integer[]",
-            DataType::Int64 => "bigint[]",
-            DataType::Text => "text[]",
-            DataType::Name => "name[]",
-            DataType::Varchar(_) => "character varying[]",
-            // PostgreSQL reports data_type='ARRAY' for user-defined element
-            // types (e.g. mood[]).  All other unrecognised element types also
-            // map to "ARRAY" as a safe fallback.
-            _ => "ARRAY",
-        },
+        // PostgreSQL reports data_type='ARRAY' for all array columns in
+        // information_schema.columns, regardless of element type.
+        DataType::Array(_) => "ARRAY",
         DataType::Json => "json",
         DataType::Jsonb => "jsonb",
         DataType::Vector(_) => "vector",
@@ -403,18 +395,28 @@ mod tests {
     }
 
     #[test]
-    fn pg_type_for_builtin_arrays_unchanged() {
+    fn pg_type_for_builtin_arrays_returns_array() {
+        // PostgreSQL reports data_type='ARRAY' for all array columns in
+        // information_schema.columns, regardless of element type.
         assert_eq!(
             data_type_to_pg_type(&DataType::Array(Box::new(DataType::Int32))),
-            "integer[]"
+            "ARRAY"
         );
         assert_eq!(
             data_type_to_pg_type(&DataType::Array(Box::new(DataType::Int64))),
-            "bigint[]"
+            "ARRAY"
         );
         assert_eq!(
             data_type_to_pg_type(&DataType::Array(Box::new(DataType::Text))),
-            "text[]"
+            "ARRAY"
+        );
+        assert_eq!(
+            data_type_to_pg_type(&DataType::Array(Box::new(DataType::Name))),
+            "ARRAY"
+        );
+        assert_eq!(
+            data_type_to_pg_type(&DataType::Array(Box::new(DataType::Varchar(255)))),
+            "ARRAY"
         );
     }
 

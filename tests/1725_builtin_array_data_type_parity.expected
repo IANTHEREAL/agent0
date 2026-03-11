@@ -1,0 +1,7 @@
+column_name|data_type|udt_name
+ints|ARRAY|_int4
+bigs|ARRAY|_int8
+texts|ARRAY|_text
+names|ARRAY|_name
+vchars|ARRAY|_varchar
+(5 rows)
