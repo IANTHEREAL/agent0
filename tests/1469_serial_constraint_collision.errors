@@ -1,0 +1,4 @@
+relation "t1469_pk_id_seq" already exists
+relation "t1469_u_id_seq" already exists
+relation "t1469_big_id_seq" already exists
+relation "t1469_small_id_seq" already exists
