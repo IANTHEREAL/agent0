@@ -113,28 +113,7 @@ pub(crate) async fn handle_auth(
         Some(user) => user,
         None => {
             let _ = auth_txn.rollback().await;
-            let response = match failure {
-                Some(Db9AuthDispatchFailure::TokenRequired) => WsResponse::error(
-                    id,
-                    WsErrorCode::Eauth,
-                    "token authentication required (DB9_AUTH_MODE=token)",
-                ),
-                Some(Db9AuthDispatchFailure::JwtFailed(err)) => WsResponse::error(
-                    id,
-                    WsErrorCode::Eauth,
-                    format!("token authentication failed for user \"{actual_user}\": {err}"),
-                ),
-                Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => WsResponse::error(
-                    id,
-                    WsErrorCode::Eauth,
-                    format!("connect-key authentication failed for user \"{actual_user}\": {err}"),
-                ),
-                _ => WsResponse::error(
-                    id,
-                    WsErrorCode::Eauth,
-                    format!("authentication failed for user \"{actual_user}\""),
-                ),
-            };
+            let response = map_auth_failure(id, &actual_user, failure);
             return Err(response);
         }
     };
@@ -183,6 +162,41 @@ pub(crate) async fn handle_auth(
         user: actual_user,
         keyspace,
     })
+}
+
+fn map_auth_failure(id: &str, user: &str, failure: Option<Db9AuthDispatchFailure>) -> WsResponse {
+    match failure {
+        Some(Db9AuthDispatchFailure::TokenRequired) => WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            "token authentication required (DB9_AUTH_MODE=token)",
+        ),
+        Some(Db9AuthDispatchFailure::JwtFailed(err)) => WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!("token authentication failed for user \"{user}\": {err}"),
+        ),
+        Some(Db9AuthDispatchFailure::JwtUserNotFound) => WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!("token authentication failed for user \"{user}\""),
+        ),
+        Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!("connect-key authentication failed for user \"{user}\": {err}"),
+        ),
+        Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!("connect-key authentication failed for user \"{user}\""),
+        ),
+        _ => WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!("authentication failed for user \"{user}\""),
+        ),
+    }
 }
 
 pub(crate) struct WsConnectionTracker {
@@ -327,6 +341,43 @@ mod tests {
         assert!(!err.ok);
         let detail = err.error.expect("error detail should be present");
         assert_eq!(detail.code, WsErrorCode::Eacces);
+    }
+
+    #[test]
+    fn test_map_auth_failure_jwt_user_not_found() {
+        let resp = map_auth_failure("r1", "alice", Some(Db9AuthDispatchFailure::JwtUserNotFound));
+        assert!(!resp.ok);
+        let detail = resp.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Eauth);
+        assert_eq!(
+            detail.message,
+            "token authentication failed for user \"alice\""
+        );
+    }
+
+    #[test]
+    fn test_map_auth_failure_connect_key_user_not_found() {
+        let resp = map_auth_failure(
+            "r2",
+            "bob",
+            Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound),
+        );
+        assert!(!resp.ok);
+        let detail = resp.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Eauth);
+        assert_eq!(
+            detail.message,
+            "connect-key authentication failed for user \"bob\""
+        );
+    }
+
+    #[test]
+    fn test_map_auth_failure_generic_fallback() {
+        let resp = map_auth_failure("r3", "carol", None);
+        assert!(!resp.ok);
+        let detail = resp.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Eauth);
+        assert_eq!(detail.message, "authentication failed for user \"carol\"");
     }
 
     #[test]
