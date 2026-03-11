@@ -47,13 +47,17 @@ fn function_qualified_name(func: &Function) -> String {
         .join(".")
 }
 
-fn pg_get_serial_sequence_error_arg_type(arg: &TypedExpr) -> DataType {
+/// Map an analyzed argument's type for use in `FunctionNotFound` error messages.
+///
+/// PostgreSQL reports untyped string literals and bare NULLs as `unknown` in
+/// "function f(unknown) does not exist" diagnostics.  The analyzer has already
+/// resolved these to `Text` / the inferred type, so we need to undo that
+/// mapping when building the error signature.
+fn error_display_arg_type(arg: &TypedExpr) -> DataType {
     if matches!(
         &arg.kind,
         TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
     ) {
-        // PostgreSQL reports string literals as unknown in unresolved function
-        // signatures (e.g. function f(unknown) does not exist).
         return DataType::UserDefined("unknown".to_string());
     }
     arg.data_type.clone()
@@ -128,10 +132,7 @@ impl<'a> Analyzer<'a> {
         if self.catalog.schema_exists(&schema) {
             return Err(AnalyzerError::FunctionNotFound {
                 name: format!("{}.{}", schema, func_name.to_lowercase()),
-                arg_types: analyzed_args
-                    .iter()
-                    .map(pg_get_serial_sequence_error_arg_type)
-                    .collect(),
+                arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
             });
         }
         Err(AnalyzerError::SchemaNotFound(schema))
@@ -361,7 +362,7 @@ impl<'a> Analyzer<'a> {
             if arg_count < sig.min_args || sig.max_args.is_some_and(|max| arg_count > max) {
                 return Err(AnalyzerError::FunctionNotFound {
                     name: func_name.to_lowercase(),
-                    arg_types: analyzed_args.iter().map(|a| a.data_type.clone()).collect(),
+                    arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
                 });
             }
 

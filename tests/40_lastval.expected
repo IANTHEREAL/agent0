@@ -111,7 +111,7 @@ lastval
 2
 (1 row)
 ERROR:  function lastval(integer) does not exist
-ERROR:  function lastval(text) does not exist
+ERROR:  function lastval(unknown) does not exist
 ERROR:  function lastval(numeric) does not exist
 ERROR:  function lastval(boolean) does not exist
 ERROR:  lastval is not yet defined in this session
