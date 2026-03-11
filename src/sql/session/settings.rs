@@ -888,6 +888,15 @@ impl SessionSettings {
                     .into()),
                 }
             }
+            // session_replication_role has real trigger-suppression semantics in
+            // PostgreSQL that db9 does not implement.  Reject explicitly instead
+            // of silently storing it through the generic GUC path (#1535).
+            "session_replication_role" => Err(SqlError::Unsupported(
+                "session_replication_role is not supported; \
+                 triggers always fire as in \"origin\" mode"
+                    .to_string(),
+            )
+            .into()),
             _ => Ok(value.to_string()),
         }
     }
