@@ -186,6 +186,8 @@ tests/296_setval_out_of_range.sql
 tests/288_copy_csv_header.sql
 # #1573 – string_agg NULL delimiter treated as empty string
 tests/1573_string_agg_null_delimiter.sql
+# #1592 – aggregate ORDER BY semantics (string_agg, array_agg)
+tests/297_aggregate_order_by.sql
 # #1572 – DISTINCT aggregate ORDER BY validation
 tests/294_string_agg_order_by.sql
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
