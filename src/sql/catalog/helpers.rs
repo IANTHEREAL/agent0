@@ -304,7 +304,7 @@ pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Jsonb => "jsonb",
         DataType::Vector(_) => "vector",
         DataType::Time => "time without time zone",
-        DataType::UserDefined(_) => "character varying",
+        DataType::UserDefined(_) => "USER-DEFINED",
         DataType::Numeric { .. } => "numeric",
         DataType::Tsvector => "tsvector",
         DataType::Tsquery => "tsquery",
@@ -347,7 +347,13 @@ pub fn data_type_to_udt_name(dt: &DataType) -> Cow<'static, str> {
         DataType::Jsonb => "jsonb".into(),
         DataType::Vector(_) => "vector".into(),
         DataType::Time => "time".into(),
-        DataType::UserDefined(_) => "text".into(),
+        DataType::UserDefined(full_udt) => {
+            let type_name = full_udt
+                .rsplit_once('.')
+                .map(|(_, name)| name)
+                .unwrap_or(full_udt.as_str());
+            type_name.to_string().into()
+        }
         DataType::Numeric { .. } => "numeric".into(),
         DataType::Tsvector => "tsvector".into(),
         DataType::Tsquery => "tsquery".into(),
@@ -433,6 +439,63 @@ mod tests {
         assert_eq!(
             data_type_to_udt_name(&DataType::Array(Box::new(DataType::Text))).as_ref(),
             "_text"
+        );
+    }
+
+    #[test]
+    fn pg_type_for_user_defined_returns_user_defined() {
+        let dt = DataType::UserDefined("public.mood".into());
+        assert_eq!(data_type_to_pg_type(&dt), "USER-DEFINED");
+    }
+
+    #[test]
+    fn pg_type_for_unqualified_user_defined_returns_user_defined() {
+        let dt = DataType::UserDefined("mood".into());
+        assert_eq!(data_type_to_pg_type(&dt), "USER-DEFINED");
+    }
+
+    #[test]
+    fn udt_name_for_user_defined_extracts_type_name() {
+        let dt = DataType::UserDefined("public.mood".into());
+        assert_eq!(data_type_to_udt_name(&dt).as_ref(), "mood");
+    }
+
+    #[test]
+    fn udt_name_for_unqualified_user_defined_returns_name() {
+        let dt = DataType::UserDefined("mood".into());
+        assert_eq!(data_type_to_udt_name(&dt).as_ref(), "mood");
+    }
+
+    #[test]
+    fn pg_type_for_internal_user_defined_types() {
+        // Internal types like "char", int2vector, oidvector are stored as UserDefined
+        assert_eq!(
+            data_type_to_pg_type(&DataType::UserDefined("char".into())),
+            "USER-DEFINED"
+        );
+        assert_eq!(
+            data_type_to_pg_type(&DataType::UserDefined("int2vector".into())),
+            "USER-DEFINED"
+        );
+        assert_eq!(
+            data_type_to_pg_type(&DataType::UserDefined("oidvector".into())),
+            "USER-DEFINED"
+        );
+    }
+
+    #[test]
+    fn udt_name_for_internal_user_defined_types() {
+        assert_eq!(
+            data_type_to_udt_name(&DataType::UserDefined("char".into())).as_ref(),
+            "char"
+        );
+        assert_eq!(
+            data_type_to_udt_name(&DataType::UserDefined("int2vector".into())).as_ref(),
+            "int2vector"
+        );
+        assert_eq!(
+            data_type_to_udt_name(&DataType::UserDefined("oidvector".into())).as_ref(),
+            "oidvector"
         );
     }
 
