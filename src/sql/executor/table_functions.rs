@@ -134,7 +134,10 @@ pub(crate) fn json_table_function_rows(
                     })
                     .collect())
             }
-            _ if is_jsonb => Err(anyhow!("cannot call jsonb_each on a non-object")),
+            _ if is_jsonb => Err(anyhow!(
+                "cannot call {} on a non-object",
+                func_upper.to_lowercase()
+            )),
             serde_json::Value::Array(_) => Err(anyhow!("cannot deconstruct an array as an object")),
             _ => Err(anyhow!("cannot deconstruct a scalar")),
         },
@@ -156,7 +159,10 @@ pub(crate) fn json_table_function_rows(
                     })
                     .collect())
             }
-            _ if is_jsonb => Err(anyhow!("cannot call jsonb_each_text on a non-object")),
+            _ if is_jsonb => Err(anyhow!(
+                "cannot call {} on a non-object",
+                func_upper.to_lowercase()
+            )),
             serde_json::Value::Array(_) => Err(anyhow!("cannot deconstruct an array as an object")),
             _ => Err(anyhow!("cannot deconstruct a scalar")),
         },
