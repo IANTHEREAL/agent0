@@ -1064,6 +1064,33 @@ fn test_function_call_pg_typeof_uses_typed_argument_type() {
     );
 }
 
+// Regression: pg_typeof(column) must return the declared column type even when
+// the runtime value is NULL (#1507).
+#[test]
+fn test_pg_typeof_null_column_returns_declared_type() {
+    // Row where column 0 is NULL at runtime.
+    let row = make_row(vec![Value::Null]);
+    let qctx = test_qctx();
+
+    let pg_typeof = TypedExpr::new(
+        TypedExprKind::FunctionCall {
+            func: ResolvedFunction {
+                name: "PG_TYPEOF".into(),
+                kind: FunctionKind::Builtin,
+                return_type: DataType::UserDefined("pg_catalog.regtype".to_string()),
+            },
+            args: vec![col_ref(0, "valuntil", DataType::TimestampTz)],
+            order_by: vec![],
+            filter: None,
+        },
+        DataType::UserDefined("pg_catalog.regtype".to_string()),
+    );
+    assert_eq!(
+        eval_typed_expr(&pg_typeof, &row, &qctx).unwrap(),
+        Value::Text("timestamp with time zone".into())
+    );
+}
+
 // ── ArrayLiteral ────────────────────────────────────────
 
 #[test]

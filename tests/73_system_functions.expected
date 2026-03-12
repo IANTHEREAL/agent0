@@ -211,6 +211,27 @@ NOTICE:  table "sys_test" does not exist, skipping
  timestamp with time zone
 (1 row)
 
+      valuntil_type
+--------------------------
+ timestamp with time zone
+(1 row)
+
+NOTICE:  table "pg_typeof_test" does not exist, skipping
+       null_ts_type
+--------------------------
+ timestamp with time zone
+(1 row)
+
+ null_text_type
+----------------
+ text
+(1 row)
+
+ null_bigint_type
+------------------
+ bigint
+(1 row)
+
               result
 ----------------------------------
  System functions tests completed

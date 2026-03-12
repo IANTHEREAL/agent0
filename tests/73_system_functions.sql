@@ -68,4 +68,20 @@ SELECT pg_backend_pid() = pg_backend_pid() AS pid_stable;
 SELECT pg_postmaster_start_time() IS NOT NULL AS has_start_time;
 SELECT pg_typeof(pg_postmaster_start_time()) AS start_time_type;
 
+-- pg_typeof: NULL-valued columns must return declared type (#1507)
+SELECT pg_typeof(valuntil) AS valuntil_type FROM pg_user LIMIT 1;
+
+DROP TABLE IF EXISTS pg_typeof_test CASCADE;
+CREATE TABLE pg_typeof_test (
+  id INT PRIMARY KEY,
+  ts TIMESTAMPTZ,
+  val TEXT,
+  n BIGINT
+);
+INSERT INTO pg_typeof_test VALUES (1, NULL, NULL, NULL);
+SELECT pg_typeof(ts) AS null_ts_type FROM pg_typeof_test WHERE id = 1;
+SELECT pg_typeof(val) AS null_text_type FROM pg_typeof_test WHERE id = 1;
+SELECT pg_typeof(n) AS null_bigint_type FROM pg_typeof_test WHERE id = 1;
+DROP TABLE pg_typeof_test;
+
 SELECT 'System functions tests completed' AS result;
