@@ -1,0 +1,19 @@
+ json_object_keys
+------------------
+ a
+ b
+(2 rows)
+
+ json_array_elements
+---------------------
+ 1
+ 2
+ 3
+(3 rows)
+
+ json_array_elements_text
+--------------------------
+ x
+ y
+(2 rows)
+
