@@ -29,7 +29,9 @@ pub(crate) fn detect_srf(expr: &TypedExpr) -> Option<SrfKind> {
         "JSONB_OBJECT_KEYS"
         | "JSONB_ARRAY_ELEMENTS"
         | "JSONB_ARRAY_ELEMENTS_TEXT"
+        | "JSON_EACH"
         | "JSONB_EACH"
+        | "JSON_EACH_TEXT"
         | "JSONB_EACH_TEXT" => Some(SrfKind::EvalFunctionArray),
         "GENERATE_SUBSCRIPTS" => Some(SrfKind::GenerateSubscripts),
         _ => None,
