@@ -1631,6 +1631,31 @@ fn test_auth_uid_returns_null_when_unset() {
 }
 
 #[test]
+fn test_auth_uid_rejects_arguments() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let func = TypedExpr::new(
+        TypedExprKind::FunctionCall {
+            func: ResolvedFunction {
+                name: "AUTH.UID".into(),
+                kind: FunctionKind::Builtin,
+                return_type: DataType::Text,
+            },
+            args: vec![const_expr(Value::Int32(1), DataType::Int32)],
+            order_by: vec![],
+            filter: None,
+        },
+        DataType::Text,
+    );
+    let err = eval_typed_expr(&func, &row, &qctx).unwrap_err();
+    assert!(
+        err.to_string().contains("auth.uid"),
+        "expected function-not-found error, got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_version() {
     let row = empty_row();
     let qctx = test_qctx();

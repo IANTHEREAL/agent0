@@ -154,6 +154,20 @@ pub(super) fn eval_function_call(
             return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
         "AUTH.UID" => {
+            // auth.uid() is a zero-argument function. Reject any arguments.
+            if !args.is_empty() {
+                return Err(SqlError::FunctionNotFound(format!(
+                    "auth.uid({})",
+                    args.iter()
+                        .map(|a| a
+                            .data_type()
+                            .map(|dt| dt.pg_display_name())
+                            .unwrap_or_else(|| "unknown".to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
+            }
             // auth.uid() — returns the JWT subject (sub claim) from the trusted
             // auth pipeline. Reads from `auth.uid` first, falling back to
             // `request.jwt.claim.sub` (populated by P2-4 JWT pipeline). Both
