@@ -34,7 +34,8 @@ use guc::{
 };
 pub(crate) use guc_engine::{
     check_reserved_guc_reset, check_reserved_guc_reset_with_original, check_reserved_guc_write,
-    session_auth_different_user_error, session_auth_different_user_error_sync,
+    is_server_reserved_guc, session_auth_different_user_error,
+    session_auth_different_user_error_sync,
 };
 pub(crate) use misc::starts_with_ignore_ascii_case;
 use misc::{get_skip_reason, get_unsupported_reason, split_sql_statements};

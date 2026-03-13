@@ -11,9 +11,27 @@ use anyhow::Result;
 pub(super) enum GucKind {
     ReadOnlyPseudo,
     SessionAuthPseudo,
+    /// Server-reserved namespace: only the auth/JWT pipeline may write these.
+    /// Client SET / set_config() is rejected.
+    ServerReserved,
     SearchPath,
     Known,
     UnknownCompat,
+}
+
+/// Namespaces reserved for server-side use only (RLS anti-spoofing).
+///
+/// A client must not be allowed to `SET request.jwt.claim.sub = 'admin'`
+/// or `SET auth.role = 'service_role'` — these are populated exclusively
+/// by the server's auth pipeline after JWT verification.
+const SERVER_RESERVED_PREFIXES: &[&str] = &["request.jwt.", "auth."];
+
+/// Returns `true` if `name` falls within a server-reserved GUC namespace.
+pub(crate) fn is_server_reserved_guc(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    SERVER_RESERVED_PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
 }
 
 pub(super) fn classify_guc(name: &str) -> GucKind {
@@ -22,6 +40,10 @@ pub(super) fn classify_guc(name: &str) -> GucKind {
         "is_superuser" => return GucKind::ReadOnlyPseudo,
         "session_authorization" => return GucKind::SessionAuthPseudo,
         _ => {}
+    }
+
+    if is_server_reserved_guc(&lowered) {
+        return GucKind::ServerReserved;
     }
 
     let canonical = SessionSettings::canonical_setting_name(&lowered);
@@ -38,6 +60,13 @@ pub(crate) fn check_reserved_guc_write(name: &str) -> Result<()> {
     match classify_guc(name) {
         GucKind::ReadOnlyPseudo => Err(SqlError::CantChangeRuntimeParam {
             message: format!("parameter \"{}\" cannot be changed", name),
+        }
+        .into()),
+        GucKind::ServerReserved => Err(SqlError::InsufficientPrivilege {
+            message: format!(
+                "parameter \"{}\" is reserved for server-side use only",
+                name
+            ),
         }
         .into()),
         // session_authorization is handled per-callsite via check_session_auth_write
@@ -186,6 +215,17 @@ pub(crate) fn check_reserved_guc_reset_with_original(name: &str, original: &str)
             .into())
         }
         GucKind::SessionAuthPseudo => Ok(()),
+        GucKind::ServerReserved => Err(SqlError::InsufficientPrivilege {
+            message: format!(
+                "parameter {} is reserved for server-side use only",
+                if original.starts_with('"') {
+                    original.to_string()
+                } else {
+                    format!("\"{}\"", original)
+                }
+            ),
+        }
+        .into()),
         GucKind::SearchPath | GucKind::Known | GucKind::UnknownCompat => Ok(()),
     }
 }
@@ -194,7 +234,7 @@ pub(crate) fn check_reserved_guc_reset_with_original(name: &str, original: &str)
 mod tests {
     use super::{
         check_reserved_guc_reset, check_reserved_guc_write, check_session_auth_write, classify_guc,
-        GucKind,
+        is_server_reserved_guc, GucKind,
     };
 
     #[test]
@@ -210,6 +250,20 @@ mod tests {
             classify_guc("session.authorization"),
             GucKind::UnknownCompat
         );
+        // Server-reserved namespaces
+        assert_eq!(
+            classify_guc("request.jwt.claim.sub"),
+            GucKind::ServerReserved
+        );
+        assert_eq!(classify_guc("request.jwt.claims"), GucKind::ServerReserved);
+        assert_eq!(classify_guc("auth.role"), GucKind::ServerReserved);
+        assert_eq!(classify_guc("auth.uid"), GucKind::ServerReserved);
+        // Case-insensitive
+        assert_eq!(
+            classify_guc("Request.JWT.Claim.Sub"),
+            GucKind::ServerReserved
+        );
+        assert_eq!(classify_guc("AUTH.ROLE"), GucKind::ServerReserved);
     }
 
     #[test]
@@ -285,5 +339,78 @@ mod tests {
     fn session_auth_write_ignores_non_session_auth_params() {
         // Non-session_authorization params pass through without error.
         check_session_auth_write("statement_timeout", "anything", "postgres").unwrap();
+    }
+
+    #[test]
+    fn is_server_reserved_detects_reserved_namespaces() {
+        assert!(is_server_reserved_guc("request.jwt.claim.sub"));
+        assert!(is_server_reserved_guc("request.jwt.claims"));
+        assert!(is_server_reserved_guc("auth.role"));
+        assert!(is_server_reserved_guc("auth.uid"));
+        // Case-insensitive
+        assert!(is_server_reserved_guc("Request.JWT.Claim.Sub"));
+        assert!(is_server_reserved_guc("AUTH.ROLE"));
+        // Non-reserved
+        assert!(!is_server_reserved_guc("statement_timeout"));
+        assert!(!is_server_reserved_guc("search_path"));
+        assert!(!is_server_reserved_guc("my_app.setting"));
+        assert!(!is_server_reserved_guc("request.header"));
+        assert!(!is_server_reserved_guc("authentication.mode"));
+    }
+
+    #[test]
+    fn server_reserved_guc_write_blocked() {
+        use crate::sql::error::SqlError;
+
+        for name in &[
+            "request.jwt.claim.sub",
+            "request.jwt.claims",
+            "auth.role",
+            "auth.uid",
+        ] {
+            let err = check_reserved_guc_write(name).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("reserved for server-side use only"),
+                "expected anti-spoofing error for {name}, got: {msg}"
+            );
+            let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
+            assert_eq!(
+                sql_err.sqlstate(),
+                "42501",
+                "SQLSTATE for {name} should be insufficient_privilege"
+            );
+        }
+    }
+
+    #[test]
+    fn server_reserved_guc_reset_blocked() {
+        use crate::sql::error::SqlError;
+
+        for name in &["request.jwt.claim.sub", "auth.role"] {
+            let err = check_reserved_guc_reset(name).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("reserved for server-side use only"),
+                "expected anti-spoofing error for RESET {name}, got: {msg}"
+            );
+            let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
+            assert_eq!(sql_err.sqlstate(), "42501");
+        }
+    }
+
+    #[test]
+    fn server_reserved_case_insensitive_blocked() {
+        // Mixed-case attempts should also be blocked.
+        check_reserved_guc_write("Request.JWT.Claim.Sub").unwrap_err();
+        check_reserved_guc_write("AUTH.Role").unwrap_err();
+    }
+
+    #[test]
+    fn non_reserved_custom_gucs_allowed() {
+        // Custom GUCs outside reserved namespaces should pass through.
+        check_reserved_guc_write("my_app.setting").unwrap();
+        check_reserved_guc_write("app.jwt_token").unwrap();
+        check_reserved_guc_write("request.header").unwrap();
     }
 }

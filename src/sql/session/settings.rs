@@ -1089,13 +1089,32 @@ impl SessionSettings {
     }
 
     /// Reset all session settings to their defaults.
+    ///
+    /// Server-reserved GUC entries (`request.jwt.*`, `auth.*`) are preserved
+    /// across RESET ALL so that a client cannot indirectly clear auth-pipeline
+    /// values set after JWT verification.
     pub(crate) fn reset_all_settings(&mut self) {
+        use crate::sql::executor::is_server_reserved_guc;
+
+        // Preserve server-reserved entries before resetting.
+        let reserved: HashMap<String, String> = self
+            .extra_settings
+            .iter()
+            .filter(|(k, _)| is_server_reserved_guc(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         let savepoint_stack = std::mem::take(&mut self.settings_savepoint_stack);
         *self = Self::new_with_defaults(
             self.default_statement_timeout_ms,
             self.default_idle_in_transaction_session_timeout_ms,
         );
         self.settings_savepoint_stack = savepoint_stack;
+
+        // Restore server-reserved entries.
+        if !reserved.is_empty() {
+            self.extra_settings.extend(reserved);
+        }
     }
 
     /// Return the boot-default display value for a GUC (what SHOW returns after RESET).
