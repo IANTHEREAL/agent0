@@ -1,0 +1,29 @@
+# RLS EXPLAIN assertions — structural elements that must appear in output
+# Validated against db9-server EXPLAIN output with RLS enabled
+
+# Q1: No RLS — plain scan, no RLS filter
+Seq Scan on rls_exp
+
+# Q2: RLS enabled, no policies — default-deny injects FALSE
+false
+
+# Q3: Permissive policy — shows owner = current_user predicate
+owner = 'rls_exp_user'::text
+
+# Q4: Actual results — only own rows visible
+rls_exp_user
+
+# Q5: Restrictive + permissive — both predicates appear
+(id > 1)
+
+# Q6: Restrictive narrows results — only id=3 visible
+also visible
+
+# Q7: User WHERE clause coexists with RLS filter
+(data = 'visible'::text)
+
+# Q8: Superuser — no RLS filter, plain scan
+Seq Scan on rls_exp
+
+# Q9: EXPLAIN ANALYZE — shows RLS filter with actual rows
+Actual Rows
