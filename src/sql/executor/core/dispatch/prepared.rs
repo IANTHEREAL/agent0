@@ -520,6 +520,7 @@ impl Executor {
             db_id,
             session.search_path(),
             &resolved_table_ids,
+            current_role,
         );
 
         // Check eligibility: analyzed SELECT only, and never cache plans that
@@ -1182,6 +1183,7 @@ mod plan_cache_flow_tests {
             1,
             &["public".to_string()],
             resolved_table_ids,
+            None,
         )
     }
 
