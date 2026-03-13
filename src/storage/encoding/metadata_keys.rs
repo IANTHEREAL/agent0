@@ -34,6 +34,8 @@ const DB_SYS_RELNAME_PREFIX: &[u8] = b"sys_relname_";
 const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
 const DB_SYS_STATS_PREFIX: &[u8] = b"sys_stats_";
 const DB_SYS_COLLATION_PREFIX: &[u8] = b"sys_collation_";
+const DB_SYS_POLICY_PREFIX: &[u8] = b"sys_policy_";
+const DB_SYS_NEXT_POLICY_OID: &[u8] = b"sys_next_policy_oid";
 const DB_SYS_TSC_PREFIX: &[u8] = b"sys_tsc_";
 const DB_SYS_CRON_JOB_PREFIX_V2: &[u8] = b"sys_cron_job_";
 const DB_SYS_CRON_RUN_PREFIX_V2: &[u8] = b"sys_cron_run_";
@@ -108,6 +110,12 @@ pub fn encode_next_trigger_oid_key_v2(db_id: u64) -> Vec<u8> {
 pub fn encode_next_view_oid_key_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_NEXT_VIEW_OID);
+    key
+}
+
+pub fn encode_next_policy_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_POLICY_OID);
     key
 }
 
@@ -604,6 +612,37 @@ pub fn encode_trigger_table_prefix_v2(db_id: u64, table_full_name: &str) -> Vec<
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
     key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key
+}
+
+// ============================================================================
+// RLS Policy keys
+// ============================================================================
+
+/// Key for a specific policy: `d_{db_id}_sys_policy_{table_id}/{policy_name}`
+pub fn encode_policy_key_v2(db_id: u64, table_id: u64, policy_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_POLICY_PREFIX);
+    key.extend_from_slice(table_id.to_string().as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(policy_name.as_bytes());
+    key
+}
+
+/// Prefix for all policies in a database: `d_{db_id}_sys_policy_`
+pub fn encode_policy_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_POLICY_PREFIX);
+    key
+}
+
+/// Prefix for all policies on a specific table: `d_{db_id}_sys_policy_{table_id}/`
+#[allow(dead_code)]
+pub fn encode_policy_table_prefix_v2(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_POLICY_PREFIX);
+    key.extend_from_slice(table_id.to_string().as_bytes());
     key.push(b'/');
     key
 }

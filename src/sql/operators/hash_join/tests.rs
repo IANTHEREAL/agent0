@@ -40,6 +40,8 @@ fn schema_left() -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }
@@ -81,6 +83,8 @@ fn schema_right() -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }

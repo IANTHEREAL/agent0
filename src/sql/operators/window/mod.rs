@@ -146,6 +146,8 @@ impl WindowOperator {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         };
 

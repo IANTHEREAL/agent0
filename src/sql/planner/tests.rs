@@ -166,6 +166,8 @@ fn gin_schema() -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }
@@ -236,6 +238,8 @@ fn test_gin_typed_no_gin_index_falls_back() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -289,6 +293,8 @@ fn test_expression_index_typed_lower() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -378,6 +384,8 @@ fn test_partial_index_typed_exact_predicate() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -464,6 +472,8 @@ fn test_partial_index_typed_missing_predicate() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -514,6 +524,8 @@ fn test_partial_index_typed_valid_cached_predicate() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -569,6 +581,8 @@ fn test_partial_index_typed_malformed_predicate() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -625,6 +639,8 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -756,6 +772,8 @@ fn build_single_column_schema(unique: bool) -> (TableSchema, IndexDef) {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -899,6 +917,8 @@ fn test_inlist_mixed_null_and_duplicates_matches_normalized_scan_keys_and_cost()
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
     let stats = build_table_stats("id", 1000.0, 0.0);
@@ -1005,6 +1025,8 @@ fn test_inlist_mixed_sign_nan_deduplicates_to_one_effective_nan() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
     let stats = build_table_stats("score", 10.0, 0.0);
@@ -1280,6 +1302,8 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 

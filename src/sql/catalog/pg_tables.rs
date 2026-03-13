@@ -69,6 +69,8 @@ impl VirtualTable for PgTables {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         }
     }
@@ -108,9 +110,9 @@ impl VirtualTable for PgTables {
                 text_val(&schema.owner),
                 null_val(),
                 Value::Boolean(hasindexes),
-                Value::Boolean(false),
+                Value::Boolean(false), // hasrules
                 Value::Boolean(hastriggers),
-                Value::Boolean(false),
+                Value::Boolean(schema.rls_enabled), // rowsecurity
             ]));
         }
 

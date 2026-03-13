@@ -158,6 +158,8 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: "admin".into(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         }
     }
@@ -319,6 +321,8 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: "postgres".into(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         };
 

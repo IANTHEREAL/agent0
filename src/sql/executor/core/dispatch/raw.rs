@@ -113,6 +113,21 @@ impl Executor {
                 let res = self.execute_drop_trigger_cmd(session, sql).await;
                 Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
             }
+            RawSqlKind::CreatePolicy => {
+                let start = Instant::now();
+                let res = self.execute_create_policy_cmd(session, sql).await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::DropPolicy => {
+                let start = Instant::now();
+                let res = self.execute_drop_policy_cmd(session, sql).await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::AlterTableRls => {
+                let start = Instant::now();
+                let res = self.execute_alter_table_rls_cmd(session, sql).await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
             _ => None,
         }
     }

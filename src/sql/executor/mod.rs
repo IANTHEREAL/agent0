@@ -12,6 +12,7 @@ mod database;
 mod ddl;
 mod default_privileges;
 mod dml_analyzed;
+mod rls_ddl;
 mod extensions;
 mod procedure;
 mod select;

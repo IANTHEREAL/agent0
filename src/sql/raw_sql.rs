@@ -61,6 +61,12 @@ pub(crate) enum RawSqlKind {
     /// parse `IF EXISTS` after `ALTER INDEX`. Intercepted here and dispatched
     /// to a raw-SQL handler that extracts index names manually.
     AlterIndexIfExists,
+    /// `CREATE POLICY <name> ON <table> ...` — RLS policy creation.
+    CreatePolicy,
+    /// `DROP POLICY [IF EXISTS] <name> ON <table>` — RLS policy removal.
+    DropPolicy,
+    /// `ALTER TABLE <table> {ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL SECURITY`
+    AlterTableRls,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
@@ -423,6 +429,17 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("DROP TRIGGER") {
         return Some(RawSqlKind::DropTrigger);
+    }
+    if sql_upper.starts_with("CREATE POLICY") {
+        return Some(RawSqlKind::CreatePolicy);
+    }
+    if sql_upper.starts_with("DROP POLICY") {
+        return Some(RawSqlKind::DropPolicy);
+    }
+    // ALTER TABLE ... {ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL SECURITY
+    // Must be checked before generic ALTER TABLE handlers.
+    if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("ROW LEVEL SECURITY") {
+        return Some(RawSqlKind::AlterTableRls);
     }
     if sql_upper.starts_with("ALTER SYSTEM SET ") {
         return Some(RawSqlKind::AlterSystemSet);
