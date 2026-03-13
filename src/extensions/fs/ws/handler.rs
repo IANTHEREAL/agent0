@@ -900,7 +900,7 @@ async fn handle_batch_write(
                         ok: false,
                         written: None,
                         error: Some(WsErrorDetail {
-                            code: code.clone(),
+                            code,
                             message: msg.clone(),
                         }),
                     }).collect::<Vec<_>>()

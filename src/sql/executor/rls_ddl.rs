@@ -85,11 +85,11 @@ fn consume_ident(s: &str) -> Option<(String, &str)> {
     if s.is_empty() {
         return None;
     }
-    if s.starts_with('"') {
+    if let Some(rest) = s.strip_prefix('"') {
         // Quoted identifier
-        let end = s[1..].find('"')?;
-        let ident = s[1..1 + end].to_string();
-        Some((ident, s[2 + end..].trim_start()))
+        let end = rest.find('"')?;
+        let ident = rest[..end].to_string();
+        Some((ident, rest[end + 1..].trim_start()))
     } else {
         // Unquoted identifier: alphanumeric + underscore
         let end = s

@@ -88,12 +88,12 @@ impl VirtualTable for PgPolicy {
                 policy
                     .using_expr
                     .as_deref()
-                    .map(|e| text_val(e))
+                    .map(text_val)
                     .unwrap_or(Value::Null),
                 policy
                     .with_check_expr
                     .as_deref()
-                    .map(|e| text_val(e))
+                    .map(text_val)
                     .unwrap_or(Value::Null),
             ]));
         }
