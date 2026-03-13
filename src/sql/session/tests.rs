@@ -986,6 +986,16 @@ mod tests {
                 .map(String::as_str)
                 == Some("alice")
         );
+
+        let local_err = settings
+            .set_local_override("auth.uid", "evil".to_string())
+            .unwrap_err();
+        assert!(
+            local_err
+                .to_string()
+                .contains("reserved for server-side use only"),
+            "SET LOCAL path must also reject server-reserved namespaces"
+        );
     }
 
     #[test]
@@ -1011,6 +1021,21 @@ mod tests {
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),
             Some("0")
+        );
+    }
+
+    #[test]
+    fn test_reset_setting_does_not_clear_server_reserved_settings() {
+        let mut settings = SessionSettings::new();
+        settings
+            .set_server_reserved_setting("auth.uid", "auth0|alice".to_string())
+            .unwrap();
+
+        settings.reset_setting("auth.uid");
+
+        assert_eq!(
+            settings.show_value("auth.uid").as_deref(),
+            Some("auth0|alice")
         );
     }
 

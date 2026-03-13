@@ -1025,6 +1025,15 @@ impl SessionSettings {
 
     pub(crate) fn set_local_override(&mut self, name: &str, value: String) -> Result<bool> {
         let canonical = Self::canonical_setting_name(name);
+        if crate::sql::executor::is_server_reserved_guc(canonical) {
+            return Err(SqlError::InsufficientPrivilege {
+                message: format!(
+                    "parameter \"{}\" is reserved for server-side use only",
+                    name
+                ),
+            }
+            .into());
+        }
         let normalized = Self::validate_and_normalize_value(canonical, &value)?;
         self.local_overrides
             .insert(canonical.to_string(), normalized);
@@ -1091,6 +1100,10 @@ impl SessionSettings {
     /// Reset a single session setting to its default value.
     pub(crate) fn reset_setting(&mut self, name: &str) {
         let canonical = Self::canonical_setting_name(name);
+        if crate::sql::executor::is_server_reserved_guc(canonical) {
+            self.remove_local_override(canonical);
+            return;
+        }
         match canonical {
             "search_path" => self.search_path = Self::default_search_path(),
             "statement_timeout" => self.statement_timeout_ms = self.default_statement_timeout_ms,
