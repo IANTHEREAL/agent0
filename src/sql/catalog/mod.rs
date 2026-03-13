@@ -23,6 +23,7 @@ mod pg_indexes;
 mod pg_inherits;
 mod pg_namespace;
 mod pg_opclass;
+mod pg_policies;
 mod pg_policy;
 mod pg_proc;
 mod pg_publication;
@@ -110,6 +111,7 @@ impl CatalogRegistry {
         registry.register(Box::new(pg_indexes::PgIndexes));
         registry.register(Box::new(pg_namespace::PgNamespace));
         registry.register(Box::new(pg_opclass::PgOpclass));
+        registry.register(Box::new(pg_policies::PgPolicies));
         registry.register(Box::new(pg_policy::PgPolicy));
         registry.register(Box::new(pg_publication::PgPublication));
         registry.register(Box::new(pg_publication_namespace::PgPublicationNamespace));

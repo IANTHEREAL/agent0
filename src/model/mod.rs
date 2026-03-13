@@ -916,6 +916,17 @@ impl RlsCommand {
         }
     }
 
+    /// Return the human-readable command name used by `pg_policies` view.
+    pub fn pg_cmd_display(&self) -> &'static str {
+        match self {
+            RlsCommand::All => "ALL",
+            RlsCommand::Select => "SELECT",
+            RlsCommand::Insert => "INSERT",
+            RlsCommand::Update => "UPDATE",
+            RlsCommand::Delete => "DELETE",
+        }
+    }
+
     /// Whether this command scope applies to a given DML operation.
     #[allow(dead_code)]
     pub fn applies_to_select(&self) -> bool {
