@@ -947,6 +947,74 @@ mod tests {
     }
 
     #[test]
+    fn test_server_reserved_settings_require_server_setter() {
+        let mut settings = SessionSettings::new();
+
+        let err = settings
+            .set_known_setting("request.jwt.claim.sub", "alice".to_string())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reserved for server-side use only"),
+            "client write path must reject server-reserved namespaces"
+        );
+
+        settings
+            .set_server_reserved_setting("Request.JWT.Claim.Sub", "alice".to_string())
+            .unwrap();
+        settings
+            .set_server_reserved_setting("request.jwt.claims", "{\"sub\":\"alice\"}".to_string())
+            .unwrap();
+
+        assert_eq!(
+            settings.show_value("request.jwt.claim.sub").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            settings.show_value("request.jwt.claims").as_deref(),
+            Some("{\"sub\":\"alice\"}")
+        );
+
+        let all = settings.show_all();
+        assert!(all
+            .iter()
+            .any(|(n, v, _)| { n == "request.jwt.claim.sub" && v == "alice" }));
+        assert!(
+            settings
+                .all_values()
+                .get("request.jwt.claim.sub")
+                .map(String::as_str)
+                == Some("alice")
+        );
+    }
+
+    #[test]
+    fn test_reset_all_preserves_server_reserved_settings() {
+        let mut settings = SessionSettings::new();
+        settings
+            .set_server_reserved_setting("request.jwt.claim.sub", "alice".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("application_name", "before-reset".to_string())
+            .unwrap();
+        settings
+            .set_local_override("statement_timeout", "2500".to_string())
+            .unwrap();
+
+        settings.reset_all_settings();
+
+        assert_eq!(
+            settings.show_value("request.jwt.claim.sub").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
     fn test_show_all_includes_local_overrides() {
         let mut settings = SessionSettings::new();
         settings
@@ -1062,6 +1130,24 @@ mod tests {
         assert_eq!(
             snapshot.get("session.authorization").map(String::as_str),
             Some("x")
+        );
+
+        session
+            .set_server_reserved_setting("request.jwt.claim.sub", "auth0|alice".to_string())
+            .expect("set trusted jwt claim");
+        let settings_snapshot = session.all_settings_snapshot();
+        let execution_snapshot = session.all_execution_settings_snapshot();
+        assert_eq!(
+            settings_snapshot
+                .get("request.jwt.claim.sub")
+                .map(String::as_str),
+            Some("auth0|alice")
+        );
+        assert_eq!(
+            execution_snapshot
+                .get("request.jwt.claim.sub")
+                .map(String::as_str),
+            Some("auth0|alice")
         );
     }
 

@@ -401,6 +401,10 @@ pub(crate) struct SessionSettings {
     /// `DateStyle`, `work_mem`). Values are stored as-is for `SHOW` readback.
     extra_settings: HashMap<String, String>,
 
+    /// Server-authored settings in reserved namespaces (`request.jwt.*`,
+    /// `auth.*`). These are never writable by client `SET` paths.
+    server_reserved_settings: HashMap<String, String>,
+
     /// Transaction-local overrides populated by `SET LOCAL`.
     local_overrides: HashMap<String, String>,
     /// Parsed search_path override for local scope.
@@ -907,6 +911,15 @@ impl SessionSettings {
     /// or `DateStyle` to work without error.
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
         let canonical = Self::canonical_setting_name(name);
+        if crate::sql::executor::is_server_reserved_guc(canonical) {
+            return Err(SqlError::InsufficientPrivilege {
+                message: format!(
+                    "parameter \"{}\" is reserved for server-side use only",
+                    name
+                ),
+            }
+            .into());
+        }
         let normalized = Self::validate_and_normalize_value(canonical, &value)?;
 
         match canonical {
@@ -979,6 +992,33 @@ impl SessionSettings {
                     .insert(canonical.to_string(), normalized.clone());
             }
         }
+        self.remove_local_override(canonical);
+        Ok(true)
+    }
+
+    /// Set a server-authored reserved GUC entry. This bypasses the client
+    /// write guards and is used only by trusted auth/session plumbing.
+    pub(crate) fn set_server_reserved_setting(
+        &mut self,
+        name: &str,
+        value: String,
+    ) -> Result<bool> {
+        let lowered = name.to_ascii_lowercase();
+        let canonical = Self::canonical_setting_name(&lowered);
+        if !crate::sql::executor::is_server_reserved_guc(canonical) {
+            return Err(SqlError::InvalidParameterValue {
+                message: format!(
+                    "parameter \"{}\" is not in a server-reserved namespace",
+                    name
+                ),
+            }
+            .into());
+        }
+
+        let normalized = Self::validate_and_normalize_value(canonical, &value)?;
+        self.extra_settings.remove(canonical);
+        self.server_reserved_settings
+            .insert(canonical.to_string(), normalized);
         self.remove_local_override(canonical);
         Ok(true)
     }
@@ -1082,6 +1122,7 @@ impl SessionSettings {
             "transaction_isolation" => self.transaction_isolation = None,
             "default_transaction_read_only" => self.default_transaction_read_only = None,
             _ => {
+                self.server_reserved_settings.remove(canonical);
                 self.extra_settings.remove(canonical);
             }
         }
@@ -1094,15 +1135,7 @@ impl SessionSettings {
     /// across RESET ALL so that a client cannot indirectly clear auth-pipeline
     /// values set after JWT verification.
     pub(crate) fn reset_all_settings(&mut self) {
-        use crate::sql::executor::is_server_reserved_guc;
-
-        // Preserve server-reserved entries before resetting.
-        let reserved: HashMap<String, String> = self
-            .extra_settings
-            .iter()
-            .filter(|(k, _)| is_server_reserved_guc(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let reserved = self.server_reserved_settings.clone();
 
         let savepoint_stack = std::mem::take(&mut self.settings_savepoint_stack);
         *self = Self::new_with_defaults(
@@ -1113,7 +1146,7 @@ impl SessionSettings {
 
         // Restore server-reserved entries.
         if !reserved.is_empty() {
-            self.extra_settings.extend(reserved);
+            self.server_reserved_settings.extend(reserved);
         }
     }
 
@@ -1201,6 +1234,7 @@ impl SessionSettings {
         // new GUCs to KNOWN_GUCS first.
         let is_registered = KNOWN_GUCS.iter().any(|g| g.name == canonical);
         if !is_registered
+            && !self.server_reserved_settings.contains_key(canonical)
             && !self.extra_settings.contains_key(canonical)
             && !self.local_overrides.contains_key(canonical)
         {
@@ -1335,19 +1369,24 @@ impl SessionSettings {
                     .unwrap_or("off")
                     .to_string(),
             ),
-            _ => self.extra_settings.get(canonical).cloned().or_else(|| {
-                // default_text_search_config uses a runtime OnceLock fn, not a const.
-                if canonical == "default_text_search_config" {
-                    return Some(
-                        crate::sql::fts_tokenizers::default_text_search_config().to_string(),
-                    );
-                }
-                KNOWN_GUCS
-                    .iter()
-                    .find(|g| g.name == canonical)
-                    .and_then(|g| g.static_default)
-                    .map(String::from)
-            }),
+            _ => self
+                .server_reserved_settings
+                .get(canonical)
+                .cloned()
+                .or_else(|| self.extra_settings.get(canonical).cloned())
+                .or_else(|| {
+                    // default_text_search_config uses a runtime OnceLock fn, not a const.
+                    if canonical == "default_text_search_config" {
+                        return Some(
+                            crate::sql::fts_tokenizers::default_text_search_config().to_string(),
+                        );
+                    }
+                    KNOWN_GUCS
+                        .iter()
+                        .find(|g| g.name == canonical)
+                        .and_then(|g| g.static_default)
+                        .map(String::from)
+                }),
         }
     }
 
@@ -1363,14 +1402,21 @@ impl SessionSettings {
             }
         }
 
-        // 2. User-SET extra_settings not in registry
+        // 2. Server-authored reserved settings not in registry.
+        for name in self.server_reserved_settings.keys() {
+            result
+                .entry(name.clone())
+                .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
+        }
+
+        // 3. User-SET extra_settings not in registry
         for name in self.extra_settings.keys() {
             result
                 .entry(name.clone())
                 .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
         }
 
-        // 3. Local overrides not already covered
+        // 4. Local overrides not already covered
         for name in self.local_overrides.keys() {
             result
                 .entry(name.clone())
@@ -1578,14 +1624,15 @@ impl SessionSettings {
     /// Collect all current settings into a flat map.
     ///
     /// Resolves every key through `show_value()` so precedence
-    /// (local_overrides > typed fields > extra_settings > default_value)
-    /// is identical to `SHOW`.
+    /// (local_overrides > typed fields > server_reserved_settings >
+    /// extra_settings > default_value) is identical to `SHOW`.
     pub(crate) fn all_values(&self) -> HashMap<String, String> {
         use std::collections::HashSet;
 
         let all_keys: HashSet<&str> = Self::KNOWN_SETTING_KEYS
             .iter()
             .copied()
+            .chain(self.server_reserved_settings.keys().map(String::as_str))
             .chain(self.extra_settings.keys().map(String::as_str))
             .chain(self.local_overrides.keys().map(String::as_str))
             .collect();

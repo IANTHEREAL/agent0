@@ -112,7 +112,7 @@ pub(crate) async fn handle_auth(
         WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
     })?;
 
-    let (user, failure) = match dispatch_db9_auth(
+    let (user, _trusted_jwt_claims, failure) = match dispatch_db9_auth(
         &auth_manager,
         &mut auth_txn,
         auth_mode,
