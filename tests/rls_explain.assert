@@ -10,8 +10,8 @@ Filter: (owner = 'rls_exp_user'::text)
 # Q3: Permissive results — unique "q3:" prefix
 q3:1,3
 
-# Q4: Restrictive+permissive AND — unique combined predicate
-(owner = 'rls_exp_user'::text) AND (id > 1)
+# Q4: Restrictive+permissive AND — full Filter line unique (starts with "((owner" vs Q6 "((data")
+Filter: ((owner = 'rls_exp_user'::text) AND (id > 1))
 
 # Q5: Restrictive narrows results — unique "q5:" prefix
 q5:3
