@@ -85,6 +85,13 @@ pub(crate) trait FsWriteStream: Send {
 #[async_trait]
 pub(crate) trait FsBackend: Send + Sync {
     async fn stat(&self, path: &str) -> Result<FsFileInfo>;
+    async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<FsFileInfo>>> {
+        let mut entries = Vec::with_capacity(paths.len());
+        for path in paths {
+            entries.push(self.stat(path).await);
+        }
+        Ok(entries)
+    }
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>>;
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>>;
     async fn read_file_stream(

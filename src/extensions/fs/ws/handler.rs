@@ -549,57 +549,78 @@ async fn handle_batch_stat(session: &WsSession, id: &str, paths: &[String]) -> W
         }
     }
 
-    let concurrency = fs9_config().batch_stat_concurrency.max(1);
-    let backend = session.backend.clone();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut join_set = tokio::task::JoinSet::new();
+    batch_stat_response(id, paths, session.backend.batch_stat(paths).await)
+}
 
-    for (idx, path) in paths.iter().cloned().enumerate() {
-        let backend = backend.clone();
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("batch_stat semaphore must not be closed");
-        join_set.spawn(async move {
-            let _permit = permit;
-            let entry = match backend.stat(&path).await {
-                Ok(info) => BatchStatEntryResponse {
-                    path,
-                    ok: true,
-                    info: Some(FileInfoResponse::from(info)),
-                    error: None,
-                },
-                Err(err) => {
-                    let (code, msg) = map_fs_error(&err);
-                    BatchStatEntryResponse {
+fn batch_stat_response(
+    id: &str,
+    paths: &[String],
+    result: anyhow::Result<Vec<anyhow::Result<crate::extensions::fs::backend::FsFileInfo>>>,
+) -> WsResponse {
+    let entries: Vec<BatchStatEntryResponse> = match result {
+        Ok(results) => {
+            if results.len() != paths.len() {
+                let code = WsErrorCode::Eio;
+                let message = format!(
+                    "batch_stat backend returned {} results for {} input paths",
+                    results.len(),
+                    paths.len()
+                );
+                paths
+                    .iter()
+                    .cloned()
+                    .map(|path| BatchStatEntryResponse {
                         path,
                         ok: false,
                         info: None,
-                        error: Some(WsErrorDetail { code, message: msg }),
-                    }
-                }
-            };
-            (idx, entry)
-        });
-    }
-
-    let mut entries: Vec<(usize, BatchStatEntryResponse)> = Vec::with_capacity(paths.len());
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(entry) => entries.push(entry),
-            Err(err) => {
-                return WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("batch_stat task failed: {err}"),
-                );
+                        error: Some(WsErrorDetail {
+                            code,
+                            message: message.clone(),
+                        }),
+                    })
+                    .collect()
+            } else {
+                paths
+                    .iter()
+                    .cloned()
+                    .zip(results.into_iter())
+                    .map(|(path, result)| match result {
+                        Ok(info) => BatchStatEntryResponse {
+                            path,
+                            ok: true,
+                            info: Some(FileInfoResponse::from(info)),
+                            error: None,
+                        },
+                        Err(err) => {
+                            let (code, msg) = map_fs_error(&err);
+                            BatchStatEntryResponse {
+                                path,
+                                ok: false,
+                                info: None,
+                                error: Some(WsErrorDetail { code, message: msg }),
+                            }
+                        }
+                    })
+                    .collect()
             }
         }
-    }
-    entries.sort_by_key(|(idx, _)| *idx);
-    let entries: Vec<BatchStatEntryResponse> =
-        entries.into_iter().map(|(_, entry)| entry).collect();
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            paths
+                .iter()
+                .cloned()
+                .map(|path| BatchStatEntryResponse {
+                    path,
+                    ok: false,
+                    info: None,
+                    error: Some(WsErrorDetail {
+                        code,
+                        message: msg.clone(),
+                    }),
+                })
+                .collect()
+        }
+    };
 
     WsResponse::success(id, json!({ "entries": entries }))
 }
@@ -992,8 +1013,11 @@ fn format_mtime(epoch_seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_base64_content, parse_sha256_checksum};
+    use super::{batch_stat_response, decode_base64_content, parse_sha256_checksum};
+    use crate::extensions::fs::backend::FsFileInfo;
     use crate::extensions::fs::ws::protocol::WsErrorCode;
+    use anyhow::anyhow;
+    use serde_json::Value;
 
     #[test]
     fn test_decode_base64_valid() {
@@ -1049,5 +1073,142 @@ mod tests {
         let detail = err.error.expect("error detail should be present");
         assert_eq!(detail.code, WsErrorCode::Einval);
         assert_eq!(detail.message, "sha256 checksum must be 32 bytes");
+    }
+
+    #[test]
+    fn test_batch_stat_response_converts_backend_error_to_per_entry_failures() {
+        let paths = vec!["/a".to_string(), "/b".to_string()];
+        let resp = batch_stat_response("req-4", &paths, Err(anyhow!("backend exploded")));
+
+        assert!(
+            resp.ok,
+            "batch_stat must keep top-level ok for backend read failures"
+        );
+        let data = resp.data.expect("batch_stat success must include data");
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["path"], Value::String("/a".to_string()));
+        assert_eq!(entries[0]["ok"], Value::Bool(false));
+        assert_eq!(entries[1]["path"], Value::String("/b".to_string()));
+        assert_eq!(entries[1]["ok"], Value::Bool(false));
+    }
+
+    #[test]
+    fn test_batch_stat_response_preserves_mixed_entry_results() {
+        let paths = vec!["/ok".to_string(), "/missing".to_string()];
+        let resp = batch_stat_response(
+            "req-5",
+            &paths,
+            Ok(vec![
+                Ok(FsFileInfo {
+                    path: "/ok".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 5,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }),
+                Err(anyhow!(
+                    crate::extensions::fs::embedded::types::EmbeddedFsError::not_found("/missing")
+                )),
+            ]),
+        );
+
+        assert!(resp.ok);
+        let data = resp.data.expect("batch_stat success must include data");
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries[0]["ok"], Value::Bool(true));
+        assert_eq!(entries[1]["ok"], Value::Bool(false));
+        assert_eq!(
+            entries[1]["error"]["code"],
+            Value::String("ENOENT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_batch_stat_response_rejects_short_backend_result_vectors() {
+        let paths = vec!["/a".to_string(), "/b".to_string()];
+        let resp = batch_stat_response(
+            "req-6",
+            &paths,
+            Ok(vec![Ok(FsFileInfo {
+                path: "/a".to_string(),
+                is_dir: false,
+                is_symlink: false,
+                size: 1,
+                mode: 0o644,
+                mtime: 0,
+                storage: None,
+                sealed: None,
+            })]),
+        );
+
+        assert!(resp.ok);
+        let data = resp.data.expect("batch_stat success must include data");
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(entry["ok"], Value::Bool(false));
+            assert_eq!(entry["error"]["code"], Value::String("EIO".to_string()));
+            assert!(entry["error"]["message"]
+                .as_str()
+                .expect("message must be a string")
+                .contains("returned 1 results for 2 input paths"));
+        }
+    }
+
+    #[test]
+    fn test_batch_stat_response_rejects_long_backend_result_vectors() {
+        let paths = vec!["/a".to_string()];
+        let resp = batch_stat_response(
+            "req-7",
+            &paths,
+            Ok(vec![
+                Ok(FsFileInfo {
+                    path: "/a".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 1,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }),
+                Ok(FsFileInfo {
+                    path: "/extra".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 1,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }),
+            ]),
+        );
+
+        assert!(resp.ok);
+        let data = resp.data.expect("batch_stat success must include data");
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["ok"], Value::Bool(false));
+        assert_eq!(
+            entries[0]["error"]["code"],
+            Value::String("EIO".to_string())
+        );
+        assert!(entries[0]["error"]["message"]
+            .as_str()
+            .expect("message must be a string")
+            .contains("returned 2 results for 1 input paths"));
     }
 }

@@ -133,6 +133,38 @@ struct PackEntryRef {
     generation: u64,
 }
 
+#[derive(Debug, Clone)]
+struct BatchStatRequest {
+    normalized: String,
+    parts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingBatchStat {
+    request_idx: usize,
+    parent_inode: u64,
+    next_part_idx: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirLookupRequest {
+    parent_inode: u64,
+    name: String,
+}
+
+#[async_trait]
+trait BatchStatStore {
+    async fn load_root_inode(&mut self) -> Result<Option<Inode>>;
+    async fn lookup_dir_entries(
+        &mut self,
+        requests: &[DirLookupRequest],
+    ) -> Result<HashMap<(u64, String), Option<u64>>>;
+    async fn load_inodes(
+        &mut self,
+        inode_ids: &[u64],
+    ) -> Result<HashMap<u64, Result<Option<Inode>>>>;
+}
+
 struct EmbeddedStagingWriteStream {
     fs: EmbeddedPageFs,
     path: String,
@@ -1668,6 +1700,14 @@ impl EmbeddedPageFs {
         let (_, inode) = resolve_path(&mut txn, path).await?;
         let _ = txn.rollback().await;
         Ok(inode)
+    }
+
+    pub(crate) async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<Inode>>> {
+        let mut txn = self.begin().await?;
+        let mut store = TxnBatchStatStore { txn: &mut txn };
+        let result = Ok(resolve_paths_batched(&mut store, paths).await);
+        let _ = txn.rollback().await;
+        result
     }
 
     pub(crate) async fn readdir(&self, path: &str) -> Result<Vec<(String, Inode)>> {
@@ -4261,6 +4301,31 @@ async fn load_inode(txn: &mut Transaction, inode_id: u64) -> Result<Option<Inode
     }
 }
 
+struct TxnBatchStatStore<'a> {
+    txn: &'a mut Transaction,
+}
+
+#[async_trait]
+impl BatchStatStore for TxnBatchStatStore<'_> {
+    async fn load_root_inode(&mut self) -> Result<Option<Inode>> {
+        load_inode(self.txn, ROOT_INODE).await
+    }
+
+    async fn lookup_dir_entries(
+        &mut self,
+        requests: &[DirLookupRequest],
+    ) -> Result<HashMap<(u64, String), Option<u64>>> {
+        lookup_dir_entries_batch(self.txn, requests).await
+    }
+
+    async fn load_inodes(
+        &mut self,
+        inode_ids: &[u64],
+    ) -> Result<HashMap<u64, Result<Option<Inode>>>> {
+        load_inodes_batch_tolerant(self.txn, inode_ids).await
+    }
+}
+
 fn deserialize_inode(inode_id: u64, data: &[u8]) -> Result<Inode> {
     serde_json::from_slice(data).map_err(|err| {
         anyhow!(
@@ -4293,6 +4358,76 @@ async fn load_inodes_batch(txn: &mut Transaction, inode_ids: &[u64]) -> Result<V
             } else {
                 out.push(None);
             }
+        }
+    }
+
+    Ok(out)
+}
+
+async fn load_inodes_batch_tolerant(
+    txn: &mut Transaction,
+    inode_ids: &[u64],
+) -> Result<HashMap<u64, Result<Option<Inode>>>> {
+    let mut out = HashMap::with_capacity(inode_ids.len());
+
+    for chunk in inode_ids.chunks(INODE_BATCH_GET_CHUNK_SIZE) {
+        let keys: Vec<Vec<u8>> = chunk
+            .iter()
+            .map(|inode_id| keys::inode_key(*inode_id))
+            .collect();
+        let pairs = txn.batch_get(keys.iter().cloned()).await?;
+        let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(keys.len());
+
+        for pair in pairs {
+            let tikv_client::KvPair(key, value) = pair;
+            by_key.insert(key, value);
+        }
+
+        for (inode_id, key) in chunk.iter().zip(keys.iter()) {
+            let key_ref: &Key = key.into();
+            let inode = if let Some(value) = by_key.get(key_ref) {
+                deserialize_inode(*inode_id, value).map(Some)
+            } else {
+                Ok(None)
+            };
+            out.insert(*inode_id, inode);
+        }
+    }
+
+    Ok(out)
+}
+
+async fn lookup_dir_entries_batch(
+    txn: &mut Transaction,
+    requests: &[DirLookupRequest],
+) -> Result<HashMap<(u64, String), Option<u64>>> {
+    let mut out = HashMap::with_capacity(requests.len());
+    if requests.is_empty() {
+        return Ok(out);
+    }
+
+    for chunk in requests.chunks(INODE_BATCH_GET_CHUNK_SIZE) {
+        let keys: Vec<Vec<u8>> = chunk
+            .iter()
+            .map(|request| keys::dir_entry_key(request.parent_inode, &request.name))
+            .collect();
+        let pairs = txn.batch_get(keys.iter().cloned()).await?;
+        let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(keys.len());
+
+        for pair in pairs {
+            let tikv_client::KvPair(key, value) = pair;
+            by_key.insert(key, value);
+        }
+
+        for (request, key) in chunk.iter().zip(keys.iter()) {
+            let key_ref: &Key = key.into();
+            let inode_id = match by_key.get(key_ref) {
+                Some(value) if value.len() == 8 => {
+                    Some(u64::from_be_bytes(value.as_slice().try_into()?))
+                }
+                Some(_) | None => None,
+            };
+            out.insert((request.parent_inode, request.name.clone()), inode_id);
         }
     }
 
@@ -4360,6 +4495,184 @@ async fn list_dir(txn: &mut Transaction, parent_inode: u64) -> Result<Vec<(Strin
         out.push((name.to_string(), child_inode));
     }
     Ok(out)
+}
+
+fn clone_batch_stat_error(err: &anyhow::Error) -> anyhow::Error {
+    if let Some(fs_err) = err.downcast_ref::<EmbeddedFsError>() {
+        anyhow!(fs_err.clone())
+    } else {
+        anyhow!(err.to_string())
+    }
+}
+
+fn fail_batch_stat_requests(
+    results: &mut [Option<Result<Inode>>],
+    request_indices: impl IntoIterator<Item = usize>,
+    err: &anyhow::Error,
+) {
+    for idx in request_indices {
+        results[idx] = Some(Err(clone_batch_stat_error(err)));
+    }
+}
+
+async fn resolve_paths_batched<S>(store: &mut S, paths: &[String]) -> Vec<Result<Inode>>
+where
+    S: BatchStatStore + Send,
+{
+    let requests: Vec<BatchStatRequest> = paths
+        .iter()
+        .map(|path| {
+            let normalized = normalize_path(path);
+            let parts = normalized
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            BatchStatRequest { normalized, parts }
+        })
+        .collect();
+    let mut results: Vec<Option<Result<Inode>>> = (0..requests.len()).map(|_| None).collect();
+    let mut pending = Vec::new();
+    let mut root_request_indices = Vec::new();
+
+    for (idx, request) in requests.iter().enumerate() {
+        if request.parts.is_empty() {
+            root_request_indices.push(idx);
+        } else {
+            pending.push(PendingBatchStat {
+                request_idx: idx,
+                parent_inode: ROOT_INODE,
+                next_part_idx: 0,
+            });
+        }
+    }
+
+    if !root_request_indices.is_empty() {
+        match store.load_root_inode().await {
+            Ok(Some(root_inode)) => {
+                for idx in root_request_indices {
+                    results[idx] = Some(Ok(root_inode.clone()));
+                }
+            }
+            Ok(None) => {
+                let err = anyhow!(EmbeddedFsError::internal("root inode missing"));
+                fail_batch_stat_requests(&mut results, 0..requests.len(), &err);
+            }
+            Err(err) => fail_batch_stat_requests(&mut results, 0..requests.len(), &err),
+        }
+    }
+
+    while !pending.is_empty() {
+        let mut unique_requests = Vec::new();
+        let mut seen_requests = HashSet::new();
+        for step in &pending {
+            let request = &requests[step.request_idx];
+            let lookup = DirLookupRequest {
+                parent_inode: step.parent_inode,
+                name: request.parts[step.next_part_idx].clone(),
+            };
+            if seen_requests.insert((lookup.parent_inode, lookup.name.clone())) {
+                unique_requests.push(lookup);
+            }
+        }
+
+        let dir_entries = match store.lookup_dir_entries(&unique_requests).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                fail_batch_stat_requests(
+                    &mut results,
+                    pending.iter().map(|step| step.request_idx),
+                    &err,
+                );
+                break;
+            }
+        };
+        let mut child_inode_ids = Vec::new();
+        let mut seen_inode_ids = HashSet::new();
+        for step in &pending {
+            let request = &requests[step.request_idx];
+            let key = (step.parent_inode, request.parts[step.next_part_idx].clone());
+            if let Some(Some(child_inode_id)) = dir_entries.get(&key) {
+                if seen_inode_ids.insert(*child_inode_id) {
+                    child_inode_ids.push(*child_inode_id);
+                }
+            }
+        }
+        let child_inodes = match store.load_inodes(&child_inode_ids).await {
+            Ok(inodes) => inodes,
+            Err(err) => {
+                fail_batch_stat_requests(
+                    &mut results,
+                    pending.iter().map(|step| step.request_idx),
+                    &err,
+                );
+                break;
+            }
+        };
+
+        let mut next_pending = Vec::new();
+        for step in pending.drain(..) {
+            let request = &requests[step.request_idx];
+            let part = &request.parts[step.next_part_idx];
+            let lookup_key = (step.parent_inode, part.clone());
+            let Some(Some(child_inode_id)) = dir_entries.get(&lookup_key) else {
+                results[step.request_idx] = Some(Err(anyhow!(EmbeddedFsError::not_found(
+                    &request.normalized
+                ))));
+                continue;
+            };
+
+            let Some(inode_result) = child_inodes.get(child_inode_id) else {
+                results[step.request_idx] = Some(Err(anyhow!(EmbeddedFsError::not_found(
+                    &request.normalized
+                ))));
+                continue;
+            };
+            let inode = match inode_result {
+                Ok(Some(inode)) => inode.clone(),
+                Ok(None) => {
+                    results[step.request_idx] = Some(Err(anyhow!(EmbeddedFsError::not_found(
+                        &request.normalized
+                    ))));
+                    continue;
+                }
+                Err(err) => {
+                    results[step.request_idx] = Some(Err(clone_batch_stat_error(err)));
+                    continue;
+                }
+            };
+
+            if step.next_part_idx + 1 == request.parts.len() {
+                results[step.request_idx] = Some(Ok(inode));
+                continue;
+            }
+
+            if !inode.is_directory() {
+                results[step.request_idx] =
+                    Some(Err(anyhow!(EmbeddedFsError::not_directory(part))));
+                continue;
+            }
+
+            next_pending.push(PendingBatchStat {
+                request_idx: step.request_idx,
+                parent_inode: *child_inode_id,
+                next_part_idx: step.next_part_idx + 1,
+            });
+        }
+        pending = next_pending;
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(idx, result)| {
+            result.unwrap_or_else(|| {
+                Err(anyhow!(EmbeddedFsError::internal(&format!(
+                    "batch stat missing result for request index {idx}"
+                ))))
+            })
+        })
+        .collect()
 }
 
 fn validate_dir_entry_name(name: &str) -> Result<()> {
@@ -5316,10 +5629,257 @@ async fn remove_inode_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::AsyncReadExt;
 
     static TEST_KEYSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct FakeBatchStatStore {
+        dir_entries: HashMap<(u64, String), u64>,
+        inodes: HashMap<u64, Inode>,
+        lookup_batches: Vec<Vec<(u64, String)>>,
+        inode_load_batches: Vec<Vec<u64>>,
+        lookup_error: Option<anyhow::Error>,
+        inode_errors: HashMap<u64, anyhow::Error>,
+    }
+
+    impl FakeBatchStatStore {
+        fn new() -> Self {
+            let mut store = Self::default();
+            store
+                .inodes
+                .insert(ROOT_INODE, Inode::new_directory(ROOT_INODE, 0o755));
+            store
+        }
+
+        fn link_inode(&mut self, parent_inode: u64, name: &str, inode: Inode) {
+            self.dir_entries
+                .insert((parent_inode, name.to_string()), inode.id);
+            self.inodes.insert(inode.id, inode);
+        }
+    }
+
+    #[async_trait]
+    impl BatchStatStore for FakeBatchStatStore {
+        async fn load_root_inode(&mut self) -> Result<Option<Inode>> {
+            Ok(self.inodes.get(&ROOT_INODE).cloned())
+        }
+
+        async fn lookup_dir_entries(
+            &mut self,
+            requests: &[DirLookupRequest],
+        ) -> Result<HashMap<(u64, String), Option<u64>>> {
+            if let Some(err) = self.lookup_error.take() {
+                return Err(err);
+            }
+            self.lookup_batches.push(
+                requests
+                    .iter()
+                    .map(|request| (request.parent_inode, request.name.clone()))
+                    .collect(),
+            );
+
+            let mut out = HashMap::with_capacity(requests.len());
+            for request in requests {
+                out.insert(
+                    (request.parent_inode, request.name.clone()),
+                    self.dir_entries
+                        .get(&(request.parent_inode, request.name.clone()))
+                        .copied(),
+                );
+            }
+            Ok(out)
+        }
+
+        async fn load_inodes(
+            &mut self,
+            inode_ids: &[u64],
+        ) -> Result<HashMap<u64, Result<Option<Inode>>>> {
+            self.inode_load_batches.push(inode_ids.to_vec());
+            Ok(inode_ids
+                .iter()
+                .copied()
+                .map(|inode_id| {
+                    let inode = self
+                        .inode_errors
+                        .remove(&inode_id)
+                        .map(Err)
+                        .unwrap_or_else(|| Ok(self.inodes.get(&inode_id).cloned()));
+                    (inode_id, inode)
+                })
+                .collect())
+        }
+    }
+
+    fn assert_not_found(result: &Result<Inode>, path: &str) {
+        let err = result.as_ref().expect_err("path must fail");
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("error must be EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotFound(actual) if actual == path),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn assert_not_directory(result: &Result<Inode>, part: &str) {
+        let err = result.as_ref().expect_err("path must fail");
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("error must be EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotDirectory(actual) if actual == part),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_paths_batched_shares_sibling_parent_traversal() {
+        let mut store = FakeBatchStatStore::new();
+        store.link_inode(ROOT_INODE, "data", Inode::new_directory(2, 0o755));
+        store.link_inode(2, "alpha.txt", Inode::new_file(3, 0o644));
+        store.link_inode(2, "beta.txt", Inode::new_file(4, 0o644));
+        store.link_inode(2, "gamma.txt", Inode::new_file(5, 0o644));
+
+        let paths = vec![
+            "/data/alpha.txt".to_string(),
+            "/data/beta.txt".to_string(),
+            "/data/gamma.txt".to_string(),
+        ];
+        let results = resolve_paths_batched(&mut store, &paths).await;
+
+        assert_eq!(results.len(), paths.len());
+        assert!(results.iter().all(|result| result.is_ok()));
+        assert_eq!(store.lookup_batches.len(), 2);
+        assert_eq!(
+            store.lookup_batches[0],
+            vec![(ROOT_INODE, "data".to_string())]
+        );
+        assert_eq!(
+            store.lookup_batches[1],
+            vec![
+                (2, "alpha.txt".to_string()),
+                (2, "beta.txt".to_string()),
+                (2, "gamma.txt".to_string()),
+            ]
+        );
+        assert_eq!(store.inode_load_batches, vec![vec![2], vec![3, 4, 5]]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_paths_batched_preserves_mixed_result_semantics() {
+        let mut store = FakeBatchStatStore::new();
+        store.link_inode(ROOT_INODE, "data", Inode::new_directory(2, 0o755));
+        store.link_inode(2, "alpha.txt", Inode::new_file(3, 0o644));
+        store.link_inode(ROOT_INODE, "note.txt", Inode::new_file(4, 0o644));
+
+        let paths = vec![
+            "/data".to_string(),
+            "/data/alpha.txt".to_string(),
+            "/missing".to_string(),
+            "/note.txt/child".to_string(),
+        ];
+        let results = resolve_paths_batched(&mut store, &paths).await;
+
+        assert!(results[0].is_ok(), "directory stat must succeed");
+        assert!(results[1].is_ok(), "file stat must succeed");
+        assert_not_found(&results[2], "/missing");
+        assert_not_directory(&results[3], "note.txt");
+        assert_eq!(store.lookup_batches.len(), 2);
+        assert_eq!(
+            store.lookup_batches[0],
+            vec![
+                (ROOT_INODE, "data".to_string()),
+                (ROOT_INODE, "missing".to_string()),
+                (ROOT_INODE, "note.txt".to_string()),
+            ]
+        );
+        assert_eq!(store.lookup_batches[1], vec![(2, "alpha.txt".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_paths_batched_collapses_deep_shared_prefixes() {
+        let mut store = FakeBatchStatStore::new();
+        store.link_inode(ROOT_INODE, "a", Inode::new_directory(2, 0o755));
+        store.link_inode(2, "b", Inode::new_directory(3, 0o755));
+        store.link_inode(3, "c", Inode::new_directory(4, 0o755));
+        store.link_inode(3, "d", Inode::new_directory(5, 0o755));
+        store.link_inode(4, "file1.txt", Inode::new_file(6, 0o644));
+        store.link_inode(4, "file2.txt", Inode::new_file(7, 0o644));
+        store.link_inode(5, "file3.txt", Inode::new_file(8, 0o644));
+
+        let paths = vec![
+            "/a/b/c/file1.txt".to_string(),
+            "/a/b/c/file2.txt".to_string(),
+            "/a/b/d/file3.txt".to_string(),
+        ];
+        let results = resolve_paths_batched(&mut store, &paths).await;
+
+        assert!(results.iter().all(|result| result.is_ok()));
+        assert_eq!(store.lookup_batches.len(), 4);
+        assert_eq!(store.lookup_batches[0], vec![(ROOT_INODE, "a".to_string())]);
+        assert_eq!(store.lookup_batches[1], vec![(2, "b".to_string())]);
+        assert_eq!(
+            store.lookup_batches[2],
+            vec![(3, "c".to_string()), (3, "d".to_string())]
+        );
+        assert_eq!(
+            store.lookup_batches[3],
+            vec![
+                (4, "file1.txt".to_string()),
+                (4, "file2.txt".to_string()),
+                (5, "file3.txt".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_paths_batched_isolates_single_inode_decode_error() {
+        let mut store = FakeBatchStatStore::new();
+        store.link_inode(ROOT_INODE, "data", Inode::new_directory(2, 0o755));
+        store.link_inode(2, "alpha.txt", Inode::new_file(3, 0o644));
+        store.link_inode(2, "broken.txt", Inode::new_file(4, 0o644));
+        store.inode_errors.insert(
+            4,
+            anyhow!("fs9: invalid inode json for inode 4: boom. Recreate the fs9 keyspace."),
+        );
+
+        let paths = vec![
+            "/data/alpha.txt".to_string(),
+            "/data/broken.txt".to_string(),
+        ];
+        let results = resolve_paths_batched(&mut store, &paths).await;
+
+        assert!(results[0].is_ok(), "healthy sibling must still succeed");
+        let err = results[1].as_ref().expect_err("broken inode must fail");
+        assert!(
+            err.to_string().contains("invalid inode json for inode 4"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_paths_batched_preserves_resolved_entries_on_shared_lookup_failure() {
+        let mut store = FakeBatchStatStore::new();
+        store.lookup_error = Some(anyhow!("tikv read failed"));
+
+        let paths = vec!["/".to_string(), "/data/alpha.txt".to_string()];
+        let results = resolve_paths_batched(&mut store, &paths).await;
+
+        assert!(
+            results[0].is_ok(),
+            "already-resolved root entry must stay successful"
+        );
+        let err = results[1]
+            .as_ref()
+            .expect_err("pending entry must be converted to per-entry failure");
+        assert!(
+            err.to_string().contains("tikv read failed"),
+            "unexpected error: {err}"
+        );
+    }
 
     // normalize_path tests
     #[test]

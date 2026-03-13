@@ -179,7 +179,7 @@ impl Inode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum EmbeddedFsError {
     NotFound(String),
     AlreadyExists(String),

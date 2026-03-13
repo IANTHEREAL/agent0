@@ -74,6 +74,11 @@ impl FsBackend for EmbeddedFsBackend {
         inode_to_file_info(path, &inode)
     }
 
+    async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<FsFileInfo>>> {
+        let inodes = self.pagefs.batch_stat(paths).await?;
+        map_batch_stat_results(paths, inodes)
+    }
+
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
         let entries = self.pagefs.readdir(path).await?;
         let normalized = normalize_dir_path(path);
@@ -219,6 +224,28 @@ fn inode_to_file_info(path: &str, inode: &Inode) -> Result<FsFileInfo> {
     })
 }
 
+fn map_batch_stat_results(
+    paths: &[String],
+    inodes: Vec<Result<Inode>>,
+) -> Result<Vec<Result<FsFileInfo>>> {
+    if inodes.len() != paths.len() {
+        return Err(anyhow!(types::EmbeddedFsError::internal(&format!(
+            "fs9: batch_stat returned {} results for {} input paths",
+            inodes.len(),
+            paths.len()
+        ))));
+    }
+
+    Ok(paths
+        .iter()
+        .cloned()
+        .zip(inodes)
+        .map(|(path, inode_result)| {
+            inode_result.and_then(|inode| inode_to_file_info(&path, &inode))
+        })
+        .collect())
+}
+
 fn normalize_dir_path(path: &str) -> &str {
     if path.is_empty() {
         "/"
@@ -269,6 +296,56 @@ mod tests {
             .expect_err("staging data must stay internal");
         assert!(
             err.to_string().contains("exposed internal staging data"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_batch_stat_results_preserves_mixed_entry_results() {
+        let paths = vec!["/ok.bin".to_string(), "/missing.bin".to_string()];
+        let mapped = map_batch_stat_results(
+            &paths,
+            vec![
+                Ok(Inode::new_file(1, 0o644)),
+                Err(anyhow!(types::EmbeddedFsError::not_found("/missing.bin"))),
+            ],
+        )
+        .expect("adapter should accept exact-length result vectors");
+
+        assert_eq!(mapped.len(), 2);
+        assert!(mapped[0].is_ok(), "successful inode must stay successful");
+        let err = mapped[1]
+            .as_ref()
+            .expect_err("missing inode must stay a per-entry error");
+        assert!(
+            err.to_string().contains("/missing.bin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_batch_stat_results_rejects_short_result_vectors() {
+        let paths = vec!["/a".to_string(), "/b".to_string()];
+        let err = map_batch_stat_results(&paths, vec![Ok(Inode::new_file(1, 0o644))])
+            .expect_err("short adapter result vectors must be rejected");
+        assert!(
+            err.to_string()
+                .contains("returned 1 results for 2 input paths"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn map_batch_stat_results_rejects_long_result_vectors() {
+        let paths = vec!["/a".to_string()];
+        let err = map_batch_stat_results(
+            &paths,
+            vec![Ok(Inode::new_file(1, 0o644)), Ok(Inode::new_file(2, 0o644))],
+        )
+        .expect_err("long adapter result vectors must be rejected");
+        assert!(
+            err.to_string()
+                .contains("returned 2 results for 1 input paths"),
             "unexpected error: {err}"
         );
     }
