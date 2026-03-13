@@ -5,19 +5,36 @@
 //!
 //! Key format:
 //! - Superblock: `_fs_S`
+//! - Inode allocator: `_fs_AI`
+//! - Bundle allocator: `_fs_AB`
 //! - Inode: `_fs_I` + inode_id (big-endian u64)
 //! - Directory entry: `_fs_D` + parent_inode (big-endian u64) + `:` + name
 //! - Directory prefix: `_fs_D` + parent_inode (big-endian u64) + `:`
+//! - Inline blob: `_fs_B` + inode_id (big-endian u64)
+//! - Lifecycle sidecar: `_fs_L` + inode_id (big-endian u64)
+//! - Bundle manifest: `_fs_M` + bundle_id (big-endian u64)
 //! - Page: `_fs_P` + inode_id (big-endian u64) + `:` + page_num (big-endian u64)
 //! - Page prefix: `_fs_P` + inode_id (big-endian u64) + `:`
 //! - Staging write marker: `_fs_T` + inode_id (big-endian u64)
 //! - Orphan cleanup marker: `_fs_O` + inode_id (big-endian u64)
 
+pub(crate) const FS_NAMESPACE_PREFIX: &[u8] = b"_fs_";
+
 /// Superblock key: `_fs_S`
 ///
-/// The superblock stores filesystem metadata (version, block size, etc.).
+/// The superblock stores filesystem identity/binding metadata.
 pub(crate) fn superblock_key() -> Vec<u8> {
     b"_fs_S".to_vec()
+}
+
+/// Inode allocator key: `_fs_AI`
+pub(crate) fn inode_allocator_key() -> Vec<u8> {
+    b"_fs_AI".to_vec()
+}
+
+/// Bundle allocator key: `_fs_AB`
+pub(crate) fn bundle_allocator_key() -> Vec<u8> {
+    b"_fs_AB".to_vec()
 }
 
 /// Inode key: `_fs_I` + inode_id (big-endian u64)
@@ -27,6 +44,61 @@ pub(crate) fn inode_key(inode_id: u64) -> Vec<u8> {
     let mut key = b"_fs_I".to_vec();
     key.extend_from_slice(&inode_id.to_be_bytes());
     key
+}
+
+/// Inline blob key: `_fs_B` + inode_id (big-endian u64)
+pub(crate) fn blob_key(inode_id: u64) -> Vec<u8> {
+    let mut key = b"_fs_B".to_vec();
+    key.extend_from_slice(&inode_id.to_be_bytes());
+    key
+}
+
+/// Lifecycle sidecar key: `_fs_L` + inode_id (big-endian u64)
+pub(crate) fn lifecycle_key(inode_id: u64) -> Vec<u8> {
+    let mut key = b"_fs_L".to_vec();
+    key.extend_from_slice(&inode_id.to_be_bytes());
+    key
+}
+
+/// Lifecycle prefix: `_fs_L`
+pub(crate) fn lifecycle_prefix() -> Vec<u8> {
+    b"_fs_L".to_vec()
+}
+
+/// Bundle manifest key: `_fs_M` + bundle_id (big-endian u64)
+pub(crate) fn bundle_manifest_key(bundle_id: u64) -> Vec<u8> {
+    let mut key = b"_fs_M".to_vec();
+    key.extend_from_slice(&bundle_id.to_be_bytes());
+    key
+}
+
+/// Bundle manifest prefix: `_fs_M`
+pub(crate) fn bundle_manifest_prefix() -> Vec<u8> {
+    b"_fs_M".to_vec()
+}
+
+/// Compute an exclusive scan end key for a given prefix.
+///
+/// This is used to construct `start..end` ranges for TiKV scans.
+pub(crate) fn scan_end_key(prefix: &[u8]) -> Vec<u8> {
+    // TiKV's client treats an empty end key as "unbounded above". Returning an empty
+    // Vec here is therefore the correct exclusive "no upper bound" representation.
+    //
+    // This happens when:
+    // - the caller wants to scan the entire keyspace (`prefix` is empty), or
+    // - the prefix is all-0xFF bytes, so there is no exclusive successor prefix.
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != u8::MAX {
+            end[i] += 1;
+            end.truncate(i + 1);
+            return end;
+        }
+    }
+    Vec::new()
 }
 
 /// Directory entry key: `_fs_D` + parent_inode (big-endian u64) + `:` + name
@@ -127,6 +199,40 @@ mod tests {
     }
 
     #[test]
+    fn test_blob_key() {
+        let key = blob_key(7);
+        assert_eq!(&key[0..5], b"_fs_B");
+        assert_eq!(&key[5..13], &7u64.to_be_bytes());
+        assert_eq!(key.len(), 13);
+    }
+
+    #[test]
+    fn test_allocator_keys() {
+        assert_eq!(inode_allocator_key(), b"_fs_AI");
+        assert_eq!(bundle_allocator_key(), b"_fs_AB");
+    }
+
+    #[test]
+    fn test_lifecycle_key_and_prefix() {
+        let key = lifecycle_key(7);
+        let prefix = lifecycle_prefix();
+        assert_eq!(&key[0..5], b"_fs_L");
+        assert_eq!(&key[5..13], &7u64.to_be_bytes());
+        assert_eq!(key.len(), 13);
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_bundle_manifest_key_and_prefix() {
+        let key = bundle_manifest_key(9);
+        let prefix = bundle_manifest_prefix();
+        assert_eq!(&key[0..5], b"_fs_M");
+        assert_eq!(&key[5..13], &9u64.to_be_bytes());
+        assert_eq!(key.len(), 13);
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
     fn test_dir_entry_key() {
         let key = dir_entry_key(1, "hello.txt");
         assert_eq!(&key[0..5], b"_fs_D");
@@ -208,6 +314,9 @@ mod tests {
         // Verify that all keys start with _fs_ to avoid collision
         assert!(superblock_key().starts_with(b"_fs_"));
         assert!(inode_key(1).starts_with(b"_fs_"));
+        assert!(blob_key(1).starts_with(b"_fs_"));
+        assert!(lifecycle_key(1).starts_with(b"_fs_"));
+        assert!(lifecycle_prefix().starts_with(b"_fs_"));
         assert!(dir_entry_key(1, "test").starts_with(b"_fs_"));
         assert!(dir_prefix(1).starts_with(b"_fs_"));
         assert!(page_key(1, 0).starts_with(b"_fs_"));

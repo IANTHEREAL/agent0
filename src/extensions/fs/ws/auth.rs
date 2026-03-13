@@ -5,16 +5,40 @@ use std::sync::{Arc, RwLock};
 use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
 use crate::extensions::fs::backend::FsBackend;
+use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::protocol::parse_tenant_username;
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 pub(crate) struct WsSession {
     pub(crate) _tenant_handle: TenantHandle,
-    pub(crate) backend: Box<dyn FsBackend>,
+    pub(crate) backend: Arc<dyn FsBackend>,
     pub(crate) user: String,
     pub(crate) keyspace: String,
+    upload_slots: Arc<Semaphore>,
+    inflight_uploads: TokioMutex<HashMap<String, OwnedSemaphorePermit>>,
+}
+
+impl WsSession {
+    pub(crate) fn try_acquire_upload_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.upload_slots.clone().try_acquire_owned().ok()
+    }
+
+    pub(crate) async fn register_inflight_upload(
+        &self,
+        upload_token: String,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let mut guard = self.inflight_uploads.lock().await;
+        guard.insert(upload_token, permit);
+    }
+
+    pub(crate) async fn release_inflight_upload(&self, upload_token: &str) {
+        let mut guard = self.inflight_uploads.lock().await;
+        guard.remove(upload_token);
+    }
 }
 
 pub(crate) async fn handle_auth(
@@ -22,10 +46,10 @@ pub(crate) async fn handle_auth(
     username: &str,
     password: &str,
     pool: &TikvClientPool,
+    default_keyspace: Option<&str>,
     is_secure: bool,
 ) -> Result<WsSession, WsResponse> {
-    let (parsed_keyspace, actual_user) = parse_tenant_username(username);
-    let keyspace = parsed_keyspace.unwrap_or_else(|| "default".to_string());
+    let (keyspace, actual_user) = resolve_auth_target(username, default_keyspace);
 
     let auth_mode = config::db9_auth_mode();
     let dev_mode = config::env_bool("DB9_DEV");
@@ -127,6 +151,11 @@ pub(crate) async fn handle_auth(
         ));
     }
 
+    // Security invariant: the fs9 WebSocket interface is superuser-only today.
+    //
+    // Several protocol operations (notably the bounded batch APIs) can act as a fast namespace
+    // enumeration oracle. If this check is ever relaxed, revisit the security properties of all
+    // ws ops before shipping.
     if !user.is_superuser {
         let _ = auth_txn.rollback().await;
         return Err(WsResponse::error(
@@ -148,20 +177,34 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    let backend = EmbeddedFsBackend::new(client).await.map_err(|err| {
-        WsResponse::error(
-            id,
-            WsErrorCode::Eio,
-            format!("failed to initialize fs backend: {err}"),
-        )
-    })?;
+    let backend = EmbeddedFsBackend::new(client, keyspace.clone())
+        .await
+        .map_err(|err| {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("failed to initialize fs backend: {err}"),
+            )
+        })?;
 
     Ok(WsSession {
         _tenant_handle: tenant_handle,
-        backend: Box::new(backend),
+        backend: Arc::new(backend),
         user: actual_user,
         keyspace,
+        upload_slots: Arc::new(Semaphore::new(
+            fs9_config().ws_max_inflight_uploads_per_connection,
+        )),
+        inflight_uploads: TokioMutex::new(HashMap::new()),
     })
+}
+
+fn resolve_auth_target(username: &str, default_keyspace: Option<&str>) -> (String, String) {
+    let (parsed_keyspace, actual_user) = parse_tenant_username(username);
+    let keyspace = parsed_keyspace
+        .or_else(|| default_keyspace.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "default".to_string());
+    (keyspace, actual_user)
 }
 
 fn map_auth_failure(id: &str, user: &str, failure: Option<Db9AuthDispatchFailure>) -> WsResponse {
@@ -397,5 +440,26 @@ mod tests {
             .try_acquire("db9_tenant_gamma")
             .expect("acquire should succeed again after drop");
         assert_eq!(active_count(&tracker, "db9_tenant_gamma"), 1);
+    }
+
+    #[test]
+    fn test_resolve_auth_target_uses_server_default_keyspace() {
+        let (keyspace, user) = resolve_auth_target("admin", Some("db9_tenant_smoke"));
+        assert_eq!(keyspace, "db9_tenant_smoke");
+        assert_eq!(user, "admin");
+    }
+
+    #[test]
+    fn test_resolve_auth_target_prefers_explicit_tenant_over_server_default() {
+        let (keyspace, user) = resolve_auth_target("tenant_a.admin", Some("db9_tenant_smoke"));
+        assert_eq!(keyspace, "db9_tenant_tenant_a");
+        assert_eq!(user, "admin");
+    }
+
+    #[test]
+    fn test_resolve_auth_target_falls_back_to_default_keyspace_name() {
+        let (keyspace, user) = resolve_auth_target("admin", None);
+        assert_eq!(keyspace, "default");
+        assert_eq!(user, "admin");
     }
 }

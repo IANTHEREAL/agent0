@@ -279,6 +279,8 @@ pub(crate) async fn infer_fs9_table_function_schema(
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },
             mtime,
+            storage: None,
+            sealed: None,
         })
     }
 
@@ -356,6 +358,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
         async fn begin_write_stream(
             &self,
             _path: &str,
+            _opts: crate::extensions::fs::backend::FsWriteStreamOptions,
         ) -> AnyResult<Box<dyn crate::extensions::fs::backend::FsWriteStream>> {
             anyhow::bail!("not implemented for test backend")
         }
@@ -378,6 +381,37 @@ pub(crate) async fn infer_fs9_table_function_schema(
         }
 
         async fn truncate(&self, _path: &str, _size: u64) -> AnyResult<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+        ) -> AnyResult<crate::extensions::fs::backend::FsCreateUpload> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn presign_upload_part(
+            &self,
+            _upload_token: &str,
+            _part_number: i32,
+        ) -> AnyResult<crate::extensions::fs::backend::FsPresignedRequest> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn complete_upload(
+            &self,
+            _upload_token: &str,
+            _parts: Vec<crate::extensions::fs::backend::FsMultipartCompletedPart>,
+            _checksum: Option<[u8; 32]>,
+        ) -> AnyResult<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn abort_upload(&self, _upload_token: &str) -> AnyResult<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn prepare_download(
+            &self,
+            _path: &str,
+        ) -> AnyResult<crate::extensions::fs::backend::FsPreparedDownload> {
             anyhow::bail!("not implemented for test backend")
         }
         async fn rename(&self, _old_path: &str, _new_path: &str) -> AnyResult<()> {

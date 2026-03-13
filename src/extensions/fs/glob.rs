@@ -244,6 +244,8 @@ mod tests {
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },
             mtime,
+            storage: None,
+            sealed: None,
         })
     }
 
@@ -307,7 +309,11 @@ mod tests {
             anyhow::bail!("not implemented for test backend")
         }
 
-        async fn begin_write_stream(&self, _path: &str) -> Result<Box<dyn FsWriteStream>> {
+        async fn begin_write_stream(
+            &self,
+            _path: &str,
+            _opts: crate::extensions::fs::backend::FsWriteStreamOptions,
+        ) -> Result<Box<dyn FsWriteStream>> {
             anyhow::bail!("not implemented for test backend")
         }
 
@@ -327,6 +333,37 @@ mod tests {
             anyhow::bail!("not implemented for test backend")
         }
         async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+        ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn presign_upload_part(
+            &self,
+            _upload_token: &str,
+            _part_number: i32,
+        ) -> Result<crate::extensions::fs::backend::FsPresignedRequest> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn complete_upload(
+            &self,
+            _upload_token: &str,
+            _parts: Vec<crate::extensions::fs::backend::FsMultipartCompletedPart>,
+            _checksum: Option<[u8; 32]>,
+        ) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn abort_upload(&self, _upload_token: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn prepare_download(
+            &self,
+            _path: &str,
+        ) -> Result<crate::extensions::fs::backend::FsPreparedDownload> {
             anyhow::bail!("not implemented for test backend")
         }
     }

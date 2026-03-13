@@ -265,6 +265,13 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
     // fs9 WebSocket server
     {
+        let fs9_cfg = extensions::fs::config::fs9_config();
+        if fs9_cfg.s3.is_some() && fs9_cfg.upload_token_secret.is_none() {
+            return Err(anyhow::anyhow!(
+                "fs9: FS9_UPLOAD_TOKEN_SECRET must be configured when FS9_S3_BUCKET is set"
+            ));
+        }
+
         let ws_port: u16 = env::var("FS9_WS_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -315,8 +322,15 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                     Ok(ws_listener) => {
                         info!("fs9 WebSocket listening on {}:{}", ws_listen_addr, ws_port);
                         let pool = client_pool.clone();
+                        let ws_default_keyspace = default_keyspace.clone();
                         tokio::spawn(async move {
-                            extensions::fs::ws::start_ws_server(ws_listener, pool, ws_tls).await;
+                            extensions::fs::ws::start_ws_server(
+                                ws_listener,
+                                pool,
+                                ws_tls,
+                                ws_default_keyspace,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {

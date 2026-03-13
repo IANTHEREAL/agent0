@@ -447,6 +447,8 @@ mod tests {
                 size: 100,
                 mode: 0o644,
                 mtime: 1705312200,
+                storage: None,
+                sealed: None,
             },
             FsFileInfo {
                 path: "/tmp/subdir".to_string(),
@@ -455,6 +457,8 @@ mod tests {
                 size: 0,
                 mode: 0o755,
                 mtime: 1705312200,
+                storage: None,
+                sealed: None,
             },
         ];
         let decoded = decode_directory(entries);

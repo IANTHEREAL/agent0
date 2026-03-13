@@ -3824,6 +3824,109 @@ fn analyze_parameter_in_vector_function() {
 }
 
 #[test]
+fn analyze_fs9_read_unknown_param_infers_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_read($1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Text);
+}
+
+#[test]
+fn analyze_fs9_write_unknown_params_infer_text_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_write($1, $2)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text, DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Int64);
+}
+
+#[test]
+fn analyze_fs9_write_explicit_bytea_param_preserves_bytes() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_write($1, $2::bytea)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text, DataType::Bytes]);
+}
+
+#[test]
+fn analyze_fs9_write_client_typed_bytea_param_preserves_bytes() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_write($1, $2)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, Some(DataType::Bytes)]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text, DataType::Bytes]);
+}
+
+#[test]
+fn analyze_fs9_remove_unknown_params_infer_text_and_boolean() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_remove($1, $2)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text, DataType::Boolean]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Int64);
+}
+
+#[test]
+fn analyze_fs9_read_at_unknown_params_infer_text_and_int64() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_read_at($1, $2, $3)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 3, &[None, None, None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        types,
+        vec![DataType::Text, DataType::Int64, DataType::Int64]
+    );
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Text);
+}
+
+#[test]
+fn analyze_fs9_read_rejects_non_text_argument() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_read(1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_fs9_write_rejects_non_text_or_bytea_payload() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_write('/tmp/x', true)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
 fn analyze_parameter_explicit_cast() {
     // $1::int4 → param typed as Int4
     let catalog = test_catalog();

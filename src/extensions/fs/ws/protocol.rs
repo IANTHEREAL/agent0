@@ -5,14 +5,24 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::extensions::fs::backend::FsFileInfo;
+use crate::extensions::fs::backend::{FsFileInfo, FsStorage};
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
 
 pub(crate) const STREAMING_THRESHOLD: usize = 1024 * 1024;
 pub(crate) const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 pub(crate) const AUTH_TIMEOUT_SECS: u64 = 10;
+/// WebSocket idle timeout.
+///
+/// Note: during presigned multipart uploads, the data plane runs directly between the client and
+/// S3 and may produce long periods of no WS traffic. Clients must send periodic WS pings while
+/// uploading parts so they can keep the control-plane connection alive for `complete_upload` /
+/// `abort_upload`.
 pub(crate) const IDLE_TIMEOUT_SECS: u64 = 300;
 pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_TENANT: u32 = 50;
+/// Hard cap on a single WS JSON text frame.
+///
+/// This bounds request buffering + JSON parsing costs. Batch APIs have additional per-operation
+/// size limits and should be tuned alongside this cap if larger payloads are desired.
 pub(crate) const MAX_JSON_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_WS_PORT: u16 = 5480;
 pub(crate) const DEFAULT_WS_LISTEN_ADDR: &str = "127.0.0.1";
@@ -137,6 +147,77 @@ pub(crate) enum WsRequest {
         old_path: String,
         new_path: String,
     },
+    #[serde(rename = "create_upload")]
+    CreateUpload {
+        id: String,
+        path: String,
+        size: u64,
+    },
+    #[serde(rename = "presign_part")]
+    PresignPart {
+        id: String,
+        upload_token: String,
+        part_number: i32,
+    },
+    #[serde(rename = "complete_upload")]
+    CompleteUpload {
+        id: String,
+        upload_token: String,
+        parts: Vec<MultipartCompletedPartRequest>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checksum: Option<String>,
+    },
+    #[serde(rename = "abort_upload")]
+    AbortUpload {
+        id: String,
+        upload_token: String,
+    },
+    #[serde(rename = "prepare_download")]
+    PrepareDownload {
+        id: String,
+        path: String,
+    },
+    /// BatchStat is a bounded helper that returns per-path results.
+    ///
+    /// The top-level WS response `ok` only indicates request-level parsing/validation success.
+    /// Callers must inspect each entry.
+    ///
+    /// Security invariant: fs9 WS is currently superuser-only (see `ws/auth.rs`). If that is ever
+    /// relaxed, batch APIs become a namespace enumeration oracle and must be revisited.
+    #[serde(rename = "batch_stat")]
+    BatchStat {
+        id: String,
+        paths: Vec<String>,
+    },
+    /// BatchInlineRead is a bounded helper for latency-sensitive tiny reads.
+    ///
+    /// It returns per-path results and is intentionally "inline-only": it does not use WS streaming
+    /// and will reject entries over the configured size caps.
+    ///
+    /// The top-level WS response `ok` only indicates request-level parsing/validation success;
+    /// callers must inspect each entry.
+    ///
+    /// Security invariant: fs9 WS is currently superuser-only (see `ws/auth.rs`). If that is ever
+    /// relaxed, batch APIs become a namespace enumeration oracle and must be revisited.
+    #[serde(rename = "batch_inline_read")]
+    BatchInlineRead {
+        id: String,
+        paths: Vec<String>,
+    },
+    /// BatchWrite is a bounded, non-atomic convenience API for small inline-sized full replacement
+    /// writes only.
+    ///
+    /// It may partially succeed: some entries can be written even if later entries fail. The
+    /// top-level WS response `ok` only indicates request-level parsing/validation success; callers
+    /// must inspect each entry.
+    ///
+    /// Security invariant: fs9 WS is currently superuser-only (see `ws/auth.rs`). If that is ever
+    /// relaxed, batch APIs must be reviewed.
+    #[serde(rename = "batch_write")]
+    BatchWrite {
+        id: String,
+        files: Vec<BatchWriteFileRequest>,
+    },
 }
 
 impl WsRequest {
@@ -153,7 +234,15 @@ impl WsRequest {
             | Self::Pwrite { id, .. }
             | Self::Append { id, .. }
             | Self::Truncate { id, .. }
-            | Self::Rename { id, .. } => id,
+            | Self::Rename { id, .. }
+            | Self::CreateUpload { id, .. }
+            | Self::PresignPart { id, .. }
+            | Self::CompleteUpload { id, .. }
+            | Self::AbortUpload { id, .. }
+            | Self::PrepareDownload { id, .. }
+            | Self::BatchStat { id, .. }
+            | Self::BatchInlineRead { id, .. }
+            | Self::BatchWrite { id, .. } => id,
         }
     }
 }
@@ -209,6 +298,10 @@ pub(crate) struct FileInfoResponse {
     pub size: u64,
     pub mode: u32,
     pub mtime: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<FsStorage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<bool>,
 }
 
 fn format_mtime_rfc3339(epoch_seconds: u64) -> String {
@@ -231,6 +324,8 @@ impl From<FsFileInfo> for FileInfoResponse {
             size: value.size,
             mode: value.mode,
             mtime: format_mtime_rfc3339(value.mtime),
+            storage: value.storage,
+            sealed: value.sealed,
         }
     }
 }
@@ -258,6 +353,85 @@ pub(crate) struct StreamEnd {
     pub checksum: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MultipartCompletedPartRequest {
+    pub part_number: i32,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BatchWriteFileRequest {
+    pub path: String,
+    pub content: String,
+    #[serde(default = "default_encoding")]
+    pub encoding: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PresignedRequestResponse {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<HeaderPairResponse>,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HeaderPairResponse {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreateUploadResponse {
+    pub upload_token: String,
+    pub upload_id: String,
+    pub part_size: usize,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrepareDownloadResponse {
+    #[serde(flatten)]
+    pub request: PresignedRequestResponse,
+    pub size: u64,
+    pub storage: FsStorage,
+    pub range_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BatchStatEntryResponse {
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info: Option<FileInfoResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<WsErrorDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BatchWriteEntryResponse {
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<WsErrorDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BatchInlineReadEntryResponse {
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<WsErrorDetail>,
+}
+
 pub(crate) fn map_fs_error(err: &Error) -> (WsErrorCode, String) {
     for cause in err.chain() {
         if let Some(fs_err) = cause.downcast_ref::<EmbeddedFsError>() {
@@ -282,6 +456,13 @@ pub(crate) fn map_fs_error(err: &Error) -> (WsErrorCode, String) {
                 ),
                 EmbeddedFsError::PermissionDenied(msg) => {
                     (WsErrorCode::Eacces, format!("Permission denied: {msg}"))
+                }
+                EmbeddedFsError::Conflict(msg) => (
+                    WsErrorCode::Eagain,
+                    format!("Resource temporarily unavailable: {msg}"),
+                ),
+                EmbeddedFsError::RestartRequired(msg) => {
+                    (WsErrorCode::Eio, format!("Restart required: {msg}"))
                 }
                 EmbeddedFsError::InvalidInput(msg) => {
                     (WsErrorCode::Einval, format!("Invalid argument: {msg}"))
@@ -483,6 +664,8 @@ mod tests {
             size: 123,
             mode: 0o100644,
             mtime: 0,
+            storage: Some(FsStorage::Object),
+            sealed: Some(true),
         };
 
         let dst = FileInfoResponse::from(src);
@@ -491,6 +674,8 @@ mod tests {
         assert_eq!(dst.size, 123);
         assert_eq!(dst.mode, 0o100644);
         assert_eq!(dst.mtime, "1970-01-01T00:00:00Z");
+        assert_eq!(dst.storage, Some(FsStorage::Object));
+        assert_eq!(dst.sealed, Some(true));
     }
 
     #[test]
@@ -528,6 +713,114 @@ mod tests {
                 assert_eq!(new_path, "/dst/file.txt");
             }
             _ => panic!("expected rename request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_create_upload() {
+        let payload =
+            r#"{"id":"12","op":"create_upload","path":"/data/large.bin","size":10485760}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("create_upload request should parse");
+        match req {
+            WsRequest::CreateUpload { id, path, size } => {
+                assert_eq!(id, "12");
+                assert_eq!(path, "/data/large.bin");
+                assert_eq!(size, 10 * 1024 * 1024);
+            }
+            _ => panic!("expected create_upload request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_complete_upload_with_checksum() {
+        let payload = r#"{
+            "id":"13",
+            "op":"complete_upload",
+            "upload_token":"token-1",
+            "parts":[
+                {"part_number":2,"etag":"etag-2"},
+                {"part_number":1,"etag":"etag-1"}
+            ],
+            "checksum":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("complete_upload request should parse");
+        match req {
+            WsRequest::CompleteUpload {
+                id,
+                upload_token,
+                parts,
+                checksum,
+            } => {
+                assert_eq!(id, "13");
+                assert_eq!(upload_token, "token-1");
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].part_number, 2);
+                assert_eq!(parts[0].etag, "etag-2");
+                assert_eq!(
+                    checksum.as_deref(),
+                    Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
+            }
+            _ => panic!("expected complete_upload request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_prepare_download() {
+        let payload = r#"{"id":"14","op":"prepare_download","path":"/data/object.bin"}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("prepare_download request should parse");
+        match req {
+            WsRequest::PrepareDownload { id, path } => {
+                assert_eq!(id, "14");
+                assert_eq!(path, "/data/object.bin");
+            }
+            _ => panic!("expected prepare_download request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_batch_write() {
+        let payload = r#"{
+            "id":"15",
+            "op":"batch_write",
+            "files":[
+                {"path":"/data/a.txt","content":"YQ=="},
+                {"path":"/data/b.txt","content":"Yg==","encoding":"base64"}
+            ]
+        }"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("batch_write request should parse");
+        match req {
+            WsRequest::BatchWrite { id, files } => {
+                assert_eq!(id, "15");
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0].path, "/data/a.txt");
+                assert_eq!(files[0].encoding, "base64");
+                assert_eq!(files[1].path, "/data/b.txt");
+                assert_eq!(files[1].encoding, "base64");
+            }
+            _ => panic!("expected batch_write request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_batch_inline_read() {
+        let payload = r#"{
+            "id":"16",
+            "op":"batch_inline_read",
+            "paths":["/data/a.txt","/data/b.txt"]
+        }"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("batch_inline_read request should parse");
+        match req {
+            WsRequest::BatchInlineRead { id, paths } => {
+                assert_eq!(id, "16");
+                assert_eq!(paths, vec!["/data/a.txt", "/data/b.txt"]);
+            }
+            _ => panic!("expected batch_inline_read request"),
         }
     }
 

@@ -14,13 +14,15 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::{Error as WsIoError, Message};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tracing::{debug, info, warn};
 
-use crate::extensions::fs::backend::FsWriteStream;
+use crate::extensions::fs::backend::{FsWriteStream, FsWriteStreamOptions};
+use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::ws::auth::{WsConnectionTracker, WsSession};
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, StreamEnd, StreamStartResponse, StreamWriteReady, WsErrorCode,
@@ -37,6 +39,7 @@ pub(crate) async fn start_ws_server(
     listener: TcpListener,
     pool: Arc<TikvClientPool>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
+    default_keyspace: Option<String>,
 ) {
     let tracker = Arc::new(WsConnectionTracker::new(DEFAULT_MAX_CONNECTIONS_PER_TENANT));
 
@@ -52,9 +55,17 @@ pub(crate) async fn start_ws_server(
         let pool = pool.clone();
         let tls_acceptor = tls_acceptor.clone();
         let tracker = tracker.clone();
+        let default_keyspace = default_keyspace.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(stream, peer_addr, pool, tls_acceptor, tracker).await
+            if let Err(err) = handle_connection(
+                stream,
+                peer_addr,
+                pool,
+                tls_acceptor,
+                tracker,
+                default_keyspace,
+            )
+            .await
             {
                 warn!("fs9 ws connection {peer_addr} ended with error: {err}");
             }
@@ -85,6 +96,7 @@ async fn handle_connection(
     pool: Arc<TikvClientPool>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     tracker: Arc<WsConnectionTracker>,
+    default_keyspace: Option<String>,
 ) -> Result<(), WsIoError> {
     info!("fs9 ws connection accepted from {peer_addr}");
 
@@ -96,9 +108,9 @@ async fn handle_connection(
                 return Ok(());
             }
         };
-        handle_ws_connection(tls_stream, peer_addr, pool, tracker, true).await
+        handle_ws_connection(tls_stream, peer_addr, pool, tracker, default_keyspace, true).await
     } else {
-        handle_ws_connection(stream, peer_addr, pool, tracker, false).await
+        handle_ws_connection(stream, peer_addr, pool, tracker, default_keyspace, false).await
     }
 }
 
@@ -107,10 +119,11 @@ async fn handle_ws_connection<S>(
     peer_addr: SocketAddr,
     pool: Arc<TikvClientPool>,
     tracker: Arc<WsConnectionTracker>,
+    default_keyspace: Option<String>,
     is_secure: bool,
 ) -> Result<(), WsIoError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -162,7 +175,16 @@ where
         return Ok(());
     };
 
-    let session = match auth::handle_auth(&id, &username, &password, &pool, is_secure).await {
+    let session = match auth::handle_auth(
+        &id,
+        &username,
+        &password,
+        &pool,
+        default_keyspace.as_deref(),
+        is_secure,
+    )
+    .await
+    {
         Ok(session) => session,
         Err(err_response) => {
             send_response(&mut ws_stream, &err_response).await?;
@@ -193,15 +215,33 @@ where
     );
     send_response(&mut ws_stream, &auth_success).await?;
 
+    let session = Arc::new(session);
+    let max_inflight = fs9_config().ws_max_inflight_requests_per_connection.max(1);
+    let request_slots = Arc::new(tokio::sync::Semaphore::new(max_inflight));
+    // Outgoing queue needs to absorb pipelined JSON responses and (optionally) streaming frames.
+    // Keep it bounded and proportional to the in-flight request cap.
+    let outgoing_capacity = (max_inflight.saturating_mul(16)).clamp(256, 4096);
+    let (out_tx, mut out_rx) = mpsc::channel::<Message>(outgoing_capacity);
+
+    let (mut ws_sink, mut ws_source) = ws_stream.split();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if ws_sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut streaming_write: Option<StreamingWriteState> = None;
     loop {
-        let msg = match timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), ws_stream.next()).await {
+        let msg = match timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), ws_source.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
                 // Abort any in-flight streaming write before propagating WS error
                 if let Some(state) = streaming_write.take() {
                     abort_streaming_write(state).await;
                 }
+                writer.abort();
                 return Err(err);
             }
             Ok(None) => break,
@@ -223,7 +263,7 @@ where
                             MAX_JSON_FRAME_BYTES
                         ),
                     );
-                    let _ = send_response(&mut ws_stream, &resp).await;
+                    let _ = send_response_tx(&out_tx, &resp).await;
                     break;
                 }
 
@@ -232,7 +272,7 @@ where
                         Ok(end) => end,
                         Err(resp) => {
                             abort_streaming_write(state).await;
-                            send_response(&mut ws_stream, &resp).await?;
+                            let _ = send_response_tx(&out_tx, &resp).await;
                             break;
                         }
                     };
@@ -244,7 +284,7 @@ where
                             "expected stream end frame",
                         );
                         abort_streaming_write(state).await;
-                        send_response(&mut ws_stream, &resp).await?;
+                        let _ = send_response_tx(&out_tx, &resp).await;
                         break;
                     }
 
@@ -258,7 +298,7 @@ where
                             ),
                         );
                         abort_streaming_write(state).await;
-                        send_response(&mut ws_stream, &resp).await?;
+                        let _ = send_response_tx(&out_tx, &resp).await;
                         break;
                     }
 
@@ -270,7 +310,7 @@ where
                                 "stream end id mismatch",
                             );
                             abort_streaming_write(state).await;
-                            send_response(&mut ws_stream, &resp).await?;
+                            let _ = send_response_tx(&out_tx, &resp).await;
                             break;
                         }
                     }
@@ -286,7 +326,7 @@ where
                                 ),
                             );
                             abort_streaming_write(state).await;
-                            send_response(&mut ws_stream, &resp).await?;
+                            let _ = send_response_tx(&out_tx, &resp).await;
                             break;
                         }
                     }
@@ -301,7 +341,7 @@ where
                                 "checksum mismatch",
                             );
                             abort_streaming_write(state).await;
-                            send_response(&mut ws_stream, &resp).await?;
+                            let _ = send_response_tx(&out_tx, &resp).await;
                             break;
                         }
                     }
@@ -316,7 +356,7 @@ where
                             WsResponse::error(&state.request_id, code, message)
                         }
                     };
-                    send_response(&mut ws_stream, &response).await?;
+                    let _ = send_response_tx(&out_tx, &response).await;
                     continue;
                 }
 
@@ -328,12 +368,12 @@ where
                             WsErrorCode::Eproto,
                             format!("invalid JSON request: {err}"),
                         );
-                        send_response(&mut ws_stream, &resp).await?;
+                        let _ = send_response_tx(&out_tx, &resp).await;
                         break;
                     }
                 };
 
-                match &request {
+                match request {
                     WsRequest::Read {
                         id,
                         path,
@@ -341,62 +381,83 @@ where
                         length,
                         streaming,
                     } => {
-                        handle_ws_read(
-                            &mut ws_stream,
-                            &session,
-                            id,
-                            path,
-                            *offset,
-                            *length,
-                            *streaming,
-                        )
-                        .await?;
+                        let permit = request_slots
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("ws request semaphore must not be closed");
+                        let session = session.clone();
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            if let Err(err) = handle_ws_read_tx(
+                                &out_tx, &session, &id, &path, offset, length, streaming,
+                            )
+                            .await
+                            {
+                                let resp = WsResponse::error(
+                                    &id,
+                                    WsErrorCode::Eio,
+                                    format!("read failed: {err}"),
+                                );
+                                let _ = send_response_tx(&out_tx, &resp).await;
+                            }
+                        });
                     }
                     WsRequest::Write {
                         id,
                         path,
                         content,
-                        streaming,
+                        streaming: true,
                         size,
                         ..
-                    } if *streaming => {
-                        if let Err((code, msg)) = validate_path(path) {
-                            send_response(&mut ws_stream, &WsResponse::error(id, code, msg))
-                                .await?;
+                    } => {
+                        if let Err((code, msg)) = validate_path(&path) {
+                            let _ =
+                                send_response_tx(&out_tx, &WsResponse::error(&id, code, msg)).await;
                             continue;
                         }
 
                         if content.is_some() {
                             let resp = WsResponse::error(
-                                id,
+                                &id,
                                 WsErrorCode::Einval,
                                 "streaming write must not include content",
                             );
-                            send_response(&mut ws_stream, &resp).await?;
+                            let _ = send_response_tx(&out_tx, &resp).await;
                             continue;
                         }
 
                         if let Some(expected_size) = size {
-                            if *expected_size > MAX_BYTES_PER_FILE as u64 {
+                            if expected_size > MAX_BYTES_PER_FILE as u64 {
                                 let resp = WsResponse::error(
-                                    id,
+                                    &id,
                                     WsErrorCode::Efbig,
                                     format!(
                                         "file too large: {} bytes exceeds limit {}",
                                         expected_size, MAX_BYTES_PER_FILE
                                     ),
                                 );
-                                send_response(&mut ws_stream, &resp).await?;
+                                let _ = send_response_tx(&out_tx, &resp).await;
                                 continue;
                             }
                         }
 
-                        let writer = match session.backend.begin_write_stream(path).await {
+                        let writer = match session
+                            .backend
+                            .begin_write_stream(
+                                &path,
+                                FsWriteStreamOptions {
+                                    expected_size: size,
+                                },
+                            )
+                            .await
+                        {
                             Ok(writer) => writer,
                             Err(err) => {
                                 let (code, message) = map_fs_error(&err);
-                                let resp = WsResponse::error(id, code, message);
-                                send_response(&mut ws_stream, &resp).await?;
+                                let resp = WsResponse::error(&id, code, message);
+                                let _ = send_response_tx(&out_tx, &resp).await;
                                 continue;
                             }
                         };
@@ -408,26 +469,36 @@ where
                             chunk_size: DEFAULT_CHUNK_SIZE,
                         };
                         let ready_resp = WsResponse::success(
-                            id,
+                            &id,
                             serde_json::to_value(ready).unwrap_or_else(|_| json!({})),
                         );
-                        if send_response(&mut ws_stream, &ready_resp).await.is_err() {
-                            // Writer exists but is not in streaming_write yet — abort directly
+                        if send_response_tx(&out_tx, &ready_resp).await.is_err() {
+                            // Writer exists but is not in streaming_write yet — abort directly.
                             let _ = writer.abort().await;
                             break;
                         }
                         streaming_write = Some(StreamingWriteState {
-                            request_id: id.clone(),
+                            request_id: id,
                             stream_id,
-                            expected_size: *size,
+                            expected_size: size,
                             bytes_written: 0,
                             hasher: Sha256::new(),
                             writer,
                         });
                     }
-                    _ => {
-                        let response = handler::handle_request(&session, &request).await;
-                        send_response(&mut ws_stream, &response).await?;
+                    request => {
+                        let permit = request_slots
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("ws request semaphore must not be closed");
+                        let session = session.clone();
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let response = handler::handle_request(&session, &request).await;
+                            let _ = send_response_tx(&out_tx, &response).await;
+                        });
                     }
                 }
             }
@@ -438,7 +509,7 @@ where
                         WsErrorCode::Eproto,
                         "unexpected binary frame outside streaming write",
                     );
-                    send_response(&mut ws_stream, &resp).await?;
+                    let _ = send_response_tx(&out_tx, &resp).await;
                     break;
                 };
 
@@ -449,7 +520,7 @@ where
                         "invalid binary frame",
                     );
                     abort_streaming_write(state).await;
-                    send_response(&mut ws_stream, &resp).await?;
+                    let _ = send_response_tx(&out_tx, &resp).await;
                     break;
                 };
 
@@ -463,7 +534,7 @@ where
                         ),
                     );
                     abort_streaming_write(state).await;
-                    send_response(&mut ws_stream, &resp).await?;
+                    let _ = send_response_tx(&out_tx, &resp).await;
                     break;
                 }
 
@@ -478,7 +549,7 @@ where
                         ),
                     );
                     abort_streaming_write(state).await;
-                    send_response(&mut ws_stream, &resp).await?;
+                    let _ = send_response_tx(&out_tx, &resp).await;
                     break;
                 }
 
@@ -486,7 +557,7 @@ where
                     let (code, message) = map_fs_error(&err);
                     let resp = WsResponse::error(&state.request_id, code, message);
                     abort_streaming_write(state).await;
-                    send_response(&mut ws_stream, &resp).await?;
+                    let _ = send_response_tx(&out_tx, &resp).await;
                     break;
                 }
 
@@ -495,8 +566,8 @@ where
                 streaming_write = Some(state);
             }
             Message::Ping(payload) => {
-                if ws_stream.send(Message::Pong(payload)).await.is_err() {
-                    break; // cleanup at end of loop will abort streaming_write
+                if out_tx.send(Message::Pong(payload)).await.is_err() {
+                    break;
                 }
             }
             Message::Pong(_) => {}
@@ -509,7 +580,7 @@ where
         abort_streaming_write(state).await;
     }
 
-    let _ = ws_stream.close(None).await;
+    writer.abort();
     info!("fs9 ws connection closed from {peer_addr}");
     Ok(())
 }
@@ -583,6 +654,25 @@ where
     ws_stream.send(Message::Text(payload)).await
 }
 
+async fn send_message_tx(out_tx: &mpsc::Sender<Message>, msg: Message) -> Result<(), WsIoError> {
+    out_tx
+        .send(msg)
+        .await
+        .map_err(|_| WsIoError::ConnectionClosed)
+}
+
+async fn send_response_tx(
+    out_tx: &mpsc::Sender<Message>,
+    response: &WsResponse,
+) -> Result<(), WsIoError> {
+    let payload = serde_json::to_string(response).map_err(|err| {
+        WsIoError::Io(std::io::Error::other(format!(
+            "failed to serialize websocket response: {err}"
+        )))
+    })?;
+    send_message_tx(out_tx, Message::Text(payload)).await
+}
+
 fn tenant_from_keyspace(keyspace: &str) -> String {
     keyspace
         .strip_prefix(KEYSPACE_PREFIX)
@@ -590,20 +680,17 @@ fn tenant_from_keyspace(keyspace: &str) -> String {
         .to_string()
 }
 
-async fn handle_ws_read<S>(
-    ws_stream: &mut WebSocketStream<S>,
+async fn handle_ws_read_tx(
+    out_tx: &mpsc::Sender<Message>,
     session: &WsSession,
     id: &str,
     path: &str,
     offset: Option<u64>,
     length: Option<usize>,
     requested_streaming: bool,
-) -> Result<(), WsIoError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<(), WsIoError> {
     if let Err((code, msg)) = validate_path(path) {
-        send_response(ws_stream, &WsResponse::error(id, code, msg)).await?;
+        send_response_tx(out_tx, &WsResponse::error(id, code, msg)).await?;
         return Ok(());
     }
 
@@ -611,14 +698,14 @@ where
         Ok(info) => info,
         Err(err) => {
             let (code, msg) = map_fs_error(&err);
-            send_response(ws_stream, &WsResponse::error(id, code, msg)).await?;
+            send_response_tx(out_tx, &WsResponse::error(id, code, msg)).await?;
             return Ok(());
         }
     };
 
     if file_info.is_dir {
-        send_response(
-            ws_stream,
+        send_response_tx(
+            out_tx,
             &WsResponse::error(id, WsErrorCode::Eisdir, format!("Is a directory: {path}")),
         )
         .await?;
@@ -628,14 +715,14 @@ where
     let actual_size = match compute_read_size(id, file_info.size, offset, length) {
         Ok(size) => size,
         Err(resp) => {
-            send_response(ws_stream, &resp).await?;
+            send_response_tx(out_tx, &resp).await?;
             return Ok(());
         }
     };
 
     if actual_size > MAX_BYTES_PER_FILE as u64 {
-        send_response(
-            ws_stream,
+        send_response_tx(
+            out_tx,
             &WsResponse::error(
                 id,
                 WsErrorCode::Efbig,
@@ -670,7 +757,7 @@ where
                 WsResponse::error(id, code, msg)
             }
         };
-        send_response(ws_stream, &response).await?;
+        send_response_tx(out_tx, &response).await?;
         return Ok(());
     }
 
@@ -692,31 +779,31 @@ where
                 Ok(reader) => reader,
                 Err(err) => {
                     let (code, msg) = map_fs_error(&err);
-                    send_response(ws_stream, &WsResponse::error(id, code, msg)).await?;
+                    send_response_tx(out_tx, &WsResponse::error(id, code, msg)).await?;
                     return Ok(());
                 }
             };
 
-            send_response(
-                ws_stream,
+            send_response_tx(
+                out_tx,
                 &WsResponse::success(
                     id,
                     serde_json::to_value(start).unwrap_or_else(|_| json!({})),
                 ),
             )
             .await?;
-            stream_whole_file(ws_stream, id, stream_id, actual_size, reader).await?;
+            stream_whole_file_tx(out_tx, id, stream_id, actual_size, reader).await?;
         }
         (Some(off), Some(_)) => {
-            send_response(
-                ws_stream,
+            send_response_tx(
+                out_tx,
                 &WsResponse::success(
                     id,
                     serde_json::to_value(start).unwrap_or_else(|_| json!({})),
                 ),
             )
             .await?;
-            stream_file_range(ws_stream, session, id, path, stream_id, off, actual_size).await?;
+            stream_file_range_tx(out_tx, session, id, path, stream_id, off, actual_size).await?;
         }
         _ => unreachable!("read size validation already checked offset/length pairing"),
     }
@@ -753,16 +840,13 @@ fn should_stream_read(requested_streaming: bool, actual_size: u64) -> bool {
     requested_streaming || actual_size >= STREAMING_THRESHOLD as u64
 }
 
-async fn stream_whole_file<S>(
-    ws_stream: &mut WebSocketStream<S>,
+async fn stream_whole_file_tx(
+    out_tx: &mpsc::Sender<Message>,
     id: &str,
     stream_id: u64,
     expected_size: u64,
     mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
-) -> Result<(), WsIoError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<(), WsIoError> {
     let mut sent = 0u64;
     let mut hasher = Sha256::new();
     let mut chunk = vec![0u8; DEFAULT_CHUNK_SIZE];
@@ -778,12 +862,11 @@ where
 
         sent += read as u64;
         hasher.update(&chunk[..read]);
-        ws_stream
-            .send(Message::Binary(stream::encode_binary_frame(
-                stream_id,
-                &chunk[..read],
-            )))
-            .await?;
+        send_message_tx(
+            out_tx,
+            Message::Binary(stream::encode_binary_frame(stream_id, &chunk[..read])),
+        )
+        .await?;
     }
 
     if sent != expected_size {
@@ -792,21 +875,18 @@ where
         )));
     }
 
-    send_stream_end(ws_stream, id, stream_id, hasher).await
+    send_stream_end_tx(out_tx, id, stream_id, hasher).await
 }
 
-async fn stream_file_range<S>(
-    ws_stream: &mut WebSocketStream<S>,
+async fn stream_file_range_tx(
+    out_tx: &mpsc::Sender<Message>,
     session: &WsSession,
     id: &str,
     path: &str,
     stream_id: u64,
     offset: u64,
     expected_size: u64,
-) -> Result<(), WsIoError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<(), WsIoError> {
     let mut current_offset = offset;
     let mut remaining = expected_size;
     let mut hasher = Sha256::new();
@@ -826,11 +906,11 @@ where
         }
 
         hasher.update(&chunk);
-        ws_stream
-            .send(Message::Binary(stream::encode_binary_frame(
-                stream_id, &chunk,
-            )))
-            .await?;
+        send_message_tx(
+            out_tx,
+            Message::Binary(stream::encode_binary_frame(stream_id, &chunk)),
+        )
+        .await?;
 
         current_offset = current_offset
             .checked_add(chunk.len() as u64)
@@ -838,25 +918,22 @@ where
         remaining = remaining.saturating_sub(chunk.len() as u64);
     }
 
-    send_stream_end(ws_stream, id, stream_id, hasher).await
+    send_stream_end_tx(out_tx, id, stream_id, hasher).await
 }
 
-async fn send_stream_end<S>(
-    ws_stream: &mut WebSocketStream<S>,
+async fn send_stream_end_tx(
+    out_tx: &mpsc::Sender<Message>,
     id: &str,
     stream_id: u64,
     hasher: Sha256,
-) -> Result<(), WsIoError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+) -> Result<(), WsIoError> {
     let end = StreamEnd {
         stream: "end".to_string(),
         stream_id,
         checksum: Some(format!("sha256:{}", hex::encode(hasher.finalize()))),
     };
     let end_resp = WsResponse::success(id, serde_json::to_value(end).unwrap_or_else(|_| json!({})));
-    send_response(ws_stream, &end_resp).await
+    send_response_tx(out_tx, &end_resp).await
 }
 
 fn ws_io_error(message: impl Into<String>) -> WsIoError {

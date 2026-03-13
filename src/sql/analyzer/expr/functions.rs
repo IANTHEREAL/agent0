@@ -564,6 +564,10 @@ impl<'a> Analyzer<'a> {
             "VEC_EMBED_COSINE_DISTANCE" | "VEC_EMBED_L2_DISTANCE" | "VEC_EMBED_INNER_PRODUCT" => {
                 self.coerce_vec_embed_signature(func_name, args)
             }
+            "FS9_READ" | "FS9_WRITE" | "FS9_EXISTS" | "FS9_SIZE" | "FS9_MTIME" | "FS9_REMOVE"
+            | "FS9_MKDIR" | "FS9_READ_AT" | "FS9_WRITE_AT" | "FS9_APPEND" | "FS9_TRUNCATE" => {
+                self.coerce_fs9_signature(func_name, args)
+            }
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -597,6 +601,227 @@ impl<'a> Analyzer<'a> {
             });
         }
         Ok(coerced)
+    }
+
+    fn coerce_fs9_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        match func_name {
+            "FS9_READ" | "FS9_EXISTS" | "FS9_SIZE" | "FS9_MTIME" => {
+                self.coerce_fs9_path_only_signature(func_name, args)
+            }
+            "FS9_WRITE" | "FS9_APPEND" => self.coerce_fs9_write_signature(func_name, args),
+            "FS9_REMOVE" | "FS9_MKDIR" => self.coerce_fs9_path_bool_signature(func_name, args),
+            "FS9_READ_AT" => self.coerce_fs9_read_at_signature(func_name, args),
+            "FS9_WRITE_AT" => self.coerce_fs9_write_at_signature(func_name, args),
+            "FS9_TRUNCATE" => self.coerce_fs9_truncate_signature(func_name, args),
+            _ => Ok(args),
+        }
+    }
+
+    fn coerce_fs9_path_only_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 1 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut args = args.into_iter();
+        let path =
+            self.coerce_fs9_path_arg(func_name, args.next().expect("arity checked"), &arg_types)?;
+        Ok(vec![path])
+    }
+
+    fn coerce_fs9_write_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 2 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut args = args.into_iter();
+        let path =
+            self.coerce_fs9_path_arg(func_name, args.next().expect("arity checked"), &arg_types)?;
+        let data = self.coerce_fs9_file_data_arg(
+            func_name,
+            args.next().expect("arity checked"),
+            &arg_types,
+        )?;
+        Ok(vec![path, data])
+    }
+
+    fn coerce_fs9_path_bool_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.is_empty() || args.len() > 2 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            let coerced_arg = match idx {
+                0 => self.coerce_fs9_path_arg(func_name, arg, &arg_types)?,
+                1 => self.coerce_fs9_boolean_arg(func_name, arg, &arg_types)?,
+                _ => unreachable!("arity already validated"),
+            };
+            coerced.push(coerced_arg);
+        }
+        Ok(coerced)
+    }
+
+    fn coerce_fs9_read_at_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 3 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut args = args.into_iter();
+        let path =
+            self.coerce_fs9_path_arg(func_name, args.next().expect("arity checked"), &arg_types)?;
+        let offset = self.coerce_fs9_integer_arg(
+            func_name,
+            args.next().expect("arity checked"),
+            &arg_types,
+        )?;
+        let length = self.coerce_fs9_integer_arg(
+            func_name,
+            args.next().expect("arity checked"),
+            &arg_types,
+        )?;
+        Ok(vec![path, offset, length])
+    }
+
+    fn coerce_fs9_write_at_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 3 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut args = args.into_iter();
+        let path =
+            self.coerce_fs9_path_arg(func_name, args.next().expect("arity checked"), &arg_types)?;
+        let offset = self.coerce_fs9_integer_arg(
+            func_name,
+            args.next().expect("arity checked"),
+            &arg_types,
+        )?;
+        let data = self.coerce_fs9_file_data_arg(
+            func_name,
+            args.next().expect("arity checked"),
+            &arg_types,
+        )?;
+        Ok(vec![path, offset, data])
+    }
+
+    fn coerce_fs9_truncate_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 2 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut args = args.into_iter();
+        let path =
+            self.coerce_fs9_path_arg(func_name, args.next().expect("arity checked"), &arg_types)?;
+        let size = self.coerce_fs9_integer_arg(
+            func_name,
+            args.next().expect("arity checked"),
+            &arg_types,
+        )?;
+        Ok(vec![path, size])
+    }
+
+    fn coerce_fs9_path_arg(
+        &mut self,
+        func_name: &str,
+        arg: TypedExpr,
+        arg_types: &[DataType],
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let arg_is_text_like = matches!(
+            arg.data_type,
+            DataType::Text | DataType::Varchar(_) | DataType::Name
+        );
+        if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_lowercase(),
+                arg_types: arg_types.to_vec(),
+            });
+        }
+        self.coerce_if_needed(arg, &DataType::Text)
+    }
+
+    fn coerce_fs9_file_data_arg(
+        &mut self,
+        func_name: &str,
+        arg: TypedExpr,
+        arg_types: &[DataType],
+    ) -> Result<TypedExpr, AnalyzerError> {
+        if matches!(arg.data_type, DataType::Bytes) {
+            return Ok(arg);
+        }
+        let arg_is_text_like = matches!(
+            arg.data_type,
+            DataType::Text | DataType::Varchar(_) | DataType::Name
+        );
+        if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_lowercase(),
+                arg_types: arg_types.to_vec(),
+            });
+        }
+        self.coerce_if_needed(arg, &DataType::Text)
+    }
+
+    fn coerce_fs9_boolean_arg(
+        &mut self,
+        func_name: &str,
+        arg: TypedExpr,
+        arg_types: &[DataType],
+    ) -> Result<TypedExpr, AnalyzerError> {
+        if !matches!(arg.data_type, DataType::Boolean)
+            && !self.is_unresolved_param(&arg)
+            && !arg.is_null_constant()
+        {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_lowercase(),
+                arg_types: arg_types.to_vec(),
+            });
+        }
+        self.coerce_if_needed(arg, &DataType::Boolean)
+    }
+
+    fn coerce_fs9_integer_arg(
+        &mut self,
+        func_name: &str,
+        arg: TypedExpr,
+        arg_types: &[DataType],
+    ) -> Result<TypedExpr, AnalyzerError> {
+        if !matches!(arg.data_type, DataType::Int32 | DataType::Int64)
+            && !self.is_unresolved_param(&arg)
+            && !arg.is_null_constant()
+        {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_lowercase(),
+                arg_types: arg_types.to_vec(),
+            });
+        }
+        self.coerce_if_needed(arg, &DataType::Int64)
     }
 
     fn coerce_args_to_vector(
