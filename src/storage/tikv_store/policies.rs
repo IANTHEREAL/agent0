@@ -69,6 +69,38 @@ impl TikvStore {
         Ok(policies)
     }
 
+    /// Get a specific policy by name. Returns None if not found.
+    pub async fn get_policy(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        policy_name: &str,
+    ) -> Result<Option<RlsPolicy>> {
+        let key = self.key(&encode_policy_key_v2(db_id, table_id, policy_name));
+        match tikv_op!(txn.get(key).await)? {
+            Some(data) => {
+                let policy: RlsPolicy =
+                    bincode::deserialize(&data).context("Failed to deserialize RLS policy")?;
+                Ok(Some(policy))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Update an existing policy in place (overwrite by key).
+    pub async fn update_policy(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        policy: &RlsPolicy,
+    ) -> Result<()> {
+        let key = self.key(&encode_policy_key_v2(db_id, policy.table_id, &policy.name));
+        let data = bincode::serialize(policy).context("Failed to serialize RLS policy")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
     /// Drop a specific policy by name. Returns true if it existed.
     pub async fn drop_policy(
         &self,
