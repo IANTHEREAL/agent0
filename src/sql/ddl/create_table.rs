@@ -504,6 +504,8 @@ pub async fn execute_create_table(
         check_constraints,
         foreign_keys,
         owner: "postgres".to_string(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -666,6 +668,8 @@ pub async fn create_table_from_query_result(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: "postgres".to_string(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
@@ -750,6 +754,8 @@ pub async fn create_table_from_stream(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: "postgres".to_string(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
@@ -845,6 +851,8 @@ pub async fn create_table_from_select_into(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: "postgres".to_string(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;

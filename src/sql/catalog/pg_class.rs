@@ -140,6 +140,8 @@ impl VirtualTable for PgClass {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         }
     }
@@ -207,9 +209,9 @@ impl VirtualTable for PgClass {
                     Value::Int64(relchecks),
                     Value::Boolean(false), // relhasrules
                     Value::Boolean(relhastriggers),
-                    Value::Boolean(false),          // relhassubclass
-                    Value::Boolean(false),          // relrowsecurity
-                    Value::Boolean(false),          // relforcerowsecurity
+                    Value::Boolean(false),                   // relhassubclass
+                    Value::Boolean(schema.rls_enabled),      // relrowsecurity
+                    Value::Boolean(schema.rls_force),        // relforcerowsecurity
                     text_val(RELREPLIDENT_DEFAULT), // relreplident
                     Value::Boolean(false),          // relispartition
                     null_val(),                     // relpartbound

@@ -170,6 +170,8 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: "postgres".to_string(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         }
     }

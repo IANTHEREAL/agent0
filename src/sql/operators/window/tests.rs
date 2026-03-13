@@ -41,6 +41,8 @@ fn test_schema() -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }
@@ -168,6 +170,8 @@ fn test_schema_with_float_partition() -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }
@@ -212,6 +216,8 @@ fn test_schema_with_numeric_partition() -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }
@@ -416,6 +422,8 @@ fn test_window_row_number_partitioned() {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 

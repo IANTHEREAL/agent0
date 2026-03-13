@@ -379,6 +379,8 @@ fn check_constraint_effective_name_and_find_index_work_for_generated_names() {
         ],
         foreign_keys: vec![],
         owner: "postgres".to_string(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 
@@ -434,6 +436,8 @@ fn constraint_name_exists_checks_pk_fk_index_and_checks() {
             on_update: ForeignKeyAction::NoAction,
         }],
         owner: "postgres".to_string(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     };
 

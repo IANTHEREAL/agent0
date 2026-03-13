@@ -706,6 +706,12 @@ pub struct TableSchema {
     /// Owner role/user name for this table (metadata only; no permission enforcement yet).
     #[serde(default = "default_owner")]
     pub owner: String,
+    /// Whether row-level security is enabled on this table.
+    #[serde(default)]
+    pub rls_enabled: bool,
+    /// Whether RLS is forced even for the table owner.
+    #[serde(default)]
+    pub rls_force: bool,
     /// Runtime-only FROM alias (e.g., `FROM foo_tbl AS bar` → alias = "bar").
     /// Not serialized; used only during query evaluation for whole-row references
     /// and qualified column resolution.
@@ -737,6 +743,8 @@ impl TableSchema {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             owner: default_owner(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         }
     }
@@ -884,6 +892,67 @@ pub struct TriggerDef {
     pub timing: String,
     pub events: Vec<String>,
     pub function: String,
+}
+
+/// RLS policy command scope (matches PostgreSQL `pg_policy.polcmd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RlsCommand {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl RlsCommand {
+    /// Return the single-character code used by `pg_policy.polcmd`.
+    pub fn pg_polcmd(&self) -> &'static str {
+        match self {
+            RlsCommand::All => "*",
+            RlsCommand::Select => "r",
+            RlsCommand::Insert => "a",
+            RlsCommand::Update => "w",
+            RlsCommand::Delete => "d",
+        }
+    }
+
+    /// Whether this command scope applies to a given DML operation.
+    pub fn applies_to_select(&self) -> bool {
+        matches!(self, RlsCommand::All | RlsCommand::Select)
+    }
+
+    pub fn applies_to_insert(&self) -> bool {
+        matches!(self, RlsCommand::All | RlsCommand::Insert)
+    }
+
+    pub fn applies_to_update(&self) -> bool {
+        matches!(self, RlsCommand::All | RlsCommand::Update)
+    }
+
+    pub fn applies_to_delete(&self) -> bool {
+        matches!(self, RlsCommand::All | RlsCommand::Delete)
+    }
+}
+
+/// A row-level security policy stored in TiKV.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RlsPolicy {
+    /// Unique OID for `pg_policy.oid` catalog compatibility.
+    pub oid: u32,
+    /// Policy name (unique per table).
+    pub name: String,
+    /// Table this policy applies to (by table_id).
+    pub table_id: u64,
+    /// Which DML command(s) the policy applies to.
+    pub command: RlsCommand,
+    /// `true` = PERMISSIVE (OR'd), `false` = RESTRICTIVE (AND'd).
+    pub permissive: bool,
+    /// Roles this policy applies to. Empty or `["public"]` means all roles.
+    pub roles: Vec<String>,
+    /// SQL expression for row visibility (SELECT/UPDATE/DELETE).
+    pub using_expr: Option<String>,
+    /// SQL expression for new-row validation (INSERT/UPDATE).
+    pub with_check_expr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

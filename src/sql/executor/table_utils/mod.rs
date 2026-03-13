@@ -95,6 +95,8 @@ pub(crate) fn create_sequence_state_table_schema(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: def.owner.clone(),
+        rls_enabled: false,
+        rls_force: false,
         from_alias: None,
     }
 }
@@ -416,6 +418,8 @@ impl Executor {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         };
 
@@ -523,6 +527,8 @@ impl Executor {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            rls_enabled: false,
+            rls_force: false,
             from_alias: None,
         };
 

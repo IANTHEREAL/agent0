@@ -2,8 +2,9 @@ use super::encoding::*;
 use super::kv_stats;
 use crate::extensions::InstalledExtension;
 use crate::model::{
-    DataType, DatabaseDef, FunctionDef, MatViewDef, MigrationRecord, Row, SequenceBacking,
-    SequenceDef, SequenceState, TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
+    DataType, DatabaseDef, FunctionDef, MatViewDef, MigrationRecord, RlsPolicy, Row,
+    SequenceBacking, SequenceDef, SequenceState, TableSchema, TriggerDef, UserTypeDef, Value,
+    ViewDef,
 };
 use crate::storage::backpressure::tikv_op;
 use crate::txn::{txn_delete, txn_put};
@@ -29,6 +30,7 @@ mod sequences;
 mod statistics;
 mod tables;
 mod text_search;
+mod policies;
 mod triggers;
 mod types;
 mod views;
@@ -572,6 +574,16 @@ impl TikvStore {
             self.key(&encode_next_view_oid_key_v2(db_id)),
             1,
             "view",
+        )
+        .await
+    }
+
+    pub async fn next_policy_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
+        self.next_oid_u32(
+            txn,
+            self.key(&encode_next_policy_oid_key_v2(db_id)),
+            1,
+            "policy",
         )
         .await
     }
