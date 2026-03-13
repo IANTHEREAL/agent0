@@ -22,11 +22,14 @@ pub(crate) struct PlanDependency {
 }
 
 /// Cache key: normalized SQL + resolved param types + db_id + search_path +
-/// resolved table IDs.
+/// resolved table IDs + current_role.
 ///
 /// Two executions produce the same key iff they would generate the same plan
 /// (same SQL text, same parameter types, same database, same search path,
-/// same resolved base-table IDs).
+/// same resolved base-table IDs, same executing role).
+///
+/// `current_role` is included because RLS policies inject role-dependent
+/// predicates into the query plan — different roles see different plans.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PlanCacheKey {
     /// Normalized SQL text (from PreparedStatement.sql).
@@ -39,6 +42,8 @@ pub(crate) struct PlanCacheKey {
     pub search_path: Vec<String>,
     /// Resolved base-table IDs bound by analysis.
     pub resolved_table_ids: Vec<u64>,
+    /// Effective role at plan time (RLS policies are role-dependent).
+    pub current_role: Option<String>,
 }
 
 impl PlanCacheKey {
@@ -49,6 +54,7 @@ impl PlanCacheKey {
         db_id: u64,
         search_path: &[String],
         resolved_table_ids: &[u64],
+        current_role: Option<&str>,
     ) -> Self {
         let mut resolved_table_ids = resolved_table_ids.to_vec();
         resolved_table_ids.sort_unstable();
@@ -59,6 +65,7 @@ impl PlanCacheKey {
             db_id,
             search_path: search_path.to_vec(),
             resolved_table_ids,
+            current_role: current_role.map(|s| s.to_string()),
         }
     }
 }
@@ -579,7 +586,7 @@ mod tests {
     use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode};
 
     fn make_key(sql: &str) -> PlanCacheKey {
-        PlanCacheKey::new(sql.to_string(), &[], 1, &["public".to_string()], &[])
+        PlanCacheKey::new(sql.to_string(), &[], 1, &["public".to_string()], &[], None)
     }
 
     fn make_entry(deps: Vec<PlanDependency>) -> PlanCacheEntry {
@@ -750,6 +757,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[10],
+            None,
         );
         let k2 = PlanCacheKey::new(
             "SELECT * FROM t2 WHERE id = $1".to_string(),
@@ -757,6 +765,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[20],
+            None,
         );
         assert_eq!(
             cache.record_execution(&k1),
@@ -804,6 +813,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[42],
+            None,
         );
         cache.insert(k1.clone(), make_entry(vec![]));
         assert_eq!(
@@ -921,6 +931,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[10],
+            None,
         );
         let k2 = PlanCacheKey::new(
             "SELECT * FROM t".to_string(),
@@ -928,6 +939,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[20],
+            None,
         );
         assert_ne!(k1, k2);
     }
@@ -940,6 +952,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[2, 1, 1],
+            None,
         );
         let k2 = PlanCacheKey::new(
             "SELECT * FROM t1 JOIN t2 ON true".to_string(),
@@ -947,6 +960,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[1, 2],
+            None,
         );
         assert_eq!(k1, k2);
     }
@@ -960,6 +974,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[],
+            None,
         );
         let k2 = PlanCacheKey::new(
             "SELECT $1".to_string(),
@@ -967,6 +982,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[],
+            None,
         );
         let k3 = PlanCacheKey::new(
             "SELECT $1".to_string(),
@@ -974,6 +990,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[],
+            None,
         );
         assert_ne!(k1, k2, "different param types must produce different keys");
         assert_eq!(k1, k3, "same param types must produce equal keys");
@@ -991,6 +1008,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[],
+            None,
         );
         let key_text = PlanCacheKey::new(
             "SELECT $1".to_string(),
@@ -998,6 +1016,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[],
+            None,
         );
         let key_int_dup = PlanCacheKey::new(
             "SELECT $1".to_string(),
@@ -1005,6 +1024,7 @@ mod tests {
             1,
             &["public".to_string()],
             &[],
+            None,
         );
 
         // Insert a plan under key_int.
