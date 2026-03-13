@@ -46,15 +46,11 @@ impl VirtualTable for PgPolicy {
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
-        let policies = ctx
-            .store
-            .list_all_policies(ctx.txn, ctx.db_id)
-            .await?;
+        let policies = ctx.store.list_all_policies(ctx.txn, ctx.db_id).await?;
 
         let mut rows = Vec::new();
         for policy in policies {
-            let polrelid = catalog_oids::pg_class_table_oid(policy.table_id)
-                .unwrap_or(0);
+            let polrelid = catalog_oids::pg_class_table_oid(policy.table_id).unwrap_or(0);
             let polcmd = policy.command.pg_polcmd();
 
             // polroles: array of role OIDs. We use 0 for PUBLIC.
@@ -72,7 +68,9 @@ impl VirtualTable for PgPolicy {
                             "0".to_string()
                         } else {
                             // Simple hash to generate a stable OID
-                            let hash = r.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+                            let hash = r
+                                .bytes()
+                                .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
                             (hash as i64 + 10000).to_string()
                         }
                     })
@@ -90,12 +88,12 @@ impl VirtualTable for PgPolicy {
                 policy
                     .using_expr
                     .as_deref()
-                    .map(|e| text_val(e))
+                    .map(text_val)
                     .unwrap_or(Value::Null),
                 policy
                     .with_check_expr
                     .as_deref()
-                    .map(|e| text_val(e))
+                    .map(text_val)
                     .unwrap_or(Value::Null),
             ]));
         }

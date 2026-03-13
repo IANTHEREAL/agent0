@@ -6008,19 +6008,16 @@ mod tests {
 
         let mut last_err = String::new();
         for _ in 0..15 {
-            match client
+            if let Ok(resp) = client
                 .post(&base)
                 .json(&serde_json::json!({ "name": keyspace }))
                 .send()
                 .await
             {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if !(status.is_success() || status.as_u16() == 409 || status.as_u16() == 500) {
-                        let _ = resp.text().await;
-                    }
+                let status = resp.status();
+                if !(status.is_success() || status.as_u16() == 409 || status.as_u16() == 500) {
+                    let _ = resp.text().await;
                 }
-                Err(_) => {}
             }
 
             match client.get(&keyspace_url).send().await {
@@ -6563,7 +6560,7 @@ mod tests {
         ensure_dir(&fs, base).await;
 
         let path = &format!("{base}/small.bin");
-        let data: Vec<u8> = (0..fs9_config().inline_max_bytes.min(32).max(1))
+        let data: Vec<u8> = (0..fs9_config().inline_max_bytes.clamp(1, 32))
             .map(|idx| (idx % 251) as u8)
             .collect();
 
