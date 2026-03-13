@@ -30,7 +30,27 @@ pub(in crate::sql::executor::core) enum PreparedObservabilityMode {
     Observability,
 }
 
-fn is_plan_cache_eligible(exec: &PreparedExec) -> bool {
+fn prepared_text_fallback_reason(exec: &PreparedExec, rls_sensitive: bool) -> Option<&'static str> {
+    if rls_sensitive {
+        Some("RLS-sensitive prepared statement")
+    } else if matches!(
+        exec,
+        PreparedExec::AnalyzedQuery {
+            has_recursive_cte: true,
+            ..
+        }
+    ) {
+        Some("prepared recursive CTE")
+    } else {
+        None
+    }
+}
+
+fn is_plan_cache_eligible(exec: &PreparedExec, rls_sensitive: bool) -> bool {
+    if rls_sensitive {
+        return false;
+    }
+
     match exec {
         PreparedExec::AnalyzedQuery {
             analyzed,
@@ -116,6 +136,10 @@ impl Executor {
     ///
     /// For schema drift (table version mismatch), this falls back to the
     /// text-based execution path (`execute`) so Parse+Analyze run again.
+    ///
+    /// Phase-1 RLS also routes `rls_sensitive` statements through the same
+    /// text path on every Execute so role-dependent policy injection always
+    /// runs under the current principal.
     pub async fn execute_prepared(
         &self,
         session: &mut Session,
@@ -124,38 +148,30 @@ impl Executor {
         params: Vec<Option<Value>>,
         param_data_types: &[DataType],
         table_versions: &[(String, u64, u64)],
+        rls_sensitive: bool,
     ) -> Result<ExecuteResults> {
         if matches!(exec, PreparedExec::RawSqlUtility) {
             unreachable!("RawSqlUtility should not be routed to execute_prepared")
         }
 
-        // Recursive CTE execution over analyzed prepared IR is not implemented yet.
-        // Preserve correctness by falling back to the normal text execution path.
-        if matches!(
-            exec,
-            PreparedExec::AnalyzedQuery {
-                has_recursive_cte: true,
-                ..
-            }
-        ) {
-            warn!("prepared recursive CTE detected; falling back to SQL parse/analyze");
-            if !params.is_empty() {
-                session.set_pending_params(params);
-            }
-            if !param_data_types.is_empty() {
-                session
-                    .set_pending_param_types(param_data_types.iter().cloned().map(Some).collect());
-            }
-            return self.execute(session, sql).await;
+        let qctx = self.build_prepared_query_context(session, params, param_data_types);
+        if let Some(reason) = prepared_text_fallback_reason(exec, rls_sensitive) {
+            warn!(
+                reason,
+                "prepared statement requires execute-time SQL parse/analyze fallback"
+            );
+            return self
+                .execute_prepared_text_fallback(session, sql, qctx.as_ref())
+                .await;
         }
 
-        let qctx = self.build_prepared_query_context(session, params, param_data_types);
         self.execute_prepared_with_framework(
             session,
             sql,
             exec,
             param_data_types,
             table_versions,
+            rls_sensitive,
             &qctx,
         )
         .await
@@ -184,6 +200,7 @@ impl Executor {
         exec: &PreparedExec,
         param_data_types: &[DataType],
         table_versions: &[(String, u64, u64)],
+        rls_sensitive: bool,
         qctx: &Arc<crate::sql::query_context::QueryContext>,
     ) -> Result<ExecuteResults> {
         let savepoints = session.savepoints();
@@ -222,6 +239,7 @@ impl Executor {
                                 exec,
                                 param_data_types,
                                 table_versions,
+                                rls_sensitive,
                                 qctx.as_ref(),
                                 is_observability_query,
                             )
@@ -264,6 +282,7 @@ impl Executor {
         exec: &'a PreparedExec,
         param_data_types: &'a [DataType],
         table_versions: &'a [(String, u64, u64)],
+        rls_sensitive: bool,
         qctx: &'a crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
@@ -279,6 +298,7 @@ impl Executor {
                 exec,
                 param_data_types,
                 table_versions,
+                rls_sensitive,
                 qctx,
                 is_observability_query,
             ));
@@ -292,6 +312,7 @@ impl Executor {
         exec: &PreparedExec,
         param_data_types: &[DataType],
         table_versions: &[(String, u64, u64)],
+        rls_sensitive: bool,
         qctx: &crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Result<ExecuteResults> {
@@ -351,6 +372,7 @@ impl Executor {
                         exec,
                         param_data_types,
                         table_versions,
+                        rls_sensitive,
                         current_role.as_deref(),
                     ),
                 ),
@@ -482,6 +504,7 @@ impl Executor {
         exec: &PreparedExec,
         param_data_types: &[DataType],
         table_versions: &[(String, u64, u64)],
+        rls_sensitive: bool,
         current_role: Option<&str>,
     ) -> Result<PreparedTxnResult> {
         use crate::sql::executor::core::plan_cache::PlanCacheKey;
@@ -501,7 +524,7 @@ impl Executor {
 
         // Check eligibility: analyzed SELECT only, and never cache plans that
         // require pre-materialization (subquery/async constants).
-        let cache_eligible = is_plan_cache_eligible(exec);
+        let cache_eligible = is_plan_cache_eligible(exec, rls_sensitive);
 
         // Plan cache decision contract:
         // - lookup cached entry first
@@ -933,6 +956,7 @@ impl Executor {
                     output_schema,
                     param_data_types: param_types,
                     table_versions,
+                    rls_sensitive: false,
                 }
             }
             PreparedAnalysis::Dml {
@@ -951,6 +975,7 @@ impl Executor {
                     output_schema,
                     param_data_types: param_types,
                     table_versions,
+                    rls_sensitive: false,
                 }
             }
             PreparedAnalysis::Utility => {
@@ -967,14 +992,14 @@ impl Executor {
 
     /// Execute a SQL-level `EXECUTE name (params)`.
     ///
-    /// Unified through `execute_prepared_with_framework` so that SQL EXECUTE
+    /// Unified through `execute_prepared` so that SQL EXECUTE
     /// benefits from schema drift detection, plan cache, and observability —
     /// the same pipeline as pgwire Extended Query Execute.
     ///
     /// Returns `Pin<Box<dyn Future + Send>>` (instead of `async fn`) to break
     /// the recursive type created by `execute → execute_single →
-    /// execute_sql_execute_statement → self.execute()` for the recursive CTE
-    /// fallback path.
+    /// execute_sql_execute_statement → execute_prepared →
+    /// execute_prepared_text_fallback → self.execute()`.
     pub(super) fn execute_sql_execute_statement<'a>(
         &'a self,
         session: &'a mut Session,
@@ -1010,46 +1035,14 @@ impl Executor {
                 param_values.push(Some(eval_const_ast_expr(expr)?));
             }
 
-            // Recursive CTE fallback: re-parse through the text path.
-            if matches!(
-                prepared.exec,
-                PreparedExec::AnalyzedQuery {
-                    has_recursive_cte: true,
-                    ..
-                }
-            ) {
-                warn!("SQL EXECUTE: recursive CTE detected; falling back to SQL parse/analyze");
-                if !param_values.is_empty() {
-                    session.set_pending_params(param_values);
-                }
-                if !prepared.param_data_types.is_empty() {
-                    session.set_pending_param_types(
-                        prepared
-                            .param_data_types
-                            .iter()
-                            .cloned()
-                            .map(Some)
-                            .collect(),
-                    );
-                }
-                return self
-                    .execute(session, &prepared.sql)
-                    .await
-                    .map(|r| r.into_vec());
-            }
-
-            let qctx = self.build_prepared_query_context(
-                session,
-                param_values,
-                &prepared.param_data_types,
-            );
-            self.execute_prepared_with_framework(
+            self.execute_prepared(
                 session,
                 &prepared.sql,
                 &prepared.exec,
+                param_values,
                 &prepared.param_data_types,
                 &prepared.table_versions,
-                &qctx,
+                prepared.rls_sensitive,
             )
             .await
             .map(|r| r.into_vec())
@@ -1142,19 +1135,25 @@ mod tests {
     #[test]
     fn plan_cache_eligible_for_simple_analyzed_query() {
         let exec = analyzed_query_exec(values_query(), false);
-        assert!(is_plan_cache_eligible(&exec));
+        assert!(is_plan_cache_eligible(&exec, false));
     }
 
     #[test]
     fn plan_cache_ineligible_for_recursive_cte_query() {
         let exec = analyzed_query_exec(values_query(), true);
-        assert!(!is_plan_cache_eligible(&exec));
+        assert!(!is_plan_cache_eligible(&exec, false));
+    }
+
+    #[test]
+    fn plan_cache_ineligible_for_rls_sensitive_query() {
+        let exec = analyzed_query_exec(values_query(), false);
+        assert!(!is_plan_cache_eligible(&exec, true));
     }
 
     #[test]
     fn plan_cache_ineligible_when_query_needs_pre_materialization() {
         let exec = analyzed_query_exec(query_with_scalar_subquery_projection(), false);
-        assert!(!is_plan_cache_eligible(&exec));
+        assert!(!is_plan_cache_eligible(&exec, false));
     }
 
     #[test]
@@ -1163,8 +1162,8 @@ mod tests {
             analyzed: crate::sql::analyzer::types::AnalyzedStatement::Query(values_query()),
             required_privileges: vec![],
         };
-        assert!(!is_plan_cache_eligible(&dml));
-        assert!(!is_plan_cache_eligible(&PreparedExec::RawSqlUtility));
+        assert!(!is_plan_cache_eligible(&dml, false));
+        assert!(!is_plan_cache_eligible(&PreparedExec::RawSqlUtility, false));
     }
 }
 #[cfg(test)]
@@ -1465,6 +1464,7 @@ mod prepared_policy_tests {
                 vec![Some(Value::Int32(11))],
                 &[DataType::Int32],
                 &[],
+                false,
             )
             .await
             .unwrap()
@@ -1474,6 +1474,31 @@ mod prepared_policy_tests {
         // Empty SQL returns early, so pending params/types are still queued.
         let qctx = session.query_context_for_statement(1, 1);
         assert_eq!(qctx.params, vec![Some(Value::Int32(11))]);
+        assert_eq!(qctx.param_types, vec![Some(DataType::Int32)]);
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_rls_sensitive_falls_back_to_text_path() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+
+        let out = exec
+            .execute_prepared(
+                &mut session,
+                "",
+                &analyzed_query_exec(),
+                vec![Some(Value::Int32(22))],
+                &[DataType::Int32],
+                &[],
+                true,
+            )
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(out.as_slice(), [ExecuteResult::Empty]));
+
+        let qctx = session.query_context_for_statement(1, 1);
+        assert_eq!(qctx.params, vec![Some(Value::Int32(22))]);
         assert_eq!(qctx.param_types, vec![Some(DataType::Int32)]);
     }
 
@@ -1536,6 +1561,7 @@ mod prepared_policy_tests {
             output_schema: vec![],
             param_data_types: vec![],
             table_versions: vec![],
+            rls_sensitive: false,
         };
         session.put_sql_prepared_statement("p1".to_string(), stmt.clone());
         session.put_sql_prepared_statement("p2".to_string(), stmt);
@@ -1583,6 +1609,7 @@ mod prepared_policy_tests {
                 output_schema: vec![],
                 param_data_types: vec![],
                 table_versions: vec![],
+                rls_sensitive: false,
             },
         );
         let out = exec
@@ -1617,6 +1644,7 @@ mod prepared_policy_tests {
             output_schema: vec![],
             param_data_types: vec![DataType::Int32],
             table_versions: vec![],
+            rls_sensitive: false,
         };
         session.put_sql_prepared_statement("p1".to_string(), stmt);
 
@@ -1640,6 +1668,7 @@ mod prepared_policy_tests {
             output_schema: vec![],
             param_data_types: vec![DataType::Int32],
             table_versions: vec![],
+            rls_sensitive: false,
         };
         session.put_sql_prepared_statement("p1".to_string(), stmt);
 
@@ -1682,6 +1711,7 @@ mod prepared_policy_tests {
             output_schema: vec![],
             param_data_types: vec![DataType::Int32],
             table_versions: vec![],
+            rls_sensitive: false,
         };
         session.put_sql_prepared_statement("p1".to_string(), stmt);
 
@@ -1700,6 +1730,38 @@ mod prepared_policy_tests {
 
         let qctx = session.query_context_for_statement(1, 1);
         assert_eq!(qctx.params, vec![Some(Value::Int32(7))]);
+        assert_eq!(qctx.param_types, vec![Some(DataType::Int32)]);
+    }
+
+    #[tokio::test]
+    async fn sql_execute_rls_sensitive_fallback_sets_pending_bindings() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let stmt = PreparedStatement {
+            sql: "".to_string(),
+            exec: analyzed_query_exec(),
+            output_schema: vec![],
+            param_data_types: vec![DataType::Int32],
+            table_versions: vec![],
+            rls_sensitive: true,
+        };
+        session.put_sql_prepared_statement("p1".to_string(), stmt);
+
+        let out = exec
+            .execute_sql_execute_statement(
+                &mut session,
+                &sqlparser::ast::Ident::new("p1"),
+                &[Expr::Value(sqlparser::ast::Value::Number(
+                    "9".to_string(),
+                    false,
+                ))],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out.as_slice(), [ExecuteResult::Empty]));
+
+        let qctx = session.query_context_for_statement(1, 1);
+        assert_eq!(qctx.params, vec![Some(Value::Int32(9))]);
         assert_eq!(qctx.param_types, vec![Some(DataType::Int32)]);
     }
 

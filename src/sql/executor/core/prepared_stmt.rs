@@ -51,6 +51,13 @@ pub struct PreparedStatement {
     /// same table name. `schema_version` detects DDL mutations (including
     /// CREATE/DROP INDEX).
     pub table_versions: Vec<(String, u64, u64)>,
+    /// Whether Execute must re-analyze this statement from SQL text under the
+    /// current principal instead of reusing frozen prepared IR.
+    ///
+    /// Phase-1 RLS uses this to force text fallback for statements touching RLS
+    /// tables, which avoids caching role-sensitive predicates inside the
+    /// immutable prepared representation.
+    pub rls_sensitive: bool,
 }
 
 impl PreparedStatement {
@@ -124,6 +131,7 @@ mod tests {
         let stmt = PreparedStatement::default();
         assert!(matches!(stmt.exec, PreparedExec::RawSqlUtility));
         assert!(stmt.sql.is_empty());
+        assert!(!stmt.rls_sensitive);
     }
 
     #[test]

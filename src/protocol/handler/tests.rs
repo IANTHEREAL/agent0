@@ -2649,6 +2649,7 @@ fn test_prepared_stmt(sql: &str) -> PreparedStatement {
         output_schema: vec![],
         param_data_types: vec![],
         table_versions: vec![],
+        rls_sensitive: false,
     }
 }
 
@@ -2763,6 +2764,7 @@ fn test_prepared_stmt_analyzed(
             .collect(),
         param_data_types,
         table_versions: vec![],
+        rls_sensitive: false,
     }
 }
 
