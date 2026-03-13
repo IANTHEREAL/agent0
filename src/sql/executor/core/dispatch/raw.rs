@@ -118,6 +118,11 @@ impl Executor {
                 let res = self.execute_create_policy_cmd(session, sql).await;
                 Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
             }
+            RawSqlKind::AlterPolicy => {
+                let start = Instant::now();
+                let res = self.execute_alter_policy_cmd(session, sql).await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
             RawSqlKind::DropPolicy => {
                 let start = Instant::now();
                 let res = self.execute_drop_policy_cmd(session, sql).await;

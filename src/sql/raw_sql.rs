@@ -63,6 +63,8 @@ pub(crate) enum RawSqlKind {
     AlterIndexIfExists,
     /// `CREATE POLICY <name> ON <table> ...` — RLS policy creation.
     CreatePolicy,
+    /// `ALTER POLICY <name> ON <table> ...` — RLS policy modification.
+    AlterPolicy,
     /// `DROP POLICY [IF EXISTS] <name> ON <table>` — RLS policy removal.
     DropPolicy,
     /// `ALTER TABLE <table> {ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL SECURITY`
@@ -432,6 +434,9 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("CREATE POLICY") {
         return Some(RawSqlKind::CreatePolicy);
+    }
+    if sql_upper.starts_with("ALTER POLICY") {
+        return Some(RawSqlKind::AlterPolicy);
     }
     if sql_upper.starts_with("DROP POLICY") {
         return Some(RawSqlKind::DropPolicy);

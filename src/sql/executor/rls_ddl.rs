@@ -1,4 +1,4 @@
-//! RLS DDL execution: CREATE POLICY, DROP POLICY, ALTER TABLE ... ROW LEVEL SECURITY.
+//! RLS DDL execution: CREATE POLICY, ALTER POLICY, DROP POLICY, ALTER TABLE ... ROW LEVEL SECURITY.
 //!
 //! These statements bypass sqlparser (which lacks CREATE/DROP POLICY support in 0.40)
 //! and are parsed manually, following the same pattern as triggers.rs.
@@ -335,6 +335,103 @@ fn parse_drop_policy_sql(sql: &str) -> Result<DropPolicyParsed> {
     })
 }
 
+// ── ALTER POLICY parser ──────────────────────────────────────────────────
+
+/// Parsed ALTER POLICY statement.
+/// ALTER POLICY <name> ON <table>
+///     [TO { <role> | PUBLIC } [, ...]]
+///     [USING ( <expr> )]
+///     [WITH CHECK ( <expr> )]
+struct AlterPolicyParsed {
+    name: String,
+    table: String,
+    roles: Option<Vec<String>>,
+    using_expr: Option<Option<String>>,      // Some(Some(expr)) = set, Some(None) impossible, None = unchanged
+    with_check_expr: Option<Option<String>>,
+}
+
+fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
+    let sql = strip_leading_sql_comments(sql);
+    let rest = consume_keyword(sql, "ALTER")
+        .ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
+    let rest = consume_keyword(rest, "POLICY")
+        .ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
+
+    // Policy name
+    let (name, rest) = consume_ident(rest)
+        .ok_or_else(|| anyhow!("Expected policy name after ALTER POLICY"))?;
+
+    // ON table_name
+    let rest = consume_keyword(rest, "ON")
+        .ok_or_else(|| anyhow!("Expected ON after policy name"))?;
+    let (table, mut rest) = consume_ident(rest)
+        .ok_or_else(|| anyhow!("Expected table name after ON"))?;
+
+    let mut roles = None;
+    let mut using_expr = None;
+    let mut with_check_expr = None;
+
+    loop {
+        let trimmed = rest.trim_start().trim_end_matches(';').trim();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some(r) = consume_keyword(rest, "TO") {
+            let mut r = r;
+            let mut role_list = Vec::new();
+            loop {
+                let (role, r2) = consume_ident(r)
+                    .ok_or_else(|| anyhow!("Expected role name after TO"))?;
+                role_list.push(role.to_lowercase());
+                r = r2;
+                if r.starts_with(',') {
+                    r = r[1..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            roles = Some(role_list);
+            rest = r;
+            continue;
+        }
+
+        if let Some(r) = consume_keyword(rest, "USING") {
+            let (expr, r2) = extract_paren_expr(r)?;
+            using_expr = Some(Some(expr));
+            rest = r2;
+            continue;
+        }
+
+        if let Some(r) = consume_keyword(rest, "WITH") {
+            let r = consume_keyword(r, "CHECK")
+                .ok_or_else(|| anyhow!("Expected CHECK after WITH"))?;
+            let (expr, r2) = extract_paren_expr(r)?;
+            with_check_expr = Some(Some(expr));
+            rest = r2;
+            continue;
+        }
+
+        let trimmed = rest.trim().trim_end_matches(';');
+        if !trimmed.is_empty() {
+            return Err(anyhow!("Unexpected token in ALTER POLICY: '{}'", trimmed));
+        }
+        break;
+    }
+
+    if roles.is_none() && using_expr.is_none() && with_check_expr.is_none() {
+        return Err(anyhow!("ALTER POLICY must specify at least one of TO, USING, or WITH CHECK"));
+    }
+
+    Ok(AlterPolicyParsed {
+        name,
+        table,
+        roles,
+        using_expr,
+        with_check_expr,
+    })
+}
+
 // ── ALTER TABLE ... ROW LEVEL SECURITY parser ────────────────────────────
 
 enum AlterTableRlsAction {
@@ -543,6 +640,82 @@ impl Executor {
         )
     }
 
+    pub(crate) async fn execute_alter_policy_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let parsed = parse_alter_policy_sql(sql)?;
+        let table_name_obj = object_name_from_str(&parsed.table)?;
+
+        autocommit_ddl!(
+            session,
+            async {
+                let db_id = session.current_database_id();
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+
+                let table_resolved = names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &table_name_obj,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| SqlError::RelationNotFound(parsed.table.clone()))?;
+
+                let schema = self
+                    .store()
+                    .get_schema(txn, db_id, &table_resolved.full)
+                    .await?
+                    .ok_or_else(|| SqlError::RelationNotFound(table_resolved.full.clone()))?;
+
+                let mut policy = self
+                    .store()
+                    .get_policy(txn, db_id, schema.table_id, &parsed.name)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "policy \"{}\" for table \"{}\" does not exist",
+                            parsed.name,
+                            table_resolved.full
+                        )
+                    })?;
+
+                // Update fields that were specified
+                if let Some(roles) = parsed.roles {
+                    policy.roles = if roles.is_empty() {
+                        vec!["public".to_string()]
+                    } else {
+                        roles
+                    };
+                }
+                if let Some(using) = parsed.using_expr {
+                    policy.using_expr = using;
+                }
+                if let Some(with_check) = parsed.with_check_expr {
+                    policy.with_check_expr = with_check;
+                }
+
+                self.store().update_policy(txn, db_id, &policy).await?;
+
+                // Bump schema version to invalidate plan cache
+                let mut updated_schema = schema;
+                updated_schema.version += 1;
+                self.store()
+                    .update_schema(txn, db_id, updated_schema)
+                    .await?;
+
+                Ok(ExecuteResult::CommandComplete {
+                    tag: "ALTER POLICY",
+                })
+            }
+            .await
+        )
+    }
+
     pub(crate) async fn execute_alter_table_rls_cmd(
         &self,
         session: &mut Session,
@@ -702,6 +875,55 @@ mod tests {
         let sql = "ALTER TABLE users NO FORCE ROW LEVEL SECURITY";
         let p = parse_alter_table_rls_sql(sql).unwrap();
         assert!(matches!(p.action, AlterTableRlsAction::NoForce));
+    }
+
+    #[test]
+    fn test_parse_alter_policy_using() {
+        let sql = "ALTER POLICY my_policy ON users USING (role = 'admin')";
+        let p = parse_alter_policy_sql(sql).unwrap();
+        assert_eq!(p.name, "my_policy");
+        assert_eq!(p.table, "users");
+        assert!(p.roles.is_none());
+        assert_eq!(
+            p.using_expr.as_ref().unwrap().as_deref(),
+            Some("role = 'admin'")
+        );
+        assert!(p.with_check_expr.is_none());
+    }
+
+    #[test]
+    fn test_parse_alter_policy_roles_and_check() {
+        let sql = "ALTER POLICY pol ON t TO admin, editor WITH CHECK (x > 0)";
+        let p = parse_alter_policy_sql(sql).unwrap();
+        assert_eq!(p.name, "pol");
+        assert_eq!(p.table, "t");
+        assert_eq!(p.roles.as_ref().unwrap(), &["admin", "editor"]);
+        assert!(p.using_expr.is_none());
+        assert_eq!(
+            p.with_check_expr.as_ref().unwrap().as_deref(),
+            Some("x > 0")
+        );
+    }
+
+    #[test]
+    fn test_parse_alter_policy_all_fields() {
+        let sql = "ALTER POLICY pol ON t TO public USING (visible) WITH CHECK (x > 0)";
+        let p = parse_alter_policy_sql(sql).unwrap();
+        assert_eq!(p.roles.as_ref().unwrap(), &["public"]);
+        assert_eq!(
+            p.using_expr.as_ref().unwrap().as_deref(),
+            Some("visible")
+        );
+        assert_eq!(
+            p.with_check_expr.as_ref().unwrap().as_deref(),
+            Some("x > 0")
+        );
+    }
+
+    #[test]
+    fn test_parse_alter_policy_no_changes_fails() {
+        let sql = "ALTER POLICY pol ON t";
+        assert!(parse_alter_policy_sql(sql).is_err());
     }
 
     #[test]
