@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 use super::super::errors::sqlstate_for_executor_error;
 use super::super::tenant::parse_tenant_username;
 use super::super::{
-    parse_startup_options, PgServerParameterProvider, METADATA_ACTUAL_USER,
+    startup_setting_overrides, PgServerParameterProvider, METADATA_ACTUAL_USER,
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
 
@@ -507,24 +507,9 @@ impl StartupHandler for DynamicPgHandler {
 
                             {
                                 let mut session = self.auth().session.lock().await;
-                                if let Some(options) = client.metadata().get("options") {
-                                    for (key, value) in parse_startup_options(options) {
-                                        if let Err(e) = session
-                                            .set_known_setting(&key.to_ascii_lowercase(), value)
-                                        {
-                                            warn!("Failed to apply startup option {}: {}", key, e);
-                                        }
-                                    }
-                                }
-
-                                if let Some(app_name) = client.metadata().get("application_name") {
-                                    if let Err(e) = session
-                                        .set_known_setting("application_name", app_name.clone())
-                                    {
-                                        warn!(
-                                            "Failed to apply application_name from startup: {}",
-                                            e
-                                        );
+                                for (key, value) in startup_setting_overrides(client) {
+                                    if let Err(e) = session.set_known_setting(&key, value) {
+                                        warn!("Failed to apply startup option {}: {}", key, e);
                                     }
                                 }
                             }

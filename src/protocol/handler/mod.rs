@@ -1,8 +1,10 @@
 use crate::model::DataType;
+use crate::sql::executor::core::is_server_reserved_guc;
 use crate::sql::{ExecuteResult, Session};
 use futures::{Sink, SinkExt};
 use pgwire::api::portal::Format;
 use pgwire::api::results::Response;
+use pgwire::api::ClientInfo;
 // Re-exported for tests (via `use super::*`)
 #[allow(unused_imports)]
 use pgwire::api::results::{FieldFormat, FieldInfo};
@@ -208,6 +210,30 @@ fn parse_startup_options(options: &str) -> Vec<(String, String)> {
         }
         i += 1;
     }
+    settings
+}
+
+/// Collect client-supplied startup setting overrides that may be applied to a session.
+///
+/// Server-reserved namespaces (`request.jwt.*`, `auth.*`) are filtered here so the
+/// client cannot spoof trusted auth/JWT context through the pgwire startup packet.
+pub(crate) fn startup_setting_overrides<C: ClientInfo>(client: &C) -> Vec<(String, String)> {
+    let mut settings = Vec::new();
+
+    if let Some(options) = client.metadata().get("options") {
+        for (key, value) in parse_startup_options(options) {
+            let lowered = key.to_ascii_lowercase();
+            if is_server_reserved_guc(&lowered) {
+                continue;
+            }
+            settings.push((lowered, value));
+        }
+    }
+
+    if let Some(app_name) = client.metadata().get("application_name") {
+        settings.push(("application_name".to_string(), app_name.clone()));
+    }
+
     settings
 }
 
