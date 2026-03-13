@@ -1,22 +1,20 @@
-# RLS EXPLAIN assertions — all positive (presence) checks
-# Absence-of-filter bypass cases are covered by rls_select.sql
+# RLS EXPLAIN assertions — each line is globally unique in the test output
+# so substring matching validates per-query behavior.
 
-# Q1: Default-deny (no policies, RLS enabled) — injects WHERE false
+# Q1: Default-deny (no policies) — only this query produces "Filter: false"
 Filter: false
 
-# Q2: Permissive policy — shows owner = current_user predicate
-owner = 'rls_exp_user'::text
+# Q2: Permissive policy — unique because Q4/Q6 produce longer Filter lines
+Filter: (owner = 'rls_exp_user'::text)
 
-# Q3: Actual results — only own rows visible
-rls_exp_user|visible
-rls_exp_user|also visible
+# Q3: Permissive results — unique "q3:" prefix
+q3:1,3
 
-# Q4: Restrictive + permissive — both predicates appear with AND
-(id > 1)
+# Q4: Restrictive+permissive AND — unique combined predicate
+(owner = 'rls_exp_user'::text) AND (id > 1)
 
-# Q5: Restrictive narrows results — only id=3 visible
-3|rls_exp_user|also visible
+# Q5: Restrictive narrows results — unique "q5:" prefix
+q5:3
 
-# Q6: User WHERE clause coexists with RLS filter
-(data = 'visible'::text)
-owner = 'rls_exp_user'::text
+# Q6: User WHERE coexists with RLS — unique triple-predicate combination
+(data = 'visible'::text) AND ((owner = 'rls_exp_user'::text) AND (id > 1))
