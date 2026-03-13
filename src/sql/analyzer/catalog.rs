@@ -262,6 +262,26 @@ impl CatalogSnapshot {
         result
     }
 
+    /// Returns `true` if any real (non-virtual) base table in the snapshot
+    /// has Row Level Security enabled. Used at Parse time to flag prepared
+    /// statements as `rls_sensitive` so EXECUTE falls back to text re-analysis.
+    pub fn has_rls_enabled_table(&self) -> bool {
+        for (qualified_name, schema) in self.tables.values() {
+            if self.non_base_names.contains(qualified_name.as_str()) {
+                continue;
+            }
+            if qualified_name.starts_with("information_schema.")
+                || qualified_name.starts_with("pg_catalog.")
+            {
+                continue;
+            }
+            if schema.rls_enabled {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Merge tables from another snapshot into this one (for DML + subquery).
     pub fn merge_from(&mut self, other: &CatalogSnapshot) {
         for (key, (qualified, schema)) in &other.tables {

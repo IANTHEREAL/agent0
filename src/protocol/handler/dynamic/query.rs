@@ -926,6 +926,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                     base_table_names,
                                     table_versions,
                                     has_recursive_cte,
+                                    rls_sensitive,
                                 } => {
                                     let required_privileges = base_table_names
                                         .into_iter()
@@ -947,7 +948,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                         output_schema,
                                         param_data_types: param_types,
                                         table_versions,
-                                        rls_sensitive: false,
+                                        rls_sensitive,
                                     };
                                 }
                                 PreparedAnalysis::Dml {
@@ -955,6 +956,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                     output_schema,
                                     param_types,
                                     table_versions,
+                                    rls_sensitive,
                                 } => {
                                     let required_privileges =
                                         PreparedStatement::compute_privileges(&analyzed, &[]);
@@ -971,7 +973,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                         output_schema,
                                         param_data_types: param_types,
                                         table_versions,
-                                        rls_sensitive: false,
+                                        rls_sensitive,
                                     };
                                 }
                                 PreparedAnalysis::Utility => {

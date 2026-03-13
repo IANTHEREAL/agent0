@@ -25,6 +25,7 @@ pub enum PreparedAnalysis {
         base_table_names: Vec<String>,
         table_versions: Vec<(String, u64, u64)>,
         has_recursive_cte: bool,
+        rls_sensitive: bool,
     },
     /// INSERT / UPDATE / DELETE — analyzed DML IR.
     Dml {
@@ -32,6 +33,7 @@ pub enum PreparedAnalysis {
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
         table_versions: Vec<(String, u64, u64)>,
+        rls_sensitive: bool,
     },
     /// DDL / utility / non-analyzable statement.
     Utility,
@@ -157,6 +159,7 @@ impl Executor {
                     _ => None,
                 };
                 let has_recursive_cte = query_contains_recursive_cte(&expanded);
+                let rls_sensitive = catalog.has_rls_enabled_table();
 
                 crate::sql::stack_safety::drop_on_grown_stack(expanded);
 
@@ -169,6 +172,7 @@ impl Executor {
                     base_table_names,
                     table_versions,
                     has_recursive_cte,
+                    rls_sensitive,
                 })
             }
 
@@ -199,12 +203,14 @@ impl Executor {
                     AnalyzedStatement::Delete(d) => returning_schema(&d.returning),
                 };
                 let table_versions = catalog.base_table_versions();
+                let rls_sensitive = catalog.has_rls_enabled_table();
 
                 Ok(PreparedAnalysis::Dml {
                     analyzed: analyzed_stmt,
                     output_schema,
                     param_types,
                     table_versions,
+                    rls_sensitive,
                 })
             }
 
