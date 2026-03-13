@@ -62,8 +62,9 @@ pub(crate) use metadata_keys::{
     encode_comment_prefix_v2, encode_comment_table_key_v2,
 };
 pub use serialization::{
-    deserialize_function_def, deserialize_row, deserialize_schema, serialize_function_def,
-    serialize_row, serialize_schema,
+    deserialize_function_def, deserialize_materialized_view_def, deserialize_row,
+    deserialize_schema, deserialize_view_def, serialize_function_def,
+    serialize_materialized_view_def, serialize_row, serialize_schema, serialize_view_def,
 };
 pub use value_encoding::{decode_pk_from_index_suffix, decode_value_memcomparable};
 

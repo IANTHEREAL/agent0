@@ -27,7 +27,7 @@ impl TikvStore {
                 .ok_or_else(|| anyhow!("View '{}' does not exist", name))?;
             def.query = query.to_string();
             def.deps = deps;
-            let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
+            let data = serialize_view_def(&def)?;
             txn_put(txn, key, data).await?;
             let bindings = bincode::serialize(&relation_bindings)
                 .context("Failed to serialize view relation bindings")?;
@@ -47,7 +47,7 @@ impl TikvStore {
             deps,
             security_definer: false,
         };
-        let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
+        let data = serialize_view_def(&def)?;
         txn_put(txn, key, data).await?;
         let bindings = bincode::serialize(&relation_bindings)
             .context("Failed to serialize view relation bindings")?;
@@ -65,8 +65,7 @@ impl TikvStore {
         let key = self.key(&encode_view_key_v2(db_id, name));
         match tikv_op!(txn.get(key).await)? {
             Some(data) => {
-                let def: ViewDef =
-                    bincode::deserialize(&data).context("Failed to deserialize view definition")?;
+                let def: ViewDef = deserialize_view_def(&data)?;
                 Ok(Some(def))
             }
             None => Ok(None),
@@ -87,7 +86,7 @@ impl TikvStore {
             .await?
             .ok_or_else(|| anyhow!("View '{}' does not exist", name))?;
         def.query = query.to_string();
-        let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
+        let data = serialize_view_def(&def)?;
         txn_put(txn, key, data).await?;
         Ok(())
     }
@@ -118,8 +117,7 @@ impl TikvStore {
             if !is_definition_key(key_bytes, &prefix, &bindings_prefix) {
                 continue;
             }
-            let def: ViewDef = bincode::deserialize(pair.value())
-                .context("Failed to deserialize view definition")?;
+            let def: ViewDef = deserialize_view_def(pair.value())?;
             views.push(def);
         }
         Ok(views)
@@ -177,7 +175,7 @@ impl TikvStore {
             query: query.to_string(),
             deps,
         };
-        let data = bincode::serialize(&def).context("Failed to serialize matview definition")?;
+        let data = serialize_materialized_view_def(&def)?;
         txn_put(txn, key, data).await?;
         let bindings = bincode::serialize(&relation_bindings)
             .context("Failed to serialize matview relation bindings")?;
@@ -195,8 +193,7 @@ impl TikvStore {
         let key = self.key(&encode_matview_key_v2(db_id, name));
         match tikv_op!(txn.get(key).await)? {
             Some(data) => {
-                let def: MatViewDef = bincode::deserialize(&data)
-                    .context("Failed to deserialize matview definition")?;
+                let def = deserialize_materialized_view_def(&data, name)?;
                 Ok(Some(def))
             }
             None => Ok(None),
@@ -217,7 +214,7 @@ impl TikvStore {
             .await?
             .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", name))?;
         def.query = query.to_string();
-        let data = bincode::serialize(&def).context("Failed to serialize matview definition")?;
+        let data = serialize_materialized_view_def(&def)?;
         txn_put(txn, key, data).await?;
         Ok(())
     }
@@ -257,8 +254,8 @@ impl TikvStore {
             if !is_definition_key(key, &prefix, &bindings_prefix) {
                 continue;
             }
-            let def: MatViewDef = bincode::deserialize(pair.value())
-                .context("Failed to deserialize matview definition")?;
+            let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            let def = deserialize_materialized_view_def(pair.value(), &name)?;
             matviews.push(def);
         }
         Ok(matviews)

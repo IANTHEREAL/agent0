@@ -136,6 +136,52 @@ pub struct User {
     pub bypass_rls: bool,
 }
 
+/// Legacy User struct without the `bypass_rls` field, for backward-compatible
+/// bincode deserialization of data written before the RLS BYPASSRLS feature.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct UserLegacy {
+    name: String,
+    password_hash: String,
+    password_salt: String,
+    roles: HashSet<String>,
+    privileges: Vec<GrantedPrivilege>,
+    is_superuser: bool,
+    can_login: bool,
+    can_create_db: bool,
+    can_create_role: bool,
+    connection_limit: i32,
+    valid_until: Option<i64>,
+}
+
+impl From<UserLegacy> for User {
+    fn from(legacy: UserLegacy) -> Self {
+        Self {
+            name: legacy.name,
+            password_hash: legacy.password_hash,
+            password_salt: legacy.password_salt,
+            roles: legacy.roles,
+            privileges: legacy.privileges,
+            is_superuser: legacy.is_superuser,
+            can_login: legacy.can_login,
+            can_create_db: legacy.can_create_db,
+            can_create_role: legacy.can_create_role,
+            connection_limit: legacy.connection_limit,
+            valid_until: legacy.valid_until,
+            bypass_rls: false,
+        }
+    }
+}
+
+/// Deserialize a User from bincode, falling back to the legacy format (without
+/// `bypass_rls`) if the data was written before the BYPASSRLS feature.
+fn deserialize_user(data: &[u8]) -> Result<User> {
+    match bincode::deserialize::<User>(data) {
+        Ok(user) => Ok(user),
+        Err(_) => Ok(bincode::deserialize::<UserLegacy>(data)?.into()),
+    }
+}
+
 impl User {
     pub fn new(name: &str, password: &str) -> Self {
         let salt = super::password::generate_salt();
@@ -265,6 +311,40 @@ pub struct Role {
     pub can_create_role: bool,
     #[serde(default)]
     pub bypass_rls: bool,
+}
+
+/// Legacy Role struct without `bypass_rls`.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct RoleLegacy {
+    name: String,
+    privileges: Vec<GrantedPrivilege>,
+    member_of: HashSet<String>,
+    is_superuser: bool,
+    can_create_db: bool,
+    can_create_role: bool,
+}
+
+impl From<RoleLegacy> for Role {
+    fn from(legacy: RoleLegacy) -> Self {
+        Self {
+            name: legacy.name,
+            privileges: legacy.privileges,
+            member_of: legacy.member_of,
+            is_superuser: legacy.is_superuser,
+            can_create_db: legacy.can_create_db,
+            can_create_role: legacy.can_create_role,
+            bypass_rls: false,
+        }
+    }
+}
+
+/// Deserialize a Role from bincode, falling back to the legacy format.
+fn deserialize_role(data: &[u8]) -> Result<Role> {
+    match bincode::deserialize::<Role>(data) {
+        Ok(role) => Ok(role),
+        Err(_) => Ok(bincode::deserialize::<RoleLegacy>(data)?.into()),
+    }
 }
 
 impl Role {
@@ -503,7 +583,7 @@ impl AuthManager {
         let range: tikv_client::BoundRange = (prefix..end).into();
         let pairs = txn.scan(range, SCAN_LIMIT).await?;
         for pair in pairs {
-            let user: User = bincode::deserialize(pair.value())?;
+            let user: User = deserialize_user(pair.value())?;
             if user.is_superuser {
                 return Ok(true);
             }
@@ -524,7 +604,7 @@ impl AuthManager {
     pub async fn get_user(&self, txn: &mut Transaction, username: &str) -> Result<Option<User>> {
         let key = self.user_key(username);
         match txn.get(key).await? {
-            Some(data) => Ok(Some(bincode::deserialize(&data)?)),
+            Some(data) => Ok(Some(deserialize_user(&data)?)),
             None => Ok(None),
         }
     }
@@ -583,7 +663,7 @@ impl AuthManager {
     pub async fn get_role(&self, txn: &mut Transaction, rolename: &str) -> Result<Option<Role>> {
         let key = self.role_key(rolename);
         match txn.get(key).await? {
-            Some(data) => Ok(Some(bincode::deserialize(&data)?)),
+            Some(data) => Ok(Some(deserialize_role(&data)?)),
             None => Ok(None),
         }
     }
@@ -723,7 +803,7 @@ impl AuthManager {
 
         let mut users = Vec::new();
         for pair in pairs {
-            let user: User = bincode::deserialize(pair.value())?;
+            let user: User = deserialize_user(pair.value())?;
             users.push(user);
         }
         Ok(users)
@@ -739,7 +819,7 @@ impl AuthManager {
 
         let mut roles = Vec::new();
         for pair in pairs {
-            let role: Role = bincode::deserialize(pair.value())?;
+            let role: Role = deserialize_role(pair.value())?;
             roles.push(role);
         }
         Ok(roles)
@@ -855,6 +935,45 @@ mod tests {
         assert_eq!(role.name, "readonly");
         assert!(role.privileges.is_empty());
         assert!(!role.is_superuser);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_user_defaults_bypass_rls_false() {
+        let data = bincode::serialize(&UserLegacy {
+            name: "legacy_user".into(),
+            password_hash: "hash".into(),
+            password_salt: "salt".into(),
+            roles: HashSet::new(),
+            privileges: Vec::new(),
+            is_superuser: false,
+            can_login: true,
+            can_create_db: false,
+            can_create_role: false,
+            connection_limit: -1,
+            valid_until: None,
+        })
+        .unwrap();
+
+        let user = deserialize_user(&data).unwrap();
+        assert_eq!(user.name, "legacy_user");
+        assert!(!user.bypass_rls);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_role_defaults_bypass_rls_false() {
+        let data = bincode::serialize(&RoleLegacy {
+            name: "legacy_role".into(),
+            privileges: Vec::new(),
+            member_of: HashSet::new(),
+            is_superuser: false,
+            can_create_db: false,
+            can_create_role: false,
+        })
+        .unwrap();
+
+        let role = deserialize_role(&data).unwrap();
+        assert_eq!(role.name, "legacy_role");
+        assert!(!role.bypass_rls);
     }
 
     #[test]

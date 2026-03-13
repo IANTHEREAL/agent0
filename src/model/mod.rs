@@ -1061,6 +1061,6 @@ mod tests {
 }
 
 #[allow(clippy::items_after_test_module)]
-fn default_owner() -> String {
+pub(crate) fn default_owner() -> String {
     "postgres".to_string()
 }

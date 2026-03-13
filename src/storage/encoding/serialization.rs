@@ -10,9 +10,12 @@
 //! V2 uses MessagePack named-map mode so `#[serde(default)]` works
 //! natively — future field additions need zero legacy structs.
 
-use crate::model::{FunctionDef, Row, TableSchema};
+use crate::model::{default_owner, FunctionDef, MatViewDef, Row, TableSchema, ViewDef};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use sqlparser::ast::Statement;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use std::sync::LazyLock;
 
 const SCHEMA_MAGIC_V2: &[u8] = b"DB9_SCHEMA_V2\0";
@@ -93,18 +96,228 @@ pub fn serialize_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// DB9_FUNCTION_V1 bincode eras (newest first):
+// - current: +security_definer
+// - era 1: pre-security-definer
+// - era 0: pre-owner
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct FunctionDefEra1 {
+    #[serde(default)]
+    oid: u32,
+    schema: String,
+    name: String,
+    arg_types: Vec<String>,
+    return_type: String,
+    language: String,
+    body: String,
+    owner: String,
+}
+
+impl From<FunctionDefEra1> for FunctionDef {
+    fn from(legacy: FunctionDefEra1) -> Self {
+        Self {
+            oid: legacy.oid,
+            schema: legacy.schema,
+            name: legacy.name,
+            arg_types: legacy.arg_types,
+            return_type: legacy.return_type,
+            language: legacy.language,
+            body: legacy.body,
+            owner: legacy.owner,
+            security_definer: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct FunctionDefEra0 {
+    #[serde(default)]
+    oid: u32,
+    schema: String,
+    name: String,
+    arg_types: Vec<String>,
+    return_type: String,
+    language: String,
+    body: String,
+}
+
+impl From<FunctionDefEra0> for FunctionDef {
+    fn from(legacy: FunctionDefEra0) -> Self {
+        Self {
+            oid: legacy.oid,
+            schema: legacy.schema,
+            name: legacy.name,
+            arg_types: legacy.arg_types,
+            return_type: legacy.return_type,
+            language: legacy.language,
+            body: legacy.body,
+            owner: default_owner(),
+            security_definer: false,
+        }
+    }
+}
+
 pub fn deserialize_function_def(data: &[u8]) -> Result<FunctionDef> {
     const FUNCTION_MAGIC: &[u8] = b"DB9_FUNCTION_V1\0";
     let payload = data.strip_prefix(FUNCTION_MAGIC).context(
         "Function data missing DB9_FUNCTION_V1 header (V1 legacy format no longer supported)",
     )?;
-    bincode::deserialize(payload).context("Failed to deserialize function definition")
+    if let Ok(def) = bincode::deserialize::<FunctionDef>(payload) {
+        return Ok(def);
+    }
+    if let Ok(def) = bincode::deserialize::<FunctionDefEra1>(payload) {
+        return Ok(def.into());
+    }
+    if let Ok(def) = bincode::deserialize::<FunctionDefEra0>(payload) {
+        return Ok(def.into());
+    }
+    anyhow::bail!(
+        "Failed to deserialize function definition (tried current, era-1/pre-security-definer, era-0/pre-owner)"
+    )
+}
+
+pub fn serialize_view_def(def: &ViewDef) -> Result<Vec<u8>> {
+    bincode::serialize(def).context("Failed to serialize view definition")
+}
+
+pub fn serialize_materialized_view_def(def: &MatViewDef) -> Result<Vec<u8>> {
+    bincode::serialize(def).context("Failed to serialize matview definition")
+}
+
+// View definition bincode eras (newest first):
+// - current: +owner +deps +security_definer
+// - era 2: pre-security-definer
+// - era 1: pre-owner
+// - era 0: pre-deps
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct ViewDefEra2 {
+    oid: u32,
+    schema: String,
+    name: String,
+    owner: String,
+    query: String,
+    deps: Vec<String>,
+}
+
+impl From<ViewDefEra2> for ViewDef {
+    fn from(legacy: ViewDefEra2) -> Self {
+        Self {
+            oid: legacy.oid,
+            schema: legacy.schema,
+            name: legacy.name,
+            owner: legacy.owner,
+            query: legacy.query,
+            deps: legacy.deps,
+            security_definer: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct ViewDefEra1 {
+    oid: u32,
+    schema: String,
+    name: String,
+    query: String,
+    deps: Vec<String>,
+}
+
+impl From<ViewDefEra1> for ViewDef {
+    fn from(legacy: ViewDefEra1) -> Self {
+        Self {
+            oid: legacy.oid,
+            schema: legacy.schema,
+            name: legacy.name,
+            owner: default_owner(),
+            query: legacy.query,
+            deps: legacy.deps,
+            security_definer: false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct ViewDefEra0 {
+    #[serde(default)]
+    oid: u32,
+    schema: String,
+    name: String,
+    query: String,
+}
+
+impl From<ViewDefEra0> for ViewDef {
+    fn from(legacy: ViewDefEra0) -> Self {
+        Self {
+            oid: legacy.oid,
+            schema: legacy.schema,
+            name: legacy.name,
+            owner: default_owner(),
+            query: legacy.query,
+            deps: Vec::new(),
+            security_definer: false,
+        }
+    }
+}
+
+pub fn deserialize_view_def(data: &[u8]) -> Result<ViewDef> {
+    if let Ok(def) = bincode::deserialize::<ViewDef>(data) {
+        return Ok(def);
+    }
+    if let Ok(def) = bincode::deserialize::<ViewDefEra2>(data) {
+        return Ok(def.into());
+    }
+    if let Ok(def) = bincode::deserialize::<ViewDefEra1>(data) {
+        return Ok(def.into());
+    }
+    if let Ok(def) = bincode::deserialize::<ViewDefEra0>(data) {
+        return Ok(def.into());
+    }
+    anyhow::bail!(
+        "Failed to deserialize view definition (tried current, era-2/pre-security-definer, era-1/pre-owner, era-0/pre-deps)"
+    )
+}
+
+pub fn deserialize_materialized_view_def(data: &[u8], full_name: &str) -> Result<MatViewDef> {
+    if let Ok(def) = bincode::deserialize::<MatViewDef>(data) {
+        return Ok(def);
+    }
+
+    let query = decode_legacy_materialized_view_query(data)?;
+    let (schema, name) = split_relation_name(full_name);
+    Ok(MatViewDef {
+        schema: schema.to_string(),
+        name: name.to_string(),
+        query,
+        deps: Vec::new(),
+    })
+}
+
+fn decode_legacy_materialized_view_query(data: &[u8]) -> Result<String> {
+    let query = std::str::from_utf8(data)
+        .context("Failed to deserialize matview definition as bincode or legacy UTF-8 SQL")?
+        .to_string();
+    let dialect = PostgreSqlDialect {};
+    let stmts = Parser::parse_sql(&dialect, &query)
+        .context("Failed to parse legacy materialized view SQL")?;
+    match stmts.as_slice() {
+        [Statement::Query(_)] => Ok(query),
+        _ => anyhow::bail!("Legacy materialized view SQL is not a single query"),
+    }
+}
+
+fn split_relation_name(full_name: &str) -> (&str, &str) {
+    full_name.split_once('.').unwrap_or(("public", full_name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ColumnDef, DataType, IndexDef};
+    use crate::model::{default_owner, ColumnDef, DataType, IndexDef};
     use crate::worker::types::IndexState;
 
     fn sample_schema() -> TableSchema {
@@ -235,6 +448,140 @@ mod tests {
         assert_eq!(index.hnsw_m, Some(32));
         assert_eq!(index.hnsw_ef_construction, Some(128));
         assert_eq!(index.hnsw_distance_metric.as_deref(), Some("ip"));
+    }
+
+    #[test]
+    fn function_deserializer_accepts_pre_security_definer_bytes() {
+        let mut data = Vec::from(b"DB9_FUNCTION_V1\0".as_slice());
+        data.extend(
+            bincode::serialize(&FunctionDefEra1 {
+                oid: 42,
+                schema: "public".into(),
+                name: "legacy_func".into(),
+                arg_types: vec!["int4".into()],
+                return_type: "int4".into(),
+                language: "sql".into(),
+                body: "SELECT 1".into(),
+                owner: "admin".into(),
+            })
+            .unwrap(),
+        );
+
+        let decoded = deserialize_function_def(&data).unwrap();
+        assert_eq!(decoded.oid, 42);
+        assert_eq!(decoded.owner, "admin");
+        assert!(!decoded.security_definer);
+    }
+
+    #[test]
+    fn function_deserializer_uses_canonical_owner_default_for_pre_owner_bytes() {
+        let mut data = Vec::from(b"DB9_FUNCTION_V1\0".as_slice());
+        data.extend(
+            bincode::serialize(&FunctionDefEra0 {
+                oid: 7,
+                schema: "public".into(),
+                name: "legacy_ownerless_func".into(),
+                arg_types: vec![],
+                return_type: "text".into(),
+                language: "sql".into(),
+                body: "SELECT 'ok'".into(),
+            })
+            .unwrap(),
+        );
+
+        let decoded = deserialize_function_def(&data).unwrap();
+        assert_eq!(decoded.oid, 7);
+        assert_eq!(decoded.owner, default_owner());
+        assert!(!decoded.security_definer);
+    }
+
+    #[test]
+    fn view_deserializer_accepts_pre_owner_bytes() {
+        let data = bincode::serialize(&ViewDefEra1 {
+            oid: 9,
+            schema: "public".into(),
+            name: "legacy_view".into(),
+            query: "SELECT 1".into(),
+            deps: vec!["public.t".into()],
+        })
+        .unwrap();
+
+        let decoded = deserialize_view_def(&data).unwrap();
+        assert_eq!(decoded.oid, 9);
+        assert_eq!(decoded.owner, default_owner());
+        assert_eq!(decoded.deps, vec!["public.t".to_string()]);
+        assert!(!decoded.security_definer);
+    }
+
+    #[test]
+    fn view_deserializer_accepts_pre_security_definer_bytes() {
+        let data = bincode::serialize(&ViewDefEra2 {
+            oid: 10,
+            schema: "public".into(),
+            name: "legacy_view_with_owner".into(),
+            owner: "admin".into(),
+            query: "SELECT 1".into(),
+            deps: vec!["public.t".into()],
+        })
+        .unwrap();
+
+        let decoded = deserialize_view_def(&data).unwrap();
+        assert_eq!(decoded.oid, 10);
+        assert_eq!(decoded.owner, "admin");
+        assert_eq!(decoded.deps, vec!["public.t".to_string()]);
+        assert!(!decoded.security_definer);
+    }
+
+    #[test]
+    fn view_deserializer_accepts_pre_deps_bytes() {
+        let data = bincode::serialize(&ViewDefEra0 {
+            oid: 11,
+            schema: "public".into(),
+            name: "legacy_view_no_deps".into(),
+            query: "SELECT 1".into(),
+        })
+        .unwrap();
+
+        let decoded = deserialize_view_def(&data).unwrap();
+        assert_eq!(decoded.oid, 11);
+        assert_eq!(decoded.owner, default_owner());
+        assert!(decoded.deps.is_empty());
+        assert!(!decoded.security_definer);
+    }
+
+    #[test]
+    fn materialized_view_deserializer_accepts_current_bytes() {
+        let data = serialize_materialized_view_def(&MatViewDef {
+            schema: "public".into(),
+            name: "mv".into(),
+            query: "SELECT 1".into(),
+            deps: vec!["public.t".into()],
+        })
+        .unwrap();
+
+        let decoded = deserialize_materialized_view_def(&data, "public.mv").unwrap();
+        assert_eq!(decoded.schema, "public");
+        assert_eq!(decoded.name, "mv");
+        assert_eq!(decoded.query, "SELECT 1");
+        assert_eq!(decoded.deps, vec!["public.t".to_string()]);
+    }
+
+    #[test]
+    fn materialized_view_deserializer_accepts_legacy_plain_sql_bytes() {
+        let data = b"SELECT * FROM public.t".to_vec();
+
+        let decoded = deserialize_materialized_view_def(&data, "analytics.mv_sales").unwrap();
+        assert_eq!(decoded.schema, "analytics");
+        assert_eq!(decoded.name, "mv_sales");
+        assert_eq!(decoded.query, "SELECT * FROM public.t");
+        assert!(decoded.deps.is_empty());
+    }
+
+    #[test]
+    fn materialized_view_deserializer_rejects_non_query_legacy_sql() {
+        let err =
+            deserialize_materialized_view_def(b"CREATE TABLE t(id INT)", "public.mv").unwrap_err();
+        assert!(format!("{err}").contains("not a single query"));
     }
 
     #[test]
