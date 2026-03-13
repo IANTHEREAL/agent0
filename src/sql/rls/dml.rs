@@ -4,9 +4,7 @@
 //! DML statement. Created once per statement in `stmt_dml.rs`, then threaded into
 //! `execute_analyzed_insert/update/delete` and COPY paths.
 
-use super::policy::{
-    compile_rls_policy_expr, should_bypass_rls, CompiledRlsPolicy,
-};
+use super::policy::{compile_rls_policy_expr, should_bypass_rls, CompiledRlsPolicy};
 use crate::model::{RlsCommand, RlsPolicy, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::error::SqlError;
@@ -28,7 +26,9 @@ fn filter_applicable_policies<'a>(
     use super::policy::{command_matches, policy_applies_to_role};
     policies
         .iter()
-        .filter(|p| command_matches(&p.command, &command) && policy_applies_to_role(p, current_role))
+        .filter(|p| {
+            command_matches(&p.command, &command) && policy_applies_to_role(p, current_role)
+        })
         .collect()
 }
 
@@ -71,7 +71,10 @@ fn eval_rls_expr(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Result<boo
     match result {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
-        other => Err(anyhow!("RLS policy expression must evaluate to boolean, got {:?}", other)),
+        other => Err(anyhow!(
+            "RLS policy expression must evaluate to boolean, got {:?}",
+            other
+        )),
     }
 }
 
@@ -127,29 +130,51 @@ fn eval_combined_policies(
 }
 
 /// Validate row visibility through USING policies.
-fn validate_rls_using(policies: &[CompiledRlsPolicy], row: &Row, qctx: &QueryContext) -> Result<bool> {
+fn validate_rls_using(
+    policies: &[CompiledRlsPolicy],
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<bool> {
     eval_combined_policies(policies, row, qctx, false)
 }
 
 /// Validate row against WITH CHECK policies. Error 42501 on failure.
-fn validate_rls_with_check(schema: &TableSchema, policies: &[CompiledRlsPolicy], row: &Row, qctx: &QueryContext) -> Result<()> {
+fn validate_rls_with_check(
+    schema: &TableSchema,
+    policies: &[CompiledRlsPolicy],
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<()> {
     if !eval_combined_policies(policies, row, qctx, true)? {
         let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
         return Err(SqlError::InsufficientPrivilege {
-            message: format!("new row violates row-level security policy for table \"{}\"", short_table),
-        }.into());
+            message: format!(
+                "new row violates row-level security policy for table \"{}\"",
+                short_table
+            ),
+        }
+        .into());
     }
     Ok(())
 }
 
 /// Validate RETURNING rows against SELECT USING policies. Error 42501 on failure.
-fn validate_rls_returning(schema: &TableSchema, select_policies: &[CompiledRlsPolicy], rows: &[Row], qctx: &QueryContext) -> Result<()> {
+fn validate_rls_returning(
+    schema: &TableSchema,
+    select_policies: &[CompiledRlsPolicy],
+    rows: &[Row],
+    qctx: &QueryContext,
+) -> Result<()> {
     for row in rows {
         if !validate_rls_using(select_policies, row, qctx)? {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
             return Err(SqlError::InsufficientPrivilege {
-                message: format!("new row violates row-level security policy for table \"{}\"", short_table),
-            }.into());
+                message: format!(
+                    "new row violates row-level security policy for table \"{}\"",
+                    short_table
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -183,6 +208,7 @@ pub struct RlsDmlContext {
     /// Pre-combined as a single `TypedExpr` for efficient injection.
     /// TODO: Build as TypedExpr for injection into AnalyzedUpdate/Delete.where_clause.
     /// For now, per-row evaluation via `visibility_policies` handles correctness.
+    #[allow(dead_code)]
     pub using_predicate: Option<TypedExpr>,
 }
 
@@ -332,16 +358,6 @@ impl RlsDmlContext {
         })
     }
 
-    /// Build RLS context for COPY FROM (same as INSERT WITH CHECK).
-    pub fn for_copy_from(
-        schema: &TableSchema,
-        all_policies: &[RlsPolicy],
-        current_role: &str,
-        qctx: &QueryContext,
-    ) -> Result<Self> {
-        Self::for_insert(schema, all_policies, current_role, false, false, qctx)
-    }
-
     /// Validate a new/modified row against WITH CHECK policies.
     /// Used by INSERT (new row), UPDATE (post-update row), COPY FROM.
     pub fn check_row(&self, schema: &TableSchema, row: &Row, qctx: &QueryContext) -> Result<()> {
@@ -352,7 +368,10 @@ impl RlsDmlContext {
     /// Used by UPDATE/DELETE to filter pre-existing rows.
     /// Evaluates merged SELECT USING + command USING policies (PG semantics).
     pub fn is_row_visible(&self, row: &Row, qctx: &QueryContext) -> Result<bool> {
-        let policies = self.visibility_policies.as_deref().unwrap_or(&self.command_policies);
+        let policies = self
+            .visibility_policies
+            .as_deref()
+            .unwrap_or(&self.command_policies);
         validate_rls_using(policies, row, qctx)
     }
 
@@ -406,9 +425,14 @@ where
     let all_policies = load_policies_fn().await?;
 
     let ctx = match command {
-        RlsCommand::Insert => {
-            RlsDmlContext::for_insert(schema, &all_policies, role, has_returning, has_on_conflict_update, qctx)?
-        }
+        RlsCommand::Insert => RlsDmlContext::for_insert(
+            schema,
+            &all_policies,
+            role,
+            has_returning,
+            has_on_conflict_update,
+            qctx,
+        )?,
         RlsCommand::Update => {
             RlsDmlContext::for_update(schema, &all_policies, role, has_returning, qctx)?
         }
@@ -496,7 +520,8 @@ mod tests {
             with_check_expr: Some("user_id = 'alice'".into()),
         }];
 
-        let ctx = RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx).unwrap();
+        let ctx =
+            RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx).unwrap();
 
         let good_row = Row::new(vec![Value::Int32(1), Value::Text("alice".into())]);
         ctx.check_row(&schema, &good_row, &qctx).unwrap();
@@ -533,7 +558,8 @@ mod tests {
             },
         ];
 
-        let ctx = RlsDmlContext::for_insert(&schema, &policies, "alice", true, false, &qctx).unwrap();
+        let ctx =
+            RlsDmlContext::for_insert(&schema, &policies, "alice", true, false, &qctx).unwrap();
 
         // Returning alice's row → OK
         let alice_row = Row::new(vec![Value::Int32(1), Value::Text("alice".into())]);
@@ -560,7 +586,8 @@ mod tests {
             with_check_expr: Some("true".into()),
         }];
 
-        let ctx = RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx).unwrap();
+        let ctx =
+            RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx).unwrap();
         assert!(ctx.select_policies.is_none());
         // check_returning is a no-op when select_policies is None
         let any_row = Row::new(vec![Value::Int32(1), Value::Text("bob".into())]);

@@ -666,16 +666,15 @@ impl Executor {
 
                 // RLS: validate row against INSERT WITH CHECK policies.
                 if let Some(ref rls) = rls_ctx {
-                    rls.check_row(&table_schema, &row, &qctx)
-                        .map_err(|e| {
-                            anyhow!(
-                                "COPY {}, row group {}, row {}: {}",
-                                short_table,
-                                row_group_num,
-                                row_in_group,
-                                e
-                            )
-                        })?;
+                    rls.check_row(&table_schema, &row, &qctx).map_err(|e| {
+                        anyhow!(
+                            "COPY {}, row group {}, row {}: {}",
+                            short_table,
+                            row_group_num,
+                            row_in_group,
+                            e
+                        )
+                    })?;
                 }
 
                 // Insert the row (handles indexes, FK etc)

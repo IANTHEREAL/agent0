@@ -118,10 +118,8 @@ impl Executor {
                             &ins.table_name,
                         )
                         .await?;
-                        let has_on_conflict_update = matches!(
-                            ins.on_conflict,
-                            Some(AnalyzedOnConflict::DoUpdate { .. })
-                        );
+                        let has_on_conflict_update =
+                            matches!(ins.on_conflict, Some(AnalyzedOnConflict::DoUpdate { .. }));
                         if has_on_conflict_update {
                             self.require_table_privilege(
                                 txn,
@@ -142,8 +140,15 @@ impl Executor {
                                 has_on_conflict_update,
                             )
                             .await?;
-                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, &ins, rls_ctx.as_ref())
-                            .await
+                        self.execute_analyzed_insert(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &ins,
+                            rls_ctx.as_ref(),
+                        )
+                        .await
                     }
                     _ => unreachable!("INSERT statement should analyze to AnalyzedInsert"),
                 }
@@ -180,8 +185,15 @@ impl Executor {
                                 false,
                             )
                             .await?;
-                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, &del, rls_ctx.as_ref())
-                            .await
+                        self.execute_analyzed_delete(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &del,
+                            rls_ctx.as_ref(),
+                        )
+                        .await
                     }
                     _ => unreachable!("DELETE statement should analyze to AnalyzedDelete"),
                 }
@@ -218,8 +230,15 @@ impl Executor {
                                 false,
                             )
                             .await?;
-                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, &upd, rls_ctx.as_ref())
-                            .await
+                        self.execute_analyzed_update(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &upd,
+                            rls_ctx.as_ref(),
+                        )
+                        .await
                     }
                     _ => unreachable!("UPDATE statement should analyze to AnalyzedUpdate"),
                 }
