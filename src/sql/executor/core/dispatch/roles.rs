@@ -38,6 +38,11 @@ impl Executor {
                         .map(|u| u.is_superuser)
                         .or_else(|| role.as_ref().map(|r| r.is_superuser))
                         .ok_or_else(|| anyhow!("role \"{}\" does not exist", role_name))?;
+                    let bypass_rls = user
+                        .as_ref()
+                        .map(|u| u.bypass_rls)
+                        .or_else(|| role.as_ref().map(|r| r.bypass_rls))
+                        .unwrap_or(false);
 
                     let session_user_def = self.auth_manager.get_user(txn, &session_user).await?;
                     let can_set_role = match session_user_def.as_ref() {
@@ -52,7 +57,7 @@ impl Executor {
                         }
                         .into());
                     }
-                    Ok::<bool, anyhow::Error>(is_superuser)
+                    Ok::<(bool, bool), anyhow::Error>((is_superuser, bypass_rls))
                 }
                 .await;
 
@@ -67,8 +72,8 @@ impl Executor {
                     }
                 }
 
-                let is_superuser = result?;
-                session.set_current_role(role_name, is_superuser);
+                let (is_superuser, bypass_rls) = result?;
+                session.set_current_role(role_name, is_superuser, bypass_rls);
             }
         } else {
             // `SET ROLE NONE` (and our `RESET ROLE` rewrite) resets to the
@@ -111,13 +116,14 @@ mod tests {
             obs,
             "app_user".to_string(),
             false,
+            false,
             1,
             1,
             "postgres".to_string(),
             0,
             0,
         );
-        session.set_current_role("other".to_string(), false);
+        session.set_current_role("other".to_string(), false, false);
         let out = executor
             .execute_set_role(&mut session, &None)
             .await
@@ -139,13 +145,14 @@ mod tests {
             obs,
             "app_user".to_string(),
             false,
+            false,
             1,
             1,
             "postgres".to_string(),
             0,
             0,
         );
-        session.set_current_role("other".to_string(), false);
+        session.set_current_role("other".to_string(), false, false);
         let role_ident = sqlparser::ast::Ident::new("default");
         let out = executor
             .execute_set_role(&mut session, &Some(role_ident))

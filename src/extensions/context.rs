@@ -23,15 +23,17 @@ pub enum EmbeddingExecutionMode {
 #[derive(Clone)]
 pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
+    pub(crate) bypass_rls: bool,
     pub(crate) tenant_keyspace: String,
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
 }
 
 impl ExtensionContextOpts {
-    pub(crate) fn statement(is_superuser: bool, tenant_keyspace: &str) -> Self {
+    pub(crate) fn statement(is_superuser: bool, bypass_rls: bool, tenant_keyspace: &str) -> Self {
         Self {
             is_superuser,
+            bypass_rls,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
@@ -41,6 +43,7 @@ impl ExtensionContextOpts {
     pub(crate) fn cron(tenant_keyspace: &str) -> Self {
         Self {
             is_superuser: true,
+            bypass_rls: true, // Cron runs as superuser, implicitly bypasses RLS
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
@@ -55,6 +58,7 @@ impl ExtensionContextOpts {
 
 pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,
+    pub(crate) bypass_rls: bool,
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     http_requests: Cell<u32>,
@@ -88,7 +92,7 @@ pub(crate) async fn with_context<R>(
     future: impl Future<Output = R>,
 ) -> R {
     with_context_opts(
-        ExtensionContextOpts::statement(is_superuser, tenant_keyspace),
+        ExtensionContextOpts::statement(is_superuser, false, tenant_keyspace),
         future,
     )
     .await
@@ -100,6 +104,7 @@ pub(crate) async fn with_context_opts<R>(
 ) -> R {
     let ctx = ExtensionContext {
         is_superuser: opts.is_superuser,
+        bypass_rls: opts.bypass_rls,
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         http_requests: Cell::new(0),
@@ -123,6 +128,10 @@ pub(crate) async fn with_context_opts<R>(
 
 pub(crate) fn is_superuser() -> bool {
     CTX.try_with(|ctx| ctx.is_superuser).unwrap_or(false)
+}
+
+pub(crate) fn bypass_rls() -> bool {
+    CTX.try_with(|ctx| ctx.bypass_rls).unwrap_or(false)
 }
 
 pub(crate) fn tenant_keyspace() -> Option<String> {

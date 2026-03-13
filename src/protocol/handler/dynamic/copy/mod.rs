@@ -501,6 +501,7 @@ mod tests {
         let runtime = StatementRuntimeContext {
             settings: RuntimeSettings {
                 is_superuser: false,
+                bypass_rls: false,
                 timezone: Arc::from("UTC"),
                 max_sort_bytes: 4096,
                 search_path: Arc::new(vec!["public".to_string()]),

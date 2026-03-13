@@ -58,13 +58,11 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check if user is superuser.
-        let is_superuser = self
-            .auth_manager()
-            .get_user(txn, role)
-            .await?
-            .map(|u| u.is_superuser)
-            .unwrap_or(false);
+        // Use session-level identity from ExtensionContext (set at statement start).
+        // This correctly reflects SET ROLE to non-login roles with BYPASSRLS,
+        // unlike re-querying get_user() which only finds login users.
+        let is_superuser = crate::extensions::context::is_superuser();
+        let bypass_rls = crate::extensions::context::bypass_rls();
 
         let qctx = crate::sql::query_context::QueryContext::from_task_locals();
 
@@ -76,6 +74,7 @@ impl Executor {
             &schema,
             Some(role),
             is_superuser,
+            bypass_rls,
             schema.rls_enabled,
             schema.rls_force,
             command,

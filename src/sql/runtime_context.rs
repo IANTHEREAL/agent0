@@ -8,6 +8,7 @@ use tikv_client::TransactionClient;
 #[derive(Clone)]
 pub(crate) struct RuntimeSettings {
     pub is_superuser: bool,
+    pub bypass_rls: bool,
     pub timezone: Arc<str>,
     pub max_sort_bytes: usize,
     pub search_path: Arc<Vec<String>>,
@@ -18,6 +19,7 @@ impl RuntimeSettings {
     pub(crate) fn from_session(session: &Session) -> Self {
         Self {
             is_superuser: session.is_superuser(),
+            bypass_rls: session.bypass_rls(),
             timezone: Arc::from(
                 session
                     .show_setting_value("timezone")
@@ -102,6 +104,7 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                                     crate::extensions::context::with_context_opts(
                                         crate::extensions::context::ExtensionContextOpts::statement(
                                             settings.is_superuser,
+                                            settings.bypass_rls,
                                             tenant_keyspace.as_ref(),
                                         )
                                         .with_tikv_client(tikv_client),
@@ -128,6 +131,7 @@ mod tests {
         let runtime = StatementRuntimeContext {
             settings: RuntimeSettings {
                 is_superuser: false,
+                bypass_rls: false,
                 timezone: Arc::from("UTC"),
                 max_sort_bytes: 1234,
                 search_path: Arc::new(vec!["$user".to_string(), "public".to_string()]),

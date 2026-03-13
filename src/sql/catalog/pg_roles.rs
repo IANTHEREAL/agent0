@@ -68,6 +68,7 @@ impl VirtualTable for PgRoles {
             can_create_role: bool,
             can_create_db: bool,
             can_login: bool,
+            bypass_rls: bool,
         ) -> Row {
             Row::new(vec![
                 text_val(name),
@@ -80,7 +81,7 @@ impl VirtualTable for PgRoles {
                 int_val(-1),
                 null_val(),
                 null_val(),
-                Value::Boolean(false),
+                Value::Boolean(bypass_rls),
                 null_val(),
                 int_val(catalog_oids::pg_role_oid(name)),
             ])
@@ -88,7 +89,7 @@ impl VirtualTable for PgRoles {
 
         let mut seen = HashSet::new();
         let mut rows = Vec::with_capacity(users.len() + roles.len() + 2);
-        rows.push(role_row("postgres", true, true, true, true));
+        rows.push(role_row("postgres", true, true, true, true, true));
         seen.insert("postgres".to_string());
 
         for user in users {
@@ -102,6 +103,7 @@ impl VirtualTable for PgRoles {
                 user.can_create_role,
                 user.can_create_db,
                 user.can_login,
+                user.bypass_rls,
             ));
             seen.insert(lower);
         }
@@ -117,6 +119,7 @@ impl VirtualTable for PgRoles {
                 role.can_create_role,
                 role.can_create_db,
                 false,
+                role.bypass_rls,
             ));
             seen.insert(lower);
         }
@@ -129,6 +132,7 @@ impl VirtualTable for PgRoles {
                 false,
                 false,
                 true,
+                false,
             ));
         }
 

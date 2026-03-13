@@ -419,6 +419,7 @@ mod tests {
             observability,
             "tester".to_string(),
             true,
+            false,
             1,
             1,
             "postgres".to_string(),

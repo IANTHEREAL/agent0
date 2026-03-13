@@ -20,6 +20,8 @@ pub(crate) struct RlsContext<'a> {
     pub current_role: &'a str,
     /// Whether the current role is a superuser.
     pub is_superuser: bool,
+    /// Whether the current role has the BYPASSRLS attribute.
+    pub bypass_rls: bool,
     /// Table schemas indexed by table name (schema-qualified).
     pub table_schemas: &'a HashMap<String, &'a TableSchema>,
     /// RLS policies indexed by table_id.
@@ -122,6 +124,7 @@ fn collect_rls_predicates_from_table_ref(
             if let Some(schema) = ctx.table_schemas.get(name.as_str()) {
                 if !should_bypass_rls(
                     ctx.is_superuser,
+                    ctx.bypass_rls,
                     ctx.current_role,
                     &schema.owner,
                     schema.rls_enabled,

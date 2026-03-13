@@ -122,6 +122,7 @@ impl Executor {
 
         let role = current_role.unwrap_or(""); // empty role matches no role-specific policies
         let is_superuser = crate::extensions::context::is_superuser();
+        let bypass_rls = crate::extensions::context::bypass_rls();
 
         // Load RLS policies for all RLS-enabled tables.
         let mut policies_by_table: HashMap<u64, Vec<RlsPolicy>> = HashMap::new();
@@ -131,6 +132,7 @@ impl Executor {
             }
             if should_bypass_rls(
                 is_superuser,
+                bypass_rls,
                 role,
                 &schema.owner,
                 schema.rls_enabled,
@@ -172,6 +174,7 @@ impl Executor {
         let rls_ctx = crate::sql::rls::inject::RlsContext {
             current_role: role,
             is_superuser,
+            bypass_rls,
             table_schemas: &table_schemas,
             policies_by_table: &policies_by_table,
             qctx: &qctx,

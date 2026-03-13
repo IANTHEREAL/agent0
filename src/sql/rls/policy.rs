@@ -228,10 +228,12 @@ pub fn combine_rls_predicates(policies: &[CompiledRlsPolicy]) -> Option<TypedExp
 ///
 /// PG rules:
 /// - Superuser always bypasses
+/// - Role with BYPASSRLS attribute bypasses
 /// - Table owner bypasses unless FORCE ROW LEVEL SECURITY is set
 /// - If RLS is not enabled, bypass (no filtering)
 pub fn should_bypass_rls(
     is_superuser: bool,
+    bypass_rls: bool,
     current_role: &str,
     table_owner: &str,
     rls_enabled: bool,
@@ -241,6 +243,9 @@ pub fn should_bypass_rls(
         return true;
     }
     if is_superuser {
+        return true;
+    }
+    if bypass_rls {
         return true;
     }
     if current_role == table_owner && !rls_force {
@@ -326,27 +331,49 @@ mod tests {
 
     #[test]
     fn bypass_rls_superuser() {
-        assert!(should_bypass_rls(true, "alice", "bob", true, true));
+        assert!(should_bypass_rls(true, false, "alice", "bob", true, true));
     }
 
     #[test]
     fn bypass_rls_owner_no_force() {
-        assert!(should_bypass_rls(false, "alice", "alice", true, false));
+        assert!(should_bypass_rls(
+            false, false, "alice", "alice", true, false
+        ));
     }
 
     #[test]
     fn no_bypass_rls_owner_force() {
-        assert!(!should_bypass_rls(false, "alice", "alice", true, true));
+        assert!(!should_bypass_rls(
+            false, false, "alice", "alice", true, true
+        ));
     }
 
     #[test]
     fn no_bypass_rls_regular_user() {
-        assert!(!should_bypass_rls(false, "bob", "alice", true, false));
+        assert!(!should_bypass_rls(
+            false, false, "bob", "alice", true, false
+        ));
     }
 
     #[test]
     fn bypass_rls_disabled() {
-        assert!(should_bypass_rls(false, "bob", "alice", false, false));
+        assert!(should_bypass_rls(
+            false, false, "bob", "alice", false, false
+        ));
+    }
+
+    #[test]
+    fn bypass_rls_attribute() {
+        // Non-superuser with BYPASSRLS attribute should bypass even with FORCE
+        assert!(should_bypass_rls(false, true, "bob", "alice", true, true));
+    }
+
+    #[test]
+    fn no_bypass_rls_attribute_disabled() {
+        // NOBYPASSRLS regular user should not bypass
+        assert!(!should_bypass_rls(
+            false, false, "bob", "alice", true, false
+        ));
     }
 
     #[test]

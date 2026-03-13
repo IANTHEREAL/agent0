@@ -212,7 +212,8 @@ impl Executor {
                 session.clear_local_session_auth_save();
             }
             let is_su = session.session_user_is_superuser();
-            session.set_session_authorization(role_name, is_su);
+            let brls = session.bypass_rls();
+            session.set_session_authorization(role_name, is_su, brls);
             return Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }]);
         }
 
@@ -246,6 +247,12 @@ impl Executor {
                 .into());
             }
 
+            let target_bypass_rls = user
+                .as_ref()
+                .map(|u| u.bypass_rls)
+                .or_else(|| role.as_ref().map(|r| r.bypass_rls))
+                .unwrap_or(false);
+
             // Permission check: only superusers can SET session_authorization
             // to a different role (PG parity: SQLSTATE 42501)
             if !session_user_is_su {
@@ -258,7 +265,7 @@ impl Executor {
                 .into());
             }
 
-            Ok::<bool, anyhow::Error>(target_is_superuser.unwrap())
+            Ok::<(bool, bool), anyhow::Error>((target_is_superuser.unwrap(), target_bypass_rls))
         }
         .await;
 
@@ -273,7 +280,7 @@ impl Executor {
             }
         }
 
-        let target_is_superuser = result?;
+        let (target_is_superuser, target_bypass_rls) = result?;
 
         // Authorized: apply the session authorization change
         if local_outside_txn {
@@ -284,7 +291,7 @@ impl Executor {
         } else {
             session.clear_local_session_auth_save();
         }
-        session.set_session_authorization(role_name, target_is_superuser);
+        session.set_session_authorization(role_name, target_is_superuser, target_bypass_rls);
         Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
     }
 }
@@ -549,6 +556,7 @@ mod tests {
             obs,
             name.to_string(),
             is_superuser,
+            false,
             1,
             1,
             "postgres".to_string(),
@@ -656,7 +664,7 @@ mod tests {
         let mut session = make_session_with_user("app_user", false);
 
         // Simulate SET ROLE other
-        session.set_current_role("other".to_string(), false);
+        session.set_current_role("other".to_string(), false, false);
         assert_eq!(session.current_user(), Some("other"));
 
         // SET SESSION AUTHORIZATION 'app_user' (same as session_user)
@@ -685,7 +693,7 @@ mod tests {
         let mut session = make_session_with_user("app_user", false);
 
         // Simulate a prior SET SESSION AUTHORIZATION 'alice'
-        session.set_session_authorization("alice".to_string(), false);
+        session.set_session_authorization("alice".to_string(), false, false);
         assert_eq!(session.session_user(), Some("alice"));
         assert_eq!(session.current_user(), Some("alice"));
 
@@ -713,7 +721,7 @@ mod tests {
         let mut session = make_session_with_user("app_user", false);
 
         // Simulate SET ROLE other
-        session.set_current_role("other".to_string(), false);
+        session.set_current_role("other".to_string(), false, false);
         assert_eq!(session.current_user(), Some("other"));
 
         // Enter explicit transaction
@@ -744,7 +752,7 @@ mod tests {
         let mut session = make_session_with_user("app_user", false);
 
         // Simulate a prior SET SESSION AUTHORIZATION to change session_user
-        session.set_session_authorization("alice".to_string(), false);
+        session.set_session_authorization("alice".to_string(), false, false);
         assert_eq!(session.session_user(), Some("alice"));
 
         // Enter explicit transaction
@@ -802,7 +810,7 @@ mod tests {
         let mut session = make_session_with_user("app_user", false);
 
         // Simulate SET ROLE other
-        session.set_current_role("other".to_string(), false);
+        session.set_current_role("other".to_string(), false, false);
         assert_eq!(session.current_user(), Some("other"));
 
         // Enter explicit transaction
@@ -841,7 +849,7 @@ mod tests {
         let mut session = make_session_with_user("app_user", false);
 
         // Simulate a prior SET SESSION AUTHORIZATION to change session_user
-        session.set_session_authorization("alice".to_string(), false);
+        session.set_session_authorization("alice".to_string(), false, false);
         assert_eq!(session.session_user(), Some("alice"));
 
         // Enter explicit transaction

@@ -24,6 +24,7 @@ impl Executor {
                 superuser,
                 create_db,
                 create_role,
+                bypassrls,
                 ..
             } => {
                 self.require_privilege(
@@ -45,6 +46,7 @@ impl Executor {
                     superuser,
                     create_db,
                     create_role,
+                    bypassrls,
                 )
                 .await
             }

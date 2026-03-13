@@ -24,6 +24,7 @@ pub async fn execute_create_role(
     superuser: &Option<bool>,
     create_db: &Option<bool>,
     create_role: &Option<bool>,
+    bypassrls: &Option<bool>,
 ) -> Result<ExecuteResult> {
     if config::db9_auth_mode() == config::Db9AuthMode::Token && password.is_some() {
         return Err(SqlError::Unsupported(
@@ -68,6 +69,7 @@ pub async fn execute_create_role(
         user.can_login = can_login;
         user.can_create_db = create_db.unwrap_or(false);
         user.can_create_role = create_role.unwrap_or(false);
+        user.bypass_rls = bypassrls.unwrap_or(false);
 
         auth_manager.create_user(txn, user).await?;
     }
@@ -164,6 +166,7 @@ pub async fn execute_alter_role(
                     ))) => {
                         user.set_password(s);
                     }
+                    sqlparser::ast::RoleOption::BypassRLS(v) => user.bypass_rls = *v,
                     sqlparser::ast::RoleOption::ConnectionLimit(Expr::Value(SqlValue::Number(
                         n,
                         _,

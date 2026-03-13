@@ -429,6 +429,7 @@ pub async fn maybe_build_rls_context<F, Fut>(
     schema: &TableSchema,
     current_role: Option<&str>,
     is_superuser: bool,
+    bypass_rls: bool,
     rls_enabled: bool,
     rls_force: bool,
     command: RlsCommand,
@@ -447,7 +448,14 @@ where
         None => return Ok(None), // No role → no RLS
     };
 
-    if should_bypass_rls(is_superuser, role, &schema.owner, rls_enabled, rls_force) {
+    if should_bypass_rls(
+        is_superuser,
+        bypass_rls,
+        role,
+        &schema.owner,
+        rls_enabled,
+        rls_force,
+    ) {
         return Ok(None);
     }
 

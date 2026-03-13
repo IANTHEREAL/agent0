@@ -476,6 +476,7 @@ mod tests {
             observability,
             "tester".to_string(),
             is_superuser,
+            false,
             1,
             1,
             "postgres".to_string(),
