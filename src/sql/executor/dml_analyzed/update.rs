@@ -16,6 +16,7 @@ use crate::sql::analyzer::types::{AnalyzedUpdate, TypedExpr, TypedExprKind};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
+use crate::sql::rls::dml::RlsDmlContext;
 use crate::sql::sequences::SequenceSession;
 use crate::worker::types::IndexState;
 use anyhow::{anyhow, Result};
@@ -32,6 +33,7 @@ impl Executor {
         sequence_values: &mut SequenceSession,
         search_path: &[String],
         upd: &AnalyzedUpdate,
+        rls_ctx: Option<&RlsDmlContext>,
     ) -> Result<ExecuteResult> {
         let t = &upd.table_name;
         let schema = self
@@ -170,6 +172,15 @@ impl Executor {
                 r.clone()
             };
 
+            // RLS: check row visibility through USING policies.
+            // Invisible rows are silently skipped (PG semantics — USING acts
+            // as an invisible filter, not an error).
+            if let Some(rls) = rls_ctx {
+                if !rls.is_row_visible(r, &qctx)? {
+                    continue;
+                }
+            }
+
             // Truncate to schema column count to strip synthetic ctid appended
             // by append_ctid_to_rows — ctid must never be persisted.
             let mut new_vals = r.values[..schema.columns.len()].to_vec();
@@ -229,6 +240,11 @@ impl Executor {
             )
             .await?;
             let new_row = Row::new(final_vals);
+
+            // RLS: validate post-update row against UPDATE WITH CHECK policies.
+            if let Some(rls) = rls_ctx {
+                rls.check_row(&schema, &new_row, &qctx)?;
+            }
 
             // Persist (defer HNSW maintenance to batch after the loop).
             let updated_row = if has_hnsw {
@@ -340,6 +356,10 @@ impl Executor {
         }
 
         if upd.returning.is_some() {
+            // RLS: validate RETURNING rows against SELECT USING policies.
+            if let Some(rls) = rls_ctx {
+                rls.check_returning(&schema, &ret_rows, &qctx)?;
+            }
             let column_types = Some(build_returning_types_from_analyzed(&upd.returning, &schema));
             Ok(ExecuteResult::Select {
                 column_types,

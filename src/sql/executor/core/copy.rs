@@ -143,6 +143,14 @@ impl Executor {
                 .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
                 let row = Row { values: row_values };
 
+                // RLS: validate row against INSERT WITH CHECK policies.
+                // TODO(rls/copy): Wire RlsDmlContext — current_role not available
+                // in COPY batch path. Needs session context threading.
+                // if let Some(ref rls) = rls_ctx {
+                //     rls.check_row(&schema, &row, &qctx)
+                //         .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
+                // }
+
                 // Validate enum values (CPU-only).
                 dml::insert::validate_enum_values(&schema, &row, &enum_cache)
                     .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
@@ -612,6 +620,13 @@ impl Executor {
                 })?;
 
                 let row = Row { values: row_values };
+
+                // RLS: validate row against INSERT WITH CHECK policies.
+                // TODO(rls/copy): Wire RlsDmlContext — current_role not available
+                // in Parquet COPY path. Needs session context threading.
+                // if let Some(ref rls) = rls_ctx {
+                //     rls.check_row(&table_schema, &row, &qctx)?;
+                // }
 
                 // Insert the row (handles indexes, FK etc)
                 let _ = dml::execute_insert_row(

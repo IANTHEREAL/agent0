@@ -17,6 +17,7 @@ use crate::sql::analyzer::types::{
 use crate::sql::dml::{ConflictBehavior, ConflictTarget, FkRefSchemaCache};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
+use crate::sql::rls::dml::RlsDmlContext;
 use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ impl Executor {
         sequence_values: &mut SequenceSession,
         search_path: &[String],
         ins: &AnalyzedInsert,
+        rls_ctx: Option<&RlsDmlContext>,
     ) -> Result<ExecuteResult> {
         let t = &ins.table_name;
         let schema = self
@@ -228,6 +230,11 @@ impl Executor {
             .await?;
             let row = Row::new(final_vals);
 
+            // RLS: validate new row against INSERT WITH CHECK policies.
+            if let Some(rls) = rls_ctx {
+                rls.check_row(&schema, &row, &qctx)?;
+            }
+
             let conflict_behavior = match &ins.on_conflict {
                 Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
                 Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
@@ -314,6 +321,20 @@ impl Executor {
                                 where_clause: _,
                                 target: _,
                             } => {
+                                // RLS: ON CONFLICT DO UPDATE — check existing row
+                                // is visible through UPDATE USING policies.
+                                // PG: if existing row is invisible → error 42501.
+                                if let Some(rls) = rls_ctx {
+                                    if !rls.is_row_visible(&existing_row, &qctx)? {
+                                        return Err(crate::sql::error::SqlError::InsufficientPrivilege {
+                                            message: format!(
+                                                "new row violates row-level security policy for table \"{}\"",
+                                                schema.name.rsplit('.').next().unwrap_or(&schema.name)
+                                            ),
+                                        }.into());
+                                    }
+                                }
+
                                 // Build combined row: [existing, excluded].
                                 let combined = combine_rows(&existing_row, &excluded_row);
 
@@ -394,6 +415,12 @@ impl Executor {
                                 )
                                 .await?;
                                 let updated_row = Row::new(final_vals);
+
+                                // RLS: ON CONFLICT DO UPDATE — validate post-update
+                                // row against UPDATE WITH CHECK policies.
+                                if let Some(rls) = rls_ctx {
+                                    rls.check_row(&schema, &updated_row, &qctx)?;
+                                }
 
                                 let updated_row = if has_hnsw {
                                     // Defer HNSW maintenance to batch after the loop.
@@ -568,6 +595,11 @@ impl Executor {
         }
 
         if ins.returning.is_some() {
+            // RLS: validate RETURNING rows against SELECT USING policies.
+            // PG raises error 42501 if any returned row is not visible.
+            if let Some(rls) = rls_ctx {
+                rls.check_returning(&schema, &ret_rows, &qctx)?;
+            }
             let column_types = Some(build_returning_types_from_analyzed(&ins.returning, &schema));
             Ok(ExecuteResult::Select {
                 column_types,
