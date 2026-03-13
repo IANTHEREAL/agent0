@@ -1,0 +1,12 @@
+# PostgreSQL 17.7 validated positive-output fragments for the RLS DML contract.
+owner|title
+rls_alice|Alice post 1
+rls_alice|Alice post 2
+(2 rows)
+rls_bob|Bob post 1
+rls_alice|Alice post 3
+rls_alice|Alice post 1 updated
+(4 rows)
+(3 rows)
+count
+3

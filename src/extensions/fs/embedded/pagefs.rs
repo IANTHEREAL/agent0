@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock as SyncOnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tikv_client::{CheckLevel, Transaction, TransactionClient, TransactionOptions};
+use tikv_client::{CheckLevel, Key, Transaction, TransactionClient, TransactionOptions};
 use tokio::fs;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell};
@@ -76,6 +76,7 @@ const STALE_PACKING_SECS: i64 = 5 * 60;
 const STAGING_REFRESH_INTERVAL_SECS: i64 = 5 * 60;
 const INODE_ALLOC_BLOCK_SIZE: u64 = 1024;
 const BUNDLE_ALLOC_BLOCK_SIZE: u64 = 128;
+const INODE_BATCH_GET_CHUNK_SIZE: usize = 256;
 const PACK_SPOOL_HEARTBEAT_FILE: &str = ".heartbeat";
 const INSTANCE_PROBE_INTERVAL_SECS: u64 = 5;
 
@@ -873,8 +874,8 @@ impl EmbeddedPageFs {
         let mut txn = self.begin().await?;
 
         for file in files {
-            ensure_parents(self, &mut txn, &file.path).await?;
-            let (parent_inode, name) = resolve_parent(&mut txn, &file.path).await?;
+            let (parent_inode, name) =
+                ensure_parents_and_resolve_parent(self, &mut txn, &file.path).await?;
 
             let mut staging_inode = load_inode(&mut txn, file.staging_inode_id)
                 .await?
@@ -1677,9 +1678,14 @@ impl EmbeddedPageFs {
         }
 
         let entries = list_dir(&mut txn, inode_id).await?;
+        let child_inode_ids: Vec<u64> = entries
+            .iter()
+            .map(|(_, child_inode_id)| *child_inode_id)
+            .collect();
+        let child_inodes = load_inodes_batch(&mut txn, &child_inode_ids).await?;
         let mut out = Vec::with_capacity(entries.len());
-        for (name, child_inode_id) in entries {
-            if let Some(child_inode) = load_inode(&mut txn, child_inode_id).await? {
+        for ((name, _), child_inode) in entries.into_iter().zip(child_inodes.into_iter()) {
+            if let Some(child_inode) = child_inode {
                 out.push((name, child_inode));
             }
         }
@@ -1856,7 +1862,8 @@ impl EmbeddedPageFs {
         path: &str,
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
-        let inode = self.stat(path).await?;
+        let mut txn = self.begin().await?;
+        let (inode_id, inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
@@ -1877,7 +1884,10 @@ impl EmbeddedPageFs {
         let fs = self.clone();
         let err_sender = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = fs.stream_file_into_channel(stream_path, tx).await {
+            if let Err(err) = fs
+                .stream_resolved_inode_into_channel(txn, inode_id, inode, stream_path, tx)
+                .await
+            {
                 let _ = err_sender
                     .send(Err(std::io::Error::other(err.to_string())))
                     .await;
@@ -3126,13 +3136,14 @@ impl EmbeddedPageFs {
         Ok(())
     }
 
-    async fn stream_file_into_channel(
+    async fn stream_resolved_inode_into_channel(
         &self,
+        mut txn: Transaction,
+        inode_id: u64,
+        mut inode: Inode,
         path: String,
         sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
     ) -> Result<()> {
-        let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = resolve_path(&mut txn, &path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(&path)));
         }
@@ -3341,8 +3352,7 @@ impl EmbeddedPageFs {
         if let Some(reservation) = reservation {
             verify_upload_publish_preconditions(&mut txn, path, reservation).await?;
         }
-        ensure_parents(self, &mut txn, path).await?;
-        let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
+        let (parent_inode, name) = ensure_parents_and_resolve_parent(self, &mut txn, path).await?;
 
         let mut staging_inode = load_inode(&mut txn, staging_inode_id)
             .await?
@@ -3677,8 +3687,7 @@ async fn prepare_replace_file_txn(
     txn: &mut Transaction,
     path: &str,
 ) -> Result<(u64, Inode)> {
-    ensure_parents(fs, txn, path).await?;
-    let (parent_inode, name) = resolve_parent(txn, path).await?;
+    let (parent_inode, name) = ensure_parents_and_resolve_parent(fs, txn, path).await?;
 
     if let Some(existing_inode_id) = lookup(txn, parent_inode, &name).await? {
         let mut inode = load_inode(txn, existing_inode_id)
@@ -3713,8 +3722,7 @@ async fn prepare_write_at_file_txn(
     txn: &mut Transaction,
     path: &str,
 ) -> Result<(u64, Inode)> {
-    ensure_parents(fs, txn, path).await?;
-    let (parent_inode, name) = resolve_parent(txn, path).await?;
+    let (parent_inode, name) = ensure_parents_and_resolve_parent(fs, txn, path).await?;
 
     if let Some(existing_inode_id) = lookup(txn, parent_inode, &name).await? {
         let inode = load_inode(txn, existing_inode_id)
@@ -4248,17 +4256,47 @@ async fn save_allocator_counter(txn: &mut Transaction, key: &[u8], next: u64) ->
 
 async fn load_inode(txn: &mut Transaction, inode_id: u64) -> Result<Option<Inode>> {
     match txn.get(keys::inode_key(inode_id)).await? {
-        Some(data) => {
-            let inode: Inode = serde_json::from_slice(&data).map_err(|err| {
-                anyhow!(
-                    "fs9: invalid inode json for inode {inode_id}: {err}. \
-                     Recreate the fs9 keyspace with the current format."
-                )
-            })?;
-            Ok(Some(inode))
-        }
+        Some(data) => Ok(Some(deserialize_inode(inode_id, &data)?)),
         None => Ok(None),
     }
+}
+
+fn deserialize_inode(inode_id: u64, data: &[u8]) -> Result<Inode> {
+    serde_json::from_slice(data).map_err(|err| {
+        anyhow!(
+            "fs9: invalid inode json for inode {inode_id}: {err}. \
+             Recreate the fs9 keyspace with the current format."
+        )
+    })
+}
+
+async fn load_inodes_batch(txn: &mut Transaction, inode_ids: &[u64]) -> Result<Vec<Option<Inode>>> {
+    let mut out = Vec::with_capacity(inode_ids.len());
+
+    for chunk in inode_ids.chunks(INODE_BATCH_GET_CHUNK_SIZE) {
+        let keys: Vec<Vec<u8>> = chunk
+            .iter()
+            .map(|inode_id| keys::inode_key(*inode_id))
+            .collect();
+        let pairs = txn.batch_get(keys.iter().cloned()).await?;
+        let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(keys.len());
+
+        for pair in pairs {
+            let tikv_client::KvPair(key, value) = pair;
+            by_key.insert(key, value);
+        }
+
+        for (inode_id, key) in chunk.iter().zip(keys.iter()) {
+            let key_ref: &Key = key.into();
+            if let Some(value) = by_key.get(key_ref) {
+                out.push(Some(deserialize_inode(*inode_id, value)?));
+            } else {
+                out.push(None);
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 async fn save_inode(txn: &mut Transaction, inode: &Inode) -> Result<()> {
@@ -4735,27 +4773,26 @@ async fn resolve_path(txn: &mut Transaction, path: &str) -> Result<(u64, Inode)>
     Ok((current_inode, inode))
 }
 
-async fn ensure_parents(fs: &EmbeddedPageFs, txn: &mut Transaction, path: &str) -> Result<()> {
+async fn ensure_parents_and_resolve_parent(
+    fs: &EmbeddedPageFs,
+    txn: &mut Transaction,
+    path: &str,
+) -> Result<(u64, String)> {
     let normalized = normalize_path(path);
-
-    // If path is root or empty, parent is root which always exists
     if normalized == "/" {
-        return Ok(());
+        return Err(anyhow!(EmbeddedFsError::PermissionDenied(
+            "cannot get parent of root".to_string()
+        )));
     }
 
-    let (parent_path, _) = normalized.rsplit_once('/').unwrap_or(("", &normalized));
-    let parent_path = if parent_path.is_empty() {
-        "/"
-    } else {
-        parent_path
-    };
-
-    // If parent is root, it always exists
+    let (parent, name) = normalized
+        .rsplit_once('/')
+        .unwrap_or(("", normalized.as_str()));
+    let parent_path = if parent.is_empty() { "/" } else { parent };
     if parent_path == "/" {
-        return Ok(());
+        return Ok((ROOT_INODE, name.to_string()));
     }
 
-    // Walk the parent path components from root, creating any missing directories
     let parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
     let mut current_inode = ROOT_INODE;
 
@@ -4769,7 +4806,6 @@ async fn ensure_parents(fs: &EmbeddedPageFs, txn: &mut Transaction, path: &str) 
             }
             current_inode = next_inode_id;
         } else {
-            // Create missing directory
             let new_inode_id = fs.alloc_inode_id().await?;
             let inode = Inode::new_directory(new_inode_id, 0o755);
             save_inode(txn, &inode).await?;
@@ -4777,7 +4813,8 @@ async fn ensure_parents(fs: &EmbeddedPageFs, txn: &mut Transaction, path: &str) 
             current_inode = new_inode_id;
         }
     }
-    Ok(())
+
+    Ok((current_inode, name.to_string()))
 }
 
 async fn resolve_parent(txn: &mut Transaction, path: &str) -> Result<(u64, String)> {
