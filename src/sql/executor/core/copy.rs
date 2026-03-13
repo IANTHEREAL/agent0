@@ -102,6 +102,7 @@ impl Executor {
                 &schema,
                 current_role.as_deref(),
                 is_superuser,
+                false, // TODO: pass bypass_rls from session
                 schema.rls_enabled,
                 schema.rls_force,
                 crate::model::RlsCommand::Insert,
@@ -587,6 +588,7 @@ impl Executor {
             &table_schema,
             current_role.as_deref(),
             is_superuser,
+            false, // TODO: pass bypass_rls from session
             table_schema.rls_enabled,
             table_schema.rls_force,
             crate::model::RlsCommand::Insert,

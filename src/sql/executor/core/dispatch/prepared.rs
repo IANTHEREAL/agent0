@@ -1357,6 +1357,7 @@ mod prepared_policy_tests {
             crate::observability::registry().tenant("tenant_prepared_ut"),
             username.to_string(),
             is_superuser,
+            false,
             1,
             1,
             "postgres".to_string(),

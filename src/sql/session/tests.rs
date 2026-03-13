@@ -1021,6 +1021,7 @@ mod tests {
             observability,
             "admin".to_string(),
             true,
+            false,
             190090,
             1,
             "postgres".to_string(),
@@ -1234,6 +1235,7 @@ mod tests {
             observability,
             "alice".to_string(),
             true,
+            false,
             1,
             1,
             "postgres".to_string(),
@@ -1249,7 +1251,7 @@ mod tests {
 
         // SET LOCAL session_authorization 'bob' (non-superuser)
         session.save_session_auth_for_local();
-        session.set_session_authorization("bob".to_string(), false);
+        session.set_session_authorization("bob".to_string(), false, false);
         assert_eq!(session.session_user(), Some("bob"));
         assert_eq!(session.current_user(), Some("bob"));
         assert!(!session.is_superuser());
@@ -1270,6 +1272,7 @@ mod tests {
             observability,
             "alice".to_string(),
             true,
+            false,
             1,
             1,
             "postgres".to_string(),
@@ -1284,13 +1287,13 @@ mod tests {
 
         // SET LOCAL session_authorization 'bob'
         session.save_session_auth_for_local();
-        session.set_session_authorization("bob".to_string(), false);
+        session.set_session_authorization("bob".to_string(), false, false);
 
         // SAVEPOINT sp2
         session.push_session_auth_savepoint("sp2".to_string());
 
         // SET LOCAL session_authorization 'charlie'
-        session.set_session_authorization("charlie".to_string(), false);
+        session.set_session_authorization("charlie".to_string(), false, false);
 
         assert_eq!(session.session_user(), Some("charlie"));
 
@@ -1314,6 +1317,7 @@ mod tests {
             observability,
             "alice".to_string(),
             true,
+            false,
             1,
             1,
             "postgres".to_string(),
@@ -1328,7 +1332,7 @@ mod tests {
 
         // SET LOCAL session_authorization 'bob'
         session.save_session_auth_for_local();
-        session.set_session_authorization("bob".to_string(), false);
+        session.set_session_authorization("bob".to_string(), false, false);
 
         // SAVEPOINT sp2
         session.push_session_auth_savepoint("sp2".to_string());

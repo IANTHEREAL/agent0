@@ -878,13 +878,14 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             let executor = &state.executor;
             let store = executor.store();
 
-            // Brief session lock to read db_id + search_path + is_superuser
-            let (db_id, search_path, is_superuser) = {
+            // Brief session lock to read db_id + search_path + is_superuser + bypass_rls
+            let (db_id, search_path, is_superuser, bypass_rls) = {
                 let session = state.session.lock().await;
                 (
                     session.current_database_id(),
                     session.search_path().to_vec(),
                     session.is_superuser(),
+                    session.bypass_rls(),
                 )
             };
 
@@ -895,6 +896,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             let tikv_client = store.transaction_client();
             let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
                 is_superuser,
+                bypass_rls,
                 &tenant_keyspace,
             )
             .with_tikv_client(tikv_client);

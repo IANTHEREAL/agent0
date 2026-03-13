@@ -92,6 +92,7 @@ fn inject_no_rls_enabled_is_noop() {
     let ctx = RlsContext {
         current_role: "alice",
         is_superuser: false,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,
@@ -121,6 +122,7 @@ fn inject_superuser_bypass() {
     let ctx = RlsContext {
         current_role: "superadmin",
         is_superuser: true,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,
@@ -150,6 +152,7 @@ fn inject_owner_bypass_no_force() {
     let ctx = RlsContext {
         current_role: "alice",
         is_superuser: false,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,
@@ -183,6 +186,7 @@ fn inject_rls_no_policies_denies_all() {
     let ctx = RlsContext {
         current_role: "bob",
         is_superuser: false,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,
@@ -229,6 +233,7 @@ fn inject_rls_with_permissive_policy() {
     let ctx = RlsContext {
         current_role: "bob",
         is_superuser: false,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,
@@ -271,6 +276,7 @@ fn inject_rls_owner_with_force() {
     let ctx = RlsContext {
         current_role: "alice",
         is_superuser: false,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,
@@ -308,6 +314,7 @@ fn inject_rls_unmatched_table_no_injection() {
     let ctx = RlsContext {
         current_role: "bob",
         is_superuser: false,
+        bypass_rls: false,
         table_schemas: &table_schemas,
         policies_by_table: &policies,
         qctx: &qctx,

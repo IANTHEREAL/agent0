@@ -132,6 +132,8 @@ pub struct User {
     pub can_create_role: bool,
     pub connection_limit: i32,
     pub valid_until: Option<i64>,
+    #[serde(default)]
+    pub bypass_rls: bool,
 }
 
 impl User {
@@ -150,6 +152,7 @@ impl User {
             can_create_role: false,
             connection_limit: -1,
             valid_until: None,
+            bypass_rls: false,
         }
     }
 
@@ -260,6 +263,8 @@ pub struct Role {
     pub is_superuser: bool,
     pub can_create_db: bool,
     pub can_create_role: bool,
+    #[serde(default)]
+    pub bypass_rls: bool,
 }
 
 impl Role {
@@ -272,6 +277,7 @@ impl Role {
             is_superuser: false,
             can_create_db: false,
             can_create_role: false,
+            bypass_rls: false,
         }
     }
 }

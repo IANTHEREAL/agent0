@@ -58,13 +58,10 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check if user is superuser.
-        let is_superuser = self
-            .auth_manager()
-            .get_user(txn, role)
-            .await?
-            .map(|u| u.is_superuser)
-            .unwrap_or(false);
+        // Check if user is superuser / has BYPASSRLS.
+        let user_def = self.auth_manager().get_user(txn, role).await?;
+        let is_superuser = user_def.as_ref().map(|u| u.is_superuser).unwrap_or(false);
+        let bypass_rls = user_def.as_ref().map(|u| u.bypass_rls).unwrap_or(false);
 
         let qctx = crate::sql::query_context::QueryContext::from_task_locals();
 
@@ -74,6 +71,7 @@ impl Executor {
             &schema,
             Some(role),
             is_superuser,
+            bypass_rls,
             schema.rls_enabled,
             schema.rls_force,
             command,

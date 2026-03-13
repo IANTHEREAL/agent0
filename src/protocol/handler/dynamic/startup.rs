@@ -32,6 +32,7 @@ use super::super::{
 pub(in crate::protocol::handler) struct AuthResult {
     pub is_authenticated: bool,
     pub is_superuser: bool,
+    pub bypass_rls: bool,
     /// PostgreSQL `rolconnlimit`. Negative means unlimited.
     pub connection_limit: i32,
     pub failure_reason: Option<String>,
@@ -43,6 +44,7 @@ impl DynamicPgHandler {
         keyspace: Option<String>,
         username: Option<String>,
         is_superuser: bool,
+        bypass_rls: bool,
         database: String,
         connection_limit: i32,
     ) -> PgWireResult<()> {
@@ -159,6 +161,7 @@ impl DynamicPgHandler {
                 tenant_obs,
                 user,
                 is_superuser,
+                bypass_rls,
                 self.connection_id,
                 database_id,
                 database_name,
@@ -224,6 +227,7 @@ impl DynamicPgHandler {
                     return Ok(AuthResult {
                         is_authenticated: false,
                         is_superuser: false,
+                        bypass_rls: false,
                         connection_limit: -1,
                         failure_reason: None,
                     });
@@ -238,6 +242,7 @@ impl DynamicPgHandler {
                     return Ok(AuthResult {
                         is_authenticated: false,
                         is_superuser: false,
+                        bypass_rls: false,
                         connection_limit: -1,
                         failure_reason: None,
                     });
@@ -335,6 +340,7 @@ impl DynamicPgHandler {
                 Ok(AuthResult {
                     is_authenticated: true,
                     is_superuser: user.is_superuser,
+                    bypass_rls: user.bypass_rls,
                     connection_limit: user.connection_limit,
                     failure_reason: None,
                 })
@@ -346,6 +352,7 @@ impl DynamicPgHandler {
                 Ok(AuthResult {
                     is_authenticated: false,
                     is_superuser: false,
+                    bypass_rls: false,
                     connection_limit: -1,
                     failure_reason,
                 })
@@ -478,6 +485,7 @@ impl StartupHandler for DynamicPgHandler {
                     Ok(AuthResult {
                         is_authenticated,
                         is_superuser,
+                        bypass_rls,
                         connection_limit,
                         failure_reason,
                     }) => {
@@ -486,6 +494,7 @@ impl StartupHandler for DynamicPgHandler {
                                 keyspace.clone(),
                                 Some(actual_user.clone()),
                                 is_superuser,
+                                bypass_rls,
                                 database,
                                 connection_limit,
                             )
@@ -645,6 +654,7 @@ mod tests {
         let r = AuthResult {
             is_authenticated: true,
             is_superuser: true,
+            bypass_rls: false,
             connection_limit: -1,
             failure_reason: None,
         };
@@ -657,6 +667,7 @@ mod tests {
         let r = AuthResult {
             is_authenticated: false,
             is_superuser: false,
+            bypass_rls: false,
             connection_limit: -1,
             failure_reason: None,
         };
@@ -669,6 +680,7 @@ mod tests {
         let r = AuthResult {
             is_authenticated: true,
             is_superuser: false,
+            bypass_rls: false,
             connection_limit: 5,
             failure_reason: None,
         };

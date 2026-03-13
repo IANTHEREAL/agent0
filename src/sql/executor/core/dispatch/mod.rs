@@ -413,6 +413,7 @@ mod tests {
             observability.clone(),
             user,
             false,
+            false,
             connection_id,
             1,
             "postgres".to_string(),
