@@ -28,7 +28,7 @@ pub struct CompiledRlsPolicy {
 // ── Matching helpers ───────────────────────────────────────
 
 /// Check if a policy's command scope matches the given target command.
-fn command_matches(policy_cmd: &RlsCommand, target: &RlsCommand) -> bool {
+pub(super) fn command_matches(policy_cmd: &RlsCommand, target: &RlsCommand) -> bool {
     match target {
         RlsCommand::All => true,
         RlsCommand::Select => policy_cmd.applies_to_select(),
@@ -40,7 +40,7 @@ fn command_matches(policy_cmd: &RlsCommand, target: &RlsCommand) -> bool {
 
 /// Check if a policy applies to the given role.
 /// Empty roles list or `["public"]` means applies to all.
-fn policy_applies_to_role(policy: &RlsPolicy, role: &str) -> bool {
+pub(super) fn policy_applies_to_role(policy: &RlsPolicy, role: &str) -> bool {
     policy.roles.is_empty()
         || policy
             .roles

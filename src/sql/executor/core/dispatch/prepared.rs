@@ -853,16 +853,43 @@ impl Executor {
                 }
                 match analyzed {
                     crate::sql::analyzer::types::AnalyzedStatement::Insert(ref ins) => {
-                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, ins)
-                            .await
+                        // RLS: intentionally None — when rls_sensitive, text fallback
+                        // re-enters normal DML path where RLS is enforced.
+                        self.execute_analyzed_insert(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ins,
+                            None,
+                        )
+                        .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Update(ref upd) => {
-                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, upd)
-                            .await
+                        // RLS: intentionally None — when rls_sensitive, text fallback
+                        // re-enters normal DML path where RLS is enforced.
+                        self.execute_analyzed_update(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            upd,
+                            None,
+                        )
+                        .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Delete(ref del) => {
-                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, del)
-                            .await
+                        // RLS: intentionally None — when rls_sensitive, text fallback
+                        // re-enters normal DML path where RLS is enforced.
+                        self.execute_analyzed_delete(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            del,
+                            None,
+                        )
+                        .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Query(_) => {
                         Err(anyhow!("prepared DML execution received query variant"))

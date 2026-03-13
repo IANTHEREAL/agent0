@@ -74,6 +74,9 @@ impl Executor {
 
         let result = async {
             let db_id = session.current_database_id();
+            // Extract role info before mutable borrow of session.
+            let current_role = session.current_user().map(|s| s.to_string());
+            let is_superuser = session.is_superuser();
             let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .ok_or_else(|| anyhow!("Transaction must be active"))
@@ -93,6 +96,26 @@ impl Executor {
             let enum_cache = dml::build_enum_label_cache(&self.store, txn, db_id, &schema)
                 .await
                 .map_err(CopyInsertBatchError::non_row)?;
+
+            // ── RLS: build context for COPY FROM (INSERT WITH CHECK) ──
+            let rls_ctx = crate::sql::rls::dml::maybe_build_rls_context(
+                &schema,
+                current_role.as_deref(),
+                is_superuser,
+                schema.rls_enabled,
+                schema.rls_force,
+                crate::model::RlsCommand::Insert,
+                false, // COPY has no RETURNING
+                false, // no ON CONFLICT
+                &qctx,
+                || async {
+                    self.store
+                        .list_policies_for_table(txn, db_id, schema.table_id)
+                        .await
+                },
+            )
+            .await
+            .map_err(CopyInsertBatchError::non_row)?;
 
             // ── Phase 1: prepare all rows ──────────────────────────────
             // Sequential because fill_missing_columns may need sequence ops.
@@ -142,6 +165,12 @@ impl Executor {
                 .await
                 .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
                 let row = Row { values: row_values };
+
+                // RLS: validate row against INSERT WITH CHECK policies.
+                if let Some(ref rls) = rls_ctx {
+                    rls.check_row(&schema, &row, &qctx)
+                        .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
+                }
 
                 // Validate enum values (CPU-only).
                 dml::insert::validate_enum_values(&schema, &row, &enum_cache)
@@ -470,6 +499,9 @@ impl Executor {
 
         let db_id = session.current_database_id();
         let search_path: Vec<String> = session.search_path().to_vec();
+        // Extract role info before mutable borrow of session.
+        let current_role = session.current_user().map(|s| s.to_string());
+        let is_superuser = session.is_superuser();
 
         // Resolve table name via search_path.
         // Quoted identifiers preserve case; unquoted are lowercased (PostgreSQL rule).
@@ -550,6 +582,25 @@ impl Executor {
             dml::build_enum_label_cache(&self.store, txn, db_id, &table_schema).await?;
         let write_plan = self.compile_write_row_plan(&table_schema, &qctx)?;
 
+        // RLS: build context for COPY FROM Parquet (INSERT WITH CHECK).
+        let rls_ctx = crate::sql::rls::dml::maybe_build_rls_context(
+            &table_schema,
+            current_role.as_deref(),
+            is_superuser,
+            table_schema.rls_enabled,
+            table_schema.rls_force,
+            crate::model::RlsCommand::Insert,
+            false, // COPY has no RETURNING
+            false, // no ON CONFLICT
+            &qctx,
+            || async {
+                self.store
+                    .list_policies_for_table(txn, db_id, table_schema.table_id)
+                    .await
+            },
+        )
+        .await?;
+
         // Stream batches and insert rows with transaction rotation
         use futures::StreamExt;
         futures::pin_mut!(batch_stream);
@@ -612,6 +663,19 @@ impl Executor {
                 })?;
 
                 let row = Row { values: row_values };
+
+                // RLS: validate row against INSERT WITH CHECK policies.
+                if let Some(ref rls) = rls_ctx {
+                    rls.check_row(&table_schema, &row, &qctx).map_err(|e| {
+                        anyhow!(
+                            "COPY {}, row group {}, row {}: {}",
+                            short_table,
+                            row_group_num,
+                            row_in_group,
+                            e
+                        )
+                    })?;
+                }
 
                 // Insert the row (handles indexes, FK etc)
                 let _ = dml::execute_insert_row(

@@ -15,6 +15,7 @@ use crate::sql::analyzer::types::AnalyzedDelete;
 use crate::sql::dml::pk_to_hash_key;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
+use crate::sql::rls::dml::RlsDmlContext;
 use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,7 @@ impl Executor {
         sequence_values: &mut SequenceSession,
         search_path: &[String],
         del: &AnalyzedDelete,
+        rls_ctx: Option<&RlsDmlContext>,
     ) -> Result<ExecuteResult> {
         let t = &del.table_name;
         let schema = self
@@ -119,7 +121,14 @@ impl Executor {
                 true
             };
 
+            // RLS: check row visibility through USING policies.
+            // Invisible rows are silently skipped (PG semantics).
             if should_delete {
+                if let Some(rls) = rls_ctx {
+                    if !rls.is_row_visible(r, &qctx)? {
+                        continue;
+                    }
+                }
                 rows_to_delete.push(r);
             }
         }
@@ -189,6 +198,10 @@ impl Executor {
         }
 
         if del.returning.is_some() {
+            // RLS: validate RETURNING rows against SELECT USING policies.
+            if let Some(rls) = rls_ctx {
+                rls.check_returning(&schema, &ret_rows, &qctx)?;
+            }
             let column_types = Some(build_returning_types_from_analyzed(&del.returning, &schema));
             Ok(ExecuteResult::Select {
                 column_types,
