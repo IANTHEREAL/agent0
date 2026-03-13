@@ -1,0 +1,16 @@
+# pg_policies view — verify human-readable output
+
+# Query 3: all policies with correct columns, ordered by name
+del_restrict|DELETE|RESTRICTIVE|data IS NOT NULL|
+ins_own|INSERT|PERMISSIVE||user_id = current_user
+sel_all|SELECT|PERMISSIVE|true|
+upd_own|UPDATE|PERMISSIVE|user_id = current_user|user_id = current_user
+
+# Query 4: roles is array, cast to text shows {public}
+sel_all|{public}
+
+# Query 5: schema name is public
+public|pol_test
+
+# Query 6: pg_policy polroles cast works
+sel_all|{0}
