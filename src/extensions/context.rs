@@ -1,9 +1,10 @@
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use tikv_client::TransactionClient;
 
 use crate::config::EmbeddingProvider;
@@ -21,13 +22,31 @@ pub enum EmbeddingExecutionMode {
     AuthorizedGenerated,
 }
 
-#[derive(Clone)]
+pub(crate) struct ExtensionStatementState {
+    http_requests: AtomicU32,
+    embedding_calls: AtomicU32,
+    embedding_cache: Mutex<HashMap<EmbeddingCacheKey, Vec<f64>>>,
+    fs_backend: Mutex<Option<Arc<dyn SharedFsBackend>>>,
+}
+
+impl Default for ExtensionStatementState {
+    fn default() -> Self {
+        Self {
+            http_requests: AtomicU32::new(0),
+            embedding_calls: AtomicU32::new(0),
+            embedding_cache: Mutex::new(HashMap::new()),
+            fs_backend: Mutex::new(None),
+        }
+    }
+}
+
 pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
     pub(crate) bypass_rls: bool,
     pub(crate) tenant_keyspace: String,
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
+    pub(crate) statement_state: Arc<ExtensionStatementState>,
 }
 
 impl ExtensionContextOpts {
@@ -38,6 +57,7 @@ impl ExtensionContextOpts {
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
+            statement_state: Arc::new(ExtensionStatementState::default()),
         }
     }
 
@@ -48,11 +68,21 @@ impl ExtensionContextOpts {
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
+            statement_state: Arc::new(ExtensionStatementState::default()),
         }
     }
 
     pub(crate) fn with_tikv_client(mut self, client: Option<Arc<TransactionClient>>) -> Self {
         self.tikv_client = client;
+        self
+    }
+
+    pub(crate) fn with_statement_state(
+        mut self,
+        statement_state: Arc<ExtensionStatementState>,
+    ) -> Self {
+        // Reuse is only correct for re-entry within the same logical statement.
+        self.statement_state = statement_state;
         self
     }
 }
@@ -62,11 +92,8 @@ pub(crate) struct ExtensionContext {
     pub(crate) bypass_rls: bool,
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
-    http_requests: Cell<u32>,
-    embedding_calls: Cell<u32>,
     embedding_mode: Cell<EmbeddingExecutionMode>,
-    embedding_cache: RefCell<HashMap<EmbeddingCacheKey, Vec<f64>>>,
-    fs_backend: RefCell<Option<Arc<dyn SharedFsBackend>>>,
+    statement_state: Arc<ExtensionStatementState>,
     tikv_client: Option<Arc<TransactionClient>>,
 }
 
@@ -109,11 +136,8 @@ pub(crate) async fn with_context_opts<R>(
         bypass_rls: opts.bypass_rls,
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
-        http_requests: Cell::new(0),
-        embedding_calls: Cell::new(0),
         embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
-        embedding_cache: RefCell::new(HashMap::new()),
-        fs_backend: RefCell::new(None),
+        statement_state: opts.statement_state,
         tikv_client: opts.tikv_client,
     };
 
@@ -151,30 +175,45 @@ pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
 }
 
 pub(crate) fn cached_fs_backend() -> Option<Arc<dyn SharedFsBackend>> {
-    CTX.try_with(|ctx| ctx.fs_backend.borrow().clone())
-        .ok()
-        .flatten()
+    CTX.try_with(|ctx| {
+        ctx.statement_state
+            .fs_backend
+            .lock()
+            .expect("fs backend mutex poisoned")
+            .clone()
+    })
+    .ok()
+    .flatten()
 }
 
 pub(crate) fn cache_fs_backend(backend: Arc<dyn SharedFsBackend>) -> Result<()> {
     CTX.try_with(|ctx| {
-        *ctx.fs_backend.borrow_mut() = Some(backend);
+        *ctx.statement_state
+            .fs_backend
+            .lock()
+            .expect("fs backend mutex poisoned") = Some(backend);
     })
     .map_err(|_| anyhow!("fs9: extension context not available"))?;
     Ok(())
 }
 
 pub(crate) fn try_consume_http_request(max_per_statement: u32) -> Result<()> {
-    CTX.try_with(|ctx| {
-        let used = ctx.http_requests.get();
+    CTX.try_with(|ctx| loop {
+        let used = ctx.statement_state.http_requests.load(Ordering::Relaxed);
         if used >= max_per_statement {
             return Err(anyhow!(
                 "http: max_requests_per_statement exceeded (max={})",
                 max_per_statement
             ));
         }
-        ctx.http_requests.set(used + 1);
-        Ok(())
+        if ctx
+            .statement_state
+            .http_requests
+            .compare_exchange_weak(used, used + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
     })
     .map_err(|_| anyhow!("http: extension context missing"))?
 }
@@ -186,8 +225,8 @@ pub(crate) fn try_consume_embedding_call() -> Result<()> {
 }
 
 pub(crate) fn try_consume_embedding_call_with_limit(max_per_statement: u32) -> Result<()> {
-    CTX.try_with(|ctx| {
-        let used = ctx.embedding_calls.get();
+    CTX.try_with(|ctx| loop {
+        let used = ctx.statement_state.embedding_calls.load(Ordering::Relaxed);
         if used >= max_per_statement {
             return Err(SqlError::InvalidParameterValue {
                 message: format!(
@@ -197,8 +236,14 @@ pub(crate) fn try_consume_embedding_call_with_limit(max_per_statement: u32) -> R
             }
             .into());
         }
-        ctx.embedding_calls.set(used + 1);
-        Ok(())
+        if ctx
+            .statement_state
+            .embedding_calls
+            .compare_exchange_weak(used, used + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
     })
     .map_err(|_| anyhow!("embedding: extension context not available"))?
 }
@@ -230,13 +275,24 @@ pub(crate) async fn with_embedding_authorized<R>(future: impl Future<Output = R>
 }
 
 pub(crate) fn cached_embedding(key: &EmbeddingCacheKey) -> Result<Option<Vec<f64>>> {
-    CTX.try_with(|ctx| ctx.embedding_cache.borrow().get(key).cloned())
-        .map_err(|_| anyhow!("embedding: extension context not available"))
+    CTX.try_with(|ctx| {
+        ctx.statement_state
+            .embedding_cache
+            .lock()
+            .expect("embedding cache mutex poisoned")
+            .get(key)
+            .cloned()
+    })
+    .map_err(|_| anyhow!("embedding: extension context not available"))
 }
 
 pub(crate) fn cache_embedding(key: EmbeddingCacheKey, vector: Vec<f64>) -> Result<()> {
     CTX.try_with(|ctx| {
-        ctx.embedding_cache.borrow_mut().insert(key, vector);
+        ctx.statement_state
+            .embedding_cache
+            .lock()
+            .expect("embedding cache mutex poisoned")
+            .insert(key, vector);
     })
     .map_err(|_| anyhow!("embedding: extension context not available"))?;
     Ok(())

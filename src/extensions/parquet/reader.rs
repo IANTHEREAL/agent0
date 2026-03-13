@@ -42,7 +42,7 @@ async fn create_fs9_reader(url: &str) -> Result<super::fs9_reader::Fs9ParquetRea
     if !crate::extensions::context::is_superuser() {
         anyhow::bail!("fs9: permission denied");
     }
-    let backend = crate::extensions::fs::backend::get_backend(&tenant).await?;
+    let backend = crate::extensions::fs::backend::acquire_statement_backend(&tenant).await?;
     let data = backend
         .read_file(path, super::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES)
         .await
@@ -215,8 +215,16 @@ pub(crate) fn strip_fs9_scheme(url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::context;
+    use crate::extensions::fs::backend::{
+        FsBackend, FsCreateUpload, FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload,
+        FsPresignedRequest, FsStorage, FsWriteStream, FsWriteStreamOptions,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use futures::future::BoxFuture;
     use futures::FutureExt;
@@ -227,6 +235,7 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
+    use tokio::io::{AsyncBufRead, BufReader};
 
     use crate::model::DataType;
 
@@ -308,6 +317,163 @@ mod tests {
         Ok(Bytes::from(out))
     }
 
+    struct MockFsWriteStream;
+
+    #[async_trait]
+    impl FsWriteStream for MockFsWriteStream {
+        async fn write_chunk(&mut self, _chunk: &[u8]) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn finish(self: Box<Self>) -> Result<usize> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn abort(self: Box<Self>) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+    }
+
+    struct MockFsBackend {
+        files: Mutex<HashMap<String, Bytes>>,
+    }
+
+    impl MockFsBackend {
+        fn new() -> Self {
+            Self {
+                files: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn insert_file(&self, path: &str, data: Bytes) {
+            self.files.lock().unwrap().insert(path.to_string(), data);
+        }
+    }
+
+    #[async_trait]
+    impl FsBackend for MockFsBackend {
+        async fn stat(&self, path: &str) -> Result<FsFileInfo> {
+            let files = self.files.lock().unwrap();
+            let data = files
+                .get(path)
+                .ok_or_else(|| anyhow!("missing test file: {path}"))?;
+            Ok(FsFileInfo {
+                path: path.to_string(),
+                is_dir: false,
+                is_symlink: false,
+                size: data.len() as u64,
+                mode: 0o644,
+                mtime: 0,
+                storage: Some(FsStorage::Inline),
+                sealed: Some(false),
+            })
+        }
+
+        async fn readdir(&self, _path: &str) -> Result<Vec<FsFileInfo>> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+            let files = self.files.lock().unwrap();
+            let data = files
+                .get(path)
+                .ok_or_else(|| anyhow!("missing test file: {path}"))?;
+            if data.len() > max_bytes {
+                anyhow::bail!("file too large for test backend")
+            }
+            Ok(data.to_vec())
+        }
+
+        async fn read_file_stream(
+            &self,
+            path: &str,
+            max_bytes: usize,
+        ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+            let data = self.read_file(path, max_bytes).await?;
+            Ok(Box::new(BufReader::new(std::io::Cursor::new(data))))
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn batch_write(
+            &self,
+            _files: Vec<crate::extensions::fs::backend::FsBatchWriteFile>,
+        ) -> Result<Vec<crate::extensions::fs::backend::FsBatchWriteEntry>> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn begin_write_stream(
+            &self,
+            _path: &str,
+            _opts: FsWriteStreamOptions,
+        ) -> Result<Box<dyn FsWriteStream>> {
+            Ok(Box::new(MockFsWriteStream))
+        }
+
+        async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn presign_upload_part(
+            &self,
+            _upload_token: &str,
+            _part_number: i32,
+        ) -> Result<FsPresignedRequest> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn complete_upload(
+            &self,
+            _upload_token: &str,
+            _parts: Vec<FsMultipartCompletedPart>,
+            _checksum: Option<[u8; 32]>,
+        ) -> Result<usize> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn abort_upload(&self, _upload_token: &str) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
+            anyhow::bail!("not implemented")
+        }
+    }
+
     #[tokio::test]
     async fn test_schema_inference() {
         let data = make_test_parquet(10).expect("create test parquet");
@@ -387,6 +553,54 @@ mod tests {
             total_rows += 1;
         }
         assert_eq!(total_rows, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_infer_schema_fs9_url_uses_cached_backend_without_tikv() {
+        let parquet = make_test_parquet(2).expect("create test parquet");
+        let backend = Arc::new(MockFsBackend::new());
+        backend.insert_file("/cached.parquet", parquet);
+
+        context::with_context(true, "tenant_a", async {
+            let shared_backend: Arc<dyn FsBackend> = backend.clone();
+            context::cache_fs_backend(shared_backend).expect("cache backend");
+
+            let schema = infer_schema("fs9:///cached.parquet")
+                .await
+                .expect("infer schema via cached backend");
+            assert_eq!(schema.columns.len(), 2);
+            assert_eq!(schema.columns[0].name, "id");
+            assert_eq!(schema.columns[1].name, "name");
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_open_row_stream_fs9_url_uses_cached_backend_without_tikv() {
+        let parquet = make_test_parquet(3).expect("create test parquet");
+        let backend = Arc::new(MockFsBackend::new());
+        backend.insert_file("/cached.parquet", parquet);
+
+        context::with_context(true, "tenant_a", async {
+            let shared_backend: Arc<dyn FsBackend> = backend.clone();
+            context::cache_fs_backend(shared_backend).expect("cache backend");
+
+            let (_schema, mut stream) = open_row_stream("fs9:///cached.parquet")
+                .await
+                .expect("open row stream via cached backend");
+
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next().await {
+                rows.push(row.expect("row conversion should succeed"));
+            }
+
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows[0],
+                vec![Value::Int32(0), Value::Text("row_0".to_string())]
+            );
+        })
+        .await;
     }
 
     #[test]

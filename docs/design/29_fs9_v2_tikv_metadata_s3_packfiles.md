@@ -26,6 +26,11 @@ This section is the current fs9 v2 contract for implementation and rollout.
 - The supported durable schema is storage-format version `4` only.
 - Rollout is **fresh TiKV keyspace + fresh S3 prefix**. Older fs9-v2 prototype revisions are rejected.
 - The persisted superblock binds a keyspace to both one `fs_instance_id` and one object-store identity.
+- All user-facing fs9 surfaces for one tenant keyspace, including SQL builtins,
+  SQL table functions, the db9-server WebSocket API, and clients layered on
+  that WebSocket path such as FUSE / `db9 fs cp`, must resolve the same
+  authoritative namespace and visibility contract. Transport differences are
+  not allowed to create separate filesystem roots or alternate directory views.
 - If the same keyspace name is recreated into a different fs instance while db9-server stays alive, restart db9-server before further fs9 access.
 - Bootstrap / backend acquire is the only supported gate for format, object-store binding, and process-local keyspace identity. Serving paths use bound runtime state only; they do not re-read `_fs_S` or coordinate instance changes on the hot path.
 - Hidden mutators are fenced by durable per-record `fs_instance_id` ownership. Background maintenance also keeps a low-frequency self-stop probe so stale loops stand down promptly after an instance replacement.
@@ -61,6 +66,12 @@ That SQL fs client should own three responsibilities:
    - acquire the fs backend once per statement runtime scope
    - reuse the bound backend for all scalar fs9 calls in that statement
    - keep bootstrap / runtime binding checks out of individual builtin leaves
+
+   This acquire/cache rule is not scalar-only. Any SQL entry point that reads
+   or writes the tenant fs9 namespace, including `extensions.fs9(...)`,
+   `read_parquet('fs9://...')`, and `COPY FROM 'fs9://...'`, must reuse the
+   same statement-scoped backend binding instead of constructing an uncached
+   backend independently.
 
 2. **Explicit SQL type contract**
 

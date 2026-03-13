@@ -867,17 +867,7 @@ impl WorkerEngine {
         } else {
             vec!["public".to_string()]
         };
-        let ext_ctx = if entry.task_type == TaskType::Cron {
-            ExtensionContextOpts::cron(&entry.keyspace).with_tikv_client(store.transaction_client())
-        } else {
-            ExtensionContextOpts {
-                is_superuser: true,
-                bypass_rls: true,
-                tenant_keyspace: entry.keyspace.clone(),
-                execution_kind: crate::extensions::context::ExecutionKind::Interactive,
-                tikv_client: store.transaction_client(),
-            }
-        };
+        let tikv_client = store.transaction_client();
 
         let mut txn = store.begin().await?;
         let mut sequence_values = crate::sql::sequences::SequenceSession::new();
@@ -896,10 +886,15 @@ impl WorkerEngine {
 
                 // Wrap each statement in its own extension context to reset
                 // http_requests counter and isolate statement memory lifecycle.
+                let ext_ctx = background_statement_extension_context(
+                    is_cron,
+                    &entry.keyspace,
+                    tikv_client.clone(),
+                );
                 let fut = crate::pool::run_with_statement_memory_scope(
                     Some(statement_memory_accountant.clone()),
                     with_context_opts(
-                        ext_ctx.clone(),
+                        ext_ctx,
                         query_context::with_scoped_query_context(
                             &qctx,
                             exec.execute_statement_on_txn(
@@ -1239,6 +1234,18 @@ fn parse_hnsw_merge_command(command: &str) -> Result<(u64, u64)> {
     Ok((table_id, index_id))
 }
 
+fn background_statement_extension_context(
+    is_cron: bool,
+    keyspace: &str,
+    tikv_client: Option<Arc<tikv_client::TransactionClient>>,
+) -> ExtensionContextOpts {
+    if is_cron {
+        ExtensionContextOpts::cron(keyspace).with_tikv_client(tikv_client)
+    } else {
+        ExtensionContextOpts::statement(true, true, keyspace).with_tikv_client(tikv_client)
+    }
+}
+
 /// Maximum deltas to process in a single merge transaction.
 const MERGE_BATCH_SIZE: usize = 5000;
 
@@ -1440,6 +1447,30 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
         }
+    }
+
+    #[test]
+    fn background_statement_extension_context_uses_fresh_statement_state_per_call() {
+        let first = background_statement_extension_context(true, "tenant_a", None);
+        let second = background_statement_extension_context(true, "tenant_a", None);
+        assert_eq!(
+            first.execution_kind,
+            crate::extensions::context::ExecutionKind::Cron
+        );
+        assert_eq!(
+            second.execution_kind,
+            crate::extensions::context::ExecutionKind::Cron
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&first.statement_state, &second.statement_state),
+            "each background statement must start with a fresh statement-scoped extension state"
+        );
+
+        let interactive = background_statement_extension_context(false, "tenant_a", None);
+        assert_eq!(
+            interactive.execution_kind,
+            crate::extensions::context::ExecutionKind::Interactive
+        );
     }
 
     #[test]

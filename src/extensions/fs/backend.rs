@@ -133,6 +133,7 @@ pub(crate) trait FsBackend: Send + Sync {
 
 pub(crate) fn is_backend_available() -> bool {
     crate::extensions::context::tikv_client().is_some()
+        || crate::extensions::context::cached_fs_backend().is_some()
 }
 
 pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
@@ -142,7 +143,7 @@ pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
     )
 }
 
-pub(crate) async fn get_backend_shared(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
+async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
     let client = crate::extensions::context::tikv_client().ok_or_else(|| {
         anyhow!(
             "fs9: TiKV client not available in extension context. \
@@ -155,17 +156,18 @@ pub(crate) async fn get_backend_shared(tenant_keyspace: &str) -> Result<Arc<dyn 
         .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
 }
 
-pub(crate) async fn get_backend(tenant_keyspace: &str) -> Result<Box<dyn FsBackend>> {
-    let client = crate::extensions::context::tikv_client().ok_or_else(|| {
-        anyhow!(
-            "fs9: TiKV client not available in extension context. \
-             Ensure the caller wraps this in with_context_opts()."
-        )
-    })?;
-    EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
-        .await
-        .map(|b| Box::new(b) as Box<dyn FsBackend>)
-        .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+/// Acquire the authoritative fs9 backend for the current statement.
+///
+/// All SQL fs9 entry points must reuse this helper so a statement either
+/// shares one bound backend or fails under one consistent contract.
+pub(crate) async fn acquire_statement_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
+    if let Some(backend) = crate::extensions::context::cached_fs_backend() {
+        return Ok(backend);
+    }
+
+    let backend = init_backend(tenant_keyspace).await?;
+    crate::extensions::context::cache_fs_backend(backend.clone())?;
+    Ok(backend)
 }
 
 #[cfg(test)]
@@ -173,8 +175,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn get_backend_without_context_returns_error() {
-        match get_backend("tenant_a").await {
+    async fn acquire_statement_backend_without_context_returns_error() {
+        match acquire_statement_backend("tenant_a").await {
             Ok(_) => panic!("missing extension context must return error"),
             Err(err) => assert!(
                 err.to_string().contains("TiKV client not available"),
@@ -193,8 +195,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_backend_shared_without_context_returns_error() {
-        match get_backend_shared("tenant_a").await {
+    async fn init_backend_without_context_returns_error() {
+        match init_backend("tenant_a").await {
             Ok(_) => panic!("missing extension context must return error"),
             Err(err) => assert!(
                 err.to_string().contains("TiKV client not available"),

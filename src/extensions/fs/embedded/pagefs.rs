@@ -6383,6 +6383,69 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn test_write_file_behavioral_replaces_existing_object_file() {
+        let fs = make_fs().await;
+        let base = "/test_write_file_replace_existing_object";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let inline_max = fs9_config().inline_max_bytes;
+        if inline_max == 0 || fs9_config().s3.is_none() {
+            return;
+        }
+
+        let path = &format!("{base}/replace.bin");
+        let original: Vec<u8> = (0..(inline_max + 1)).map(|idx| (idx % 251) as u8).collect();
+        fs.write_file(path, &original).await.unwrap();
+
+        let original_inode = fs.stat(path).await.unwrap();
+        assert!(
+            matches!(original_inode.data, DataRef::Object { .. }),
+            "large write must route through object storage"
+        );
+        let original_data_ref = original_inode.data.clone();
+
+        let append_err = fs
+            .append_file(path, b"!")
+            .await
+            .expect_err("partial mutation on an object-backed file must stay sealed");
+        assert!(
+            append_err
+                .to_string()
+                .contains("append is not supported for sealed files"),
+            "unexpected append error: {append_err}"
+        );
+
+        let replacement = b"replacement-inline".to_vec();
+        fs.write_file(path, &replacement).await.unwrap();
+
+        let replaced_inode = fs.stat(path).await.unwrap();
+        assert_eq!(
+            replaced_inode.id, original_inode.id,
+            "full replace should reuse the inode instead of creating a second published file"
+        );
+        assert_eq!(replaced_inode.data, DataRef::InlineBlob);
+        assert_eq!(replaced_inode.size, replacement.len() as u64);
+        assert_eq!(fs.read_file(path).await.unwrap(), replacement);
+
+        let mut txn = fs.begin_internal().await.unwrap();
+        assert_eq!(
+            lifecycle::load_lifecycle(&mut txn, replaced_inode.id)
+                .await
+                .unwrap(),
+            Some(FileLifecycle::Deleting {
+                fs_instance_id: fs.runtime_state().fs_instance_id,
+                data_ref: original_data_ref,
+            }),
+            "full replace of an object-backed file must retire the old object via lifecycle cleanup"
+        );
+        let _ = txn.rollback().await;
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn test_inlineblob_behavioral_truncate_rejects_non_inline_growth() {
         let fs = make_fs().await;
         let base = "/test_inlineblob_truncate_reject_non_inline";

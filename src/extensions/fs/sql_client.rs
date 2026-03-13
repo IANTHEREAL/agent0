@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -13,10 +12,13 @@ pub(crate) struct SqlFsClient {
 }
 
 impl SqlFsClient {
+    // SqlFsClient is a thin statement-scoped adapter over the raw fs backend.
+    // It centralizes backend acquisition/caching and text-vs-bytea read rules,
+    // but it must not introduce SQL-only write semantics or a separate namespace.
     pub(crate) async fn from_context() -> Result<Self> {
         let tenant = context::tenant_keyspace()
             .ok_or_else(|| anyhow!("fs9: tenant keyspace not available in extension context"))?;
-        let backend = acquire_cached_backend(tenant).await?;
+        let backend = backend::acquire_statement_backend(&tenant).await?;
         Ok(Self { backend })
     }
 
@@ -110,29 +112,6 @@ impl SqlFsClient {
             Ok(1)
         }
     }
-}
-
-async fn acquire_cached_backend(tenant_keyspace: String) -> Result<Arc<dyn FsBackend>> {
-    acquire_cached_backend_with(tenant_keyspace, |tenant| async move {
-        backend::get_backend_shared(&tenant).await
-    })
-    .await
-}
-
-async fn acquire_cached_backend_with<F, Fut>(
-    tenant_keyspace: String,
-    init: F,
-) -> Result<Arc<dyn FsBackend>>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Result<Arc<dyn FsBackend>>>,
-{
-    if let Some(backend) = context::cached_fs_backend() {
-        return Ok(backend);
-    }
-    let backend = init(tenant_keyspace).await?;
-    context::cache_fs_backend(backend.clone())?;
-    Ok(backend)
 }
 
 fn decode_utf8(bytes: Vec<u8>, fn_name: &str, binary_fn_name: &str) -> Result<String> {
@@ -412,39 +391,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_backend_initializer_runs_once_per_statement() {
+    async fn from_context_reuses_cached_backend_within_statement() {
         let backend: Arc<dyn FsBackend> = Arc::new(MockBackend::new());
-        let init_calls = Arc::new(AtomicUsize::new(0));
 
         context::with_context(true, "tenant_a", async {
-            let init_calls_first = init_calls.clone();
-            let backend_first = backend.clone();
-            let first = acquire_cached_backend_with("tenant_a".to_string(), move |_| {
-                let init_calls = init_calls_first.clone();
-                let backend = backend_first.clone();
-                async move {
-                    init_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(backend)
-                }
-            })
-            .await
-            .expect("first acquire");
+            context::cache_fs_backend(backend.clone()).expect("cache backend");
 
-            let init_calls_second = init_calls.clone();
-            let backend_second = backend.clone();
-            let second = acquire_cached_backend_with("tenant_a".to_string(), move |_| {
-                let init_calls = init_calls_second.clone();
-                let backend = backend_second.clone();
-                async move {
-                    init_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(backend)
-                }
-            })
-            .await
-            .expect("second acquire");
+            let first = SqlFsClient::from_context()
+                .await
+                .expect("first acquire from context");
+            let second = SqlFsClient::from_context()
+                .await
+                .expect("second acquire from context");
 
-            assert!(Arc::ptr_eq(&first, &second));
-            assert_eq!(init_calls.load(Ordering::Relaxed), 1);
+            assert!(Arc::ptr_eq(&first.backend, &second.backend));
+            assert!(Arc::ptr_eq(&first.backend, &backend));
         })
         .await;
     }

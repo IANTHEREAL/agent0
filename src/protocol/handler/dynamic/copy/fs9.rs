@@ -270,7 +270,7 @@ impl DynamicPgHandler {
 
                 let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
                 let tenant = executor.tenant_keyspace().to_string();
-                let backend = crate::extensions::fs::backend::get_backend(&tenant)
+                let backend = crate::extensions::fs::backend::acquire_statement_backend(&tenant)
                     .await
                     .map_err(copy_from_fs9_io_error)?;
                 backend

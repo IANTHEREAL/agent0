@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::model::{Row, TableSchema};
@@ -51,7 +52,7 @@ pub(crate) async fn infer_table_function_schema(
     tenant: &str,
     mode: &Fs9Mode,
 ) -> Result<TableSchema> {
-    let backend = backend::get_backend(tenant).await?;
+    let backend = backend::acquire_statement_backend(tenant).await?;
     let backend = backend.as_ref();
 
     match mode {
@@ -136,7 +137,7 @@ pub(crate) async fn execute_table_function(
     tenant: &str,
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    let backend = backend::get_backend(tenant).await?;
+    let backend = backend::acquire_statement_backend(tenant).await?;
     execute_table_function_with_budget_for_backend(backend.as_ref(), mode, MAX_TOTAL_BYTES).await
 }
 
@@ -314,12 +315,12 @@ pub(crate) async fn start_file_stream(
     delimiter: Option<char>,
     header: Option<bool>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let backend = backend::get_backend(tenant).await?;
+    let backend = backend::acquire_statement_backend(tenant).await?;
     start_file_stream_for_backend(backend, path, format, delimiter, header).await
 }
 
 async fn start_file_stream_for_backend(
-    backend: Box<dyn backend::FsBackend>,
+    backend: Arc<dyn backend::FsBackend>,
     path: &str,
     format: Option<&str>,
     delimiter: Option<char>,
@@ -469,7 +470,7 @@ async fn start_file_stream_for_test_backend(
     delimiter: Option<char>,
     header: Option<bool>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    start_file_stream_for_backend(backend, path, format, delimiter, header).await
+    start_file_stream_for_backend(Arc::from(backend), path, format, delimiter, header).await
 }
 
 pub(crate) async fn start_glob_stream(
@@ -501,7 +502,7 @@ async fn start_glob_stream_with_budget(
     exclude: Option<&str>,
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let backend = backend::get_backend(tenant).await?;
+    let backend = backend::acquire_statement_backend(tenant).await?;
     start_glob_stream_with_budget_for_backend(
         backend,
         pattern,
@@ -515,7 +516,7 @@ async fn start_glob_stream_with_budget(
 }
 
 async fn start_glob_stream_with_budget_for_backend(
-    backend: Box<dyn backend::FsBackend>,
+    backend: Arc<dyn backend::FsBackend>,
     pattern: &str,
     format: Option<&str>,
     delimiter: Option<char>,
@@ -594,7 +595,7 @@ async fn start_glob_stream_with_budget_for_backend(
     let (tx, rx) = mpsc::channel(256);
     let fmt_owned = fmt.to_string();
     let pattern_owned = pattern.to_string();
-    // Move the boxed backend into the spawned task so it can make further requests.
+    // Move the shared backend into the spawned task so it can make further requests.
     tokio::spawn(async move {
         let mut total_bytes: usize = 0;
         let mut files_read_count: usize = 0;
@@ -734,7 +735,7 @@ async fn start_glob_stream_with_budget_for_test_backend(
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     start_glob_stream_with_budget_for_backend(
-        backend,
+        Arc::from(backend),
         pattern,
         format,
         delimiter,
@@ -815,6 +816,7 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tokio::io::AsyncBufRead;
@@ -827,6 +829,7 @@ mod tests {
         start_file_stream_for_test_backend, start_glob_stream,
         start_glob_stream_with_budget_for_test_backend, Fs9Mode,
     };
+    use crate::extensions::context;
     use crate::extensions::fs::backend::{FsBackend, FsFileInfo, FsWriteStream};
     use crate::model::Value;
 
@@ -1013,6 +1016,11 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    fn cache_test_local_backend() {
+        let backend: Arc<dyn FsBackend> = Arc::new(TestLocalBackend);
+        context::cache_fs_backend(backend).expect("cache backend");
+    }
+
     #[tokio::test]
     async fn infer_table_function_schema_without_context_returns_error() {
         let mode = Fs9Mode::File {
@@ -1067,6 +1075,112 @@ mod tests {
         assert!(err
             .to_string()
             .contains("fs9: TiKV client not available in extension context"));
+    }
+
+    #[tokio::test]
+    async fn infer_table_function_schema_uses_cached_backend_without_tikv() {
+        let dir = unique_base("cached-infer");
+        let csv_path = dir.join("users.csv");
+        fs::write(&csv_path, "name,age\nalice,30\n").expect("write users.csv");
+        let mode = Fs9Mode::File {
+            path: csv_path.to_string_lossy().to_string(),
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(true),
+        };
+
+        context::with_context(true, "tenant_a", async {
+            cache_test_local_backend();
+            let schema = infer_table_function_schema("tenant_a", &mode)
+                .await
+                .expect("infer schema via cached backend");
+            assert_eq!(schema.columns.len(), 4);
+            assert_eq!(schema.columns[1].name, "name");
+            assert_eq!(schema.columns[2].name, "age");
+        })
+        .await;
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn execute_table_function_uses_cached_backend_without_tikv() {
+        let dir = unique_base("cached-exec");
+        let csv_path = dir.join("users.csv");
+        fs::write(&csv_path, "name,age\nalice,30\n").expect("write users.csv");
+        let mode = Fs9Mode::File {
+            path: csv_path.to_string_lossy().to_string(),
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(true),
+        };
+
+        context::with_context(true, "tenant_a", async {
+            cache_test_local_backend();
+            let (_schema, rows) = execute_table_function("tenant_a", mode)
+                .await
+                .expect("execute via cached backend");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[1], Value::Text("alice".to_string()));
+            assert_eq!(rows[0].values[2], Value::Text("30".to_string()));
+        })
+        .await;
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_file_stream_uses_cached_backend_without_tikv() {
+        let dir = unique_base("cached-file-stream");
+        let txt_path = dir.join("hello.txt");
+        fs::write(&txt_path, "hello\nworld\n").expect("write hello.txt");
+        let path = txt_path.to_string_lossy().to_string();
+
+        context::with_context(true, "tenant_a", async {
+            cache_test_local_backend();
+            let (_schema, mut rx) = start_file_stream("tenant_a", &path, None, None, None)
+                .await
+                .expect("start file stream via cached backend")
+                .expect("expected file stream");
+
+            let mut lines = Vec::new();
+            while let Some(row) = rx.recv().await {
+                if let Value::Text(line) = &row.values[1] {
+                    lines.push(line.clone());
+                }
+            }
+            assert_eq!(lines, vec!["hello", "world"]);
+        })
+        .await;
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_glob_stream_uses_cached_backend_without_tikv() {
+        let dir = unique_base("cached-glob-stream");
+        fs::write(dir.join("a.txt"), "alpha\n").expect("write a.txt");
+        fs::write(dir.join("b.txt"), "bravo\n").expect("write b.txt");
+        let pattern = format!("{}/*.txt", dir.display());
+
+        context::with_context(true, "tenant_a", async {
+            cache_test_local_backend();
+            let (_schema, mut rx) = start_glob_stream("tenant_a", &pattern, None, None, None, None)
+                .await
+                .expect("start glob stream via cached backend")
+                .expect("expected glob stream");
+
+            let mut lines = Vec::new();
+            while let Some(row) = rx.recv().await {
+                if let Value::Text(line) = &row.values[1] {
+                    lines.push(line.clone());
+                }
+            }
+            assert_eq!(lines, vec!["alpha", "bravo"]);
+        })
+        .await;
+
+        cleanup(&dir);
     }
 
     #[tokio::test]

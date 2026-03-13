@@ -515,6 +515,9 @@ mod tests {
                 HashSet::from(["embedding".to_string()]),
                 HashSet::new(),
             )),
+            extension_statement_state: Arc::new(
+                crate::extensions::context::ExtensionStatementState::default(),
+            ),
         };
 
         let result: PgWireResult<()> = with_copy_statement_context(&qctx, &runtime, async {
@@ -539,5 +542,44 @@ mod tests {
         .await;
 
         result.expect("copy statement context should succeed");
+    }
+
+    #[tokio::test]
+    async fn copy_statement_context_reuses_statement_extension_state_across_reentry() {
+        let qctx = QueryContext::for_tests();
+        let runtime = StatementRuntimeContext {
+            settings: RuntimeSettings {
+                is_superuser: false,
+                bypass_rls: false,
+                timezone: Arc::from("UTC"),
+                max_sort_bytes: 4096,
+                search_path: Arc::new(vec!["public".to_string()]),
+                text_search_config: Arc::from("simple"),
+            },
+            tenant_keyspace: Arc::from("copy_tenant"),
+            database_id: 88,
+            txn_snapshot_ts_version: Some(1234),
+            tikv_client: None,
+            extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
+            extension_statement_state: Arc::new(
+                crate::extensions::context::ExtensionStatementState::default(),
+            ),
+        };
+
+        let first: PgWireResult<()> = with_copy_statement_context(&qctx, &runtime, async {
+            crate::extensions::context::try_consume_embedding_call_with_limit(1)
+                .expect("first re-entry should consume the shared statement budget");
+            Ok(())
+        })
+        .await;
+        first.expect("first copy statement context should succeed");
+
+        let second: PgWireResult<()> = with_copy_statement_context(&qctx, &runtime, async {
+            crate::extensions::context::try_consume_embedding_call_with_limit(1)
+                .expect_err("second re-entry must see the same shared statement state");
+            Ok(())
+        })
+        .await;
+        second.expect("second copy statement context should succeed");
     }
 }
