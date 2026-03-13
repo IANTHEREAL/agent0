@@ -70,6 +70,10 @@ pub async fn execute_drop_table(
                 .drop_trigger(txn, db_id, &resolved.full, &trigger.name)
                 .await?;
         }
+        // Drop RLS policies associated with this table.
+        if let Some(tid) = table_id {
+            store.drop_policies_for_table(txn, db_id, tid).await?;
+        }
         let dropped_seqs =
             drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
         for seq in dropped_seqs {
