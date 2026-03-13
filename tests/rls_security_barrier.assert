@@ -1,0 +1,22 @@
+# RLS Security Barrier assertions — verify user predicates cannot
+# observe RLS-hidden rows through side-channel functions.
+
+# Q1: barrier_user sees only their own rows through barrier_spy filter
+1|visible-1
+2|visible-2
+
+# Q2: Spy function log — CRITICAL: must only contain visible rows.
+# If the barrier was broken (flattened), hidden-1/hidden-2 would appear.
+visible-1
+visible-2
+
+# Q3: Direct SELECT also shows only visible rows
+1|visible-1
+2|visible-2
+
+# Q4: Compound predicate (barrier_spy AND id > 1) — only visible-2 returned
+2|visible-2
+
+# Q5: Spy log after compound predicate — still no hidden rows leaked
+visible-1
+visible-2
