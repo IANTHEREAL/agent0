@@ -4,7 +4,9 @@
 //! DML statement. Created once per statement in `stmt_dml.rs`, then threaded into
 //! `execute_analyzed_insert/update/delete` and COPY paths.
 
-use super::policy::{compile_rls_policy_expr, should_bypass_rls, CompiledRlsPolicy};
+use super::policy::{
+    compile_rls_policy_expr, should_bypass_rls, CompiledRlsPolicy,
+};
 use crate::model::{RlsCommand, RlsPolicy, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::error::SqlError;
@@ -23,12 +25,11 @@ fn filter_applicable_policies<'a>(
     command: RlsCommand,
     current_role: &str,
 ) -> Vec<&'a RlsPolicy> {
-    policies.iter().filter(|p| {
-        let cmd_match = matches!(p.command, RlsCommand::All) || p.command == command;
-        let role_match = p.roles.is_empty()
-            || p.roles.iter().any(|r| r == current_role || r.eq_ignore_ascii_case("public"));
-        cmd_match && role_match
-    }).collect()
+    use super::policy::{command_matches, policy_applies_to_role};
+    policies
+        .iter()
+        .filter(|p| command_matches(&p.command, &command) && policy_applies_to_role(p, current_role))
+        .collect()
 }
 
 // ── Expression compilation for DML (per-row eval) ─────────
@@ -168,12 +169,20 @@ pub struct RlsDmlContext {
     /// For DELETE: USING policies.
     pub command_policies: Vec<CompiledRlsPolicy>,
 
+    /// Merged SELECT USING + command USING policies for row visibility.
+    /// Used by UPDATE/DELETE `is_row_visible()` to enforce PG semantics:
+    /// both SELECT/ALL and command-specific policies must allow visibility.
+    /// `None` for INSERT (no pre-read visibility check).
+    pub visibility_policies: Option<Vec<CompiledRlsPolicy>>,
+
     /// Compiled SELECT policies for RETURNING clause validation.
     /// Only populated when the statement has a RETURNING clause.
     pub select_policies: Option<Vec<CompiledRlsPolicy>>,
 
     /// For UPDATE: compiled USING combined predicate to inject into WHERE.
     /// Pre-combined as a single `TypedExpr` for efficient injection.
+    /// TODO: Build as TypedExpr for injection into AnalyzedUpdate/Delete.where_clause.
+    /// For now, per-row evaluation via `visibility_policies` handles correctness.
     pub using_predicate: Option<TypedExpr>,
 }
 
@@ -209,6 +218,7 @@ impl RlsDmlContext {
 
         Ok(Self {
             command_policies,
+            visibility_policies: None,
             select_policies,
             using_predicate: None,
         })
@@ -219,6 +229,10 @@ impl RlsDmlContext {
     /// Compiles UPDATE USING policies (for row visibility / WHERE injection),
     /// UPDATE WITH CHECK policies (for post-update validation),
     /// and (if RETURNING present) SELECT USING policies.
+    ///
+    /// PG semantics: UPDATE's read path must also satisfy SELECT/ALL USING
+    /// policies. The `visibility_policies` field merges both sets for
+    /// `is_row_visible()`.
     pub fn for_update(
         schema: &TableSchema,
         all_policies: &[RlsPolicy],
@@ -233,20 +247,23 @@ impl RlsDmlContext {
                 .collect();
         let command_policies = compile_dml_policies(schema, &update_applicable, qctx)?;
 
-        // Also need SELECT policies for row visibility in UPDATE
-        // PG: SELECT/ALL policies also constrain UPDATE's read path
-        let select_for_visibility: Vec<RlsPolicy> =
+        // SELECT/ALL policies also constrain UPDATE's read path (PG semantics).
+        let select_applicable: Vec<RlsPolicy> =
             filter_applicable_policies(all_policies, RlsCommand::Select, current_role)
                 .into_iter()
                 .cloned()
                 .collect();
-        let select_compiled = compile_dml_policies(schema, &select_for_visibility, qctx)?;
+        let select_compiled = compile_dml_policies(schema, &select_applicable, qctx)?;
 
-        // Build combined USING predicate for WHERE injection
-        // This combines both UPDATE USING and SELECT USING policies
-        // TODO: Build as TypedExpr for injection into AnalyzedUpdate.where_clause
-        // For now, store SELECT policies for per-row evaluation
-        let using_predicate = None; // Will be implemented when integrating with Analyzer
+        // Merge UPDATE USING + SELECT USING into visibility_policies.
+        let mut visibility = Vec::with_capacity(command_policies.len() + select_compiled.len());
+        visibility.extend(command_policies.iter().cloned());
+        visibility.extend(select_compiled.iter().cloned());
+        let visibility_policies = Some(visibility);
+
+        // TODO: Build combined USING predicate as TypedExpr for WHERE injection.
+        // For now, per-row evaluation via visibility_policies handles correctness.
+        let using_predicate = None;
 
         let select_policies = if has_returning {
             Some(select_compiled)
@@ -256,6 +273,7 @@ impl RlsDmlContext {
 
         Ok(Self {
             command_policies,
+            visibility_policies,
             select_policies,
             using_predicate,
         })
@@ -265,6 +283,9 @@ impl RlsDmlContext {
     ///
     /// Compiles DELETE USING policies (for row visibility / WHERE injection)
     /// and (if RETURNING present) SELECT USING policies.
+    ///
+    /// PG semantics: DELETE's read path must also satisfy SELECT/ALL USING
+    /// policies. The `visibility_policies` field merges both sets.
     pub fn for_delete(
         schema: &TableSchema,
         all_policies: &[RlsPolicy],
@@ -279,30 +300,33 @@ impl RlsDmlContext {
                 .collect();
         let command_policies = compile_dml_policies(schema, &delete_applicable, qctx)?;
 
-        // SELECT policies also constrain DELETE's read path
-        let select_for_visibility: Vec<RlsPolicy> =
+        // SELECT/ALL policies also constrain DELETE's read path (PG semantics).
+        let select_applicable: Vec<RlsPolicy> =
             filter_applicable_policies(all_policies, RlsCommand::Select, current_role)
                 .into_iter()
                 .cloned()
                 .collect();
-        let _select_compiled = compile_dml_policies(schema, &select_for_visibility, qctx)?;
+        let select_compiled = compile_dml_policies(schema, &select_applicable, qctx)?;
 
-        // TODO: Build combined USING predicate for WHERE injection
+        // Merge DELETE USING + SELECT USING into visibility_policies.
+        let mut visibility = Vec::with_capacity(command_policies.len() + select_compiled.len());
+        visibility.extend(command_policies.iter().cloned());
+        visibility.extend(select_compiled.iter().cloned());
+        let visibility_policies = Some(visibility);
+
+        // TODO: Build combined USING predicate as TypedExpr for WHERE injection.
         let using_predicate = None;
 
+        // Reuse select_compiled for RETURNING (no re-compilation).
         let select_policies = if has_returning {
-            let select_applicable: Vec<RlsPolicy> =
-                filter_applicable_policies(all_policies, RlsCommand::Select, current_role)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-            Some(compile_dml_policies(schema, &select_applicable, qctx)?)
+            Some(select_compiled)
         } else {
             None
         };
 
         Ok(Self {
             command_policies,
+            visibility_policies,
             select_policies,
             using_predicate,
         })
@@ -326,8 +350,10 @@ impl RlsDmlContext {
 
     /// Check if a row is visible through USING policies.
     /// Used by UPDATE/DELETE to filter pre-existing rows.
+    /// Evaluates merged SELECT USING + command USING policies (PG semantics).
     pub fn is_row_visible(&self, row: &Row, qctx: &QueryContext) -> Result<bool> {
-        validate_rls_using(&self.command_policies, row, qctx)
+        let policies = self.visibility_policies.as_deref().unwrap_or(&self.command_policies);
+        validate_rls_using(policies, row, qctx)
     }
 
     /// Validate RETURNING clause rows against SELECT policies.
