@@ -48,6 +48,7 @@ pub(crate) mod raw_sql;
 mod rbac;
 mod result;
 pub(crate) mod rewriter;
+pub(crate) mod rls;
 mod role_settings;
 pub(crate) mod runtime_context;
 pub(crate) mod scanner;

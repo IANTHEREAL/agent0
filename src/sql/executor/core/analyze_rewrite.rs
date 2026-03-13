@@ -9,7 +9,8 @@
 //! 2) catalog snapshot build
 //! 3) SELECT privilege check
 //! 4) Analyzer
-//! 5) post-analysis rewriter
+//! 5) RLS predicate injection (post-Analyzer, pre-rewriter)
+//! 6) post-analysis rewriter
 //!
 //! Contract: this is the only semantic entrypoint. Callers must not implement
 //! runtime fallback to alternate planning/execution paths on analysis failure.
@@ -18,8 +19,10 @@ use super::catalog_prefetch::build_catalog_snapshot;
 use super::view_rewrite::expand_views_in_query;
 use super::*;
 use crate::auth::Privilege;
+use crate::model::{RlsCommand, RlsPolicy};
 use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
 use crate::sql::error::SqlError;
+use crate::sql::rls::{inject_rls_predicates, should_bypass_rls};
 
 impl Executor {
     /// Canonical `SELECT/WITH` entry:
@@ -75,11 +78,96 @@ impl Executor {
             analyzer.analyze_query(&expanded_query)
         })
         .map_err(SqlError::from)?;
+
+        // --- RLS predicate injection (step 5) ---
+        // After Analyzer resolves all columns/types but before the rewriter,
+        // inject RLS WHERE predicates for tables with row-level security enabled.
+        let analyzed = self
+            .maybe_inject_rls_select(txn, db_id, search_path, analyzed, current_role, &catalog)
+            .await?;
+
         let rewritten = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
             crate::sql::rewriter::rewrite_query(analyzed)
         });
         // Drop deep expanded AST on a grown stack before returning.
         crate::sql::stack_safety::drop_on_grown_stack(expanded_query);
         Ok(rewritten)
+    }
+
+    /// Inject RLS predicates if any referenced table has row-level security enabled.
+    ///
+    /// Fast path: if no table has `rls_enabled`, returns `analyzed` unchanged.
+    ///
+    /// **Prepared statement contract**: This method is intentionally NOT called from
+    /// `prepared_analysis.rs`. For prepared statements on RLS-sensitive tables,
+    /// the `rls_sensitive` flag (see #1811) triggers a text fallback at EXECUTE time,
+    /// which re-enters `analyze_then_rewrite_query()` where this injection runs
+    /// naturally. Do not duplicate this call into the prepared analysis path.
+    async fn maybe_inject_rls_select(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        _search_path: &[String],
+        analyzed: AnalyzedQuery,
+        current_role: Option<&str>,
+        catalog: &crate::sql::analyzer::CatalogSnapshot,
+    ) -> Result<AnalyzedQuery> {
+        let table_schemas = catalog.base_table_schemas();
+
+        // Fast path: skip if no table has RLS enabled.
+        let any_rls = table_schemas.values().any(|s| s.rls_enabled);
+        if !any_rls {
+            return Ok(analyzed);
+        }
+
+        let role = current_role.unwrap_or(""); // empty role matches no role-specific policies
+        let is_superuser = crate::extensions::context::is_superuser();
+
+        // Load RLS policies for all RLS-enabled tables.
+        let mut policies_by_table: HashMap<u64, Vec<RlsPolicy>> = HashMap::new();
+        for schema in table_schemas.values() {
+            if !schema.rls_enabled {
+                continue;
+            }
+            if should_bypass_rls(
+                is_superuser,
+                role,
+                &schema.owner,
+                schema.rls_enabled,
+                schema.rls_force,
+            ) {
+                continue;
+            }
+            let policies = self
+                .store()
+                .list_policies_for_table(txn, db_id, schema.table_id)
+                .await?;
+            if !policies.is_empty() {
+                policies_by_table.insert(schema.table_id, policies);
+            }
+            // If no policies but RLS is enabled, leave the table absent from the map.
+            // inject_rls_predicates will produce WHERE false (default-deny).
+        }
+
+        // Build a minimal QueryContext for policy expression compilation.
+        let qctx = crate::sql::query_context::QueryContext::new(
+            0, // connection_id not critical for RLS expr compilation
+            std::sync::Arc::from(""),
+            std::sync::Arc::from(role),
+            chrono::Utc::now().timestamp_millis(),
+            chrono::Utc::now().timestamp_millis(),
+            std::sync::Arc::from("UTC"),
+        );
+
+        let rls_ctx = crate::sql::rls::inject::RlsContext {
+            current_role: role,
+            is_superuser,
+            table_schemas: &table_schemas,
+            policies_by_table: &policies_by_table,
+            qctx: &qctx,
+            command: RlsCommand::Select,
+        };
+
+        inject_rls_predicates(analyzed, &rls_ctx)
     }
 }

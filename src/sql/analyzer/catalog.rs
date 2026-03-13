@@ -244,6 +244,24 @@ impl CatalogSnapshot {
         result
     }
 
+    /// Return a map of qualified_name → TableSchema for all real base tables.
+    /// Used by the RLS injection layer to look up table metadata.
+    pub fn base_table_schemas(&self) -> HashMap<String, &TableSchema> {
+        let mut result = HashMap::new();
+        for (qualified_name, schema) in self.tables.values() {
+            if self.non_base_names.contains(qualified_name.as_str()) {
+                continue;
+            }
+            if qualified_name.starts_with("information_schema.")
+                || qualified_name.starts_with("pg_catalog.")
+            {
+                continue;
+            }
+            result.insert(qualified_name.clone(), schema);
+        }
+        result
+    }
+
     /// Merge tables from another snapshot into this one (for DML + subquery).
     pub fn merge_from(&mut self, other: &CatalogSnapshot) {
         for (key, (qualified, schema)) in &other.tables {

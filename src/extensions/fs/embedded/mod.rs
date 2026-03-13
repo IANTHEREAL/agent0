@@ -20,10 +20,10 @@ use tokio::io::AsyncBufRead;
 use tokio::sync::OnceCell;
 use types::{DataRef, FsInstanceIdentity, Inode, InodeType};
 
-type BackendRegistry = Mutex<HashMap<FsInstanceIdentity, Arc<OnceCell<Arc<EmbeddedPageFs>>>>>;
+type FsRegistry = Mutex<HashMap<FsInstanceIdentity, Arc<OnceCell<Arc<EmbeddedPageFs>>>>>;
 
-fn backend_registry() -> &'static BackendRegistry {
-    static REGISTRY: OnceLock<BackendRegistry> = OnceLock::new();
+fn backend_registry() -> &'static FsRegistry {
+    static REGISTRY: OnceLock<FsRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
