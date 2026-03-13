@@ -6,8 +6,10 @@
 
 use crate::model::{DataType, RlsCommand, RlsPolicy, TableSchema};
 use crate::sql::analyzer::types::{BinaryOp, TypedExpr, TypedExprKind};
-use crate::sql::expr::compile::compile_row_expr_for_table;
+use crate::sql::expr::compile::{analyze_row_expr_for_table, compile_row_expr_for_table};
+use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
+use crate::sql::rls::cache::RlsPolicyCache;
 use anyhow::{anyhow, Result};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -68,6 +70,59 @@ pub fn compile_rls_policy_expr(
     compile_row_expr_for_table(&expr, schema, table_alias, qctx)
 }
 
+/// Parse and analyze a policy expression without folding.
+///
+/// Returns a pre-fold `TypedExpr` that can be cached across queries.
+/// The caller must apply `fold_typed_expr()` before evaluation.
+fn analyze_rls_policy_expr(expr_sql: &str, schema: &TableSchema) -> Result<TypedExpr> {
+    let dialect = PostgreSqlDialect {};
+    let expr = Parser::new(&dialect)
+        .try_with_sql(expr_sql)
+        .and_then(|mut p| p.parse_expr())
+        .map_err(|e| anyhow!("Invalid RLS policy expression '{}': {}", expr_sql, e))?;
+    let table_alias = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+    analyze_row_expr_for_table(&expr, schema, table_alias)
+}
+
+/// Compile a policy expression with caching.
+///
+/// Checks the cache for a pre-fold `TypedExpr`; on miss, parses + analyzes
+/// the SQL expression and caches the result. Then applies `fold_typed_expr`
+/// with the current `QueryContext` (cheap tree walk).
+pub fn compile_rls_policy_expr_cached(
+    expr_sql: &str,
+    schema: &TableSchema,
+    qctx: &QueryContext,
+    cache: &RlsPolicyCache,
+    db_id: u64,
+    policy_oid: u32,
+    schema_version: u64,
+    is_using: bool,
+) -> Result<TypedExpr> {
+    // Check cache for pre-fold analyzed expr.
+    let cached = if is_using {
+        cache.get_using_expr(db_id, policy_oid, schema_version)
+    } else {
+        cache.get_with_check_expr(db_id, policy_oid, schema_version)
+    };
+
+    let analyzed = match cached {
+        Some(expr) => expr,
+        None => {
+            let expr = analyze_rls_policy_expr(expr_sql, schema)?;
+            if is_using {
+                cache.put_using_expr(db_id, policy_oid, schema_version, expr.clone());
+            } else {
+                cache.put_with_check_expr(db_id, policy_oid, schema_version, expr.clone());
+            }
+            expr
+        }
+    };
+
+    // Fold with per-query context (cheap: resolves current_user, now(), etc.)
+    Ok(fold_typed_expr(&analyzed, qctx))
+}
+
 /// Compile all applicable policies for a table + command + role.
 ///
 /// Filters policies by command and role, then compiles their USING expressions.
@@ -78,6 +133,7 @@ pub fn compile_applicable_using_policies(
     command: &RlsCommand,
     role: &str,
     qctx: &QueryContext,
+    cache: Option<(&RlsPolicyCache, u64, u64)>,
 ) -> Result<Vec<CompiledRlsPolicy>> {
     let mut compiled = Vec::new();
     for p in policies {
@@ -85,7 +141,22 @@ pub fn compile_applicable_using_policies(
             continue;
         }
         let using = match &p.using_expr {
-            Some(sql) => Some(compile_rls_policy_expr(sql, schema, qctx)?),
+            Some(sql) => {
+                if let Some((cache, db_id, schema_version)) = cache {
+                    Some(compile_rls_policy_expr_cached(
+                        sql,
+                        schema,
+                        qctx,
+                        cache,
+                        db_id,
+                        p.oid,
+                        schema_version,
+                        true,
+                    )?)
+                } else {
+                    Some(compile_rls_policy_expr(sql, schema, qctx)?)
+                }
+            }
             None => None,
         };
         // Skip policies with no USING for SELECT/UPDATE/DELETE injection
@@ -347,6 +418,85 @@ mod tests {
             TypedExprKind::BinaryOp { op, .. } => assert_eq!(*op, BinaryOp::Or),
             other => panic!("expected BinaryOp::Or, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn cached_expr_folds_differently_per_query_context() {
+        use crate::model::ColumnDef;
+        use crate::sql::rls::cache::RlsPolicyCache;
+        use std::sync::Arc;
+
+        // Schema with a text column for the policy expression to reference.
+        let schema = TableSchema {
+            name: "public.posts".to_string(),
+            table_id: 1,
+            columns: vec![ColumnDef {
+                name: "owner".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
+                collation: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "admin".to_string(),
+            from_alias: None,
+            rls_enabled: true,
+            rls_force: false,
+        };
+
+        let cache = RlsPolicyCache::new();
+
+        // Policy: owner = current_user
+        // current_user is resolved during fold, not during analysis.
+        let expr_sql = "owner = current_user";
+
+        let qctx_alice = QueryContext::new(
+            1,
+            Arc::from("testdb"),
+            Arc::from("alice"),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Arc::from("UTC"),
+        );
+        let qctx_bob = QueryContext::new(
+            1,
+            Arc::from("testdb"),
+            Arc::from("bob"),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Arc::from("UTC"),
+        );
+
+        // First call: cache miss → analyze + cache + fold for alice.
+        let result_alice =
+            compile_rls_policy_expr_cached(expr_sql, &schema, &qctx_alice, &cache, 1, 42, 1, true)
+                .unwrap();
+
+        // Second call: cache hit → fold for bob (different current_user).
+        let result_bob =
+            compile_rls_policy_expr_cached(expr_sql, &schema, &qctx_bob, &cache, 1, 42, 1, true)
+                .unwrap();
+
+        // Both should be BinaryOp(Eq), but the RHS constant should differ.
+        // After folding, current_user resolves to a Constant("alice") or Constant("bob").
+        assert_ne!(
+            format!("{:?}", result_alice),
+            format!("{:?}", result_bob),
+            "same cached analyzed expr must fold differently for different current_user"
+        );
+
+        // Verify the cache was actually hit (only one entry for this key).
+        assert!(cache.get_using_expr(1, 42, 1).is_some());
     }
 
     #[test]

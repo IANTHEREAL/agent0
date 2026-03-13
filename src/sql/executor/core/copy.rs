@@ -98,6 +98,8 @@ impl Executor {
                 .map_err(CopyInsertBatchError::non_row)?;
 
             // ── RLS: build context for COPY FROM (INSERT WITH CHECK) ──
+            let rls_cache = self.rls_policy_cache().clone();
+            let schema_version = schema.version;
             let rls_ctx = crate::sql::rls::dml::maybe_build_rls_context(
                 &schema,
                 current_role.as_deref(),
@@ -109,10 +111,17 @@ impl Executor {
                 false, // no ON CONFLICT
                 &qctx,
                 || async {
-                    self.store
+                    if let Some(cached) = rls_cache.get(db_id, schema.table_id, schema_version) {
+                        return Ok(cached);
+                    }
+                    let policies = self
+                        .store
                         .list_policies_for_table(txn, db_id, schema.table_id)
-                        .await
+                        .await?;
+                    rls_cache.put(db_id, schema.table_id, schema_version, policies.clone());
+                    Ok(policies)
                 },
+                Some((&rls_cache, db_id, schema_version)),
             )
             .await
             .map_err(CopyInsertBatchError::non_row)?;
@@ -583,6 +592,8 @@ impl Executor {
         let write_plan = self.compile_write_row_plan(&table_schema, &qctx)?;
 
         // RLS: build context for COPY FROM Parquet (INSERT WITH CHECK).
+        let rls_cache = self.rls_policy_cache().clone();
+        let schema_version = table_schema.version;
         let rls_ctx = crate::sql::rls::dml::maybe_build_rls_context(
             &table_schema,
             current_role.as_deref(),
@@ -594,10 +605,22 @@ impl Executor {
             false, // no ON CONFLICT
             &qctx,
             || async {
-                self.store
+                if let Some(cached) = rls_cache.get(db_id, table_schema.table_id, schema_version) {
+                    return Ok(cached);
+                }
+                let policies = self
+                    .store
                     .list_policies_for_table(txn, db_id, table_schema.table_id)
-                    .await
+                    .await?;
+                rls_cache.put(
+                    db_id,
+                    table_schema.table_id,
+                    schema_version,
+                    policies.clone(),
+                );
+                Ok(policies)
             },
+            Some((&rls_cache, db_id, schema_version)),
         )
         .await?;
 

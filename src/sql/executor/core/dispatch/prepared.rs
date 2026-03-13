@@ -1347,6 +1347,7 @@ mod prepared_policy_tests {
             crate::observability::registry().tenant("tenant_prepared_ut"),
             crate::pool::TenantMemoryAccountant::unlimited("tenant_prepared_ut".to_string()),
             Arc::new(crate::sql::triggers::TriggerBodyCache::new()),
+            Arc::new(crate::sql::rls::cache::RlsPolicyCache::new()),
             Arc::new(crate::sql::stats::TableStatsCache::new()),
         )
     }

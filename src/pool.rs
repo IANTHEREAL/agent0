@@ -1,3 +1,4 @@
+use crate::sql::rls::cache::RlsPolicyCache;
 use crate::sql::stats::TableStatsCache;
 use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
@@ -369,6 +370,7 @@ pub(crate) struct TenantEntry {
     last_idle_at: AtomicU64,
     keyspace: String,
     trigger_cache: Arc<TriggerBodyCache>,
+    rls_policy_cache: Arc<RlsPolicyCache>,
     stats_cache: Arc<TableStatsCache>,
     /// Per-tenant QPS rate limiter. `None` when rate limiting is disabled (limit = 0).
     rate_limiter: Option<TokenBucket>,
@@ -391,6 +393,7 @@ impl TenantEntry {
             last_idle_at: AtomicU64::new(0),
             keyspace: keyspace.clone(),
             trigger_cache: Arc::new(TriggerBodyCache::new()),
+            rls_policy_cache: Arc::new(RlsPolicyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: if qps_limit > 0 {
                 Some(TokenBucket::new(qps_limit))
@@ -479,6 +482,10 @@ impl TenantHandle {
         &self.entry.trigger_cache
     }
 
+    pub fn rls_policy_cache(&self) -> &Arc<RlsPolicyCache> {
+        &self.entry.rls_policy_cache
+    }
+
     pub fn stats_cache(&self) -> &Arc<TableStatsCache> {
         &self.entry.stats_cache
     }
@@ -529,6 +536,7 @@ impl TenantHandle {
             last_idle_at: AtomicU64::new(0),
             keyspace: "test_ks".to_string(),
             trigger_cache: Arc::new(TriggerBodyCache::new()),
+            rls_policy_cache: Arc::new(RlsPolicyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: if qps_limit > 0 {
                 Some(TokenBucket::new(qps_limit))
@@ -971,6 +979,7 @@ mod tests {
             last_idle_at: AtomicU64::new(0),
             keyspace: keyspace.to_string(),
             trigger_cache: Arc::new(TriggerBodyCache::new()),
+            rls_policy_cache: Arc::new(RlsPolicyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: None,
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace.to_string(), 0),

@@ -4,7 +4,10 @@
 //! DML statement. Created once per statement in `stmt_dml.rs`, then threaded into
 //! `execute_analyzed_insert/update/delete` and COPY paths.
 
-use super::policy::{compile_rls_policy_expr, should_bypass_rls, CompiledRlsPolicy};
+use super::cache::RlsPolicyCache;
+use super::policy::{
+    compile_rls_policy_expr, compile_rls_policy_expr_cached, should_bypass_rls, CompiledRlsPolicy,
+};
 use crate::model::{RlsCommand, RlsPolicy, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::error::SqlError;
@@ -41,15 +44,32 @@ fn compile_dml_policies(
     schema: &TableSchema,
     policies: &[RlsPolicy],
     qctx: &QueryContext,
+    cache: Option<(&RlsPolicyCache, u64, u64)>,
 ) -> Result<Vec<CompiledRlsPolicy>> {
     let mut compiled = Vec::with_capacity(policies.len());
     for policy in policies {
         let using = match &policy.using_expr {
-            Some(sql) => Some(compile_rls_policy_expr(sql, schema, qctx)?),
+            Some(sql) => {
+                if let Some((cache, db_id, sv)) = cache {
+                    Some(compile_rls_policy_expr_cached(
+                        sql, schema, qctx, cache, db_id, policy.oid, sv, true,
+                    )?)
+                } else {
+                    Some(compile_rls_policy_expr(sql, schema, qctx)?)
+                }
+            }
             None => None,
         };
         let with_check = match &policy.with_check_expr {
-            Some(sql) => Some(compile_rls_policy_expr(sql, schema, qctx)?),
+            Some(sql) => {
+                if let Some((cache, db_id, sv)) = cache {
+                    Some(compile_rls_policy_expr_cached(
+                        sql, schema, qctx, cache, db_id, policy.oid, sv, false,
+                    )?)
+                } else {
+                    Some(compile_rls_policy_expr(sql, schema, qctx)?)
+                }
+            }
             None => None,
         };
         compiled.push(CompiledRlsPolicy {
@@ -223,13 +243,14 @@ impl RlsDmlContext {
         has_returning: bool,
         _has_on_conflict_update: bool,
         qctx: &QueryContext,
+        cache: Option<(&RlsPolicyCache, u64, u64)>,
     ) -> Result<Self> {
         let insert_applicable: Vec<RlsPolicy> =
             filter_applicable_policies(all_policies, RlsCommand::Insert, current_role)
                 .into_iter()
                 .cloned()
                 .collect();
-        let command_policies = compile_dml_policies(schema, &insert_applicable, qctx)?;
+        let command_policies = compile_dml_policies(schema, &insert_applicable, qctx, cache)?;
 
         let select_policies = if has_returning {
             let select_applicable: Vec<RlsPolicy> =
@@ -237,7 +258,12 @@ impl RlsDmlContext {
                     .into_iter()
                     .cloned()
                     .collect();
-            Some(compile_dml_policies(schema, &select_applicable, qctx)?)
+            Some(compile_dml_policies(
+                schema,
+                &select_applicable,
+                qctx,
+                cache,
+            )?)
         } else {
             None
         };
@@ -265,13 +291,14 @@ impl RlsDmlContext {
         current_role: &str,
         has_returning: bool,
         qctx: &QueryContext,
+        cache: Option<(&RlsPolicyCache, u64, u64)>,
     ) -> Result<Self> {
         let update_applicable: Vec<RlsPolicy> =
             filter_applicable_policies(all_policies, RlsCommand::Update, current_role)
                 .into_iter()
                 .cloned()
                 .collect();
-        let command_policies = compile_dml_policies(schema, &update_applicable, qctx)?;
+        let command_policies = compile_dml_policies(schema, &update_applicable, qctx, cache)?;
 
         // SELECT/ALL policies also constrain UPDATE's read path (PG semantics).
         let select_applicable: Vec<RlsPolicy> =
@@ -279,7 +306,7 @@ impl RlsDmlContext {
                 .into_iter()
                 .cloned()
                 .collect();
-        let select_compiled = compile_dml_policies(schema, &select_applicable, qctx)?;
+        let select_compiled = compile_dml_policies(schema, &select_applicable, qctx, cache)?;
 
         // Merge UPDATE USING + SELECT USING into visibility_policies.
         let mut visibility = Vec::with_capacity(command_policies.len() + select_compiled.len());
@@ -318,13 +345,14 @@ impl RlsDmlContext {
         current_role: &str,
         has_returning: bool,
         qctx: &QueryContext,
+        cache: Option<(&RlsPolicyCache, u64, u64)>,
     ) -> Result<Self> {
         let delete_applicable: Vec<RlsPolicy> =
             filter_applicable_policies(all_policies, RlsCommand::Delete, current_role)
                 .into_iter()
                 .cloned()
                 .collect();
-        let command_policies = compile_dml_policies(schema, &delete_applicable, qctx)?;
+        let command_policies = compile_dml_policies(schema, &delete_applicable, qctx, cache)?;
 
         // SELECT/ALL policies also constrain DELETE's read path (PG semantics).
         let select_applicable: Vec<RlsPolicy> =
@@ -332,7 +360,7 @@ impl RlsDmlContext {
                 .into_iter()
                 .cloned()
                 .collect();
-        let select_compiled = compile_dml_policies(schema, &select_applicable, qctx)?;
+        let select_compiled = compile_dml_policies(schema, &select_applicable, qctx, cache)?;
 
         // Merge DELETE USING + SELECT USING into visibility_policies.
         let mut visibility = Vec::with_capacity(command_policies.len() + select_compiled.len());
@@ -408,6 +436,7 @@ pub async fn maybe_build_rls_context<F, Fut>(
     has_on_conflict_update: bool,
     qctx: &QueryContext,
     load_policies_fn: F,
+    expr_cache: Option<(&RlsPolicyCache, u64, u64)>,
 ) -> Result<Option<RlsDmlContext>>
 where
     F: FnOnce() -> Fut,
@@ -432,12 +461,13 @@ where
             has_returning,
             has_on_conflict_update,
             qctx,
+            expr_cache,
         )?,
         RlsCommand::Update => {
-            RlsDmlContext::for_update(schema, &all_policies, role, has_returning, qctx)?
+            RlsDmlContext::for_update(schema, &all_policies, role, has_returning, qctx, expr_cache)?
         }
         RlsCommand::Delete => {
-            RlsDmlContext::for_delete(schema, &all_policies, role, has_returning, qctx)?
+            RlsDmlContext::for_delete(schema, &all_policies, role, has_returning, qctx, expr_cache)?
         }
         _ => return Ok(None),
     };
@@ -520,8 +550,8 @@ mod tests {
             with_check_expr: Some("user_id = 'alice'".into()),
         }];
 
-        let ctx =
-            RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx).unwrap();
+        let ctx = RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx, None)
+            .unwrap();
 
         let good_row = Row::new(vec![Value::Int32(1), Value::Text("alice".into())]);
         ctx.check_row(&schema, &good_row, &qctx).unwrap();
@@ -558,8 +588,8 @@ mod tests {
             },
         ];
 
-        let ctx =
-            RlsDmlContext::for_insert(&schema, &policies, "alice", true, false, &qctx).unwrap();
+        let ctx = RlsDmlContext::for_insert(&schema, &policies, "alice", true, false, &qctx, None)
+            .unwrap();
 
         // Returning alice's row → OK
         let alice_row = Row::new(vec![Value::Int32(1), Value::Text("alice".into())]);
@@ -586,8 +616,8 @@ mod tests {
             with_check_expr: Some("true".into()),
         }];
 
-        let ctx =
-            RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx).unwrap();
+        let ctx = RlsDmlContext::for_insert(&schema, &policies, "alice", false, false, &qctx, None)
+            .unwrap();
         assert!(ctx.select_policies.is_none());
         // check_returning is a no-op when select_policies is None
         let any_row = Row::new(vec![Value::Int32(1), Value::Text("bob".into())]);

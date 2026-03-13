@@ -121,6 +121,7 @@ pub struct Executor {
     observability: Arc<TenantObservability>,
     tenant_memory_accountant: TenantMemoryAccountant,
     trigger_cache: Arc<TriggerBodyCache>,
+    rls_policy_cache: Arc<crate::sql::rls::cache::RlsPolicyCache>,
     stats_cache: Arc<TableStatsCache>,
     /// Keyspaces whose trigger workers need activation after the current
     /// transaction commits.  Accumulated during DML execution (inside the
@@ -144,6 +145,7 @@ impl Executor {
         observability: Arc<TenantObservability>,
         tenant_memory_accountant: TenantMemoryAccountant,
         trigger_cache: Arc<TriggerBodyCache>,
+        rls_policy_cache: Arc<crate::sql::rls::cache::RlsPolicyCache>,
         stats_cache: Arc<TableStatsCache>,
     ) -> Self {
         Self {
@@ -153,6 +155,7 @@ impl Executor {
             observability,
             tenant_memory_accountant,
             trigger_cache,
+            rls_policy_cache,
             stats_cache,
             pending_trigger_activations: Mutex::new(HashSet::new()),
             pending_async_triggers: Mutex::new(Vec::new()),
@@ -183,6 +186,10 @@ impl Executor {
 
     pub fn trigger_cache(&self) -> &Arc<TriggerBodyCache> {
         &self.trigger_cache
+    }
+
+    pub fn rls_policy_cache(&self) -> &Arc<crate::sql::rls::cache::RlsPolicyCache> {
+        &self.rls_policy_cache
     }
 
     pub fn stats_cache(&self) -> &Arc<TableStatsCache> {

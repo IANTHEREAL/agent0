@@ -88,6 +88,7 @@ mod tests {
         let keyspace = "dispatch_roles_tests".to_string();
         let observability = crate::observability::registry().tenant(&keyspace);
         let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let rls_policy_cache = std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
         let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
         Executor::new(
             store,
@@ -95,6 +96,7 @@ mod tests {
             observability,
             crate::pool::TenantMemoryAccountant::unlimited("dispatch_roles_tests".to_string()),
             trigger_cache,
+            rls_policy_cache,
             stats_cache,
         )
     }

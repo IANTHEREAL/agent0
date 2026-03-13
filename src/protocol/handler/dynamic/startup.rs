@@ -63,46 +63,50 @@ impl DynamicPgHandler {
             let _ = self.connection_guard.set(tenant_obs.connection_open());
         }
 
-        let (store, trigger_cache, stats_cache, memory_accountant) = if let Some(pool) =
-            &self.client_pool
-        {
-            let mut handle = pool
-                .acquire(Some(effective_keyspace.clone()))
-                .await
-                .map_err(|e| fatal_internal(format!("Failed to get client from pool: {}", e)))?;
-            if let Some(ref user) = username {
-                handle
-                    .try_bind_user(user.clone(), connection_limit)
-                    .map_err(|msg| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "FATAL".to_owned(),
-                            "53300".to_owned(),
-                            msg,
-                        )))
+        let (store, trigger_cache, rls_policy_cache, stats_cache, memory_accountant) =
+            if let Some(pool) = &self.client_pool {
+                let mut handle = pool
+                    .acquire(Some(effective_keyspace.clone()))
+                    .await
+                    .map_err(|e| {
+                        fatal_internal(format!("Failed to get client from pool: {}", e))
                     })?;
-            }
-            let s = handle.store().clone();
-            let tc = handle.trigger_cache().clone();
-            let sc = handle.stats_cache().clone();
-            let ma = handle.memory_accountant();
-            let _ = self.tenant_handle.set(handle);
-            (s, tc, sc, ma)
-        } else {
-            use crate::sql::stats::TableStatsCache;
-            use crate::sql::triggers::TriggerBodyCache;
-            let s = TikvStore::new_with_keyspace(
-                self.pd_endpoints.clone(),
-                Some(effective_keyspace.clone()),
-            )
-            .await
-            .map_err(|e| fatal_internal(format!("Failed to connect to TiKV: {}", e)))?;
-            (
-                Arc::new(s),
-                Arc::new(TriggerBodyCache::new()),
-                Arc::new(TableStatsCache::new()),
-                crate::pool::TenantMemoryAccountant::unlimited(effective_keyspace.clone()),
-            )
-        };
+                if let Some(ref user) = username {
+                    handle
+                        .try_bind_user(user.clone(), connection_limit)
+                        .map_err(|msg| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "FATAL".to_owned(),
+                                "53300".to_owned(),
+                                msg,
+                            )))
+                        })?;
+                }
+                let s = handle.store().clone();
+                let tc = handle.trigger_cache().clone();
+                let rpc = handle.rls_policy_cache().clone();
+                let sc = handle.stats_cache().clone();
+                let ma = handle.memory_accountant();
+                let _ = self.tenant_handle.set(handle);
+                (s, tc, rpc, sc, ma)
+            } else {
+                use crate::sql::rls::cache::RlsPolicyCache;
+                use crate::sql::stats::TableStatsCache;
+                use crate::sql::triggers::TriggerBodyCache;
+                let s = TikvStore::new_with_keyspace(
+                    self.pd_endpoints.clone(),
+                    Some(effective_keyspace.clone()),
+                )
+                .await
+                .map_err(|e| fatal_internal(format!("Failed to connect to TiKV: {}", e)))?;
+                (
+                    Arc::new(s),
+                    Arc::new(TriggerBodyCache::new()),
+                    Arc::new(RlsPolicyCache::new()),
+                    Arc::new(TableStatsCache::new()),
+                    crate::pool::TenantMemoryAccountant::unlimited(effective_keyspace.clone()),
+                )
+            };
 
         let executor = Arc::new(Executor::new(
             store.clone(),
@@ -110,6 +114,7 @@ impl DynamicPgHandler {
             tenant_obs.clone(),
             memory_accountant,
             trigger_cache,
+            rls_policy_cache,
             stats_cache,
         ));
 

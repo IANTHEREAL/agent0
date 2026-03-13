@@ -138,10 +138,20 @@ impl Executor {
             ) {
                 continue;
             }
-            let policies = self
-                .store()
-                .list_policies_for_table(txn, db_id, schema.table_id)
-                .await?;
+            let policies = if let Some(cached) =
+                self.rls_policy_cache()
+                    .get(db_id, schema.table_id, schema.version)
+            {
+                cached
+            } else {
+                let loaded = self
+                    .store()
+                    .list_policies_for_table(txn, db_id, schema.table_id)
+                    .await?;
+                self.rls_policy_cache()
+                    .put(db_id, schema.table_id, schema.version, loaded.clone());
+                loaded
+            };
             if !policies.is_empty() {
                 policies_by_table.insert(schema.table_id, policies);
             }
@@ -166,6 +176,7 @@ impl Executor {
             policies_by_table: &policies_by_table,
             qctx: &qctx,
             command: RlsCommand::Select,
+            expr_cache: Some((self.rls_policy_cache(), db_id)),
         };
 
         inject_rls_predicates(analyzed, &rls_ctx)
