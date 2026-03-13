@@ -87,9 +87,11 @@ pub struct Session {
     /// Used by `SET SESSION AUTHORIZATION DEFAULT` to restore the initial identity.
     authenticated_user: Option<String>,
     authenticated_user_is_superuser: bool,
+    authenticated_bypass_rls: bool,
     /// Authenticated session user (login role). This does not change with `SET ROLE`.
     session_user: Option<String>,
     session_user_is_superuser: bool,
+    session_bypass_rls: bool,
     /// Current effective role. This can change with `SET ROLE` / `RESET ROLE`.
     current_user: Option<String>,
     is_superuser: bool,
@@ -193,8 +195,10 @@ impl Session {
             settings,
             authenticated_user: None,
             authenticated_user_is_superuser: false,
+            authenticated_bypass_rls: false,
             session_user: None,
             session_user_is_superuser: false,
+            session_bypass_rls: false,
             current_user: None,
             is_superuser: false,
             bypass_rls: false,
@@ -256,8 +260,10 @@ impl Session {
             settings,
             authenticated_user: Some(username.clone()),
             authenticated_user_is_superuser: is_superuser,
+            authenticated_bypass_rls: bypass_rls,
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
+            session_bypass_rls: bypass_rls,
             current_user: Some(username),
             is_superuser,
             bypass_rls,
@@ -331,6 +337,7 @@ impl Session {
     ) {
         self.session_user = Some(role.clone());
         self.session_user_is_superuser = is_superuser;
+        self.session_bypass_rls = bypass_rls;
         self.current_user = Some(role);
         self.is_superuser = is_superuser;
         self.bypass_rls = bypass_rls;
@@ -341,8 +348,10 @@ impl Session {
     pub(crate) fn reset_session_authorization(&mut self) {
         self.session_user = self.authenticated_user.clone();
         self.session_user_is_superuser = self.authenticated_user_is_superuser;
+        self.session_bypass_rls = self.authenticated_bypass_rls;
         self.current_user = self.authenticated_user.clone();
         self.is_superuser = self.authenticated_user_is_superuser;
+        self.bypass_rls = self.authenticated_bypass_rls;
     }
 
     /// Save session authorization state before applying SET LOCAL session_authorization.
@@ -424,6 +433,7 @@ impl Session {
     pub(crate) fn reset_role(&mut self) {
         self.current_user = self.session_user.clone();
         self.is_superuser = self.session_user_is_superuser;
+        self.bypass_rls = self.session_bypass_rls;
     }
 
     pub fn connection_id(&self) -> i64 {
