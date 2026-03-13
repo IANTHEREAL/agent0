@@ -9,9 +9,8 @@
 -- function to observe hidden data.
 --
 -- Test strategy: use a logging function that records which rows it sees
--- into a side table. If the barrier is working, the function only sees
--- RLS-visible rows. If the barrier is broken (flattened), the function
--- may see all rows.
+-- into a side table. Assertions use explicit counts with unique query
+-- markers to prove absence of hidden rows — not just presence of visible ones.
 
 -- Setup
 DROP TABLE IF EXISTS barrier_data CASCADE;
@@ -64,25 +63,38 @@ SET ROLE barrier_user;
 SELECT id, secret FROM barrier_data WHERE barrier_spy(secret) ORDER BY id;
 RESET ROLE;
 
--- Q2: Check what the spy function saw.
--- With a working security barrier, it should only see visible-1 and visible-2.
--- If the barrier was flattened, it might also see hidden-1 and hidden-2.
-SELECT seen_secret FROM barrier_log ORDER BY seen_secret;
+-- Q2: CRITICAL — prove hidden rows did NOT leak into the spy log.
+-- total_seen=2 means the spy only saw visible rows.
+-- hidden_leaked=0 proves no hidden rows were observed.
+-- If the barrier was broken, hidden_leaked would be > 0.
+SELECT
+    'barrier_q2' AS marker,
+    COUNT(*) AS total_seen,
+    COUNT(*) FILTER (WHERE seen_secret LIKE 'hidden%') AS hidden_leaked
+FROM barrier_log;
 
 -- Q3: Verify actual query results (only visible rows returned)
 SET ROLE barrier_user;
-SELECT id, secret FROM barrier_data ORDER BY id;
+SELECT 'barrier_q3:' || id || ':' || secret AS result
+FROM barrier_data ORDER BY id;
 RESET ROLE;
 
 -- Q4: Test with user WHERE + RLS together (compound predicate)
+-- The spy function evaluates on all RLS-visible rows first (barrier
+-- prevents pushdown of id > 1), then id > 1 filters the result.
 TRUNCATE barrier_log;
 SET ROLE barrier_user;
 SELECT id, secret FROM barrier_data WHERE barrier_spy(secret) AND id > 1 ORDER BY id;
 RESET ROLE;
 
--- Q5: Check spy log — should only see visible-1 and visible-2 (or just visible-2
--- depending on evaluation order), but never hidden rows.
-SELECT seen_secret FROM barrier_log ORDER BY seen_secret;
+-- Q5: CRITICAL — again prove no hidden rows leaked, even with compound predicate.
+-- total_seen=2: spy sees both visible rows (barrier prevents id>1 pushdown).
+-- hidden_leaked=0: no hidden rows observed.
+SELECT
+    'barrier_q5' AS marker,
+    COUNT(*) AS total_seen,
+    COUNT(*) FILTER (WHERE seen_secret LIKE 'hidden%') AS hidden_leaked
+FROM barrier_log;
 
 -- Cleanup
 DROP FUNCTION IF EXISTS barrier_spy(text);

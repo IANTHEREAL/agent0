@@ -1,22 +1,22 @@
 # RLS Security Barrier assertions — verify user predicates cannot
 # observe RLS-hidden rows through side-channel functions.
+#
+# Key: assertions use unique "barrier_qN" markers and explicit
+# hidden_leaked=0 counts, not just presence of visible rows.
 
 # Q1: barrier_user sees only their own rows through barrier_spy filter
 1|visible-1
 2|visible-2
 
-# Q2: Spy function log — CRITICAL: must only contain visible rows.
-# If the barrier was broken (flattened), hidden-1/hidden-2 would appear.
-visible-1
-visible-2
+# Q2: CRITICAL — spy log contains only visible rows, zero hidden rows leaked.
+# "barrier_q2" marker is globally unique. hidden_leaked=0 proves barrier held.
+barrier_q2|2|0
 
-# Q3: Direct SELECT also shows only visible rows
-1|visible-1
-2|visible-2
+# Q3: Direct SELECT — unique "barrier_q3:" prefix per row
+barrier_q3:1:visible-1
+barrier_q3:2:visible-2
 
-# Q4: Compound predicate (barrier_spy AND id > 1) — only visible-2 returned
-2|visible-2
-
-# Q5: Spy log after compound predicate — still no hidden rows leaked
-visible-1
-visible-2
+# Q5: CRITICAL — compound predicate (barrier_spy AND id > 1).
+# total_seen=2: spy evaluates on all RLS-visible rows (barrier prevents
+# id>1 from being pushed below RLS filter). hidden_leaked=0: no leak.
+barrier_q5|2|0
