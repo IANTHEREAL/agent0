@@ -9,8 +9,8 @@
 //! 2) catalog snapshot build
 //! 3) SELECT privilege check
 //! 4) Analyzer
-//! 5) RLS predicate injection (post-Analyzer, pre-rewriter)
-//! 6) post-analysis rewriter
+//! 5) post-analysis rewriter (flattens view subqueries)
+//! 6) RLS predicate injection (wraps tables in security barrier subqueries)
 //!
 //! Contract: this is the only semantic entrypoint. Callers must not implement
 //! runtime fallback to alternate planning/execution paths on analysis failure.
@@ -79,16 +79,22 @@ impl Executor {
         })
         .map_err(SqlError::from)?;
 
-        // --- RLS predicate injection (step 5) ---
-        // After Analyzer resolves all columns/types but before the rewriter,
-        // inject RLS WHERE predicates for tables with row-level security enabled.
-        let analyzed = self
-            .maybe_inject_rls_select(txn, db_id, search_path, analyzed, current_role, &catalog)
-            .await?;
-
+        // --- Post-analysis rewrite (step 5) ---
+        // Flatten simple view subqueries before RLS injection so that
+        // base-table Table refs are exposed for wrapping.
         let rewritten = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
             crate::sql::rewriter::rewrite_query(analyzed)
         });
+
+        // --- RLS predicate injection (step 6) ---
+        // After rewriting (so flattened tables are visible) but before the
+        // optimizer, wrap RLS-filtered tables in security barrier subqueries.
+        // These subqueries must not be flattened — running the rewriter first
+        // guarantees they survive to the optimizer where Subquery is a
+        // pushdown barrier.
+        let rewritten = self
+            .maybe_inject_rls_select(txn, db_id, search_path, rewritten, current_role, &catalog)
+            .await?;
         // Drop deep expanded AST on a grown stack before returning.
         crate::sql::stack_safety::drop_on_grown_stack(expanded_query);
         Ok(rewritten)
