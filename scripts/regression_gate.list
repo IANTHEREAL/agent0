@@ -219,6 +219,8 @@ tests/249_enum_array_validation.sql
 tests/1599_copy_non_ascii_quote_escape.sql
 # #1662 – RESET "ALL" quoted-identifier parity + unknown-param SQLSTATE 42704
 tests/1662_reset_quoted_all.sql
+# #1810 – RLS DML enforcement (INSERT/UPDATE/DELETE/RETURNING)
+tests/1810_rls_dml_enforcement.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
