@@ -1,14 +1,31 @@
 //! Post-Analyzer RLS predicate injection into `AnalyzedQuery`.
 //!
 //! Walks the analyzed query's FROM clause to find base tables with RLS enabled,
-//! compiles applicable policies, combines them, and ANDs the result into WHERE.
+//! compiles applicable policies, combines them, and wraps each RLS-filtered
+//! table in a **security barrier subquery**.
+//!
+//! ## Security barrier semantics
+//!
+//! PostgreSQL wraps RLS-filtered tables in security barrier subqueries to
+//! prevent the optimizer from pushing user-supplied predicates below the RLS
+//! filter.  Without this, a malicious user-defined function in a WHERE clause
+//! could observe rows that should be hidden by RLS (information leak via
+//! side-channel).
+//!
+//! We replicate this by converting:
+//!   `FROM table WHERE user_pred`
+//! into:
+//!   `FROM (SELECT * FROM table WHERE rls_pred) AS table WHERE user_pred`
+//!
+//! The optimizer treats `Subquery` nodes as barriers — it never pushes
+//! predicates through them — so user predicates stay above the RLS filter.
 
 use super::cache::RlsPolicyCache;
 use super::policy::{combine_rls_predicates, compile_applicable_using_policies, should_bypass_rls};
 use crate::model::{DataType, RlsCommand, RlsPolicy, TableSchema};
 use crate::sql::analyzer::types::{
-    AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
-    BinaryOp, TypedExpr, TypedExprKind,
+    AnalyzedDistinct, AnalyzedProjection, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
+    AnalyzedTableRef, AnalyzedTableRefKind, TypedExpr, TypedExprKind,
 };
 use crate::sql::query_context::QueryContext;
 use anyhow::Result;
@@ -41,7 +58,7 @@ pub(crate) struct RlsContext<'a> {
 /// 1. Check bypass (superuser, owner)
 /// 2. Load and compile applicable policies
 /// 3. Combine (permissive OR + restrictive AND)
-/// 4. AND into WHERE clause
+/// 4. Wrap the table in a security barrier subquery: `(SELECT * FROM t WHERE rls_pred)`
 ///
 /// For SELECT, also applies SELECT policies.
 /// For UPDATE/DELETE, applies both SELECT and command-specific policies.
@@ -68,60 +85,29 @@ pub(crate) fn inject_rls_predicates(
     Ok(query)
 }
 
-/// Inject RLS predicates into a SELECT clause.
+/// Inject RLS predicates into a SELECT clause by wrapping each RLS-filtered
+/// table in a security barrier subquery.
 fn inject_into_select(select: &mut AnalyzedSelect, ctx: &RlsContext<'_>) -> Result<()> {
-    // Collect RLS predicates from all base tables in FROM
-    let mut rls_predicates: Vec<TypedExpr> = Vec::new();
-
-    for table_ref in &select.from {
-        collect_rls_predicates_from_table_ref(table_ref, ctx, &mut rls_predicates)?;
+    for table_ref in &mut select.from {
+        wrap_table_ref_with_rls(table_ref, ctx)?;
     }
-
-    // AND all RLS predicates into the existing WHERE clause
-    if !rls_predicates.is_empty() {
-        let rls_combined = rls_predicates
-            .into_iter()
-            .reduce(|a, b| {
-                TypedExpr::new(
-                    TypedExprKind::BinaryOp {
-                        left: Box::new(a),
-                        op: BinaryOp::And,
-                        right: Box::new(b),
-                    },
-                    DataType::Boolean,
-                )
-            })
-            .unwrap();
-
-        select.where_clause = match select.where_clause.take() {
-            Some(existing) => Some(TypedExpr::new(
-                TypedExprKind::BinaryOp {
-                    left: Box::new(existing),
-                    op: BinaryOp::And,
-                    right: Box::new(rls_combined),
-                },
-                DataType::Boolean,
-            )),
-            None => Some(rls_combined),
-        };
-    }
-
     Ok(())
 }
 
-/// Recursively collect RLS predicates from a table reference.
+/// Recursively walk a table reference tree, wrapping base tables that have
+/// RLS enabled in security barrier subqueries.
 ///
-/// For base tables: compile and combine policies.
+/// For base tables: compile policies and wrap as `(SELECT * FROM t WHERE rls_pred)`.
 /// For joins: recurse into both sides.
-/// For subqueries: inject into the subquery (handled by top-level recursion).
-fn collect_rls_predicates_from_table_ref(
-    table_ref: &AnalyzedTableRef,
+/// For subqueries: handled by top-level recursion in `inject_rls_predicates`.
+fn wrap_table_ref_with_rls(
+    table_ref: &mut AnalyzedTableRef,
     ctx: &RlsContext<'_>,
-    out: &mut Vec<TypedExpr>,
 ) -> Result<()> {
-    match &table_ref.kind {
+    match &mut table_ref.kind {
         AnalyzedTableRefKind::Table { name, .. } => {
-            if let Some(schema) = ctx.table_schemas.get(name.as_str()) {
+            let table_name = name.clone();
+            if let Some(schema) = ctx.table_schemas.get(table_name.as_str()) {
                 if !should_bypass_rls(
                     ctx.is_superuser,
                     ctx.bypass_rls,
@@ -130,51 +116,33 @@ fn collect_rls_predicates_from_table_ref(
                     schema.rls_enabled,
                     schema.rls_force,
                 ) {
-                    let policies = ctx.policies_by_table.get(&schema.table_id);
-                    if let Some(policies) = policies {
-                        let cache_args = ctx
-                            .expr_cache
-                            .map(|(cache, db_id)| (cache, db_id, schema.version));
-
-                        // For UPDATE/DELETE, SELECT policies also apply to the read path
-                        let mut all_compiled = compile_applicable_using_policies(
-                            policies,
-                            schema,
-                            &ctx.command,
-                            ctx.current_role,
-                            ctx.qctx,
-                            cache_args,
-                        )?;
-
-                        // If command is UPDATE or DELETE, also include SELECT policies
-                        if ctx.command == RlsCommand::Update || ctx.command == RlsCommand::Delete {
-                            let select_compiled = compile_applicable_using_policies(
-                                policies,
-                                schema,
-                                &RlsCommand::Select,
-                                ctx.current_role,
-                                ctx.qctx,
-                                cache_args,
-                            )?;
-                            all_compiled.extend(select_compiled);
-                        }
-
-                        if let Some(pred) = combine_rls_predicates(&all_compiled) {
-                            out.push(pred);
-                        }
-                    } else {
-                        // RLS enabled but no policies → deny all
-                        out.push(TypedExpr::new(
-                            TypedExprKind::Constant(crate::model::Value::Boolean(false)),
-                            DataType::Boolean,
-                        ));
-                    }
+                    let rls_pred = compile_rls_predicate_for_table(schema, ctx)?;
+                    // Wrap: Table → Subquery(SELECT * FROM table WHERE rls_pred)
+                    let original_kind = std::mem::replace(
+                        &mut table_ref.kind,
+                        // Temporary placeholder; replaced below.
+                        AnalyzedTableRefKind::Subquery(Box::new(AnalyzedQuery {
+                            ctes: vec![],
+                            body: AnalyzedQueryBody::Values(vec![]),
+                            order_by: vec![],
+                            limit: None,
+                            offset: None,
+                            output_schema: vec![],
+                        })),
+                    );
+                    let (inner_name, inner_schema) = match original_kind {
+                        AnalyzedTableRefKind::Table { name, schema } => (name, schema),
+                        _ => unreachable!(),
+                    };
+                    let subquery =
+                        build_security_barrier_subquery(&inner_name, &inner_schema, rls_pred);
+                    table_ref.kind = AnalyzedTableRefKind::Subquery(Box::new(subquery));
                 }
             }
         }
         AnalyzedTableRefKind::Join { left, right, .. } => {
-            collect_rls_predicates_from_table_ref(left, ctx, out)?;
-            collect_rls_predicates_from_table_ref(right, ctx, out)?;
+            wrap_table_ref_with_rls(left, ctx)?;
+            wrap_table_ref_with_rls(right, ctx)?;
         }
         AnalyzedTableRefKind::Subquery(_) | AnalyzedTableRefKind::Function { .. } => {
             // Subqueries are handled by top-level recursion in inject_rls_predicates.
@@ -182,4 +150,117 @@ fn collect_rls_predicates_from_table_ref(
         }
     }
     Ok(())
+}
+
+/// Compile the combined RLS predicate for a table.
+///
+/// Returns `WHERE false` if RLS is enabled but no policies apply.
+fn compile_rls_predicate_for_table(
+    schema: &TableSchema,
+    ctx: &RlsContext<'_>,
+) -> Result<TypedExpr> {
+    let policies = ctx.policies_by_table.get(&schema.table_id);
+    if let Some(policies) = policies {
+        let cache_args = ctx
+            .expr_cache
+            .map(|(cache, db_id)| (cache, db_id, schema.version));
+
+        let mut all_compiled = compile_applicable_using_policies(
+            policies,
+            schema,
+            &ctx.command,
+            ctx.current_role,
+            ctx.qctx,
+            cache_args,
+        )?;
+
+        // If command is UPDATE or DELETE, also include SELECT policies
+        if ctx.command == RlsCommand::Update || ctx.command == RlsCommand::Delete {
+            let select_compiled = compile_applicable_using_policies(
+                policies,
+                schema,
+                &RlsCommand::Select,
+                ctx.current_role,
+                ctx.qctx,
+                cache_args,
+            )?;
+            all_compiled.extend(select_compiled);
+        }
+
+        Ok(combine_rls_predicates(&all_compiled).unwrap_or_else(|| {
+            // All policies compiled but none have USING → deny all
+            TypedExpr::new(
+                TypedExprKind::Constant(crate::model::Value::Boolean(false)),
+                DataType::Boolean,
+            )
+        }))
+    } else {
+        // RLS enabled but no policies → deny all
+        Ok(TypedExpr::new(
+            TypedExprKind::Constant(crate::model::Value::Boolean(false)),
+            DataType::Boolean,
+        ))
+    }
+}
+
+/// Build a synthetic `AnalyzedQuery` representing:
+///   `SELECT * FROM table WHERE rls_predicate`
+///
+/// This serves as a security barrier subquery — the optimizer will not
+/// push user-supplied predicates through it.
+fn build_security_barrier_subquery(
+    table_name: &str,
+    table_schema: &crate::sql::analyzer::types::TableRefSchema,
+    rls_predicate: TypedExpr,
+) -> AnalyzedQuery {
+    // Build SELECT * projection: one ColumnRef per table column.
+    let projection: Vec<AnalyzedProjection> = table_schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, (col_name, col_type, _nullable))| AnalyzedProjection {
+            output_name: col_name.clone(),
+            expr: TypedExpr::new(
+                TypedExprKind::ColumnRef {
+                    scope_depth: 0,
+                    column_index: i,
+                    column_name: col_name.clone(),
+                },
+                col_type.clone(),
+            ),
+        })
+        .collect();
+
+    // Output schema: (name, type, collation=None) for each column.
+    let output_schema: Vec<(String, DataType, Option<crate::sql::collation::ResolvedCollation>)> =
+        table_schema
+            .columns
+            .iter()
+            .map(|(name, dt, _nullable)| (name.clone(), dt.clone(), None))
+            .collect();
+
+    // Inner FROM: the original table reference (no alias — alias lives on the outer Subquery).
+    let inner_table_ref = AnalyzedTableRef {
+        kind: AnalyzedTableRefKind::Table {
+            name: table_name.to_string(),
+            schema: table_schema.clone(),
+        },
+        alias: None,
+    };
+
+    AnalyzedQuery {
+        ctes: vec![],
+        body: AnalyzedQueryBody::Select(AnalyzedSelect {
+            projection,
+            from: vec![inner_table_ref],
+            where_clause: Some(rls_predicate),
+            group_by: vec![],
+            having: None,
+            distinct: AnalyzedDistinct::All,
+        }),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        output_schema,
+    }
 }
