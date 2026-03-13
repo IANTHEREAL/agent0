@@ -37,6 +37,66 @@ Operational note:
 - Restart is only required for operator-driven keyspace recreation / rebinding, for example deleting and recreating fs9 metadata for the same keyspace name, or reusing the same keyspace name with a fresh S3 prefix / bucket while `db9-server` is still running.
 - Ordinary file reads and writes against the same bound filesystem instance do **not** require restart. Using S3 as the data plane does not by itself trigger this rule.
 
+### 0.1 SQL Scalar Execution Model (2026-03-13)
+
+The fs9-v2 SQL scalar path needs its own execution model instead of treating
+`fs9_*` builtins as thin wrappers over raw filesystem backend calls.
+
+The root cause behind the current SQL issues is structural:
+
+- the SQL scalar layer currently calls `FsBackend` directly
+- `FsBackend` is a byte-oriented, storage-class-aware backend boundary
+- backend acquire / bootstrap is repeated from each builtin leaf
+- raw backend mutation limits for sealed `PackEntry` / `Object` files leak into
+  SQL builtins that appear to be generic logical file operations
+- text vs binary read semantics are implicit and currently inconsistent
+
+The design correction is to introduce a **statement-scoped SQL fs client** as
+the only boundary between SQL builtins and the raw backend.
+
+That SQL fs client should own three responsibilities:
+
+1. **Statement-scoped acquire/cache**
+
+   - acquire the fs backend once per statement runtime scope
+   - reuse the bound backend for all scalar fs9 calls in that statement
+   - keep bootstrap / runtime binding checks out of individual builtin leaves
+
+2. **Explicit SQL type contract**
+
+   - `fs9_read` and `fs9_read_at` are **text** functions, not generic byte
+     readers
+   - text reads must be **strict UTF-8**; invalid UTF-8 is an error, not a
+     lossy conversion
+   - `fs9_read_at(path, offset, len)` remains a byte-window read; it returns
+     `TEXT` only when the selected byte slice is itself valid UTF-8
+   - SQL must expose separate **bytea-safe** read entry points for binary
+     round-trip use cases
+   - write-side functions may continue to accept `TEXT` or `BYTEA`, but the
+     read side must no longer pretend that one text API covers both
+
+3. **No SQL mutation carve-out for sealed files in Phase 1**
+
+   - SQL scalar `fs9_write_at`, `fs9_append`, and `fs9_truncate` must preserve
+     the same sealed-file mutation boundary enforced by the raw fs backend
+   - `PackEntry` and `Object` remain sealed for partial mutation in Phase 1
+   - `SqlFsClient` exists to centralize statement-scoped backend acquire/cache
+     and the explicit text-vs-bytea read contract, not to change write
+     semantics relative to WS / FUSE / protocol paths
+
+Non-goals for this SQL execution model:
+
+- do **not** change raw `FsBackend` semantics into a SQL-specific contract
+- do **not** make WebSocket / FUSE partial mutation on sealed files implicitly
+  succeed
+- do **not** reintroduce hot-path `_fs_S` probing or per-call runtime
+  coordination
+
+Implementation follow-up for this model is tracked in:
+
+- #1806 SQL text vs bytea read contract
+- #1808 statement-scoped backend reuse for SQL fs9 builtins
+
 ## 1. Summary
 
 fs9 v2 should evolve from a whole-file TiKV page filesystem into a three-plane architecture:
@@ -530,6 +590,8 @@ Phase 1 SQL scope should be conservative:
 
 - `fs9_read(path)` remains bounded by `MAX_BYTES_PER_FILE`
 - `fs9_read_at(path, offset, len)` can be efficient for `PackEntry` and `Object`
+  but its effective post-EOF-trim read window must still error explicitly if it
+  exceeds `MAX_BYTES_PER_FILE` (no silent truncation)
 - `fs9_write(path, data)` is full replacement only
 - `fs9_write_at` / `append` / `truncate` reject `Object`
 - `COPY FROM fs9://` for `Object` or `PackEntry` should be treated as **deferred unless true streaming backend support lands in the same phase**

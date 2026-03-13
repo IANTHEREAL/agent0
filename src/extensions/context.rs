@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tikv_client::TransactionClient;
 
 use crate::config::EmbeddingProvider;
+use crate::extensions::fs::backend::FsBackend as SharedFsBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
@@ -65,6 +66,7 @@ pub(crate) struct ExtensionContext {
     embedding_calls: Cell<u32>,
     embedding_mode: Cell<EmbeddingExecutionMode>,
     embedding_cache: RefCell<HashMap<EmbeddingCacheKey, Vec<f64>>>,
+    fs_backend: RefCell<Option<Arc<dyn SharedFsBackend>>>,
     tikv_client: Option<Arc<TransactionClient>>,
 }
 
@@ -111,6 +113,7 @@ pub(crate) async fn with_context_opts<R>(
         embedding_calls: Cell::new(0),
         embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
         embedding_cache: RefCell::new(HashMap::new()),
+        fs_backend: RefCell::new(None),
         tikv_client: opts.tikv_client,
     };
 
@@ -145,6 +148,20 @@ pub(crate) fn execution_kind() -> ExecutionKind {
 
 pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
     CTX.try_with(|ctx| ctx.tikv_client.clone()).ok().flatten()
+}
+
+pub(crate) fn cached_fs_backend() -> Option<Arc<dyn SharedFsBackend>> {
+    CTX.try_with(|ctx| ctx.fs_backend.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn cache_fs_backend(backend: Arc<dyn SharedFsBackend>) -> Result<()> {
+    CTX.try_with(|ctx| {
+        *ctx.fs_backend.borrow_mut() = Some(backend);
+    })
+    .map_err(|_| anyhow!("fs9: extension context not available"))?;
+    Ok(())
 }
 
 pub(crate) fn try_consume_http_request(max_per_statement: u32) -> Result<()> {

@@ -12,6 +12,7 @@ pub(crate) mod decoders;
 pub(crate) mod embedded;
 pub(crate) mod glob;
 pub(crate) mod s3;
+pub(crate) mod sql_client;
 pub(crate) mod streaming;
 pub(crate) mod upload_token;
 pub(crate) mod ws;

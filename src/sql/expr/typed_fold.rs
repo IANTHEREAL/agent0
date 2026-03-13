@@ -153,6 +153,8 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
             | "FS9_REMOVE"
             | "FS9_MKDIR"
             | "FS9_READ_AT"
+            | "FS9_READ_BYTEA"
+            | "FS9_READ_AT_BYTEA"
             | "FS9_WRITE_AT"
             | "FS9_APPEND"
             | "FS9_TRUNCATE"

@@ -3839,6 +3839,21 @@ fn analyze_fs9_read_unknown_param_infers_text() {
 }
 
 #[test]
+fn analyze_fs9_read_bytea_unknown_param_infers_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_read_bytea($1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Bytes);
+}
+
+#[test]
 fn analyze_fs9_write_unknown_params_infer_text_text() {
     let catalog = test_catalog();
     let stmt = parse_statement("SELECT fs9_write($1, $2)");
@@ -3904,6 +3919,24 @@ fn analyze_fs9_read_at_unknown_params_infer_text_and_int64() {
         panic!("expected query statement");
     };
     assert_eq!(q.output_schema[0].1, DataType::Text);
+}
+
+#[test]
+fn analyze_fs9_read_at_bytea_unknown_params_infer_text_and_int64() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT fs9_read_at_bytea($1, $2, $3)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 3, &[None, None, None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        types,
+        vec![DataType::Text, DataType::Int64, DataType::Int64]
+    );
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Bytes);
 }
 
 #[test]

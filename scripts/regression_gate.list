@@ -207,6 +207,8 @@ tests/30_matview_relkind.sql
 tests/563_reserved_guc_set_config.sql
 # #1686 – fs9 embedded PageFS contract (COPY FROM fs9://, constant-fold guard)
 tests/244_fs9_parquet_integration.sql
+# #1806 / #1808 – fs9 SQL scalar contract: strict UTF-8 text reads + bytea-safe reads
+tests/304_fs9_sql_scalar_contract.sql
 # #1563 – TABLE <relation> shorthand
 tests/table_shorthand.sql
 # #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax

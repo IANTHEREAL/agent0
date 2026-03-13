@@ -320,6 +320,14 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Text).with_args(3, Some(3)),
     );
     r.register(
+        "FS9_READ_BYTEA",
+        FunctionSignature::fixed(DataType::Bytes).with_args(1, Some(1)),
+    );
+    r.register(
+        "FS9_READ_AT_BYTEA",
+        FunctionSignature::fixed(DataType::Bytes).with_args(3, Some(3)),
+    );
+    r.register(
         "FS9_WRITE_AT",
         FunctionSignature::fixed(DataType::Int64).with_args(3, Some(3)),
     );

@@ -1,4 +1,4 @@
-use crate::extensions::fs::{backend, glob};
+use crate::extensions::fs::{backend, sql_client::SqlFsClient};
 use crate::model::Value;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -56,6 +56,8 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FS9_REMOVE", fs9_remove);
     map.insert("FS9_MKDIR", fs9_mkdir);
     map.insert("FS9_READ_AT", fs9_read_at);
+    map.insert("FS9_READ_BYTEA", fs9_read_bytea);
+    map.insert("FS9_READ_AT_BYTEA", fs9_read_at_bytea);
     map.insert("FS9_WRITE_AT", fs9_write_at);
     map.insert("FS9_APPEND", fs9_append);
     map.insert("FS9_TRUNCATE", fs9_truncate);
@@ -104,11 +106,30 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
-/// Get the fs9 backend using the tenant keyspace from extension context.
-fn get_backend_sync() -> Result<Box<dyn backend::FsBackend>> {
-    let tenant = crate::extensions::context::tenant_keyspace()
-        .ok_or_else(|| anyhow!("fs9: tenant keyspace not available in extension context"))?;
-    run_async(backend::get_backend(&tenant))
+fn get_client_sync() -> Result<SqlFsClient> {
+    run_async(SqlFsClient::from_context())
+}
+
+fn checked_read_at_len(fn_name: &str, file_size: u64, offset: u64, length: usize) -> Result<usize> {
+    if length == 0 || offset >= file_size {
+        return Ok(0);
+    }
+
+    let requested_len =
+        u64::try_from(length).map_err(|_| anyhow!("{fn_name}: length exceeds u64"))?;
+    let actual_size = requested_len.min(file_size - offset);
+    let max = u64::try_from(crate::extensions::fs::MAX_BYTES_PER_FILE)
+        .map_err(|_| anyhow!("{fn_name}: max read size exceeds u64"))?;
+    if actual_size > max {
+        return Err(anyhow!(
+            "{fn_name}: file too large: {} bytes exceeds limit {}",
+            actual_size,
+            crate::extensions::fs::MAX_BYTES_PER_FILE
+        ));
+    }
+
+    usize::try_from(actual_size)
+        .map_err(|_| anyhow!("{fn_name}: read length exceeds addressable memory"))
 }
 
 pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
@@ -117,11 +138,9 @@ pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
-    let bk = get_backend_sync()?;
-    let max = crate::extensions::fs::MAX_BYTES_PER_FILE;
-    let bytes = run_async(bk.read_file(&path, max))?;
-    let _budget = reserve_read_budget(bytes.len())?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let client = get_client_sync()?;
+    let text = run_async(client.read_text(&path))?;
+    let _budget = reserve_read_budget(text.len())?;
     Ok(Value::Text(text))
 }
 
@@ -144,8 +163,8 @@ pub fn fs9_write(args: Vec<Value>) -> Result<Value> {
         ));
     }
 
-    let bk = get_backend_sync()?;
-    let len = run_async(bk.write_file(&path, &content))?;
+    let client = get_client_sync()?;
+    let len = run_async(client.write_file(&path, &content))?;
     Ok(Value::Int64(len as i64))
 }
 
@@ -159,19 +178,8 @@ pub fn fs9_exists(args: Vec<Value>) -> Result<Value> {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
-    let bk = get_backend_sync()?;
-    match run_async(bk.stat(&path)) {
-        Ok(_) => Ok(Value::Boolean(true)),
-        Err(e)
-            if {
-                let msg = e.to_string();
-                msg.contains("not found") || msg.contains("NotFound")
-            } =>
-        {
-            Ok(Value::Boolean(false))
-        }
-        Err(e) => Err(e),
-    }
+    let client = get_client_sync()?;
+    Ok(Value::Boolean(run_async(client.exists(&path))?))
 }
 
 pub fn fs9_size(args: Vec<Value>) -> Result<Value> {
@@ -184,8 +192,8 @@ pub fn fs9_size(args: Vec<Value>) -> Result<Value> {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
-    let bk = get_backend_sync()?;
-    let info = run_async(bk.stat(&path))?;
+    let client = get_client_sync()?;
+    let info = run_async(client.stat(&path))?;
     Ok(Value::Int64(info.size as i64))
 }
 
@@ -199,8 +207,8 @@ pub fn fs9_mtime(args: Vec<Value>) -> Result<Value> {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
-    let bk = get_backend_sync()?;
-    let info = run_async(bk.stat(&path))?;
+    let client = get_client_sync()?;
+    let info = run_async(client.stat(&path))?;
     let dt =
         DateTime::<Utc>::from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.mtime));
     Ok(Value::Text(dt.to_rfc3339_opts(SecondsFormat::Secs, true)))
@@ -226,33 +234,8 @@ pub fn fs9_remove(args: Vec<Value>) -> Result<Value> {
         }
     };
 
-    let bk = get_backend_sync()?;
-    if glob::is_glob_pattern(&path) {
-        let files = run_async(glob::expand_glob(
-            &*bk,
-            &path,
-            crate::extensions::fs::MAX_FILES_PER_GLOB,
-            None,
-        ))?;
-        let mut count = 0i64;
-        for file in files {
-            if recursive {
-                count += run_async(bk.remove_recursive(&file))? as i64;
-            } else {
-                run_async(bk.remove(&file))?;
-                count += 1;
-            }
-        }
-        return Ok(Value::Int64(count));
-    }
-
-    if recursive {
-        let count = run_async(bk.remove_recursive(&path))?;
-        Ok(Value::Int64(count as i64))
-    } else {
-        run_async(bk.remove(&path))?;
-        Ok(Value::Int64(1))
-    }
+    let client = get_client_sync()?;
+    Ok(Value::Int64(run_async(client.remove(&path, recursive))?))
 }
 
 pub fn fs9_mkdir(args: Vec<Value>) -> Result<Value> {
@@ -275,8 +258,8 @@ pub fn fs9_mkdir(args: Vec<Value>) -> Result<Value> {
         }
     };
 
-    let bk = get_backend_sync()?;
-    run_async(bk.mkdir(&path, recursive))?;
+    let client = get_client_sync()?;
+    run_async(client.mkdir(&path, recursive))?;
     Ok(Value::Boolean(true))
 }
 
@@ -332,11 +315,88 @@ pub fn fs9_read_at(args: Vec<Value>) -> Result<Value> {
             ))
         }
     };
-    let bk = get_backend_sync()?;
-    let bytes = run_async(bk.read_file_at(&path, offset, length))?;
-    let _budget = reserve_read_budget(bytes.len())?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let client = get_client_sync()?;
+    let info = run_async(client.stat(&path))?;
+    let actual_len = checked_read_at_len("fs9_read_at", info.size, offset, length)?;
+    let text = run_async(client.read_text_at(&path, offset, actual_len))?;
+    let _budget = reserve_read_budget(text.len())?;
     Ok(Value::Text(text))
+}
+
+pub fn fs9_read_bytea(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg(
+        "fs9_read_bytea",
+        args.first().cloned().unwrap_or(Value::Null),
+        0,
+    )? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let client = get_client_sync()?;
+    let bytes = run_async(client.read_bytes(&path))?;
+    let _budget = reserve_read_budget(bytes.len())?;
+    Ok(Value::Bytes(bytes))
+}
+
+pub fn fs9_read_at_bytea(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg(
+        "fs9_read_at_bytea",
+        args.first().cloned().unwrap_or(Value::Null),
+        0,
+    )? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let offset = match args.get(1).unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at_bytea: offset must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Int32(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at_bytea: offset must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_read_at_bytea: expected integer for offset, got {:?}",
+                other
+            ))
+        }
+    };
+    let length = match args.get(2).unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at_bytea: length must be non-negative"));
+            }
+            *v as usize
+        }
+        Value::Int32(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at_bytea: length must be non-negative"));
+            }
+            *v as usize
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_read_at_bytea: expected integer for length, got {:?}",
+                other
+            ))
+        }
+    };
+    let client = get_client_sync()?;
+    let info = run_async(client.stat(&path))?;
+    let actual_len = checked_read_at_len("fs9_read_at_bytea", info.size, offset, length)?;
+    let bytes = run_async(client.read_bytes_at(&path, offset, actual_len))?;
+    let _budget = reserve_read_budget(bytes.len())?;
+    Ok(Value::Bytes(bytes))
 }
 
 pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
@@ -381,8 +441,8 @@ pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
     if data.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
         return Err(anyhow!("fs9_write_at: data exceeds maximum file size"));
     }
-    let bk = get_backend_sync()?;
-    let written = run_async(bk.write_file_at(&path, offset, &data))?;
+    let client = get_client_sync()?;
+    let written = run_async(client.write_file_at(&path, offset, &data))?;
     Ok(Value::Int64(written as i64))
 }
 
@@ -404,8 +464,8 @@ pub fn fs9_append(args: Vec<Value>) -> Result<Value> {
     if data.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
         return Err(anyhow!("fs9_append: data exceeds maximum file size"));
     }
-    let bk = get_backend_sync()?;
-    let written = run_async(bk.append_file(&path, &data))?;
+    let client = get_client_sync()?;
+    let written = run_async(client.append_file(&path, &data))?;
     Ok(Value::Int64(written as i64))
 }
 
@@ -440,8 +500,8 @@ pub fn fs9_truncate(args: Vec<Value>) -> Result<Value> {
             ))
         }
     };
-    let bk = get_backend_sync()?;
-    run_async(bk.truncate(&path, size))?;
+    let client = get_client_sync()?;
+    run_async(client.truncate(&path, size))?;
     Ok(Value::Boolean(true))
 }
 
@@ -469,6 +529,44 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "fs9_write: argument 2 must be TEXT or BYTEA, got BOOLEAN"
+        );
+    }
+
+    #[test]
+    fn checked_read_at_len_trims_to_eof() {
+        assert_eq!(
+            checked_read_at_len("fs9_read_at", 1024, 900, 512).unwrap(),
+            124
+        );
+    }
+
+    #[test]
+    fn checked_read_at_len_rejects_oversize_window() {
+        let max = crate::extensions::fs::MAX_BYTES_PER_FILE;
+        let err = checked_read_at_len("fs9_read_at_bytea", (max + 1) as u64, 0, max + 1)
+            .expect_err("effective window above limit must fail");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "fs9_read_at_bytea: file too large: {} bytes exceeds limit {}",
+                max + 1,
+                max
+            )
+        );
+    }
+
+    #[test]
+    fn checked_read_at_len_allows_large_request_trimmed_by_eof() {
+        let max = crate::extensions::fs::MAX_BYTES_PER_FILE as u64;
+        assert_eq!(
+            checked_read_at_len(
+                "fs9_read_at",
+                max,
+                max - 1,
+                crate::extensions::fs::MAX_BYTES_PER_FILE + 123
+            )
+            .unwrap(),
+            1
         );
     }
 

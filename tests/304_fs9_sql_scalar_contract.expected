@@ -1,0 +1,17 @@
+setup_cleanup_existing
+0
+(1 row)
+write_binary
+4
+(1 row)
+read_binary_hex
+00ff6162
+(1 row)
+read_binary_slice_hex
+ff61
+(1 row)
+psql:tests/304_fs9_sql_scalar_contract.sql:24: ERROR:  fs9_read: file is not valid UTF-8; use fs9_read_bytea for binary data
+psql:tests/304_fs9_sql_scalar_contract.sql:26: ERROR:  fs9_read_at: file is not valid UTF-8; use fs9_read_at_bytea for binary data
+cleanup_after
+1
+(1 row)

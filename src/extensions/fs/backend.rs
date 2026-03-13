@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::io::AsyncBufRead;
 
+use crate::extensions::fs::embedded::types::EmbeddedFsError;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +135,26 @@ pub(crate) fn is_backend_available() -> bool {
     crate::extensions::context::tikv_client().is_some()
 }
 
+pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<EmbeddedFsError>(),
+        Some(EmbeddedFsError::NotFound(_))
+    )
+}
+
+pub(crate) async fn get_backend_shared(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
+    let client = crate::extensions::context::tikv_client().ok_or_else(|| {
+        anyhow!(
+            "fs9: TiKV client not available in extension context. \
+             Ensure the caller wraps this in with_context_opts()."
+        )
+    })?;
+    EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
+        .await
+        .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
+        .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+}
+
 pub(crate) async fn get_backend(tenant_keyspace: &str) -> Result<Box<dyn FsBackend>> {
     let client = crate::extensions::context::tikv_client().ok_or_else(|| {
         anyhow!(
@@ -153,6 +175,26 @@ mod tests {
     #[tokio::test]
     async fn get_backend_without_context_returns_error() {
         match get_backend("tenant_a").await {
+            Ok(_) => panic!("missing extension context must return error"),
+            Err(err) => assert!(
+                err.to_string().contains("TiKV client not available"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn is_not_found_error_matches_embedded_error_type() {
+        let err = anyhow!(EmbeddedFsError::NotFound("/missing".to_string()));
+        assert!(is_not_found_error(&err));
+
+        let other = anyhow!(EmbeddedFsError::InvalidInput("bad".to_string()));
+        assert!(!is_not_found_error(&other));
+    }
+
+    #[tokio::test]
+    async fn get_backend_shared_without_context_returns_error() {
+        match get_backend_shared("tenant_a").await {
             Ok(_) => panic!("missing extension context must return error"),
             Err(err) => assert!(
                 err.to_string().contains("TiKV client not available"),

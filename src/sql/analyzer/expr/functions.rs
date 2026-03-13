@@ -565,7 +565,8 @@ impl<'a> Analyzer<'a> {
                 self.coerce_vec_embed_signature(func_name, args)
             }
             "FS9_READ" | "FS9_WRITE" | "FS9_EXISTS" | "FS9_SIZE" | "FS9_MTIME" | "FS9_REMOVE"
-            | "FS9_MKDIR" | "FS9_READ_AT" | "FS9_WRITE_AT" | "FS9_APPEND" | "FS9_TRUNCATE" => {
+            | "FS9_MKDIR" | "FS9_READ_AT" | "FS9_READ_BYTEA" | "FS9_READ_AT_BYTEA"
+            | "FS9_WRITE_AT" | "FS9_APPEND" | "FS9_TRUNCATE" => {
                 self.coerce_fs9_signature(func_name, args)
             }
             _ if is_two_arg_advisory_lock_function(func_name) => {
@@ -609,12 +610,14 @@ impl<'a> Analyzer<'a> {
         args: Vec<TypedExpr>,
     ) -> Result<Vec<TypedExpr>, AnalyzerError> {
         match func_name {
-            "FS9_READ" | "FS9_EXISTS" | "FS9_SIZE" | "FS9_MTIME" => {
+            "FS9_READ" | "FS9_READ_BYTEA" | "FS9_EXISTS" | "FS9_SIZE" | "FS9_MTIME" => {
                 self.coerce_fs9_path_only_signature(func_name, args)
             }
             "FS9_WRITE" | "FS9_APPEND" => self.coerce_fs9_write_signature(func_name, args),
             "FS9_REMOVE" | "FS9_MKDIR" => self.coerce_fs9_path_bool_signature(func_name, args),
-            "FS9_READ_AT" => self.coerce_fs9_read_at_signature(func_name, args),
+            "FS9_READ_AT" | "FS9_READ_AT_BYTEA" => {
+                self.coerce_fs9_read_at_signature(func_name, args)
+            }
             "FS9_WRITE_AT" => self.coerce_fs9_write_at_signature(func_name, args),
             "FS9_TRUNCATE" => self.coerce_fs9_truncate_signature(func_name, args),
             _ => Ok(args),
