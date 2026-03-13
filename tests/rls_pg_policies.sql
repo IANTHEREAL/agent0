@@ -26,21 +26,27 @@ SELECT policyname, cmd, permissive, qual, with_check
   WHERE tablename = 'pol_test'
   ORDER BY policyname;
 
--- 4. Verify roles is an array (cast to text for display)
+-- 4. Verify roles is a name[] array (cast to text for display)
 SELECT policyname, roles::text
   FROM pg_policies
   WHERE tablename = 'pol_test' AND policyname = 'sel_all';
 
--- 5. Verify schema name
+-- 5. Verify roles column type
+SELECT pg_typeof(roles)::text
+  FROM pg_policies
+  WHERE tablename = 'pol_test'
+  LIMIT 1;
+
+-- 6. Verify schema name
 SELECT schemaname, tablename
   FROM pg_policies
   WHERE tablename = 'pol_test'
   LIMIT 1;
 
--- 6. pg_policy polroles is an array (cast to text for display)
+-- 7. pg_policy polroles is an array (cast to text for display)
 SELECT polname, polroles::text
   FROM pg_policy
   WHERE polname = 'sel_all';
 
--- 7. Cleanup
+-- 8. Cleanup
 DROP TABLE pol_test;

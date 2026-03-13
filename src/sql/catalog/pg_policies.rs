@@ -1,5 +1,6 @@
-use super::helpers::{split_schema_and_name, text_array_col, text_col, text_val};
+use super::helpers::{split_schema_and_name, text_col, text_val};
 use super::{ScanContext, VirtualTable};
+use crate::model::{ColumnDef, DataType};
 use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -34,7 +35,18 @@ impl VirtualTable for PgPolicies {
                 text_col("tablename"),
                 text_col("policyname"),
                 text_col("permissive"),
-                text_array_col("roles"),
+                ColumnDef {
+                    name: "roles".to_string(),
+                    data_type: DataType::Array(Box::new(DataType::Name)),
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                },
                 text_col("cmd"),
                 text_col("qual"),
                 text_col("with_check"),
