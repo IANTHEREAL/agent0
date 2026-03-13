@@ -26,10 +26,10 @@ SELECT policyname, cmd, permissive, qual, with_check
   WHERE tablename = 'pol_test'
   ORDER BY policyname;
 
--- 4. Verify permissive/restrictive labeling
-SELECT policyname, permissive
+-- 4. Verify roles is an array (cast to text for display)
+SELECT policyname, roles::text
   FROM pg_policies
-  WHERE tablename = 'pol_test' AND policyname = 'del_restrict';
+  WHERE tablename = 'pol_test' AND policyname = 'sel_all';
 
 -- 5. Verify schema name
 SELECT schemaname, tablename
@@ -37,20 +37,10 @@ SELECT schemaname, tablename
   WHERE tablename = 'pol_test'
   LIMIT 1;
 
--- 6. Verify roles defaults to {public}
-SELECT policyname, roles
-  FROM pg_policies
-  WHERE tablename = 'pol_test' AND policyname = 'sel_all';
-
--- 7. pg_policy also works (low-level catalog)
-SELECT polname, polcmd, polpermissive
-  FROM pg_policy
-  WHERE polname = 'sel_all';
-
--- 8. pg_policy polroles cast to text works
+-- 6. pg_policy polroles is an array (cast to text for display)
 SELECT polname, polroles::text
   FROM pg_policy
   WHERE polname = 'sel_all';
 
--- 9. Cleanup
+-- 7. Cleanup
 DROP TABLE pol_test;

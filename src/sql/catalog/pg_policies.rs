@@ -1,4 +1,4 @@
-use super::helpers::{split_schema_and_name, text_col, text_val};
+use super::helpers::{split_schema_and_name, text_array_col, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
@@ -7,7 +7,8 @@ use async_trait::async_trait;
 /// pg_policies — human-readable view of RLS policies (PostgreSQL-compatible).
 ///
 /// Unlike pg_policy (which uses OIDs), this view returns role names directly
-/// and spells out command types as readable strings.
+/// and spells out command types as readable strings. Matches PostgreSQL's
+/// `pg_policies` view column layout.
 pub struct PgPolicies;
 
 #[async_trait]
@@ -33,7 +34,7 @@ impl VirtualTable for PgPolicies {
                 text_col("tablename"),
                 text_col("policyname"),
                 text_col("permissive"),
-                text_col("roles"),
+                text_array_col("roles"),
                 text_col("cmd"),
                 text_col("qual"),
                 text_col("with_check"),
@@ -81,18 +82,15 @@ impl VirtualTable for PgPolicies {
                 "RESTRICTIVE"
             };
 
-            let roles = if policy.roles.is_empty() {
-                "{public}".to_string()
+            // roles: name[] — array of role names. PUBLIC for empty roles list.
+            let roles_array: Vec<Value> = if policy.roles.is_empty() {
+                vec![Value::Text("public".to_string())]
             } else {
-                format!(
-                    "{{{}}}",
-                    policy
-                        .roles
-                        .iter()
-                        .map(|r| r.as_str())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
+                policy
+                    .roles
+                    .iter()
+                    .map(|r| Value::Text(r.clone()))
+                    .collect()
             };
 
             let cmd = policy.command.pg_cmd_display();
@@ -102,7 +100,7 @@ impl VirtualTable for PgPolicies {
                 text_val(table_name),
                 text_val(&policy.name),
                 text_val(permissive),
-                text_val(&roles),
+                Value::Array(roles_array),
                 text_val(cmd),
                 policy
                     .using_expr
