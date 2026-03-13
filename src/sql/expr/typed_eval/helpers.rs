@@ -153,6 +153,38 @@ pub(super) fn eval_function_call(
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
             return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
+        "AUTH.UID" => {
+            // auth.uid() is a zero-argument function. Reject any arguments.
+            if !args.is_empty() {
+                return Err(SqlError::FunctionNotFound(format!(
+                    "auth.uid({})",
+                    args.iter()
+                        .map(|a| a
+                            .data_type()
+                            .map(|dt| dt.pg_display_name())
+                            .unwrap_or_else(|| "unknown".to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
+            }
+            // auth.uid() — returns the JWT subject (sub claim) from the trusted
+            // auth pipeline. Reads from `auth.uid` first, falling back to
+            // `request.jwt.claim.sub` (populated by P2-4 JWT pipeline). Both
+            // namespaces are protected from client spoofing by the anti-spoofing
+            // guard. Returns NULL when no JWT context is available.
+            for key in &["auth.uid", "request.jwt.claim.sub"] {
+                if let Some(v) = QueryContext::current_setting_snapshot(key) {
+                    return Ok(Value::Text(v));
+                }
+                if let Some(ref snapshot) = qctx.settings_snapshot {
+                    if let Some(v) = snapshot.get(*key) {
+                        return Ok(Value::Text(v.clone()));
+                    }
+                }
+            }
+            return Ok(Value::Null);
+        }
         "VERSION" => {
             return Ok(Value::Text(crate::sql::expr::VERSION_STRING.to_string()));
         }
