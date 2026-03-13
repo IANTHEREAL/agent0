@@ -1611,6 +1611,26 @@ fn test_current_user() {
 }
 
 #[test]
+fn test_auth_uid_returns_null_when_unset() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let func = TypedExpr::new(
+        TypedExprKind::FunctionCall {
+            func: ResolvedFunction {
+                name: "AUTH.UID".into(),
+                kind: FunctionKind::Builtin,
+                return_type: DataType::Text,
+            },
+            args: vec![],
+            order_by: vec![],
+            filter: None,
+        },
+        DataType::Text,
+    );
+    assert_eq!(eval_typed_expr(&func, &row, &qctx).unwrap(), Value::Null);
+}
+
+#[test]
 fn test_version() {
     let row = empty_row();
     let qctx = test_qctx();

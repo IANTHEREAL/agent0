@@ -1,0 +1,10 @@
+-- auth.uid() returns NULL when unset
+uid_is_null
+t
+
+-- auth.uid() in COALESCE
+effective_uid
+anonymous
+
+-- anti-spoofing blocks client SET
+reserved for server-side use only

@@ -281,8 +281,8 @@ impl<'a> Analyzer<'a> {
         // materialize.rs, and typed_eval.rs.
         if func.name.0.len() > 1 {
             let schema = func.name.0[0].value.to_lowercase();
-            if schema == "cron" {
-                func_name = format!("cron.{}", func_name);
+            if schema == "cron" || schema == "auth" {
+                func_name = format!("{}.{}", schema, func_name);
             }
         }
 

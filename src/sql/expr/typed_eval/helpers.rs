@@ -153,6 +153,23 @@ pub(super) fn eval_function_call(
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
             return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
+        "AUTH.UID" => {
+            // auth.uid() — returns the JWT subject (sub claim) from the trusted
+            // auth pipeline. Reads from the server-reserved `auth.uid` GUC which
+            // is populated by the JWT claims pipeline (P2-4) and protected from
+            // client spoofing by the anti-spoofing guard.
+            // Returns NULL when no JWT context is available.
+            if let Some(v) = QueryContext::current_setting_snapshot("auth.uid") {
+                return Ok(Value::Text(v));
+            }
+            if let Some(ref snapshot) = qctx.settings_snapshot {
+                return match snapshot.get("auth.uid") {
+                    Some(v) => Ok(Value::Text(v.clone())),
+                    None => Ok(Value::Null),
+                };
+            }
+            return Ok(Value::Null);
+        }
         "VERSION" => {
             return Ok(Value::Text(crate::sql::expr::VERSION_STRING.to_string()));
         }
