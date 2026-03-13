@@ -155,18 +155,19 @@ pub(super) fn eval_function_call(
         }
         "AUTH.UID" => {
             // auth.uid() — returns the JWT subject (sub claim) from the trusted
-            // auth pipeline. Reads from the server-reserved `auth.uid` GUC which
-            // is populated by the JWT claims pipeline (P2-4) and protected from
-            // client spoofing by the anti-spoofing guard.
-            // Returns NULL when no JWT context is available.
-            if let Some(v) = QueryContext::current_setting_snapshot("auth.uid") {
-                return Ok(Value::Text(v));
-            }
-            if let Some(ref snapshot) = qctx.settings_snapshot {
-                return match snapshot.get("auth.uid") {
-                    Some(v) => Ok(Value::Text(v.clone())),
-                    None => Ok(Value::Null),
-                };
+            // auth pipeline. Reads from `auth.uid` first, falling back to
+            // `request.jwt.claim.sub` (populated by P2-4 JWT pipeline). Both
+            // namespaces are protected from client spoofing by the anti-spoofing
+            // guard. Returns NULL when no JWT context is available.
+            for key in &["auth.uid", "request.jwt.claim.sub"] {
+                if let Some(v) = QueryContext::current_setting_snapshot(key) {
+                    return Ok(Value::Text(v));
+                }
+                if let Some(ref snapshot) = qctx.settings_snapshot {
+                    if let Some(v) = snapshot.get(*key) {
+                        return Ok(Value::Text(v.clone()));
+                    }
+                }
             }
             return Ok(Value::Null);
         }
