@@ -1318,6 +1318,10 @@ impl EmbeddedPageFs {
         begin_transaction(&self.client).await
     }
 
+    async fn begin_read(&self) -> Result<Transaction> {
+        begin_read_transaction(&self.client).await
+    }
+
     #[cfg(test)]
     async fn begin_unchecked(&self) -> Result<Transaction> {
         self.begin_internal().await
@@ -1696,7 +1700,7 @@ impl EmbeddedPageFs {
     }
 
     pub(crate) async fn stat(&self, path: &str) -> Result<Inode> {
-        let mut txn = self.begin().await?;
+        let mut txn = self.begin_read().await?;
         let (_, inode) = resolve_path(&mut txn, path).await?;
         let _ = txn.rollback().await;
         Ok(inode)
@@ -1711,7 +1715,7 @@ impl EmbeddedPageFs {
     }
 
     pub(crate) async fn readdir(&self, path: &str) -> Result<Vec<(String, Inode)>> {
-        let mut txn = self.begin().await?;
+        let mut txn = self.begin_read().await?;
         let (inode_id, inode) = resolve_path(&mut txn, path).await?;
         if !inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::not_directory(path)));
@@ -1736,8 +1740,8 @@ impl EmbeddedPageFs {
     }
 
     pub(crate) async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = resolve_path(&mut txn, path).await?;
+        let mut txn = self.begin_read().await?;
+        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
@@ -1790,23 +1794,12 @@ impl EmbeddedPageFs {
             }
             _ => {
                 let data =
-                    read_file_range_from_txn(&mut txn, inode_id, &inode, 0, file_len).await?;
-                inode.touch_atime();
-                save_inode(&mut txn, &inode).await?;
-                txn.commit().await?;
+                    read_file_range_from_txn(&mut txn, inode.id, &inode, 0, file_len).await?;
+                let _ = txn.rollback().await;
                 return Ok(data);
             }
         };
 
-        // Best-effort: update atime for object-backed reads after fetching bytes from S3.
-        let mut txn = self.begin().await?;
-        if let Some(mut inode) = load_inode(&mut txn, inode_id).await? {
-            inode.touch_atime();
-            save_inode(&mut txn, &inode).await?;
-            txn.commit().await?;
-        } else {
-            let _ = txn.rollback().await;
-        }
         Ok(data)
     }
 
@@ -1816,16 +1809,14 @@ impl EmbeddedPageFs {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = resolve_path(&mut txn, path).await?;
+        let mut txn = self.begin_read().await?;
+        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
 
         if offset >= inode.size || length == 0 {
-            inode.touch_atime();
-            save_inode(&mut txn, &inode).await?;
-            txn.commit().await?;
+            let _ = txn.rollback().await;
             return Ok(Vec::new());
         }
 
@@ -1878,22 +1869,12 @@ impl EmbeddedPageFs {
             }
             _ => {
                 let data =
-                    read_file_range_from_txn(&mut txn, inode_id, &inode, offset, length).await?;
-                inode.touch_atime();
-                save_inode(&mut txn, &inode).await?;
-                txn.commit().await?;
+                    read_file_range_from_txn(&mut txn, inode.id, &inode, offset, length).await?;
+                let _ = txn.rollback().await;
                 return Ok(data);
             }
         };
 
-        let mut txn = self.begin().await?;
-        if let Some(mut inode) = load_inode(&mut txn, inode_id).await? {
-            inode.touch_atime();
-            save_inode(&mut txn, &inode).await?;
-            txn.commit().await?;
-        } else {
-            let _ = txn.rollback().await;
-        }
         Ok(data)
     }
 
@@ -1902,7 +1883,7 @@ impl EmbeddedPageFs {
         path: &str,
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
-        let mut txn = self.begin().await?;
+        let mut txn = self.begin_read().await?;
         let (inode_id, inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
@@ -2835,7 +2816,7 @@ impl EmbeddedPageFs {
 
     pub(crate) async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload> {
         let normalized = normalize_path(path);
-        let mut txn = self.begin().await?;
+        let mut txn = self.begin_read().await?;
         let result: Result<(String, FsStorage, u64)> = async {
             let (_inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
             if inode.is_directory() {
@@ -3180,7 +3161,7 @@ impl EmbeddedPageFs {
         &self,
         mut txn: Transaction,
         inode_id: u64,
-        mut inode: Inode,
+        inode: Inode,
         path: String,
         sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
     ) -> Result<()> {
@@ -3208,15 +3189,6 @@ impl EmbeddedPageFs {
                     if sender.send(Ok(buf[..n].to_vec())).await.is_err() {
                         break;
                     }
-                }
-
-                let mut txn = self.begin().await?;
-                if let Some(mut inode) = load_inode(&mut txn, inode_id).await? {
-                    inode.touch_atime();
-                    save_inode(&mut txn, &inode).await?;
-                    txn.commit().await?;
-                } else {
-                    let _ = txn.rollback().await;
                 }
                 return Ok(());
             }
@@ -3264,15 +3236,6 @@ impl EmbeddedPageFs {
                         }
                     }
                 }
-
-                let mut txn = self.begin().await?;
-                if let Some(mut inode) = load_inode(&mut txn, inode_id).await? {
-                    inode.touch_atime();
-                    save_inode(&mut txn, &inode).await?;
-                    txn.commit().await?;
-                } else {
-                    let _ = txn.rollback().await;
-                }
                 return Ok(());
             }
             _ => {}
@@ -3296,9 +3259,7 @@ impl EmbeddedPageFs {
                 .ok_or_else(|| anyhow!(EmbeddedFsError::internal("stream offset overflow")))?;
         }
 
-        inode.touch_atime();
-        save_inode(&mut txn, &inode).await?;
-        txn.commit().await?;
+        let _ = txn.rollback().await;
         Ok(())
     }
 
@@ -4128,6 +4089,16 @@ async fn fs_keyspace_is_empty(txn: &mut Transaction) -> Result<bool> {
 
 async fn begin_transaction(client: &Arc<TransactionClient>) -> Result<Transaction> {
     let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+    client
+        .begin_with_options(options)
+        .await
+        .map_err(|e| anyhow!(e))
+}
+
+async fn begin_read_transaction(client: &Arc<TransactionClient>) -> Result<Transaction> {
+    let options = TransactionOptions::new_optimistic()
+        .read_only()
+        .drop_check(CheckLevel::Warn);
     client
         .begin_with_options(options)
         .await
@@ -6666,6 +6637,13 @@ mod tests {
         let _ = fs.remove(path).await;
     }
 
+    async fn inode_snapshot(fs: &EmbeddedPageFs, path: &str) -> serde_json::Value {
+        let mut txn = fs.begin_internal().await.unwrap();
+        let (_, inode) = resolve_path(&mut txn, path).await.unwrap();
+        let _ = txn.rollback().await;
+        serde_json::to_value(&inode).unwrap()
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_init_filesystem_persists_binding_and_allocator_state() {
@@ -7000,6 +6978,171 @@ mod tests {
             "full replace of an object-backed file must retire the old object via lifecycle cleanup"
         );
         let _ = txn.rollback().await;
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_inline_read_paths_do_not_mutate_inode_metadata() {
+        let fs = make_fs().await;
+        let base = "/test_inline_read_paths_do_not_mutate_inode_metadata";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let inline_max = fs9_config().inline_max_bytes;
+        if inline_max == 0 {
+            return;
+        }
+
+        let path = &format!("{base}/inline.txt");
+        let data = b"inline-read-regression".to_vec();
+        fs.write_file(path, &data).await.unwrap();
+
+        let inode = fs.stat(path).await.unwrap();
+        assert_eq!(inode.data, DataRef::InlineBlob);
+
+        let before = inode_snapshot(&fs, path).await;
+        let stat_inode = fs.stat(path).await.unwrap();
+        assert_eq!(stat_inode.size, data.len() as u64);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        assert_eq!(fs.read_file(path).await.unwrap(), data);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        assert_eq!(
+            fs.read_file_at(path, 3, 6).await.unwrap(),
+            data[3..9].to_vec()
+        );
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        assert!(fs
+            .read_file_at(path, data.len() as u64, 16)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        let mut reader = fs.read_file_stream(path, data.len()).await.unwrap();
+        let mut streamed = Vec::new();
+        reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, data);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_pack_read_paths_do_not_mutate_inode_metadata() {
+        if fs9_config().s3.is_none() {
+            return;
+        }
+
+        let fs = make_fs().await;
+        let base = "/test_pack_read_paths_do_not_mutate_inode_metadata";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let first_path = format!("{base}/first.txt");
+        let second_path = format!("{base}/second.txt");
+        let first_data = b"pack-entry-first".to_vec();
+        let second_data = b"pack-entry-second".to_vec();
+        let entries = fs
+            .batch_write(vec![
+                FsBatchWriteFile {
+                    path: first_path.clone(),
+                    data: first_data.clone(),
+                },
+                FsBatchWriteFile {
+                    path: second_path.clone(),
+                    data: second_data,
+                },
+            ])
+            .await
+            .unwrap();
+        assert!(entries.iter().all(|entry| entry.result.is_ok()));
+
+        let inode = fs.stat(&first_path).await.unwrap();
+        assert!(
+            matches!(inode.data, DataRef::PackEntry { .. }),
+            "batch pack write must publish pack-backed files"
+        );
+
+        let before = inode_snapshot(&fs, &first_path).await;
+        let stat_inode = fs.stat(&first_path).await.unwrap();
+        assert_eq!(stat_inode.size, first_data.len() as u64);
+        assert_eq!(inode_snapshot(&fs, &first_path).await, before);
+
+        assert_eq!(fs.read_file(&first_path).await.unwrap(), first_data);
+        assert_eq!(inode_snapshot(&fs, &first_path).await, before);
+
+        assert_eq!(
+            fs.read_file_at(&first_path, 5, 4).await.unwrap(),
+            first_data[5..9].to_vec()
+        );
+        assert_eq!(inode_snapshot(&fs, &first_path).await, before);
+
+        let mut reader = fs
+            .read_file_stream(&first_path, first_data.len())
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, first_data);
+        assert_eq!(inode_snapshot(&fs, &first_path).await, before);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_object_read_paths_do_not_mutate_inode_metadata() {
+        let fs = make_fs().await;
+        let base = "/test_object_read_paths_do_not_mutate_inode_metadata";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let inline_max = fs9_config().inline_max_bytes;
+        if inline_max == 0 || fs9_config().s3.is_none() {
+            return;
+        }
+
+        let path = &format!("{base}/object.bin");
+        let data: Vec<u8> = (0..(inline_max + 1)).map(|idx| (idx % 251) as u8).collect();
+        fs.write_file(path, &data).await.unwrap();
+
+        let inode = fs.stat(path).await.unwrap();
+        assert!(
+            matches!(inode.data, DataRef::Object { .. }),
+            "large write must route through object storage"
+        );
+
+        let before = inode_snapshot(&fs, path).await;
+        let stat_inode = fs.stat(path).await.unwrap();
+        assert_eq!(stat_inode.size, data.len() as u64);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        assert_eq!(fs.read_file(path).await.unwrap(), data);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        assert_eq!(
+            fs.read_file_at(path, 7, 11).await.unwrap(),
+            data[7..18].to_vec()
+        );
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        let mut reader = fs.read_file_stream(path, data.len()).await.unwrap();
+        let mut streamed = Vec::new();
+        reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, data);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        let prepared = fs.prepare_download(path).await.unwrap();
+        assert_eq!(prepared.storage, FsStorage::Object);
+        assert_eq!(prepared.size, data.len() as u64);
+        assert!(prepared.range_supported);
+        assert_eq!(inode_snapshot(&fs, path).await, before);
 
         cleanup(&fs, base).await;
     }

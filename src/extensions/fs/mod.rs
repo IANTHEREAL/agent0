@@ -333,8 +333,8 @@ async fn start_file_stream_for_backend(
 
     let fmt = decoders::detect_format(path, format);
 
-    // Parquet uses a full read_file (parquet needs random access), so skip
-    // spawning a streaming reader that would race on the inode atime key.
+    // Parquet needs random access, so it stays on the full read_file path
+    // instead of the sequential read_file_stream path.
     #[cfg(feature = "parquet")]
     if fmt == "parquet" {
         let data = backend
