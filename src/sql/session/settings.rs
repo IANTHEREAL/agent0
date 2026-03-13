@@ -1135,7 +1135,6 @@ impl SessionSettings {
             "transaction_isolation" => self.transaction_isolation = None,
             "default_transaction_read_only" => self.default_transaction_read_only = None,
             _ => {
-                self.server_reserved_settings.remove(canonical);
                 self.extra_settings.remove(canonical);
             }
         }

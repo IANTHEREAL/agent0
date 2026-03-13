@@ -194,7 +194,7 @@ struct Db9ConnectTokenClaims {
 impl Db9ConnectTokenClaims {
     fn into_verified_jwt_claims(self) -> Result<VerifiedJwtClaims, Db9AuthError> {
         let mut claims = self.extra;
-        claims.insert("exp".to_string(), JsonValue::from(self.exp as u64));
+        claims.insert("exp".to_string(), serde_json::json!(self.exp));
         claims.insert("tid".to_string(), JsonValue::from(self.tid));
         claims.insert("usr".to_string(), JsonValue::from(self.usr));
 
@@ -206,10 +206,9 @@ impl Db9ConnectTokenClaims {
         let mut settings = BTreeMap::new();
         settings.insert("request.jwt.claims".to_string(), all_claims_json);
         for (claim_name, value) in claims {
-            if value.is_null() {
+            let Some(setting_value) = claim_value_to_setting_string(&value) else {
                 continue;
-            }
-            let setting_value = claim_value_to_setting_string(&value);
+            };
             if claim_name.eq_ignore_ascii_case("sub") {
                 settings.insert("auth.uid".to_string(), setting_value.clone());
             }
@@ -223,15 +222,15 @@ impl Db9ConnectTokenClaims {
     }
 }
 
-fn claim_value_to_setting_string(value: &JsonValue) -> String {
-    match value {
+fn claim_value_to_setting_string(value: &JsonValue) -> Option<String> {
+    Some(match value {
         JsonValue::String(s) => s.clone(),
         JsonValue::Bool(v) => v.to_string(),
         JsonValue::Number(n) => n.to_string(),
-        JsonValue::Null => String::new(),
+        JsonValue::Null => return None,
         JsonValue::Array(_) | JsonValue::Object(_) => serde_json::to_string(value)
             .expect("serde_json::Value from JWT claims must be serializable"),
-    }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -891,6 +890,49 @@ JwIDAQAB
             .await
             .unwrap_err();
         assert!(matches!(err, Db9AuthError::RoleMismatch { .. }));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_skips_null_claim_settings_but_keeps_claims_blob() {
+        let _guard = test_lock().lock().unwrap();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
+        let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
+
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = serde_json::json!({
+            "iss": "https://issuer.example",
+            "aud": "db9-server",
+            "tid": "t1",
+            "usr": "admin",
+            "sub": "auth0|admin-user",
+            "nullable": null,
+            "exp": exp,
+        });
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let verified = verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verified.setting("request.jwt.claim.nullable"),
+            None,
+            "null claims should not get per-claim GUC entries"
+        );
+
+        let all_claims: serde_json::Value =
+            serde_json::from_str(verified.setting("request.jwt.claims").unwrap()).unwrap();
+        assert!(
+            all_claims["nullable"].is_null(),
+            "full claims blob should preserve explicit null claims"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
