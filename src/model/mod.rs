@@ -917,18 +917,22 @@ impl RlsCommand {
     }
 
     /// Whether this command scope applies to a given DML operation.
+    #[allow(dead_code)]
     pub fn applies_to_select(&self) -> bool {
         matches!(self, RlsCommand::All | RlsCommand::Select)
     }
 
+    #[allow(dead_code)]
     pub fn applies_to_insert(&self) -> bool {
         matches!(self, RlsCommand::All | RlsCommand::Insert)
     }
 
+    #[allow(dead_code)]
     pub fn applies_to_update(&self) -> bool {
         matches!(self, RlsCommand::All | RlsCommand::Update)
     }
 
+    #[allow(dead_code)]
     pub fn applies_to_delete(&self) -> bool {
         matches!(self, RlsCommand::All | RlsCommand::Delete)
     }

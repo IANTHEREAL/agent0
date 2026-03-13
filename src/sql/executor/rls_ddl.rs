@@ -338,10 +338,10 @@ fn parse_drop_policy_sql(sql: &str) -> Result<DropPolicyParsed> {
 // ── ALTER TABLE ... ROW LEVEL SECURITY parser ────────────────────────────
 
 enum AlterTableRlsAction {
-    EnableRls,
-    DisableRls,
-    ForceRls,
-    NoForceRls,
+    Enable,
+    Disable,
+    Force,
+    NoForce,
 }
 
 struct AlterTableRlsParsed {
@@ -365,19 +365,19 @@ fn parse_alter_table_rls_sql(sql: &str) -> Result<AlterTableRlsParsed> {
             .and_then(|r| consume_keyword(r, "LEVEL"))
             .and_then(|r| consume_keyword(r, "SECURITY"))
             .ok_or_else(|| anyhow!("Expected ROW LEVEL SECURITY after ENABLE"))?;
-        AlterTableRlsAction::EnableRls
+        AlterTableRlsAction::Enable
     } else if let Some(r) = consume_keyword(rest, "DISABLE") {
         let _r = consume_keyword(r, "ROW")
             .and_then(|r| consume_keyword(r, "LEVEL"))
             .and_then(|r| consume_keyword(r, "SECURITY"))
             .ok_or_else(|| anyhow!("Expected ROW LEVEL SECURITY after DISABLE"))?;
-        AlterTableRlsAction::DisableRls
+        AlterTableRlsAction::Disable
     } else if let Some(r) = consume_keyword(rest, "FORCE") {
         let _r = consume_keyword(r, "ROW")
             .and_then(|r| consume_keyword(r, "LEVEL"))
             .and_then(|r| consume_keyword(r, "SECURITY"))
             .ok_or_else(|| anyhow!("Expected ROW LEVEL SECURITY after FORCE"))?;
-        AlterTableRlsAction::ForceRls
+        AlterTableRlsAction::Force
     } else if let Some(r) = consume_keyword(rest, "NO") {
         let r = consume_keyword(r, "FORCE")
             .ok_or_else(|| anyhow!("Expected FORCE after NO"))?;
@@ -385,7 +385,7 @@ fn parse_alter_table_rls_sql(sql: &str) -> Result<AlterTableRlsParsed> {
             .and_then(|r| consume_keyword(r, "LEVEL"))
             .and_then(|r| consume_keyword(r, "SECURITY"))
             .ok_or_else(|| anyhow!("Expected ROW LEVEL SECURITY after NO FORCE"))?;
-        AlterTableRlsAction::NoForceRls
+        AlterTableRlsAction::NoForce
     } else {
         return Err(anyhow!(
             "Expected ENABLE, DISABLE, FORCE, or NO FORCE ROW LEVEL SECURITY"
@@ -576,10 +576,10 @@ impl Executor {
                     .ok_or_else(|| SqlError::RelationNotFound(table_resolved.full.clone()))?;
 
                 match parsed.action {
-                    AlterTableRlsAction::EnableRls => schema.rls_enabled = true,
-                    AlterTableRlsAction::DisableRls => schema.rls_enabled = false,
-                    AlterTableRlsAction::ForceRls => schema.rls_force = true,
-                    AlterTableRlsAction::NoForceRls => schema.rls_force = false,
+                    AlterTableRlsAction::Enable => schema.rls_enabled = true,
+                    AlterTableRlsAction::Disable => schema.rls_enabled = false,
+                    AlterTableRlsAction::Force => schema.rls_force = true,
+                    AlterTableRlsAction::NoForce => schema.rls_force = false,
                 }
 
                 schema.version += 1;
@@ -679,7 +679,7 @@ mod tests {
         let sql = "ALTER TABLE users ENABLE ROW LEVEL SECURITY";
         let p = parse_alter_table_rls_sql(sql).unwrap();
         assert_eq!(p.table, "users");
-        assert!(matches!(p.action, AlterTableRlsAction::EnableRls));
+        assert!(matches!(p.action, AlterTableRlsAction::Enable));
     }
 
     #[test]
@@ -687,21 +687,21 @@ mod tests {
         let sql = "ALTER TABLE users DISABLE ROW LEVEL SECURITY;";
         let p = parse_alter_table_rls_sql(sql).unwrap();
         assert_eq!(p.table, "users");
-        assert!(matches!(p.action, AlterTableRlsAction::DisableRls));
+        assert!(matches!(p.action, AlterTableRlsAction::Disable));
     }
 
     #[test]
     fn test_parse_alter_table_force_rls() {
         let sql = "ALTER TABLE users FORCE ROW LEVEL SECURITY";
         let p = parse_alter_table_rls_sql(sql).unwrap();
-        assert!(matches!(p.action, AlterTableRlsAction::ForceRls));
+        assert!(matches!(p.action, AlterTableRlsAction::Force));
     }
 
     #[test]
     fn test_parse_alter_table_no_force_rls() {
         let sql = "ALTER TABLE users NO FORCE ROW LEVEL SECURITY";
         let p = parse_alter_table_rls_sql(sql).unwrap();
-        assert!(matches!(p.action, AlterTableRlsAction::NoForceRls));
+        assert!(matches!(p.action, AlterTableRlsAction::NoForce));
     }
 
     #[test]

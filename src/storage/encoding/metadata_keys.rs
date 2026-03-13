@@ -638,6 +638,7 @@ pub fn encode_policy_prefix_v2(db_id: u64) -> Vec<u8> {
 }
 
 /// Prefix for all policies on a specific table: `d_{db_id}_sys_policy_{table_id}/`
+#[allow(dead_code)]
 pub fn encode_policy_table_prefix_v2(db_id: u64, table_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_POLICY_PREFIX);

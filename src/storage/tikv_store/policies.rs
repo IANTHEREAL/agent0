@@ -26,6 +26,7 @@ impl TikvStore {
     }
 
     /// List all RLS policies for a specific table.
+    #[allow(dead_code)]
     pub async fn list_policies_for_table(
         &self,
         txn: &mut Transaction,
@@ -86,6 +87,7 @@ impl TikvStore {
     }
 
     /// Drop all policies for a given table (used when dropping a table).
+    #[allow(dead_code)]
     pub async fn drop_policies_for_table(
         &self,
         txn: &mut Transaction,
