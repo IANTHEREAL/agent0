@@ -209,9 +209,13 @@ impl Db9ConnectTokenClaims {
             if value.is_null() {
                 continue;
             }
+            let setting_value = claim_value_to_setting_string(&value);
+            if claim_name.eq_ignore_ascii_case("sub") {
+                settings.insert("auth.uid".to_string(), setting_value.clone());
+            }
             settings.insert(
                 format!("request.jwt.claim.{}", claim_name.to_ascii_lowercase()),
-                claim_value_to_setting_string(&value),
+                setting_value,
             );
         }
 
@@ -834,6 +838,11 @@ JwIDAQAB
             verified.setting("request.jwt.claim.sub"),
             Some("auth0|admin-user"),
             "custom identity claims should be exposed"
+        );
+        assert_eq!(
+            verified.setting("auth.uid"),
+            Some("auth0|admin-user"),
+            "sub should be mirrored into auth.uid for auth helpers"
         );
         assert_eq!(
             verified.setting("request.jwt.claim.email_verified"),
