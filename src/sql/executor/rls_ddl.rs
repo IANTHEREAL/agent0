@@ -684,6 +684,21 @@ impl Executor {
                         )
                     })?;
 
+                // Validate command-specific constraints (PG-compatible)
+                if parsed.using_expr.is_some() && policy.command == RlsCommand::Insert {
+                    return Err(anyhow!("USING cannot be applied to INSERT policies"));
+                }
+                if parsed.with_check_expr.is_some() {
+                    match policy.command {
+                        RlsCommand::Select | RlsCommand::Delete => {
+                            return Err(anyhow!(
+                                "WITH CHECK cannot be applied to SELECT or DELETE policies"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Update fields that were specified
                 if let Some(roles) = parsed.roles {
                     policy.roles = if roles.is_empty() {
@@ -924,6 +939,14 @@ mod tests {
     fn test_parse_alter_policy_no_changes_fails() {
         let sql = "ALTER POLICY pol ON t";
         assert!(parse_alter_policy_sql(sql).is_err());
+    }
+
+    #[test]
+    fn test_parse_alter_policy_quoted_ident() {
+        let sql = r#"ALTER POLICY "my policy" ON "my table" USING (x > 0)"#;
+        let p = parse_alter_policy_sql(sql).unwrap();
+        assert_eq!(p.name, "my policy");
+        assert_eq!(p.table, "my table");
     }
 
     #[test]
