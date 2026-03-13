@@ -209,14 +209,14 @@ impl VirtualTable for PgClass {
                     Value::Int64(relchecks),
                     Value::Boolean(false), // relhasrules
                     Value::Boolean(relhastriggers),
-                    Value::Boolean(false),                   // relhassubclass
-                    Value::Boolean(schema.rls_enabled),      // relrowsecurity
-                    Value::Boolean(schema.rls_force),        // relforcerowsecurity
-                    text_val(RELREPLIDENT_DEFAULT), // relreplident
-                    Value::Boolean(false),          // relispartition
-                    null_val(),                     // relpartbound
-                    int_val(0),                     // reltablespace
-                    null_val(),                     // reloptions
+                    Value::Boolean(false),              // relhassubclass
+                    Value::Boolean(schema.rls_enabled), // relrowsecurity
+                    Value::Boolean(schema.rls_force),   // relforcerowsecurity
+                    text_val(RELREPLIDENT_DEFAULT),     // relreplident
+                    Value::Boolean(false),              // relispartition
+                    null_val(),                         // relpartbound
+                    int_val(0),                         // reltablespace
+                    null_val(),                         // reloptions
                 ]));
 
                 for idx in &schema.indexes {

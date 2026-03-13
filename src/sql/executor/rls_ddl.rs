@@ -69,7 +69,9 @@ fn consume_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     }
     let rest = &s[kw.len()..];
     // Must be followed by whitespace, '(', ';', or end of string
-    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '(' || c == ';') {
+    if rest.is_empty()
+        || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '(' || c == ';')
+    {
         Some(rest.trim_start())
     } else {
         None
@@ -152,20 +154,18 @@ struct CreatePolicyParsed {
 
 fn parse_create_policy_sql(sql: &str) -> Result<CreatePolicyParsed> {
     let sql = strip_leading_sql_comments(sql);
-    let rest = consume_keyword(sql, "CREATE")
-        .ok_or_else(|| anyhow!("Expected CREATE POLICY"))?;
-    let rest = consume_keyword(rest, "POLICY")
-        .ok_or_else(|| anyhow!("Expected CREATE POLICY"))?;
+    let rest = consume_keyword(sql, "CREATE").ok_or_else(|| anyhow!("Expected CREATE POLICY"))?;
+    let rest = consume_keyword(rest, "POLICY").ok_or_else(|| anyhow!("Expected CREATE POLICY"))?;
 
     // Policy name
-    let (name, rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected policy name after CREATE POLICY"))?;
+    let (name, rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected policy name after CREATE POLICY"))?;
 
     // ON table_name
-    let rest = consume_keyword(rest, "ON")
-        .ok_or_else(|| anyhow!("Expected ON after policy name"))?;
-    let (table, mut rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected table name after ON"))?;
+    let rest =
+        consume_keyword(rest, "ON").ok_or_else(|| anyhow!("Expected ON after policy name"))?;
+    let (table, mut rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected table name after ON"))?;
 
     // Optional clauses in any order
     let mut permissive = true; // default PERMISSIVE
@@ -229,8 +229,8 @@ fn parse_create_policy_sql(sql: &str) -> Result<CreatePolicyParsed> {
             // Parse role list (comma-separated)
             let mut r = r;
             loop {
-                let (role, r2) = consume_ident(r)
-                    .ok_or_else(|| anyhow!("Expected role name after TO"))?;
+                let (role, r2) =
+                    consume_ident(r).ok_or_else(|| anyhow!("Expected role name after TO"))?;
                 roles.push(role.to_lowercase());
                 r = r2;
                 if r.starts_with(',') {
@@ -251,8 +251,8 @@ fn parse_create_policy_sql(sql: &str) -> Result<CreatePolicyParsed> {
         }
 
         if let Some(r) = consume_keyword(rest, "WITH") {
-            let r = consume_keyword(r, "CHECK")
-                .ok_or_else(|| anyhow!("Expected CHECK after WITH"))?;
+            let r =
+                consume_keyword(r, "CHECK").ok_or_else(|| anyhow!("Expected CHECK after WITH"))?;
             let (expr, r2) = extract_paren_expr(r)?;
             with_check_expr = Some(expr);
             rest = r2;
@@ -307,26 +307,23 @@ struct DropPolicyParsed {
 
 fn parse_drop_policy_sql(sql: &str) -> Result<DropPolicyParsed> {
     let sql = strip_leading_sql_comments(sql);
-    let rest = consume_keyword(sql, "DROP")
-        .ok_or_else(|| anyhow!("Expected DROP POLICY"))?;
-    let rest = consume_keyword(rest, "POLICY")
-        .ok_or_else(|| anyhow!("Expected DROP POLICY"))?;
+    let rest = consume_keyword(sql, "DROP").ok_or_else(|| anyhow!("Expected DROP POLICY"))?;
+    let rest = consume_keyword(rest, "POLICY").ok_or_else(|| anyhow!("Expected DROP POLICY"))?;
 
     let (if_exists, rest) = if let Some(r) = consume_keyword(rest, "IF") {
-        let r = consume_keyword(r, "EXISTS")
-            .ok_or_else(|| anyhow!("Expected EXISTS after IF"))?;
+        let r = consume_keyword(r, "EXISTS").ok_or_else(|| anyhow!("Expected EXISTS after IF"))?;
         (true, r)
     } else {
         (false, rest)
     };
 
-    let (name, rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected policy name after DROP POLICY"))?;
+    let (name, rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected policy name after DROP POLICY"))?;
 
-    let rest = consume_keyword(rest, "ON")
-        .ok_or_else(|| anyhow!("Expected ON after policy name"))?;
-    let (table, _rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected table name after ON"))?;
+    let rest =
+        consume_keyword(rest, "ON").ok_or_else(|| anyhow!("Expected ON after policy name"))?;
+    let (table, _rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected table name after ON"))?;
 
     Ok(DropPolicyParsed {
         if_exists,
@@ -346,26 +343,24 @@ struct AlterPolicyParsed {
     name: String,
     table: String,
     roles: Option<Vec<String>>,
-    using_expr: Option<Option<String>>,      // Some(Some(expr)) = set, Some(None) impossible, None = unchanged
+    using_expr: Option<Option<String>>, // Some(Some(expr)) = set, Some(None) impossible, None = unchanged
     with_check_expr: Option<Option<String>>,
 }
 
 fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
     let sql = strip_leading_sql_comments(sql);
-    let rest = consume_keyword(sql, "ALTER")
-        .ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
-    let rest = consume_keyword(rest, "POLICY")
-        .ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
+    let rest = consume_keyword(sql, "ALTER").ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
+    let rest = consume_keyword(rest, "POLICY").ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
 
     // Policy name
-    let (name, rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected policy name after ALTER POLICY"))?;
+    let (name, rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected policy name after ALTER POLICY"))?;
 
     // ON table_name
-    let rest = consume_keyword(rest, "ON")
-        .ok_or_else(|| anyhow!("Expected ON after policy name"))?;
-    let (table, mut rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected table name after ON"))?;
+    let rest =
+        consume_keyword(rest, "ON").ok_or_else(|| anyhow!("Expected ON after policy name"))?;
+    let (table, mut rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected table name after ON"))?;
 
     let mut roles = None;
     let mut using_expr = None;
@@ -381,8 +376,8 @@ fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
             let mut r = r;
             let mut role_list = Vec::new();
             loop {
-                let (role, r2) = consume_ident(r)
-                    .ok_or_else(|| anyhow!("Expected role name after TO"))?;
+                let (role, r2) =
+                    consume_ident(r).ok_or_else(|| anyhow!("Expected role name after TO"))?;
                 role_list.push(role.to_lowercase());
                 r = r2;
                 if r.starts_with(',') {
@@ -404,8 +399,8 @@ fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
         }
 
         if let Some(r) = consume_keyword(rest, "WITH") {
-            let r = consume_keyword(r, "CHECK")
-                .ok_or_else(|| anyhow!("Expected CHECK after WITH"))?;
+            let r =
+                consume_keyword(r, "CHECK").ok_or_else(|| anyhow!("Expected CHECK after WITH"))?;
             let (expr, r2) = extract_paren_expr(r)?;
             with_check_expr = Some(Some(expr));
             rest = r2;
@@ -420,7 +415,9 @@ fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
     }
 
     if roles.is_none() && using_expr.is_none() && with_check_expr.is_none() {
-        return Err(anyhow!("ALTER POLICY must specify at least one of TO, USING, or WITH CHECK"));
+        return Err(anyhow!(
+            "ALTER POLICY must specify at least one of TO, USING, or WITH CHECK"
+        ));
     }
 
     Ok(AlterPolicyParsed {
@@ -448,13 +445,11 @@ struct AlterTableRlsParsed {
 
 fn parse_alter_table_rls_sql(sql: &str) -> Result<AlterTableRlsParsed> {
     let sql = strip_leading_sql_comments(sql);
-    let rest = consume_keyword(sql, "ALTER")
-        .ok_or_else(|| anyhow!("Expected ALTER TABLE"))?;
-    let rest = consume_keyword(rest, "TABLE")
-        .ok_or_else(|| anyhow!("Expected ALTER TABLE"))?;
+    let rest = consume_keyword(sql, "ALTER").ok_or_else(|| anyhow!("Expected ALTER TABLE"))?;
+    let rest = consume_keyword(rest, "TABLE").ok_or_else(|| anyhow!("Expected ALTER TABLE"))?;
 
-    let (table, rest) = consume_ident(rest)
-        .ok_or_else(|| anyhow!("Expected table name after ALTER TABLE"))?;
+    let (table, rest) =
+        consume_ident(rest).ok_or_else(|| anyhow!("Expected table name after ALTER TABLE"))?;
 
     // Parse the RLS action
     let action = if let Some(r) = consume_keyword(rest, "ENABLE") {
@@ -476,8 +471,7 @@ fn parse_alter_table_rls_sql(sql: &str) -> Result<AlterTableRlsParsed> {
             .ok_or_else(|| anyhow!("Expected ROW LEVEL SECURITY after FORCE"))?;
         AlterTableRlsAction::Force
     } else if let Some(r) = consume_keyword(rest, "NO") {
-        let r = consume_keyword(r, "FORCE")
-            .ok_or_else(|| anyhow!("Expected FORCE after NO"))?;
+        let r = consume_keyword(r, "FORCE").ok_or_else(|| anyhow!("Expected FORCE after NO"))?;
         let _r = consume_keyword(r, "ROW")
             .and_then(|r| consume_keyword(r, "LEVEL"))
             .and_then(|r| consume_keyword(r, "SECURITY"))
@@ -632,9 +626,7 @@ impl Executor {
                         .await?;
                 }
 
-                Ok(ExecuteResult::CommandComplete {
-                    tag: "DROP POLICY",
-                })
+                Ok(ExecuteResult::CommandComplete { tag: "DROP POLICY" })
             }
             .await
         )
@@ -925,10 +917,7 @@ mod tests {
         let sql = "ALTER POLICY pol ON t TO public USING (visible) WITH CHECK (x > 0)";
         let p = parse_alter_policy_sql(sql).unwrap();
         assert_eq!(p.roles.as_ref().unwrap(), &["public"]);
-        assert_eq!(
-            p.using_expr.as_ref().unwrap().as_deref(),
-            Some("visible")
-        );
+        assert_eq!(p.using_expr.as_ref().unwrap().as_deref(), Some("visible"));
         assert_eq!(
             p.with_check_expr.as_ref().unwrap().as_deref(),
             Some("x > 0")
