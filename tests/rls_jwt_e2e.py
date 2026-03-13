@@ -31,7 +31,8 @@ except ImportError:
     print("SKIP: psycopg2-binary and/or PyJWT not installed", file=sys.stderr)
     sys.exit(0)
 
-# Test RSA key pair (same as db9-server unit tests)
+# Test-only RSA key pair — NOT a real secret.
+# Same keys used in db9-server Rust unit tests (src/auth/db9_auth.rs).
 TEST_RSA_PRIVATE_KEY = """-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCvjVk3qWFad3bQ
 HsXmiT5i6g3SEDk+VwmfOgNEwBwW/xjpMog9K8RPe3b7S4XSDh8vmDOh20flJQs+
