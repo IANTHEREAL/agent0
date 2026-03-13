@@ -441,24 +441,21 @@ fn inject_rls_security_barrier_preserves_user_where() {
             // FROM should be a security barrier subquery.
             assert_eq!(select.from.len(), 1);
             match &select.from[0].kind {
-                AnalyzedTableRefKind::Subquery(subquery) => {
-                    match &subquery.body {
-                        AnalyzedQueryBody::Select(inner_select) => {
-                            let rls_pred = inner_select
-                                .where_clause
-                                .as_ref()
-                                .expect("barrier should have RLS WHERE");
-                            match &rls_pred.kind {
-                                TypedExprKind::Constant(Value::Boolean(true)) => {}
-                                other => panic!(
-                                    "expected RLS WHERE true inside barrier, got {:?}",
-                                    other
-                                ),
+                AnalyzedTableRefKind::Subquery(subquery) => match &subquery.body {
+                    AnalyzedQueryBody::Select(inner_select) => {
+                        let rls_pred = inner_select
+                            .where_clause
+                            .as_ref()
+                            .expect("barrier should have RLS WHERE");
+                        match &rls_pred.kind {
+                            TypedExprKind::Constant(Value::Boolean(true)) => {}
+                            other => {
+                                panic!("expected RLS WHERE true inside barrier, got {:?}", other)
                             }
                         }
-                        other => panic!("expected inner Select, got {:?}", other),
                     }
-                }
+                    other => panic!("expected inner Select, got {:?}", other),
+                },
                 other => panic!("expected Subquery in FROM, got {:?}", other),
             }
         }
