@@ -4,7 +4,7 @@
 //! [`StartupHandler`] trait implementation.
 
 use super::{AuthenticatedState, DynamicPgHandler};
-use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
+use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure, VerifiedJwtClaims};
 use crate::config;
 use crate::observability;
 use crate::sql::{Executor, Session};
@@ -35,8 +35,25 @@ pub(in crate::protocol::handler) struct AuthResult {
     pub bypass_rls: bool,
     /// PostgreSQL `rolconnlimit`. Negative means unlimited.
     pub connection_limit: i32,
+    pub trusted_jwt_claims: Option<VerifiedJwtClaims>,
     pub failure_reason: Option<String>,
 }
+
+fn apply_trusted_jwt_claims(
+    session: &mut Session,
+    claims: &VerifiedJwtClaims,
+) -> anyhow::Result<()> {
+    for (key, value) in claims.iter_settings() {
+        session.set_server_reserved_setting(key, value.clone())?;
+    }
+    Ok(())
+}
+
+type AuthDispatchOutcome = (
+    Option<crate::auth::User>,
+    Option<VerifiedJwtClaims>,
+    Option<String>,
+);
 
 impl DynamicPgHandler {
     pub(in crate::protocol::handler) async fn init_executor(
@@ -234,6 +251,7 @@ impl DynamicPgHandler {
                         is_superuser: false,
                         bypass_rls: false,
                         connection_limit: -1,
+                        trusted_jwt_claims: None,
                         failure_reason: None,
                     });
                 }
@@ -249,6 +267,7 @@ impl DynamicPgHandler {
                         is_superuser: false,
                         bypass_rls: false,
                         connection_limit: -1,
+                        trusted_jwt_claims: None,
                         failure_reason: None,
                     });
                 }
@@ -290,55 +309,51 @@ impl DynamicPgHandler {
             .context("Failed to begin transaction")?;
 
         let auth_mode = config::db9_auth_mode();
-        let auth_outcome: Result<(Option<crate::auth::User>, Option<String>), anyhow::Error> =
-            dispatch_db9_auth(
-                &auth_manager,
-                &mut txn,
-                auth_mode,
-                &ks_name,
-                username,
-                password,
-            )
-            .await
-            .and_then(|(user, failure)| {
-                if let Some(user) = user.as_ref() {
-                    if !user.can_login {
-                        return Err(
-                            crate::sql::error::SqlError::InvalidAuthorizationSpecification {
-                                message: format!(
-                                    "role \"{}\" is not permitted to log in",
-                                    username
-                                ),
-                            }
-                            .into(),
-                        );
-                    }
+        let auth_outcome: Result<AuthDispatchOutcome, anyhow::Error> = dispatch_db9_auth(
+            &auth_manager,
+            &mut txn,
+            auth_mode,
+            &ks_name,
+            username,
+            password,
+        )
+        .await
+        .and_then(|(user, trusted_jwt_claims, failure)| {
+            if let Some(user) = user.as_ref() {
+                if !user.can_login {
+                    return Err(
+                        crate::sql::error::SqlError::InvalidAuthorizationSpecification {
+                            message: format!("role \"{}\" is not permitted to log in", username),
+                        }
+                        .into(),
+                    );
                 }
+            }
 
-                let failure_reason = match failure {
-                    Some(Db9AuthDispatchFailure::TokenRequired) => {
-                        Some("Token authentication required (DB9_AUTH_MODE=token)".to_string())
-                    }
-                    Some(Db9AuthDispatchFailure::JwtFailed(err)) => Some(format!(
-                        "Token authentication failed for user \"{username}\": {err}"
-                    )),
-                    Some(Db9AuthDispatchFailure::JwtUserNotFound) => Some(format!(
-                        "Token authentication failed for user \"{username}\""
-                    )),
-                    Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => Some(format!(
-                        "Connect-key authentication failed for user \"{username}\": {err}"
-                    )),
-                    Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => Some(format!(
-                        "Connect-key authentication failed for user \"{username}\""
-                    )),
-                    None => None,
-                };
+            let failure_reason = match failure {
+                Some(Db9AuthDispatchFailure::TokenRequired) => {
+                    Some("Token authentication required (DB9_AUTH_MODE=token)".to_string())
+                }
+                Some(Db9AuthDispatchFailure::JwtFailed(err)) => Some(format!(
+                    "Token authentication failed for user \"{username}\": {err}"
+                )),
+                Some(Db9AuthDispatchFailure::JwtUserNotFound) => Some(format!(
+                    "Token authentication failed for user \"{username}\""
+                )),
+                Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => Some(format!(
+                    "Connect-key authentication failed for user \"{username}\": {err}"
+                )),
+                Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => Some(format!(
+                    "Connect-key authentication failed for user \"{username}\""
+                )),
+                None => None,
+            };
 
-                Ok((user, failure_reason))
-            });
+            Ok((user, trusted_jwt_claims, failure_reason))
+        });
 
         match auth_outcome {
-            Ok((Some(user), _)) => {
+            Ok((Some(user), trusted_jwt_claims, _)) => {
                 if let Err(e) = txn.rollback().await {
                     warn!("rollback failed after auth success: {}", e);
                 }
@@ -347,10 +362,11 @@ impl DynamicPgHandler {
                     is_superuser: user.is_superuser,
                     bypass_rls: user.bypass_rls,
                     connection_limit: user.connection_limit,
+                    trusted_jwt_claims,
                     failure_reason: None,
                 })
             }
-            Ok((None, failure_reason)) => {
+            Ok((None, _, failure_reason)) => {
                 if let Err(e) = txn.rollback().await {
                     warn!("rollback failed after auth rejection: {}", e);
                 }
@@ -359,6 +375,7 @@ impl DynamicPgHandler {
                     is_superuser: false,
                     bypass_rls: false,
                     connection_limit: -1,
+                    trusted_jwt_claims: None,
                     failure_reason,
                 })
             }
@@ -492,6 +509,7 @@ impl StartupHandler for DynamicPgHandler {
                         is_superuser,
                         bypass_rls,
                         connection_limit,
+                        trusted_jwt_claims,
                         failure_reason,
                     }) => {
                         if is_authenticated {
@@ -507,6 +525,20 @@ impl StartupHandler for DynamicPgHandler {
 
                             {
                                 let mut session = self.auth().session.lock().await;
+                                if let Some(claims) = trusted_jwt_claims.as_ref() {
+                                    apply_trusted_jwt_claims(&mut session, claims).map_err(
+                                        |e| {
+                                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                                "FATAL".to_owned(),
+                                                "XX000".to_owned(),
+                                                format!(
+                                                    "failed to initialize trusted JWT claims: {}",
+                                                    e
+                                                ),
+                                            )))
+                                        },
+                                    )?;
+                                }
                                 for (key, value) in startup_setting_overrides(client) {
                                     if let Err(e) = session.set_known_setting(&key, value) {
                                         warn!("Failed to apply startup option {}: {}", key, e);
@@ -646,6 +678,7 @@ mod tests {
             is_superuser: true,
             bypass_rls: false,
             connection_limit: -1,
+            trusted_jwt_claims: None,
             failure_reason: None,
         };
         assert!(r.is_authenticated);
@@ -659,6 +692,7 @@ mod tests {
             is_superuser: false,
             bypass_rls: false,
             connection_limit: -1,
+            trusted_jwt_claims: None,
             failure_reason: None,
         };
         assert!(!r.is_authenticated);
@@ -672,6 +706,7 @@ mod tests {
             is_superuser: false,
             bypass_rls: false,
             connection_limit: 5,
+            trusted_jwt_claims: None,
             failure_reason: None,
         };
         let AuthResult {

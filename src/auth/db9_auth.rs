@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::config;
 use anyhow::Result as AnyhowResult;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tikv_client::Transaction;
 use tokio::sync::Mutex;
 
@@ -43,6 +44,22 @@ pub(crate) enum Db9AuthDispatchFailure {
     ConnectKeyUserNotFound,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedJwtClaims {
+    settings: BTreeMap<String, String>,
+}
+
+impl VerifiedJwtClaims {
+    pub(crate) fn iter_settings(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.settings.iter()
+    }
+
+    #[cfg(test)]
+    fn setting(&self, name: &str) -> Option<&str> {
+        self.settings.get(name).map(String::as_str)
+    }
+}
+
 pub(crate) async fn dispatch_db9_auth(
     auth_manager: &AuthManager,
     txn: &mut Transaction,
@@ -50,10 +67,15 @@ pub(crate) async fn dispatch_db9_auth(
     keyspace: &str,
     username: &str,
     password: &str,
-) -> AnyhowResult<(Option<User>, Option<Db9AuthDispatchFailure>)> {
+) -> AnyhowResult<(
+    Option<User>,
+    Option<VerifiedJwtClaims>,
+    Option<Db9AuthDispatchFailure>,
+)> {
     match auth_mode {
         config::Db9AuthMode::Password => Ok((
             auth_manager.authenticate(txn, username, password).await?,
+            None,
             None,
         )),
         config::Db9AuthMode::Both | config::Db9AuthMode::Token => {
@@ -64,24 +86,29 @@ pub(crate) async fn dispatch_db9_auth(
             match material_kind {
                 Db9AuthMaterialKind::Password => {
                     if require_token {
-                        return Ok((None, Some(Db9AuthDispatchFailure::TokenRequired)));
+                        return Ok((None, None, Some(Db9AuthDispatchFailure::TokenRequired)));
                     }
 
                     Ok((
                         auth_manager.authenticate(txn, username, password).await?,
                         None,
+                        None,
                     ))
                 }
                 Db9AuthMaterialKind::Jwt => {
                     match verify_jwt_connect_token(token_material, keyspace, username).await {
-                        Ok(()) => {
+                        Ok(claims) => {
                             let user = auth_manager.get_user(txn, username).await?;
                             if user.is_none() {
-                                return Ok((None, Some(Db9AuthDispatchFailure::JwtUserNotFound)));
+                                return Ok((
+                                    None,
+                                    None,
+                                    Some(Db9AuthDispatchFailure::JwtUserNotFound),
+                                ));
                             }
-                            Ok((user, None))
+                            Ok((user, Some(claims), None))
                         }
-                        Err(err) => Ok((None, Some(Db9AuthDispatchFailure::JwtFailed(err)))),
+                        Err(err) => Ok((None, None, Some(Db9AuthDispatchFailure::JwtFailed(err)))),
                     }
                 }
                 Db9AuthMaterialKind::ConnectKey => {
@@ -91,12 +118,17 @@ pub(crate) async fn dispatch_db9_auth(
                             if user.is_none() {
                                 return Ok((
                                     None,
+                                    None,
                                     Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound),
                                 ));
                             }
-                            Ok((user, None))
+                            Ok((user, None, None))
                         }
-                        Err(err) => Ok((None, Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)))),
+                        Err(err) => Ok((
+                            None,
+                            None,
+                            Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)),
+                        )),
                     }
                 }
             }
@@ -149,12 +181,56 @@ pub(crate) enum Db9AuthError {
     InvalidJwtPublicKey { reason: String },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Db9ConnectTokenClaims {
     tid: String,
     usr: String,
     #[allow(dead_code)] // Required by JWT spec; validated by jsonwebtoken.
     exp: usize,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, JsonValue>,
+}
+
+impl Db9ConnectTokenClaims {
+    fn into_verified_jwt_claims(self) -> Result<VerifiedJwtClaims, Db9AuthError> {
+        let mut claims = self.extra;
+        claims.insert("exp".to_string(), serde_json::json!(self.exp));
+        claims.insert("tid".to_string(), JsonValue::from(self.tid));
+        claims.insert("usr".to_string(), JsonValue::from(self.usr));
+
+        let all_claims_json =
+            serde_json::to_string(&claims).map_err(|err| Db9AuthError::InvalidJwt {
+                reason: format!("validated JWT claims could not be serialized: {err}"),
+            })?;
+
+        let mut settings = BTreeMap::new();
+        settings.insert("request.jwt.claims".to_string(), all_claims_json);
+        for (claim_name, value) in claims {
+            let Some(setting_value) = claim_value_to_setting_string(&value) else {
+                continue;
+            };
+            if claim_name.eq_ignore_ascii_case("sub") {
+                settings.insert("auth.uid".to_string(), setting_value.clone());
+            }
+            settings.insert(
+                format!("request.jwt.claim.{}", claim_name.to_ascii_lowercase()),
+                setting_value,
+            );
+        }
+
+        Ok(VerifiedJwtClaims { settings })
+    }
+}
+
+fn claim_value_to_setting_string(value: &JsonValue) -> Option<String> {
+    Some(match value {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Bool(v) => v.to_string(),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Null => return None,
+        JsonValue::Array(_) | JsonValue::Object(_) => serde_json::to_string(value)
+            .expect("serde_json::Value from JWT claims must be serializable"),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,7 +383,7 @@ pub(crate) async fn verify_jwt_connect_token(
     token: &str,
     expected_keyspace: &str,
     expected_role: &str,
-) -> Result<(), Db9AuthError> {
+) -> Result<VerifiedJwtClaims, Db9AuthError> {
     let tenant_id =
         tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
     let key = jwt_decoding_key(token).await?;
@@ -346,7 +422,7 @@ pub(crate) async fn verify_jwt_connect_token(
         });
     }
 
-    Ok(())
+    claims.into_verified_jwt_claims()
 }
 
 pub(crate) async fn verify_connect_key(
@@ -707,6 +783,11 @@ JwIDAQAB
         aud: &'a str,
         tid: &'a str,
         usr: &'a str,
+        sub: &'a str,
+        email_verified: bool,
+        roles: Vec<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nullable: Option<&'a str>,
         exp: usize,
     }
 
@@ -724,6 +805,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin", "writer"],
+            nullable: None,
             exp,
         };
         let mut header = Header::new(Algorithm::RS256);
@@ -735,9 +820,45 @@ JwIDAQAB
         )
         .unwrap();
 
-        verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+        let verified = verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
             .await
             .unwrap();
+        assert_eq!(
+            verified.setting("request.jwt.claim.tid"),
+            Some("t1"),
+            "tenant claim should be exposed"
+        );
+        assert_eq!(
+            verified.setting("request.jwt.claim.usr"),
+            Some("admin"),
+            "role claim should be exposed"
+        );
+        assert_eq!(
+            verified.setting("request.jwt.claim.sub"),
+            Some("auth0|admin-user"),
+            "custom identity claims should be exposed"
+        );
+        assert_eq!(
+            verified.setting("auth.uid"),
+            Some("auth0|admin-user"),
+            "sub should be mirrored into auth.uid for auth helpers"
+        );
+        assert_eq!(
+            verified.setting("request.jwt.claim.email_verified"),
+            Some("true"),
+            "boolean claims should be stringified for current_setting()"
+        );
+        assert_eq!(
+            verified.setting("request.jwt.claim.roles"),
+            Some("[\"admin\",\"writer\"]"),
+            "array claims should be preserved as JSON strings"
+        );
+        let all_claims: serde_json::Value =
+            serde_json::from_str(verified.setting("request.jwt.claims").unwrap()).unwrap();
+        assert_eq!(all_claims["tid"], "t1");
+        assert_eq!(all_claims["usr"], "admin");
+        assert_eq!(all_claims["sub"], "auth0|admin-user");
+        assert_eq!(all_claims["roles"], serde_json::json!(["admin", "writer"]));
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -752,6 +873,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
         let token = encode(
@@ -765,6 +890,49 @@ JwIDAQAB
             .await
             .unwrap_err();
         assert!(matches!(err, Db9AuthError::RoleMismatch { .. }));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_skips_null_claim_settings_but_keeps_claims_blob() {
+        let _guard = test_lock().lock().unwrap();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
+        let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
+
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = serde_json::json!({
+            "iss": "https://issuer.example",
+            "aud": "db9-server",
+            "tid": "t1",
+            "usr": "admin",
+            "sub": "auth0|admin-user",
+            "nullable": null,
+            "exp": exp,
+        });
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let verified = verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verified.setting("request.jwt.claim.nullable"),
+            None,
+            "null claims should not get per-claim GUC entries"
+        );
+
+        let all_claims: serde_json::Value =
+            serde_json::from_str(verified.setting("request.jwt.claims").unwrap()).unwrap();
+        assert!(
+            all_claims["nullable"].is_null(),
+            "full claims blob should preserve explicit null claims"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -785,6 +953,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
         let token = encode(

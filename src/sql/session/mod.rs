@@ -786,6 +786,16 @@ impl Session {
         Ok(changed)
     }
 
+    pub(crate) fn set_server_reserved_setting(
+        &mut self,
+        name: &str,
+        value: String,
+    ) -> Result<bool> {
+        let changed = self.settings.set_server_reserved_setting(name, value)?;
+        self.sync_plan_cache_settings();
+        Ok(changed)
+    }
+
     pub(crate) fn set_local_setting(&mut self, name: &str, value: String) -> Result<bool> {
         let changed = self.settings.set_local_override(name, value)?;
         self.sync_plan_cache_settings();
