@@ -70,6 +70,8 @@ impl Executor {
 
         let store = self.store();
         let table_id = schema.table_id;
+        let rls_cache = self.rls_policy_cache().clone();
+        let schema_version = schema.version;
         maybe_build_rls_context(
             &schema,
             Some(role),
@@ -80,7 +82,14 @@ impl Executor {
             has_returning,
             has_on_conflict_update,
             &qctx,
-            || async { store.list_policies_for_table(txn, db_id, table_id).await },
+            || async {
+                if let Some(cached) = rls_cache.get(db_id, table_id, schema_version) {
+                    return Ok(cached);
+                }
+                let policies = store.list_policies_for_table(txn, db_id, table_id).await?;
+                rls_cache.put(db_id, table_id, schema_version, policies.clone());
+                Ok(policies)
+            },
         )
         .await
     }

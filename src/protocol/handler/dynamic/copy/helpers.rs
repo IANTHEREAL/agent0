@@ -344,6 +344,7 @@ mod tests {
         let keyspace = "copy_helpers_csv_blank_row".to_string();
         let observability = crate::observability::registry().tenant(&keyspace);
         let trigger_cache = Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let rls_policy_cache = Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
         let stats_cache = Arc::new(crate::sql::stats::TableStatsCache::new());
         Executor::new(
             store,
@@ -351,6 +352,7 @@ mod tests {
             observability,
             crate::pool::TenantMemoryAccountant::unlimited("copy_helpers".to_string()),
             trigger_cache,
+            rls_policy_cache,
             stats_cache,
         )
     }

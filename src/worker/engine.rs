@@ -858,6 +858,7 @@ impl WorkerEngine {
             observability::registry().tenant(&entry.keyspace),
             handle.memory_accountant(),
             handle.trigger_cache().clone(),
+            handle.rls_policy_cache().clone(),
             handle.stats_cache().clone(),
         );
 

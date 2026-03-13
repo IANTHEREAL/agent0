@@ -10,6 +10,7 @@
 //!
 //! Design: see db9-server#1810.
 
+pub(crate) mod cache;
 pub(crate) mod dml;
 pub(crate) mod inject;
 mod policy;

@@ -393,6 +393,7 @@ mod tests {
         let store = crate::storage::TikvStore::new_stub();
         let observability = crate::observability::registry().tenant(&keyspace);
         let trigger_cache = Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let rls_policy_cache = Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
         let stats_cache = Arc::new(crate::sql::stats::TableStatsCache::new());
         let executor = Executor::new(
             store.clone(),
@@ -400,6 +401,7 @@ mod tests {
             observability.clone(),
             crate::pool::TenantMemoryAccountant::unlimited("dispatch_test".to_string()),
             trigger_cache,
+            rls_policy_cache,
             stats_cache,
         );
         let user = if observability_user {

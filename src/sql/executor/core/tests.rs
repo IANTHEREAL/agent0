@@ -408,6 +408,7 @@ fn test_executor_getters_and_trigger_buffers() {
     let keyspace = "core_tests_executor_getters".to_string();
     let observability = crate::observability::registry().tenant(&keyspace);
     let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let rls_policy_cache = std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
     let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
     let executor = super::Executor::new(
         store.clone(),
@@ -415,6 +416,7 @@ fn test_executor_getters_and_trigger_buffers() {
         observability.clone(),
         crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
         trigger_cache.clone(),
+        rls_policy_cache,
         stats_cache.clone(),
     );
 
@@ -450,6 +452,7 @@ fn test_flush_trigger_activations_clears_buffers_even_without_system_store() {
     let keyspace = "core_tests_flush_trigger".to_string();
     let observability = crate::observability::registry().tenant(&keyspace);
     let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let rls_policy_cache = std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
     let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
     let executor = super::Executor::new(
         store,
@@ -457,6 +460,7 @@ fn test_flush_trigger_activations_clears_buffers_even_without_system_store() {
         observability,
         crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
         trigger_cache,
+        rls_policy_cache,
         stats_cache,
     );
 
@@ -511,6 +515,7 @@ fn test_flush_pending_hnsw_merges_clears_buffer_without_system_store() {
     let keyspace = "core_tests_hnsw_merge_flush".to_string();
     let observability = crate::observability::registry().tenant(&keyspace);
     let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let rls_policy_cache = std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
     let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
     let executor = super::Executor::new(
         store,
@@ -518,6 +523,7 @@ fn test_flush_pending_hnsw_merges_clears_buffer_without_system_store() {
         observability,
         crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
         trigger_cache,
+        rls_policy_cache,
         stats_cache,
     );
 
