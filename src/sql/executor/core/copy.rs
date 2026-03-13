@@ -121,6 +121,7 @@ impl Executor {
                     rls_cache.put(db_id, schema.table_id, schema_version, policies.clone());
                     Ok(policies)
                 },
+                Some((&rls_cache, db_id, schema_version)),
             )
             .await
             .map_err(CopyInsertBatchError::non_row)?;
@@ -619,6 +620,7 @@ impl Executor {
                 );
                 Ok(policies)
             },
+            Some((&rls_cache, db_id, schema_version)),
         )
         .await?;
 

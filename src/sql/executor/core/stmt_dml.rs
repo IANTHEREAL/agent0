@@ -90,6 +90,7 @@ impl Executor {
                 rls_cache.put(db_id, table_id, schema_version, policies.clone());
                 Ok(policies)
             },
+            Some((&rls_cache, db_id, schema_version)),
         )
         .await
     }

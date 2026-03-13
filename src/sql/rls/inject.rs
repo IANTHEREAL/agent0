@@ -3,6 +3,7 @@
 //! Walks the analyzed query's FROM clause to find base tables with RLS enabled,
 //! compiles applicable policies, combines them, and ANDs the result into WHERE.
 
+use super::cache::RlsPolicyCache;
 use super::policy::{combine_rls_predicates, compile_applicable_using_policies, should_bypass_rls};
 use crate::model::{DataType, RlsCommand, RlsPolicy, TableSchema};
 use crate::sql::analyzer::types::{
@@ -27,6 +28,9 @@ pub(crate) struct RlsContext<'a> {
     pub qctx: &'a QueryContext,
     /// Which DML command we're enforcing (SELECT, UPDATE, DELETE).
     pub command: RlsCommand,
+    /// Optional expression cache: (cache, db_id).
+    /// Schema version is per-table, looked up from table_schemas.
+    pub expr_cache: Option<(&'a RlsPolicyCache, u64)>,
 }
 
 /// Inject RLS predicates into an analyzed query.
@@ -125,6 +129,10 @@ fn collect_rls_predicates_from_table_ref(
                 ) {
                     let policies = ctx.policies_by_table.get(&schema.table_id);
                     if let Some(policies) = policies {
+                        let cache_args = ctx
+                            .expr_cache
+                            .map(|(cache, db_id)| (cache, db_id, schema.version));
+
                         // For UPDATE/DELETE, SELECT policies also apply to the read path
                         let mut all_compiled = compile_applicable_using_policies(
                             policies,
@@ -132,6 +140,7 @@ fn collect_rls_predicates_from_table_ref(
                             &ctx.command,
                             ctx.current_role,
                             ctx.qctx,
+                            cache_args,
                         )?;
 
                         // If command is UPDATE or DELETE, also include SELECT policies
@@ -142,6 +151,7 @@ fn collect_rls_predicates_from_table_ref(
                                 &RlsCommand::Select,
                                 ctx.current_role,
                                 ctx.qctx,
+                                cache_args,
                             )?;
                             all_compiled.extend(select_compiled);
                         }

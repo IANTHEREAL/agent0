@@ -176,6 +176,7 @@ impl Executor {
             policies_by_table: &policies_by_table,
             qctx: &qctx,
             command: RlsCommand::Select,
+            expr_cache: Some((self.rls_policy_cache(), db_id)),
         };
 
         inject_rls_predicates(analyzed, &rls_ctx)

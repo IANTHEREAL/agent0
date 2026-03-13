@@ -96,6 +96,7 @@ fn inject_no_rls_enabled_is_noop() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     let query = simple_select_query("public.users");
@@ -125,6 +126,7 @@ fn inject_superuser_bypass() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     let query = simple_select_query("public.users");
@@ -154,6 +156,7 @@ fn inject_owner_bypass_no_force() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     let query = simple_select_query("public.users");
@@ -187,6 +190,7 @@ fn inject_rls_no_policies_denies_all() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     let query = simple_select_query("public.users");
@@ -233,6 +237,7 @@ fn inject_rls_with_permissive_policy() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     let query = simple_select_query("public.users");
@@ -275,6 +280,7 @@ fn inject_rls_owner_with_force() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     let query = simple_select_query("public.users");
@@ -312,6 +318,7 @@ fn inject_rls_unmatched_table_no_injection() {
         policies_by_table: &policies,
         qctx: &qctx,
         command: RlsCommand::Select,
+        expr_cache: None,
     };
 
     // Query references "public.users" but schemas only have "public.orders".
