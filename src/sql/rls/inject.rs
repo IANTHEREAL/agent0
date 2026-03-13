@@ -100,10 +100,7 @@ fn inject_into_select(select: &mut AnalyzedSelect, ctx: &RlsContext<'_>) -> Resu
 /// For base tables: compile policies and wrap as `(SELECT * FROM t WHERE rls_pred)`.
 /// For joins: recurse into both sides.
 /// For subqueries: handled by top-level recursion in `inject_rls_predicates`.
-fn wrap_table_ref_with_rls(
-    table_ref: &mut AnalyzedTableRef,
-    ctx: &RlsContext<'_>,
-) -> Result<()> {
+fn wrap_table_ref_with_rls(table_ref: &mut AnalyzedTableRef, ctx: &RlsContext<'_>) -> Result<()> {
     match &mut table_ref.kind {
         AnalyzedTableRefKind::Table { name, .. } => {
             let table_name = name.clone();
@@ -232,12 +229,15 @@ fn build_security_barrier_subquery(
         .collect();
 
     // Output schema: (name, type, collation=None) for each column.
-    let output_schema: Vec<(String, DataType, Option<crate::sql::collation::ResolvedCollation>)> =
-        table_schema
-            .columns
-            .iter()
-            .map(|(name, dt, _nullable)| (name.clone(), dt.clone(), None))
-            .collect();
+    let output_schema: Vec<(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )> = table_schema
+        .columns
+        .iter()
+        .map(|(name, dt, _nullable)| (name.clone(), dt.clone(), None))
+        .collect();
 
     // Inner FROM: the original table reference (no alias — alias lives on the outer Subquery).
     let inner_table_ref = AnalyzedTableRef {
