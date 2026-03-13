@@ -42,6 +42,12 @@ pub fn execute_plpgsql_function<'a>(
     Box::pin(async move {
         let mut ctx = PlpgsqlContext::new();
 
+        // SECURITY DEFINER: set the role override so all statements inside
+        // this function execute with the owner's identity for RLS evaluation.
+        if func_def.security_definer {
+            ctx.security_definer_role = Some(func_def.owner.clone());
+        }
+
         for (i, arg_type) in func_def.arg_types.iter().enumerate() {
             let parts: Vec<&str> = arg_type.split_whitespace().collect();
             let (param_name, param_type) = if parts.len() >= 2 && !is_type_keyword(parts[0]) {
@@ -249,7 +255,7 @@ fn execute_statements<'a>(
                             search_path,
                             &stmt,
                             with_params.as_deref(),
-                            None,
+                            ctx.security_definer_role.as_deref(),
                             None,
                         )
                         .await?;
@@ -270,7 +276,7 @@ fn execute_statements<'a>(
                                 sequence_values,
                                 search_path,
                                 &stmt,
-                                None,
+                                ctx.security_definer_role.as_deref(),
                                 None,
                             )
                             .await?;
@@ -293,7 +299,7 @@ fn execute_statements<'a>(
                                     sequence_values,
                                     search_path,
                                     &stmt,
-                                    None,
+                                    ctx.security_definer_role.as_deref(),
                                     None,
                                 )
                                 .await?;
@@ -338,7 +344,7 @@ fn execute_statements<'a>(
                                     sequence_values,
                                     search_path,
                                     &stmt,
-                                    None,
+                                    ctx.security_definer_role.as_deref(),
                                     None,
                                 )
                                 .await?;
@@ -529,7 +535,7 @@ async fn evaluate_expression(
                     sequence_values,
                     search_path,
                     stmt,
-                    None,
+                    ctx.security_definer_role.as_deref(),
                     None,
                 )
                 .await?;
@@ -647,6 +653,24 @@ async fn execute_user_function_by_name(
     }
 
     if lang == "sql" {
+        // SECURITY DEFINER scalar SQL functions must go through the executor
+        // path so that the owner's role identity is applied for RLS evaluation.
+        // The fast path (execute_sql_function) uses eval_expr_with_sequences
+        // which doesn't support role context switching.
+        if func_def.security_definer {
+            if let Some(exec) = executor {
+                return execute_sql_function_via_executor(
+                    exec,
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &func_def,
+                    args,
+                )
+                .await;
+            }
+        }
         return execute_sql_function(
             store,
             txn,
@@ -725,6 +749,72 @@ async fn execute_sql_function(
                     .await;
                 }
             }
+        }
+    }
+
+    Ok(Value::Null)
+}
+
+/// Execute a scalar SQL function through the full executor pipeline so that
+/// SECURITY DEFINER role context switching is applied (RLS evaluation uses
+/// the function owner's identity).
+async fn execute_sql_function_via_executor(
+    executor: &Executor,
+    txn: &mut Transaction,
+    db_id: u64,
+    sequence_values: &mut SequenceSession,
+    search_path: &[String],
+    func_def: &FunctionDef,
+    args: Vec<Value>,
+) -> Result<Value> {
+    let mut param_map = HashMap::new();
+    for (i, arg_type) in func_def.arg_types.iter().enumerate() {
+        let parts: Vec<&str> = arg_type.split_whitespace().collect();
+        let param_name = if parts.len() >= 2 && !is_type_keyword(parts[0]) {
+            parts[0].to_lowercase()
+        } else {
+            format!("${}", i + 1)
+        };
+        if i < args.len() {
+            param_map.insert(param_name, args[i].clone());
+        }
+    }
+
+    let mut sql = func_def.body.clone();
+    for (name, value) in &param_map {
+        let value_str = match value {
+            Value::Null => "NULL".to_string(),
+            Value::Text(t) => quoting::quote_literal(t),
+            Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            v => v.to_string(),
+        };
+        sql = replace_identifier(&sql, name, &value_str);
+    }
+
+    let stmts = parse_sql(&sql)?;
+    let current_role = if func_def.security_definer {
+        Some(func_def.owner.as_str())
+    } else {
+        None
+    };
+
+    for stmt in &stmts {
+        let result = executor
+            .execute_statement_on_txn(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                stmt,
+                current_role,
+                None,
+            )
+            .await?;
+        if let ExecuteResult::Select { rows, .. } = result {
+            if let Some(first_row) = rows.first() {
+                return Ok(first_row.values.first().cloned().unwrap_or(Value::Null));
+            }
+            return Ok(Value::Null);
         }
     }
 

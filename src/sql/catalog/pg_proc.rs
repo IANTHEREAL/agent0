@@ -1,6 +1,6 @@
-use super::helpers::{int_col, int_val, owner_role_oid, schema_oid, text_col, text_val};
+use super::helpers::{bool_col, int_col, int_val, owner_role_oid, schema_oid, text_col, text_val};
 use super::{ScanContext, VirtualTable};
-use crate::model::{Row, TableSchema};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use crate::sql::types::registry::{global_registry, ReturnType};
 use anyhow::Result;
@@ -29,6 +29,7 @@ impl VirtualTable for PgProc {
                 int_col("proowner"),
                 int_col("prorettype"),
                 text_col("prokind"),
+                bool_col("prosecdef"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -80,6 +81,7 @@ impl VirtualTable for PgProc {
                 int_val(catalog_oids::pg_role_oid("postgres")),
                 int_val(crate::sql::pg_types::oid_and_typlen_for_datatype(prorettype).0),
                 text_val(prokind),
+                Value::Boolean(false),
             ]));
         }
 
@@ -101,6 +103,7 @@ impl VirtualTable for PgProc {
                         int_val(catalog_oids::pg_role_oid("postgres")),
                         int_val(25),
                         text_val("f"),
+                        Value::Boolean(false),
                     ]));
                 }
             }
@@ -123,6 +126,7 @@ impl VirtualTable for PgProc {
                         int_val(catalog_oids::pg_role_oid("postgres")),
                         int_val(prorettype),
                         text_val("f"),
+                        Value::Boolean(false),
                     ]));
                 }
             }
@@ -168,6 +172,7 @@ impl VirtualTable for PgProc {
                 int_val(owner_role_oid(Some(&f.owner), ctx.current_user)),
                 int_val(prorettype),
                 text_val("f"),
+                Value::Boolean(f.security_definer),
             ]));
         }
 

@@ -1,0 +1,17 @@
+-- Q1: caller sees only their own row via RLS
+caller-secret-1
+
+-- Q2: owner sees their own rows via RLS policy
+owner-secret-1
+owner-secret-2
+
+-- Q3: SECURITY DEFINER — caller sees owner's rows (RLS evaluates as function owner)
+owner-secret-1
+owner-secret-2
+
+-- Q4: SECURITY INVOKER — caller sees only their own rows
+caller-secret-1
+
+-- Q5: pg_proc.prosecdef reflects the attribute
+invoker_read_all
+secdef_read_all

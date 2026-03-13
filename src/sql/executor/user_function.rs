@@ -156,8 +156,24 @@ async fn execute_sql_table_function(
         )
     })?;
 
+    // SECURITY DEFINER: execute using the function owner's role identity so that
+    // RLS policies are evaluated against the definer, not the caller.
+    let current_role_override = if func_def.security_definer {
+        Some(func_def.owner.as_str())
+    } else {
+        None
+    };
+
     let result = executor
-        .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt, None, None)
+        .execute_statement_on_txn(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            stmt,
+            current_role_override,
+            None,
+        )
         .await?;
 
     match result {

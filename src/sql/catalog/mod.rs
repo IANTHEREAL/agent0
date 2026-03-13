@@ -433,7 +433,7 @@ mod tests {
         let t = catalog.get("pg_proc").unwrap();
         assert_eq!(t.name(), "pg_proc");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 6);
+        assert_eq!(t.schema().columns.len(), 7);
     }
 
     #[test]

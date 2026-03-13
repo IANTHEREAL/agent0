@@ -880,6 +880,11 @@ pub struct FunctionDef {
     /// Owner role/user name for this function (metadata only).
     #[serde(default = "default_owner")]
     pub owner: String,
+    /// Whether this function runs with the privileges of the definer (owner)
+    /// rather than the invoker (caller). Corresponds to PostgreSQL's
+    /// `SECURITY DEFINER` attribute (pg_proc.prosecdef).
+    #[serde(default)]
+    pub security_definer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -981,6 +986,10 @@ pub struct ViewDef {
     /// Fully-qualified names of relations this view depends on.
     /// Resolved at CREATE time using the active search_path.
     pub deps: Vec<String>,
+    /// Whether this view uses SECURITY DEFINER semantics: RLS policies
+    /// are evaluated using the view owner's identity, not the caller's.
+    #[serde(default)]
+    pub security_definer: bool,
 }
 
 impl ViewDef {

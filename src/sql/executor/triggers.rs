@@ -284,6 +284,12 @@ fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool
     let body_tail = after_returns[as_pos + "AS".len()..].trim_start();
     let body = parse_sql_string_or_dollar_literal(body_tail)?;
 
+    // Check for SECURITY DEFINER outside of quoted/dollar-quoted strings.
+    // Uses find_keyword_outside_quotes_and_dollar to avoid false positives
+    // from occurrences inside function body text.
+    let security_definer =
+        find_keyword_outside_quotes_and_dollar(after_returns, "SECURITY DEFINER").is_some();
+
     let def = FunctionDef {
         oid: 0,
         schema: String::new(),
@@ -293,6 +299,7 @@ fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool
         language,
         body,
         owner: "postgres".to_string(),
+        security_definer,
     };
 
     Ok((name, def, or_replace))
@@ -563,6 +570,7 @@ impl Executor {
             language: "plpgsql".to_string(),
             body,
             owner: session.current_user().unwrap_or("postgres").to_string(),
+            security_definer: false,
         };
 
         autocommit_ddl!(
@@ -601,6 +609,9 @@ impl Executor {
         if def.language.to_lowercase() == "plpgsql" {
             plpgsql::validate_plpgsql_body(&def.body)?;
         }
+
+        // Set the function owner to the current session user.
+        def.owner = session.current_user().unwrap_or("postgres").to_string();
 
         autocommit_ddl!(
             session,

@@ -205,9 +205,14 @@ pub fn function_to_ddl(def: &crate::model::FunctionDef) -> String {
     let language = def.language.trim();
     let body = def.body.trim();
 
+    let sec = if def.security_definer {
+        " SECURITY DEFINER"
+    } else {
+        ""
+    };
     format!(
-        "CREATE OR REPLACE FUNCTION {}({}) RETURNS {} AS $$\n{}\n$$ LANGUAGE {};",
-        full_name, args, return_type, body, language
+        "CREATE OR REPLACE FUNCTION {}({}) RETURNS {} AS $$\n{}\n$$ LANGUAGE {}{};",
+        full_name, args, return_type, body, language, sec
     )
 }
 
@@ -695,6 +700,7 @@ mod tests {
             language: "plpgsql".to_string(),
             body: "BEGIN RETURN NEW; END;".to_string(),
             owner: "postgres".to_string(),
+            security_definer: false,
         };
         let ddl = function_to_ddl(&def);
         assert!(ddl.starts_with("CREATE OR REPLACE FUNCTION public.audit_fn() RETURNS trigger"));

@@ -28,6 +28,9 @@ pub struct PlpgsqlContext {
     pub variables: HashMap<String, Value>,
     pub variable_types: HashMap<String, crate::model::DataType>,
     pub notices: Vec<String>,
+    /// When set, all statements within this function execute using the given
+    /// role identity (SECURITY DEFINER). `None` means SECURITY INVOKER (default).
+    pub security_definer_role: Option<String>,
 }
 
 impl PlpgsqlContext {
@@ -36,6 +39,7 @@ impl PlpgsqlContext {
             variables: HashMap::new(),
             variable_types: HashMap::new(),
             notices: Vec::new(),
+            security_definer_role: None,
         }
     }
 

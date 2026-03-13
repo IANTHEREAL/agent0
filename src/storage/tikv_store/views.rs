@@ -45,6 +45,7 @@ impl TikvStore {
             owner: owner.to_string(),
             query: query.to_string(),
             deps,
+            security_definer: false,
         };
         let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
         txn_put(txn, key, data).await?;
