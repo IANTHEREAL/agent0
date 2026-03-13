@@ -619,6 +619,26 @@ fn parse_startup_options_supports_backslash_escaping() {
 }
 
 #[test]
+fn startup_setting_overrides_filters_server_reserved_namespaces() {
+    let mut client = TestClient::new();
+    client.metadata_mut().insert(
+        "options".to_string(),
+        "-c timezone=UTC -c request.jwt.claim.sub=alice -c AUTH.UID=123".to_string(),
+    );
+    client
+        .metadata_mut()
+        .insert("application_name".to_string(), "db9-test".to_string());
+
+    assert_eq!(
+        startup_setting_overrides(&client),
+        vec![
+            ("timezone".to_string(), "UTC".to_string()),
+            ("application_name".to_string(), "db9-test".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn test_parameter_status_includes_common_keys() {
     let mut client = TestClient::new();
     client

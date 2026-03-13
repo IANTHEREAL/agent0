@@ -13,13 +13,8 @@ impl ServerParameterProvider for PgServerParameterProvider {
         // `current_setting()` readbacks by deriving values from the same
         // `SessionSettings` defaults + startup overrides.
         let mut settings = SessionSettings::new();
-        if let Some(options) = client.metadata().get("options") {
-            for (key, value) in super::parse_startup_options(options) {
-                let _ = settings.set_known_setting(&key.to_ascii_lowercase(), value);
-            }
-        }
-        if let Some(app_name) = client.metadata().get("application_name") {
-            let _ = settings.set_known_setting("application_name", app_name.clone());
+        for (key, value) in super::startup_setting_overrides(client) {
+            let _ = settings.set_known_setting(&key, value);
         }
 
         let session_authorization = client
