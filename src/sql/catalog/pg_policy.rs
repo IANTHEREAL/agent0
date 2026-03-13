@@ -1,4 +1,4 @@
-use super::helpers::{bool_col, int_array_col, int_col, int_val, text_col, text_val};
+use super::helpers::{bool_col, int_col, int_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
@@ -28,7 +28,7 @@ impl VirtualTable for PgPolicy {
                 int_col("polrelid"),
                 text_col("polcmd"),
                 bool_col("polpermissive"),
-                int_array_col("polroles"),
+                text_col("polroles"),
                 text_col("polqual"),
                 text_col("polwithcheck"),
             ],
