@@ -947,6 +947,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                         output_schema,
                                         param_data_types: param_types,
                                         table_versions,
+                                        rls_sensitive: false,
                                     };
                                 }
                                 PreparedAnalysis::Dml {
@@ -970,6 +971,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                         output_schema,
                                         param_data_types: param_types,
                                         table_versions,
+                                        rls_sensitive: false,
                                     };
                                 }
                                 PreparedAnalysis::Utility => {
@@ -1258,6 +1260,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                     params,
                     &prepared.param_data_types,
                     &prepared.table_versions,
+                    prepared.rls_sensitive,
                 ))
             }
         };

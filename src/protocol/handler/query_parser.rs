@@ -52,6 +52,7 @@ impl pgwire::api::stmt::QueryParser for Db9QueryParser {
                 output_schema: vec![],
                 param_data_types: vec![],
                 table_versions: vec![],
+                rls_sensitive: false,
             });
         }
 
@@ -64,6 +65,7 @@ impl pgwire::api::stmt::QueryParser for Db9QueryParser {
                     output_schema: vec![],
                     param_data_types: vec![],
                     table_versions: vec![],
+                    rls_sensitive: false,
                 });
             }
             Err(e) => e,
@@ -84,6 +86,7 @@ impl pgwire::api::stmt::QueryParser for Db9QueryParser {
                 output_schema: vec![],
                 param_data_types: vec![],
                 table_versions: vec![],
+                rls_sensitive: false,
             });
         }
 
