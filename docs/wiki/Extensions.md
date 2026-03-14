@@ -424,7 +424,7 @@ This metadata drives `pg_extension` catalog visibility and function resolution.
 
 The fs9 table function operates in three modes controlled by `Fs9Mode`:
 
-**Directory mode** -- Lists directory contents (optionally recursive up to 10 levels, max 100,000 entries). Output schema: `path`, `type`, `size`, `mode`, `mtime`. Symlink directories are not followed during recursive traversal to prevent loops.
+**Directory mode** -- Lists directory contents (optionally recursive up to 20 levels, max 50,000 entries). Output schema: `path`, `type`, `size`, `mode`, `mtime`. Symlink directories are not followed during recursive traversal to prevent loops.
 
 **File mode** -- Reads a single file and decodes it based on detected format. If the path points to a directory, falls back to directory listing. Output schema depends on format:
 - Text: `_line_number`, `line`, `_path`
@@ -571,8 +571,8 @@ sequenceDiagram
 | Max file size | 10 MB (`MAX_BYTES_PER_FILE`) | `read_file`, `write_file`, WebSocket |
 | Max files per glob | 10,000 (`MAX_FILES_PER_GLOB`) | `expand_glob` |
 | Max total bytes (glob) | 100 MB (`MAX_TOTAL_BYTES`) | `start_glob_stream`, `execute_table_function` |
-| Max recursive depth (directory) | 10 levels | `list_directory_entries` |
-| Max directory entries | 100,000 | `list_directory_entries` |
+| Max recursive depth (directory) | 20 levels | `list_directory_entries` |
+| Max directory entries | 50,000 | `list_directory_entries` |
 | Page size | 16 KB (`PAGE_SIZE`) | `EmbeddedPageFs` |
 | Root inode ID | 1 (`ROOT_INODE`) | `EmbeddedPageFs` |
 

@@ -288,6 +288,49 @@ def test_readdir_exact(ws, path, expected_paths):
     print(f"  ✓ readdir exact OK — {path} ({len(actual_paths)} entries)")
     return resp["data"]["entries"]
 
+def test_readdir_recursive_exact(
+    ws,
+    path,
+    expected_paths,
+    max_depth=None,
+    max_entries=None,
+    expected_truncated=False,
+    expected_dirs_scanned=None,
+):
+    """Test recursive readdir and require an exact descendant-path set."""
+    rid = next_id()
+    payload = {"id": rid, "op": "readdir_recursive", "path": path}
+    if max_depth is not None:
+        payload["max_depth"] = max_depth
+    if max_entries is not None:
+        payload["max_entries"] = max_entries
+    resp = send_json(ws, payload)
+    assert_ok(resp, f"readdir_recursive {path}")
+    data = resp["data"]
+    actual_paths = sorted(entry["path"] for entry in data["entries"])
+    expected_paths = sorted(expected_paths)
+    if actual_paths != expected_paths:
+        missing = sorted(set(expected_paths) - set(actual_paths))
+        extra = sorted(set(actual_paths) - set(expected_paths))
+        raise AssertionError(
+            f"readdir_recursive exact mismatch for {path}: actual={actual_paths} "
+            f"expected={expected_paths} missing={missing} extra={extra}"
+        )
+    assert data["truncated"] is expected_truncated, (
+        f"readdir_recursive truncated mismatch for {path}: "
+        f"{data['truncated']} != {expected_truncated}"
+    )
+    if expected_dirs_scanned is not None:
+        assert data["total_dirs_scanned"] == expected_dirs_scanned, (
+            f"readdir_recursive dirs_scanned mismatch for {path}: "
+            f"{data['total_dirs_scanned']} != {expected_dirs_scanned}"
+        )
+    print(
+        f"  ✓ readdir recursive OK — {path} "
+        f"({len(actual_paths)} entries, dirs_scanned={data['total_dirs_scanned']})"
+    )
+    return data["entries"]
+
 def test_pwrite(ws, path, offset, content_bytes):
     """Test pwrite (offset write)."""
     rid = next_id()
@@ -1057,6 +1100,21 @@ def main():
             ws,
             batch_dir,
             [path for path, _ in batch_files],
+        )),
+        ("readdir_recursive_exact", lambda: test_readdir_recursive_exact(
+            ws,
+            test_dir,
+            [
+                f"{test_dir}/a",
+                f"{test_dir}/a/b",
+                f"{test_dir}/a/b/c",
+                batch_dir,
+                test_file,
+                test_file2,
+                *[path for path, _ in batch_files],
+            ],
+            max_depth=8,
+            expected_dirs_scanned=5,
         )),
 
         # Unlink

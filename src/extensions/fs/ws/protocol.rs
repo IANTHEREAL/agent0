@@ -84,6 +84,15 @@ pub(crate) enum WsRequest {
         id: String,
         path: String,
     },
+    #[serde(rename = "readdir_recursive")]
+    ReaddirRecursive {
+        id: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_depth: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_entries: Option<usize>,
+    },
     Mkdir {
         id: String,
         path: String,
@@ -226,6 +235,7 @@ impl WsRequest {
             Self::Auth { id, .. }
             | Self::Stat { id, .. }
             | Self::Readdir { id, .. }
+            | Self::ReaddirRecursive { id, .. }
             | Self::Mkdir { id, .. }
             | Self::Unlink { id, .. }
             | Self::Rm { id, .. }
@@ -302,6 +312,13 @@ pub(crate) struct FileInfoResponse {
     pub storage: Option<FsStorage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sealed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReaddirRecursiveResponse {
+    pub entries: Vec<FileInfoResponse>,
+    pub truncated: bool,
+    pub total_dirs_scanned: usize,
 }
 
 fn format_mtime_rfc3339(epoch_seconds: u64) -> String {
@@ -537,6 +554,33 @@ mod tests {
                 assert_eq!(path, "/data/file.csv");
             }
             _ => panic!("expected stat request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_readdir_recursive() {
+        let payload = r#"{
+            "id":"2b",
+            "op":"readdir_recursive",
+            "path":"/data",
+            "max_depth":12,
+            "max_entries":4096
+        }"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("readdir_recursive request should parse");
+        match req {
+            WsRequest::ReaddirRecursive {
+                id,
+                path,
+                max_depth,
+                max_entries,
+            } => {
+                assert_eq!(id, "2b");
+                assert_eq!(path, "/data");
+                assert_eq!(max_depth, Some(12));
+                assert_eq!(max_entries, Some(4096));
+            }
+            _ => panic!("expected readdir_recursive request"),
         }
     }
 
@@ -859,7 +903,10 @@ mod tests {
         ));
         let (code, msg) = map_fs_error(&err);
         assert_eq!(code, WsErrorCode::Efbig);
-        assert_eq!(msg, "batch_inline_read raw payload exceeds limit 1024 bytes");
+        assert_eq!(
+            msg,
+            "batch_inline_read raw payload exceeds limit 1024 bytes"
+        );
     }
 
     #[test]

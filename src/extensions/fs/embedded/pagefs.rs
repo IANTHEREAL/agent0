@@ -1,7 +1,8 @@
 use crate::extensions::fs::backend::{
     batch_inline_read_entry_too_large_error, batch_inline_read_payload_too_large_error,
     FsBatchWriteEntry, FsBatchWriteFile, FsCreateUpload, FsMultipartCompletedPart,
-    FsPreparedDownload, FsPresignedRequest, FsStorage, FsWriteStream, FsWriteStreamOptions,
+    FsPreparedDownload, FsPresignedRequest, FsRecursiveReaddirOptions, FsStorage, FsWriteStream,
+    FsWriteStreamOptions,
 };
 use crate::extensions::fs::channel_reader::ChunkReceiverReader;
 use crate::extensions::fs::config::fs9_config;
@@ -22,7 +23,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock as SyncOnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -146,6 +147,19 @@ struct PendingBatchStat {
     request_idx: usize,
     parent_inode: u64,
     next_part_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPath {
+    inode_id: u64,
+    inode: Inode,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PageFsRecursiveReaddirResult {
+    pub(crate) entries: Vec<(String, Inode)>,
+    pub(crate) truncated: bool,
+    pub(crate) total_dirs_scanned: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1344,8 +1358,9 @@ impl EmbeddedPageFs {
                 .bundle_offset
                 .checked_sub(window.start_offset)
                 .ok_or_else(|| anyhow!(EmbeddedFsError::internal("pack read window underflow")))?;
-            let start = usize::try_from(relative_offset)
-                .map_err(|_| anyhow!(EmbeddedFsError::internal("pack read window exceeds usize")))?;
+            let start = usize::try_from(relative_offset).map_err(|_| {
+                anyhow!(EmbeddedFsError::internal("pack read window exceeds usize"))
+            })?;
             let end = start
                 .checked_add(entry.len)
                 .ok_or_else(|| anyhow!(EmbeddedFsError::internal("pack read slice overflow")))?;
@@ -1391,7 +1406,13 @@ impl EmbeddedPageFs {
         };
 
         let window_bytes = match self
-            .fetch_pack_range_with_s3(s3, manifest, window.start_offset, window_len, window_len_u64)
+            .fetch_pack_range_with_s3(
+                s3,
+                manifest,
+                window.start_offset,
+                window_len,
+                window_len_u64,
+            )
             .await
         {
             Ok(bytes) => bytes,
@@ -1936,6 +1957,64 @@ impl EmbeddedPageFs {
         result
     }
 
+    pub(crate) async fn batch_readdir(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<Result<Vec<(String, Inode)>>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut txn = self.begin_read().await?;
+        let resolved = {
+            let mut store = TxnBatchStatStore { txn: &mut txn };
+            resolve_paths_with_ids_batched(&mut store, paths).await
+        };
+
+        let mut raw_entries_by_index: Vec<Option<Result<Vec<(String, Inode)>>>> =
+            std::iter::repeat_with(|| None).take(paths.len()).collect();
+        let mut dir_request_order = Vec::new();
+        let mut dir_inode_ids = Vec::new();
+
+        for (idx, resolved_result) in resolved.into_iter().enumerate() {
+            let path = &paths[idx];
+            let resolved = match resolved_result {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    raw_entries_by_index[idx] = Some(Err(err));
+                    continue;
+                }
+            };
+
+            if !resolved.inode.is_directory() {
+                raw_entries_by_index[idx] =
+                    Some(Err(anyhow!(EmbeddedFsError::not_directory(path))));
+                continue;
+            }
+
+            dir_request_order.push(idx);
+            dir_inode_ids.push(resolved.inode_id);
+        }
+
+        let hydrated_dirs = load_directory_entries_batch(&mut txn, &dir_inode_ids).await?;
+        if hydrated_dirs.len() != dir_request_order.len() {
+            return Err(anyhow!(EmbeddedFsError::internal(&format!(
+                "batch_readdir hydrated {} directories for {} directory requests",
+                hydrated_dirs.len(),
+                dir_request_order.len()
+            ))));
+        }
+
+        for (idx, dir_entries) in dir_request_order.into_iter().zip(hydrated_dirs) {
+            raw_entries_by_index[idx] = Some(Ok(dir_entries));
+        }
+
+        Ok(raw_entries_by_index
+            .into_iter()
+            .map(|entry| entry.expect("batch_readdir must produce an entry for every input path"))
+            .collect())
+    }
+
     pub(crate) async fn batch_inline_read(
         &self,
         paths: &[String],
@@ -2119,12 +2198,8 @@ impl EmbeddedPageFs {
                         let s3 = s3.clone();
                         external_tasks.spawn(async move {
                             let _permit = permit;
-                            fs.read_pack_window_entries_with_s3(
-                                s3.as_ref(),
-                                &manifest,
-                                window,
-                            )
-                            .await
+                            fs.read_pack_window_entries_with_s3(s3.as_ref(), &manifest, window)
+                                .await
                         });
                     }
                     Some(Err(err)) => {
@@ -2190,21 +2265,124 @@ impl EmbeddedPageFs {
             return Err(anyhow!(EmbeddedFsError::not_directory(path)));
         }
 
-        let entries = list_dir(&mut txn, inode_id).await?;
-        let child_inode_ids: Vec<u64> = entries
-            .iter()
-            .map(|(_, child_inode_id)| *child_inode_id)
-            .collect();
-        let child_inodes = load_inodes_batch(&mut txn, &child_inode_ids).await?;
-        let mut out = Vec::with_capacity(entries.len());
-        for ((name, _), child_inode) in entries.into_iter().zip(child_inodes.into_iter()) {
-            if let Some(child_inode) = child_inode {
-                out.push((name, child_inode));
+        let mut entries = load_directory_entries_batch(&mut txn, &[inode_id]).await?;
+        Ok(entries.pop().unwrap_or_default())
+    }
+
+    pub(crate) async fn readdir_recursive(
+        &self,
+        path: &str,
+        opts: FsRecursiveReaddirOptions,
+    ) -> Result<PageFsRecursiveReaddirResult> {
+        if opts.max_entries == 0 {
+            return Ok(PageFsRecursiveReaddirResult {
+                entries: Vec::new(),
+                truncated: false,
+                total_dirs_scanned: 0,
+            });
+        }
+
+        let normalized = normalize_path(path);
+        let mut txn = self.begin_read().await?;
+        let (root_inode_id, root_inode) = resolve_path(&mut txn, &normalized).await?;
+        if !root_inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::not_directory(path)));
+        }
+
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        let mut total_dirs_scanned = 0usize;
+        let mut visited_dirs = HashSet::from([root_inode_id]);
+        let mut frontier = VecDeque::from([(normalized, root_inode_id, 0usize)]);
+
+        while !frontier.is_empty() {
+            if entries.len() >= opts.max_entries {
+                truncated = true;
+                break;
+            }
+
+            let current_depth = frontier
+                .front()
+                .map(|(_, _, depth)| *depth)
+                .expect("frontier must be non-empty while traversing");
+            let mut current_level = Vec::new();
+            while matches!(frontier.front(), Some((_, _, depth)) if *depth == current_depth) {
+                current_level.push(
+                    frontier
+                        .pop_front()
+                        .expect("frontier entry must exist while draining current level"),
+                );
+            }
+
+            let mut level_dirs = Vec::with_capacity(current_level.len());
+            let mut planned_entries = 0usize;
+            for (dir_path, dir_inode_id, _) in &current_level {
+                let remaining = opts
+                    .max_entries
+                    .saturating_sub(entries.len().saturating_add(planned_entries));
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+
+                let (dir_entries, dir_truncated) = load_directory_entries_limited(
+                    &mut txn,
+                    dir_path,
+                    *dir_inode_id,
+                    remaining,
+                    opts.exclude_set.as_deref(),
+                )
+                .await?;
+                total_dirs_scanned = total_dirs_scanned.saturating_add(1);
+                planned_entries = planned_entries.saturating_add(dir_entries.len());
+                level_dirs.push(dir_entries);
+
+                if dir_truncated {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            for ((dir_path, _, dir_depth), dir_entries) in current_level.into_iter().zip(level_dirs)
+            {
+                for (name, child_inode) in dir_entries {
+                    let child_path = if dir_path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{dir_path}/{name}")
+                    };
+
+                    if entries.len() >= opts.max_entries {
+                        truncated = true;
+                        break;
+                    }
+
+                    if child_inode.is_directory()
+                        && dir_depth < opts.max_depth
+                        && visited_dirs.insert(child_inode.id)
+                    {
+                        frontier.push_back((child_path.clone(), child_inode.id, dir_depth + 1));
+                    }
+
+                    entries.push((child_path, child_inode));
+                }
+
+                if truncated {
+                    break;
+                }
+            }
+
+            if truncated {
+                break;
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
 
-        Ok(out)
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(PageFsRecursiveReaddirResult {
+            entries,
+            truncated,
+            total_dirs_scanned,
+        })
     }
 
     // Plan metadata under a TiKV snapshot, then execute any external object-store reads after the
@@ -2444,10 +2622,7 @@ impl EmbeddedPageFs {
         let fs = self.clone();
         let err_sender = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = fs
-                .stream_read_plan_into_channel(plan, tx)
-                .await
-            {
+            if let Err(err) = fs.stream_read_plan_into_channel(plan, tx).await {
                 let _ = err_sender
                     .send(Err(std::io::Error::other(err.to_string())))
                     .await;
@@ -3787,10 +3962,10 @@ impl EmbeddedPageFs {
                 let file_size = inode.size;
                 while offset < file_size {
                     let remaining = file_size - offset;
-                    let chunk_len =
-                        usize::try_from(remaining.min(STREAM_READ_CHUNK_BYTES as u64)).map_err(
-                            |_| anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize")),
-                        )?;
+                    let chunk_len = usize::try_from(remaining.min(STREAM_READ_CHUNK_BYTES as u64))
+                        .map_err(|_| {
+                            anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize"))
+                        })?;
                     let chunk =
                         read_file_range_from_txn(&mut txn, inode_id, &inode, offset, chunk_len)
                             .await?;
@@ -4883,6 +5058,54 @@ async fn load_inodes_batch(txn: &mut Transaction, inode_ids: &[u64]) -> Result<V
     Ok(out)
 }
 
+async fn hydrate_directory_raw_entries(
+    txn: &mut Transaction,
+    raw_dirs: Vec<Vec<(String, u64)>>,
+) -> Result<Vec<Vec<(String, Inode)>>> {
+    let mut child_inode_ids = Vec::new();
+    let mut seen_inode_ids = HashSet::new();
+    for dir_entries in &raw_dirs {
+        for (_, child_inode_id) in dir_entries {
+            if seen_inode_ids.insert(*child_inode_id) {
+                child_inode_ids.push(*child_inode_id);
+            }
+        }
+    }
+
+    let child_inodes = load_inodes_batch(txn, &child_inode_ids).await?;
+    let child_inode_map: HashMap<u64, Inode> = child_inode_ids
+        .into_iter()
+        .zip(child_inodes.into_iter())
+        .filter_map(|(inode_id, inode)| inode.map(|inode| (inode_id, inode)))
+        .collect();
+
+    Ok(raw_dirs
+        .into_iter()
+        .map(|dir_entries| {
+            dir_entries
+                .into_iter()
+                .filter_map(|(name, child_inode_id)| {
+                    child_inode_map
+                        .get(&child_inode_id)
+                        .cloned()
+                        .map(|inode| (name, inode))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+async fn load_directory_entries_batch(
+    txn: &mut Transaction,
+    dir_inode_ids: &[u64],
+) -> Result<Vec<Vec<(String, Inode)>>> {
+    let mut raw_dirs = Vec::with_capacity(dir_inode_ids.len());
+    for dir_inode_id in dir_inode_ids {
+        raw_dirs.push(list_dir(txn, *dir_inode_id).await?);
+    }
+    hydrate_directory_raw_entries(txn, raw_dirs).await
+}
+
 async fn load_inodes_batch_tolerant(
     txn: &mut Transaction,
     inode_ids: &[u64],
@@ -5016,6 +5239,84 @@ async fn list_dir(txn: &mut Transaction, parent_inode: u64) -> Result<Vec<(Strin
     Ok(out)
 }
 
+fn next_scan_start_key(last_key: &[u8]) -> Vec<u8> {
+    let mut next = last_key.to_vec();
+    next.push(0);
+    next
+}
+
+async fn load_directory_entries_limited(
+    txn: &mut Transaction,
+    dir_path: &str,
+    parent_inode: u64,
+    limit: usize,
+    exclude_set: Option<&globset::GlobSet>,
+) -> Result<(Vec<(String, Inode)>, bool)> {
+    if limit == 0 {
+        return Ok((Vec::new(), true));
+    }
+
+    let prefix = keys::dir_prefix(parent_inode);
+    let end = keys::scan_end_key(&prefix);
+    let mut start = prefix.clone();
+    let mut out = Vec::new();
+
+    loop {
+        let mut pairs = txn
+            .scan(
+                start.clone()..end.clone(),
+                u32::try_from(INODE_BATCH_GET_CHUNK_SIZE).unwrap_or(u32::MAX),
+            )
+            .await?
+            .peekable();
+        if pairs.peek().is_none() {
+            break;
+        }
+
+        let mut raw_batch = Vec::new();
+        let mut next_start = None;
+        for pair in pairs {
+            let key: Vec<u8> = pair.0.into();
+            next_start = Some(next_scan_start_key(&key));
+
+            let value = pair.1;
+            let Some(name) = dir_entry_name_from_scan_key(&prefix, &key) else {
+                continue;
+            };
+            if value.len() != 8 {
+                continue;
+            }
+            let child_inode = u64::from_be_bytes(value.as_slice().try_into()?);
+            raw_batch.push((name.to_string(), child_inode));
+        }
+
+        let mut hydrated = hydrate_directory_raw_entries(txn, vec![raw_batch]).await?;
+        for (name, inode) in hydrated.pop().unwrap_or_default() {
+            let child_path = if dir_path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{dir_path}/{name}")
+            };
+            if exclude_set.is_some_and(|set| {
+                crate::extensions::fs::glob::path_matches_exclude(&child_path, set)
+            }) {
+                continue;
+            }
+            if out.len() >= limit {
+                return Ok((out, true));
+            }
+            out.push((name, inode));
+        }
+
+        let Some(next_start) = next_start else {
+            break;
+        };
+        start = next_start;
+    }
+
+    Ok((out, false))
+}
+
 fn clone_fs_error(err: &anyhow::Error) -> anyhow::Error {
     if let Some(fs_err) = err.downcast_ref::<EmbeddedFsError>() {
         anyhow!(fs_err.clone())
@@ -5044,7 +5345,10 @@ fn plan_batch_inline_read_pack_windows(
         .map_err(|_| anyhow!(EmbeddedFsError::internal("pack read window exceeds u64")))?;
     let mut by_bundle: HashMap<u64, Vec<PendingBatchInlineReadPack>> = HashMap::new();
     for pending in pack_reads {
-        by_bundle.entry(pending.bundle_id).or_default().push(pending);
+        by_bundle
+            .entry(pending.bundle_id)
+            .or_default()
+            .push(pending);
     }
 
     let mut bundle_ids = by_bundle.keys().copied().collect::<Vec<_>>();
@@ -5064,9 +5368,10 @@ fn plan_batch_inline_read_pack_windows(
                 Some(window) => {
                     let gap = entry.bundle_offset.saturating_sub(window.end_offset);
                     let merged_end = window.end_offset.max(entry_end);
-                    let merged_len = merged_end.checked_sub(window.start_offset).ok_or_else(|| {
-                        anyhow!(EmbeddedFsError::internal("pack read window underflow"))
-                    })?;
+                    let merged_len =
+                        merged_end.checked_sub(window.start_offset).ok_or_else(|| {
+                            anyhow!(EmbeddedFsError::internal("pack read window underflow"))
+                        })?;
                     Some((
                         gap <= PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES
                             && merged_len <= max_window_bytes_u64,
@@ -5111,8 +5416,8 @@ fn plan_batch_inline_read_pack_windows(
     Ok(windows)
 }
 
-fn fail_batch_stat_requests(
-    results: &mut [Option<Result<Inode>>],
+fn fail_resolved_path_requests(
+    results: &mut [Option<Result<ResolvedPath>>],
     request_indices: impl IntoIterator<Item = usize>,
     err: &anyhow::Error,
 ) {
@@ -5121,7 +5426,10 @@ fn fail_batch_stat_requests(
     }
 }
 
-async fn resolve_paths_batched<S>(store: &mut S, paths: &[String]) -> Vec<Result<Inode>>
+async fn resolve_paths_with_ids_batched<S>(
+    store: &mut S,
+    paths: &[String],
+) -> Vec<Result<ResolvedPath>>
 where
     S: BatchStatStore + Send,
 {
@@ -5137,7 +5445,8 @@ where
             BatchStatRequest { normalized, parts }
         })
         .collect();
-    let mut results: Vec<Option<Result<Inode>>> = (0..requests.len()).map(|_| None).collect();
+    let mut results: Vec<Option<Result<ResolvedPath>>> =
+        (0..requests.len()).map(|_| None).collect();
     let mut pending = Vec::new();
     let mut root_request_indices = Vec::new();
 
@@ -5157,14 +5466,17 @@ where
         match store.load_root_inode().await {
             Ok(Some(root_inode)) => {
                 for idx in root_request_indices {
-                    results[idx] = Some(Ok(root_inode.clone()));
+                    results[idx] = Some(Ok(ResolvedPath {
+                        inode_id: ROOT_INODE,
+                        inode: root_inode.clone(),
+                    }));
                 }
             }
             Ok(None) => {
                 let err = anyhow!(EmbeddedFsError::internal("root inode missing"));
-                fail_batch_stat_requests(&mut results, 0..requests.len(), &err);
+                fail_resolved_path_requests(&mut results, 0..requests.len(), &err);
             }
-            Err(err) => fail_batch_stat_requests(&mut results, 0..requests.len(), &err),
+            Err(err) => fail_resolved_path_requests(&mut results, 0..requests.len(), &err),
         }
     }
 
@@ -5185,7 +5497,7 @@ where
         let dir_entries = match store.lookup_dir_entries(&unique_requests).await {
             Ok(entries) => entries,
             Err(err) => {
-                fail_batch_stat_requests(
+                fail_resolved_path_requests(
                     &mut results,
                     pending.iter().map(|step| step.request_idx),
                     &err,
@@ -5207,7 +5519,7 @@ where
         let child_inodes = match store.load_inodes(&child_inode_ids).await {
             Ok(inodes) => inodes,
             Err(err) => {
-                fail_batch_stat_requests(
+                fail_resolved_path_requests(
                     &mut results,
                     pending.iter().map(|step| step.request_idx),
                     &err,
@@ -5249,7 +5561,10 @@ where
             };
 
             if step.next_part_idx + 1 == request.parts.len() {
-                results[step.request_idx] = Some(Ok(inode));
+                results[step.request_idx] = Some(Ok(ResolvedPath {
+                    inode_id: *child_inode_id,
+                    inode,
+                }));
                 continue;
             }
 
@@ -5278,6 +5593,17 @@ where
                 ))))
             })
         })
+        .collect()
+}
+
+async fn resolve_paths_batched<S>(store: &mut S, paths: &[String]) -> Vec<Result<Inode>>
+where
+    S: BatchStatStore + Send,
+{
+    resolve_paths_with_ids_batched(store, paths)
+        .await
+        .into_iter()
+        .map(|result| result.map(|resolved| resolved.inode))
         .collect()
 }
 
@@ -6375,6 +6701,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_paths_with_ids_batched_preserves_inode_ids() {
+        let mut store = FakeBatchStatStore::new();
+        store.link_inode(ROOT_INODE, "data", Inode::new_directory(2, 0o755));
+        store.link_inode(2, "alpha.txt", Inode::new_file(3, 0o644));
+
+        let results = resolve_paths_with_ids_batched(
+            &mut store,
+            &["/".to_string(), "/data/alpha.txt".to_string()],
+        )
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().inode_id, ROOT_INODE);
+        assert_eq!(results[1].as_ref().unwrap().inode_id, 3);
+    }
+
+    #[tokio::test]
     async fn test_resolve_paths_batched_preserves_mixed_result_semantics() {
         let mut store = FakeBatchStatStore::new();
         store.link_inode(ROOT_INODE, "data", Inode::new_directory(2, 0o755));
@@ -6513,11 +6856,13 @@ mod tests {
             end_offset,
             entries: entries
                 .iter()
-                .map(|(result_idx, bundle_offset, len)| PlannedBatchInlineReadPackWindowEntry {
-                    result_idx: *result_idx,
-                    bundle_offset: *bundle_offset,
-                    len: *len,
-                })
+                .map(
+                    |(result_idx, bundle_offset, len)| PlannedBatchInlineReadPackWindowEntry {
+                        result_idx: *result_idx,
+                        bundle_offset: *bundle_offset,
+                        len: *len,
+                    },
+                )
                 .collect(),
         }
     }
@@ -6592,11 +6937,9 @@ mod tests {
     #[test]
     fn test_split_pack_window_bytes_returns_expected_entry_payloads() {
         let window = planned_pack_window(7, 10, 20, &[(0, 10, 4), (1, 16, 4)]);
-        let entries = EmbeddedPageFs::split_pack_window_bytes(
-            &window,
-            Bytes::from_static(b"abcdefghij"),
-        )
-        .unwrap();
+        let entries =
+            EmbeddedPageFs::split_pack_window_bytes(&window, Bytes::from_static(b"abcdefghij"))
+                .unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, 0);
@@ -7650,6 +7993,125 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn test_readdir_recursive_behavioral_caps_frontier_scan_with_batched_hydration() {
+        let fs = make_fs().await;
+        let nonce = rand::thread_rng().gen::<u64>();
+        let base = format!("/test_readdir_recursive_{nonce}");
+        let dir_a = format!("{base}/a");
+        let dir_b = format!("{dir_a}/b");
+        let dir_c = format!("{dir_b}/c");
+        let dir_batch = format!("{base}/batch");
+
+        cleanup(&fs, &base).await;
+        ensure_dir(&fs, &dir_c).await;
+        ensure_dir(&fs, &dir_batch).await;
+
+        fs.write_file(&format!("{base}/root.txt"), b"root")
+            .await
+            .unwrap();
+        fs.write_file(&format!("{dir_a}/alpha.txt"), b"alpha")
+            .await
+            .unwrap();
+        fs.write_file(&format!("{dir_b}/beta.txt"), b"beta")
+            .await
+            .unwrap();
+        fs.write_file(&format!("{dir_c}/charlie.txt"), b"charlie")
+            .await
+            .unwrap();
+        fs.write_file(&format!("{dir_batch}/delta.txt"), b"delta")
+            .await
+            .unwrap();
+
+        let result = fs
+            .readdir_recursive(
+                &base,
+                FsRecursiveReaddirOptions {
+                    max_depth: 8,
+                    max_entries: 6,
+                    exclude_set: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let paths = result
+            .entries
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                format!("{base}/a"),
+                format!("{base}/a/alpha.txt"),
+                format!("{base}/a/b"),
+                format!("{base}/batch"),
+                format!("{base}/batch/delta.txt"),
+                format!("{base}/root.txt"),
+            ]
+        );
+        assert!(
+            result.truncated,
+            "recursive traversal should stop once max_entries is exhausted"
+        );
+        assert_eq!(
+            result.total_dirs_scanned, 3,
+            "should scan root plus the next frontier before hitting the cap"
+        );
+
+        cleanup(&fs, &base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_readdir_recursive_behavioral_dangling_dirent_does_not_consume_budget() {
+        let fs = make_fs().await;
+        let nonce = rand::thread_rng().gen::<u64>();
+        let base = format!("/test_readdir_recursive_dangling_{nonce}");
+
+        cleanup(&fs, &base).await;
+        ensure_dir(&fs, &base).await;
+        fs.write_file(&format!("{base}/bb.txt"), b"ok")
+            .await
+            .unwrap();
+
+        let mut txn = fs.begin().await.unwrap();
+        let (base_inode_id, _) = resolve_path(&mut txn, &base).await.unwrap();
+        txn.put(
+            keys::dir_entry_key(base_inode_id, "aa-dangling.txt"),
+            u64::MAX.to_be_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let result = fs
+            .readdir_recursive(
+                &base,
+                FsRecursiveReaddirOptions {
+                    max_depth: 1,
+                    max_entries: 1,
+                    exclude_set: None,
+                },
+            )
+            .await
+            .unwrap();
+        let paths = result
+            .entries
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![format!("{base}/bb.txt")]);
+        assert!(
+            !result.truncated,
+            "dangling dirents should not consume recursive result budget"
+        );
+
+        cleanup(&fs, &base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn test_inlineblob_behavioral_large_write_routes_to_object() {
         let fs = make_fs().await;
         let base = "/test_inlineblob_large_write";
@@ -8087,7 +8549,9 @@ mod tests {
                 .unwrap_err()
                 .downcast::<EmbeddedFsError>()
                 .expect("external entry failure should stay typed");
-            assert!(matches!(fs_err, EmbeddedFsError::Internal(msg) if msg == "S3 is not configured"));
+            assert!(
+                matches!(fs_err, EmbeddedFsError::Internal(msg) if msg == "S3 is not configured")
+            );
         }
 
         cleanup(&fs, base).await;

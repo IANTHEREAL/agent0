@@ -202,8 +202,8 @@ To ensure system stability, `fs9` enforces the following limits:
 | Max file size | 10 MB |
 | Max total bytes per glob query | 100 MB |
 | Max glob traversal files | 10,000 |
-| Max directory entries (recursive) | 100,000 |
-| Max glob recursion depth | 10 levels |
+| Max directory entries (recursive) | 50,000 |
+| Max recursive directory depth | 20 levels |
 | Permission required | Superuser only |
 
 ### How Limits Work
@@ -211,7 +211,7 @@ To ensure system stability, `fs9` enforces the following limits:
 - **Per-file limit (10 MB)**: Individual files larger than 10 MB are rejected with an error.
 - **Total bytes budget (100 MB)**: In glob mode, fs9 reads matched files until the cumulative bytes read reaches 100 MB. Remaining files are skipped and a server-side warning is logged. This ensures that SQL `WHERE` clauses see complete data from all scanned files — no partial row truncation occurs.
 - **Glob traversal (10,000 files)**: The glob pattern expansion walks at most 10,000 filesystem entries to find matching files. This prevents runaway directory walks.
-- **Directory listing (100,000 entries)**: Recursive directory listing returns at most 100,000 entries. If exceeded, a server-side warning is logged.
+- **Directory listing (50,000 entries)**: Recursive directory listing returns at most 50,000 entries. If exceeded, a server-side warning is logged.
 
 ## 10. Architecture
 

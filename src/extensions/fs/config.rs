@@ -28,6 +28,10 @@ const DEFAULT_BATCH_STAT_CONCURRENCY: usize = 16;
 const DEFAULT_BATCH_INLINE_READ_MAX_FILES: usize = 256;
 const DEFAULT_BATCH_INLINE_READ_MAX_TOTAL_BYTES: usize = 1024 * 1024;
 const DEFAULT_BATCH_WRITE_MAX_FILES: usize = 32;
+const DEFAULT_READDIR_RECURSIVE_MAX_DEPTH: usize = 20;
+const DEFAULT_READDIR_RECURSIVE_MAX_ENTRIES: usize = 50_000;
+const DEFAULT_READDIR_RECURSIVE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_READDIR_RECURSIVE_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 // `batch_write_max_total_bytes` is a post-decode safety limit (raw bytes written).
 // `batch_write_max_encoded_bytes` is a pre-decode limit on the base64-encoded payload carried
 // inside a JSON frame. Under the default WS JSON frame limit (`MAX_JSON_FRAME_BYTES`), the
@@ -60,6 +64,10 @@ pub(crate) struct Fs9Config {
     pub(crate) batch_write_max_files: usize,
     pub(crate) batch_write_max_total_bytes: usize,
     pub(crate) batch_write_max_encoded_bytes: usize,
+    pub(crate) readdir_recursive_max_depth: usize,
+    pub(crate) readdir_recursive_max_entries: usize,
+    pub(crate) readdir_recursive_timeout_secs: u64,
+    pub(crate) readdir_recursive_max_response_bytes: usize,
     pub(crate) pack_spool_root: PathBuf,
     pub(crate) pack_cache_bytes: usize,
 }
@@ -194,6 +202,25 @@ impl Fs9Config {
             batch_write_max_encoded_bytes: config::env_string("FS9_BATCH_WRITE_MAX_ENCODED_BYTES")
                 .and_then(|v| parse_bytes(&v))
                 .unwrap_or(DEFAULT_BATCH_WRITE_MAX_ENCODED_BYTES),
+            readdir_recursive_max_depth: config::env_string("FS9_READDIR_RECURSIVE_MAX_DEPTH")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_READDIR_RECURSIVE_MAX_DEPTH),
+            readdir_recursive_max_entries: config::env_string("FS9_READDIR_RECURSIVE_MAX_ENTRIES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_READDIR_RECURSIVE_MAX_ENTRIES),
+            readdir_recursive_timeout_secs: config::env_string(
+                "FS9_READDIR_RECURSIVE_TIMEOUT_SECS",
+            )
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_READDIR_RECURSIVE_TIMEOUT_SECS),
+            readdir_recursive_max_response_bytes: config::env_string(
+                "FS9_READDIR_RECURSIVE_MAX_RESPONSE_BYTES",
+            )
+            .and_then(|v| parse_bytes(&v))
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_READDIR_RECURSIVE_MAX_RESPONSE_BYTES),
             pack_spool_root: config::env_string("FS9_PACK_SPOOL_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::temp_dir().join("db9-fs9-pack-spool")),

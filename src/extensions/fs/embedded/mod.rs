@@ -7,8 +7,8 @@ pub(crate) mod types;
 
 use crate::extensions::fs::backend::{
     FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsCreateUpload, FsFileInfo,
-    FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest, FsStorage, FsWriteStream,
-    FsWriteStreamOptions,
+    FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest, FsRecursiveReaddirOptions,
+    FsRecursiveReaddirResult, FsStorage, FsWriteStream, FsWriteStreamOptions,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -93,6 +93,28 @@ impl FsBackend for EmbeddedFsBackend {
                 inode_to_file_info(&child_path, &inode)
             })
             .collect::<Result<Vec<_>>>()?)
+    }
+
+    async fn batch_readdir(&self, paths: &[String]) -> Result<Vec<Result<Vec<FsFileInfo>>>> {
+        let dir_entries = self.pagefs.batch_readdir(paths).await?;
+        map_batch_readdir_results(paths, dir_entries)
+    }
+
+    async fn readdir_recursive(
+        &self,
+        path: &str,
+        opts: FsRecursiveReaddirOptions,
+    ) -> Result<FsRecursiveReaddirResult> {
+        let result = self.pagefs.readdir_recursive(path, opts).await?;
+        Ok(FsRecursiveReaddirResult {
+            entries: result
+                .entries
+                .into_iter()
+                .map(|(entry_path, inode)| inode_to_file_info(&entry_path, &inode))
+                .collect::<Result<Vec<_>>>()?,
+            truncated: result.truncated,
+            total_dirs_scanned: result.total_dirs_scanned,
+        })
     }
 
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
@@ -247,6 +269,40 @@ fn map_batch_stat_results(
         .zip(inodes)
         .map(|(path, inode_result)| {
             inode_result.and_then(|inode| inode_to_file_info(&path, &inode))
+        })
+        .collect())
+}
+
+fn map_batch_readdir_results(
+    paths: &[String],
+    dir_entries: Vec<Result<Vec<(String, Inode)>>>,
+) -> Result<Vec<Result<Vec<FsFileInfo>>>> {
+    if dir_entries.len() != paths.len() {
+        return Err(anyhow!(types::EmbeddedFsError::internal(&format!(
+            "fs9: batch_readdir returned {} results for {} input paths",
+            dir_entries.len(),
+            paths.len()
+        ))));
+    }
+
+    Ok(paths
+        .iter()
+        .zip(dir_entries)
+        .map(|(path, entries_result)| {
+            let normalized = normalize_dir_path(path);
+            entries_result.and_then(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(name, inode)| {
+                        let child_path = if normalized == "/" {
+                            format!("/{name}")
+                        } else {
+                            format!("{normalized}/{name}")
+                        };
+                        inode_to_file_info(&child_path, &inode)
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
         })
         .collect())
 }

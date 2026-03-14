@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::io::AsyncBufRead;
 
@@ -38,6 +39,20 @@ pub(crate) struct FsBatchWriteFile {
 pub(crate) struct FsBatchWriteEntry {
     pub path: String,
     pub result: Result<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FsRecursiveReaddirOptions {
+    pub max_depth: usize,
+    pub max_entries: usize,
+    pub exclude_set: Option<Arc<globset::GlobSet>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FsRecursiveReaddirResult {
+    pub entries: Vec<FsFileInfo>,
+    pub truncated: bool,
+    pub total_dirs_scanned: usize,
 }
 
 pub(crate) fn batch_inline_read_entry_too_large_error(
@@ -113,6 +128,105 @@ pub(crate) trait FsBackend: Send + Sync {
         Ok(entries)
     }
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>>;
+    async fn batch_readdir(&self, paths: &[String]) -> Result<Vec<Result<Vec<FsFileInfo>>>> {
+        let mut entries = Vec::with_capacity(paths.len());
+        for path in paths {
+            entries.push(self.readdir(path).await);
+        }
+        Ok(entries)
+    }
+    async fn readdir_recursive(
+        &self,
+        path: &str,
+        opts: FsRecursiveReaddirOptions,
+    ) -> Result<FsRecursiveReaddirResult> {
+        if opts.max_entries == 0 {
+            return Ok(FsRecursiveReaddirResult {
+                entries: Vec::new(),
+                truncated: false,
+                total_dirs_scanned: 0,
+            });
+        }
+
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        let mut total_dirs_scanned = 0usize;
+        let root = normalize_readdir_path(path);
+        let mut frontier = VecDeque::from([(root.clone(), 0usize)]);
+        let mut visited = HashSet::from([root]);
+
+        while let Some((_, depth)) = frontier.front() {
+            if entries.len() >= opts.max_entries {
+                truncated = true;
+                break;
+            }
+
+            let current_depth = *depth;
+            let mut level_paths = Vec::new();
+            while matches!(frontier.front(), Some((_, level_depth)) if *level_depth == current_depth)
+            {
+                let (dir_path, dir_depth) = frontier
+                    .pop_front()
+                    .expect("frontier entry must exist while draining current level");
+                level_paths.push((dir_path, dir_depth));
+            }
+
+            let paths = level_paths
+                .iter()
+                .map(|(dir_path, _)| dir_path.clone())
+                .collect::<Vec<_>>();
+            let results = self.batch_readdir(&paths).await?;
+            if results.len() != level_paths.len() {
+                return Err(anyhow!(EmbeddedFsError::internal(&format!(
+                    "batch_readdir returned {} results for {} input paths",
+                    results.len(),
+                    level_paths.len()
+                ))));
+            }
+
+            total_dirs_scanned = total_dirs_scanned.saturating_add(level_paths.len());
+            for ((_, dir_depth), result) in level_paths.into_iter().zip(results) {
+                let dir_entries = result?;
+                for entry in dir_entries {
+                    if opts.exclude_set.as_deref().is_some_and(|set| {
+                        crate::extensions::fs::glob::path_matches_exclude(&entry.path, set)
+                    }) {
+                        continue;
+                    }
+
+                    if entry.is_dir
+                        && dir_depth < opts.max_depth
+                        && !entry.is_symlink
+                        && visited.insert(entry.path.clone())
+                    {
+                        frontier.push_back((entry.path.clone(), dir_depth + 1));
+                    }
+
+                    if entries.len() >= opts.max_entries {
+                        truncated = true;
+                        break;
+                    }
+
+                    entries.push(entry);
+                }
+
+                if truncated {
+                    break;
+                }
+            }
+
+            if truncated {
+                break;
+            }
+        }
+
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(FsRecursiveReaddirResult {
+            entries,
+            truncated,
+            total_dirs_scanned,
+        })
+    }
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>>;
     async fn batch_inline_read(
         &self,
@@ -223,6 +337,19 @@ pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
     )
 }
 
+fn normalize_readdir_path(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+}
+
 async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
     let client = crate::extensions::context::tikv_client().ok_or_else(|| {
         anyhow!(
@@ -262,12 +389,22 @@ mod tests {
         files: HashMap<String, Result<Vec<u8>>>,
     }
 
+    struct RecursiveReaddirTestBackend {
+        dirs: HashMap<String, Result<Vec<FsFileInfo>>>,
+    }
+
     impl BatchInlineReadTestBackend {
         fn new(
             stats: HashMap<String, Result<FsFileInfo>>,
             files: HashMap<String, Result<Vec<u8>>>,
         ) -> Self {
             Self { stats, files }
+        }
+    }
+
+    impl RecursiveReaddirTestBackend {
+        fn new(dirs: HashMap<String, Result<Vec<FsFileInfo>>>) -> Self {
+            Self { dirs }
         }
     }
 
@@ -291,6 +428,106 @@ mod tests {
                 Some(Err(err)) => Err(anyhow!(err.to_string())),
                 None => Err(anyhow!(EmbeddedFsError::not_found(path))),
             }
+        }
+
+        async fn read_file_stream(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+            Ok(Box::new(empty()))
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            unreachable!("remove is not used in these tests");
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+            unreachable!("remove_recursive is not used in these tests");
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+            unreachable!("mkdir is not used in these tests");
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            unreachable!("write_file is not used in these tests");
+        }
+
+        async fn begin_write_stream(
+            &self,
+            _path: &str,
+            _opts: FsWriteStreamOptions,
+        ) -> Result<Box<dyn FsWriteStream>> {
+            unreachable!("begin_write_stream is not used in these tests");
+        }
+
+        async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+            unreachable!("read_file_at is not used in these tests");
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
+            unreachable!("write_file_at is not used in these tests");
+        }
+
+        async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            unreachable!("append_file is not used in these tests");
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+            unreachable!("truncate is not used in these tests");
+        }
+
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            unreachable!("rename is not used in these tests");
+        }
+
+        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+            unreachable!("create_upload is not used in these tests");
+        }
+
+        async fn presign_upload_part(
+            &self,
+            _upload_token: &str,
+            _part_number: i32,
+        ) -> Result<FsPresignedRequest> {
+            unreachable!("presign_upload_part is not used in these tests");
+        }
+
+        async fn complete_upload(
+            &self,
+            _upload_token: &str,
+            _parts: Vec<FsMultipartCompletedPart>,
+            _checksum: Option<[u8; 32]>,
+        ) -> Result<usize> {
+            unreachable!("complete_upload is not used in these tests");
+        }
+
+        async fn abort_upload(&self, _upload_token: &str) -> Result<()> {
+            unreachable!("abort_upload is not used in these tests");
+        }
+
+        async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
+            unreachable!("prepare_download is not used in these tests");
+        }
+    }
+
+    #[async_trait]
+    impl FsBackend for RecursiveReaddirTestBackend {
+        async fn stat(&self, _path: &str) -> Result<FsFileInfo> {
+            unreachable!("stat is not used in these tests");
+        }
+
+        async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
+            match self.dirs.get(path) {
+                Some(Ok(entries)) => Ok(entries.clone()),
+                Some(Err(err)) => Err(anyhow!(err.to_string())),
+                None => Err(anyhow!(EmbeddedFsError::not_found(path))),
+            }
+        }
+
+        async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
+            unreachable!("read_file is not used in these tests");
         }
 
         async fn read_file_stream(
@@ -546,5 +783,210 @@ mod tests {
             fs_err.to_string(),
             "embedded_fs: TooLarge: batch_inline_read raw payload exceeds limit 8 bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn default_batch_readdir_preserves_per_path_results() {
+        let backend = RecursiveReaddirTestBackend::new(HashMap::from([
+            (
+                "/".to_string(),
+                Ok(vec![FsFileInfo {
+                    path: "/root.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 4,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: Some(FsStorage::Inline),
+                    sealed: Some(false),
+                }]),
+            ),
+            (
+                "/missing".to_string(),
+                Err(anyhow!(EmbeddedFsError::not_found("/missing"))),
+            ),
+        ]));
+
+        let results = backend
+            .batch_readdir(&["/".to_string(), "/missing".to_string()])
+            .await
+            .expect("batch_readdir should succeed");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().len(), 1);
+        assert!(results[1]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("NotFound"));
+    }
+
+    #[tokio::test]
+    async fn default_readdir_recursive_walks_frontiers_and_caps_entries() {
+        let backend = RecursiveReaddirTestBackend::new(HashMap::from([
+            (
+                "/".to_string(),
+                Ok(vec![
+                    FsFileInfo {
+                        path: "/alpha.txt".to_string(),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: 5,
+                        mode: 0o644,
+                        mtime: 0,
+                        storage: Some(FsStorage::Inline),
+                        sealed: Some(false),
+                    },
+                    FsFileInfo {
+                        path: "/dir".to_string(),
+                        is_dir: true,
+                        is_symlink: false,
+                        size: 0,
+                        mode: 0o755,
+                        mtime: 0,
+                        storage: None,
+                        sealed: Some(false),
+                    },
+                ]),
+            ),
+            (
+                "/dir".to_string(),
+                Ok(vec![
+                    FsFileInfo {
+                        path: "/dir/bravo.txt".to_string(),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: 5,
+                        mode: 0o644,
+                        mtime: 0,
+                        storage: Some(FsStorage::Inline),
+                        sealed: Some(false),
+                    },
+                    FsFileInfo {
+                        path: "/dir/nested".to_string(),
+                        is_dir: true,
+                        is_symlink: false,
+                        size: 0,
+                        mode: 0o755,
+                        mtime: 0,
+                        storage: None,
+                        sealed: Some(false),
+                    },
+                ]),
+            ),
+            (
+                "/dir/nested".to_string(),
+                Ok(vec![FsFileInfo {
+                    path: "/dir/nested/charlie.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 7,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: Some(FsStorage::Inline),
+                    sealed: Some(false),
+                }]),
+            ),
+        ]));
+
+        let result = backend
+            .readdir_recursive(
+                "/",
+                FsRecursiveReaddirOptions {
+                    max_depth: 8,
+                    max_entries: 3,
+                    exclude_set: None,
+                },
+            )
+            .await
+            .expect("readdir_recursive should succeed");
+
+        let paths = result
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/alpha.txt", "/dir", "/dir/bravo.txt"]);
+        assert!(result.truncated);
+        assert_eq!(result.total_dirs_scanned, 2);
+    }
+
+    #[tokio::test]
+    async fn default_readdir_recursive_prunes_excluded_directories() {
+        let backend = RecursiveReaddirTestBackend::new(HashMap::from([
+            (
+                "/".to_string(),
+                Ok(vec![
+                    FsFileInfo {
+                        path: "/keep".to_string(),
+                        is_dir: true,
+                        is_symlink: false,
+                        size: 0,
+                        mode: 0o755,
+                        mtime: 0,
+                        storage: None,
+                        sealed: Some(false),
+                    },
+                    FsFileInfo {
+                        path: "/skip".to_string(),
+                        is_dir: true,
+                        is_symlink: false,
+                        size: 0,
+                        mode: 0o755,
+                        mtime: 0,
+                        storage: None,
+                        sealed: Some(false),
+                    },
+                ]),
+            ),
+            (
+                "/keep".to_string(),
+                Ok(vec![FsFileInfo {
+                    path: "/keep/visible.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 7,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: Some(FsStorage::Inline),
+                    sealed: Some(false),
+                }]),
+            ),
+            (
+                "/skip".to_string(),
+                Ok(vec![FsFileInfo {
+                    path: "/skip/hidden.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 6,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: Some(FsStorage::Inline),
+                    sealed: Some(false),
+                }]),
+            ),
+        ]));
+        let exclude_set =
+            crate::extensions::fs::glob::build_exclude_globset(Some("skip/**")).unwrap();
+
+        let result = backend
+            .readdir_recursive(
+                "/",
+                FsRecursiveReaddirOptions {
+                    max_depth: 8,
+                    max_entries: 10,
+                    exclude_set,
+                },
+            )
+            .await
+            .expect("readdir_recursive should succeed");
+
+        let paths = result
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/keep", "/keep/visible.txt"]);
+        assert_eq!(result.total_dirs_scanned, 2);
     }
 }

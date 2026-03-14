@@ -3,7 +3,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::model::{Row, TableSchema};
-use std::collections::HashSet;
 use tracing::warn;
 
 pub(crate) mod backend;
@@ -163,8 +162,7 @@ async fn execute_table_function_with_budget_for_backend(
             exclude,
         } => {
             let exclude_set = glob::build_exclude_globset(exclude.as_deref())?;
-            let entries =
-                list_directory_entries(backend, &path, recursive, exclude_set.as_ref()).await?;
+            let entries = list_directory_entries(backend, &path, recursive, exclude_set).await?;
             let decoded = decoders::decode_directory(entries);
             Ok((decoded.schema, decoded.rows))
         }
@@ -750,62 +748,36 @@ async fn list_directory_entries(
     backend: &dyn backend::FsBackend,
     path: &str,
     recursive: bool,
-    exclude_set: Option<&globset::GlobSet>,
+    exclude_set: Option<Arc<globset::GlobSet>>,
 ) -> Result<Vec<backend::FsFileInfo>> {
     if !recursive {
         let mut entries = backend.readdir(path).await?;
-        if let Some(exclude_set) = exclude_set {
+        if let Some(exclude_set) = exclude_set.as_deref() {
             entries.retain(|entry| !glob::path_matches_exclude(&entry.path, exclude_set));
         }
         return Ok(entries);
     }
 
-    const MAX_RECURSIVE_DEPTH: usize = 10;
-    const MAX_DIR_ENTRIES: usize = 100_000;
-    let max_entries = MAX_DIR_ENTRIES;
+    let config = config::fs9_config();
+    let result = backend
+        .readdir_recursive(
+            path,
+            backend::FsRecursiveReaddirOptions {
+                max_depth: config.readdir_recursive_max_depth,
+                max_entries: config.readdir_recursive_max_entries,
+                exclude_set,
+            },
+        )
+        .await?;
 
-    let mut entries = Vec::new();
-    let mut stack = vec![(path.to_string(), 0usize)];
-    let mut visited: HashSet<String> = HashSet::new();
-
-    while let Some((current_dir, depth)) = stack.pop() {
-        if entries.len() >= max_entries {
-            warn!("fs9: directory listing capped at {} entries", max_entries);
-            break;
-        }
-        if depth > MAX_RECURSIVE_DEPTH {
-            continue;
-        }
-        if !visited.insert(current_dir.clone()) {
-            continue;
-        }
-
-        let dir_entries = backend.readdir(&current_dir).await?;
-        for entry in dir_entries {
-            if exclude_set.is_some_and(|set| glob::path_matches_exclude(&entry.path, set)) {
-                continue;
-            }
-
-            if entries.len() >= max_entries {
-                break;
-            }
-
-            if entry.is_dir && depth < MAX_RECURSIVE_DEPTH {
-                // Avoid following directory symlinks in recursive mode to prevent loops.
-                if !entry.is_symlink {
-                    stack.push((entry.path.clone(), depth + 1));
-                }
-            }
-
-            entries.push(entry);
-            if entries.len() >= max_entries {
-                break;
-            }
-        }
+    if result.truncated {
+        warn!(
+            "fs9: directory listing capped at {} entries",
+            config.readdir_recursive_max_entries
+        );
     }
 
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(entries)
+    Ok(result.entries)
 }
 
 #[cfg(test)]
@@ -830,10 +802,13 @@ mod tests {
         start_glob_stream_with_budget_for_test_backend, Fs9Mode,
     };
     use crate::extensions::context;
-    use crate::extensions::fs::backend::{FsBackend, FsFileInfo, FsWriteStream};
+    use crate::extensions::fs::backend::{
+        FsBackend, FsFileInfo, FsRecursiveReaddirOptions, FsRecursiveReaddirResult, FsWriteStream,
+    };
     use crate::model::Value;
 
     struct TestLocalBackend;
+    struct RecursiveListBackend;
 
     fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
         let is_dir = metadata.is_dir();
@@ -993,6 +968,145 @@ mod tests {
             _path: &str,
         ) -> Result<crate::extensions::fs::backend::FsPreparedDownload> {
             anyhow::bail!("not implemented for test backend")
+        }
+    }
+
+    #[async_trait]
+    impl FsBackend for RecursiveListBackend {
+        async fn stat(&self, _path: &str) -> Result<FsFileInfo> {
+            unreachable!("stat is not used in this test");
+        }
+
+        async fn readdir(&self, _path: &str) -> Result<Vec<FsFileInfo>> {
+            unreachable!("recursive listing should use backend-native readdir_recursive");
+        }
+
+        async fn readdir_recursive(
+            &self,
+            path: &str,
+            opts: FsRecursiveReaddirOptions,
+        ) -> Result<FsRecursiveReaddirResult> {
+            assert_eq!(path, "/root");
+            assert_eq!(
+                opts.max_depth,
+                crate::extensions::fs::config::fs9_config().readdir_recursive_max_depth
+            );
+            assert_eq!(
+                opts.max_entries,
+                crate::extensions::fs::config::fs9_config().readdir_recursive_max_entries
+            );
+            let exclude_set = opts.exclude_set.expect("exclude_set should be forwarded");
+            assert!(crate::extensions::fs::glob::path_matches_exclude(
+                "/root/skip",
+                &exclude_set
+            ));
+
+            Ok(FsRecursiveReaddirResult {
+                entries: vec![FsFileInfo {
+                    path: "/root/keep.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 4,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }],
+                truncated: false,
+                total_dirs_scanned: 1,
+            })
+        }
+
+        async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
+            unreachable!("read_file is not used in this test");
+        }
+
+        async fn read_file_stream(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+            unreachable!("read_file_stream is not used in this test");
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            unreachable!("remove is not used in this test");
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+            unreachable!("remove_recursive is not used in this test");
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+            unreachable!("mkdir is not used in this test");
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            unreachable!("write_file is not used in this test");
+        }
+
+        async fn begin_write_stream(
+            &self,
+            _path: &str,
+            _opts: crate::extensions::fs::backend::FsWriteStreamOptions,
+        ) -> Result<Box<dyn FsWriteStream>> {
+            unreachable!("begin_write_stream is not used in this test");
+        }
+
+        async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+            unreachable!("read_file_at is not used in this test");
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
+            unreachable!("write_file_at is not used in this test");
+        }
+
+        async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            unreachable!("append_file is not used in this test");
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+            unreachable!("truncate is not used in this test");
+        }
+
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            unreachable!("rename is not used in this test");
+        }
+
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+        ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
+            unreachable!("create_upload is not used in this test");
+        }
+
+        async fn presign_upload_part(
+            &self,
+            _upload_token: &str,
+            _part_number: i32,
+        ) -> Result<crate::extensions::fs::backend::FsPresignedRequest> {
+            unreachable!("presign_upload_part is not used in this test");
+        }
+
+        async fn complete_upload(
+            &self,
+            _upload_token: &str,
+            _parts: Vec<crate::extensions::fs::backend::FsMultipartCompletedPart>,
+            _checksum: Option<[u8; 32]>,
+        ) -> Result<usize> {
+            unreachable!("complete_upload is not used in this test");
+        }
+
+        async fn abort_upload(&self, _upload_token: &str) -> Result<()> {
+            unreachable!("abort_upload is not used in this test");
+        }
+
+        async fn prepare_download(
+            &self,
+            _path: &str,
+        ) -> Result<crate::extensions::fs::backend::FsPreparedDownload> {
+            unreachable!("prepare_download is not used in this test");
         }
     }
 
@@ -1209,6 +1323,18 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("/subdir")));
 
         cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn recursive_directory_listing_uses_backend_native_readdir_recursive() {
+        let exclude_set = crate::extensions::fs::glob::build_exclude_globset(Some("skip/**"))
+            .expect("exclude globset should build");
+        let entries = list_directory_entries(&RecursiveListBackend, "/root", true, exclude_set)
+            .await
+            .expect("recursive listing should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/root/keep.txt");
     }
 
     #[tokio::test]

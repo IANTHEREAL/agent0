@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::sync::Arc;
 use tracing::warn;
 
 use super::backend::FsBackend;
@@ -53,7 +54,7 @@ pub(crate) async fn expand_glob(
         0,
         max_depth,
         include_dotfiles,
-        exclude_set.as_ref(),
+        exclude_set.as_deref(),
     )
     .await?;
 
@@ -87,7 +88,7 @@ pub(crate) async fn find_first_match(
         0,
         max_depth,
         include_dotfiles,
-        exclude_set.as_ref(),
+        exclude_set.as_deref(),
     )
     .await?;
 
@@ -168,7 +169,7 @@ fn glob_prefix_dir(pattern: &str) -> &str {
 
 pub(crate) fn build_exclude_globset(
     exclude_pattern: Option<&str>,
-) -> Result<Option<globset::GlobSet>> {
+) -> Result<Option<Arc<globset::GlobSet>>> {
     let Some(exclude_pattern) = exclude_pattern else {
         return Ok(None);
     };
@@ -184,6 +185,13 @@ pub(crate) fn build_exclude_globset(
         let glob = globset::Glob::new(trimmed)
             .map_err(|err| anyhow!("fs9: invalid exclude pattern '{trimmed}': {err}"))?;
         builder.add(glob);
+        if let Some(dir_only) = trimmed.strip_suffix("/**") {
+            if !dir_only.is_empty() {
+                let dir_glob = globset::Glob::new(dir_only)
+                    .map_err(|err| anyhow!("fs9: invalid exclude pattern '{trimmed}': {err}"))?;
+                builder.add(dir_glob);
+            }
+        }
         has_patterns = true;
     }
 
@@ -194,18 +202,31 @@ pub(crate) fn build_exclude_globset(
     let set = builder
         .build()
         .map_err(|err| anyhow!("fs9: invalid exclude pattern: {err}"))?;
-    Ok(Some(set))
+    Ok(Some(Arc::new(set)))
 }
 
 pub(crate) fn path_matches_exclude(path: &str, exclude_set: &globset::GlobSet) -> bool {
-    exclude_set.is_match(path)
-        || path
-            .strip_prefix("./")
-            .is_some_and(|p| exclude_set.is_match(p))
-        || path
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| exclude_set.is_match(name))
+    if exclude_set.is_match(path) {
+        return true;
+    }
+
+    let normalized = path.trim_start_matches("./").trim_start_matches('/');
+    if normalized.is_empty() {
+        return false;
+    }
+    if exclude_set.is_match(normalized) {
+        return true;
+    }
+
+    let mut suffix = normalized;
+    while let Some((_, tail)) = suffix.split_once('/') {
+        if exclude_set.is_match(tail) {
+            return true;
+        }
+        suffix = tail;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -602,6 +623,37 @@ mod tests {
             .expect("expand glob with full exclude should succeed");
 
         assert_eq!(files.len(), 0);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_path_matches_exclude_matches_absolute_subtree_paths() {
+        let exclude_set = build_exclude_globset(Some("skip/**"))
+            .expect("exclude globset should build")
+            .expect("exclude globset should exist");
+
+        assert!(path_matches_exclude("/root/skip", &exclude_set));
+        assert!(path_matches_exclude("/root/skip/file.txt", &exclude_set));
+        assert!(!path_matches_exclude("/root/keep/file.txt", &exclude_set));
+    }
+
+    #[tokio::test]
+    async fn test_expand_glob_with_absolute_subtree_exclude() {
+        let dir = unique_base("glob-exclude-subtree");
+        fs::create_dir_all(dir.join("keep")).expect("create keep");
+        fs::create_dir_all(dir.join("skip")).expect("create skip");
+        fs::write(dir.join("keep/keep.txt"), b"keep").expect("write keep");
+        fs::write(dir.join("skip/skip.txt"), b"skip").expect("write skip");
+
+        let backend = TestLocalBackend;
+        let pattern = format!("{}/**/*.txt", dir.display());
+        let files = expand_glob(&backend, &pattern, 100, Some("skip/**"))
+            .await
+            .expect("expand glob with subtree exclude should succeed");
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("keep/keep.txt"));
 
         cleanup(&dir);
     }

@@ -1,18 +1,22 @@
+use anyhow::Error;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use anyhow::Error;
 use serde_json::json;
 use std::collections::HashSet;
+use tokio::time::{timeout, Duration};
 
-use crate::extensions::fs::backend::{FsBatchWriteFile, FsMultipartCompletedPart};
+use crate::extensions::fs::backend::{
+    FsBatchWriteFile, FsMultipartCompletedPart, FsRecursiveReaddirOptions, FsRecursiveReaddirResult,
+};
 use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
 use crate::extensions::fs::ws::auth::WsSession;
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, BatchInlineReadEntryResponse, BatchStatEntryResponse,
     BatchWriteEntryResponse, CreateUploadResponse, FileInfoResponse, HeaderPairResponse,
-    MultipartCompletedPartRequest, PrepareDownloadResponse, PresignedRequestResponse, WsErrorCode,
-    WsErrorDetail, WsRequest, WsResponse,
+    MultipartCompletedPartRequest, PrepareDownloadResponse, PresignedRequestResponse,
+    ReaddirRecursiveResponse, WsErrorCode, WsErrorDetail, WsRequest, WsResponse,
+    MAX_JSON_FRAME_BYTES,
 };
 use crate::extensions::fs::MAX_BYTES_PER_FILE;
 
@@ -23,6 +27,12 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
         }
         WsRequest::Stat { id, path } => handle_stat(session, id, path).await,
         WsRequest::Readdir { id, path } => handle_readdir(session, id, path).await,
+        WsRequest::ReaddirRecursive {
+            id,
+            path,
+            max_depth,
+            max_entries,
+        } => handle_readdir_recursive(session, id, path, *max_depth, *max_entries).await,
         WsRequest::Mkdir {
             id,
             path,
@@ -149,6 +159,70 @@ async fn handle_readdir(session: &WsSession, id: &str, path: &str) -> WsResponse
                 entries.into_iter().map(FileInfoResponse::from).collect();
             WsResponse::success(id, json!({ "entries": entries }))
         }
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            WsResponse::error(id, code, msg)
+        }
+    }
+}
+
+async fn handle_readdir_recursive(
+    session: &WsSession,
+    id: &str,
+    path: &str,
+    max_depth: Option<usize>,
+    max_entries: Option<usize>,
+) -> WsResponse {
+    if let Err((code, msg)) = validate_path(path) {
+        return WsResponse::error(id, code, msg);
+    }
+
+    if max_entries == Some(0) {
+        return WsResponse::error(
+            id,
+            WsErrorCode::Einval,
+            "max_entries must be greater than 0",
+        );
+    }
+
+    let config = fs9_config();
+    let opts = FsRecursiveReaddirOptions {
+        max_depth: max_depth
+            .unwrap_or(config.readdir_recursive_max_depth)
+            .min(config.readdir_recursive_max_depth),
+        max_entries: max_entries
+            .unwrap_or(config.readdir_recursive_max_entries)
+            .min(config.readdir_recursive_max_entries),
+        exclude_set: None,
+    };
+
+    let result = match timeout(
+        Duration::from_secs(config.readdir_recursive_timeout_secs),
+        session.backend.readdir_recursive(path, opts),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            return WsResponse::error(
+                id,
+                WsErrorCode::Eagain,
+                format!(
+                    "readdir_recursive timed out after {} seconds",
+                    config.readdir_recursive_timeout_secs
+                ),
+            )
+        }
+    };
+
+    match result {
+        Ok(result) => recursive_readdir_response(
+            id,
+            result,
+            config
+                .readdir_recursive_max_response_bytes
+                .min(MAX_JSON_FRAME_BYTES),
+        ),
         Err(err) => {
             let (code, msg) = map_fs_error(&err);
             WsResponse::error(id, code, msg)
@@ -732,6 +806,50 @@ fn batch_inline_read_response(
     WsResponse::success(id, json!({ "entries": entries }))
 }
 
+fn recursive_readdir_response(
+    id: &str,
+    result: FsRecursiveReaddirResult,
+    max_response_bytes: usize,
+) -> WsResponse {
+    let payload = match serde_json::to_value(ReaddirRecursiveResponse {
+        entries: result
+            .entries
+            .into_iter()
+            .map(FileInfoResponse::from)
+            .collect(),
+        truncated: result.truncated,
+        total_dirs_scanned: result.total_dirs_scanned,
+    }) {
+        Ok(value) => value,
+        Err(err) => {
+            return WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("failed to serialize recursive readdir payload: {err}"),
+            )
+        }
+    };
+
+    let response = WsResponse::success(id, payload);
+    match serde_json::to_vec(&response) {
+        Ok(bytes) if bytes.len() <= max_response_bytes => response,
+        Ok(bytes) => WsResponse::error(
+            id,
+            WsErrorCode::Efbig,
+            format!(
+                "readdir_recursive response exceeds limit {} bytes (actual {})",
+                max_response_bytes,
+                bytes.len()
+            ),
+        ),
+        Err(err) => WsResponse::error(
+            id,
+            WsErrorCode::Eio,
+            format!("failed to serialize recursive readdir response: {err}"),
+        ),
+    }
+}
+
 async fn handle_batch_write(
     session: &WsSession,
     id: &str,
@@ -918,9 +1036,9 @@ fn format_mtime(epoch_seconds: i64) -> String {
 mod tests {
     use super::{
         batch_inline_read_response, batch_stat_response, decode_base64_content,
-        map_batch_inline_read_error, parse_sha256_checksum,
+        map_batch_inline_read_error, parse_sha256_checksum, recursive_readdir_response,
     };
-    use crate::extensions::fs::backend::FsFileInfo;
+    use crate::extensions::fs::backend::{FsFileInfo, FsRecursiveReaddirResult};
     use crate::extensions::fs::ws::protocol::WsErrorCode;
     use anyhow::anyhow;
     use serde_json::Value;
@@ -1200,5 +1318,81 @@ mod tests {
         assert!(detail
             .message
             .contains("backend returned 1 results for 2 input paths"));
+    }
+
+    #[test]
+    fn test_recursive_readdir_response_serializes_payload() {
+        let resp = recursive_readdir_response(
+            "req-10",
+            FsRecursiveReaddirResult {
+                entries: vec![
+                    FsFileInfo {
+                        path: "/root/a.txt".to_string(),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: 5,
+                        mode: 0o644,
+                        mtime: 0,
+                        storage: None,
+                        sealed: None,
+                    },
+                    FsFileInfo {
+                        path: "/root/sub".to_string(),
+                        is_dir: true,
+                        is_symlink: false,
+                        size: 0,
+                        mode: 0o755,
+                        mtime: 0,
+                        storage: None,
+                        sealed: Some(false),
+                    },
+                ],
+                truncated: true,
+                total_dirs_scanned: 3,
+            },
+            4096,
+        );
+
+        assert!(resp.ok);
+        let data = resp
+            .data
+            .expect("recursive readdir success must include data");
+        assert_eq!(data["truncated"], Value::Bool(true));
+        assert_eq!(data["total_dirs_scanned"], Value::from(3usize));
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["path"], Value::String("/root/a.txt".to_string()));
+        assert_eq!(entries[1]["type"], Value::String("dir".to_string()));
+    }
+
+    #[test]
+    fn test_recursive_readdir_response_rejects_oversized_payload() {
+        let resp = recursive_readdir_response(
+            "req-11",
+            FsRecursiveReaddirResult {
+                entries: vec![FsFileInfo {
+                    path: "/root/very-long-file-name.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 5,
+                    mode: 0o644,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }],
+                truncated: false,
+                total_dirs_scanned: 1,
+            },
+            64,
+        );
+
+        assert!(!resp.ok);
+        let detail = resp.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Efbig);
+        assert!(detail
+            .message
+            .contains("readdir_recursive response exceeds limit"));
     }
 }
