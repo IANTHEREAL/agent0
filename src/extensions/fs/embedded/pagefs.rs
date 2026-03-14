@@ -78,6 +78,7 @@ const STAGING_REFRESH_INTERVAL_SECS: i64 = 5 * 60;
 const INODE_ALLOC_BLOCK_SIZE: u64 = 1024;
 const BUNDLE_ALLOC_BLOCK_SIZE: u64 = 128;
 const INODE_BATCH_GET_CHUNK_SIZE: usize = 256;
+const PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES: u64 = 4 * 1024;
 const PACK_SPOOL_HEARTBEAT_FILE: &str = ".heartbeat";
 const INSTANCE_PROBE_INTERVAL_SECS: u64 = 5;
 
@@ -168,10 +169,71 @@ struct PendingBatchInlineReadPack {
 }
 
 #[derive(Debug, Clone)]
+struct PlannedBatchInlineReadPackWindowEntry {
+    result_idx: usize,
+    bundle_offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedBatchInlineReadPackWindow {
+    bundle_id: u64,
+    start_offset: u64,
+    end_offset: u64,
+    entries: Vec<PlannedBatchInlineReadPackWindowEntry>,
+}
+
+#[derive(Debug, Clone)]
 struct PendingBatchInlineReadObject {
     result_idx: usize,
     key: String,
     len: usize,
+}
+
+enum ResolvedFileReadPlan {
+    Ready(Vec<u8>),
+    Object {
+        key: String,
+        len: usize,
+    },
+    Pack {
+        manifest: BundleManifest,
+        bundle_id: u64,
+        bundle_offset: u64,
+        len: usize,
+    },
+}
+
+enum FileRangeReadPlan {
+    Ready(Vec<u8>),
+    Object {
+        key: String,
+        offset: u64,
+        len: usize,
+    },
+    Pack {
+        manifest: BundleManifest,
+        bundle_id: u64,
+        bundle_offset: u64,
+        file_offset: u64,
+        len: usize,
+    },
+}
+
+enum StreamReadPlan {
+    Inline {
+        txn: Transaction,
+        inode_id: u64,
+        inode: Inode,
+    },
+    Object {
+        key: String,
+    },
+    Pack {
+        manifest: BundleManifest,
+        bundle_offset: u64,
+        len: usize,
+    },
 }
 
 #[async_trait]
@@ -1245,17 +1307,136 @@ impl EmbeddedPageFs {
             return Ok(bytes);
         }
 
+        let bytes = self
+            .fetch_pack_range_with_s3(s3, manifest, read_offset, length, length_u64)
+            .await?;
+        self.bundle_cache
+            .insert(bundle_id, cache_offset, bytes.clone());
+        Ok(bytes)
+    }
+
+    async fn fetch_pack_range_with_s3(
+        &self,
+        s3: &FsS3Client,
+        manifest: &BundleManifest,
+        read_offset: u64,
+        length: usize,
+        expected_len_u64: u64,
+    ) -> Result<Bytes> {
         let bytes = s3
             .get_object_range_bytes(&manifest.key, read_offset, length)
             .await?;
-        if u64::try_from(bytes.len()).ok() != Some(length_u64) {
+        if u64::try_from(bytes.len()).ok() != Some(expected_len_u64) {
             return Err(anyhow!(EmbeddedFsError::internal(
                 "pack read returned an unexpected byte length",
             )));
         }
-        self.bundle_cache
-            .insert(bundle_id, cache_offset, bytes.clone());
         Ok(bytes)
+    }
+
+    fn split_pack_window_bytes(
+        window: &PlannedBatchInlineReadPackWindow,
+        window_bytes: Bytes,
+    ) -> Result<Vec<(usize, u64, Vec<u8>)>> {
+        let mut entry_results = Vec::with_capacity(window.entries.len());
+        for entry in &window.entries {
+            let relative_offset = entry
+                .bundle_offset
+                .checked_sub(window.start_offset)
+                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("pack read window underflow")))?;
+            let start = usize::try_from(relative_offset)
+                .map_err(|_| anyhow!(EmbeddedFsError::internal("pack read window exceeds usize")))?;
+            let end = start
+                .checked_add(entry.len)
+                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("pack read slice overflow")))?;
+            if end > window_bytes.len() {
+                return Err(anyhow!(EmbeddedFsError::internal(
+                    "pack read window returned an unexpected byte layout",
+                )));
+            }
+
+            let bytes = window_bytes.slice(start..end).to_vec();
+            entry_results.push((entry.result_idx, entry.bundle_offset, bytes));
+        }
+        Ok(entry_results)
+    }
+
+    async fn read_pack_window_entries_with_s3(
+        &self,
+        s3: &FsS3Client,
+        manifest: &BundleManifest,
+        window: PlannedBatchInlineReadPackWindow,
+    ) -> Vec<(usize, Result<Vec<u8>>)> {
+        let window_len_u64 = match window.end_offset.checked_sub(window.start_offset) {
+            Some(len) => len,
+            None => {
+                let err = anyhow!(EmbeddedFsError::internal("pack read window underflow"));
+                return window
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.result_idx, Err(clone_fs_error(&err))))
+                    .collect();
+            }
+        };
+        let window_len = match usize::try_from(window_len_u64) {
+            Ok(len) => len,
+            Err(_) => {
+                let err = anyhow!(EmbeddedFsError::internal("pack read window exceeds usize"));
+                return window
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.result_idx, Err(clone_fs_error(&err))))
+                    .collect();
+            }
+        };
+
+        let window_bytes = match self
+            .fetch_pack_range_with_s3(s3, manifest, window.start_offset, window_len, window_len_u64)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return window
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.result_idx, Err(clone_fs_error(&err))))
+                    .collect();
+            }
+        };
+
+        // Keep transport failures shared across the window; only retry per entry when a
+        // successful coalesced fetch returns an unexpected byte layout for slicing.
+        match Self::split_pack_window_bytes(&window, window_bytes) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|(idx, bundle_offset, data)| {
+                    self.bundle_cache.insert(
+                        window.bundle_id,
+                        bundle_offset,
+                        Bytes::copy_from_slice(&data),
+                    );
+                    (idx, Ok(data))
+                })
+                .collect(),
+            Err(_layout_err) => {
+                let mut results = Vec::with_capacity(window.entries.len());
+                for entry in window.entries {
+                    let result = self
+                        .read_pack_entry_bytes_with_s3(
+                            s3,
+                            manifest,
+                            window.bundle_id,
+                            entry.bundle_offset,
+                            0,
+                            entry.len,
+                        )
+                        .await
+                        .map(|bytes| bytes.to_vec());
+                    results.push((entry.result_idx, result));
+                }
+                results
+            }
+        }
     }
 
     async fn read_pack_entry_bytes(
@@ -1744,7 +1925,6 @@ impl EmbeddedPageFs {
     pub(crate) async fn stat(&self, path: &str) -> Result<Inode> {
         let mut txn = self.begin_read().await?;
         let (_, inode) = resolve_path(&mut txn, path).await?;
-        let _ = txn.rollback().await;
         Ok(inode)
     }
 
@@ -1843,7 +2023,6 @@ impl EmbeddedPageFs {
         }
 
         if total_planned > max_total_bytes as u64 {
-            let _ = txn.rollback().await;
             return Err(batch_inline_read_payload_too_large_error(
                 total_planned,
                 max_total_bytes,
@@ -1861,28 +2040,42 @@ impl EmbeddedPageFs {
             results[pending.result_idx] = Some(data);
         }
 
+        let mut uncached_pack_reads = Vec::new();
+        for pending in pack_reads {
+            if let Some(bytes) =
+                self.bundle_cache
+                    .get(pending.bundle_id, pending.bundle_offset, pending.len)
+            {
+                results[pending.result_idx] = Some(Ok(bytes.to_vec()));
+            } else {
+                uncached_pack_reads.push(pending);
+            }
+        }
+
+        let pack_windows =
+            plan_batch_inline_read_pack_windows(uncached_pack_reads, max_total_bytes)?;
         let mut manifests_by_bundle = HashMap::new();
-        for pending in &pack_reads {
-            if manifests_by_bundle.contains_key(&pending.bundle_id) {
+        for window in &pack_windows {
+            if manifests_by_bundle.contains_key(&window.bundle_id) {
                 continue;
             }
 
-            let manifest_result = match load_bundle_manifest(&mut txn, pending.bundle_id).await {
+            let manifest_result = match load_bundle_manifest(&mut txn, window.bundle_id).await {
                 Ok(Some(manifest)) => Ok(manifest),
                 Ok(None) => Err(anyhow!(EmbeddedFsError::internal(
                     "bundle manifest missing"
                 ))),
                 Err(err) => Err(err),
             };
-            manifests_by_bundle.insert(pending.bundle_id, manifest_result);
+            manifests_by_bundle.insert(window.bundle_id, manifest_result);
         }
 
-        let _ = txn.rollback().await;
+        drop(txn);
 
         let mut external_tasks = tokio::task::JoinSet::new();
         let concurrency = fs9_config().batch_stat_concurrency.max(1);
         let semaphore = Arc::new(Semaphore::new(concurrency));
-        let has_external_reads = !pack_reads.is_empty() || !object_reads.is_empty();
+        let has_external_reads = !pack_windows.is_empty() || !object_reads.is_empty();
         let mut shared_s3_error = None;
         let shared_s3 = if has_external_reads {
             match self.s3_client().await {
@@ -1902,8 +2095,10 @@ impl EmbeddedPageFs {
         };
 
         if let Some(err) = shared_s3_error.as_ref() {
-            for pending in &pack_reads {
-                results[pending.result_idx] = Some(Err(clone_fs_error(err)));
+            for window in &pack_windows {
+                for entry in &window.entries {
+                    results[entry.result_idx] = Some(Err(clone_fs_error(err)));
+                }
             }
             for pending in &object_reads {
                 results[pending.result_idx] = Some(Err(clone_fs_error(err)));
@@ -1911,40 +2106,38 @@ impl EmbeddedPageFs {
         }
 
         if let Some(s3) = shared_s3 {
-            for pending in pack_reads {
-                let permit = semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("batch_inline_read semaphore must not be closed");
-                let fs = self.clone();
-                match manifests_by_bundle.get(&pending.bundle_id) {
+            for window in pack_windows {
+                match manifests_by_bundle.get(&window.bundle_id) {
                     Some(Ok(manifest)) => {
+                        let permit = semaphore
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("batch_inline_read semaphore must not be closed");
+                        let fs = self.clone();
                         let manifest = manifest.clone();
                         let s3 = s3.clone();
                         external_tasks.spawn(async move {
                             let _permit = permit;
-                            let result = fs
-                                .read_pack_entry_bytes_with_s3(
-                                    s3.as_ref(),
-                                    &manifest,
-                                    pending.bundle_id,
-                                    pending.bundle_offset,
-                                    0,
-                                    pending.len,
-                                )
-                                .await
-                                .map(|bytes| bytes.to_vec());
-                            (pending.result_idx, result)
+                            fs.read_pack_window_entries_with_s3(
+                                s3.as_ref(),
+                                &manifest,
+                                window,
+                            )
+                            .await
                         });
                     }
                     Some(Err(err)) => {
-                        results[pending.result_idx] = Some(Err(clone_fs_error(err)));
+                        for entry in &window.entries {
+                            results[entry.result_idx] = Some(Err(clone_fs_error(err)));
+                        }
                     }
                     None => {
-                        results[pending.result_idx] = Some(Err(anyhow!(
-                            EmbeddedFsError::internal("bundle manifest plan missing")
-                        )));
+                        for entry in &window.entries {
+                            results[entry.result_idx] = Some(Err(anyhow!(
+                                EmbeddedFsError::internal("bundle manifest plan missing")
+                            )));
+                        }
                     }
                 }
             }
@@ -1965,18 +2158,20 @@ impl EmbeddedPageFs {
                         }
                         data
                     });
-                    (pending.result_idx, result)
+                    vec![(pending.result_idx, result)]
                 });
             }
 
             while let Some(join_result) = external_tasks.join_next().await {
-                let (idx, result) = match join_result {
-                    Ok(tuple) => tuple,
+                let task_entries = match join_result {
+                    Ok(entries) => entries,
                     Err(err) => {
                         return Err(anyhow!("batch_inline_read task failed: {err}"));
                     }
                 };
-                results[idx] = Some(result);
+                for (idx, result) in task_entries {
+                    results[idx] = Some(result);
+                }
             }
         }
 
@@ -2009,18 +2204,19 @@ impl EmbeddedPageFs {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let _ = txn.rollback().await;
         Ok(out)
     }
 
-    async fn read_resolved_file(
+    // Plan metadata under a TiKV snapshot, then execute any external object-store reads after the
+    // snapshot drops. Inline reads stay fully inside the metadata phase.
+    async fn plan_resolved_file_read(
         &self,
         txn: &mut Transaction,
         path: &str,
-        inode: &Inode,
-    ) -> Result<Vec<u8>> {
+        inode: Inode,
+        max_bytes: Option<usize>,
+    ) -> Result<ResolvedFileReadPlan> {
         if inode.is_directory() {
-            let _ = txn.rollback().await;
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
 
@@ -2029,79 +2225,181 @@ impl EmbeddedPageFs {
                 "file size exceeds addressable memory"
             ))
         })?;
-        let data = match &inode.data {
-            DataRef::Object { key, .. } => {
-                let key = key.clone();
-                let _ = txn.rollback().await;
-                let s3 = self
-                    .s3_client()
-                    .await?
-                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
-                let bytes = s3.get_object_bytes(&key).await?;
-                let mut data = bytes.to_vec();
-                if data.len() > file_len {
-                    data.truncate(file_len);
-                }
-                data
+        if let Some(max_bytes) = max_bytes {
+            if file_len > max_bytes {
+                return Err(anyhow!(
+                    "fs9: file too large: {path} (exceeded max {max_bytes} bytes)"
+                ));
             }
+        }
+
+        match &inode.data {
+            DataRef::Object { key, .. } => Ok(ResolvedFileReadPlan::Object {
+                key: key.clone(),
+                len: file_len,
+            }),
             DataRef::PackEntry {
                 bundle_id,
                 offset,
                 len,
                 ..
             } => {
-                let bundle_id = *bundle_id;
-                let bundle_offset = *offset;
+                let manifest = load_bundle_manifest(txn, *bundle_id)
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("bundle manifest missing")))?;
                 let entry_len = usize::try_from(*len).map_err(|_| {
                     anyhow!(EmbeddedFsError::internal("pack entry length exceeds usize"))
                 })?;
-                let manifest = load_bundle_manifest(txn, bundle_id)
+                Ok(ResolvedFileReadPlan::Pack {
+                    manifest,
+                    bundle_id: *bundle_id,
+                    bundle_offset: *offset,
+                    len: file_len.min(entry_len),
+                })
+            }
+            _ => Ok(ResolvedFileReadPlan::Ready(
+                read_file_range_from_txn(txn, inode.id, &inode, 0, file_len).await?,
+            )),
+        }
+    }
+
+    async fn execute_resolved_file_read_plan(&self, plan: ResolvedFileReadPlan) -> Result<Vec<u8>> {
+        match plan {
+            ResolvedFileReadPlan::Ready(data) => Ok(data),
+            ResolvedFileReadPlan::Object { key, len } => {
+                let s3 = self
+                    .s3_client()
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
+                let bytes = s3.get_object_bytes(&key).await?;
+                let mut data = bytes.to_vec();
+                if data.len() > len {
+                    data.truncate(len);
+                }
+                Ok(data)
+            }
+            ResolvedFileReadPlan::Pack {
+                manifest,
+                bundle_id,
+                bundle_offset,
+                len,
+            } => Ok(self
+                .read_pack_entry_bytes(&manifest, bundle_id, bundle_offset, 0, len)
+                .await?
+                .to_vec()),
+        }
+    }
+
+    async fn plan_file_range_read(
+        &self,
+        txn: &mut Transaction,
+        path: &str,
+        inode: Inode,
+        offset: u64,
+        length: usize,
+    ) -> Result<FileRangeReadPlan> {
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        if offset >= inode.size || length == 0 {
+            return Ok(FileRangeReadPlan::Ready(Vec::new()));
+        }
+
+        match &inode.data {
+            DataRef::Object { key, .. } => {
+                let available = inode.size - offset;
+                let len = usize::try_from(available.min(length as u64)).map_err(|_| {
+                    anyhow!(EmbeddedFsError::internal(
+                        "read length exceeds addressable memory"
+                    ))
+                })?;
+                Ok(FileRangeReadPlan::Object {
+                    key: key.clone(),
+                    offset,
+                    len,
+                })
+            }
+            DataRef::PackEntry {
+                bundle_id,
+                offset: bundle_offset,
+                len,
+                ..
+            } => {
+                let manifest = load_bundle_manifest(txn, *bundle_id)
                     .await?
                     .ok_or_else(|| anyhow!(EmbeddedFsError::internal("bundle manifest missing")))?;
-                let _ = txn.rollback().await;
-                let bytes = self
-                    .read_pack_entry_bytes(
-                        &manifest,
-                        bundle_id,
-                        bundle_offset,
-                        0,
-                        file_len.min(entry_len),
-                    )
-                    .await?;
-                bytes.to_vec()
+                let entry_size = u64::from(*len);
+                let available = entry_size.saturating_sub(offset);
+                let len = usize::try_from(available.min(length as u64)).map_err(|_| {
+                    anyhow!(EmbeddedFsError::internal(
+                        "pack read length exceeds addressable memory",
+                    ))
+                })?;
+                Ok(FileRangeReadPlan::Pack {
+                    manifest,
+                    bundle_id: *bundle_id,
+                    bundle_offset: *bundle_offset,
+                    file_offset: offset,
+                    len,
+                })
             }
-            _ => {
-                let data = read_file_range_from_txn(txn, inode.id, inode, 0, file_len).await?;
-                let _ = txn.rollback().await;
-                return Ok(data);
-            }
-        };
+            _ => Ok(FileRangeReadPlan::Ready(
+                read_file_range_from_txn(txn, inode.id, &inode, offset, length).await?,
+            )),
+        }
+    }
 
-        Ok(data)
+    async fn execute_file_range_read_plan(&self, plan: FileRangeReadPlan) -> Result<Vec<u8>> {
+        match plan {
+            FileRangeReadPlan::Ready(data) => Ok(data),
+            FileRangeReadPlan::Object { key, offset, len } => {
+                if len == 0 {
+                    return Ok(Vec::new());
+                }
+                let s3 = self
+                    .s3_client()
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
+                Ok(s3.get_object_range_bytes(&key, offset, len).await?.to_vec())
+            }
+            FileRangeReadPlan::Pack {
+                manifest,
+                bundle_id,
+                bundle_offset,
+                file_offset,
+                len,
+            } => {
+                if len == 0 {
+                    return Ok(Vec::new());
+                }
+                Ok(self
+                    .read_pack_entry_bytes(&manifest, bundle_id, bundle_offset, file_offset, len)
+                    .await?
+                    .to_vec())
+            }
+        }
     }
 
     pub(crate) async fn read_file_capped(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let mut txn = self.begin_read().await?;
-        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
-        let file_len = usize::try_from(inode.size).map_err(|_| {
-            anyhow!(EmbeddedFsError::internal(
-                "file size exceeds addressable memory"
-            ))
-        })?;
-        if file_len > max_bytes {
-            let _ = txn.rollback().await;
-            return Err(anyhow!(
-                "fs9: file too large: {path} (exceeded max {max_bytes} bytes)"
-            ));
-        }
-        self.read_resolved_file(&mut txn, path, &inode).await
+        let plan = {
+            let mut txn = self.begin_read().await?;
+            let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+            self.plan_resolved_file_read(&mut txn, path, inode, Some(max_bytes))
+                .await?
+        };
+        self.execute_resolved_file_read_plan(plan).await
     }
 
     #[cfg(test)]
     pub(crate) async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let mut txn = self.begin_read().await?;
-        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
-        self.read_resolved_file(&mut txn, path, &inode).await
+        let plan = {
+            let mut txn = self.begin_read().await?;
+            let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+            self.plan_resolved_file_read(&mut txn, path, inode, None)
+                .await?
+        };
+        self.execute_resolved_file_read_plan(plan).await
     }
 
     pub(crate) async fn read_file_at(
@@ -2110,73 +2408,13 @@ impl EmbeddedPageFs {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let mut txn = self.begin_read().await?;
-        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
-        if inode.is_directory() {
-            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
-        }
-
-        if offset >= inode.size || length == 0 {
-            let _ = txn.rollback().await;
-            return Ok(Vec::new());
-        }
-
-        let data = match &inode.data {
-            DataRef::Object { key, .. } => {
-                let key = key.clone();
-                let file_size = inode.size;
-                let _ = txn.rollback().await;
-
-                if offset >= file_size || length == 0 {
-                    return Ok(Vec::new());
-                }
-                let available = file_size - offset;
-                let actual_len = usize::try_from(available.min(length as u64)).map_err(|_| {
-                    anyhow!(EmbeddedFsError::internal(
-                        "read length exceeds addressable memory"
-                    ))
-                })?;
-
-                let s3 = self
-                    .s3_client()
-                    .await?
-                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
-                s3.get_object_range_bytes(&key, offset, actual_len)
-                    .await?
-                    .to_vec()
-            }
-            DataRef::PackEntry {
-                bundle_id,
-                offset: bundle_offset,
-                len,
-                ..
-            } => {
-                let bundle_id = *bundle_id;
-                let bundle_offset = *bundle_offset;
-                let entry_size = u64::from(*len);
-                let manifest = load_bundle_manifest(&mut txn, bundle_id)
-                    .await?
-                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("bundle manifest missing")))?;
-                let _ = txn.rollback().await;
-                let available = entry_size.saturating_sub(offset);
-                let actual_len = usize::try_from(available.min(length as u64)).map_err(|_| {
-                    anyhow!(EmbeddedFsError::internal(
-                        "pack read length exceeds addressable memory",
-                    ))
-                })?;
-                self.read_pack_entry_bytes(&manifest, bundle_id, bundle_offset, offset, actual_len)
-                    .await?
-                    .to_vec()
-            }
-            _ => {
-                let data =
-                    read_file_range_from_txn(&mut txn, inode.id, &inode, offset, length).await?;
-                let _ = txn.rollback().await;
-                return Ok(data);
-            }
+        let plan = {
+            let mut txn = self.begin_read().await?;
+            let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+            self.plan_file_range_read(&mut txn, path, inode, offset, length)
+                .await?
         };
-
-        Ok(data)
+        self.execute_file_range_read_plan(plan).await
     }
 
     pub(crate) async fn read_file_stream(
@@ -2201,13 +2439,13 @@ impl EmbeddedPageFs {
             ));
         }
 
+        let plan = self.plan_stream_read(txn, inode_id, inode).await?;
         let (tx, rx) = mpsc::channel(8);
-        let stream_path = path.to_string();
         let fs = self.clone();
         let err_sender = tx.clone();
         tokio::spawn(async move {
             if let Err(err) = fs
-                .stream_resolved_inode_into_channel(txn, inode_id, inode, stream_path, tx)
+                .stream_read_plan_into_channel(plan, tx)
                 .await
             {
                 let _ = err_sender
@@ -3117,8 +3355,8 @@ impl EmbeddedPageFs {
 
     pub(crate) async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload> {
         let normalized = normalize_path(path);
-        let mut txn = self.begin_read().await?;
-        let result: Result<(String, FsStorage, u64)> = async {
+        let (key, storage, size) = {
+            let mut txn = self.begin_read().await?;
             let (_inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
             if inode.is_directory() {
                 return Err(anyhow!(EmbeddedFsError::is_directory(&normalized)));
@@ -3132,19 +3370,7 @@ impl EmbeddedPageFs {
                     )))
                 }
             };
-            Ok((key, storage, inode.size))
-        }
-        .await;
-
-        let (key, storage, size) = match result {
-            Ok(value) => {
-                txn.rollback().await?;
-                value
-            }
-            Err(err) => {
-                let _ = txn.rollback().await;
-                return Err(err);
-            }
+            (key, storage, inode.size)
         };
 
         let ttl_secs = fs9_config().presign_ttl_secs.max(1);
@@ -3458,29 +3684,52 @@ impl EmbeddedPageFs {
         Ok(())
     }
 
-    async fn stream_resolved_inode_into_channel(
+    async fn plan_stream_read(
         &self,
         mut txn: Transaction,
         inode_id: u64,
         inode: Inode,
-        path: String,
+    ) -> Result<StreamReadPlan> {
+        match &inode.data {
+            DataRef::Object { key, .. } => Ok(StreamReadPlan::Object { key: key.clone() }),
+            DataRef::PackEntry {
+                bundle_id,
+                offset,
+                len,
+                ..
+            } => {
+                let manifest = load_bundle_manifest(&mut txn, *bundle_id)
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("bundle manifest missing")))?;
+                let entry_len = usize::try_from(*len).map_err(|_| {
+                    anyhow!(EmbeddedFsError::internal("pack entry length exceeds usize"))
+                })?;
+                Ok(StreamReadPlan::Pack {
+                    manifest,
+                    bundle_offset: *offset,
+                    len: entry_len.min(usize::try_from(inode.size).unwrap_or(entry_len)),
+                })
+            }
+            _ => Ok(StreamReadPlan::Inline {
+                txn,
+                inode_id,
+                inode,
+            }),
+        }
+    }
+
+    async fn stream_read_plan_into_channel(
+        &self,
+        plan: StreamReadPlan,
         sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
     ) -> Result<()> {
-        if inode.is_directory() {
-            return Err(anyhow!(EmbeddedFsError::is_directory(&path)));
-        }
-
-        match &inode.data {
-            DataRef::Object { key, .. } => {
-                let key = key.clone();
-                let _ = txn.rollback().await;
-
+        match plan {
+            StreamReadPlan::Object { key } => {
                 let s3 = self
                     .s3_client()
                     .await?
                     .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
                 let mut reader = s3.get_object_stream(&key).await?;
-
                 let mut buf = vec![0u8; STREAM_READ_CHUNK_BYTES];
                 loop {
                     let n = reader.read(&mut buf).await?;
@@ -3491,77 +3740,73 @@ impl EmbeddedPageFs {
                         break;
                     }
                 }
-                return Ok(());
+                Ok(())
             }
-            DataRef::PackEntry {
-                bundle_id,
-                offset,
+            StreamReadPlan::Pack {
+                manifest,
+                bundle_offset,
                 len,
-                ..
             } => {
-                let bundle_id = *bundle_id;
-                let bundle_offset = *offset;
-                let entry_len = usize::try_from(*len).map_err(|_| {
-                    anyhow!(EmbeddedFsError::internal("pack entry length exceeds usize"))
-                })?;
-                let manifest = load_bundle_manifest(&mut txn, bundle_id)
+                if len == 0 {
+                    return Ok(());
+                }
+                let s3 = self
+                    .s3_client()
                     .await?
-                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("bundle manifest missing")))?;
-                let _ = txn.rollback().await;
-
-                let actual_len = entry_len.min(usize::try_from(inode.size).unwrap_or(entry_len));
-                if actual_len > 0 {
-                    let s3 = self.s3_client().await?.ok_or_else(|| {
-                        anyhow!(EmbeddedFsError::internal("S3 is not configured"))
-                    })?;
-                    let mut reader = s3
-                        .get_object_range_stream(&manifest.key, bundle_offset, actual_len)
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
+                let mut reader = s3
+                    .get_object_range_stream(&manifest.key, bundle_offset, len)
+                    .await?;
+                let mut remaining = len;
+                let mut buf = vec![0u8; STREAM_READ_CHUNK_BYTES];
+                while remaining > 0 {
+                    if sender.is_closed() {
+                        break;
+                    }
+                    let n = reader
+                        .read(&mut buf[..STREAM_READ_CHUNK_BYTES.min(remaining)])
                         .await?;
-                    let mut remaining = actual_len;
-                    let mut buf = vec![0u8; STREAM_READ_CHUNK_BYTES];
-                    while remaining > 0 {
-                        if sender.is_closed() {
-                            break;
-                        }
-                        let n = reader
-                            .read(&mut buf[..STREAM_READ_CHUNK_BYTES.min(remaining)])
-                            .await?;
-                        if n == 0 {
-                            return Err(anyhow!(EmbeddedFsError::internal(
-                                "pack entry range read ended early"
-                            )));
-                        }
-                        remaining = remaining.saturating_sub(n);
-                        if sender.send(Ok(buf[..n].to_vec())).await.is_err() {
-                            break;
-                        }
+                    if n == 0 {
+                        return Err(anyhow!(EmbeddedFsError::internal(
+                            "pack entry range read ended early"
+                        )));
+                    }
+                    remaining = remaining.saturating_sub(n);
+                    if sender.send(Ok(buf[..n].to_vec())).await.is_err() {
+                        break;
                     }
                 }
-                return Ok(());
+                Ok(())
             }
-            _ => {}
-        }
+            StreamReadPlan::Inline {
+                mut txn,
+                inode_id,
+                inode,
+            } => {
+                let mut offset = 0u64;
+                let file_size = inode.size;
+                while offset < file_size {
+                    let remaining = file_size - offset;
+                    let chunk_len =
+                        usize::try_from(remaining.min(STREAM_READ_CHUNK_BYTES as u64)).map_err(
+                            |_| anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize")),
+                        )?;
+                    let chunk =
+                        read_file_range_from_txn(&mut txn, inode_id, &inode, offset, chunk_len)
+                            .await?;
 
-        let mut offset = 0u64;
-        let file_size = inode.size;
-        while offset < file_size {
-            let remaining = file_size - offset;
-            let chunk_len = usize::try_from(remaining.min(STREAM_READ_CHUNK_BYTES as u64))
-                .map_err(|_| anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize")))?;
-            let chunk =
-                read_file_range_from_txn(&mut txn, inode_id, &inode, offset, chunk_len).await?;
+                    if sender.send(Ok(chunk)).await.is_err() {
+                        break;
+                    }
 
-            if sender.send(Ok(chunk)).await.is_err() {
-                break;
+                    offset = offset.checked_add(chunk_len as u64).ok_or_else(|| {
+                        anyhow!(EmbeddedFsError::internal("stream offset overflow"))
+                    })?;
+                }
+
+                Ok(())
             }
-
-            offset = offset
-                .checked_add(chunk_len as u64)
-                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("stream offset overflow")))?;
         }
-
-        let _ = txn.rollback().await;
-        Ok(())
     }
 
     async fn flush_staged_write_chunk(
@@ -4397,6 +4642,8 @@ async fn begin_transaction(client: &Arc<TransactionClient>) -> Result<Transactio
 }
 
 async fn begin_read_transaction(client: &Arc<TransactionClient>) -> Result<Transaction> {
+    // TiKV read-only transactions are snapshot handles. They finish on drop;
+    // explicit rollback() is invalid for this transaction status.
     let options = TransactionOptions::new_optimistic()
         .read_only()
         .drop_check(CheckLevel::Warn);
@@ -4775,6 +5022,93 @@ fn clone_fs_error(err: &anyhow::Error) -> anyhow::Error {
     } else {
         anyhow!(err.to_string())
     }
+}
+
+fn pack_read_end_offset(offset: u64, len: usize) -> Result<u64> {
+    let len_u64 = u64::try_from(len)
+        .map_err(|_| anyhow!(EmbeddedFsError::internal("pack read length exceeds u64")))?;
+    offset
+        .checked_add(len_u64)
+        .ok_or_else(|| anyhow!(EmbeddedFsError::internal("pack read offset overflow")))
+}
+
+fn plan_batch_inline_read_pack_windows(
+    pack_reads: Vec<PendingBatchInlineReadPack>,
+    max_window_bytes: usize,
+) -> Result<Vec<PlannedBatchInlineReadPackWindow>> {
+    if pack_reads.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_window_bytes_u64 = u64::try_from(max_window_bytes)
+        .map_err(|_| anyhow!(EmbeddedFsError::internal("pack read window exceeds u64")))?;
+    let mut by_bundle: HashMap<u64, Vec<PendingBatchInlineReadPack>> = HashMap::new();
+    for pending in pack_reads {
+        by_bundle.entry(pending.bundle_id).or_default().push(pending);
+    }
+
+    let mut bundle_ids = by_bundle.keys().copied().collect::<Vec<_>>();
+    bundle_ids.sort_unstable();
+
+    let mut windows = Vec::new();
+    for bundle_id in bundle_ids {
+        let mut entries = by_bundle
+            .remove(&bundle_id)
+            .expect("bundle id must exist while planning pack windows");
+        entries.sort_by_key(|entry| entry.bundle_offset);
+
+        let mut current: Option<PlannedBatchInlineReadPackWindow> = None;
+        for entry in entries {
+            let entry_end = pack_read_end_offset(entry.bundle_offset, entry.len)?;
+            let merge_plan = match current.as_ref() {
+                Some(window) => {
+                    let gap = entry.bundle_offset.saturating_sub(window.end_offset);
+                    let merged_end = window.end_offset.max(entry_end);
+                    let merged_len = merged_end.checked_sub(window.start_offset).ok_or_else(|| {
+                        anyhow!(EmbeddedFsError::internal("pack read window underflow"))
+                    })?;
+                    Some((
+                        gap <= PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES
+                            && merged_len <= max_window_bytes_u64,
+                        merged_end,
+                    ))
+                }
+                None => None,
+            };
+
+            if let Some((true, merged_end)) = merge_plan {
+                let window = current
+                    .as_mut()
+                    .expect("current window must exist while merging pack reads");
+                window.end_offset = merged_end;
+                window.entries.push(PlannedBatchInlineReadPackWindowEntry {
+                    result_idx: entry.result_idx,
+                    bundle_offset: entry.bundle_offset,
+                    len: entry.len,
+                });
+            } else {
+                if let Some(window) = current.take() {
+                    windows.push(window);
+                }
+                current = Some(PlannedBatchInlineReadPackWindow {
+                    bundle_id,
+                    start_offset: entry.bundle_offset,
+                    end_offset: entry_end,
+                    entries: vec![PlannedBatchInlineReadPackWindowEntry {
+                        result_idx: entry.result_idx,
+                        bundle_offset: entry.bundle_offset,
+                        len: entry.len,
+                    }],
+                });
+            }
+        }
+
+        if let Some(window) = current.take() {
+            windows.push(window);
+        }
+    }
+
+    Ok(windows)
 }
 
 fn fail_batch_stat_requests(
@@ -6149,6 +6483,138 @@ mod tests {
             .expect_err("pending entry must be converted to per-entry failure");
         assert!(
             err.to_string().contains("tikv read failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn pending_pack(
+        result_idx: usize,
+        bundle_id: u64,
+        bundle_offset: u64,
+        len: usize,
+    ) -> PendingBatchInlineReadPack {
+        PendingBatchInlineReadPack {
+            result_idx,
+            bundle_id,
+            bundle_offset,
+            len,
+        }
+    }
+
+    fn planned_pack_window(
+        bundle_id: u64,
+        start_offset: u64,
+        end_offset: u64,
+        entries: &[(usize, u64, usize)],
+    ) -> PlannedBatchInlineReadPackWindow {
+        PlannedBatchInlineReadPackWindow {
+            bundle_id,
+            start_offset,
+            end_offset,
+            entries: entries
+                .iter()
+                .map(|(result_idx, bundle_offset, len)| PlannedBatchInlineReadPackWindowEntry {
+                    result_idx: *result_idx,
+                    bundle_offset: *bundle_offset,
+                    len: *len,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_plan_batch_inline_read_pack_windows_merges_small_gaps_within_bundle() {
+        let windows = plan_batch_inline_read_pack_windows(
+            vec![
+                pending_pack(0, 7, 0, 8),
+                pending_pack(1, 7, 10, 4),
+                pending_pack(2, 7, 20, 4),
+            ],
+            64,
+        )
+        .unwrap();
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].bundle_id, 7);
+        assert_eq!(windows[0].start_offset, 0);
+        assert_eq!(windows[0].end_offset, 24);
+        assert_eq!(windows[0].entries.len(), 3);
+        assert_eq!(windows[0].entries[0].result_idx, 0);
+        assert_eq!(windows[0].entries[1].result_idx, 1);
+        assert_eq!(windows[0].entries[2].result_idx, 2);
+    }
+
+    #[test]
+    fn test_plan_batch_inline_read_pack_windows_does_not_merge_across_bundle_or_large_gap() {
+        let windows = plan_batch_inline_read_pack_windows(
+            vec![
+                pending_pack(0, 7, 0, 8),
+                pending_pack(1, 7, PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES + 9, 4),
+                pending_pack(2, 8, 0, 4),
+            ],
+            128,
+        )
+        .unwrap();
+
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].bundle_id, 7);
+        assert_eq!(windows[0].start_offset, 0);
+        assert_eq!(windows[0].end_offset, 8);
+        assert_eq!(windows[1].bundle_id, 7);
+        assert_eq!(
+            windows[1].start_offset,
+            PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES + 9
+        );
+        assert_eq!(
+            windows[1].end_offset,
+            PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES + 13
+        );
+        assert_eq!(windows[2].bundle_id, 8);
+        assert_eq!(windows[2].start_offset, 0);
+        assert_eq!(windows[2].end_offset, 4);
+    }
+
+    #[test]
+    fn test_plan_batch_inline_read_pack_windows_respects_window_cap() {
+        let windows = plan_batch_inline_read_pack_windows(
+            vec![pending_pack(0, 7, 0, 8), pending_pack(1, 7, 8, 8)],
+            12,
+        )
+        .unwrap();
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].start_offset, 0);
+        assert_eq!(windows[0].end_offset, 8);
+        assert_eq!(windows[1].start_offset, 8);
+        assert_eq!(windows[1].end_offset, 16);
+    }
+
+    #[test]
+    fn test_split_pack_window_bytes_returns_expected_entry_payloads() {
+        let window = planned_pack_window(7, 10, 20, &[(0, 10, 4), (1, 16, 4)]);
+        let entries = EmbeddedPageFs::split_pack_window_bytes(
+            &window,
+            Bytes::from_static(b"abcdefghij"),
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 0);
+        assert_eq!(entries[0].1, 10);
+        assert_eq!(entries[0].2, b"abcd".to_vec());
+        assert_eq!(entries[1].0, 1);
+        assert_eq!(entries[1].1, 16);
+        assert_eq!(entries[1].2, b"ghij".to_vec());
+    }
+
+    #[test]
+    fn test_split_pack_window_bytes_rejects_short_window_payload() {
+        let window = planned_pack_window(7, 10, 20, &[(0, 10, 4), (1, 16, 4)]);
+        let err = EmbeddedPageFs::split_pack_window_bytes(&window, Bytes::from_static(b"abcdefg"))
+            .expect_err("short window payload must fail");
+        assert!(
+            err.to_string()
+                .contains("pack read window returned an unexpected byte layout"),
             "unexpected error: {err}"
         );
     }
