@@ -1,4 +1,5 @@
 use crate::extensions::fs::backend::{
+    batch_inline_read_entry_too_large_error, batch_inline_read_payload_too_large_error,
     FsBatchWriteEntry, FsBatchWriteFile, FsCreateUpload, FsMultipartCompletedPart,
     FsPreparedDownload, FsPresignedRequest, FsStorage, FsWriteStream, FsWriteStreamOptions,
 };
@@ -28,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tikv_client::{CheckLevel, Key, Transaction, TransactionClient, TransactionOptions};
 use tokio::fs;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
-use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell, Semaphore};
 use tokio::time::sleep;
 use tracing::warn;
 
@@ -150,6 +151,27 @@ struct PendingBatchStat {
 struct DirLookupRequest {
     parent_inode: u64,
     name: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBatchInlineReadInline {
+    result_idx: usize,
+    inode: Inode,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBatchInlineReadPack {
+    result_idx: usize,
+    bundle_id: u64,
+    bundle_offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBatchInlineReadObject {
+    result_idx: usize,
+    key: String,
+    len: usize,
 }
 
 #[async_trait]
@@ -1200,8 +1222,9 @@ impl EmbeddedPageFs {
         Ok(())
     }
 
-    async fn read_pack_entry_bytes(
+    async fn read_pack_entry_bytes_with_s3(
         &self,
+        s3: &FsS3Client,
         manifest: &BundleManifest,
         bundle_id: u64,
         bundle_offset: u64,
@@ -1222,10 +1245,6 @@ impl EmbeddedPageFs {
             return Ok(bytes);
         }
 
-        let s3 = self
-            .s3_client()
-            .await?
-            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
         let bytes = s3
             .get_object_range_bytes(&manifest.key, read_offset, length)
             .await?;
@@ -1237,6 +1256,29 @@ impl EmbeddedPageFs {
         self.bundle_cache
             .insert(bundle_id, cache_offset, bytes.clone());
         Ok(bytes)
+    }
+
+    async fn read_pack_entry_bytes(
+        &self,
+        manifest: &BundleManifest,
+        bundle_id: u64,
+        bundle_offset: u64,
+        file_offset: u64,
+        length: usize,
+    ) -> Result<Bytes> {
+        let s3 = self
+            .s3_client()
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
+        self.read_pack_entry_bytes_with_s3(
+            s3.as_ref(),
+            manifest,
+            bundle_id,
+            bundle_offset,
+            file_offset,
+            length,
+        )
+        .await
     }
 
     fn maybe_start_background_maintenance(&self) {
@@ -1714,6 +1756,238 @@ impl EmbeddedPageFs {
         result
     }
 
+    pub(crate) async fn batch_inline_read(
+        &self,
+        paths: &[String],
+        max_file_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<Result<Vec<u8>>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results: Vec<Option<Result<Vec<u8>>>> =
+            std::iter::repeat_with(|| None).take(paths.len()).collect();
+        let mut inline_reads = Vec::new();
+        let mut pack_reads = Vec::new();
+        let mut object_reads = Vec::new();
+        let mut total_planned = 0u64;
+
+        let mut txn = self.begin_read().await?;
+        let resolved = {
+            let mut store = TxnBatchStatStore { txn: &mut txn };
+            resolve_paths_batched(&mut store, paths).await
+        };
+
+        for (idx, inode_result) in resolved.into_iter().enumerate() {
+            let path = &paths[idx];
+            let inode = match inode_result {
+                Ok(inode) => inode,
+                Err(err) => {
+                    results[idx] = Some(Err(err));
+                    continue;
+                }
+            };
+
+            if inode.is_directory() {
+                results[idx] = Some(Err(anyhow!(EmbeddedFsError::is_directory(path))));
+                continue;
+            }
+
+            if inode.size > max_file_bytes as u64 {
+                results[idx] = Some(Err(batch_inline_read_entry_too_large_error(
+                    inode.size,
+                    max_file_bytes,
+                )));
+                continue;
+            }
+
+            total_planned = total_planned.saturating_add(inode.size);
+            let file_len = usize::try_from(inode.size).map_err(|_| {
+                anyhow!(EmbeddedFsError::internal(
+                    "file size exceeds addressable memory"
+                ))
+            })?;
+
+            match &inode.data {
+                DataRef::InlineBlob | DataRef::None => {
+                    inline_reads.push(PendingBatchInlineReadInline {
+                        result_idx: idx,
+                        inode,
+                    })
+                }
+                DataRef::PackEntry {
+                    bundle_id,
+                    offset,
+                    len,
+                    ..
+                } => pack_reads.push(PendingBatchInlineReadPack {
+                    result_idx: idx,
+                    bundle_id: *bundle_id,
+                    bundle_offset: *offset,
+                    len: file_len.min(usize::try_from(*len).map_err(|_| {
+                        anyhow!(EmbeddedFsError::internal("pack entry length exceeds usize"))
+                    })?),
+                }),
+                DataRef::Object { key, .. } => object_reads.push(PendingBatchInlineReadObject {
+                    result_idx: idx,
+                    key: key.clone(),
+                    len: file_len,
+                }),
+                DataRef::StagingPages => {
+                    results[idx] = Some(Err(anyhow!(EmbeddedFsError::internal(
+                        "published read reached internal staging pages",
+                    ))));
+                }
+            }
+        }
+
+        if total_planned > max_total_bytes as u64 {
+            let _ = txn.rollback().await;
+            return Err(batch_inline_read_payload_too_large_error(
+                total_planned,
+                max_total_bytes,
+            ));
+        }
+
+        for pending in inline_reads {
+            let len = usize::try_from(pending.inode.size).map_err(|_| {
+                anyhow!(EmbeddedFsError::internal(
+                    "file size exceeds addressable memory"
+                ))
+            })?;
+            let data =
+                read_file_range_from_txn(&mut txn, pending.inode.id, &pending.inode, 0, len).await;
+            results[pending.result_idx] = Some(data);
+        }
+
+        let mut manifests_by_bundle = HashMap::new();
+        for pending in &pack_reads {
+            if manifests_by_bundle.contains_key(&pending.bundle_id) {
+                continue;
+            }
+
+            let manifest_result = match load_bundle_manifest(&mut txn, pending.bundle_id).await {
+                Ok(Some(manifest)) => Ok(manifest),
+                Ok(None) => Err(anyhow!(EmbeddedFsError::internal(
+                    "bundle manifest missing"
+                ))),
+                Err(err) => Err(err),
+            };
+            manifests_by_bundle.insert(pending.bundle_id, manifest_result);
+        }
+
+        let _ = txn.rollback().await;
+
+        let mut external_tasks = tokio::task::JoinSet::new();
+        let concurrency = fs9_config().batch_stat_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let has_external_reads = !pack_reads.is_empty() || !object_reads.is_empty();
+        let mut shared_s3_error = None;
+        let shared_s3 = if has_external_reads {
+            match self.s3_client().await {
+                Ok(Some(s3)) => Some(s3),
+                Ok(None) => {
+                    shared_s3_error =
+                        Some(anyhow!(EmbeddedFsError::internal("S3 is not configured")));
+                    None
+                }
+                Err(err) => {
+                    shared_s3_error = Some(err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(err) = shared_s3_error.as_ref() {
+            for pending in &pack_reads {
+                results[pending.result_idx] = Some(Err(clone_fs_error(err)));
+            }
+            for pending in &object_reads {
+                results[pending.result_idx] = Some(Err(clone_fs_error(err)));
+            }
+        }
+
+        if let Some(s3) = shared_s3 {
+            for pending in pack_reads {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("batch_inline_read semaphore must not be closed");
+                let fs = self.clone();
+                match manifests_by_bundle.get(&pending.bundle_id) {
+                    Some(Ok(manifest)) => {
+                        let manifest = manifest.clone();
+                        let s3 = s3.clone();
+                        external_tasks.spawn(async move {
+                            let _permit = permit;
+                            let result = fs
+                                .read_pack_entry_bytes_with_s3(
+                                    s3.as_ref(),
+                                    &manifest,
+                                    pending.bundle_id,
+                                    pending.bundle_offset,
+                                    0,
+                                    pending.len,
+                                )
+                                .await
+                                .map(|bytes| bytes.to_vec());
+                            (pending.result_idx, result)
+                        });
+                    }
+                    Some(Err(err)) => {
+                        results[pending.result_idx] = Some(Err(clone_fs_error(err)));
+                    }
+                    None => {
+                        results[pending.result_idx] = Some(Err(anyhow!(
+                            EmbeddedFsError::internal("bundle manifest plan missing")
+                        )));
+                    }
+                }
+            }
+
+            for pending in object_reads {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("batch_inline_read semaphore must not be closed");
+                let s3 = s3.clone();
+                external_tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = s3.get_object_bytes(&pending.key).await.map(|bytes| {
+                        let mut data = bytes.to_vec();
+                        if data.len() > pending.len {
+                            data.truncate(pending.len);
+                        }
+                        data
+                    });
+                    (pending.result_idx, result)
+                });
+            }
+
+            while let Some(join_result) = external_tasks.join_next().await {
+                let (idx, result) = match join_result {
+                    Ok(tuple) => tuple,
+                    Err(err) => {
+                        return Err(anyhow!("batch_inline_read task failed: {err}"));
+                    }
+                };
+                results[idx] = Some(result);
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|entry| {
+                entry.expect("batch_inline_read must produce a result entry for each input path")
+            })
+            .collect())
+    }
+
     pub(crate) async fn readdir(&self, path: &str) -> Result<Vec<(String, Inode)>> {
         let mut txn = self.begin_read().await?;
         let (inode_id, inode) = resolve_path(&mut txn, path).await?;
@@ -1739,10 +2013,14 @@ impl EmbeddedPageFs {
         Ok(out)
     }
 
-    pub(crate) async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let mut txn = self.begin_read().await?;
-        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+    async fn read_resolved_file(
+        &self,
+        txn: &mut Transaction,
+        path: &str,
+        inode: &Inode,
+    ) -> Result<Vec<u8>> {
         if inode.is_directory() {
+            let _ = txn.rollback().await;
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
 
@@ -1777,7 +2055,7 @@ impl EmbeddedPageFs {
                 let entry_len = usize::try_from(*len).map_err(|_| {
                     anyhow!(EmbeddedFsError::internal("pack entry length exceeds usize"))
                 })?;
-                let manifest = load_bundle_manifest(&mut txn, bundle_id)
+                let manifest = load_bundle_manifest(txn, bundle_id)
                     .await?
                     .ok_or_else(|| anyhow!(EmbeddedFsError::internal("bundle manifest missing")))?;
                 let _ = txn.rollback().await;
@@ -1793,14 +2071,37 @@ impl EmbeddedPageFs {
                 bytes.to_vec()
             }
             _ => {
-                let data =
-                    read_file_range_from_txn(&mut txn, inode.id, &inode, 0, file_len).await?;
+                let data = read_file_range_from_txn(txn, inode.id, inode, 0, file_len).await?;
                 let _ = txn.rollback().await;
                 return Ok(data);
             }
         };
 
         Ok(data)
+    }
+
+    pub(crate) async fn read_file_capped(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let mut txn = self.begin_read().await?;
+        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+        let file_len = usize::try_from(inode.size).map_err(|_| {
+            anyhow!(EmbeddedFsError::internal(
+                "file size exceeds addressable memory"
+            ))
+        })?;
+        if file_len > max_bytes {
+            let _ = txn.rollback().await;
+            return Err(anyhow!(
+                "fs9: file too large: {path} (exceeded max {max_bytes} bytes)"
+            ));
+        }
+        self.read_resolved_file(&mut txn, path, &inode).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let mut txn = self.begin_read().await?;
+        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+        self.read_resolved_file(&mut txn, path, &inode).await
     }
 
     pub(crate) async fn read_file_at(
@@ -4468,7 +4769,7 @@ async fn list_dir(txn: &mut Transaction, parent_inode: u64) -> Result<Vec<(Strin
     Ok(out)
 }
 
-fn clone_batch_stat_error(err: &anyhow::Error) -> anyhow::Error {
+fn clone_fs_error(err: &anyhow::Error) -> anyhow::Error {
     if let Some(fs_err) = err.downcast_ref::<EmbeddedFsError>() {
         anyhow!(fs_err.clone())
     } else {
@@ -4482,7 +4783,7 @@ fn fail_batch_stat_requests(
     err: &anyhow::Error,
 ) {
     for idx in request_indices {
-        results[idx] = Some(Err(clone_batch_stat_error(err)));
+        results[idx] = Some(Err(clone_fs_error(err)));
     }
 }
 
@@ -4608,7 +4909,7 @@ where
                     continue;
                 }
                 Err(err) => {
-                    results[step.request_idx] = Some(Err(clone_batch_stat_error(err)));
+                    results[step.request_idx] = Some(Err(clone_fs_error(err)));
                     continue;
                 }
             };
@@ -7097,6 +7398,62 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
+    async fn test_batch_inline_read_behavioral_pack_entry_round_trip() {
+        if fs9_config().s3.is_none() {
+            return;
+        }
+
+        let fs = make_fs().await;
+        let base = "/test_batch_inline_read_behavioral_pack_entry_round_trip";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let first_path = format!("{base}/first.txt");
+        let second_path = format!("{base}/second.txt");
+        let first_data = b"pack-batch-first".to_vec();
+        let second_data = b"pack-batch-second".to_vec();
+        let entries = fs
+            .batch_write(vec![
+                FsBatchWriteFile {
+                    path: first_path.clone(),
+                    data: first_data.clone(),
+                },
+                FsBatchWriteFile {
+                    path: second_path.clone(),
+                    data: second_data.clone(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert!(entries.iter().all(|entry| entry.result.is_ok()));
+
+        let first_inode = fs.stat(&first_path).await.unwrap();
+        let second_inode = fs.stat(&second_path).await.unwrap();
+        assert!(matches!(first_inode.data, DataRef::PackEntry { .. }));
+        assert!(matches!(second_inode.data, DataRef::PackEntry { .. }));
+
+        let first_before = inode_snapshot(&fs, &first_path).await;
+        let second_before = inode_snapshot(&fs, &second_path).await;
+        let results = fs
+            .batch_inline_read(
+                &[first_path.clone(), second_path.clone()],
+                first_data.len().max(second_data.len()),
+                first_data.len() + second_data.len(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap(), &first_data);
+        assert_eq!(results[1].as_ref().unwrap(), &second_data);
+        assert_eq!(inode_snapshot(&fs, &first_path).await, first_before);
+        assert_eq!(inode_snapshot(&fs, &second_path).await, second_before);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn test_object_read_paths_do_not_mutate_inode_metadata() {
         let fs = make_fs().await;
         let base = "/test_object_read_paths_do_not_mutate_inode_metadata";
@@ -7143,6 +7500,129 @@ mod tests {
         assert_eq!(prepared.size, data.len() as u64);
         assert!(prepared.range_supported);
         assert_eq!(inode_snapshot(&fs, path).await, before);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_batch_inline_read_behavioral_object_round_trip() {
+        let fs = make_fs().await;
+        let base = "/test_batch_inline_read_behavioral_object_round_trip";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let inline_max = fs9_config().inline_max_bytes;
+        if inline_max == 0 || fs9_config().s3.is_none() {
+            return;
+        }
+
+        let path = format!("{base}/object.bin");
+        let data: Vec<u8> = (0..(inline_max + 1)).map(|idx| (idx % 251) as u8).collect();
+        fs.write_file(&path, &data).await.unwrap();
+
+        let inode = fs.stat(&path).await.unwrap();
+        assert!(matches!(inode.data, DataRef::Object { .. }));
+
+        let before = inode_snapshot(&fs, &path).await;
+        let results = fs
+            .batch_inline_read(&[path.clone()], data.len(), data.len())
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap(), &data);
+        assert_eq!(inode_snapshot(&fs, &path).await, before);
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_batch_inline_read_behavioral_shared_s3_error_for_external_entries() {
+        if fs9_config().s3.is_some() {
+            return;
+        }
+
+        let fs = make_fs().await;
+        let base = "/test_batch_inline_read_behavioral_shared_s3_error";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let object_path = format!("{base}/object.bin");
+        let pack_path = format!("{base}/pack.bin");
+        let bundle_id = fs.alloc_bundle_id().await.unwrap();
+        let object_inode_id = fs.alloc_inode_id().await.unwrap();
+        let pack_inode_id = fs.alloc_inode_id().await.unwrap();
+
+        let mut txn = fs.begin().await.unwrap();
+        let (object_parent, object_name) =
+            ensure_parents_and_resolve_parent(&fs, &mut txn, &object_path)
+                .await
+                .unwrap();
+        let mut object_inode = Inode::new_file(object_inode_id, 0o644);
+        object_inode.size = 4;
+        object_inode.data = DataRef::Object {
+            key: "missing-object".to_string(),
+            version: 1,
+            checksum: [1u8; 32],
+        };
+        save_inode(&mut txn, &object_inode).await.unwrap();
+        link(&mut txn, object_parent, &object_name, object_inode_id)
+            .await
+            .unwrap();
+
+        let (pack_parent, pack_name) = ensure_parents_and_resolve_parent(&fs, &mut txn, &pack_path)
+            .await
+            .unwrap();
+        let mut pack_inode = Inode::new_file(pack_inode_id, 0o644);
+        pack_inode.size = 4;
+        pack_inode.data = DataRef::PackEntry {
+            bundle_id,
+            offset: 0,
+            len: 4,
+            checksum: [2u8; 32],
+            generation: 1,
+        };
+        save_inode(&mut txn, &pack_inode).await.unwrap();
+        link(&mut txn, pack_parent, &pack_name, pack_inode_id)
+            .await
+            .unwrap();
+
+        save_bundle_manifest(
+            &mut txn,
+            &BundleManifest {
+                fs_instance_id: fs.instance_identity().fs_instance_id,
+                bundle_id,
+                key: "missing-pack".to_string(),
+                created_at: current_unix_timestamp(),
+                object_size: 4,
+                footer_offset: 0,
+                entry_count: 1,
+                live_entries: 1,
+                live_bytes: 4,
+                stale_entries: 0,
+                checksum: [3u8; 32],
+                state: BundleManifestState::Active,
+            },
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+
+        let results = fs
+            .batch_inline_read(&[object_path.clone(), pack_path.clone()], 8, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        for result in results {
+            let fs_err = result
+                .unwrap_err()
+                .downcast::<EmbeddedFsError>()
+                .expect("external entry failure should stay typed");
+            assert!(matches!(fs_err, EmbeddedFsError::Internal(msg) if msg == "S3 is not configured"));
+        }
 
         cleanup(&fs, base).await;
     }

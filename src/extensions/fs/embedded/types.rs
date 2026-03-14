@@ -186,6 +186,7 @@ pub(crate) enum EmbeddedFsError {
     IsDirectory(String),
     NotDirectory(String),
     DirectoryNotEmpty(String),
+    TooLarge(String),
     PermissionDenied(String),
     Conflict(String),
     RestartRequired(String),
@@ -214,6 +215,10 @@ impl EmbeddedFsError {
         Self::DirectoryNotEmpty(path.to_string())
     }
 
+    pub(crate) fn too_large(msg: impl Into<String>) -> Self {
+        Self::TooLarge(msg.into())
+    }
+
     pub(crate) fn conflict(msg: &str) -> Self {
         Self::Conflict(msg.to_string())
     }
@@ -235,6 +240,7 @@ impl std::fmt::Display for EmbeddedFsError {
             Self::IsDirectory(msg) => write!(f, "embedded_fs: IsDirectory: {}", msg),
             Self::NotDirectory(msg) => write!(f, "embedded_fs: NotDirectory: {}", msg),
             Self::DirectoryNotEmpty(msg) => write!(f, "embedded_fs: DirectoryNotEmpty: {}", msg),
+            Self::TooLarge(msg) => write!(f, "embedded_fs: TooLarge: {}", msg),
             Self::PermissionDenied(msg) => write!(f, "embedded_fs: PermissionDenied: {}", msg),
             Self::Conflict(msg) => write!(f, "embedded_fs: Conflict: {}", msg),
             Self::RestartRequired(msg) => write!(f, "embedded_fs: RestartRequired: {}", msg),
@@ -332,6 +338,9 @@ mod tests {
 
         let e = EmbeddedFsError::directory_not_empty("/e");
         assert_eq!(e.to_string(), "embedded_fs: DirectoryNotEmpty: /e");
+
+        let e = EmbeddedFsError::too_large("limit exceeded");
+        assert_eq!(e.to_string(), "embedded_fs: TooLarge: limit exceeded");
 
         let e = EmbeddedFsError::internal("boom");
         assert_eq!(e.to_string(), "embedded_fs: Internal: boom");

@@ -454,6 +454,7 @@ pub(crate) fn map_fs_error(err: &Error) -> (WsErrorCode, String) {
                     WsErrorCode::Enotempty,
                     format!("Directory not empty: {path}"),
                 ),
+                EmbeddedFsError::TooLarge(msg) => (WsErrorCode::Efbig, msg.clone()),
                 EmbeddedFsError::PermissionDenied(msg) => {
                     (WsErrorCode::Eacces, format!("Permission denied: {msg}"))
                 }
@@ -849,6 +850,16 @@ mod tests {
         ));
         let (code, _msg) = map_fs_error(&err);
         assert_eq!(code, WsErrorCode::Eacces);
+    }
+
+    #[test]
+    fn test_map_fs_error_too_large() {
+        let err = anyhow::anyhow!(EmbeddedFsError::too_large(
+            "batch_inline_read raw payload exceeds limit 1024 bytes",
+        ));
+        let (code, msg) = map_fs_error(&err);
+        assert_eq!(code, WsErrorCode::Efbig);
+        assert_eq!(msg, "batch_inline_read raw payload exceeds limit 1024 bytes");
     }
 
     #[test]

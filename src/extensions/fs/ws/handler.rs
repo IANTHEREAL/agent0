@@ -1,11 +1,12 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use anyhow::Error;
 use serde_json::json;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use crate::extensions::fs::backend::{FsBatchWriteFile, FsMultipartCompletedPart};
 use crate::extensions::fs::config::fs9_config;
+use crate::extensions::fs::embedded::types::EmbeddedFsError;
 use crate::extensions::fs::ws::auth::WsSession;
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, BatchInlineReadEntryResponse, BatchStatEntryResponse,
@@ -583,7 +584,7 @@ fn batch_stat_response(
                 paths
                     .iter()
                     .cloned()
-                    .zip(results.into_iter())
+                    .zip(results)
                     .map(|(path, result)| match result {
                         Ok(info) => BatchStatEntryResponse {
                             path,
@@ -657,175 +658,77 @@ async fn handle_batch_inline_read(session: &WsSession, id: &str, paths: &[String
 
     let max_file_bytes = fs9_config().batch_inline_read_max_file_bytes;
     let max_total_bytes = fs9_config().batch_inline_read_max_total_bytes;
-    let max_total_bytes_u64 = max_total_bytes as u64;
-
-    let concurrency = fs9_config().batch_stat_concurrency.max(1);
-    let backend = session.backend.clone();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut join_set = tokio::task::JoinSet::new();
-
-    for (idx, path) in paths.iter().cloned().enumerate() {
-        let backend = backend.clone();
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("batch_inline_read semaphore must not be closed");
-        join_set.spawn(async move {
-            let _permit = permit;
-            let result = backend.stat(&path).await;
-            (idx, path, result)
-        });
+    match session
+        .backend
+        .batch_inline_read(paths, max_file_bytes, max_total_bytes)
+        .await
+    {
+        Ok(results) => batch_inline_read_response(id, paths, results),
+        Err(err) => {
+            let (code, msg) = map_batch_inline_read_error(&err);
+            WsResponse::error(id, code, msg)
+        }
     }
+}
 
-    // Phase 1: stat + bounds preflight (so we can enforce total payload cap before doing reads).
-    let mut entries: Vec<Option<BatchInlineReadEntryResponse>> = vec![None; paths.len()];
-    let mut eligible: Vec<Option<u64>> = vec![None; paths.len()];
-    let mut total_planned = 0u64;
+fn map_batch_inline_read_error(err: &Error) -> (WsErrorCode, String) {
+    map_fs_error(err)
+}
 
-    while let Some(result) = join_set.join_next().await {
-        let (idx, path, stat_result) = match result {
-            Ok(tuple) => tuple,
-            Err(err) => {
-                return WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("batch_inline_read task failed: {err}"),
-                );
-            }
-        };
-
-        match stat_result {
-            Ok(info) => {
-                if info.is_dir {
-                    entries[idx] = Some(BatchInlineReadEntryResponse {
-                        path,
-                        ok: false,
-                        content: None,
-                        size: None,
-                        encoding: None,
-                        error: Some(WsErrorDetail {
-                            code: WsErrorCode::Eisdir,
-                            message: "Is a directory".to_string(),
-                        }),
-                    });
-                    continue;
-                }
-
-                if info.size > max_file_bytes as u64 {
-                    entries[idx] = Some(BatchInlineReadEntryResponse {
-                        path,
-                        ok: false,
-                        content: None,
-                        size: None,
-                        encoding: None,
-                        error: Some(WsErrorDetail {
-                            code: WsErrorCode::Efbig,
-                            message: format!(
-                                "file too large for batch_inline_read: {} bytes exceeds limit {}",
-                                info.size, max_file_bytes
-                            ),
-                        }),
-                    });
-                    continue;
-                }
-
-                total_planned = total_planned.saturating_add(info.size);
-                eligible[idx] = Some(info.size);
-            }
-            Err(err) => {
-                let (code, msg) = map_fs_error(&err);
-                entries[idx] = Some(BatchInlineReadEntryResponse {
-                    path,
-                    ok: false,
-                    content: None,
-                    size: None,
-                    encoding: None,
-                    error: Some(WsErrorDetail { code, message: msg }),
-                });
-            }
+fn map_batch_inline_read_entry_error(err: &Error) -> (WsErrorCode, String) {
+    for cause in err.chain() {
+        if let Some(EmbeddedFsError::IsDirectory(_)) = cause.downcast_ref::<EmbeddedFsError>() {
+            return (WsErrorCode::Eisdir, "Is a directory".to_string());
         }
     }
 
-    if total_planned > max_total_bytes_u64 {
+    map_batch_inline_read_error(err)
+}
+
+fn batch_inline_read_response(
+    id: &str,
+    paths: &[String],
+    results: Vec<anyhow::Result<Vec<u8>>>,
+) -> WsResponse {
+    if results.len() != paths.len() {
         return WsResponse::error(
             id,
-            WsErrorCode::Efbig,
+            WsErrorCode::Eio,
             format!(
-                "batch_inline_read raw payload exceeds limit {} bytes",
-                max_total_bytes
+                "batch_inline_read backend returned {} results for {} input paths",
+                results.len(),
+                paths.len()
             ),
         );
     }
 
-    // Phase 2: bounded reads for eligible entries.
-    let backend = session.backend.clone();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut join_set = tokio::task::JoinSet::new();
-    for (idx, (path, planned_size)) in paths
+    let entries = paths
         .iter()
         .cloned()
-        .zip(eligible.iter().copied())
-        .enumerate()
-    {
-        let Some(_planned) = planned_size else {
-            continue;
-        };
-        let backend = backend.clone();
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("batch_inline_read semaphore must not be closed");
-        join_set.spawn(async move {
-            let _permit = permit;
-            let result = backend.read_file(&path, max_file_bytes).await;
-            (idx, path, result)
-        });
-    }
-
-    while let Some(result) = join_set.join_next().await {
-        let (idx, path, read_result) = match result {
-            Ok(tuple) => tuple,
+        .zip(results)
+        .map(|(path, result)| match result {
+            Ok(data) => BatchInlineReadEntryResponse {
+                path,
+                ok: true,
+                content: Some(STANDARD.encode(&data)),
+                size: Some(data.len()),
+                encoding: Some("base64".to_string()),
+                error: None,
+            },
             Err(err) => {
-                return WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("batch_inline_read task failed: {err}"),
-                );
-            }
-        };
-        match read_result {
-            Ok(data) => {
-                entries[idx] = Some(BatchInlineReadEntryResponse {
-                    path,
-                    ok: true,
-                    content: Some(STANDARD.encode(&data)),
-                    size: Some(data.len()),
-                    encoding: Some("base64".to_string()),
-                    error: None,
-                });
-            }
-            Err(err) => {
-                let (code, msg) = map_fs_error(&err);
-                entries[idx] = Some(BatchInlineReadEntryResponse {
+                let (code, msg) = map_batch_inline_read_entry_error(&err);
+                BatchInlineReadEntryResponse {
                     path,
                     ok: false,
                     content: None,
                     size: None,
                     encoding: None,
                     error: Some(WsErrorDetail { code, message: msg }),
-                });
+                }
             }
-        }
-    }
-
-    let entries: Vec<BatchInlineReadEntryResponse> = entries
-        .into_iter()
-        .map(|entry| {
-            entry.expect("batch_inline_read must produce a result entry for each input path")
         })
-        .collect();
+        .collect::<Vec<_>>();
+
     WsResponse::success(id, json!({ "entries": entries }))
 }
 
@@ -1013,7 +916,10 @@ fn format_mtime(epoch_seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_stat_response, decode_base64_content, parse_sha256_checksum};
+    use super::{
+        batch_inline_read_response, batch_stat_response, decode_base64_content,
+        map_batch_inline_read_error, parse_sha256_checksum,
+    };
     use crate::extensions::fs::backend::FsFileInfo;
     use crate::extensions::fs::ws::protocol::WsErrorCode;
     use anyhow::anyhow;
@@ -1210,5 +1116,89 @@ mod tests {
             .as_str()
             .expect("message must be a string")
             .contains("returned 2 results for 1 input paths"));
+    }
+
+    #[test]
+    fn test_batch_inline_read_response_preserves_mixed_entry_results() {
+        let paths = vec!["/ok".to_string(), "/missing".to_string()];
+        let resp = batch_inline_read_response(
+            "req-8",
+            &paths,
+            vec![
+                Ok(b"hello".to_vec()),
+                Err(anyhow!(
+                    crate::extensions::fs::embedded::types::EmbeddedFsError::not_found("/missing")
+                )),
+            ],
+        );
+
+        assert!(resp.ok);
+        let data = resp
+            .data
+            .expect("batch_inline_read success must include data");
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["ok"], Value::Bool(true));
+        assert_eq!(entries[0]["size"], Value::Number(5usize.into()));
+        assert_eq!(entries[0]["encoding"], Value::String("base64".to_string()));
+        assert_eq!(entries[1]["ok"], Value::Bool(false));
+        assert_eq!(
+            entries[1]["error"]["code"],
+            Value::String("ENOENT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_batch_inline_read_response_preserves_directory_wire_message() {
+        let paths = vec!["/dir".to_string()];
+        let resp = batch_inline_read_response(
+            "req-8b",
+            &paths,
+            vec![Err(anyhow!(
+                crate::extensions::fs::embedded::types::EmbeddedFsError::is_directory("/dir")
+            ))],
+        );
+
+        assert!(resp.ok);
+        let data = resp
+            .data
+            .expect("batch_inline_read success must include data");
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["ok"], Value::Bool(false));
+        assert_eq!(
+            entries[0]["error"]["code"],
+            Value::String("EISDIR".to_string())
+        );
+        assert_eq!(
+            entries[0]["error"]["message"],
+            Value::String("Is a directory".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_batch_inline_read_error_preserves_payload_contract() {
+        let err = crate::extensions::fs::backend::batch_inline_read_payload_too_large_error(17, 16);
+        let (code, msg) = map_batch_inline_read_error(&err);
+        assert_eq!(code, WsErrorCode::Efbig);
+        assert_eq!(msg, "batch_inline_read raw payload exceeds limit 16 bytes");
+    }
+
+    #[test]
+    fn test_batch_inline_read_response_rejects_backend_result_length_mismatch() {
+        let paths = vec!["/a".to_string(), "/b".to_string()];
+        let resp = batch_inline_read_response("req-9", &paths, vec![Ok(vec![1u8])]);
+
+        assert!(!resp.ok);
+        assert!(resp.data.is_none());
+        let detail = resp.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Eio);
+        assert!(detail
+            .message
+            .contains("backend returned 1 results for 2 input paths"));
     }
 }

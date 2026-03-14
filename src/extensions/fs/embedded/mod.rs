@@ -96,13 +96,18 @@ impl FsBackend for EmbeddedFsBackend {
     }
 
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let inode = self.pagefs.stat(path).await?;
-        if inode.size as usize > max_bytes {
-            return Err(anyhow!(
-                "fs9: file too large: {path} (exceeded max {max_bytes} bytes)"
-            ));
-        }
-        self.pagefs.read_file(path).await
+        self.pagefs.read_file_capped(path, max_bytes).await
+    }
+
+    async fn batch_inline_read(
+        &self,
+        paths: &[String],
+        max_file_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<Result<Vec<u8>>>> {
+        self.pagefs
+            .batch_inline_read(paths, max_file_bytes, max_total_bytes)
+            .await
     }
 
     async fn read_file_stream(
