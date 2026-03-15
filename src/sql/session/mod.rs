@@ -872,15 +872,10 @@ impl Session {
                     .unwrap_or("postgres")
                     .to_string(),
             ),
-            // Mask sensitive settings for display (SHOW command).
-            "embedding.api_key" => {
-                let raw = self.settings.show_value(name);
-                match raw.as_deref() {
-                    Some("") | None => Some("".to_string()),
-                    Some(_) => Some("****".to_string()),
-                }
-            }
-            _ => self.settings.show_value(name),
+            _ => self
+                .settings
+                .show_value(name)
+                .map(|value| settings::public_setting_value(name, value)),
         }
     }
 
@@ -908,10 +903,8 @@ impl Session {
         force_insert_setting(
             &mut all,
             "embedding.api_key",
-            match self.settings.show_value("embedding.api_key").as_deref() {
-                Some("") | None => "".to_string(),
-                Some(_) => "****".to_string(),
-            },
+            self.show_setting_value("embedding.api_key")
+                .unwrap_or_default(),
         );
 
         all

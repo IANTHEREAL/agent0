@@ -9,7 +9,7 @@ use crate::sql::error::SqlError;
 use crate::sql::executor::{
     check_reserved_guc_reset, check_reserved_guc_write, session_auth_different_user_error_sync,
 };
-use crate::sql::query_context::QueryContext;
+use crate::sql::query_context::{CurrentSettingLookup, QueryContext};
 use anyhow::{anyhow, Result};
 use std::sync::OnceLock;
 
@@ -217,15 +217,10 @@ pub(super) fn eval_function_call(
                 }
                 Some(_) => return Err(anyhow!("argument of current_setting must be type boolean")),
             };
-            if let Some(v) = QueryContext::current_setting_snapshot(canonical) {
-                return Ok(Value::Text(v));
-            }
-            if let Some(ref snapshot) = qctx.settings_snapshot {
-                return match snapshot.get(canonical) {
-                    Some(v) => Ok(Value::Text(v.clone())),
-                    None if missing_ok => Ok(Value::Null),
-                    None => Err(anyhow!("unrecognized configuration parameter \"{}\"", name)),
-                };
+            match QueryContext::current_setting_lookup(qctx, canonical) {
+                CurrentSettingLookup::Found(v) => return Ok(Value::Text(v)),
+                CurrentSettingLookup::Missing if missing_ok => return Ok(Value::Null),
+                CurrentSettingLookup::Missing | CurrentSettingLookup::NoSnapshot => {}
             }
             // No snapshot (unit tests, DDL contexts) — fall through to error
             return Err(anyhow!("unrecognized configuration parameter \"{}\"", name));

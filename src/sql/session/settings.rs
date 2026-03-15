@@ -413,6 +413,14 @@ pub(crate) struct SessionSettings {
     settings_savepoint_stack: Vec<SettingsSavepoint>,
 }
 
+pub(crate) fn public_setting_value(canonical: &str, value: String) -> String {
+    if canonical.eq_ignore_ascii_case("embedding.api_key") && !value.is_empty() {
+        "****".to_string()
+    } else {
+        value
+    }
+}
+
 impl SessionSettings {
     fn default_search_path() -> Vec<String> {
         vec!["$user".to_string(), "public".to_string()]
@@ -1322,7 +1330,8 @@ impl SessionSettings {
             "embedding.api_key" => {
                 // Return the raw value so that internal snapshot consumers
                 // (e.g. call_embedding_api) receive the real key.
-                // Display masking is applied in Session::show_setting_value().
+                // Public SQL readback masking is applied by public_setting_value()
+                // through Session::show_setting_value() / QueryContext lookups.
                 self.extra_settings
                     .get(canonical)
                     .cloned()

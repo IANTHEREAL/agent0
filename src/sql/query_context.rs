@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::model::Value;
 use crate::sql::advisory_locks::AdvisoryLockMode;
+pub(crate) use crate::sql::session::settings::public_setting_value;
 use crate::storage::TikvStore;
 
 /// Wrapper around `Arc<TikvStore>` that implements `Debug` so it can live
@@ -367,6 +368,24 @@ impl QueryContext {
             .map(|value| public_setting_value(canonical, value))
     }
 
+    /// Resolve a public SQL-facing current_setting() lookup for an explicit
+    /// QueryContext, preferring the scoped task-local snapshot when present and
+    /// falling back to the snapshot carried on the QueryContext itself.
+    pub(crate) fn current_setting_lookup(qctx: &QueryContext, name: &str) -> CurrentSettingLookup {
+        let canonical =
+            crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
+        if let Some(value) = Self::current_setting_snapshot(canonical) {
+            return CurrentSettingLookup::Found(value);
+        }
+        match qctx.settings_snapshot.as_deref() {
+            Some(snapshot) => match snapshot.get(canonical).cloned() {
+                Some(value) => CurrentSettingLookup::Found(public_setting_value(canonical, value)),
+                None => CurrentSettingLookup::Missing,
+            },
+            None => CurrentSettingLookup::NoSnapshot,
+        }
+    }
+
     /// Read a raw execution setting from the current statement's internal snapshot.
     ///
     /// Returns `None` when there is no scoped snapshot or the key is absent.
@@ -483,6 +502,13 @@ impl QueryContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CurrentSettingLookup {
+    Found(String),
+    Missing,
+    NoSnapshot,
+}
+
 pub(crate) async fn with_query_context<R, Fut>(
     connection_id: i64,
     database_name: Arc<str>,
@@ -589,14 +615,6 @@ where
         ),
     )
     .await
-}
-
-fn public_setting_value(canonical: &str, value: String) -> String {
-    if canonical.eq_ignore_ascii_case("embedding.api_key") && !value.is_empty() {
-        "****".to_string()
-    } else {
-        value
-    }
 }
 
 #[cfg(test)]
@@ -793,6 +811,22 @@ mod tests {
 
         assert_eq!(result.0.as_deref(), Some("****"));
         assert_eq!(result.1.as_deref(), Some("session-secret"));
+    }
+
+    #[test]
+    fn public_setting_value_masks_embedding_api_key() {
+        // Raw secret → masked
+        assert_eq!(
+            public_setting_value("embedding.api_key", "sk-secret-1234".to_string()),
+            "****"
+        );
+        // Empty → passthrough (no masking needed)
+        assert_eq!(
+            public_setting_value("embedding.api_key", "".to_string()),
+            ""
+        );
+        // Non-sensitive setting → passthrough
+        assert_eq!(public_setting_value("timezone", "UTC".to_string()), "UTC");
     }
 
     #[test]

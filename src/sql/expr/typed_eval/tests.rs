@@ -4,6 +4,7 @@ use super::*;
 use crate::model::DataType;
 use crate::sql::error::SqlError;
 use crate::sql::types::CastContext;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_row(vals: Vec<Value>) -> Row {
@@ -1608,6 +1609,69 @@ fn test_current_user() {
         eval_typed_expr(&func, &row, &qctx).unwrap(),
         Value::Text("postgres".into())
     );
+}
+
+#[test]
+fn typed_builtin_current_setting_masks_embedding_api_key_from_explicit_qctx_snapshot() {
+    let row = empty_row();
+    let mut qctx = test_qctx();
+    let mut snapshot = HashMap::new();
+    snapshot.insert(
+        "embedding.api_key".to_string(),
+        "sk-secret-1234".to_string(),
+    );
+    qctx.settings_snapshot = Some(Arc::new(snapshot));
+
+    let expr = func_call(
+        "CURRENT_SETTING",
+        vec![const_expr(
+            Value::Text("embedding.api_key".to_string()),
+            DataType::Text,
+        )],
+        DataType::Text,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Text("****".to_string())
+    );
+}
+
+#[test]
+fn typed_builtin_current_setting_missing_ok_returns_null_from_explicit_qctx_snapshot() {
+    let row = empty_row();
+    let mut qctx = test_qctx();
+    qctx.settings_snapshot = Some(Arc::new(HashMap::new()));
+
+    let expr = func_call(
+        "CURRENT_SETTING",
+        vec![
+            const_expr(Value::Text("missing.setting".to_string()), DataType::Text),
+            const_expr(Value::Boolean(true), DataType::Boolean),
+        ],
+        DataType::Text,
+    );
+
+    assert_eq!(eval_typed_expr(&expr, &row, &qctx).unwrap(), Value::Null);
+}
+
+#[test]
+fn typed_builtin_current_setting_missing_ok_still_errors_without_snapshot() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "CURRENT_SETTING",
+        vec![
+            const_expr(Value::Text("missing.setting".to_string()), DataType::Text),
+            const_expr(Value::Boolean(true), DataType::Boolean),
+        ],
+        DataType::Text,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("unrecognized configuration parameter \"missing.setting\""));
 }
 
 #[test]

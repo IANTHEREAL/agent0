@@ -1177,6 +1177,37 @@ mod tests {
     }
 
     #[test]
+    fn test_embedding_api_key_public_readback_is_masked() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_embedding_api_key_readback");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "admin".to_string(),
+            true,
+            false,
+            190091,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        session
+            .set_known_setting("embedding.api_key", "sk-secret-1234".to_string())
+            .expect("set embedding api key");
+
+        assert_eq!(
+            session.show_setting_value("embedding.api_key").as_deref(),
+            Some("****")
+        );
+
+        let all = session.show_all_settings();
+        let found = all.iter().find(|(n, _, _)| n == "embedding.api_key");
+        assert_eq!(found.map(|(_, v, _)| v.as_str()), Some("****"));
+    }
+
+    #[test]
     fn test_show_value_covers_all_known_gucs() {
         use crate::sql::session::settings::KNOWN_GUCS;
         let settings = SessionSettings::new();

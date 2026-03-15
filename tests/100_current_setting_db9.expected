@@ -1,3 +1,7 @@
 txn_iso
 repeatable read
 (1 row)
+SET
+masked_api_key
+****
+(1 row)
