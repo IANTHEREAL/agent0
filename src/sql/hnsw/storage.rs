@@ -51,6 +51,21 @@ pub fn writer_id() -> &'static str {
     &WRITER_ID
 }
 
+/// How HNSW labels (usearch u64 keys) relate to user primary keys.
+///
+/// - `Direct`: label = PK value cast to u64 (legacy, INTEGER/BIGINT PKs only).
+/// - `Mapped`: label = internally allocated rowid; a persistent bidirectional
+///   mapping (rowid ↔ PK) is stored in TiKV. Supports any PK type.
+///
+/// Backward-compatible: old `HnswMeta` JSON without `label_mode` deserializes
+/// to `Direct` via `#[serde(default)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HnswLabelMode {
+    #[default]
+    Direct,
+    Mapped,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswMeta {
     pub count: u64,
@@ -63,6 +78,15 @@ pub struct HnswMeta {
     /// without this field deserializes to 0.
     #[serde(default)]
     pub storage_version: u8,
+    /// How usearch labels map to user PKs. Defaults to `Direct` for
+    /// backward compatibility with existing indexes on INTEGER/BIGINT PKs.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_direct_mode")]
+    pub label_mode: HnswLabelMode,
+}
+
+fn is_direct_mode(mode: &HnswLabelMode) -> bool {
+    matches!(mode, HnswLabelMode::Direct)
 }
 
 pub struct HnswIndexHandle(Box<dyn Deref<Target = Index>>);
@@ -218,6 +242,7 @@ pub fn create_empty_hnsw_index(
         m,
         ef_construction,
         storage_version: 1,
+        label_mode: HnswLabelMode::Direct,
     };
     Ok((HnswIndexHandle::new(index), meta))
 }
@@ -543,6 +568,266 @@ pub async fn load_hnsw_graph_with_deltas(
     Ok(Some((HnswIndexHandle::new(index), live_meta, delta_count)))
 }
 
+// ===========================================================================
+// Rowid mapping for HnswLabelMode::Mapped
+// ===========================================================================
+//
+// Key layout (all under the database data prefix):
+//   pk→rid:  d_{db_id}_hnsw_rid_pk2rid_{table_id}_{pk_bytes}   → u64 BE
+//   rid→pk:  d_{db_id}_hnsw_rid_rid2pk_{table_id}_{rowid_be8}  → pk_bytes
+//   seq:     d_{db_id}_hnsw_rid_seq_{table_id}                 → u64 BE (next rowid)
+//
+// The mapping is table-level (shared across all HNSW indexes on the same table)
+// because usearch labels are opaque u64s and the mapping is PK-specific, not
+// index-specific.
+
+/// Key for PK → rowid mapping lookup.
+pub fn hnsw_rid_pk2rid_key(db_id: u64, table_id: u64, pk_bytes: &[u8]) -> Vec<u8> {
+    let mut key = format!("d_{db_id}_hnsw_rid_pk2rid_{table_id}_").into_bytes();
+    key.extend_from_slice(pk_bytes);
+    key
+}
+
+/// Key for rowid → PK reverse mapping lookup.
+pub fn hnsw_rid_rid2pk_key(db_id: u64, table_id: u64, rowid: u64) -> Vec<u8> {
+    let mut key = format!("d_{db_id}_hnsw_rid_rid2pk_{table_id}_").into_bytes();
+    key.extend_from_slice(&rowid.to_be_bytes());
+    key
+}
+
+/// Key for the rowid sequence counter (monotonic, never recycled).
+pub fn hnsw_rid_seq_key(db_id: u64, table_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_rid_seq_{table_id}").into_bytes()
+}
+
+/// Prefix for scanning all rid→pk mappings for a table (used by DROP TABLE cleanup).
+pub fn hnsw_rid_rid2pk_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_rid_rid2pk_{table_id}_").into_bytes()
+}
+
+/// Prefix for scanning all pk→rid mappings for a table (used by DROP TABLE cleanup).
+pub fn hnsw_rid_pk2rid_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_rid_pk2rid_{table_id}_").into_bytes()
+}
+
+/// Look up the rowid for a PK within the caller's transaction.
+/// Returns `None` if no mapping exists (row was never indexed or was deleted).
+pub async fn get_rowid_for_pk(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    pk_bytes: &[u8],
+) -> Result<Option<u64>, SqlError> {
+    let key = hnsw_rid_pk2rid_key(db_id, table_id, pk_bytes);
+    match txn
+        .get(key)
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+    {
+        Some(val) => {
+            let arr: [u8; 8] = val
+                .try_into()
+                .map_err(|_| SqlError::Internal(anyhow::anyhow!("corrupt pk2rid value")))?;
+            Ok(Some(u64::from_be_bytes(arr)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Write the bidirectional pk ↔ rowid mapping within the caller's transaction.
+pub async fn put_rowid_mapping(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    pk_bytes: &[u8],
+    rowid: u64,
+) -> Result<(), SqlError> {
+    let pk2rid_key = hnsw_rid_pk2rid_key(db_id, table_id, pk_bytes);
+    let rid2pk_key = hnsw_rid_rid2pk_key(db_id, table_id, rowid);
+    txn_put(txn, pk2rid_key, rowid.to_be_bytes().to_vec())
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    txn_put(txn, rid2pk_key, pk_bytes.to_vec())
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    Ok(())
+}
+
+/// Get the PK bytes for a single rowid within the caller's transaction.
+/// Returns `None` if the mapping was deleted (stale label from lazy HNSW deletion).
+#[allow(dead_code)]
+pub async fn get_pk_for_rowid(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    rowid: u64,
+) -> Result<Option<Vec<u8>>, SqlError> {
+    let key = hnsw_rid_rid2pk_key(db_id, table_id, rowid);
+    txn.get(key)
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))
+}
+
+/// Batch-read PK bytes for multiple rowids in a single TiKV call.
+/// Returns a Vec of `Option<Vec<u8>>` in the same order as `rowids`.
+/// `None` entries indicate deleted rows (stale labels).
+pub async fn batch_get_pk_for_rowids(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    rowids: &[u64],
+) -> Result<Vec<Option<Vec<u8>>>, SqlError> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<Vec<u8>> = rowids
+        .iter()
+        .map(|&rid| hnsw_rid_rid2pk_key(db_id, table_id, rid))
+        .collect();
+    let pairs: Vec<tikv_client::KvPair> = txn
+        .batch_get(keys.clone())
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+        .collect();
+    // batch_get returns only found keys; build a lookup map.
+    let mut map = std::collections::HashMap::with_capacity(pairs.len());
+    for pair in &pairs {
+        let k: &[u8] = pair.key().as_ref().into();
+        map.insert(k.to_vec(), pair.value().to_vec());
+    }
+    let result = keys.into_iter().map(|k| map.remove(&k)).collect();
+    Ok(result)
+}
+
+/// Delete the bidirectional pk ↔ rowid mapping within the caller's transaction.
+/// Used when a row is DELETEd in Mapped mode.
+pub async fn delete_rowid_mapping(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    pk_bytes: &[u8],
+    rowid: u64,
+) -> Result<(), SqlError> {
+    let pk2rid_key = hnsw_rid_pk2rid_key(db_id, table_id, pk_bytes);
+    let rid2pk_key = hnsw_rid_rid2pk_key(db_id, table_id, rowid);
+    txn_delete(txn, pk2rid_key)
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    txn_delete(txn, rid2pk_key)
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    Ok(())
+}
+
+/// Reassign a rowid mapping when the PK changes (UPDATE).
+///
+/// Looks up the rowid for `old_pk_bytes`, deletes the old bidirectional
+/// mapping, and writes a new mapping from `new_pk_bytes` to the same rowid.
+/// Returns the rowid so the caller can use it for delta writes.
+///
+/// If no mapping exists for `old_pk_bytes`, returns `None` (should not happen
+/// for a valid Mapped-mode row, but callers can fall back to allocation).
+pub async fn reassign_rowid_mapping(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    old_pk_bytes: &[u8],
+    new_pk_bytes: &[u8],
+) -> Result<Option<u64>, SqlError> {
+    let Some(rowid) = get_rowid_for_pk(txn, db_id, table_id, old_pk_bytes).await? else {
+        return Ok(None);
+    };
+    // Delete old bidirectional mapping.
+    delete_rowid_mapping(txn, db_id, table_id, old_pk_bytes, rowid).await?;
+    // Write new mapping with the same rowid.
+    put_rowid_mapping(txn, db_id, table_id, new_pk_bytes, rowid).await?;
+    Ok(Some(rowid))
+}
+
+/// Delete ALL rowid mappings for a table (pk2rid + rid2pk + seq).
+/// Used by DROP TABLE / TRUNCATE to prevent stale mapping leaks.
+pub async fn delete_all_rowid_mappings(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+) -> Result<(), SqlError> {
+    // Delete the sequence counter.
+    txn_delete(txn, hnsw_rid_seq_key(db_id, table_id))
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    // Paginated delete of pk2rid keys.
+    delete_keys_by_prefix(txn, &hnsw_rid_pk2rid_prefix(db_id, table_id)).await?;
+    // Paginated delete of rid2pk keys.
+    delete_keys_by_prefix(txn, &hnsw_rid_rid2pk_prefix(db_id, table_id)).await?;
+    Ok(())
+}
+
+/// Delete all keys matching a given prefix, paginated to completion.
+async fn delete_keys_by_prefix(txn: &mut Transaction, prefix: &[u8]) -> Result<(), SqlError> {
+    let mut end = prefix.to_vec();
+    // Increment last byte to form exclusive end of range.
+    if let Some(last) = end.last_mut() {
+        *last = last.checked_add(1).unwrap_or(0xFF);
+    }
+    let mut start = prefix.to_vec();
+    loop {
+        let range: BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn
+            .scan(range, DELTA_SCAN_BATCH_SIZE)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+            .collect();
+        let count = pairs.len();
+        let mut last_key: Option<Vec<u8>> = None;
+        for pair in pairs {
+            let k: &[u8] = pair.key().as_ref().into();
+            let key: Vec<u8> = k.to_vec();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            last_key = Some(key.clone());
+            txn_delete(txn, key)
+                .await
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        }
+        if (count as u32) < DELTA_SCAN_BATCH_SIZE {
+            break;
+        }
+        match last_key {
+            Some(mut lk) => {
+                lk.push(0x00);
+                start = lk;
+            }
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Look up an existing rowid for a PK, or allocate a new one.
+/// Uses the caller's transaction for the mapping lookup/write,
+/// and `store` for the atomic rowid sequence counter (autocommit).
+pub async fn get_or_alloc_rowid(
+    txn: &mut Transaction,
+    store: &TikvStore,
+    db_id: u64,
+    table_id: u64,
+    pk_bytes: &[u8],
+) -> Result<u64, SqlError> {
+    // Fast path: existing mapping
+    if let Some(rowid) = get_rowid_for_pk(txn, db_id, table_id, pk_bytes).await? {
+        return Ok(rowid);
+    }
+    // Allocate a new rowid via atomic increment
+    let rowid = store
+        .alloc_hnsw_rowid(db_id, table_id)
+        .await
+        .map_err(SqlError::Internal)?;
+    // Write the bidirectional mapping
+    put_rowid_mapping(txn, db_id, table_id, pk_bytes, rowid).await?;
+    Ok(rowid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +923,85 @@ mod tests {
             writer1, other,
             "different index must have different task_id"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // HnswLabelMode + rowid mapping key tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hnsw_meta_missing_label_mode_defaults_to_direct() {
+        // Simulates deserializing an existing HnswMeta stored before label_mode was added.
+        let meta_json = r#"{"count":0,"capacity":0,"dimensions":3,"distance_metric":"l2","m":16,"ef_construction":200,"storage_version":1}"#;
+        let meta: HnswMeta = serde_json::from_str(meta_json).expect("parse meta");
+        assert_eq!(
+            meta.label_mode,
+            HnswLabelMode::Direct,
+            "missing label_mode must default to Direct for backward compat"
+        );
+    }
+
+    #[test]
+    fn hnsw_meta_mapped_mode_round_trips() {
+        let meta = HnswMeta {
+            count: 5,
+            capacity: 10,
+            dimensions: 128,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Mapped,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"label_mode\":\"Mapped\""));
+        let parsed: HnswMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.label_mode, HnswLabelMode::Mapped);
+    }
+
+    #[test]
+    fn hnsw_meta_direct_mode_omits_label_mode_field() {
+        let meta = HnswMeta {
+            count: 0,
+            capacity: 0,
+            dimensions: 3,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("label_mode"),
+            "Direct mode should omit label_mode for backward compat: {json}"
+        );
+    }
+
+    #[test]
+    fn rowid_mapping_key_format() {
+        let pk_bytes = b"hello";
+        let pk2rid = hnsw_rid_pk2rid_key(1, 2, pk_bytes);
+        assert_eq!(
+            std::str::from_utf8(&pk2rid[..pk2rid.len() - 5]).unwrap(),
+            "d_1_hnsw_rid_pk2rid_2_"
+        );
+        assert_eq!(&pk2rid[pk2rid.len() - 5..], b"hello");
+
+        let rid2pk = hnsw_rid_rid2pk_key(1, 2, 42);
+        let prefix = "d_1_hnsw_rid_rid2pk_2_";
+        assert!(std::str::from_utf8(&rid2pk[..prefix.len()])
+            .unwrap()
+            .starts_with(prefix));
+        assert_eq!(&rid2pk[prefix.len()..], &42u64.to_be_bytes());
+
+        let seq = hnsw_rid_seq_key(1, 2);
+        assert_eq!(std::str::from_utf8(&seq).unwrap(), "d_1_hnsw_rid_seq_2");
+    }
+
+    #[test]
+    fn new_hnsw_meta_defaults_to_direct_label_mode() {
+        let (_, meta) = create_empty_hnsw_index(3, "l2", 16, 200).unwrap();
+        assert_eq!(meta.label_mode, HnswLabelMode::Direct);
     }
 }

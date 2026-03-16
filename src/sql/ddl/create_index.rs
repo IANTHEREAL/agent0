@@ -13,7 +13,7 @@ use crate::sql::error::SqlError;
 use crate::sql::gin::{extract_gin_token_hashes_from_row, supported_gin_index_column};
 use crate::sql::hnsw::storage::{hnsw_graph_key, hnsw_meta_key, serialize_hnsw_snapshot};
 use crate::sql::hnsw::{
-    hnsw_pk_label, metric_from_string, vec_f64_to_f32, HnswMeta, HNSW_DEFAULT_EF_CONSTRUCTION,
+    metric_from_string, vec_f64_to_f32, HnswMeta, HNSW_DEFAULT_EF_CONSTRUCTION,
     HNSW_DEFAULT_EF_SEARCH, HNSW_DEFAULT_M,
 };
 use crate::sql::index_consistency::{
@@ -227,20 +227,12 @@ pub async fn execute_create_index(
             ));
         }
 
-        // HNSW requires a single non-composite INTEGER or BIGINT primary key.
+        // HNSW requires a single-column primary key.
+        // Integer PKs use Direct mode (label = PK), others use Mapped mode
+        // (label = internal rowid with persistent bidirectional mapping).
         if schema.pk_indices.len() != 1 {
-            return Err(anyhow!(
-                "HNSW indexes require a single-column primary key (INTEGER or BIGINT)"
-            ));
+            return Err(anyhow!("HNSW indexes require a single-column primary key"));
         }
-        let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
-        if !matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
-            return Err(anyhow!(
-                "HNSW indexes require an INTEGER or BIGINT primary key, found {}",
-                pk_col_type
-            ));
-        }
-
         let indexed_col = idx_cols[0].clone();
         let col_idx = schema
             .column_index(&indexed_col)
@@ -441,15 +433,19 @@ pub async fn execute_create_index(
             let data_key_prefix = start.clone();
             let pk_types = pk_types_for_schema(&schema);
 
-            // ── Reject tables with negative PK values ─────────────────────
-            // db9 divergence: PostgreSQL (with pgvector) allows HNSW indexes on
-            // tables with negative PKs.  db9 rejects this because usearch labels
-            // are u64 and we derive them from the PK value — negative integers
-            // cannot be represented.  This restriction may be lifted if we adopt
-            // a PK-to-label mapping layer in the future.
-            // HNSW labels require non-negative u64.  PK values are stored in
-            // key-order, so the first row has the minimum PK.  Read one row.
-            {
+            // Determine label mode from PK type.
+            let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
+            let label_mode = if matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
+                crate::sql::hnsw::HnswLabelMode::Direct
+            } else {
+                crate::sql::hnsw::HnswLabelMode::Mapped
+            };
+
+            // ── Reject tables with negative PK values (Direct mode only) ──
+            // In Direct mode, usearch labels are derived from the PK value and
+            // must be non-negative u64. In Mapped mode, internal rowids are used
+            // so negative PKs are fine.
+            if label_mode == crate::sql::hnsw::HnswLabelMode::Direct {
                 let range: tikv_client::BoundRange = (start.clone()..end.clone()).into();
                 let pairs: Vec<tikv_client::KvPair> = txn.scan(range, 1).await?.collect();
                 if let Some(pair) = pairs.first() {
@@ -477,8 +473,6 @@ pub async fn execute_create_index(
                             .map(|v| v.to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        // db9 divergence: PG+pgvector would succeed here; db9 rejects
-                        // because usearch labels must be non-negative u64.
                         return Err(anyhow!(
                             "cannot create HNSW index: primary key contains negative value \
                              ({}); HNSW indexes require non-negative INTEGER/BIGINT primary keys",
@@ -516,7 +510,15 @@ pub async fn execute_create_index(
                         Some(Value::Vector(v)) => v,
                         Some(_) => return Err(anyhow!("Column {} is not a vector type", col_name)),
                     };
-                    let pk_label = hnsw_pk_label(&pk_values)?;
+                    let pk_label = crate::sql::hnsw::hnsw_resolve_label(
+                        label_mode,
+                        txn,
+                        store,
+                        db_id,
+                        schema.table_id,
+                        &pk_values,
+                    )
+                    .await?;
                     pending_vectors.push((pk_label, vec_f64_to_f32(vector)));
                     count = count.saturating_add(1);
                 }
@@ -554,6 +556,7 @@ pub async fn execute_create_index(
                     m,
                     ef_construction,
                     storage_version: 1, // New indexes use delta-log from the start
+                    label_mode,
                 };
                 serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
                     .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?

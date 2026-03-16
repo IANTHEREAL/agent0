@@ -541,6 +541,7 @@ impl Executor {
         if !hnsw_inserted_rows.is_empty() {
             let hnsw_stats = dml::batch_maintain_hnsw_indexes_for_inserts(
                 txn,
+                &self.store(),
                 db_id,
                 &schema,
                 &hnsw_inserted_rows,
@@ -567,9 +568,14 @@ impl Executor {
         // batch because batch_maintain_hnsw_indexes needs (old, new) pairs
         // to detect unchanged vectors.
         if !hnsw_conflict_updates.is_empty() {
-            let hnsw_stats =
-                dml::batch_maintain_hnsw_indexes(txn, db_id, &schema, &hnsw_conflict_updates)
-                    .await?;
+            let hnsw_stats = dml::batch_maintain_hnsw_indexes(
+                txn,
+                &self.store(),
+                db_id,
+                &schema,
+                &hnsw_conflict_updates,
+            )
+            .await?;
             if hnsw_stats.graph_bytes > 0 {
                 self.observability().record_hnsw_serialize(
                     hnsw_stats.graph_bytes,

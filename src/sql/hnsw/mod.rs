@@ -14,10 +14,12 @@
 pub mod storage;
 
 use anyhow::anyhow;
+use tikv_client::Transaction;
 
 use crate::model::Value;
+use crate::storage::{encode_pk_values, TikvStore};
 
-pub use storage::{metric_from_string, vec_f64_to_f32, HnswIndexHandle, HnswMeta};
+pub use storage::{metric_from_string, vec_f64_to_f32, HnswIndexHandle, HnswLabelMode, HnswMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HnswDistanceMetric {
@@ -107,12 +109,11 @@ pub const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 64;
 /// Default ef parameter for HNSW search.
 pub const HNSW_DEFAULT_EF_SEARCH: usize = 40;
 
-/// Convert primary key values to a u64 label for usearch.
+/// Convert primary key values to a u64 label for usearch (Direct mode only).
 ///
-/// HNSW indexes require a single INTEGER or BIGINT primary key (enforced
-/// at CREATE INDEX time). This function is the single source of truth for
-/// the PK → label conversion used by INSERT, UPDATE, and CREATE INDEX
-/// backfill.
+/// In Direct mode, HNSW indexes require a single INTEGER or BIGINT primary
+/// key. The PK value is cast directly to u64. For non-integer PKs, use
+/// [`hnsw_resolve_label`] with `HnswLabelMode::Mapped`.
 pub fn hnsw_pk_label(pk_values: &[Value]) -> anyhow::Result<u64> {
     if pk_values.len() != 1 {
         return Err(anyhow!(
@@ -129,6 +130,29 @@ pub fn hnsw_pk_label(pk_values: &[Value]) -> anyhow::Result<u64> {
             other.type_display_name()
         )),
         None => Err(anyhow!("HNSW index could not read primary key value")),
+    }
+}
+
+/// Resolve a PK to a usearch u64 label, dispatching on the label mode.
+///
+/// - `Direct`: calls [`hnsw_pk_label`] (sync, no TiKV round-trip).
+/// - `Mapped`: looks up or allocates a rowid via [`storage::get_or_alloc_rowid`].
+pub async fn hnsw_resolve_label(
+    label_mode: HnswLabelMode,
+    txn: &mut Transaction,
+    store: &TikvStore,
+    db_id: u64,
+    table_id: u64,
+    pk_values: &[Value],
+) -> anyhow::Result<u64> {
+    match label_mode {
+        HnswLabelMode::Direct => hnsw_pk_label(pk_values),
+        HnswLabelMode::Mapped => {
+            let pk_bytes = encode_pk_values(pk_values);
+            storage::get_or_alloc_rowid(txn, store, db_id, table_id, &pk_bytes)
+                .await
+                .map_err(|e| anyhow!("HNSW rowid allocation failed: {}", e))
+        }
     }
 }
 

@@ -331,7 +331,8 @@ impl Executor {
         //   modified.  This is an extremely narrow pattern.
         if !hnsw_changes.is_empty() {
             let hnsw_stats =
-                dml::batch_maintain_hnsw_indexes(txn, db_id, &schema, &hnsw_changes).await?;
+                dml::batch_maintain_hnsw_indexes(txn, &self.store(), db_id, &schema, &hnsw_changes)
+                    .await?;
             if hnsw_stats.graph_bytes > 0 {
                 self.observability().record_hnsw_serialize(
                     hnsw_stats.graph_bytes,
