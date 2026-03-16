@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::config;
 use anyhow::Result as AnyhowResult;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -15,6 +16,8 @@ use super::{AuthManager, User};
 const KEYSPACE_PREFIX: &str = "db9_tenant_";
 const DEFAULT_AUDIENCE: &str = "db9-server";
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
+const JWKS_UNKNOWN_KID_COOLDOWN: Duration = Duration::from_secs(10);
+const JWKS_MISSING_SELECTOR_CACHE_LIMIT: usize = 64;
 const DEFAULT_JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +143,7 @@ pub(crate) fn tenant_id_from_keyspace(keyspace: &str) -> Option<&str> {
     keyspace.strip_prefix(KEYSPACE_PREFIX)
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum Db9AuthError {
     #[error("token mode requires tenant-qualified username (<tenant>.<role>)")]
     MissingTenantInUsername,
@@ -278,15 +281,29 @@ struct Jwk {
     y: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JwksSelector {
+    Kid(String),
+    MissingKid,
+}
+
 struct JwksCacheEntry {
     jwks_url: String,
     fetched_at: Instant,
     keys_by_kid: HashMap<String, Arc<DecodingKey>>,
     singleton_key: Option<Arc<DecodingKey>>,
+    missing_selectors: HashMap<JwksSelector, Instant>,
+}
+
+type JwksRefreshFuture = Shared<BoxFuture<'static, Result<(), Db9AuthError>>>;
+
+struct JwksCacheState {
+    entry: Option<JwksCacheEntry>,
+    refresh_in_flight: Option<JwksRefreshFuture>,
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-static JWKS_CACHE: OnceLock<Mutex<Option<JwksCacheEntry>>> = OnceLock::new();
+static JWKS_CACHE: OnceLock<Mutex<JwksCacheState>> = OnceLock::new();
 
 fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
@@ -298,8 +315,159 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-fn jwks_cache() -> &'static Mutex<Option<JwksCacheEntry>> {
-    JWKS_CACHE.get_or_init(|| Mutex::new(None))
+fn jwks_cache() -> &'static Mutex<JwksCacheState> {
+    JWKS_CACHE.get_or_init(|| {
+        Mutex::new(JwksCacheState {
+            entry: None,
+            refresh_in_flight: None,
+        })
+    })
+}
+
+fn jwks_selector_from_kid(kid: Option<String>) -> JwksSelector {
+    match kid {
+        Some(kid) => JwksSelector::Kid(kid),
+        None => JwksSelector::MissingKid,
+    }
+}
+
+fn jwks_selector_error(selector: &JwksSelector) -> Db9AuthError {
+    match selector {
+        JwksSelector::Kid(kid) => Db9AuthError::JwksKidNotFound { kid: kid.clone() },
+        JwksSelector::MissingKid => Db9AuthError::JwksKidMissing,
+    }
+}
+
+fn cached_jwks_key(
+    entry: &JwksCacheEntry,
+    jwks_url: &str,
+    selector: &JwksSelector,
+) -> Option<Arc<DecodingKey>> {
+    if !jwks_entry_is_fresh(entry, jwks_url) {
+        return None;
+    }
+
+    match selector {
+        JwksSelector::Kid(kid) => entry.keys_by_kid.get(kid).cloned(),
+        JwksSelector::MissingKid => entry.singleton_key.clone(),
+    }
+}
+
+fn jwks_entry_is_fresh(entry: &JwksCacheEntry, jwks_url: &str) -> bool {
+    entry.jwks_url == jwks_url && entry.fetched_at.elapsed() < JWKS_CACHE_TTL
+}
+
+fn jwks_selector_resolved(entry: &JwksCacheEntry, selector: &JwksSelector) -> bool {
+    match selector {
+        JwksSelector::Kid(kid) => entry.keys_by_kid.contains_key(kid),
+        JwksSelector::MissingKid => entry.singleton_key.is_some(),
+    }
+}
+
+fn prune_jwks_negative_cache(entry: &mut JwksCacheEntry) {
+    let unresolved_selectors: Vec<JwksSelector> = entry
+        .missing_selectors
+        .iter()
+        .filter(|(selector, recorded_at)| {
+            recorded_at.elapsed() < JWKS_UNKNOWN_KID_COOLDOWN
+                && !jwks_selector_resolved(entry, selector)
+        })
+        .map(|(selector, _)| selector.clone())
+        .collect();
+    entry.missing_selectors.retain(|selector, _| {
+        unresolved_selectors
+            .iter()
+            .any(|unresolved_selector| unresolved_selector == selector)
+    });
+}
+
+fn jwks_negative_cache_hit(entry: &JwksCacheEntry, selector: &JwksSelector) -> bool {
+    entry
+        .missing_selectors
+        .get(selector)
+        .is_some_and(|recorded_at| recorded_at.elapsed() < JWKS_UNKNOWN_KID_COOLDOWN)
+}
+
+fn record_missing_selector(
+    entry: &mut JwksCacheEntry,
+    selector: JwksSelector,
+    recorded_at: Instant,
+) {
+    prune_jwks_negative_cache(entry);
+    if jwks_selector_resolved(entry, &selector) {
+        entry.missing_selectors.remove(&selector);
+        return;
+    }
+    entry.missing_selectors.insert(selector, recorded_at);
+    while entry.missing_selectors.len() > JWKS_MISSING_SELECTOR_CACHE_LIMIT {
+        let Some(oldest_selector) = entry
+            .missing_selectors
+            .iter()
+            .min_by_key(|(_, at)| *at)
+            .map(|(selector, _)| selector.clone())
+        else {
+            break;
+        };
+        entry.missing_selectors.remove(&oldest_selector);
+    }
+}
+
+fn build_refreshed_jwks_entry(
+    previous_entry: Option<&JwksCacheEntry>,
+    jwks_url: String,
+    fetched_at: Instant,
+    keys_by_kid: HashMap<String, Arc<DecodingKey>>,
+    singleton_key: Option<Arc<DecodingKey>>,
+) -> JwksCacheEntry {
+    let mut entry = JwksCacheEntry {
+        jwks_url: jwks_url.clone(),
+        fetched_at,
+        keys_by_kid,
+        singleton_key,
+        missing_selectors: HashMap::new(),
+    };
+
+    if let Some(previous_entry) = previous_entry {
+        if previous_entry.jwks_url == jwks_url {
+            for (previous_selector, recorded_at) in &previous_entry.missing_selectors {
+                if recorded_at.elapsed() < JWKS_UNKNOWN_KID_COOLDOWN
+                    && !jwks_selector_resolved(&entry, previous_selector)
+                {
+                    record_missing_selector(&mut entry, previous_selector.clone(), *recorded_at);
+                }
+            }
+        }
+    }
+
+    entry
+}
+
+fn start_jwks_refresh(jwks_url: String) -> JwksRefreshFuture {
+    async move {
+        let refresh_result = fetch_and_parse_jwks(&jwks_url).await;
+        let refresh_at = Instant::now();
+        let mut cache = jwks_cache().lock().await;
+
+        let result = match refresh_result {
+            Ok((keys_by_kid, singleton_key)) => {
+                let entry = build_refreshed_jwks_entry(
+                    cache.entry.as_ref(),
+                    jwks_url.clone(),
+                    refresh_at,
+                    keys_by_kid,
+                    singleton_key,
+                );
+                cache.entry = Some(entry);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        };
+
+        cache.refresh_in_flight = None;
+        result
+    }
+    .boxed()
+    .shared()
 }
 
 fn validate_connect_key_introspection(
@@ -467,8 +635,9 @@ pub(crate) async fn verify_connect_key(
             reason: format!("introspection response read failed: {err}"),
         })?;
     if !status.is_success() {
+        let status_code = status.as_u16();
         return Err(Db9AuthError::InvalidConnectKey {
-            reason: format!("introspection HTTP {}", status.as_u16()),
+            reason: format!("introspection HTTP {status_code}"),
         });
     }
 
@@ -503,42 +672,40 @@ async fn jwks_decoding_key(token: &str, jwks_url: &str) -> Result<Arc<DecodingKe
     let header = decode_header(token).map_err(|err| Db9AuthError::InvalidJwt {
         reason: err.to_string(),
     })?;
-    let kid = header.kid;
+    let selector = jwks_selector_from_kid(header.kid);
+    let mut refreshed = false;
 
-    // Try cache first (if fresh and for same URL).
-    {
-        let cache = jwks_cache().lock().await;
-        if let Some(entry) = cache.as_ref() {
-            if entry.jwks_url == jwks_url && entry.fetched_at.elapsed() < JWKS_CACHE_TTL {
-                if let Some(kid) = kid.as_deref() {
-                    if let Some(key) = entry.keys_by_kid.get(kid) {
-                        return Ok(Arc::clone(key));
+    loop {
+        let refresh = {
+            let mut cache = jwks_cache().lock().await;
+
+            if let Some(entry) = cache.entry.as_mut() {
+                prune_jwks_negative_cache(entry);
+                if let Some(key) = cached_jwks_key(entry, jwks_url, &selector) {
+                    return Ok(key);
+                }
+                if jwks_entry_is_fresh(entry, jwks_url) {
+                    if jwks_negative_cache_hit(entry, &selector) {
+                        return Err(jwks_selector_error(&selector));
                     }
-                } else if let Some(key) = entry.singleton_key.as_ref() {
-                    return Ok(Arc::clone(key));
+                    if refreshed {
+                        record_missing_selector(entry, selector.clone(), Instant::now());
+                        return Err(jwks_selector_error(&selector));
+                    }
                 }
             }
-        }
-    }
 
-    // Cache miss / stale / rotated. Refresh JWKS and try again.
-    let (keys_by_kid, singleton_key) = fetch_and_parse_jwks(jwks_url).await?;
-    {
-        let mut cache = jwks_cache().lock().await;
-        *cache = Some(JwksCacheEntry {
-            jwks_url: jwks_url.to_string(),
-            fetched_at: Instant::now(),
-            keys_by_kid: keys_by_kid.clone(),
-            singleton_key: singleton_key.clone(),
-        });
-    }
+            if let Some(refresh) = cache.refresh_in_flight.as_ref() {
+                refresh.clone()
+            } else {
+                let refresh = start_jwks_refresh(jwks_url.to_string());
+                cache.refresh_in_flight = Some(refresh.clone());
+                refresh
+            }
+        };
 
-    match kid {
-        Some(kid) => keys_by_kid
-            .get(&kid)
-            .cloned()
-            .ok_or(Db9AuthError::JwksKidNotFound { kid }),
-        None => singleton_key.ok_or(Db9AuthError::JwksKidMissing),
+        refresh.await?;
+        refreshed = true;
     }
 }
 
@@ -561,8 +728,9 @@ async fn fetch_and_parse_jwks(
             reason: err.to_string(),
         })?;
     if !status.is_success() {
+        let status_code = status.as_u16();
         return Err(Db9AuthError::JwksFetchFailed {
-            reason: format!("HTTP {} from JWKS endpoint", status.as_u16()),
+            reason: format!("HTTP {status_code} from JWKS endpoint"),
         });
     }
 
@@ -686,10 +854,14 @@ mod tests {
     use base64::Engine;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::sync::OnceLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     fn test_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -715,6 +887,26 @@ mod tests {
         let prev = std::env::var(key).ok();
         std::env::set_var(key, value);
         EnvVarGuard { key, prev }
+    }
+
+    async fn clear_jwks_cache() {
+        *jwks_cache().lock().await = JwksCacheState {
+            entry: None,
+            refresh_in_flight: None,
+        };
+    }
+
+    async fn wait_for_request_count(counter: &Arc<AtomicUsize>, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if counter.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     async fn start_jwks_server(jwks_body: String) -> (String, tokio::task::JoinHandle<()>) {
@@ -939,7 +1131,7 @@ JwIDAQAB
     #[tokio::test]
     async fn jwks_no_kid_multi_key_is_rejected() {
         let _guard = test_lock().lock().unwrap();
-        *jwks_cache().lock().await = None;
+        clear_jwks_cache().await;
 
         let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
         let x2 = URL_SAFE_NO_PAD.encode([2u8; 32]);
@@ -1077,5 +1269,638 @@ JwIDAQAB
             err,
             Db9AuthError::InvalidConnectKey { reason } if reason == "revoked"
         ));
+    }
+
+    /// Multi-connection JWKS server that counts how many HTTP requests it receives.
+    async fn start_counting_jwks_server(
+        jwks_body: String,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                let body = jwks_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/jwks"), counter, handle)
+    }
+
+    /// Multi-connection JWKS server with a mutable body and request counter.
+    async fn start_mutable_counting_jwks_server(
+        jwks_body: Arc<StdMutex<String>>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                let body = jwks_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let body = body.lock().unwrap().clone();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/jwks"), counter, handle)
+    }
+
+    /// Counting JWKS server that pops a scripted (status, body) pair per request.
+    async fn start_scripted_counting_jwks_server(
+        responses: Arc<StdMutex<VecDeque<(u16, String)>>>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let (status, body) = responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or((500, String::new()));
+                    let status_line = if status == 200 {
+                        "200 OK".to_string()
+                    } else {
+                        format!("{status} ERROR")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/jwks"), counter, handle)
+    }
+
+    /// Counting JWKS server that waits on `release_response` before replying.
+    async fn start_blocking_counting_jwks_server(
+        jwks_body: String,
+        request_started: Arc<Notify>,
+        release_response: Arc<Notify>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                request_started.notify_waiters();
+                let body = jwks_body.clone();
+                let release = release_response.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    release.notified().await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/jwks"), counter, handle)
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_repeated_unknown_kid_is_throttled_per_selector() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        // JWKS with one key whose kid is "known-kid".
+        let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let jwks_body = format!(r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x}"}}]}}"#);
+        let (jwks_url, counter, server_task) = start_counting_jwks_server(jwks_body).await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+
+        // 1) First request with unknown kid — cache empty → fetches JWKS → kid not found.
+        let mut h1 = Header::new(Algorithm::RS256);
+        h1.kid = Some("unknown-kid-1".to_string());
+        let t1 = encode(&h1, &claims, &encoding_key).unwrap();
+        let r1 = jwks_decoding_key(&t1, &jwks_url).await;
+        assert!(matches!(r1, Err(Db9AuthError::JwksKidNotFound { .. })));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "first call should fetch once"
+        );
+
+        // 2) Same unknown kid within cooldown — still no fetch.
+        let mut h2 = Header::new(Algorithm::RS256);
+        h2.kid = Some("unknown-kid-1".to_string());
+        let t2 = encode(&h2, &claims, &encoding_key).unwrap();
+        let r2 = jwks_decoding_key(&t2, &jwks_url).await;
+        assert!(matches!(r2, Err(Db9AuthError::JwksKidNotFound { .. })));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "same unknown kid within cooldown must NOT fetch again"
+        );
+
+        // 3) Request with the known kid — should succeed from cache (no extra fetch).
+        let mut h3 = Header::new(Algorithm::RS256);
+        h3.kid = Some("known-kid".to_string());
+        let t3 = encode(&h3, &claims, &encoding_key).unwrap();
+        let r3 = jwks_decoding_key(&t3, &jwks_url).await;
+        assert!(r3.is_ok(), "known kid should resolve from cache");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "known kid should hit cache without fetching"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_prior_unknown_miss_does_not_block_rotated_kid() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let x2 = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let body = Arc::new(StdMutex::new(format!(
+            r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x1}"}}]}}"#
+        )));
+        let (jwks_url, counter, server_task) =
+            start_mutable_counting_jwks_server(body.clone()).await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+
+        let mut known_header = Header::new(Algorithm::RS256);
+        known_header.kid = Some("known-kid".to_string());
+        let known_token = encode(&known_header, &claims, &encoding_key).unwrap();
+        assert!(jwks_decoding_key(&known_token, &jwks_url).await.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let mut bad_header = Header::new(Algorithm::RS256);
+        bad_header.kid = Some("bad-kid".to_string());
+        let bad_token = encode(&bad_header, &claims, &encoding_key).unwrap();
+        let bad_result = jwks_decoding_key(&bad_token, &jwks_url).await;
+        assert!(matches!(
+            bad_result,
+            Err(Db9AuthError::JwksKidNotFound { .. })
+        ));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        *body.lock().unwrap() =
+            format!(r#"{{"keys":[{{"kty":"OKP","kid":"rotated-kid","x":"{x2}"}}]}}"#);
+
+        let mut rotated_header = Header::new(Algorithm::RS256);
+        rotated_header.kid = Some("rotated-kid".to_string());
+        let rotated_token = encode(&rotated_header, &claims, &encoding_key).unwrap();
+        let rotated_result = timeout(
+            Duration::from_secs(1),
+            jwks_decoding_key(&rotated_token, &jwks_url),
+        )
+        .await
+        .unwrap();
+        assert!(
+            rotated_result.is_ok(),
+            "a prior unknown kid miss must not block a legitimate rotated kid"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "rotated kid should trigger a new JWKS fetch"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_repeated_missing_kid_is_throttled_per_selector() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let x2 = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let jwks_body =
+            format!(r#"{{"keys":[{{"kty":"OKP","x":"{x1}"}},{{"kty":"OKP","x":"{x2}"}}]}}"#);
+        let (jwks_url, counter, server_task) = start_counting_jwks_server(jwks_body).await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).unwrap();
+
+        let r1 = jwks_decoding_key(&token, &jwks_url).await;
+        assert!(matches!(r1, Err(Db9AuthError::JwksKidMissing)));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "first missing-kid call should fetch once"
+        );
+
+        let r2 = jwks_decoding_key(&token, &jwks_url).await;
+        assert!(matches!(r2, Err(Db9AuthError::JwksKidMissing)));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "same missing-kid selector within cooldown must NOT fetch again"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_new_kid_after_recent_fetch_triggers_refresh() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let x2 = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let body = Arc::new(StdMutex::new(format!(
+            r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x1}"}}]}}"#
+        )));
+        let (jwks_url, counter, server_task) =
+            start_mutable_counting_jwks_server(body.clone()).await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+
+        let mut h1 = Header::new(Algorithm::RS256);
+        h1.kid = Some("known-kid".to_string());
+        let t1 = encode(&h1, &claims, &encoding_key).unwrap();
+        let r1 = jwks_decoding_key(&t1, &jwks_url).await;
+        assert!(r1.is_ok(), "initial known kid should resolve");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "initial lookup should fetch once"
+        );
+
+        *body.lock().unwrap() =
+            format!(r#"{{"keys":[{{"kty":"OKP","kid":"rotated-kid","x":"{x2}"}}]}}"#);
+
+        let mut h2 = Header::new(Algorithm::RS256);
+        h2.kid = Some("rotated-kid".to_string());
+        let t2 = encode(&h2, &claims, &encoding_key).unwrap();
+        let r2 = jwks_decoding_key(&t2, &jwks_url).await;
+        assert!(
+            r2.is_ok(),
+            "first token for a rotated kid should force a refresh and succeed"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "rotated kid should trigger a second JWKS fetch"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_fetch_failure_does_not_block_retry_after_recovery() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let success_body = format!(r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x}"}}]}}"#);
+        let responses = Arc::new(StdMutex::new(VecDeque::from([
+            (500, String::new()),
+            (200, success_body),
+        ])));
+        let (jwks_url, counter, server_task) = start_scripted_counting_jwks_server(responses).await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("known-kid".to_string());
+        let token = encode(&header, &claims, &encoding_key).unwrap();
+
+        let first_result = jwks_decoding_key(&token, &jwks_url).await;
+        assert!(matches!(
+            first_result,
+            Err(Db9AuthError::JwksFetchFailed { .. })
+        ));
+
+        let second_result = timeout(Duration::from_secs(1), jwks_decoding_key(&token, &jwks_url))
+            .await
+            .unwrap();
+        assert!(
+            second_result.is_ok(),
+            "a transient JWKS failure must not delay the next retry after recovery"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "retry after recovery should perform a second JWKS fetch"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_missing_selector_cache_is_bounded() {
+        let _guard = test_lock().lock().unwrap();
+        let mut entry = JwksCacheEntry {
+            jwks_url: "http://jwks.example/test".to_string(),
+            fetched_at: Instant::now(),
+            keys_by_kid: HashMap::new(),
+            singleton_key: None,
+            missing_selectors: HashMap::new(),
+        };
+
+        for i in 0..(JWKS_MISSING_SELECTOR_CACHE_LIMIT + 8) {
+            record_missing_selector(
+                &mut entry,
+                JwksSelector::Kid(format!("bad-kid-{i}")),
+                Instant::now(),
+            );
+        }
+
+        assert!(
+            entry.missing_selectors.len() <= JWKS_MISSING_SELECTOR_CACHE_LIMIT,
+            "negative cache must remain bounded"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_concurrent_distinct_unknown_kids_share_one_refresh() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let jwks_body = format!(r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x}"}}]}}"#);
+        let request_started = Arc::new(Notify::new());
+        let release_response = Arc::new(Notify::new());
+        let (jwks_url, counter, server_task) = start_blocking_counting_jwks_server(
+            jwks_body,
+            request_started.clone(),
+            release_response.clone(),
+        )
+        .await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+
+        let mut h1 = Header::new(Algorithm::RS256);
+        h1.kid = Some("unknown-kid-1".to_string());
+        let t1 = encode(&h1, &claims, &encoding_key).unwrap();
+        let task1 = tokio::spawn({
+            let jwks_url = jwks_url.clone();
+            async move { jwks_decoding_key(&t1, &jwks_url).await }
+        });
+
+        let mut h2 = Header::new(Algorithm::RS256);
+        h2.kid = Some("unknown-kid-2".to_string());
+        let t2 = encode(&h2, &claims, &encoding_key).unwrap();
+        let task2 = tokio::spawn({
+            let jwks_url = jwks_url.clone();
+            async move { jwks_decoding_key(&t2, &jwks_url).await }
+        });
+
+        wait_for_request_count(&counter, 1).await;
+        release_response.notify_one();
+
+        let result1 = timeout(Duration::from_secs(1), task1)
+            .await
+            .unwrap()
+            .unwrap();
+        let result2 = timeout(Duration::from_secs(1), task2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result1, Err(Db9AuthError::JwksKidNotFound { .. })));
+        assert!(matches!(result2, Err(Db9AuthError::JwksKidNotFound { .. })));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "concurrent distinct unknown kids must share one in-flight JWKS refresh"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_concurrent_waiters_share_one_refresh() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let jwks_body = format!(r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x}"}}]}}"#);
+        let request_started = Arc::new(Notify::new());
+        let release_response = Arc::new(Notify::new());
+        let (jwks_url, counter, server_task) = start_blocking_counting_jwks_server(
+            jwks_body,
+            request_started.clone(),
+            release_response.clone(),
+        )
+        .await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("known-kid".to_string());
+        let token = encode(&header, &claims, &encoding_key).unwrap();
+
+        let task1 = tokio::spawn({
+            let token = token.clone();
+            let jwks_url = jwks_url.clone();
+            async move { jwks_decoding_key(&token, &jwks_url).await }
+        });
+        let task2 = tokio::spawn({
+            let token = token.clone();
+            let jwks_url = jwks_url.clone();
+            async move { jwks_decoding_key(&token, &jwks_url).await }
+        });
+
+        wait_for_request_count(&counter, 1).await;
+        release_response.notify_one();
+
+        let result1 = timeout(Duration::from_secs(1), task1)
+            .await
+            .unwrap()
+            .unwrap();
+        let result2 = timeout(Duration::from_secs(1), task2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result1.is_ok(), "first waiter should resolve successfully");
+        assert!(result2.is_ok(), "second waiter should resolve successfully");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "concurrent waiters must share a single JWKS fetch"
+        );
+
+        server_task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn jwks_refresh_survives_request_cancellation() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let jwks_body = format!(r#"{{"keys":[{{"kty":"OKP","kid":"known-kid","x":"{x}"}}]}}"#);
+        let request_started = Arc::new(Notify::new());
+        let release_response = Arc::new(Notify::new());
+        let (jwks_url, counter, server_task) = start_blocking_counting_jwks_server(
+            jwks_body,
+            request_started.clone(),
+            release_response.clone(),
+        )
+        .await;
+
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            exp,
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("known-kid".to_string());
+        let token = encode(&header, &claims, &encoding_key).unwrap();
+
+        let initial_task = tokio::spawn({
+            let token = token.clone();
+            let jwks_url = jwks_url.clone();
+            async move { jwks_decoding_key(&token, &jwks_url).await }
+        });
+
+        wait_for_request_count(&counter, 1).await;
+        initial_task.abort();
+
+        let retry_task = tokio::spawn({
+            let token = token.clone();
+            let jwks_url = jwks_url.clone();
+            async move { jwks_decoding_key(&token, &jwks_url).await }
+        });
+
+        release_response.notify_one();
+
+        let retry_result = timeout(Duration::from_secs(1), retry_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            retry_result.is_ok(),
+            "later callers must not wedge when the original refresher is cancelled"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "retry should reuse the in-flight JWKS refresh instead of starting a new one"
+        );
+
+        server_task.abort();
     }
 }
