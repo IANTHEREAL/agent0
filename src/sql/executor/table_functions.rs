@@ -65,8 +65,8 @@ pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<
     let max_chars = args
         .get(1)
         .and_then(|a| match (&a.name, &a.value) {
-            (_, Value::Int32(n)) if *n > 0 => Some(*n as usize),
-            (_, Value::Int64(n)) if *n > 0 => Some(*n as usize),
+            (None, Value::Int32(n)) if *n > 0 => Some(*n as usize),
+            (None, Value::Int64(n)) if *n > 0 => Some(*n as usize),
             _ => None,
         })
         .or_else(|| {
@@ -81,14 +81,18 @@ pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<
     let overlap_chars = args
         .get(2)
         .and_then(|a| match (&a.name, &a.value) {
-            (_, Value::Int32(n)) if *n >= 0 => Some(*n as usize),
-            (_, Value::Int64(n)) if *n >= 0 => Some(*n as usize),
+            (None, Value::Int32(n)) if *n >= 0 => Some(*n as usize),
+            (None, Value::Int64(n)) if *n >= 0 => Some(*n as usize),
             _ => None,
         })
         .or_else(|| {
             args.iter().find_map(|a| match (&a.name, &a.value) {
-                (Some(n), Value::Int32(v)) if n == "overlap_chars" && *v >= 0 => Some(*v as usize),
-                (Some(n), Value::Int64(v)) if n == "overlap_chars" && *v >= 0 => Some(*v as usize),
+                (Some(n), Value::Int32(v)) if n == "overlap_chars" && *v >= 0 => {
+                    Some(*v as usize)
+                }
+                (Some(n), Value::Int64(v)) if n == "overlap_chars" && *v >= 0 => {
+                    Some(*v as usize)
+                }
                 _ => None,
             })
         });
@@ -96,8 +100,8 @@ pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<
     // Parse optional title (positional arg 4 or named "title")
     let title_arg = args
         .get(3)
-        .and_then(|a| match &a.value {
-            Value::Text(s) => Some(s.clone()),
+        .and_then(|a| match (&a.name, &a.value) {
+            (None, Value::Text(s)) => Some(s.clone()),
             _ => None,
         })
         .or_else(|| {

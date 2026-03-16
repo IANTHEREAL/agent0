@@ -10,6 +10,4 @@ mod splitter;
 mod title;
 
 pub(crate) use splitter::{chunk_document, ChunkOptions, DEFAULT_MAX_CHARS, DEFAULT_OVERLAP_CHARS};
-#[allow(unused_imports)]
-pub(crate) use title::extract_title;
 pub(crate) use title::format_for_embedding;
