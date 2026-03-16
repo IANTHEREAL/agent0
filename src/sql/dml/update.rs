@@ -8,9 +8,8 @@ use tikv_client::Transaction;
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
-use crate::sql::hnsw::hnsw_pk_label;
 use crate::sql::hnsw::storage::{hnsw_meta_key, write_hnsw_deltas};
-use crate::sql::hnsw::vec_f64_to_f32;
+use crate::sql::hnsw::{hnsw_resolve_label, vec_f64_to_f32, HnswLabelMode};
 use crate::sql::index_consistency::{
     is_unique_duplicate_error, resolve_unique_index_conflict, UniqueConflictResolution,
 };
@@ -253,7 +252,7 @@ async fn update_row_indexes(
 
     if !skip_hnsw {
         maintain_hnsw_indexes_after_update(
-            txn, db_id, schema, old_row, new_row, pk_values, pk_values,
+            txn, store, db_id, schema, old_row, new_row, pk_values, pk_values,
         )
         .await?;
     }
@@ -356,6 +355,7 @@ pub async fn execute_update_row_defer_hnsw(
 /// filtered internally — callers may pass all updated rows.
 pub async fn batch_maintain_hnsw_indexes(
     txn: &mut Transaction,
+    store: &TikvStore,
     db_id: u64,
     schema: &TableSchema,
     changes: &[(Row, Row)],
@@ -409,6 +409,29 @@ pub async fn batch_maintain_hnsw_indexes(
             }
         };
 
+        // Read meta to get label_mode and validate storage version.
+        let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
+        let meta_bytes_opt = txn
+            .get(meta_key.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let label_mode = match &meta_bytes_opt {
+            Some(meta_bytes) => {
+                let meta: crate::sql::hnsw::HnswMeta =
+                    serde_json::from_slice(meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
+                if meta.storage_version != 1 {
+                    return Err(anyhow::anyhow!(
+                        "HNSW index '{}' has unsupported storage_version={}; please rebuild",
+                        index.name,
+                        meta.storage_version
+                    ));
+                }
+                meta.label_mode
+            }
+            // No meta means CREATE INDEX hasn't finished; assume Direct for compat.
+            None => HnswLabelMode::Direct,
+        };
+
         // Collect vectors that actually changed (skip unchanged vector + PK).
         let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
         for (old_row, new_row) in changes {
@@ -430,33 +453,21 @@ pub async fn batch_maintain_hnsw_indexes(
                     ))
                 }
             };
-            let pk_label = hnsw_pk_label(&new_pk_values)?;
+            let pk_label = hnsw_resolve_label(
+                label_mode,
+                txn,
+                store,
+                db_id,
+                schema.table_id,
+                &new_pk_values,
+            )
+            .await?;
             pending.push((pk_label, vec_f64_to_f32(vector_f64)));
         }
 
         if pending.is_empty() {
             continue;
         }
-
-        // Validate storage version (only v1 delta-log supported).
-        let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
-        let meta_bytes_opt = txn
-            .get(meta_key.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        if let Some(meta_bytes) = meta_bytes_opt {
-            let meta: crate::sql::hnsw::HnswMeta =
-                serde_json::from_slice(&meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
-            if meta.storage_version != 1 {
-                return Err(anyhow::anyhow!(
-                    "HNSW index '{}' has unsupported storage_version={}; please rebuild",
-                    index.name,
-                    meta.storage_version
-                ));
-            }
-        }
-        // else: no meta means CREATE INDEX hasn't finished; write deltas anyway
-        // (they'll be applied on first read after the index is created).
 
         // Write delta entries (unique keys, ~100B each, zero shared-key contention).
         let delta_bytes = write_hnsw_deltas(txn, db_id, schema.table_id, index.id, &pending)
@@ -478,6 +489,7 @@ pub async fn batch_maintain_hnsw_indexes(
 /// but for inserted rows (no old_row comparison needed).
 pub async fn batch_maintain_hnsw_indexes_for_inserts(
     txn: &mut Transaction,
+    store: &TikvStore,
     db_id: u64,
     schema: &TableSchema,
     inserted_rows: &[Row],
@@ -531,6 +543,28 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
             }
         };
 
+        // Read meta to get label_mode and validate storage version.
+        let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
+        let meta_bytes_opt = txn
+            .get(meta_key.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let label_mode = match &meta_bytes_opt {
+            Some(meta_bytes) => {
+                let meta: crate::sql::hnsw::HnswMeta =
+                    serde_json::from_slice(meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
+                if meta.storage_version != 1 {
+                    return Err(anyhow::anyhow!(
+                        "HNSW index '{}' has unsupported storage_version={}; please rebuild",
+                        index.name,
+                        meta.storage_version
+                    ));
+                }
+                meta.label_mode
+            }
+            None => HnswLabelMode::Direct,
+        };
+
         // Collect vectors from inserted rows (skip NULLs).
         let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
         for row in inserted_rows {
@@ -546,30 +580,20 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
                 }
             };
             let pk_values = schema.get_pk_values(row);
-            let pk_label = hnsw_pk_label(&pk_values)?;
+            let pk_label = hnsw_resolve_label(
+                label_mode,
+                txn,
+                store,
+                db_id,
+                schema.table_id,
+                &pk_values,
+            )
+            .await?;
             pending.push((pk_label, vec_f64_to_f32(vector_f64)));
         }
 
         if pending.is_empty() {
             continue;
-        }
-
-        // Validate storage version (only v1 delta-log supported).
-        let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
-        let meta_bytes_opt = txn
-            .get(meta_key.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        if let Some(meta_bytes) = meta_bytes_opt {
-            let meta: crate::sql::hnsw::HnswMeta =
-                serde_json::from_slice(&meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
-            if meta.storage_version != 1 {
-                return Err(anyhow::anyhow!(
-                    "HNSW index '{}' has unsupported storage_version={}; please rebuild",
-                    index.name,
-                    meta.storage_version
-                ));
-            }
         }
 
         // Write delta entries.
@@ -795,7 +819,7 @@ async fn execute_update_row_inner(
 
     if !skip_hnsw {
         maintain_hnsw_indexes_after_update(
-            txn, db_id, schema, old_row, &new_row, &old_pks, &new_pks,
+            txn, store, db_id, schema, old_row, &new_row, &old_pks, &new_pks,
         )
         .await?;
     }
@@ -823,6 +847,7 @@ async fn execute_update_row_inner(
 /// responsible for any UPDATE-specific unchanged-skip guards.
 pub(super) async fn maintain_hnsw_indexes_inner(
     txn: &mut Transaction,
+    store: &TikvStore,
     db_id: u64,
     schema: &TableSchema,
     target_row: &Row,
@@ -830,6 +855,7 @@ pub(super) async fn maintain_hnsw_indexes_inner(
 ) -> Result<()> {
     maintain_hnsw_indexes_inner_for_index_ids(
         txn,
+        store,
         db_id,
         schema,
         target_row,
@@ -841,6 +867,7 @@ pub(super) async fn maintain_hnsw_indexes_inner(
 
 async fn maintain_hnsw_indexes_inner_for_index_ids(
     txn: &mut Transaction,
+    store: &TikvStore,
     db_id: u64,
     schema: &TableSchema,
     target_row: &Row,
@@ -850,8 +877,6 @@ async fn maintain_hnsw_indexes_inner_for_index_ids(
     if !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
         return Ok(());
     }
-
-    let pk_label = hnsw_pk_label(target_pk_values)?;
 
     for index in &schema.indexes {
         if !index.is_hnsw() {
@@ -887,23 +912,37 @@ async fn maintain_hnsw_indexes_inner_for_index_ids(
         };
         let vector_f32 = vec_f64_to_f32(vector_f64);
 
-        // Validate storage version (only v1 delta-log supported).
+        // Read meta to get label_mode and validate storage version.
         let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
         let meta_bytes_opt = txn
             .get(meta_key.clone())
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        if let Some(meta_bytes) = meta_bytes_opt {
-            let meta: crate::sql::hnsw::HnswMeta =
-                serde_json::from_slice(&meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
-            if meta.storage_version != 1 {
-                return Err(anyhow::anyhow!(
-                    "HNSW index '{}' has unsupported storage_version={}; please rebuild",
-                    index.name,
-                    meta.storage_version
-                ));
+        let label_mode = match &meta_bytes_opt {
+            Some(meta_bytes) => {
+                let meta: crate::sql::hnsw::HnswMeta =
+                    serde_json::from_slice(meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
+                if meta.storage_version != 1 {
+                    return Err(anyhow::anyhow!(
+                        "HNSW index '{}' has unsupported storage_version={}; please rebuild",
+                        index.name,
+                        meta.storage_version
+                    ));
+                }
+                meta.label_mode
             }
-        }
+            None => HnswLabelMode::Direct,
+        };
+
+        let pk_label = hnsw_resolve_label(
+            label_mode,
+            txn,
+            store,
+            db_id,
+            schema.table_id,
+            target_pk_values,
+        )
+        .await?;
 
         // Write single delta entry.
         let adds = vec![(pk_label, vector_f32)];
@@ -978,6 +1017,7 @@ fn changed_hnsw_index_ids_for_update(
 /// indexes whose vector column changed (or whose PK changed).
 async fn maintain_hnsw_indexes_after_update(
     txn: &mut Transaction,
+    store: &TikvStore,
     db_id: u64,
     schema: &TableSchema,
     old_row: &Row,
@@ -993,6 +1033,7 @@ async fn maintain_hnsw_indexes_after_update(
 
     maintain_hnsw_indexes_inner_for_index_ids(
         txn,
+        store,
         db_id,
         schema,
         new_row,

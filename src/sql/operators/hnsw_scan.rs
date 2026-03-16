@@ -5,8 +5,11 @@ use std::collections::{HashMap, HashSet};
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::hnsw::storage::load_hnsw_graph_with_deltas;
-use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle};
+use crate::sql::hnsw::storage::{
+    batch_get_pk_for_rowids, load_hnsw_graph_with_deltas,
+};
+use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle, HnswLabelMode};
+use crate::storage::decode_pk_from_index_suffix;
 use crate::sql::projection::fill_row_defaults;
 
 #[allow(dead_code)] // fields used in explain_info() trait method
@@ -162,12 +165,13 @@ impl PhysicalOperator for HnswScanOperator {
         // Load base graph + apply pending deltas so read-your-writes holds:
         // delta keys written by prior INSERT/UPDATE in the same txn are
         // visible via txn.scan's buffer merge.
-        let Some((hnsw_index, _meta, delta_count)) =
+        let Some((hnsw_index, meta, delta_count)) =
             load_hnsw_graph_with_deltas(ctx.txn, ctx.db_id, self.schema.table_id, self.index_id)
                 .await?
         else {
             return Ok(());
         };
+        let label_mode = meta.label_mode;
         if delta_count > 0 {
             if let Some(m) = crate::worker::get_worker_metrics() {
                 m.hnsw_scan_deltas_applied
@@ -199,6 +203,7 @@ impl PhysicalOperator for HnswScanOperator {
         let mut fetch_k = self.k.max(ef_search).max(self.k * 2).max(self.k + 100);
         let mut rows;
         let mut distance_by_label: HashMap<u64, f64>;
+        let mut pk_to_label: HashMap<String, u64> = HashMap::new();
 
         loop {
             let ranked_labels =
@@ -208,17 +213,60 @@ impl PhysicalOperator for HnswScanOperator {
                 return Ok(());
             }
 
-            let batch_pks = ranked_labels
-                .iter()
-                .map(|(label, _)| self.pk_value_from_label(*label).map(|pk| vec![pk]))
-                .collect::<Result<Vec<_>>>()?;
-
+            // Build rank and distance maps keyed by label (= rowid in Mapped mode).
             let rank_by_label: HashMap<u64, usize> = ranked_labels
                 .iter()
                 .enumerate()
                 .map(|(rank, (label, _))| (*label, rank))
                 .collect();
             distance_by_label = ranked_labels.iter().copied().collect();
+
+            // Convert labels → PK values for batch_get_rows.
+            pk_to_label.clear();
+            let batch_pks: Vec<Vec<Value>> = match label_mode {
+                HnswLabelMode::Direct => {
+                    ranked_labels
+                        .iter()
+                        .map(|(label, _)| {
+                            self.pk_value_from_label(*label).map(|pk| vec![pk])
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                HnswLabelMode::Mapped => {
+                    let rowids: Vec<u64> =
+                        ranked_labels.iter().map(|(label, _)| *label).collect();
+                    let pk_types: Vec<DataType> = self
+                        .schema
+                        .pk_indices
+                        .iter()
+                        .map(|&i| self.schema.columns[i].data_type.clone())
+                        .collect();
+                    let pk_bytes_vec = batch_get_pk_for_rowids(
+                        ctx.txn,
+                        ctx.db_id,
+                        self.schema.table_id,
+                        &rowids,
+                    )
+                    .await?;
+                    let mut pks = Vec::with_capacity(rowids.len());
+                    for (i, opt_bytes) in pk_bytes_vec.into_iter().enumerate() {
+                        let Some(pk_bytes) = opt_bytes else {
+                            // Stale label — row was deleted, mapping removed.
+                            continue;
+                        };
+                        let pk_values =
+                            decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
+                        let pk_key = pk_values
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        pk_to_label.insert(pk_key, rowids[i]);
+                        pks.push(pk_values);
+                    }
+                    pks
+                }
+            };
 
             let fetched_rows = ctx
                 .store
@@ -248,12 +296,26 @@ impl PhysicalOperator for HnswScanOperator {
                 valid.push(r);
             }
 
+            // Sort by HNSW search rank (closest first).
+            let pk_to_label_ref = &pk_to_label;
             valid.sort_by_key(|row| {
                 let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
-                row.values
-                    .get(pk_col_idx)
-                    .and_then(Self::pk_as_u64)
-                    .and_then(|label| rank_by_label.get(&label).copied())
+                let label = match label_mode {
+                    HnswLabelMode::Direct => row
+                        .values
+                        .get(pk_col_idx)
+                        .and_then(Self::pk_as_u64),
+                    HnswLabelMode::Mapped => {
+                        let pk_key = row
+                            .values
+                            .get(pk_col_idx)
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        pk_to_label_ref.get(&pk_key).copied()
+                    }
+                };
+                label
+                    .and_then(|l| rank_by_label.get(&l).copied())
                     .unwrap_or(usize::MAX)
             });
 
@@ -270,13 +332,25 @@ impl PhysicalOperator for HnswScanOperator {
         }
 
         if self.distance_expr.is_some() {
+            let pk_to_label_ref = &pk_to_label;
             for row in &mut rows {
                 let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
-                let distance = row
-                    .values
-                    .get(pk_col_idx)
-                    .and_then(Self::pk_as_u64)
-                    .and_then(|label| distance_by_label.get(&label).copied())
+                let label = match label_mode {
+                    HnswLabelMode::Direct => row
+                        .values
+                        .get(pk_col_idx)
+                        .and_then(Self::pk_as_u64),
+                    HnswLabelMode::Mapped => {
+                        let pk_key = row
+                            .values
+                            .get(pk_col_idx)
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        pk_to_label_ref.get(&pk_key).copied()
+                    }
+                };
+                let distance = label
+                    .and_then(|l| distance_by_label.get(&l).copied())
                     .unwrap_or(f64::NAN);
                 row.values.push(Value::Float64(distance));
             }

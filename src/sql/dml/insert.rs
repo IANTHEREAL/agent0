@@ -112,12 +112,13 @@ fn build_unique_violation_error(index: &IndexDef, idx_values: &[Value]) -> SqlEr
 /// [`super::update::maintain_hnsw_indexes_inner`].
 async fn maintain_hnsw_indexes_after_insert(
     txn: &mut Transaction,
+    store: &TikvStore,
     db_id: u64,
     schema: &TableSchema,
     row: &Row,
     pk_values: &[Value],
 ) -> Result<()> {
-    super::update::maintain_hnsw_indexes_inner(txn, db_id, schema, row, pk_values).await
+    super::update::maintain_hnsw_indexes_inner(txn, store, db_id, schema, row, pk_values).await
 }
 
 pub async fn build_enum_label_cache(
@@ -519,7 +520,8 @@ async fn execute_insert_row_inner(
                     .await?;
             }
             if !skip_hnsw {
-                maintain_hnsw_indexes_after_insert(txn, db_id, schema, &row, &pk_values).await?;
+                maintain_hnsw_indexes_after_insert(txn, store, db_id, schema, &row, &pk_values)
+                    .await?;
             }
             Ok(InsertRowResult::Inserted(row))
         }

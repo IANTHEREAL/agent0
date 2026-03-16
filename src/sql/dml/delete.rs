@@ -62,7 +62,35 @@ pub(super) async fn delete_row_storage_entries(
 
         // HNSW uses lazy deletion: the old PK label stays in the graph and
         // is filtered out by the over-fetch strategy in HnswScanOperator.
+        // In Mapped mode, we additionally delete the rowid mapping so that
+        // the scan operator can detect stale labels (missing rid→pk entry).
         if index.is_hnsw() {
+            // Read meta to check label_mode.
+            let meta_key =
+                crate::sql::hnsw::storage::hnsw_meta_key(db_id, schema.table_id, index.id);
+            if let Some(meta_bytes) = txn.get(meta_key).await? {
+                let meta: crate::sql::hnsw::HnswMeta = serde_json::from_slice(&meta_bytes)?;
+                if meta.label_mode == crate::sql::hnsw::HnswLabelMode::Mapped {
+                    let pk_bytes = crate::storage::encode_pk_values(&pk_values);
+                    if let Some(rowid) = crate::sql::hnsw::storage::get_rowid_for_pk(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        &pk_bytes,
+                    )
+                    .await?
+                    {
+                        crate::sql::hnsw::storage::delete_rowid_mapping(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            &pk_bytes,
+                            rowid,
+                        )
+                        .await?;
+                    }
+                }
+            }
             continue;
         }
 

@@ -201,6 +201,28 @@ impl TikvStore {
             .await
     }
 
+    /// Allocate the next HNSW rowid for a table. Monotonic, never recycled.
+    /// Uses autocommit (survives caller transaction rollback).
+    /// Rowids start at 1.
+    pub async fn alloc_hnsw_rowid(&self, db_id: u64, table_id: u64) -> Result<u64> {
+        use crate::sql::hnsw::storage::hnsw_rid_seq_key;
+        let key = self.key(&hnsw_rid_seq_key(db_id, table_id));
+        self.autocommit_update_key(key, |current| {
+            let current_val = match current {
+                Some(data) => u64::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid HNSW rowid sequence format"))?,
+                ),
+                None => 0,
+            };
+            let next_val = current_val
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("HNSW rowid sequence overflow"))?;
+            Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+        })
+        .await
+    }
+
     pub async fn create_sequence(
         &self,
         txn: &mut Transaction,
