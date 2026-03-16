@@ -31,6 +31,19 @@ fn floor_char_boundary(s: &str, pos: usize) -> usize {
     p
 }
 
+/// Snap a byte offset to the nearest valid UTF-8 char boundary at or after `pos`.
+/// Used to guarantee forward progress when floor_char_boundary would regress.
+fn ceil_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut p = pos;
+    while p < s.len() && !s.is_char_boundary(p) {
+        p += 1;
+    }
+    p
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Chunk {
     pub(crate) text: String,
@@ -150,12 +163,16 @@ pub(crate) fn chunk_document(content: &str, options: &ChunkOptions) -> Result<Ve
             }
         }
 
-        // Ensure progress (snap to char boundary)
+        // Ensure progress: use ceil_char_boundary to guarantee we advance at least one char
         if end_pos <= char_pos {
-            end_pos = floor_char_boundary(
+            end_pos = ceil_char_boundary(
                 content,
                 std::cmp::min(char_pos + options.max_chars, content.len()),
             );
+            // If max_chars < single char width, advance to next char boundary
+            if end_pos <= char_pos {
+                end_pos = ceil_char_boundary(content, char_pos + 1);
+            }
         }
 
         chunks.push(Chunk {
@@ -274,6 +291,21 @@ mod tests {
         for chunk in &chunks {
             assert!(!chunk.text.is_empty());
         }
+    }
+
+    #[test]
+    fn tiny_max_chars_with_multibyte() {
+        // max_chars=1 is smaller than a single CJK char (3 bytes)
+        // Must still make progress without panic or infinite loop
+        let text = "你好";
+        let opts = ChunkOptions {
+            max_chars: 1,
+            overlap_chars: 0,
+        };
+        let chunks = chunk_document(text, &opts).unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "你");
+        assert_eq!(chunks[1].text, "好");
     }
 
     #[test]

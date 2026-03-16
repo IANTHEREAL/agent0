@@ -309,11 +309,15 @@ impl<'a> Analyzer<'a> {
                             ("value".to_string(), DataType::Text, true, None),
                         ]
                     } else if obj_name.eq_ignore_ascii_case("chunk_text") {
-                        let positional_count = typed_args
+                        // Require at least 1 arg (positional or named "content")
+                        let has_content = typed_args
                             .iter()
-                            .filter(|a| matches!(a, TypedFunctionArg::Positional(_)))
-                            .count();
-                        if positional_count < 1 {
+                            .any(|a| matches!(a, TypedFunctionArg::Positional(_)))
+                            || typed_args.iter().any(|a| {
+                                matches!(a,
+                                TypedFunctionArg::Named { name, .. } if name == "content")
+                            });
+                        if !has_content {
                             return Err(AnalyzerError::Unsupported(
                                 "chunk_text requires at least 1 argument (content TEXT)"
                                     .to_string(),
