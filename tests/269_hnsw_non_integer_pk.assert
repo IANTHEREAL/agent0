@@ -5,4 +5,5 @@ text_cosine_nearest|dog
 multi_v1_nearest|x1
 multi_v2_nearest|x2
 int_compat_nearest|100
+varchar_after_update|delta
 varchar_null_search|delta

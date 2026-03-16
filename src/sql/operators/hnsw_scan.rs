@@ -256,6 +256,10 @@ impl PhysicalOperator for HnswScanOperator {
                         };
                         let pk_values =
                             decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
+                        // INVARIANT: pk_key must use the same Value::to_string()
+                        // format here and in the sort/distance blocks below.
+                        // If Value's Display impl changes, both sites must stay
+                        // in sync or the HashMap lookup will silently miss.
                         let pk_key = pk_values
                             .iter()
                             .map(|v| v.to_string())

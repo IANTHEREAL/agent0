@@ -606,11 +606,13 @@ pub fn hnsw_rid_seq_key(db_id: u64, table_id: u64) -> Vec<u8> {
 }
 
 /// Prefix for scanning all rid→pk mappings for a table (used by DROP TABLE cleanup).
+#[allow(dead_code)]
 pub fn hnsw_rid_rid2pk_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_rid_rid2pk_{table_id}_").into_bytes()
 }
 
 /// Prefix for scanning all pk→rid mappings for a table (used by DROP TABLE cleanup).
+#[allow(dead_code)]
 pub fn hnsw_rid_pk2rid_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_rid_pk2rid_{table_id}_").into_bytes()
 }
@@ -660,6 +662,7 @@ pub async fn put_rowid_mapping(
 
 /// Get the PK bytes for a single rowid within the caller's transaction.
 /// Returns `None` if the mapping was deleted (stale label from lazy HNSW deletion).
+#[allow(dead_code)]
 pub async fn get_pk_for_rowid(
     txn: &mut Transaction,
     db_id: u64,

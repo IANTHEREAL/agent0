@@ -235,13 +235,6 @@ pub async fn execute_create_index(
                 "HNSW indexes require a single-column primary key"
             ));
         }
-        let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
-        let label_mode = if matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
-            crate::sql::hnsw::HnswLabelMode::Direct
-        } else {
-            crate::sql::hnsw::HnswLabelMode::Mapped
-        };
-
         let indexed_col = idx_cols[0].clone();
         let col_idx = schema
             .column_index(&indexed_col)

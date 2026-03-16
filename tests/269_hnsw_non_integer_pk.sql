@@ -91,7 +91,12 @@ CREATE INDEX idx_int_compat ON hnsw_int_pk_compat USING hnsw (v vector_l2_ops);
 
 SELECT id AS int_compat_nearest FROM hnsw_int_pk_compat ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
 
--- ── 8. NULL vector handling with non-integer PK ─────────────────────
+-- ── 8. UPDATE vector value — ANN still returns correct row ──────────
+
+UPDATE hnsw_varchar_pk SET v = '[0.0, 1.0, 0.0]' WHERE id = 'delta';
+SELECT id AS varchar_after_update FROM hnsw_varchar_pk ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
+
+-- ── 9. NULL vector handling with non-integer PK ─────────────────────
 
 INSERT INTO hnsw_varchar_pk (id, v) VALUES ('nullvec', NULL);
 SELECT id AS varchar_null_search FROM hnsw_varchar_pk ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
