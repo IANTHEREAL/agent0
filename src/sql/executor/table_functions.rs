@@ -38,6 +38,103 @@ fn bridge_function_args(args: &[EvaluatedTableFunctionArg]) -> Vec<FunctionArg> 
         .collect()
 }
 
+pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<Row>> {
+    use crate::sql::chunker::{
+        chunk_document, format_for_embedding, ChunkOptions, DEFAULT_MAX_CHARS,
+        DEFAULT_OVERLAP_CHARS,
+    };
+
+    if args.is_empty() {
+        return Err(anyhow!(
+            "chunk_text requires at least 1 argument (content TEXT)"
+        ));
+    }
+
+    let content = match &args[0].value {
+        Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Vec::new()),
+        other => {
+            return Err(anyhow!(
+                "chunk_text: first argument must be TEXT, got {}",
+                other
+            ))
+        }
+    };
+
+    // Parse optional max_chars (positional arg 2 or named "max_chars")
+    let max_chars = args
+        .get(1)
+        .and_then(|a| match (&a.name, &a.value) {
+            (_, Value::Int32(n)) if *n > 0 => Some(*n as usize),
+            (_, Value::Int64(n)) if *n > 0 => Some(*n as usize),
+            _ => None,
+        })
+        .or_else(|| {
+            args.iter().find_map(|a| match (&a.name, &a.value) {
+                (Some(n), Value::Int32(v)) if n == "max_chars" && *v > 0 => Some(*v as usize),
+                (Some(n), Value::Int64(v)) if n == "max_chars" && *v > 0 => Some(*v as usize),
+                _ => None,
+            })
+        });
+
+    // Parse optional overlap_chars (positional arg 3 or named "overlap_chars")
+    let overlap_chars = args
+        .get(2)
+        .and_then(|a| match (&a.name, &a.value) {
+            (_, Value::Int32(n)) if *n >= 0 => Some(*n as usize),
+            (_, Value::Int64(n)) if *n >= 0 => Some(*n as usize),
+            _ => None,
+        })
+        .or_else(|| {
+            args.iter().find_map(|a| match (&a.name, &a.value) {
+                (Some(n), Value::Int32(v)) if n == "overlap_chars" && *v >= 0 => Some(*v as usize),
+                (Some(n), Value::Int64(v)) if n == "overlap_chars" && *v >= 0 => Some(*v as usize),
+                _ => None,
+            })
+        });
+
+    // Parse optional title (positional arg 4 or named "title")
+    let title_arg = args
+        .get(3)
+        .and_then(|a| match &a.value {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            args.iter().find_map(|a| match (&a.name, &a.value) {
+                (Some(n), Value::Text(v)) if n == "title" => Some(v.clone()),
+                _ => None,
+            })
+        });
+
+    let opts = ChunkOptions {
+        max_chars: max_chars.unwrap_or(DEFAULT_MAX_CHARS),
+        overlap_chars: overlap_chars.unwrap_or(DEFAULT_OVERLAP_CHARS),
+    };
+
+    let chunks = chunk_document(content, &opts).map_err(|e| anyhow!("{}", e))?;
+
+    let title = title_arg.as_deref();
+
+    let rows = chunks
+        .into_iter()
+        .map(|chunk| {
+            let text = if let Some(t) = title {
+                format_for_embedding(&chunk.text, t)
+            } else {
+                chunk.text
+            };
+            Row::new(vec![
+                Value::Int32(chunk.index as i32),
+                Value::Text(text),
+                Value::Int32(chunk.pos as i32),
+            ])
+        })
+        .collect();
+
+    Ok(rows)
+}
+
 pub(crate) fn json_table_function_rows(
     func_upper: &str,
     args: &[EvaluatedTableFunctionArg],
@@ -281,6 +378,8 @@ impl Executor {
             } else if func_upper == "_DB9_SYS_RECORD_MIGRATION" {
                 let (_, rows) = self.execute_record_migration(txn, &bridge_args).await?;
                 rows
+            } else if func_upper == "CHUNK_TEXT" {
+                chunk_text_rows(&evaluated_args)?
             } else if matches!(
                 func_upper.as_str(),
                 "JSONB_OBJECT_KEYS"
