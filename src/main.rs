@@ -2,6 +2,10 @@
 // chain in `protocol::handler::dynamic::query` needs depth 130, exceeding the
 // default limit of 128.  256 gives comfortable headroom.
 #![recursion_limit = "256"]
+// Stable Clippy keeps tightening format-string style lints. Treating
+// `uninlined_format_args` as a hard error blocks CI on bulk mechanical churn
+// without changing behavior, so keep it out of the warning budget.
+#![allow(clippy::uninlined_format_args)]
 
 mod auth;
 mod cli;

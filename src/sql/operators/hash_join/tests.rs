@@ -405,7 +405,6 @@ fn test_hash_table_into_unmatched_parts_preserves_components() {
 }
 
 #[test]
-#[allow(clippy::cloned_ref_to_slice_refs)]
 fn test_hash_key_and_join_equality_for_misc_value_variants() {
     use crate::model::IntervalValue;
     use rust_decimal::Decimal;

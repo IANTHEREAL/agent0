@@ -204,6 +204,9 @@ struct PendingBatchInlineReadObject {
     len: usize,
 }
 
+type DirectoryEntries = Vec<(String, Inode)>;
+type DirectoryEntriesResult = Result<DirectoryEntries>;
+
 enum ResolvedFileReadPlan {
     Ready(Vec<u8>),
     Object {
@@ -1960,7 +1963,7 @@ impl EmbeddedPageFs {
     pub(crate) async fn batch_readdir(
         &self,
         paths: &[String],
-    ) -> Result<Vec<Result<Vec<(String, Inode)>>>> {
+    ) -> Result<Vec<DirectoryEntriesResult>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -1971,8 +1974,7 @@ impl EmbeddedPageFs {
             resolve_paths_with_ids_batched(&mut store, paths).await
         };
 
-        type RawEntriesByIndex = Vec<Option<Result<Vec<(String, Inode)>>>>;
-        let mut raw_entries_by_index: RawEntriesByIndex =
+        let mut raw_entries_by_index: Vec<Option<DirectoryEntriesResult>> =
             std::iter::repeat_with(|| None).take(paths.len()).collect();
         let mut dir_request_order = Vec::new();
         let mut dir_inode_ids = Vec::new();
@@ -3968,7 +3970,7 @@ impl EmbeddedPageFs {
                             anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize"))
                         })?;
                     let chunk =
-                        read_file_range_from_txn(txn.as_mut(), inode_id, &inode, offset, chunk_len)
+                        read_file_range_from_txn(&mut txn, inode_id, &inode, offset, chunk_len)
                             .await?;
 
                     if sender.send(Ok(chunk)).await.is_err() {

@@ -983,6 +983,20 @@ JwIDAQAB
         exp: usize,
     }
 
+    fn test_claims(exp: usize) -> Claims<'static> {
+        Claims {
+            iss: "https://issuer.example",
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
+            exp,
+        }
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_happy_path() {
@@ -1428,17 +1442,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
 
         // 1) First request with unknown kid — cache empty → fetches JWKS → kid not found.
         let mut h1 = Header::new(Algorithm::RS256);
@@ -1495,17 +1499,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
 
         let mut known_header = Header::new(Algorithm::RS256);
         known_header.kid = Some("known-kid".to_string());
@@ -1562,17 +1556,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
         let token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).unwrap();
 
         let r1 = jwks_decoding_key(&token, &jwks_url).await;
@@ -1610,17 +1594,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
 
         let mut h1 = Header::new(Algorithm::RS256);
         h1.kid = Some("known-kid".to_string());
@@ -1669,17 +1643,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("known-kid".to_string());
         let token = encode(&header, &claims, &encoding_key).unwrap();
@@ -1751,17 +1715,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
 
         let mut h1 = Header::new(Algorithm::RS256);
         h1.kid = Some("unknown-kid-1".to_string());
@@ -1820,17 +1774,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("known-kid".to_string());
         let token = encode(&header, &claims, &encoding_key).unwrap();
@@ -1887,17 +1831,7 @@ JwIDAQAB
 
         let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
-        let claims = Claims {
-            iss: "https://issuer.example",
-            aud: "db9-server",
-            tid: "t1",
-            usr: "admin",
-            sub: "auth0|admin-user",
-            email_verified: true,
-            roles: vec!["admin"],
-            nullable: None,
-            exp,
-        };
+        let claims = test_claims(exp);
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("known-kid".to_string());
         let token = encode(&header, &claims, &encoding_key).unwrap();
