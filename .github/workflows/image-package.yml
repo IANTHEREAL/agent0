@@ -59,7 +59,7 @@ jobs:
           IMAGE_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
           IMAGE_TAG="sha-${SOURCE_SHORT_SHA}"
           IMAGE_REF_TAG="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
-          VERSION="$(grep '^version = ' Cargo.toml | head -1 | cut -d'\"' -f2)"
+          VERSION="$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)"
           MANIFEST_DIR="dist/image-package/server"
           ARTIFACT_NAME="image-package-server-${SOURCE_SHORT_SHA}"
           BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
