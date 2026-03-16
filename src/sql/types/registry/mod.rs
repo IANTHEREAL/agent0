@@ -7,6 +7,7 @@ use crate::model::DataType;
 
 mod aggregate_window;
 mod embedding;
+pub(crate) mod http;
 mod json;
 mod math;
 mod misc;
@@ -29,6 +30,9 @@ pub struct FunctionSignature {
     pub return_type: ReturnType,
     pub is_aggregate: bool,
     pub is_window: bool,
+    /// Expected argument types, used for parameter coercion in PREPARE.
+    /// Empty means no explicit arg type info (coercion handled elsewhere or skipped).
+    pub arg_types: Vec<DataType>,
 }
 
 impl FunctionSignature {
@@ -39,6 +43,7 @@ impl FunctionSignature {
             return_type: ReturnType::Fixed(return_type),
             is_aggregate: false,
             is_window: false,
+            arg_types: Vec::new(),
         }
     }
 
@@ -65,6 +70,7 @@ impl FunctionSignature {
             return_type: ReturnType::SameAsArg(arg_index),
             is_aggregate: false,
             is_window: false,
+            arg_types: Vec::new(),
         }
     }
 
@@ -75,7 +81,13 @@ impl FunctionSignature {
             return_type: ReturnType::Custom(f),
             is_aggregate: false,
             is_window: false,
+            arg_types: Vec::new(),
         }
+    }
+
+    pub fn with_arg_types(mut self, types: Vec<DataType>) -> Self {
+        self.arg_types = types;
+        self
     }
 }
 
@@ -127,6 +139,7 @@ pub fn global_registry() -> &'static FunctionRegistry {
 fn register_builtin_functions(r: &mut FunctionRegistry) {
     aggregate_window::register(r);
     embedding::register(r);
+    http::register(r);
     string::register(r);
     math::register(r);
     temporal::register(r);

@@ -4,7 +4,9 @@ use super::FunctionSignature;
 use crate::model::DataType;
 
 pub(super) fn register(r: &mut super::FunctionRegistry) {
-    // Math functions
+    let f64 = DataType::Float64;
+
+    // Polymorphic math functions (SameAsArg) — no arg_types
     r.register(
         "ABS",
         FunctionSignature::same_as_arg(0).with_args(1, Some(1)),
@@ -37,86 +39,128 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "MOD",
         FunctionSignature::same_as_arg(0).with_args(2, Some(2)),
     );
+
+    // Float64 functions — known arg types
     r.register(
         "POWER",
-        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![f64.clone(), f64.clone()]),
     );
     r.register(
         "POW",
-        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![f64.clone(), f64.clone()]),
     );
     r.register(
         "SQRT",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
     );
     r.register(
         "CBRT",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
     );
     r.register(
         "EXP",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
     );
     r.register(
         "LN",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
     );
     r.register(
         "LOG",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(2)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(2))
+            .with_arg_types(vec![f64.clone(), f64.clone()]),
     );
     r.register(
         "LOG10",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
     );
+    r.register(
+        "DEGREES",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "RADIANS",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "SIN",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "COS",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "TAN",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "ASIN",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "ACOS",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "ATAN",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "ATAN2",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![f64.clone(), f64.clone()]),
+    );
+
+    // Int result functions
     r.register(
         "SIGN",
         FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
     );
+
+    // Zero-arg functions
     r.register(
         "PI",
-        FunctionSignature::fixed(DataType::Float64).with_args(0, Some(0)),
+        FunctionSignature::fixed(f64.clone()).with_args(0, Some(0)),
     );
     r.register(
         "RANDOM",
-        FunctionSignature::fixed(DataType::Float64).with_args(0, Some(0)),
+        FunctionSignature::fixed(f64.clone()).with_args(0, Some(0)),
     );
-    r.register(
-        "DEGREES",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "RADIANS",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "SIN",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "COS",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "TAN",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "ASIN",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "ACOS",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "ATAN",
-        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
-    );
-    r.register(
-        "ATAN2",
-        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
-    );
+
+    // Polymorphic variadic — no arg_types
     r.register(
         "GREATEST",
         FunctionSignature::same_as_arg(0).with_args(1, None),

@@ -9,6 +9,7 @@ pub mod embedding;
 pub mod encoding;
 pub mod fs9;
 pub mod fts;
+pub mod http;
 pub mod json;
 pub mod math;
 pub mod misc;
@@ -31,6 +32,7 @@ fn init_registry() -> HashMap<&'static str, SqlFn> {
     encoding::register(&mut map);
     fs9::register(&mut map);
     fts::register(&mut map);
+    http::register(&mut map);
     json::register(&mut map);
     math::register(&mut map);
     misc::register(&mut map);

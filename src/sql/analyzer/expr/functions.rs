@@ -18,6 +18,30 @@ use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;
 use crate::sql::analyzer::Analyzer;
 
+/// Check whether `arg_type` is implicitly compatible with `target` for function
+/// argument matching, mirroring PostgreSQL's implicit cast rules:
+///   - Text family: Text, Varchar, Name, Char are compatible with Text
+///   - Numeric widening: Int32/Int64 widen to Float64
+///   - Json family: Json is compatible with Jsonb
+fn is_implicitly_compatible(arg_type: &DataType, target: &DataType) -> bool {
+    if arg_type == target {
+        return true;
+    }
+    match target {
+        DataType::Text => matches!(
+            arg_type,
+            DataType::Text | DataType::Varchar(_) | DataType::Name
+        ),
+        DataType::Float64 => matches!(
+            arg_type,
+            DataType::Float64 | DataType::Int32 | DataType::Int64
+        ),
+        DataType::Int64 => matches!(arg_type, DataType::Int64 | DataType::Int32),
+        DataType::Jsonb => matches!(arg_type, DataType::Jsonb | DataType::Json),
+        _ => false,
+    }
+}
+
 fn is_two_arg_advisory_lock_function(name: &str) -> bool {
     matches!(
         name,
@@ -569,10 +593,23 @@ impl<'a> Analyzer<'a> {
             | "FS9_WRITE_AT" | "FS9_APPEND" | "FS9_TRUNCATE" => {
                 self.coerce_fs9_signature(func_name, args)
             }
+            "HTTP_GET" | "HTTP_HEAD" | "HTTP_DELETE" | "HTTP_POST" | "HTTP_PUT" | "HTTP_PATCH"
+            | "HTTP" => self.coerce_http_signature(func_name, args),
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
-            _ => Ok(args),
+            _ => {
+                // Generic fallback: use registry arg_types if available.
+                // Covers ordinary single-signature functions like lower(text),
+                // length(text), sqrt(float8) etc. for PREPARE parameter inference.
+                let sig = global_registry().get(func_name);
+                match sig {
+                    Some(sig) if !sig.arg_types.is_empty() => {
+                        self.coerce_registry_arg_types(func_name, args, &sig.arg_types)
+                    }
+                    _ => Ok(args),
+                }
+            }
         }
     }
 
@@ -600,6 +637,103 @@ impl<'a> Analyzer<'a> {
                 name: func_name.to_string(),
                 arg_types,
             });
+        }
+        Ok(coerced)
+    }
+
+    /// Generic registry-based parameter coercion and type validation.
+    ///
+    /// Three cases per argument:
+    /// 1. Unresolved parameter / NULL → coerce to declared arg type (PREPARE inference).
+    /// 2. Pre-typed parameter (from PREPARE explicit type list) → validate compatibility,
+    ///    reject mismatches (e.g. `PREPARE q(int) AS SELECT lower($1)` → error).
+    /// 3. Non-parameter expression (column ref, literal, function call) → pass through.
+    ///    The registry stores only one signature per function and does not model PG
+    ///    overloads (e.g. `length(bytea)`, `quote_literal(anyelement)`), so we must
+    ///    not reject non-parameter args that simply don't match the modeled signature.
+    fn coerce_registry_arg_types(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        expected: &[DataType],
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            let Some(target) = expected.get(idx) else {
+                coerced.push(arg);
+                continue;
+            };
+            if self.is_unresolved_param(&arg) || arg.is_null_constant() {
+                // Case 1: infer type for unresolved param
+                coerced.push(self.coerce_if_needed(arg, target)?);
+            } else if matches!(arg.kind, TypedExprKind::Parameter { .. }) {
+                // Case 2: pre-typed parameter — validate against declared type
+                if is_implicitly_compatible(&arg.data_type, target) {
+                    coerced.push(self.coerce_if_needed(arg, target)?);
+                } else {
+                    return Err(AnalyzerError::FunctionNotFound {
+                        name: func_name.to_lowercase(),
+                        arg_types,
+                    });
+                }
+            } else {
+                // Case 3: non-parameter — pass through (registry may not model all overloads)
+                coerced.push(arg);
+            }
+        }
+        Ok(coerced)
+    }
+
+    fn coerce_http_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        // Expected arg types per position for each HTTP function group:
+        //   GET/HEAD/DELETE: (url TEXT [, headers JSONB])
+        //   POST/PUT/PATCH:  (url TEXT, body TEXT, content_type TEXT [, headers JSONB])
+        //   HTTP (universal): (method TEXT, uri TEXT [, headers JSONB [, content_type TEXT [, content TEXT]]])
+        let expected_types: &[DataType] = match func_name {
+            "HTTP_GET" | "HTTP_HEAD" | "HTTP_DELETE" => &[DataType::Text, DataType::Jsonb],
+            "HTTP_POST" | "HTTP_PUT" | "HTTP_PATCH" => &[
+                DataType::Text,
+                DataType::Text,
+                DataType::Text,
+                DataType::Jsonb,
+            ],
+            "HTTP" => &[
+                DataType::Text,
+                DataType::Text,
+                DataType::Jsonb,
+                DataType::Text,
+                DataType::Text,
+            ],
+            _ => return Ok(args),
+        };
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            let Some(target) = expected_types.get(idx) else {
+                coerced.push(arg);
+                continue;
+            };
+            let compatible = match target {
+                DataType::Text => matches!(
+                    arg.data_type,
+                    DataType::Text | DataType::Varchar(_) | DataType::Name
+                ),
+                DataType::Jsonb => matches!(arg.data_type, DataType::Jsonb | DataType::Json),
+                _ => arg.data_type == *target,
+            };
+            if !compatible && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_lowercase(),
+                    arg_types,
+                });
+            }
+            coerced.push(self.coerce_if_needed(arg, target)?);
         }
         Ok(coerced)
     }

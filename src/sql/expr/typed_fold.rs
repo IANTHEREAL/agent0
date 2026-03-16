@@ -142,6 +142,16 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
             | "VEC_EMBED_COSINE_DISTANCE"
             | "VEC_EMBED_L2_DISTANCE"
             | "VEC_EMBED_INNER_PRODUCT"
+            // HTTP extension functions perform network IO with observable
+            // side effects; must never be constant-folded or accepted in
+            // immutable contexts (e.g. generated columns).
+            | "HTTP"
+            | "HTTP_GET"
+            | "HTTP_HEAD"
+            | "HTTP_DELETE"
+            | "HTTP_POST"
+            | "HTTP_PUT"
+            | "HTTP_PATCH"
             // fs9 builtins perform filesystem IO against embedded PageFS and
             // must execute under statement runtime context, never during
             // analysis-time constant folding.

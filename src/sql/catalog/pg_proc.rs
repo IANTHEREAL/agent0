@@ -53,11 +53,23 @@ impl VirtualTable for PgProc {
 
         let mut rows = Vec::new();
 
+        // HTTP extension functions are registered in global_registry for
+        // analysis-time signature validation, but exposed in pg_proc only via
+        // the extension-specific path (lines below). Filter them here to
+        // prevent duplicate rows.
+        let http_names = crate::sql::types::registry::http::HTTP_FUNCTION_NAMES;
         let mut builtin_funcs: Vec<(String, &crate::sql::types::registry::FunctionSignature)> =
             global_registry()
                 .iter()
                 .filter_map(|(name, sig)| match &sig.return_type {
-                    ReturnType::Fixed(_) => Some((name.to_ascii_lowercase(), sig)),
+                    ReturnType::Fixed(_) => {
+                        let upper = name.to_ascii_uppercase();
+                        if http_names.contains(&upper.as_str()) {
+                            None
+                        } else {
+                            Some((name.to_ascii_lowercase(), sig))
+                        }
+                    }
                     _ => None,
                 })
                 .collect();
@@ -101,7 +113,7 @@ impl VirtualTable for PgProc {
                         text_val(name),
                         int_val(extensions_oid),
                         int_val(catalog_oids::pg_role_oid("postgres")),
-                        int_val(25),
+                        int_val(3802), // jsonb OID — matches scalar return type
                         text_val("f"),
                         Value::Boolean(false),
                     ]));

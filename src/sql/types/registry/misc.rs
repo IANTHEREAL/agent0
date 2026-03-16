@@ -104,6 +104,7 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
             return_type: ReturnType::FirstNonNull,
             is_aggregate: false,
             is_window: false,
+            arg_types: Vec::new(),
         },
     );
     r.register(

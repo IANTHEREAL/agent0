@@ -525,6 +525,53 @@ async fn acquire_quota_permit(
     }
 }
 
+/// Extension install check for the scalar function path (SqlFn).
+///
+/// Mirrors the embedding two-phase visibility model:
+///   1. In-txn DDL delta override (catches BEGIN; CREATE EXTENSION http; SELECT http_get(...))
+///   2. Snapshot read at the transaction's start timestamp (explicit txn) or
+///      latest committed timestamp (autocommit).
+pub(crate) async fn check_extension_installed() -> Result<()> {
+    use crate::extensions::InstalledExtension;
+    use crate::session_context;
+    use crate::storage::encode_extension_key_v2;
+    use tikv_client::TimestampExt;
+
+    // Phase 1: in-transaction DDL delta override.
+    match session_context::extension_txn_status("http") {
+        Some(true) => return Ok(()),
+        Some(false) => return Err(anyhow!("extension \"http\" is not installed")),
+        None => {}
+    }
+
+    // Phase 2: snapshot read with deterministic visibility.
+    let db_id = session_context::current_database_id();
+    if db_id == 0 {
+        return Ok(());
+    }
+
+    let client =
+        context::tikv_client().ok_or_else(|| anyhow!("extension \"http\" is not installed"))?;
+    let snapshot_ts = session_context::current_txn_snapshot_ts_version()
+        .map(tikv_client::Timestamp::from_version)
+        .unwrap_or(client.current_timestamp().await?);
+    let key = encode_extension_key_v2(db_id, "http");
+    let mut snap = client.snapshot(
+        snapshot_ts,
+        tikv_client::TransactionOptions::new_optimistic(),
+    );
+    match snap.get(key).await? {
+        Some(data) => {
+            let ext: InstalledExtension = bincode::deserialize(&data)?;
+            if !ext.enabled {
+                return Err(anyhow!("extension \"http\" is disabled"));
+            }
+            Ok(())
+        }
+        None => Err(anyhow!("extension \"http\" is not installed")),
+    }
+}
+
 pub(crate) async fn execute_table_function(
     tenant: &str,
     call: HttpTableFunctionCall,

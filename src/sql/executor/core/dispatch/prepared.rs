@@ -8,6 +8,7 @@ use super::super::*;
 use super::utils::{apply_pending_set_config_mutations, apply_statement_timeout};
 use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
+use crate::sql::scanner::count_sql_parameters;
 use crate::sql::sequences::SequenceSession;
 use crate::sql::types::sql_datatype_to_internal_strict;
 use std::future::Future;
@@ -912,6 +913,7 @@ impl Executor {
     ) -> Result<Vec<ExecuteResult>> {
         let prepared_name = normalize_ident(name);
         let prepared_sql = statement.to_string();
+        let param_count = count_sql_parameters(&prepared_sql).max(data_types.len());
 
         let mut client_oids: Vec<Option<DataType>> = Vec::with_capacity(data_types.len());
         for sql_type in data_types {
@@ -933,7 +935,7 @@ impl Executor {
                 db_id,
                 search_path,
                 &prepared_sql,
-                client_oids.len(),
+                param_count,
                 &client_oids,
             )
             .await

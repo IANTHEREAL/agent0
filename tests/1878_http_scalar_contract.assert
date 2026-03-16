@@ -1,0 +1,15 @@
+has_status|has_content|has_content_type|has_headers
+t|t|t|t
+
+status
+200
+
+url
+https://httpbin.org/get
+
+status
+200
+
+status
+200
+
