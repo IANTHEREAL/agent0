@@ -91,6 +91,13 @@ pub(crate) fn chunk_document(content: &str, options: &ChunkOptions) -> Result<Ve
         ));
     }
 
+    if options.overlap_chars >= options.max_chars {
+        return Err(format!(
+            "CHUNK_TEXT overlap_chars ({}) must be less than max_chars ({})",
+            options.overlap_chars, options.max_chars,
+        ));
+    }
+
     if content.is_empty() {
         return Ok(Vec::new());
     }
