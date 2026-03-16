@@ -59,16 +59,11 @@ pub fn writer_id() -> &'static str {
 ///
 /// Backward-compatible: old `HnswMeta` JSON without `label_mode` deserializes
 /// to `Direct` via `#[serde(default)]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum HnswLabelMode {
+    #[default]
     Direct,
     Mapped,
-}
-
-impl Default for HnswLabelMode {
-    fn default() -> Self {
-        Self::Direct
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,7 +822,7 @@ pub async fn get_or_alloc_rowid(
     let rowid = store
         .alloc_hnsw_rowid(db_id, table_id)
         .await
-        .map_err(|e| SqlError::Internal(e))?;
+        .map_err(SqlError::Internal)?;
     // Write the bidirectional mapping
     put_rowid_mapping(txn, db_id, table_id, pk_bytes, rowid).await?;
     Ok(rowid)
