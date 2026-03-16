@@ -87,12 +87,8 @@ pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<
         })
         .or_else(|| {
             args.iter().find_map(|a| match (&a.name, &a.value) {
-                (Some(n), Value::Int32(v)) if n == "overlap_chars" && *v >= 0 => {
-                    Some(*v as usize)
-                }
-                (Some(n), Value::Int64(v)) if n == "overlap_chars" && *v >= 0 => {
-                    Some(*v as usize)
-                }
+                (Some(n), Value::Int32(v)) if n == "overlap_chars" && *v >= 0 => Some(*v as usize),
+                (Some(n), Value::Int64(v)) if n == "overlap_chars" && *v >= 0 => Some(*v as usize),
                 _ => None,
             })
         });
