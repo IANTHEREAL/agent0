@@ -580,15 +580,9 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
                 }
             };
             let pk_values = schema.get_pk_values(row);
-            let pk_label = hnsw_resolve_label(
-                label_mode,
-                txn,
-                store,
-                db_id,
-                schema.table_id,
-                &pk_values,
-            )
-            .await?;
+            let pk_label =
+                hnsw_resolve_label(label_mode, txn, store, db_id, schema.table_id, &pk_values)
+                    .await?;
             pending.push((pk_label, vec_f64_to_f32(vector_f64)));
         }
 

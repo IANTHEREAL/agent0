@@ -231,9 +231,7 @@ pub async fn execute_create_index(
         // Integer PKs use Direct mode (label = PK), others use Mapped mode
         // (label = internal rowid with persistent bidirectional mapping).
         if schema.pk_indices.len() != 1 {
-            return Err(anyhow!(
-                "HNSW indexes require a single-column primary key"
-            ));
+            return Err(anyhow!("HNSW indexes require a single-column primary key"));
         }
         let indexed_col = idx_cols[0].clone();
         let col_idx = schema

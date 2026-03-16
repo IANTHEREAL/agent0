@@ -702,10 +702,7 @@ pub async fn batch_get_pk_for_rowids(
         let k: &[u8] = pair.key().as_ref().into();
         map.insert(k.to_vec(), pair.value().to_vec());
     }
-    let result = keys
-        .into_iter()
-        .map(|k| map.remove(&k))
-        .collect();
+    let result = keys.into_iter().map(|k| map.remove(&k)).collect();
     Ok(result)
 }
 
@@ -921,10 +918,7 @@ mod tests {
         assert_eq!(&rid2pk[prefix.len()..], &42u64.to_be_bytes());
 
         let seq = hnsw_rid_seq_key(1, 2);
-        assert_eq!(
-            std::str::from_utf8(&seq).unwrap(),
-            "d_1_hnsw_rid_seq_2"
-        );
+        assert_eq!(std::str::from_utf8(&seq).unwrap(), "d_1_hnsw_rid_seq_2");
     }
 
     #[test]

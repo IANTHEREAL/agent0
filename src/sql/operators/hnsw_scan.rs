@@ -5,12 +5,10 @@ use std::collections::{HashMap, HashSet};
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::hnsw::storage::{
-    batch_get_pk_for_rowids, load_hnsw_graph_with_deltas,
-};
+use crate::sql::hnsw::storage::{batch_get_pk_for_rowids, load_hnsw_graph_with_deltas};
 use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle, HnswLabelMode};
-use crate::storage::decode_pk_from_index_suffix;
 use crate::sql::projection::fill_row_defaults;
+use crate::storage::decode_pk_from_index_suffix;
 
 #[allow(dead_code)] // fields used in explain_info() trait method
 #[derive(Debug)]
@@ -224,38 +222,28 @@ impl PhysicalOperator for HnswScanOperator {
             // Convert labels → PK values for batch_get_rows.
             pk_to_label.clear();
             let batch_pks: Vec<Vec<Value>> = match label_mode {
-                HnswLabelMode::Direct => {
-                    ranked_labels
-                        .iter()
-                        .map(|(label, _)| {
-                            self.pk_value_from_label(*label).map(|pk| vec![pk])
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                }
+                HnswLabelMode::Direct => ranked_labels
+                    .iter()
+                    .map(|(label, _)| self.pk_value_from_label(*label).map(|pk| vec![pk]))
+                    .collect::<Result<Vec<_>>>()?,
                 HnswLabelMode::Mapped => {
-                    let rowids: Vec<u64> =
-                        ranked_labels.iter().map(|(label, _)| *label).collect();
+                    let rowids: Vec<u64> = ranked_labels.iter().map(|(label, _)| *label).collect();
                     let pk_types: Vec<DataType> = self
                         .schema
                         .pk_indices
                         .iter()
                         .map(|&i| self.schema.columns[i].data_type.clone())
                         .collect();
-                    let pk_bytes_vec = batch_get_pk_for_rowids(
-                        ctx.txn,
-                        ctx.db_id,
-                        self.schema.table_id,
-                        &rowids,
-                    )
-                    .await?;
+                    let pk_bytes_vec =
+                        batch_get_pk_for_rowids(ctx.txn, ctx.db_id, self.schema.table_id, &rowids)
+                            .await?;
                     let mut pks = Vec::with_capacity(rowids.len());
                     for (i, opt_bytes) in pk_bytes_vec.into_iter().enumerate() {
                         let Some(pk_bytes) = opt_bytes else {
                             // Stale label — row was deleted, mapping removed.
                             continue;
                         };
-                        let pk_values =
-                            decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
+                        let pk_values = decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
                         // INVARIANT: pk_key must use the same Value::to_string()
                         // format here and in the sort/distance blocks below.
                         // If Value's Display impl changes, both sites must stay
@@ -305,10 +293,7 @@ impl PhysicalOperator for HnswScanOperator {
             valid.sort_by_key(|row| {
                 let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
                 let label = match label_mode {
-                    HnswLabelMode::Direct => row
-                        .values
-                        .get(pk_col_idx)
-                        .and_then(Self::pk_as_u64),
+                    HnswLabelMode::Direct => row.values.get(pk_col_idx).and_then(Self::pk_as_u64),
                     HnswLabelMode::Mapped => {
                         let pk_key = row
                             .values
@@ -340,10 +325,7 @@ impl PhysicalOperator for HnswScanOperator {
             for row in &mut rows {
                 let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
                 let label = match label_mode {
-                    HnswLabelMode::Direct => row
-                        .values
-                        .get(pk_col_idx)
-                        .and_then(Self::pk_as_u64),
+                    HnswLabelMode::Direct => row.values.get(pk_col_idx).and_then(Self::pk_as_u64),
                     HnswLabelMode::Mapped => {
                         let pk_key = row
                             .values
