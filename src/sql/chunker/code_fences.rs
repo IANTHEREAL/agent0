@@ -17,7 +17,7 @@ pub(crate) fn find_code_fences(text: &str) -> Vec<Range<usize>> {
             fence_start = pos;
             in_fence = true;
         } else {
-            regions.push(fence_start..pos + offset.min(4)); // include the closing ```
+            regions.push(fence_start..pos + 4); // include the closing \n```
             in_fence = false;
         }
         search_start = pos + 4; // skip past \n```
