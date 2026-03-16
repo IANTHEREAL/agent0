@@ -236,7 +236,7 @@ enum FileRangeReadPlan {
 
 enum StreamReadPlan {
     Inline {
-        txn: Transaction,
+        txn: Box<Transaction>,
         inode_id: u64,
         inode: Inode,
     },
@@ -1971,7 +1971,8 @@ impl EmbeddedPageFs {
             resolve_paths_with_ids_batched(&mut store, paths).await
         };
 
-        let mut raw_entries_by_index: Vec<Option<Result<Vec<(String, Inode)>>>> =
+        type RawEntriesByIndex = Vec<Option<Result<Vec<(String, Inode)>>>>;
+        let mut raw_entries_by_index: RawEntriesByIndex =
             std::iter::repeat_with(|| None).take(paths.len()).collect();
         let mut dir_request_order = Vec::new();
         let mut dir_inode_ids = Vec::new();
@@ -3886,7 +3887,7 @@ impl EmbeddedPageFs {
                 })
             }
             _ => Ok(StreamReadPlan::Inline {
-                txn,
+                txn: Box::new(txn),
                 inode_id,
                 inode,
             }),
@@ -3967,7 +3968,7 @@ impl EmbeddedPageFs {
                             anyhow!(EmbeddedFsError::internal("stream chunk exceeds usize"))
                         })?;
                     let chunk =
-                        read_file_range_from_txn(&mut txn, inode_id, &inode, offset, chunk_len)
+                        read_file_range_from_txn(txn.as_mut(), inode_id, &inode, offset, chunk_len)
                             .await?;
 
                     if sender.send(Ok(chunk)).await.is_err() {
@@ -8454,7 +8455,7 @@ mod tests {
 
         let before = inode_snapshot(&fs, &path).await;
         let results = fs
-            .batch_inline_read(&[path.clone()], data.len(), data.len())
+            .batch_inline_read(std::slice::from_ref(&path), data.len(), data.len())
             .await
             .unwrap();
 
