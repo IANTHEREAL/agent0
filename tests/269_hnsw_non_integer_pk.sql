@@ -19,17 +19,26 @@ INSERT INTO hnsw_varchar_pk (id, v) VALUES ('gamma', '[0.0, 0.0, 1.0]');
 CREATE INDEX idx_hnsw_varchar ON hnsw_varchar_pk USING hnsw (v vector_l2_ops);
 
 -- k-NN search should return closest vector
-SELECT id AS varchar_nearest FROM hnsw_varchar_pk ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
+SELECT 'varchar_nearest' AS test_name, id
+FROM hnsw_varchar_pk
+ORDER BY v <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
 
 -- ── 2. INSERT after index — delta-log with mapping ───────────────────
 
 INSERT INTO hnsw_varchar_pk (id, v) VALUES ('delta', '[0.9, 0.1, 0.0]');
-SELECT id AS varchar_insert_nearest FROM hnsw_varchar_pk ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 2;
+SELECT 'varchar_insert_nearest' AS test_name, id
+FROM hnsw_varchar_pk
+ORDER BY v <-> '[1.0, 0.0, 0.0]'
+LIMIT 2;
 
 -- ── 3. DELETE — rowid mapping cleanup ────────────────────────────────
 
 DELETE FROM hnsw_varchar_pk WHERE id = 'alpha';
-SELECT id AS varchar_after_delete FROM hnsw_varchar_pk ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
+SELECT 'varchar_after_delete' AS test_name, id
+FROM hnsw_varchar_pk
+ORDER BY v <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
 
 -- ── 4. Distance expression with non-integer PK ──────────────────────
 
@@ -53,9 +62,32 @@ INSERT INTO hnsw_text_pk (name, embedding) VALUES ('dog',   '[1.0, 0.0, 0.0]');
 INSERT INTO hnsw_text_pk (name, embedding) VALUES ('cat',   '[0.9, 0.1, 0.0]');
 INSERT INTO hnsw_text_pk (name, embedding) VALUES ('fish',  '[0.0, 0.0, 1.0]');
 
-SELECT name AS text_cosine_nearest FROM hnsw_text_pk ORDER BY embedding <-> '[1.0, 0.0, 0.0]' LIMIT 1;
+SELECT 'text_cosine_nearest' AS test_name, name
+FROM hnsw_text_pk
+ORDER BY embedding <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
 
--- ── 6. Multiple HNSW indexes on same table share rowid mapping ──────
+-- ── 6. UUID PK — create index then search ──────────────────────────
+
+DROP TABLE IF EXISTS hnsw_uuid_pk;
+
+CREATE TABLE hnsw_uuid_pk (
+    id UUID PRIMARY KEY,
+    v VECTOR(3)
+);
+
+INSERT INTO hnsw_uuid_pk (id, v) VALUES ('00000000-0000-0000-0000-000000000001', '[1.0, 0.0, 0.0]');
+INSERT INTO hnsw_uuid_pk (id, v) VALUES ('00000000-0000-0000-0000-000000000002', '[0.0, 1.0, 0.0]');
+INSERT INTO hnsw_uuid_pk (id, v) VALUES ('00000000-0000-0000-0000-000000000003', '[0.0, 0.0, 1.0]');
+
+CREATE INDEX idx_hnsw_uuid ON hnsw_uuid_pk USING hnsw (v vector_l2_ops);
+
+SELECT 'uuid_nearest' AS test_name, id::TEXT
+FROM hnsw_uuid_pk
+ORDER BY v <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
+
+-- ── 7. Multiple HNSW indexes on same table share rowid mapping ──────
 
 DROP TABLE IF EXISTS hnsw_multi_idx;
 
@@ -72,10 +104,16 @@ INSERT INTO hnsw_multi_idx VALUES ('x3', '[0.0, 0.0, 1.0]', '[0.0, 0.0, 1.0]');
 CREATE INDEX idx_multi_v1 ON hnsw_multi_idx USING hnsw (v1 vector_l2_ops);
 CREATE INDEX idx_multi_v2 ON hnsw_multi_idx USING hnsw (v2 vector_l2_ops);
 
-SELECT code AS multi_v1_nearest FROM hnsw_multi_idx ORDER BY v1 <-> '[1.0, 0.0, 0.0]' LIMIT 1;
-SELECT code AS multi_v2_nearest FROM hnsw_multi_idx ORDER BY v2 <-> '[1.0, 0.0, 0.0]' LIMIT 1;
+SELECT 'multi_v1_nearest' AS test_name, code
+FROM hnsw_multi_idx
+ORDER BY v1 <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
+SELECT 'multi_v2_nearest' AS test_name, code
+FROM hnsw_multi_idx
+ORDER BY v2 <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
 
--- ── 7. Integer PK still works (backward compat — Direct mode) ───────
+-- ── 8. Integer PK still works (backward compat — Direct mode) ───────
 
 DROP TABLE IF EXISTS hnsw_int_pk_compat;
 
@@ -89,26 +127,39 @@ INSERT INTO hnsw_int_pk_compat VALUES (200, '[0.0, 1.0, 0.0]');
 
 CREATE INDEX idx_int_compat ON hnsw_int_pk_compat USING hnsw (v vector_l2_ops);
 
-SELECT id AS int_compat_nearest FROM hnsw_int_pk_compat ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
+SELECT 'int_compat_nearest' AS test_name, id
+FROM hnsw_int_pk_compat
+ORDER BY v <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
 
--- ── 8. UPDATE vector value — ANN still returns correct row ──────────
+-- ── 9. UPDATE vector value — ANN still returns correct row ──────────
 
-UPDATE hnsw_varchar_pk SET v = '[0.0, 1.0, 0.0]' WHERE id = 'delta';
-SELECT id AS varchar_after_update FROM hnsw_varchar_pk ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
+UPDATE hnsw_varchar_pk SET v = '[0.0, 0.8, 0.0]' WHERE id = 'delta';
+SELECT 'varchar_after_update' AS test_name, id
+FROM hnsw_varchar_pk
+ORDER BY v <-> '[0.0, 0.8, 0.0]'
+LIMIT 1;
 
--- ── 9. PK value UPDATE — rowid stays stable, ANN still correct ──────
+-- ── 10. PK value UPDATE — rowid stays stable, ANN still correct ──────
 
 UPDATE hnsw_varchar_pk SET id = 'delta_renamed' WHERE id = 'delta';
-SELECT id AS varchar_pk_update FROM hnsw_varchar_pk ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
+SELECT 'varchar_pk_update' AS test_name, id
+FROM hnsw_varchar_pk
+ORDER BY v <-> '[0.0, 0.8, 0.0]'
+LIMIT 1;
 
--- ── 10. NULL vector handling with non-integer PK ────────────────────
+-- ── 11. NULL vector handling with non-integer PK ────────────────────
 
 INSERT INTO hnsw_varchar_pk (id, v) VALUES ('nullvec', NULL);
-SELECT id AS varchar_null_search FROM hnsw_varchar_pk ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
+SELECT 'varchar_null_search' AS test_name, id
+FROM hnsw_varchar_pk
+ORDER BY v <-> '[1.0, 0.0, 0.0]'
+LIMIT 1;
 
 -- ── Cleanup ─────────────────────────────────────────────────────────
 
 DROP TABLE hnsw_varchar_pk;
 DROP TABLE hnsw_text_pk;
+DROP TABLE hnsw_uuid_pk;
 DROP TABLE hnsw_multi_idx;
 DROP TABLE hnsw_int_pk_compat;
