@@ -1433,6 +1433,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
 
@@ -1496,6 +1500,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
 
@@ -1559,6 +1567,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
         let token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key).unwrap();
@@ -1603,6 +1615,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
 
@@ -1658,6 +1674,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
         let mut header = Header::new(Algorithm::RS256);
@@ -1736,6 +1756,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
 
@@ -1801,6 +1825,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
         let mut header = Header::new(Algorithm::RS256);
@@ -1864,6 +1892,10 @@ JwIDAQAB
             aud: "db9-server",
             tid: "t1",
             usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
             exp,
         };
         let mut header = Header::new(Algorithm::RS256);
