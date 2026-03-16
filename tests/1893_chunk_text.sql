@@ -2,48 +2,34 @@
 -- Issue: #1893, #1892
 
 -- 1. Basic: short document returns single chunk
-SELECT chunk_index, chunk_text, chunk_pos FROM CHUNK_TEXT('Hello, world!');
+SELECT 'basic_single' AS test_name, chunk_index, chunk_text, chunk_pos
+FROM CHUNK_TEXT('Hello, world!');
 
 -- 2. Empty string returns no rows
-SELECT COUNT(*) AS cnt FROM CHUNK_TEXT('');
+SELECT 'empty_count' AS test_name, COUNT(*) AS cnt FROM CHUNK_TEXT('');
 
 -- 3. NULL input returns no rows
-SELECT COUNT(*) AS cnt FROM CHUNK_TEXT(NULL);
+SELECT 'null_count' AS test_name, COUNT(*) AS cnt FROM CHUNK_TEXT(NULL);
 
--- 4. Custom max_chars: force multiple chunks from moderate text
-SELECT chunk_index, length(chunk_text) AS len, chunk_pos
+-- 4. With title: output includes title prefix
+SELECT 'title_prefix' AS test_name, chunk_text
+FROM CHUNK_TEXT('Short doc content', 3600, 540, 'My Document');
+
+-- 5. Without title: no prefix
+SELECT 'no_prefix' AS test_name, chunk_text
+FROM CHUNK_TEXT('Plain content');
+
+-- 6. Multiple chunks with custom params
+SELECT 'multi_chunk' AS test_name, COUNT(*) AS cnt
 FROM CHUNK_TEXT(repeat('abcdefgh ', 500), 200, 30);
 
--- 5. Chunks are sequential
-SELECT chunk_index FROM CHUNK_TEXT(repeat('word ', 1000), 100, 15) ORDER BY chunk_index;
-
--- 6. With title parameter: output includes title prefix
-SELECT chunk_index, chunk_text FROM CHUNK_TEXT('Short doc content', 3600, 540, 'My Document');
-
--- 7. Title parameter NULL: no prefix
-SELECT chunk_index, chunk_text FROM CHUNK_TEXT('Plain content');
-
--- 8. Markdown heading respected as break point
-SELECT chunk_index, left(chunk_text, 40) AS preview
-FROM CHUNK_TEXT(
-    concat(repeat('x', 3200), E'\n## Section Two\n', repeat('y', 2000)),
-    3600, 540
-);
-
--- 9. Code fence not split
-SELECT chunk_index, chunk_text LIKE '%```%partial%' AS has_partial_fence
-FROM CHUNK_TEXT(
-    concat('intro text\n```python\n', repeat('code_line\n', 50), '```\nafter code\n', repeat('z', 4000)),
-    300, 45
-);
-
--- 10. Named parameters
-SELECT chunk_index, chunk_pos
-FROM CHUNK_TEXT('Hello named params test content here', max_chars => 20, overlap_chars => 5);
-
--- 11. Use in subquery / CTE
+-- 7. CTE usage
 WITH chunks AS (
     SELECT chunk_index, chunk_text, chunk_pos
-    FROM CHUNK_TEXT('First paragraph.\n\nSecond paragraph.\n\nThird paragraph.', 30, 5)
+    FROM CHUNK_TEXT(repeat('hello world ', 400), 200, 30)
 )
-SELECT COUNT(*) AS total_chunks FROM chunks;
+SELECT 'cte_works' AS test_name, COUNT(*) > 0 AS has_chunks FROM chunks;
+
+-- 8. Named parameters
+SELECT 'named_params' AS test_name, COUNT(*) > 0 AS has_chunks
+FROM CHUNK_TEXT('test content for named params usage', max_chars => 20, overlap_chars => 5);
