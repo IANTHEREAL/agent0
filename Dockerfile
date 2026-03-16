@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 rust:1.88-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 
 # Add arm64 architecture and install cross-compilation toolchain
 RUN dpkg --add-architecture arm64 && \
@@ -42,11 +42,11 @@ ARG BUILD_DATE=""
 ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
 ENV BUILD_DATE=${BUILD_DATE}
 
-# Cross-compile for arm64
+# Build db9-server for arm64
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 
 # Runtime stage (arm64)
-FROM --platform=linux/arm64 debian:bookworm-slim
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     libssl3 \
