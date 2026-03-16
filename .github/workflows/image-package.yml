@@ -5,6 +5,18 @@ on:
   push:
     branches:
       - master
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'DIFY_COMPATIBILITY.md'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+      - '.github/workflows/governance-lint.yml'
+      - '.github/workflows/doc-*.yml'
   workflow_dispatch:
 
 permissions:
