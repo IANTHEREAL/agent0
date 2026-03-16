@@ -50,12 +50,22 @@ pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<
         ));
     }
 
-    let content = match &args[0].value {
+    // Resolve content: positional arg[0] (unnamed) or named "content"
+    let content_value = if args[0].name.is_none() {
+        &args[0].value
+    } else {
+        args.iter()
+            .find(|a| a.name.as_deref() == Some("content"))
+            .map(|a| &a.value)
+            .ok_or_else(|| anyhow!("chunk_text: missing required argument 'content'"))?
+    };
+
+    let content = match content_value {
         Value::Text(s) => s.as_str(),
         Value::Null => return Ok(Vec::new()),
         other => {
             return Err(anyhow!(
-                "chunk_text: first argument must be TEXT, got {}",
+                "chunk_text: content argument must be TEXT, got {}",
                 other
             ))
         }

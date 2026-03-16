@@ -19,6 +19,18 @@ const DEFAULT_WINDOW_CHARS: usize = 800;
 /// Decay factor for distance-based score weighting.
 const DECAY_FACTOR: f64 = 0.7;
 
+/// Snap a byte offset to the nearest valid UTF-8 char boundary at or before `pos`.
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut p = pos;
+    while p > 0 && !s.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Chunk {
     pub(crate) text: String,
@@ -118,7 +130,10 @@ pub(crate) fn chunk_document(content: &str, options: &ChunkOptions) -> Result<Ve
     let mut index = 0;
 
     while char_pos < content.len() {
-        let target_end = std::cmp::min(char_pos + options.max_chars, content.len());
+        let target_end = floor_char_boundary(
+            content,
+            std::cmp::min(char_pos + options.max_chars, content.len()),
+        );
         let mut end_pos = target_end;
 
         // Find best break point if not at end of document
@@ -135,9 +150,12 @@ pub(crate) fn chunk_document(content: &str, options: &ChunkOptions) -> Result<Ve
             }
         }
 
-        // Ensure progress
+        // Ensure progress (snap to char boundary)
         if end_pos <= char_pos {
-            end_pos = std::cmp::min(char_pos + options.max_chars, content.len());
+            end_pos = floor_char_boundary(
+                content,
+                std::cmp::min(char_pos + options.max_chars, content.len()),
+            );
         }
 
         chunks.push(Chunk {
@@ -151,8 +169,8 @@ pub(crate) fn chunk_document(content: &str, options: &ChunkOptions) -> Result<Ve
             break;
         }
 
-        // Move forward with overlap
-        let new_pos = end_pos.saturating_sub(options.overlap_chars);
+        // Move forward with overlap (snap to char boundary)
+        let new_pos = floor_char_boundary(content, end_pos.saturating_sub(options.overlap_chars));
         if new_pos <= char_pos {
             char_pos = end_pos; // Prevent infinite loop
         } else {
@@ -240,6 +258,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cjk_text_no_panic() {
+        // CJK chars are 3 bytes each; byte-based slicing must not panic
+        let text = "你好世界".repeat(500); // 6000 chars = 18000 bytes
+        let opts = ChunkOptions {
+            max_chars: 100, // byte offset may land mid-char
+            overlap_chars: 15,
+        };
+        let chunks = chunk_document(&text, &opts).unwrap();
+        assert!(!chunks.is_empty());
+        // All chunks must be valid UTF-8 (implicit: String construction succeeds)
+        for chunk in &chunks {
+            assert!(!chunk.text.is_empty());
+        }
+    }
+
+    #[test]
+    fn overlap_ge_max_chars_rejected() {
+        let result = chunk_document(
+            "hello",
+            &ChunkOptions {
+                max_chars: 10,
+                overlap_chars: 10,
+            },
+        );
+        assert!(result.is_err());
+        let result = chunk_document(
+            "hello",
+            &ChunkOptions {
+                max_chars: 10,
+                overlap_chars: 20,
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]
