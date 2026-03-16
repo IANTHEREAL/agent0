@@ -8,12 +8,13 @@ use tikv_client::Transaction;
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
-use crate::sql::hnsw::storage::{hnsw_meta_key, write_hnsw_deltas};
+use crate::sql::hnsw::storage::{hnsw_meta_key, reassign_rowid_mapping, write_hnsw_deltas};
 use crate::sql::hnsw::{hnsw_resolve_label, vec_f64_to_f32, HnswLabelMode};
 use crate::sql::index_consistency::{
     is_unique_duplicate_error, resolve_unique_index_conflict, UniqueConflictResolution,
 };
 use crate::sql::index_helpers;
+use crate::storage::encode_pk_values;
 use crate::storage::TikvStore;
 use crate::worker::types::IndexState;
 
@@ -453,6 +454,15 @@ pub async fn batch_maintain_hnsw_indexes(
                     ))
                 }
             };
+            // When PK changes in Mapped mode, reassign the rowid mapping
+            // so the existing rowid stays stable (design invariant #3).
+            if label_mode == HnswLabelMode::Mapped && old_pk_values != new_pk_values {
+                let old_pk_bytes = encode_pk_values(&old_pk_values);
+                let new_pk_bytes = encode_pk_values(&new_pk_values);
+                reassign_rowid_mapping(txn, db_id, schema.table_id, &old_pk_bytes, &new_pk_bytes)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("HNSW rowid reassign failed: {}", e))?;
+            }
             let pk_label = hnsw_resolve_label(
                 label_mode,
                 txn,
@@ -1009,6 +1019,8 @@ fn changed_hnsw_index_ids_for_update(
 ///
 /// Computes per-index change detection and writes deltas only for HNSW
 /// indexes whose vector column changed (or whose PK changed).
+/// When PK changes in Mapped mode, reassigns the rowid mapping so the
+/// same rowid is reused (invariant: rowid is stable across PK updates).
 async fn maintain_hnsw_indexes_after_update(
     txn: &mut Transaction,
     store: &TikvStore,
@@ -1023,6 +1035,32 @@ async fn maintain_hnsw_indexes_after_update(
         changed_hnsw_index_ids_for_update(schema, old_row, new_row, old_pk_values, new_pk_values)?;
     if changed_index_ids.is_empty() {
         return Ok(());
+    }
+
+    // When the PK changes in Mapped mode, reassign the rowid mapping
+    // so the existing rowid stays stable (design invariant #3).
+    if old_pk_values != new_pk_values {
+        // Read label_mode from the first changed HNSW index's meta.
+        if let Some(&idx_id) = changed_index_ids.first() {
+            let meta_key = hnsw_meta_key(db_id, schema.table_id, idx_id);
+            if let Some(meta_bytes) = txn.get(meta_key).await.map_err(|e| anyhow::anyhow!(e))? {
+                let meta: crate::sql::hnsw::HnswMeta =
+                    serde_json::from_slice(&meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
+                if meta.label_mode == HnswLabelMode::Mapped {
+                    let old_pk_bytes = encode_pk_values(old_pk_values);
+                    let new_pk_bytes = encode_pk_values(new_pk_values);
+                    reassign_rowid_mapping(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        &old_pk_bytes,
+                        &new_pk_bytes,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("HNSW rowid reassign failed: {}", e))?;
+                }
+            }
+        }
     }
 
     maintain_hnsw_indexes_inner_for_index_ids(

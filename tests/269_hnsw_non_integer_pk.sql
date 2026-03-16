@@ -96,7 +96,12 @@ SELECT id AS int_compat_nearest FROM hnsw_int_pk_compat ORDER BY v <-> '[1.0, 0.
 UPDATE hnsw_varchar_pk SET v = '[0.0, 1.0, 0.0]' WHERE id = 'delta';
 SELECT id AS varchar_after_update FROM hnsw_varchar_pk ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
 
--- ── 9. NULL vector handling with non-integer PK ─────────────────────
+-- ── 9. PK value UPDATE — rowid stays stable, ANN still correct ──────
+
+UPDATE hnsw_varchar_pk SET id = 'delta_renamed' WHERE id = 'delta';
+SELECT id AS varchar_pk_update FROM hnsw_varchar_pk ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
+
+-- ── 10. NULL vector handling with non-integer PK ────────────────────
 
 INSERT INTO hnsw_varchar_pk (id, v) VALUES ('nullvec', NULL);
 SELECT id AS varchar_null_search FROM hnsw_varchar_pk ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;

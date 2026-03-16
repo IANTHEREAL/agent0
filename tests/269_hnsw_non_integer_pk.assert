@@ -6,4 +6,5 @@ multi_v1_nearest|x1
 multi_v2_nearest|x2
 int_compat_nearest|100
 varchar_after_update|delta
-varchar_null_search|delta
+varchar_pk_update|delta_renamed
+varchar_null_search|delta_renamed

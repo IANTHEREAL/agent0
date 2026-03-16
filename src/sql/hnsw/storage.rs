@@ -606,13 +606,11 @@ pub fn hnsw_rid_seq_key(db_id: u64, table_id: u64) -> Vec<u8> {
 }
 
 /// Prefix for scanning all rid→pk mappings for a table (used by DROP TABLE cleanup).
-#[allow(dead_code)]
 pub fn hnsw_rid_rid2pk_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_rid_rid2pk_{table_id}_").into_bytes()
 }
 
 /// Prefix for scanning all pk→rid mappings for a table (used by DROP TABLE cleanup).
-#[allow(dead_code)]
 pub fn hnsw_rid_pk2rid_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_rid_pk2rid_{table_id}_").into_bytes()
 }
@@ -723,6 +721,91 @@ pub async fn delete_rowid_mapping(
     txn_delete(txn, rid2pk_key)
         .await
         .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    Ok(())
+}
+
+/// Reassign a rowid mapping when the PK changes (UPDATE).
+///
+/// Looks up the rowid for `old_pk_bytes`, deletes the old bidirectional
+/// mapping, and writes a new mapping from `new_pk_bytes` to the same rowid.
+/// Returns the rowid so the caller can use it for delta writes.
+///
+/// If no mapping exists for `old_pk_bytes`, returns `None` (should not happen
+/// for a valid Mapped-mode row, but callers can fall back to allocation).
+pub async fn reassign_rowid_mapping(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    old_pk_bytes: &[u8],
+    new_pk_bytes: &[u8],
+) -> Result<Option<u64>, SqlError> {
+    let Some(rowid) = get_rowid_for_pk(txn, db_id, table_id, old_pk_bytes).await? else {
+        return Ok(None);
+    };
+    // Delete old bidirectional mapping.
+    delete_rowid_mapping(txn, db_id, table_id, old_pk_bytes, rowid).await?;
+    // Write new mapping with the same rowid.
+    put_rowid_mapping(txn, db_id, table_id, new_pk_bytes, rowid).await?;
+    Ok(Some(rowid))
+}
+
+/// Delete ALL rowid mappings for a table (pk2rid + rid2pk + seq).
+/// Used by DROP TABLE / TRUNCATE to prevent stale mapping leaks.
+pub async fn delete_all_rowid_mappings(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+) -> Result<(), SqlError> {
+    // Delete the sequence counter.
+    txn_delete(txn, hnsw_rid_seq_key(db_id, table_id))
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    // Paginated delete of pk2rid keys.
+    delete_keys_by_prefix(txn, &hnsw_rid_pk2rid_prefix(db_id, table_id)).await?;
+    // Paginated delete of rid2pk keys.
+    delete_keys_by_prefix(txn, &hnsw_rid_rid2pk_prefix(db_id, table_id)).await?;
+    Ok(())
+}
+
+/// Delete all keys matching a given prefix, paginated to completion.
+async fn delete_keys_by_prefix(txn: &mut Transaction, prefix: &[u8]) -> Result<(), SqlError> {
+    let mut end = prefix.to_vec();
+    // Increment last byte to form exclusive end of range.
+    if let Some(last) = end.last_mut() {
+        *last = last.checked_add(1).unwrap_or(0xFF);
+    }
+    let mut start = prefix.to_vec();
+    loop {
+        let range: BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn
+            .scan(range, DELTA_SCAN_BATCH_SIZE)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+            .collect();
+        let count = pairs.len();
+        let mut last_key: Option<Vec<u8>> = None;
+        for pair in pairs {
+            let k: &[u8] = pair.key().as_ref().into();
+            let key: Vec<u8> = k.to_vec();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            last_key = Some(key.clone());
+            txn_delete(txn, key)
+                .await
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        }
+        if (count as u32) < DELTA_SCAN_BATCH_SIZE {
+            break;
+        }
+        match last_key {
+            Some(mut lk) => {
+                lk.push(0x00);
+                start = lk;
+            }
+            None => break,
+        }
+    }
     Ok(())
 }
 
