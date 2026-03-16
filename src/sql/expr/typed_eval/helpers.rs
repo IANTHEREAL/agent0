@@ -185,6 +185,57 @@ pub(super) fn eval_function_call(
             }
             return Ok(Value::Null);
         }
+        "AUTH.JWT" => {
+            // auth.jwt() is a zero-argument function. Reject any arguments.
+            if !args.is_empty() {
+                return Err(SqlError::FunctionNotFound(format!(
+                    "auth.jwt({})",
+                    args.iter()
+                        .map(|a| a
+                            .data_type()
+                            .map(|dt| dt.pg_display_name())
+                            .unwrap_or_else(|| "unknown".to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
+            }
+            // auth.jwt() — returns the full verified JWT claims as a JSON text
+            // string. Reads from `request.jwt.claims` which is populated by the
+            // trusted auth pipeline and protected by the anti-spoofing guard.
+            // Returns NULL when no JWT context is available.
+            let key = "request.jwt.claims";
+            if let Some(v) = QueryContext::current_setting_snapshot(key) {
+                return Ok(Value::Text(v));
+            }
+            if let Some(ref snapshot) = qctx.settings_snapshot {
+                if let Some(v) = snapshot.get(key) {
+                    return Ok(Value::Text(v.clone()));
+                }
+            }
+            return Ok(Value::Null);
+        }
+        "AUTH.ROLE" => {
+            // auth.role() is a zero-argument function. Reject any arguments.
+            if !args.is_empty() {
+                return Err(SqlError::FunctionNotFound(format!(
+                    "auth.role({})",
+                    args.iter()
+                        .map(|a| a
+                            .data_type()
+                            .map(|dt| dt.pg_display_name())
+                            .unwrap_or_else(|| "unknown".to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
+            }
+            // auth.role() — returns the current database role name for this
+            // session. This is the effective role after any SET ROLE, equivalent
+            // to current_user. Useful in RLS policies to distinguish between
+            // anon and authenticated roles.
+            return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
+        }
         "VERSION" => {
             return Ok(Value::Text(crate::sql::expr::VERSION_STRING.to_string()));
         }

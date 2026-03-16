@@ -1,0 +1,18 @@
+-- auth.jwt() returns NULL when unset
+jwt_is_null
+t
+
+-- auth.role() returns a non-null value
+role_is_not_null
+t
+
+-- auth.role() matches current_user
+role_matches_current_user
+t
+
+-- auth.jwt() in COALESCE returns {} when no JWT context
+effective_jwt
+{}
+
+-- anti-spoofing blocks client SET on request.jwt.claims
+reserved for server-side use only
