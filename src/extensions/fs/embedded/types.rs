@@ -3,7 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const PAGE_SIZE: usize = 16 * 1024;
 pub(crate) const ROOT_INODE: u64 = 1;
-pub(crate) const FS9_STORAGE_FORMAT_VERSION: u32 = 4;
+/// Oldest storage format version this binary can read.
+pub(crate) const FS9_FORMAT_VERSION_MIN: u32 = 4;
+/// Newest storage format version this binary can read.
+pub(crate) const FS9_FORMAT_VERSION_MAX: u32 = 5;
+/// Format version stamped on newly created keyspaces.
+pub(crate) const FS9_FORMAT_VERSION_DEFAULT: u32 = 4;
+/// Format version used for local pack spool directory layout.
+/// Decoupled from DEFAULT so spool paths remain stable if DEFAULT changes.
+pub(crate) const FS9_SPOOL_LAYOUT_VERSION: u32 = 4;
+/// Minimum format version required for symlink inode support.
+pub(crate) const FS9_FORMAT_VERSION_SYMLINK: u32 = 5;
 pub(crate) const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +57,7 @@ pub(crate) struct Superblock {
 impl Superblock {
     pub(crate) fn new(fs_instance_id: [u8; 16], object_store: Option<ObjectStoreBinding>) -> Self {
         Self {
-            format_version: FS9_STORAGE_FORMAT_VERSION,
+            format_version: FS9_FORMAT_VERSION_DEFAULT,
             fs_instance_id,
             object_store,
         }
@@ -284,7 +294,7 @@ mod tests {
     #[test]
     fn superblock_default_matches_contract() {
         let sb = Superblock::default();
-        assert_eq!(sb.format_version, FS9_STORAGE_FORMAT_VERSION);
+        assert_eq!(sb.format_version, FS9_FORMAT_VERSION_DEFAULT);
         assert_eq!(sb.fs_instance_id, [0u8; 16]);
         assert_eq!(sb.object_store, None);
     }

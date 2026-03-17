@@ -4483,7 +4483,20 @@ impl EmbeddedPageFs {
         let attempts = fs9_config().tikv_commit_retry_attempts.max(1);
         for attempt in 0..attempts {
             let mut txn = self.begin().await?;
+            let mut did_bump_version = false;
             let result: Result<()> = async {
+                // Lazy format version bump: ensure this keyspace declares symlink support.
+                // One-time per keyspace; concurrent bumps are resolved by TiKV write conflict + retry.
+                let sb = load_current_superblock_if_present(&mut txn)
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("superblock missing")))?;
+                if sb.format_version < FS9_FORMAT_VERSION_SYMLINK {
+                    let mut bumped = sb;
+                    bumped.format_version = FS9_FORMAT_VERSION_SYMLINK;
+                    save_superblock(&mut txn, &bumped).await?;
+                    did_bump_version = true;
+                }
+
                 let (parent_inode, name) = resolve_parent(&mut txn, &normalized).await?;
                 if lookup(&mut txn, parent_inode, &name).await?.is_some() {
                     return Err(anyhow!(EmbeddedFsError::already_exists(&normalized)));
@@ -4501,7 +4514,16 @@ impl EmbeddedPageFs {
             .await;
 
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if did_bump_version {
+                        tracing::info!(
+                            keyspace = %self.keyspace,
+                            "fs9: superblock format version bumped to v{} for symlink support",
+                            FS9_FORMAT_VERSION_SYMLINK
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < attempts => {
                     fs9_commit_backoff(attempt).await;
                 }
@@ -4753,7 +4775,7 @@ fn pack_spool_keyspace_root(keyspace: &str) -> PathBuf {
 
 fn pack_spool_root(identity: &FsInstanceIdentity, fs_instance_id_hex: &str) -> PathBuf {
     pack_spool_keyspace_root(&identity.keyspace)
-        .join(format!("format-{}", FS9_STORAGE_FORMAT_VERSION))
+        .join(format!("format-{}", FS9_SPOOL_LAYOUT_VERSION))
         .join(fs_instance_id_hex)
 }
 
@@ -4888,12 +4910,20 @@ fn parse_superblock_bytes(data: &[u8]) -> Result<Superblock> {
 }
 
 fn validate_superblock_format(sb: &Superblock) -> Result<()> {
-    if sb.format_version != FS9_STORAGE_FORMAT_VERSION {
+    if sb.format_version > FS9_FORMAT_VERSION_MAX {
         return Err(anyhow!(
-            "fs9: unsupported storage format version {} (expected {}). \
+            "fs9: storage format version {} is newer than this binary supports (max {}). \
+             Upgrade db9-server to access this keyspace.",
+            sb.format_version,
+            FS9_FORMAT_VERSION_MAX
+        ));
+    }
+    if sb.format_version < FS9_FORMAT_VERSION_MIN {
+        return Err(anyhow!(
+            "fs9: storage format version {} is too old (min supported: {}). \
              Recreate the fs9 keyspace with the current format.",
             sb.format_version,
-            FS9_STORAGE_FORMAT_VERSION
+            FS9_FORMAT_VERSION_MIN
         ));
     }
     if sb.fs_instance_id == [0u8; 16] {
@@ -5162,10 +5192,20 @@ impl BatchStatStore for TxnBatchStatStore<'_> {
 
 fn deserialize_inode(inode_id: u64, data: &[u8]) -> Result<Inode> {
     serde_json::from_slice(data).map_err(|err| {
-        anyhow!(
-            "fs9: invalid inode json for inode {inode_id}: {err}. \
-             Recreate the fs9 keyspace with the current format."
-        )
+        // Diagnostic classification: distinguish version skew from data corruption.
+        // This is NOT a compatibility gate — superblock format_version is the sole gate.
+        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(data) {
+            if let Some(t) = raw.get("inode_type").and_then(|v| v.as_str()) {
+                if !matches!(t, "File" | "Directory" | "Symlink") {
+                    return anyhow!(
+                        "fs9: inode {inode_id} has unrecognized type \"{t}\". \
+                         This keyspace was written by a newer version of db9-server. \
+                         Upgrade db9-server to access this keyspace."
+                    );
+                }
+            }
+        }
+        anyhow!("fs9: corrupt inode data for inode {inode_id}: {err}.")
     })
 }
 
@@ -6930,10 +6970,9 @@ mod tests {
         store.link_inode(ROOT_INODE, "data", Inode::new_directory(2, 0o755));
         store.link_inode(2, "alpha.txt", Inode::new_file(3, 0o644));
         store.link_inode(2, "broken.txt", Inode::new_file(4, 0o644));
-        store.inode_errors.insert(
-            4,
-            anyhow!("fs9: invalid inode json for inode 4: boom. Recreate the fs9 keyspace."),
-        );
+        store
+            .inode_errors
+            .insert(4, anyhow!("fs9: corrupt inode data for inode 4: boom."));
 
         let paths = vec![
             "/data/alpha.txt".to_string(),
@@ -6944,7 +6983,7 @@ mod tests {
         assert!(results[0].is_ok(), "healthy sibling must still succeed");
         let err = results[1].as_ref().expect_err("broken inode must fail");
         assert!(
-            err.to_string().contains("invalid inode json for inode 4"),
+            err.to_string().contains("corrupt inode data for inode 4"),
             "unexpected error: {err}"
         );
     }
@@ -7345,7 +7384,7 @@ mod tests {
         assert!(
             superblock
                 .to_string()
-                .contains("unsupported storage format version"),
+                .contains("storage format version 0 is too old"),
             "unexpected error: {superblock}"
         );
     }
@@ -7371,7 +7410,65 @@ mod tests {
             .expect_err("previous prototype revision must be rejected");
         assert!(
             err.to_string()
-                .contains("unsupported storage format version 3"),
+                .contains("storage format version 3 is too old"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_superblock_format_accepts_v4_explicitly() {
+        let sb = Superblock {
+            format_version: 4,
+            fs_instance_id: [1u8; 16],
+            object_store: None,
+        };
+        validate_superblock_format(&sb).expect("v4 must be accepted");
+    }
+
+    #[test]
+    fn test_validate_superblock_format_accepts_v5() {
+        let sb = Superblock {
+            format_version: 5,
+            fs_instance_id: [1u8; 16],
+            object_store: None,
+        };
+        validate_superblock_format(&sb).expect("v5 must be accepted");
+    }
+
+    #[test]
+    fn test_validate_superblock_format_rejects_v6_with_upgrade_message() {
+        let sb = Superblock {
+            format_version: 6,
+            fs_instance_id: [1u8; 16],
+            object_store: None,
+        };
+        let err = validate_superblock_format(&sb).expect_err("v6 must be rejected");
+        assert!(
+            err.to_string().contains("Upgrade db9-server"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_inode_unknown_type_reports_version_skew() {
+        let json = br#"{"id":42,"inode_type":"HardLink","mode":0,"size":0,"generation":1,"data":"None","atime":0,"mtime":0,"nlink":1}"#;
+        let err = deserialize_inode(42, json).expect_err("unknown type must fail");
+        assert!(
+            err.to_string().contains("unrecognized type \"HardLink\""),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("Upgrade db9-server"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_inode_corrupt_json_reports_corruption() {
+        let json = b"{not valid json at all";
+        let err = deserialize_inode(99, json).expect_err("corrupt json must fail");
+        assert!(
+            err.to_string().contains("corrupt inode data for inode 99"),
             "unexpected error: {err}"
         );
     }
@@ -7468,7 +7565,7 @@ mod tests {
             rendered.ends_with(&format!(
                 "{}/format-{}/{}",
                 encode_s3_key_component("tenant-a"),
-                FS9_STORAGE_FORMAT_VERSION,
+                FS9_SPOOL_LAYOUT_VERSION,
                 hex::encode([0x11u8; 16])
             )),
             "unexpected spool root: {rendered}"
@@ -7920,7 +8017,7 @@ mod tests {
             .unwrap();
         let _ = txn.rollback().await;
 
-        assert_eq!(superblock.format_version, FS9_STORAGE_FORMAT_VERSION);
+        assert_eq!(superblock.format_version, FS9_FORMAT_VERSION_DEFAULT);
         assert_ne!(superblock.fs_instance_id, [0u8; 16]);
         assert_eq!(superblock.object_store, current_object_store_binding());
         assert_eq!(inode_next, ROOT_INODE + 1);
@@ -8975,6 +9072,65 @@ mod tests {
         );
 
         cleanup(&reopened, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_symlink_creation_bumps_superblock_to_v5() {
+        let fs = make_fs().await;
+        let base = "/test_symlink_version_bump";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        // Before any symlink, superblock should be at DEFAULT (v4).
+        let mut txn = fs.begin().await.unwrap();
+        let sb_before = load_superblock(&mut txn).await.unwrap();
+        let _ = txn.rollback().await;
+        assert_eq!(
+            sb_before.format_version, FS9_FORMAT_VERSION_DEFAULT,
+            "fresh keyspace must have default format version"
+        );
+
+        // Create a symlink — this should bump superblock to v5.
+        let target = format!("{base}/target.txt");
+        let link = format!("{base}/link");
+        fs.write_file(&target, b"data").await.unwrap();
+        fs.symlink(&link, &target).await.unwrap();
+
+        let mut txn = fs.begin().await.unwrap();
+        let sb_after = load_superblock(&mut txn).await.unwrap();
+        let _ = txn.rollback().await;
+        assert_eq!(
+            sb_after.format_version, FS9_FORMAT_VERSION_SYMLINK,
+            "superblock must be bumped to v5 after first symlink"
+        );
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_keyspace_without_symlinks_stays_at_v4() {
+        let fs = make_fs().await;
+        let base = "/test_no_symlink_stays_v4";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        // Write regular files only — no symlinks.
+        fs.write_file(&format!("{base}/file.txt"), b"hello")
+            .await
+            .unwrap();
+        fs.mkdir(&format!("{base}/subdir"), false).await.unwrap();
+
+        let mut txn = fs.begin().await.unwrap();
+        let sb = load_superblock(&mut txn).await.unwrap();
+        let _ = txn.rollback().await;
+        assert_eq!(
+            sb.format_version, FS9_FORMAT_VERSION_DEFAULT,
+            "keyspace without symlinks must remain at v4"
+        );
+
+        cleanup(&fs, base).await;
     }
 
     #[tokio::test]

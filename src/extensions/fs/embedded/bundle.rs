@@ -14,7 +14,7 @@ use tracing::warn;
 
 use crate::extensions::fs::embedded::keys;
 #[cfg(test)]
-use crate::extensions::fs::embedded::types::FS9_STORAGE_FORMAT_VERSION;
+use crate::extensions::fs::embedded::types::FS9_SPOOL_LAYOUT_VERSION;
 
 const BUNDLE_TRAILER_MAGIC: &[u8; 8] = b"FS9PACK1";
 
@@ -923,10 +923,10 @@ mod tests {
             nanos
         ));
         let current_root = root
-            .join(format!("format-{FS9_STORAGE_FORMAT_VERSION}"))
+            .join(format!("format-{FS9_SPOOL_LAYOUT_VERSION}"))
             .join("current");
         let old_root = root
-            .join(format!("format-{}", FS9_STORAGE_FORMAT_VERSION - 1))
+            .join(format!("format-{}", FS9_SPOOL_LAYOUT_VERSION - 1))
             .join("legacy");
         let spool = BundleSpool::new(current_root.clone(), [7u8; 16]);
 
