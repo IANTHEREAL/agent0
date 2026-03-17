@@ -111,6 +111,7 @@ impl<'a> Analyzer<'a> {
                     || obj_name.eq_ignore_ascii_case("json_each")
                     || obj_name.eq_ignore_ascii_case("jsonb_each_text")
                     || obj_name.eq_ignore_ascii_case("json_each_text")
+                    || obj_name.eq_ignore_ascii_case("chunk_text")
                 {
                     // Built-in table/scalar-in-FROM functions should keep their canonical
                     // dispatch name even when schema-qualified in SQL (e.g. pg_catalog.unnest).
@@ -306,6 +307,26 @@ impl<'a> Analyzer<'a> {
                         vec![
                             ("key".to_string(), DataType::Text, false, None),
                             ("value".to_string(), DataType::Text, true, None),
+                        ]
+                    } else if obj_name.eq_ignore_ascii_case("chunk_text") {
+                        // Require at least 1 arg (positional or named "content")
+                        let has_content = typed_args
+                            .iter()
+                            .any(|a| matches!(a, TypedFunctionArg::Positional(_)))
+                            || typed_args.iter().any(|a| {
+                                matches!(a,
+                                TypedFunctionArg::Named { name, .. } if name == "content")
+                            });
+                        if !has_content {
+                            return Err(AnalyzerError::Unsupported(
+                                "chunk_text requires at least 1 argument (content TEXT)"
+                                    .to_string(),
+                            ));
+                        }
+                        vec![
+                            ("chunk_index".to_string(), DataType::Int32, false, None),
+                            ("chunk_text".to_string(), DataType::Text, false, None),
+                            ("chunk_pos".to_string(), DataType::Int32, false, None),
                         ]
                     } else if obj_name.eq_ignore_ascii_case("_db9_sys_record_migration") {
                         vec![

@@ -8,6 +8,7 @@ pub(crate) mod binder;
 pub(crate) mod bytea;
 mod catalog_oids;
 mod check_constraints;
+pub(crate) mod chunker;
 pub(crate) mod collation;
 mod default_privileges;
 

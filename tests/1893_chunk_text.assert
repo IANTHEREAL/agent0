@@ -1,0 +1,7 @@
+basic_single|0|Hello, world!|0
+empty_count|0
+null_count|0
+title_prefix|title: My Document | text: Short doc content
+no_prefix|Plain content
+cte_works|t
+named_params|t
