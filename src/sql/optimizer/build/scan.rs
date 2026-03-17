@@ -129,6 +129,7 @@ pub(super) fn build_index_scan_operator(
             *index_id,
             index_name.clone(),
             qual.clone(),
+            scan_limit,
         ))),
         ScanType::HnswIndexScan {
             index_id,

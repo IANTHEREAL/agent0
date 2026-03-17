@@ -214,6 +214,47 @@ fn test_gin_typed_json_contains_selects_gin_scan() {
 }
 
 #[test]
+fn test_gin_typed_json_contains_merges_multiple_conjuncts() {
+    let schema = gin_schema();
+    let left = typed_binop(
+        typed_column("data", DataType::Jsonb),
+        TypedBinaryOp::JsonContains,
+        typed_constant(
+            Value::Jsonb(r#"{"key1": "val1"}"#.to_string()),
+            DataType::Jsonb,
+        ),
+        DataType::Boolean,
+    );
+    let right = typed_binop(
+        typed_column("data", DataType::Jsonb),
+        TypedBinaryOp::JsonContains,
+        typed_constant(
+            Value::Jsonb(r#"{"key2": "val2"}"#.to_string()),
+            DataType::Jsonb,
+        ),
+        DataType::Boolean,
+    );
+    let filter = typed_binop(left, TypedBinaryOp::And, right, DataType::Boolean);
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match path.scan_type {
+        ScanType::GinIndexScan {
+            index_name, qual, ..
+        } => {
+            assert_eq!(index_name, "idx_data_gin");
+            match qual {
+                GinQual::And(children) => assert!(
+                    children.len() >= 2,
+                    "expected merged top-level AND qual, got {children:?}"
+                ),
+                other => panic!("expected merged And qual, got {other:?}"),
+            }
+        }
+        other => panic!("expected GinIndexScan, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_gin_typed_no_gin_index_falls_back() {
     // Schema without GIN index
     let schema = TableSchema {
