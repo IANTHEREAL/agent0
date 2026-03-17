@@ -33,6 +33,9 @@ DEFAULT_ROWS = 100_000
 DEFAULT_WARMUP = 3
 DEFAULT_MEASURED = 5
 DEFAULT_BATCH_SIZE = 1_000
+HOT_TOKENS = [f"hot_{j:02d}" for j in range(10)]
+WARM_TOKENS = [f"warm_{j:03d}" for j in range(100)]
+RARE_TOKENS = [f"rare_{j:04d}" for j in range(5000)]
 
 
 @dataclass(frozen=True)
@@ -264,15 +267,11 @@ def teardown_schema(cur: Any) -> None:
 
 
 def make_row(i: int) -> tuple[str, str, dict[str, Any], list[str]]:
-    hot = [f"hot_{j:02d}" for j in range(10)]
-    warm = [f"warm_{j:03d}" for j in range(100)]
-    rare = [f"rare_{j:04d}" for j in range(5000)]
-
-    hot_token = hot[i % len(hot)]
-    hot_token_2 = hot[(i + 1) % len(hot)]
-    warm_token = warm[(i // 3) % len(warm)]
-    warm_token_2 = warm[(i // 7) % len(warm)]
-    rare_token = rare[i % len(rare)]
+    hot_token = HOT_TOKENS[i % len(HOT_TOKENS)]
+    hot_token_2 = HOT_TOKENS[(i + 1) % len(HOT_TOKENS)]
+    warm_token = WARM_TOKENS[(i // 3) % len(WARM_TOKENS)]
+    warm_token_2 = WARM_TOKENS[(i // 7) % len(WARM_TOKENS)]
+    rare_token = RARE_TOKENS[i % len(RARE_TOKENS)]
     body_tokens = [
         hot_token,
         hot_token_2,

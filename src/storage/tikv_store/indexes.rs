@@ -812,16 +812,17 @@ impl TikvStore {
                 ))
             })
             .collect();
-        kv_stats::record_batch_get_keys(keys.len());
-
-        let pairs = tikv_op!(txn.batch_get(keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
-        let existing: HashSet<Vec<u8>> = pairs
-            .map(|pair| {
+        let mut existing: HashSet<Vec<u8>> = HashSet::with_capacity(keys.len());
+        for chunk in keys.chunks(BATCH_GET_CHUNK_SIZE) {
+            kv_stats::record_batch_get_keys(chunk.len());
+            for pair in
+                tikv_op!(txn.batch_get(chunk.iter().cloned()).await).map_err(|e| anyhow!(e))?
+            {
                 let tikv_client::KvPair(key, _) = pair;
                 let key_vec: Vec<u8> = key.into();
-                key_vec
-            })
-            .collect();
+                existing.insert(key_vec);
+            }
+        }
 
         Ok(keys
             .into_iter()
@@ -879,27 +880,11 @@ impl TikvStore {
         index_id: u64,
         token_hash: u64,
     ) -> Result<Vec<Vec<u8>>> {
-        let mut pk_bytes_list = Vec::new();
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let (page, next_cursor) = self
-                .scan_gin_posting_list_page(
-                    txn,
-                    db_id,
-                    table_id,
-                    index_id,
-                    token_hash,
-                    cursor.as_deref(),
-                    SCAN_LIMIT,
-                )
-                .await?;
-            pk_bytes_list.extend(page);
-            match next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
+        let (pk_bytes_list, _) = self
+            .scan_gin_posting_list_page(
+                txn, db_id, table_id, index_id, token_hash, None, SCAN_LIMIT,
+            )
+            .await?;
         Ok(pk_bytes_list)
     }
 }

@@ -35,6 +35,8 @@ struct GinScanMetrics {
     term_count: u32,
     posting_scan_rpcs: u32,
     posting_pairs_scanned: u64,
+    table_pk_scan_rpcs: u32,
+    table_pk_pairs_scanned: u64,
     membership_probe_rpcs: u32,
     membership_probe_keys: u64,
     candidate_pk_count: u64,
@@ -488,7 +490,7 @@ impl PhysicalOperator for GinScanOperator {
                 let effective_limit = self.scan_limit.unwrap_or(usize::MAX);
                 let mut cursor: Option<Vec<u8>> = None;
                 while self.pk_queue.len() < effective_limit {
-                    self.metrics.posting_scan_rpcs += 1;
+                    self.metrics.table_pk_scan_rpcs += 1;
                     let page_size = effective_limit
                         .saturating_sub(self.pk_queue.len())
                         .min(GIN_POSTING_PAGE_SIZE as usize)
@@ -503,7 +505,7 @@ impl PhysicalOperator for GinScanOperator {
                             page_size,
                         )
                         .await?;
-                    self.metrics.posting_pairs_scanned += page.len() as u64;
+                    self.metrics.table_pk_pairs_scanned += page.len() as u64;
                     if page.is_empty() {
                         break;
                     }
@@ -533,6 +535,8 @@ impl PhysicalOperator for GinScanOperator {
             term_count = self.metrics.term_count,
             posting_scan_rpcs = self.metrics.posting_scan_rpcs,
             posting_pairs_scanned = self.metrics.posting_pairs_scanned,
+            table_pk_scan_rpcs = self.metrics.table_pk_scan_rpcs,
+            table_pk_pairs_scanned = self.metrics.table_pk_pairs_scanned,
             membership_probe_rpcs = self.metrics.membership_probe_rpcs,
             membership_probe_keys = self.metrics.membership_probe_keys,
             candidate_pk_count = self.metrics.candidate_pk_count,
@@ -575,6 +579,8 @@ impl PhysicalOperator for GinScanOperator {
             term_count = self.metrics.term_count,
             posting_scan_rpcs = self.metrics.posting_scan_rpcs,
             posting_pairs_scanned = self.metrics.posting_pairs_scanned,
+            table_pk_scan_rpcs = self.metrics.table_pk_scan_rpcs,
+            table_pk_pairs_scanned = self.metrics.table_pk_pairs_scanned,
             membership_probe_rpcs = self.metrics.membership_probe_rpcs,
             membership_probe_keys = self.metrics.membership_probe_keys,
             candidate_pk_count = self.metrics.candidate_pk_count,

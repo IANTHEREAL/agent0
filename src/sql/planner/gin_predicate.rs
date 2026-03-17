@@ -423,9 +423,25 @@ fn simplify_gin_qual(qual: GinQual) -> GinQual {
     match qual {
         GinQual::Term { token_hash } => GinQual::Term { token_hash },
         GinQual::And(children) => {
-            GinQual::And(children.into_iter().map(simplify_gin_qual).collect())
+            let mut flattened = Vec::new();
+            for child in children.into_iter().map(simplify_gin_qual) {
+                match child {
+                    GinQual::And(grandchildren) => flattened.extend(grandchildren),
+                    other => flattened.push(other),
+                }
+            }
+            GinQual::And(flattened)
         }
-        GinQual::Or(children) => GinQual::Or(children.into_iter().map(simplify_gin_qual).collect()),
+        GinQual::Or(children) => {
+            let mut flattened = Vec::new();
+            for child in children.into_iter().map(simplify_gin_qual) {
+                match child {
+                    GinQual::Or(grandchildren) => flattened.extend(grandchildren),
+                    other => flattened.push(other),
+                }
+            }
+            GinQual::Or(flattened)
+        }
         GinQual::Not(inner) => match simplify_gin_qual(*inner) {
             GinQual::Not(grandchild) => simplify_gin_qual(*grandchild),
             simplified_inner => GinQual::Not(Box::new(simplified_inner)),
@@ -437,7 +453,7 @@ fn merge_gin_quals(mut quals: Vec<GinQual>) -> GinQual {
     if quals.len() == 1 {
         return quals.pop().expect("single gin qual");
     }
-    GinQual::And(quals)
+    simplify_gin_qual(GinQual::And(quals))
 }
 
 fn merge_recheck_exprs(mut exprs: Vec<TypedExpr>) -> TypedExpr {
