@@ -13,13 +13,14 @@
 //! Expression-index matching: `to_tsvector('chinese', col) @@ ...` matches a
 //! GIN expression index on `to_tsvector('chinese', col)`.
 
-use crate::model::{IndexDef, TableSchema, Value};
+use crate::model::{DataType, IndexDef, TableSchema, Value};
 use crate::sql::analyzer::types::{BinaryOp, TypedExpr, TypedExprKind};
 use crate::sql::gin::{
     extract_array_gin_tokens, extract_gin_tokens, hash_tsvector_lexeme, supported_gin_index_column,
     GinColumnType, GinIndexSource,
 };
 use crate::sql::planner::GinQual;
+use std::collections::HashSet;
 
 /// Result of analysing a filter predicate for GIN index applicability.
 #[derive(Debug)]
@@ -44,14 +45,26 @@ pub(super) fn try_extract_gin_predicate(
 ) -> Option<GinPredicateMatch> {
     let (source, col_type) = supported_gin_index_column(schema, index)?;
 
-    // Walk AND-conjuncts; the first matching GIN predicate wins.
+    // Collect all matching AND-conjuncts on the same index, not just the first.
+    let mut quals = Vec::new();
+    let mut rechecks = Vec::new();
     for conjunct in extract_conjuncts(filter) {
         if let Some(m) = try_match_single_predicate(schema, index, &source, col_type, conjunct) {
-            return Some(m);
+            quals.push(m.qual);
+            rechecks.push(m.recheck_expr);
         }
     }
 
-    None
+    if quals.is_empty() {
+        return None;
+    }
+
+    Some(GinPredicateMatch {
+        index_id: index.id,
+        index_name: index.name.clone(),
+        qual: merge_gin_quals(quals),
+        recheck_expr: merge_recheck_exprs(rechecks),
+    })
 }
 
 /// Decompose an AND-tree into a flat list of conjuncts.
@@ -410,14 +423,57 @@ fn simplify_gin_qual(qual: GinQual) -> GinQual {
     match qual {
         GinQual::Term { token_hash } => GinQual::Term { token_hash },
         GinQual::And(children) => {
-            GinQual::And(children.into_iter().map(simplify_gin_qual).collect())
+            let mut flattened = Vec::new();
+            for child in children.into_iter().map(simplify_gin_qual) {
+                match child {
+                    GinQual::And(grandchildren) => flattened.extend(grandchildren),
+                    other => flattened.push(other),
+                }
+            }
+            GinQual::And(flattened)
         }
-        GinQual::Or(children) => GinQual::Or(children.into_iter().map(simplify_gin_qual).collect()),
+        GinQual::Or(children) => {
+            let mut flattened = Vec::new();
+            for child in children.into_iter().map(simplify_gin_qual) {
+                match child {
+                    GinQual::Or(grandchildren) => flattened.extend(grandchildren),
+                    other => flattened.push(other),
+                }
+            }
+            GinQual::Or(flattened)
+        }
         GinQual::Not(inner) => match simplify_gin_qual(*inner) {
             GinQual::Not(grandchild) => simplify_gin_qual(*grandchild),
             simplified_inner => GinQual::Not(Box::new(simplified_inner)),
         },
     }
+}
+
+fn merge_gin_quals(mut quals: Vec<GinQual>) -> GinQual {
+    if quals.len() == 1 {
+        return quals.pop().expect("single gin qual");
+    }
+    simplify_gin_qual(GinQual::And(quals))
+}
+
+fn merge_recheck_exprs(mut exprs: Vec<TypedExpr>) -> TypedExpr {
+    if exprs.len() == 1 {
+        return exprs.pop().expect("single recheck expr");
+    }
+
+    let mut iter = exprs.into_iter();
+    let mut merged = iter.next().expect("at least one recheck expr");
+    for expr in iter {
+        merged = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(merged),
+                op: BinaryOp::And,
+                right: Box::new(expr),
+            },
+            data_type: DataType::Boolean,
+        };
+    }
+    merged
 }
 
 fn gin_qual_first_positive_term(qual: &GinQual) -> Option<GinQual> {
@@ -445,10 +501,23 @@ fn jsonb_containment_to_gin_qual(rhs: &TypedExpr) -> Option<GinQual> {
 
     let json: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let tokens = extract_gin_tokens(&json);
-    let mut hashes: Vec<u64> = tokens.key_values;
-    hashes.extend(tokens.key_exists);
-    hashes.sort_unstable();
-    hashes.dedup();
+    let mut key_value_hashes = tokens.key_values;
+    let mut key_exists_hashes = tokens.key_exists;
+    key_value_hashes.sort_unstable();
+    key_value_hashes.dedup();
+    key_exists_hashes.sort_unstable();
+    key_exists_hashes.dedup();
+
+    let mut seen = HashSet::with_capacity(key_value_hashes.len() + key_exists_hashes.len());
+    let mut hashes = Vec::with_capacity(key_value_hashes.len() + key_exists_hashes.len());
+    for hash in key_value_hashes
+        .into_iter()
+        .chain(key_exists_hashes.into_iter())
+    {
+        if seen.insert(hash) {
+            hashes.push(hash);
+        }
+    }
 
     if hashes.is_empty() {
         return None;
@@ -750,6 +819,37 @@ mod tests {
             GinQual::And(children) => assert!(children.len() >= 2),
             GinQual::Term { .. } => {} // single token is fine too
             other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jsonb_containment_orders_key_value_before_key_exists() {
+        let expr = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Jsonb(r#"{"key":"val"}"#.to_string())),
+            data_type: DataType::Jsonb,
+        };
+        let qual = jsonb_containment_to_gin_qual(&expr).expect("jsonb gin qual");
+        let tokens = extract_gin_tokens(
+            &serde_json::from_str::<serde_json::Value>(r#"{"key":"val"}"#).expect("valid json"),
+        );
+        let mut key_value_hashes = tokens.key_values;
+        key_value_hashes.sort_unstable();
+        key_value_hashes.dedup();
+
+        match qual {
+            GinQual::And(children) => {
+                let first = children.first().expect("at least one gin term");
+                match first {
+                    GinQual::Term { token_hash } => {
+                        assert!(
+                            key_value_hashes.contains(token_hash),
+                            "expected first hash {token_hash} to be a key-value token"
+                        );
+                    }
+                    other => panic!("expected first child to be Term, got {other:?}"),
+                }
+            }
+            other => panic!("expected And, got {other:?}"),
         }
     }
 

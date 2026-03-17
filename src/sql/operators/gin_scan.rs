@@ -11,7 +11,8 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use tracing::debug;
 
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema, Value};
@@ -20,11 +21,28 @@ use crate::sql::projection::fill_row_defaults;
 use crate::storage::decode_pk_from_index_suffix;
 
 const GIN_BATCH_FETCH_SIZE: usize = 256;
+const GIN_POSTING_PAGE_SIZE: u32 = 4096;
+const GIN_PROBE_LIMIT: u32 = 1024;
 
 #[derive(Debug)]
 enum GinCandidateSet {
     Keys(BTreeSet<Vec<u8>>),
     AllDocs,
+}
+
+#[derive(Debug, Default, Clone)]
+struct GinScanMetrics {
+    term_count: u32,
+    posting_scan_rpcs: u32,
+    posting_pairs_scanned: u64,
+    table_pk_scan_rpcs: u32,
+    table_pk_pairs_scanned: u64,
+    membership_probe_rpcs: u32,
+    membership_probe_keys: u64,
+    candidate_pk_count: u64,
+    row_batch_get_rpcs: u32,
+    rows_fetched: u64,
+    rows_output: u64,
 }
 
 #[derive(Debug)]
@@ -34,25 +52,45 @@ pub struct GinScanOperator {
     #[allow(dead_code)]
     index_name: String,
     qual: GinQual,
+    scan_limit: Option<usize>,
     /// Primary-key queue produced by posting-list set operations.
     pk_queue: Vec<Vec<Value>>,
     /// Row buffer for batch_get results.
     row_buffer: Vec<Row>,
     position: usize,
     opened: bool,
+    metrics: GinScanMetrics,
 }
 
 impl GinScanOperator {
-    pub fn new(schema: TableSchema, index_id: u64, index_name: String, qual: GinQual) -> Self {
+    pub fn new(
+        schema: TableSchema,
+        index_id: u64,
+        index_name: String,
+        qual: GinQual,
+        scan_limit: Option<usize>,
+    ) -> Self {
         Self {
             schema,
             index_id,
             index_name,
             qual,
+            scan_limit,
             pk_queue: Vec::new(),
             row_buffer: Vec::new(),
             position: 0,
             opened: false,
+            metrics: GinScanMetrics::default(),
+        }
+    }
+
+    fn gin_qual_term_count(qual: &GinQual) -> u32 {
+        match qual {
+            GinQual::Term { .. } => 1,
+            GinQual::And(children) | GinQual::Or(children) => {
+                children.iter().map(Self::gin_qual_term_count).sum()
+            }
+            GinQual::Not(inner) => Self::gin_qual_term_count(inner),
         }
     }
 
@@ -79,10 +117,202 @@ impl GinScanOperator {
         }
     }
 
+    fn collect_flat_and_terms(
+        qual: &GinQual,
+        positive: &mut Vec<u64>,
+        negative: &mut Vec<u64>,
+    ) -> bool {
+        match qual {
+            GinQual::Term { token_hash } => {
+                positive.push(*token_hash);
+                true
+            }
+            GinQual::And(children) => children
+                .iter()
+                .all(|child| Self::collect_flat_and_terms(child, positive, negative)),
+            GinQual::Not(inner) => match inner.as_ref() {
+                GinQual::Term { token_hash } => {
+                    negative.push(*token_hash);
+                    true
+                }
+                _ => false,
+            },
+            GinQual::Or(_) => false,
+        }
+    }
+
+    fn dedup_in_order(tokens: Vec<u64>) -> Vec<u64> {
+        let mut seen = HashSet::with_capacity(tokens.len());
+        tokens
+            .into_iter()
+            .filter(|token| seen.insert(*token))
+            .collect()
+    }
+
+    async fn probe_posting_list_size(
+        &mut self,
+        ctx: &mut ExecutionContext<'_>,
+        token_hash: u64,
+        probe_cache: &mut HashMap<u64, (u32, bool)>,
+    ) -> Result<(u32, bool)> {
+        if let Some(cached) = probe_cache.get(&token_hash).copied() {
+            return Ok(cached);
+        }
+
+        self.metrics.posting_scan_rpcs += 1;
+        let probe = ctx
+            .store
+            .probe_gin_posting_list_size(
+                ctx.txn,
+                ctx.db_id,
+                self.schema.table_id,
+                self.index_id,
+                token_hash,
+                GIN_PROBE_LIMIT,
+            )
+            .await?;
+        self.metrics.posting_pairs_scanned += probe.0 as u64;
+        probe_cache.insert(token_hash, probe);
+        Ok(probe)
+    }
+
+    async fn scan_posting_list_page(
+        &mut self,
+        ctx: &mut ExecutionContext<'_>,
+        token_hash: u64,
+        cursor: Option<&[u8]>,
+    ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+        self.metrics.posting_scan_rpcs += 1;
+        let (page, next_cursor) = ctx
+            .store
+            .scan_gin_posting_list_page(
+                ctx.txn,
+                ctx.db_id,
+                self.schema.table_id,
+                self.index_id,
+                token_hash,
+                cursor,
+                GIN_POSTING_PAGE_SIZE,
+            )
+            .await?;
+        self.metrics.posting_pairs_scanned += page.len() as u64;
+        Ok((page, next_cursor))
+    }
+
+    async fn filter_posting_membership(
+        &mut self,
+        ctx: &mut ExecutionContext<'_>,
+        token_hash: u64,
+        candidates: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>> {
+        self.metrics.membership_probe_rpcs += 1;
+        self.metrics.membership_probe_keys += candidates.len() as u64;
+        ctx.store
+            .filter_gin_posting_membership(
+                ctx.txn,
+                ctx.db_id,
+                self.schema.table_id,
+                self.index_id,
+                token_hash,
+                candidates,
+            )
+            .await
+    }
+
+    async fn evaluate_flat_and_driver_probe(
+        &mut self,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<Option<GinCandidateSet>> {
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        if !Self::collect_flat_and_terms(&self.qual, &mut positive, &mut negative) {
+            return Ok(None);
+        }
+
+        positive = Self::dedup_in_order(positive);
+        negative = Self::dedup_in_order(negative);
+        if positive.is_empty() {
+            return Ok(Some(GinCandidateSet::AllDocs));
+        }
+
+        let mut probe_cache = HashMap::new();
+        let mut estimates = Vec::with_capacity(positive.len());
+        for token_hash in &positive {
+            let (count, saturated) = self
+                .probe_posting_list_size(ctx, *token_hash, &mut probe_cache)
+                .await?;
+            estimates.push((*token_hash, count, saturated));
+        }
+        estimates.sort_by_key(|(_, count, saturated)| (*saturated, *count));
+
+        let driver_token = estimates[0].0;
+        let probe_tokens: Vec<u64> = estimates
+            .iter()
+            .skip(1)
+            .map(|(token, _, _)| *token)
+            .collect();
+
+        let effective_limit = self.scan_limit.unwrap_or(usize::MAX);
+        let mut matched = BTreeSet::new();
+        let mut cursor: Option<Vec<u8>> = None;
+
+        loop {
+            let (page, next_cursor) = self
+                .scan_posting_list_page(ctx, driver_token, cursor.as_deref())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+
+            let mut candidates = page;
+            for token_hash in &probe_tokens {
+                if candidates.is_empty() {
+                    break;
+                }
+                candidates = self
+                    .filter_posting_membership(ctx, *token_hash, &candidates)
+                    .await?;
+            }
+
+            for token_hash in &negative {
+                if candidates.is_empty() {
+                    break;
+                }
+                let excluded = self
+                    .filter_posting_membership(ctx, *token_hash, &candidates)
+                    .await?;
+                if excluded.is_empty() {
+                    continue;
+                }
+                let excluded_set: HashSet<Vec<u8>> = excluded.into_iter().collect();
+                candidates.retain(|pk_bytes| !excluded_set.contains(pk_bytes));
+            }
+
+            for pk_bytes in candidates {
+                matched.insert(pk_bytes);
+                if matched.len() >= effective_limit {
+                    break;
+                }
+            }
+
+            if matched.len() >= effective_limit {
+                break;
+            }
+
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(Some(GinCandidateSet::Keys(matched)))
+    }
+
     /// Recursively evaluate a `GinQual` tree against the TiKV store.
     ///
     /// Returns a **sorted, deduplicated** set of raw PK byte vectors.
     async fn evaluate_qual(
+        &mut self,
         qual: &GinQual,
         ctx: &mut ExecutionContext<'_>,
         table_id: u64,
@@ -90,10 +320,12 @@ impl GinScanOperator {
     ) -> Result<GinCandidateSet> {
         match qual {
             GinQual::Term { token_hash } => {
+                self.metrics.posting_scan_rpcs += 1;
                 let pk_list = ctx
                     .store
                     .scan_gin_posting_list(ctx.txn, ctx.db_id, table_id, index_id, *token_hash)
                     .await?;
+                self.metrics.posting_pairs_scanned += pk_list.len() as u64;
                 Ok(GinCandidateSet::Keys(pk_list.into_iter().collect()))
             }
 
@@ -120,11 +352,17 @@ impl GinScanOperator {
                 }
 
                 // Start with first positive child, then intersect the rest.
-                let mut result =
-                    Box::pin(Self::evaluate_qual(positive[0], ctx, table_id, index_id)).await?;
+                let mut result = Box::pin(Self::evaluate_qual(
+                    self,
+                    positive[0],
+                    ctx,
+                    table_id,
+                    index_id,
+                ))
+                .await?;
                 for child in &positive[1..] {
                     let other =
-                        Box::pin(Self::evaluate_qual(child, ctx, table_id, index_id)).await?;
+                        Box::pin(Self::evaluate_qual(self, child, ctx, table_id, index_id)).await?;
                     result = match (result, other) {
                         (GinCandidateSet::AllDocs, rhs) => rhs,
                         (lhs, GinCandidateSet::AllDocs) => lhs,
@@ -136,8 +374,10 @@ impl GinScanOperator {
 
                 // Subtract negative children.
                 for neg_child in negative {
-                    let exclude =
-                        Box::pin(Self::evaluate_qual(neg_child, ctx, table_id, index_id)).await?;
+                    let exclude = Box::pin(Self::evaluate_qual(
+                        self, neg_child, ctx, table_id, index_id,
+                    ))
+                    .await?;
                     result = Self::subtract_candidates(result, exclude);
                 }
 
@@ -148,7 +388,7 @@ impl GinScanOperator {
                 let mut result = GinCandidateSet::Keys(BTreeSet::new());
                 for child in children {
                     let child_set =
-                        Box::pin(Self::evaluate_qual(child, ctx, table_id, index_id)).await?;
+                        Box::pin(Self::evaluate_qual(self, child, ctx, table_id, index_id)).await?;
                     result = match (result, child_set) {
                         (GinCandidateSet::AllDocs, _) | (_, GinCandidateSet::AllDocs) => {
                             GinCandidateSet::AllDocs
@@ -177,6 +417,8 @@ impl GinScanOperator {
         while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
             let batch_size = GIN_BATCH_FETCH_SIZE.min(self.pk_queue.len());
             let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
+            self.metrics.row_batch_get_rpcs += 1;
+            self.metrics.rows_fetched += batch_pks.len() as u64;
             let rows = ctx
                 .store
                 .batch_get_rows(
@@ -215,10 +457,21 @@ impl PhysicalOperator for GinScanOperator {
         self.row_buffer.clear();
         self.position = 0;
         self.opened = true;
+        self.metrics = GinScanMetrics {
+            term_count: Self::gin_qual_term_count(&self.qual),
+            ..GinScanMetrics::default()
+        };
 
-        // Evaluate the GinQual tree to get candidate PK bytes.
-        let candidate_pk_set =
-            Self::evaluate_qual(&self.qual, ctx, self.schema.table_id, self.index_id).await?;
+        // Use the flat-AND driver/probe fast path when possible; otherwise fall
+        // back to the existing recursive posting-list evaluation.
+        let candidate_pk_set = match self.evaluate_flat_and_driver_probe(ctx).await? {
+            Some(candidate_pk_set) => candidate_pk_set,
+            None => {
+                let qual = self.qual.clone();
+                self.evaluate_qual(&qual, ctx, self.schema.table_id, self.index_id)
+                    .await?
+            }
+        };
 
         match candidate_pk_set {
             GinCandidateSet::Keys(candidate_pk_bytes) => {
@@ -231,39 +484,65 @@ impl PhysicalOperator for GinScanOperator {
                 }
             }
             GinCandidateSet::AllDocs => {
-                // Conservative fallback: scan all rows and let the recheck filter
-                // enforce exact boolean semantics.
-                let rows = ctx
-                    .store
-                    .scan(ctx.txn, ctx.db_id, &self.schema.name, None)
-                    .await?;
-                self.pk_queue.reserve(rows.len());
-                for row in rows {
-                    let pk_values = if self.schema.pk_indices.is_empty() {
-                        let Some(first) = row.values.first() else {
-                            continue;
-                        };
-                        vec![first.clone()]
-                    } else {
-                        let mut values = Vec::with_capacity(self.schema.pk_indices.len());
-                        let mut missing_pk = false;
-                        for &idx in &self.schema.pk_indices {
-                            if let Some(v) = row.values.get(idx) {
-                                values.push(v.clone());
-                            } else {
-                                missing_pk = true;
-                                break;
-                            }
+                // Conservative fallback: scan primary-key bytes only instead of
+                // materializing full rows for the whole table.
+                let pk_types = self.pk_types();
+                let effective_limit = self.scan_limit.unwrap_or(usize::MAX);
+                let mut cursor: Option<Vec<u8>> = None;
+                while self.pk_queue.len() < effective_limit {
+                    self.metrics.table_pk_scan_rpcs += 1;
+                    let page_size = effective_limit
+                        .saturating_sub(self.pk_queue.len())
+                        .min(GIN_POSTING_PAGE_SIZE as usize)
+                        .max(1) as u32;
+                    let (page, next_cursor) = ctx
+                        .store
+                        .scan_table_primary_key_bytes_page(
+                            ctx.txn,
+                            ctx.db_id,
+                            self.schema.table_id,
+                            cursor.as_deref(),
+                            page_size,
+                        )
+                        .await?;
+                    self.metrics.table_pk_pairs_scanned += page.len() as u64;
+                    if page.is_empty() {
+                        break;
+                    }
+
+                    for pk_bytes in page {
+                        let pk = decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
+                        self.pk_queue.push(pk);
+                        if self.pk_queue.len() >= effective_limit {
+                            break;
                         }
-                        if missing_pk {
-                            continue;
+                    }
+
+                    match next_cursor {
+                        Some(next) if self.pk_queue.len() < effective_limit => {
+                            cursor = Some(next);
                         }
-                        values
-                    };
-                    self.pk_queue.push(pk_values);
+                        _ => break,
+                    }
                 }
             }
         }
+        self.metrics.candidate_pk_count = self.pk_queue.len() as u64;
+
+        debug!(
+            table = %self.schema.name,
+            index = %self.index_name,
+            term_count = self.metrics.term_count,
+            posting_scan_rpcs = self.metrics.posting_scan_rpcs,
+            posting_pairs_scanned = self.metrics.posting_pairs_scanned,
+            table_pk_scan_rpcs = self.metrics.table_pk_scan_rpcs,
+            table_pk_pairs_scanned = self.metrics.table_pk_pairs_scanned,
+            membership_probe_rpcs = self.metrics.membership_probe_rpcs,
+            membership_probe_keys = self.metrics.membership_probe_keys,
+            candidate_pk_count = self.metrics.candidate_pk_count,
+            scan_limit = self.scan_limit,
+            "gin_scan_open"
+        );
 
         // Prime the first batch.
         self.load_next_batch(ctx).await?;
@@ -278,12 +557,14 @@ impl PhysicalOperator for GinScanOperator {
         if self.position < self.row_buffer.len() {
             let row = self.row_buffer[self.position].clone();
             self.position += 1;
+            self.metrics.rows_output += 1;
             Ok(Some(row))
         } else {
             self.load_next_batch(ctx).await?;
             if self.position < self.row_buffer.len() {
                 let row = self.row_buffer[self.position].clone();
                 self.position += 1;
+                self.metrics.rows_output += 1;
                 Ok(Some(row))
             } else {
                 Ok(None)
@@ -292,6 +573,23 @@ impl PhysicalOperator for GinScanOperator {
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        debug!(
+            table = %self.schema.name,
+            index = %self.index_name,
+            term_count = self.metrics.term_count,
+            posting_scan_rpcs = self.metrics.posting_scan_rpcs,
+            posting_pairs_scanned = self.metrics.posting_pairs_scanned,
+            table_pk_scan_rpcs = self.metrics.table_pk_scan_rpcs,
+            table_pk_pairs_scanned = self.metrics.table_pk_pairs_scanned,
+            membership_probe_rpcs = self.metrics.membership_probe_rpcs,
+            membership_probe_keys = self.metrics.membership_probe_keys,
+            candidate_pk_count = self.metrics.candidate_pk_count,
+            row_batch_get_rpcs = self.metrics.row_batch_get_rpcs,
+            rows_fetched = self.metrics.rows_fetched,
+            rows_output = self.metrics.rows_output,
+            scan_limit = self.scan_limit,
+            "gin_scan_close"
+        );
         self.pk_queue.clear();
         self.row_buffer.clear();
         self.opened = false;
@@ -333,5 +631,41 @@ mod tests {
             }
             other => panic!("expected Keys, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_collect_flat_and_terms_accepts_terms_and_not_terms() {
+        let qual = GinQual::And(vec![
+            GinQual::Term { token_hash: 11 },
+            GinQual::Not(Box::new(GinQual::Term { token_hash: 22 })),
+            GinQual::Term { token_hash: 33 },
+        ]);
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        assert!(GinScanOperator::collect_flat_and_terms(
+            &qual,
+            &mut positive,
+            &mut negative
+        ));
+        assert_eq!(positive, vec![11, 33]);
+        assert_eq!(negative, vec![22]);
+    }
+
+    #[test]
+    fn test_collect_flat_and_terms_rejects_or_children() {
+        let qual = GinQual::And(vec![
+            GinQual::Term { token_hash: 11 },
+            GinQual::Or(vec![
+                GinQual::Term { token_hash: 22 },
+                GinQual::Term { token_hash: 33 },
+            ]),
+        ]);
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        assert!(!GinScanOperator::collect_flat_and_terms(
+            &qual,
+            &mut positive,
+            &mut negative
+        ));
     }
 }

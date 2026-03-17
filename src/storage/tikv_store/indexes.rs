@@ -708,22 +708,21 @@ impl TikvStore {
     /// The caller is responsible for decoding these with
     /// `decode_pk_from_index_suffix`.  Keeping them as raw bytes allows
     /// efficient set operations (intersect / union) before decoding.
-    pub async fn scan_gin_posting_list(
+    pub async fn scan_gin_posting_list_page(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         table_id: u64,
         index_id: u64,
         token_hash: u64,
-    ) -> Result<Vec<Vec<u8>>> {
+        cursor: Option<&[u8]>,
+        page_size: u32,
+    ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
         let prefix = self.key(&encode_gin_index_prefix_v2(
             db_id, table_id, index_id, token_hash,
         ));
         let prefix_len = prefix.len();
 
-        // End key: increment last byte of prefix to get exclusive upper bound.
-        // The prefix ends with GIN_PK_SEP_START (0x00).  Incrementing gives 0x01
-        // which is past all PK suffixes appended after the 0x00 separator.
         let end_key = {
             let mut end = prefix.clone();
             if let Some(last) = end.last_mut() {
@@ -732,20 +731,160 @@ impl TikvStore {
             end
         };
 
-        let range: BoundRange = (prefix.clone()..end_key).into();
-        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
+        let start_key = match cursor {
+            Some(existing_cursor) => existing_cursor.to_vec(),
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start_key..end_key).into();
+        let pairs = tikv_op!(txn.scan(range, page_size).await)?;
 
         let mut pk_bytes_list = Vec::new();
+        let mut last_key: Option<Vec<u8>> = None;
         let mut scanned = 0usize;
         for pair in pairs {
             scanned += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
+            last_key = Some(full_key.to_vec());
             if full_key.len() > prefix_len {
                 pk_bytes_list.push(full_key[prefix_len..].to_vec());
             }
         }
         kv_stats::record_index_scan_pairs(scanned);
 
+        let next_cursor = if (pk_bytes_list.len() as u32) < page_size {
+            None
+        } else {
+            last_key.map(|mut key| {
+                key.push(0x00);
+                key
+            })
+        };
+
+        Ok((pk_bytes_list, next_cursor))
+    }
+
+    /// Estimate the size of a GIN posting list by scanning up to `probe_limit`
+    /// entries. Returns `(count, saturated)` where `saturated=true` means the
+    /// true posting-list size is at least `count`.
+    pub async fn probe_gin_posting_list_size(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hash: u64,
+        probe_limit: u32,
+    ) -> Result<(u32, bool)> {
+        let (pk_bytes_list, next_cursor) = self
+            .scan_gin_posting_list_page(
+                txn,
+                db_id,
+                table_id,
+                index_id,
+                token_hash,
+                None,
+                probe_limit,
+            )
+            .await?;
+        Ok((pk_bytes_list.len() as u32, next_cursor.is_some()))
+    }
+
+    /// Filter `pk_bytes_list` to only PKs that exist in the posting list for
+    /// `token_hash`, preserving the input order.
+    pub async fn filter_gin_posting_membership(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hash: u64,
+        pk_bytes_list: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>> {
+        if pk_bytes_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys: Vec<Vec<u8>> = pk_bytes_list
+            .iter()
+            .map(|pk_bytes| {
+                self.key(&encode_gin_index_key_v2(
+                    db_id, table_id, index_id, token_hash, pk_bytes,
+                ))
+            })
+            .collect();
+        let mut existing: HashSet<Vec<u8>> = HashSet::with_capacity(keys.len());
+        for chunk in keys.chunks(BATCH_GET_CHUNK_SIZE) {
+            kv_stats::record_batch_get_keys(chunk.len());
+            for pair in
+                tikv_op!(txn.batch_get(chunk.iter().cloned()).await).map_err(|e| anyhow!(e))?
+            {
+                let tikv_client::KvPair(key, _) = pair;
+                let key_vec: Vec<u8> = key.into();
+                existing.insert(key_vec);
+            }
+        }
+
+        Ok(keys
+            .into_iter()
+            .zip(pk_bytes_list.iter().cloned())
+            .filter_map(|(full_key, pk_bytes)| existing.contains(&full_key).then_some(pk_bytes))
+            .collect())
+    }
+
+    /// Scan table data keys only and return raw PK byte sequences without
+    /// materializing full rows.
+    pub async fn scan_table_primary_key_bytes_page(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        cursor: Option<&[u8]>,
+        page_size: u32,
+    ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+        let (table_start, table_end) = encode_table_data_range_v2(db_id, table_id);
+        let prefix_len = table_start.len();
+        let start_key = cursor.map_or(table_start.clone(), |cursor| cursor.to_vec());
+        let range: BoundRange = (start_key..table_end).into();
+        let pairs = tikv_op!(txn.scan(range, page_size).await)?;
+
+        let mut pk_bytes_list = Vec::new();
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut scanned = 0usize;
+        for pair in pairs {
+            scanned += 1;
+            let full_key: &[u8] = pair.key().as_ref().into();
+            last_key = Some(full_key.to_vec());
+            if full_key.len() > prefix_len {
+                pk_bytes_list.push(full_key[prefix_len..].to_vec());
+            }
+        }
+        kv_stats::record_table_scan_pairs(scanned);
+
+        let next_cursor = if (pk_bytes_list.len() as u32) < page_size {
+            None
+        } else {
+            last_key.map(|mut key| {
+                key.push(0x00);
+                key
+            })
+        };
+
+        Ok((pk_bytes_list, next_cursor))
+    }
+
+    pub async fn scan_gin_posting_list(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hash: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        let (pk_bytes_list, _) = self
+            .scan_gin_posting_list_page(
+                txn, db_id, table_id, index_id, token_hash, None, SCAN_LIMIT,
+            )
+            .await?;
         Ok(pk_bytes_list)
     }
 }

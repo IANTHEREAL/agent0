@@ -129,6 +129,9 @@ pub(super) fn build_index_scan_operator(
             *index_id,
             index_name.clone(),
             qual.clone(),
+            // GIN produces a superset that still needs recheck, so LIMIT cannot
+            // be pushed down on candidate PK count without risking under-return.
+            None,
         ))),
         ScanType::HnswIndexScan {
             index_id,
