@@ -179,6 +179,8 @@ impl GinScanOperator {
     async fn scan_posting_list_page(
         &mut self,
         ctx: &mut ExecutionContext<'_>,
+        table_id: u64,
+        index_id: u64,
         token_hash: u64,
         cursor: Option<&[u8]>,
     ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
@@ -188,8 +190,8 @@ impl GinScanOperator {
             .scan_gin_posting_list_page(
                 ctx.txn,
                 ctx.db_id,
-                self.schema.table_id,
-                self.index_id,
+                table_id,
+                index_id,
                 token_hash,
                 cursor,
                 GIN_POSTING_PAGE_SIZE,
@@ -197,6 +199,31 @@ impl GinScanOperator {
             .await?;
         self.metrics.posting_pairs_scanned += page.len() as u64;
         Ok((page, next_cursor))
+    }
+
+    async fn collect_posting_list_all_pages(
+        &mut self,
+        ctx: &mut ExecutionContext<'_>,
+        table_id: u64,
+        index_id: u64,
+        token_hash: u64,
+    ) -> Result<BTreeSet<Vec<u8>>> {
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut pk_set = BTreeSet::new();
+        loop {
+            let (page, next_cursor) = self
+                .scan_posting_list_page(ctx, table_id, index_id, token_hash, cursor.as_deref())
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            pk_set.extend(page);
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(pk_set)
     }
 
     async fn filter_posting_membership(
@@ -258,7 +285,13 @@ impl GinScanOperator {
 
         loop {
             let (page, next_cursor) = self
-                .scan_posting_list_page(ctx, driver_token, cursor.as_deref())
+                .scan_posting_list_page(
+                    ctx,
+                    self.schema.table_id,
+                    self.index_id,
+                    driver_token,
+                    cursor.as_deref(),
+                )
                 .await?;
             if page.is_empty() {
                 break;
@@ -320,13 +353,10 @@ impl GinScanOperator {
     ) -> Result<GinCandidateSet> {
         match qual {
             GinQual::Term { token_hash } => {
-                self.metrics.posting_scan_rpcs += 1;
-                let pk_list = ctx
-                    .store
-                    .scan_gin_posting_list(ctx.txn, ctx.db_id, table_id, index_id, *token_hash)
+                let pk_set = self
+                    .collect_posting_list_all_pages(ctx, table_id, index_id, *token_hash)
                     .await?;
-                self.metrics.posting_pairs_scanned += pk_list.len() as u64;
-                Ok(GinCandidateSet::Keys(pk_list.into_iter().collect()))
+                Ok(GinCandidateSet::Keys(pk_set))
             }
 
             GinQual::And(children) => {

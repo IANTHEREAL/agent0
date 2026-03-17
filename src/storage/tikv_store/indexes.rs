@@ -871,22 +871,6 @@ impl TikvStore {
 
         Ok((pk_bytes_list, next_cursor))
     }
-
-    pub async fn scan_gin_posting_list(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_id: u64,
-        index_id: u64,
-        token_hash: u64,
-    ) -> Result<Vec<Vec<u8>>> {
-        let (pk_bytes_list, _) = self
-            .scan_gin_posting_list_page(
-                txn, db_id, table_id, index_id, token_hash, None, SCAN_LIMIT,
-            )
-            .await?;
-        Ok(pk_bytes_list)
-    }
 }
 
 #[cfg(test)]
