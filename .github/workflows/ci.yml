@@ -154,9 +154,11 @@ jobs:
   integration-tests:
     needs: build-release
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - uses: actions/download-artifact@v4
         with:
@@ -267,6 +269,12 @@ jobs:
 
           curl -sf http://127.0.0.1:2379/pd/api/v1/health || (cat "$PLAYGROUND_LOG" && exit 1)
           curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]' || (cat "$PLAYGROUND_LOG" && exit 1)
+
+      - name: Run fs9 symlink format behavioral tests
+        shell: bash
+        run: |
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_symlink_creation_bumps_superblock_to_v5 -- --ignored --nocapture
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_keyspace_without_symlinks_stays_at_v4 -- --ignored --nocapture
 
       - name: Start db9-server
         run: |
