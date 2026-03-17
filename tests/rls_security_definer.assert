@@ -13,5 +13,5 @@ owner-secret-2
 caller-secret-1
 
 -- Q5: pg_proc.prosecdef reflects the attribute
-invoker_read_all
-secdef_read_all
+invoker_read_all|f
+secdef_read_all|t

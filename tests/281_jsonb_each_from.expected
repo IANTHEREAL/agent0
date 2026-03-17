@@ -105,10 +105,9 @@ NOTICE:  table "jtest" does not exist, skipping
  b
 (2 rows)
 
- elem
+elem
 ------
- 1
- 2
+1
+2
 (2 rows)
-
-
+ 

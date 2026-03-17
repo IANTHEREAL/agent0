@@ -29,7 +29,7 @@ SELECT column_default FROM information_schema.columns
   WHERE table_name = 't1458_big' AND column_name = 'id';
 
 -- 6. pg_attrdef reflects new default after SET DEFAULT
-SELECT adsrc FROM pg_attrdef
+SELECT pg_get_expr(adbin, adrelid) AS adsrc FROM pg_attrdef
   WHERE adrelid = (SELECT oid FROM pg_class WHERE relname = 't1458_big')
     AND adnum = 1;
 

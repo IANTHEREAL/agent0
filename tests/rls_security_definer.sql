@@ -11,6 +11,9 @@ DROP ROLE IF EXISTS secdef_owner;
 DROP ROLE IF EXISTS secdef_caller;
 CREATE ROLE secdef_owner LOGIN PASSWORD 'pw';
 CREATE ROLE secdef_caller LOGIN PASSWORD 'pw';
+GRANT secdef_owner TO CURRENT_USER WITH SET TRUE;
+GRANT secdef_caller TO CURRENT_USER WITH SET TRUE;
+GRANT CREATE ON SCHEMA public TO secdef_owner;
 
 CREATE TABLE secdef_data (
     id INT PRIMARY KEY,
@@ -86,5 +89,8 @@ ORDER BY proname;
 DROP FUNCTION IF EXISTS secdef_read_all();
 DROP FUNCTION IF EXISTS invoker_read_all();
 DROP TABLE IF EXISTS secdef_data CASCADE;
+REVOKE CREATE ON SCHEMA public FROM secdef_owner;
+REVOKE secdef_owner FROM CURRENT_USER;
+REVOKE secdef_caller FROM CURRENT_USER;
 DROP ROLE IF EXISTS secdef_owner;
 DROP ROLE IF EXISTS secdef_caller;

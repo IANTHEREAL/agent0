@@ -10,6 +10,7 @@
 DROP TABLE IF EXISTS rls_exp CASCADE;
 DROP ROLE IF EXISTS rls_exp_user;
 CREATE ROLE rls_exp_user LOGIN PASSWORD 'pw';
+GRANT rls_exp_user TO CURRENT_USER WITH SET TRUE;
 
 CREATE TABLE rls_exp (
     id INT PRIMARY KEY,
@@ -21,6 +22,7 @@ INSERT INTO rls_exp VALUES
     (1, 'rls_exp_user', 'visible'),
     (2, 'other',        'hidden'),
     (3, 'rls_exp_user', 'also visible');
+ANALYZE rls_exp;
 
 GRANT SELECT ON rls_exp TO rls_exp_user;
 

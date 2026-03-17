@@ -2,25 +2,25 @@
 dump_test|t|t
 
 -- pg_policy joined with pg_class: all 4 policies
-del_restrictive|dump_test|d|f|{0}|id > 0|
-ins_check|dump_test|a|t|{0}||owner_name = current_user
-sel_owner|dump_test|r|t|{0}|owner_name = current_user|
-upd_all|dump_test|w|t|{0}|true|owner_name = current_user
+del_restrictive|dump_test|d|f|{0}|(id > 0)|NULL
+ins_check|dump_test|a|t|{0}|NULL|(owner_name = CURRENT_USER)
+sel_owner|dump_test|r|t|{0}|(owner_name = CURRENT_USER)|NULL
+upd_all|dump_test|w|t|{0}|true|(owner_name = CURRENT_USER)
 
 -- pg_policies view: all 4 policies with human-readable fields
-del_restrictive|dump_test|RESTRICTIVE|DELETE|{public}|id > 0|
-ins_check|dump_test|PERMISSIVE|INSERT|{public}||owner_name = current_user
-sel_owner|dump_test|PERMISSIVE|SELECT|{public}|owner_name = current_user|
-upd_all|dump_test|PERMISSIVE|UPDATE|{public}|true|owner_name = current_user
+del_restrictive|dump_test|RESTRICTIVE|DELETE|{public}|(id > 0)|NULL
+ins_check|dump_test|PERMISSIVE|INSERT|{public}|NULL|(owner_name = CURRENT_USER)
+sel_owner|dump_test|PERMISSIVE|SELECT|{public}|(owner_name = CURRENT_USER)|NULL
+upd_all|dump_test|PERMISSIVE|UPDATE|{public}|true|(owner_name = CURRENT_USER)
 
 -- pg_tables RLS flag
 dump_test|t
 
 -- policies dropped
-0
+policy_count=0
 
 -- round-trip: recreated policies match
-del_restrictive|RESTRICTIVE|DELETE|id > 0|
-ins_check|PERMISSIVE|INSERT||owner_name = current_user
-sel_owner|PERMISSIVE|SELECT|owner_name = current_user|
-upd_all|PERMISSIVE|UPDATE|true|owner_name = current_user
+del_restrictive|RESTRICTIVE|DELETE|(id > 0)|NULL
+ins_check|PERMISSIVE|INSERT|NULL|(owner_name = CURRENT_USER)
+sel_owner|PERMISSIVE|SELECT|(owner_name = CURRENT_USER)|NULL
+upd_all|PERMISSIVE|UPDATE|true|(owner_name = CURRENT_USER)

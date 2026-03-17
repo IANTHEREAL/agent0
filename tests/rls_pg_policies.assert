@@ -1,10 +1,10 @@
 # pg_policies view — verify human-readable output and correct types
 
 # Query 3: all policies with correct columns, ordered by name
-del_restrict|DELETE|RESTRICTIVE|data IS NOT NULL|
-ins_own|INSERT|PERMISSIVE||user_id = current_user
-sel_all|SELECT|PERMISSIVE|true|
-upd_own|UPDATE|PERMISSIVE|user_id = current_user|user_id = current_user
+del_restrict|DELETE|RESTRICTIVE|(data IS NOT NULL)|NULL
+ins_own|INSERT|PERMISSIVE|NULL|(user_id = CURRENT_USER)
+sel_all|SELECT|PERMISSIVE|true|NULL
+upd_own|UPDATE|PERMISSIVE|(user_id = CURRENT_USER)|(user_id = CURRENT_USER)
 
 # Query 4: roles is array, cast to text shows {public}
 sel_all|{public}

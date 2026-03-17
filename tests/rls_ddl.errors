@@ -1,0 +1,5 @@
+policy "sel_own" for table "rls_test" already exists
+policy "nonexistent" for table "rls_test" does not exist
+WITH CHECK cannot be applied to SELECT or DELETE
+WITH CHECK cannot be applied to SELECT or DELETE
+only WITH CHECK expression allowed for INSERT

@@ -31,14 +31,16 @@ SELECT relname, relrowsecurity, relforcerowsecurity
   FROM pg_class
  WHERE relname = 'dump_test';
 
--- 2. pg_dump queries pg_policy joined with pg_class for policy details
+-- 2. pg_dump-compatible policy details: OIDs plus deparsed expressions
+--    (pg_policy stores expressions as pg_node_tree; pg_get_expr renders
+--    PostgreSQL's canonical human-readable form).
 SELECT p.polname,
        c.relname,
        p.polcmd,
        p.polpermissive,
        p.polroles::text,
-       p.polqual,
-       p.polwithcheck
+       pg_get_expr(p.polqual, p.polrelid) AS polqual,
+       pg_get_expr(p.polwithcheck, p.polrelid) AS polwithcheck
   FROM pg_policy p
   JOIN pg_class c ON c.oid = p.polrelid
  WHERE c.relname = 'dump_test'
@@ -63,7 +65,8 @@ DROP POLICY upd_all ON dump_test;
 DROP POLICY del_restrictive ON dump_test;
 
 -- Verify policies are gone
-SELECT count(*) AS policy_count FROM pg_policies WHERE tablename = 'dump_test';
+SELECT 'policy_count=' || count(*) AS policy_count
+  FROM pg_policies WHERE tablename = 'dump_test';
 
 -- Recreate from what pg_dump would emit
 CREATE POLICY del_restrictive ON dump_test AS RESTRICTIVE FOR DELETE

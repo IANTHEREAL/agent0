@@ -1,15 +1,15 @@
-id,v
-1,before
-42,after
+id|v
+42|after
+1|before
 (2 rows)
-id,v
-99,explicit
+id|v
+99|explicit
 (1 row)
-valid_seq,v
-t,seq_restored
+valid_seq|v
+t|seq_restored
 (1 row)
-id,v
-42,big
+id|v
+42|big
 (1 row)
 column_default
 42
@@ -18,12 +18,14 @@ adsrc
 42
 (1 row)
 ERROR:  null value in column "id" of relation "t1458_drop" violates not-null constraint
+DETAIL:  Failing row contains (null, should_fail).
 ERROR:  null value in column "id" of relation "t1458_drop2" violates not-null constraint
-id,v
-1,a
-2,b
+DETAIL:  Failing row contains (null, should_fail).
+id|v
+1|a
+2|b
 (2 rows)
-id,v
-1,x
+id|v
+1|x
 (1 row)
 ERROR:  multiple default values specified for column "id" of table "t1458_reject"

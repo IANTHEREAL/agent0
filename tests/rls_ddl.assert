@@ -1,0 +1,13 @@
+# RLS DDL: stable PG-compatible catalog reflections
+
+rls_test|t|f
+sel_own|r|t|{0}|(user_id = 1)
+restrict_active|r|f
+ins_check|a|(user_id > 0)
+upd_both|w|(user_id = 1)|(user_id > 0)
+sel_own|(user_id = 2)
+ins_check_count=0
+rls_test|t|t
+rls_test|f|f
+complex_pol|(user_id IN ( SELECT rls_test_1.id
+policy_count=4

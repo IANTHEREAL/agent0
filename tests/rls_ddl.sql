@@ -23,7 +23,8 @@ CREATE POLICY sel_own ON rls_test
   USING (user_id = 1);
 
 -- Verify pg_policy shows it
-SELECT polname, polcmd, polpermissive, polroles::text, polqual
+SELECT polname, polcmd, polpermissive, polroles::text,
+       pg_get_expr(polqual, polrelid) AS polqual
   FROM pg_policy WHERE polname = 'sel_own';
 
 -- 4. Create a RESTRICTIVE policy
@@ -41,7 +42,8 @@ CREATE POLICY ins_check ON rls_test
   FOR INSERT
   WITH CHECK (user_id > 0);
 
-SELECT polname, polcmd, polwithcheck
+SELECT polname, polcmd,
+       pg_get_expr(polwithcheck, polrelid) AS polwithcheck
   FROM pg_policy WHERE polname = 'ins_check';
 
 -- 6. Create an UPDATE policy with both USING and WITH CHECK
@@ -50,7 +52,9 @@ CREATE POLICY upd_both ON rls_test
   USING (user_id = 1)
   WITH CHECK (user_id > 0);
 
-SELECT polname, polcmd, polqual, polwithcheck
+SELECT polname, polcmd,
+       pg_get_expr(polqual, polrelid) AS polqual,
+       pg_get_expr(polwithcheck, polrelid) AS polwithcheck
   FROM pg_policy WHERE polname = 'upd_both';
 
 -- 7. Verify duplicate policy name fails
@@ -59,20 +63,21 @@ CREATE POLICY sel_own ON rls_test FOR SELECT USING (true);
 -- 8. ALTER POLICY — change USING expression
 ALTER POLICY sel_own ON rls_test USING (user_id = 2);
 
-SELECT polname, polqual
+SELECT polname, pg_get_expr(polqual, polrelid) AS polqual
   FROM pg_policy WHERE polname = 'sel_own';
 
 -- 9. ALTER POLICY — change roles
 ALTER POLICY sel_own ON rls_test TO public;
 
--- 10. ALTER POLICY with no changes should fail
+-- 10. PostgreSQL accepts ALTER POLICY with no changes as a no-op.
 ALTER POLICY sel_own ON rls_test;
 
 -- 11. DROP POLICY
 DROP POLICY ins_check ON rls_test;
 
 -- Verify it's gone
-SELECT COUNT(*) FROM pg_policy WHERE polname = 'ins_check';
+SELECT 'ins_check_count=' || COUNT(*) AS result
+  FROM pg_policy WHERE polname = 'ins_check';
 
 -- 12. DROP POLICY IF EXISTS (no error for missing)
 DROP POLICY IF EXISTS ins_check ON rls_test;
@@ -110,11 +115,12 @@ CREATE POLICY complex_pol ON rls_test
   FOR SELECT
   USING (user_id IN (SELECT id FROM rls_test WHERE data = 'admin'));
 
-SELECT polname, polqual
+SELECT polname, pg_get_expr(polqual, polrelid) AS polqual
   FROM pg_policy WHERE polname = 'complex_pol';
 
 -- 20. Count all remaining policies
-SELECT COUNT(*) FROM pg_policy
+SELECT 'policy_count=' || COUNT(*) AS result
+  FROM pg_policy
   WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'rls_test');
 
 -- 21. Cleanup
