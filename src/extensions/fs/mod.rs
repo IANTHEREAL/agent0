@@ -904,11 +904,11 @@ mod tests {
             anyhow::bail!("not implemented for test backend")
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             anyhow::bail!("not implemented for test backend")
         }
 
-        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, _path: &str, _data: &[u8], _mode: Option<u32>) -> Result<usize> {
             anyhow::bail!("not implemented for test backend")
         }
 
@@ -942,6 +942,7 @@ mod tests {
             &self,
             _path: &str,
             _expected_size: u64,
+            _mode: Option<u32>,
         ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
             anyhow::bail!("not implemented for test backend")
         }
@@ -976,6 +977,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 
@@ -1045,11 +1050,11 @@ mod tests {
             unreachable!("remove_recursive is not used in this test");
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             unreachable!("mkdir is not used in this test");
         }
 
-        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, _path: &str, _data: &[u8], _mode: Option<u32>) -> Result<usize> {
             unreachable!("write_file is not used in this test");
         }
 
@@ -1085,6 +1090,7 @@ mod tests {
             &self,
             _path: &str,
             _expected_size: u64,
+            _mode: Option<u32>,
         ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
             unreachable!("create_upload is not used in this test");
         }
@@ -1123,6 +1129,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             unreachable!("readlink is not used in this test");
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 

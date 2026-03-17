@@ -349,11 +349,16 @@ pub(crate) async fn infer_fs9_table_function_schema(
             anyhow::bail!("not implemented for test backend")
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> AnyResult<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> AnyResult<()> {
             anyhow::bail!("not implemented for test backend")
         }
 
-        async fn write_file(&self, _path: &str, _data: &[u8]) -> AnyResult<usize> {
+        async fn write_file(
+            &self,
+            _path: &str,
+            _data: &[u8],
+            _mode: Option<u32>,
+        ) -> AnyResult<usize> {
             anyhow::bail!("not implemented for test backend")
         }
 
@@ -389,6 +394,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             &self,
             _path: &str,
             _expected_size: u64,
+            _mode: Option<u32>,
         ) -> AnyResult<crate::extensions::fs::backend::FsCreateUpload> {
             anyhow::bail!("not implemented for test backend")
         }
@@ -423,6 +429,9 @@ pub(crate) async fn infer_fs9_table_function_schema(
             anyhow::bail!("not implemented for test backend")
         }
         async fn readlink(&self, _path: &str) -> AnyResult<String> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn chmod(&self, _path: &str, _mode: u32) -> AnyResult<()> {
             anyhow::bail!("not implemented for test backend")
         }
     }

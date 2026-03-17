@@ -37,7 +37,8 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             id,
             path,
             recursive,
-        } => handle_mkdir(session, id, path, *recursive).await,
+            mode,
+        } => handle_mkdir(session, id, path, *recursive, *mode).await,
         WsRequest::Unlink { id, path } => handle_unlink(session, id, path).await,
         WsRequest::Rm {
             id,
@@ -66,6 +67,7 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             content,
             encoding,
             streaming,
+            mode,
             ..
         } => {
             if *streaming {
@@ -75,7 +77,7 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
                     "streaming must be handled at connection level",
                 );
             }
-            handle_write(session, id, path, content.as_deref(), encoding).await
+            handle_write(session, id, path, content.as_deref(), encoding, *mode).await
         }
         WsRequest::Pwrite {
             id,
@@ -96,9 +98,12 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             old_path,
             new_path,
         } => handle_rename(session, id, old_path, new_path).await,
-        WsRequest::CreateUpload { id, path, size } => {
-            handle_create_upload(session, id, path, *size).await
-        }
+        WsRequest::CreateUpload {
+            id,
+            path,
+            size,
+            mode,
+        } => handle_create_upload(session, id, path, *size, *mode).await,
         WsRequest::PresignPart {
             id,
             upload_token,
@@ -116,6 +121,7 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
         WsRequest::PrepareDownload { id, path } => handle_prepare_download(session, id, path).await,
         WsRequest::Symlink { id, path, target } => handle_symlink(session, id, path, target).await,
         WsRequest::Readlink { id, path } => handle_readlink(session, id, path).await,
+        WsRequest::Chmod { id, path, mode } => handle_chmod(session, id, path, *mode).await,
         WsRequest::BatchStat { id, paths } => handle_batch_stat(session, id, paths).await,
         WsRequest::BatchInlineRead { id, paths } => {
             handle_batch_inline_read(session, id, paths).await
@@ -232,12 +238,21 @@ async fn handle_readdir_recursive(
     }
 }
 
-async fn handle_mkdir(session: &WsSession, id: &str, path: &str, recursive: bool) -> WsResponse {
+async fn handle_mkdir(
+    session: &WsSession,
+    id: &str,
+    path: &str,
+    recursive: bool,
+    mode: Option<u32>,
+) -> WsResponse {
     if let Err((code, msg)) = validate_path(path) {
         return WsResponse::error(id, code, msg);
     }
 
-    let result = session.backend.mkdir(path, recursive).await;
+    let result = session
+        .backend
+        .mkdir(path, recursive, mode.map(|m| m & 0o7777))
+        .await;
     match result {
         Ok(()) => WsResponse::success_empty(id),
         Err(err) => {
@@ -280,6 +295,21 @@ async fn handle_readlink(session: &WsSession, id: &str, path: &str) -> WsRespons
     let result = session.backend.readlink(path).await;
     match result {
         Ok(target) => WsResponse::success(id, json!({ "target": target })),
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            WsResponse::error(id, code, msg)
+        }
+    }
+}
+
+async fn handle_chmod(session: &WsSession, id: &str, path: &str, mode: u32) -> WsResponse {
+    if let Err((code, msg)) = validate_path(path) {
+        return WsResponse::error(id, code, msg);
+    }
+
+    let result = session.backend.chmod(path, mode).await;
+    match result {
+        Ok(()) => WsResponse::success_empty(id),
         Err(err) => {
             let (code, msg) = map_fs_error(&err);
             WsResponse::error(id, code, msg)
@@ -376,6 +406,7 @@ async fn handle_write(
     path: &str,
     content: Option<&str>,
     encoding: &str,
+    mode: Option<u32>,
 ) -> WsResponse {
     if let Err((code, msg)) = validate_path(path) {
         return WsResponse::error(id, code, msg);
@@ -402,7 +433,10 @@ async fn handle_write(
         );
     }
 
-    let result = session.backend.write_file(path, &data).await;
+    let result = session
+        .backend
+        .write_file(path, &data, mode.map(|m| m & 0o7777))
+        .await;
     match result {
         Ok(written) => WsResponse::success(id, json!({ "written": written })),
         Err(err) => {
@@ -503,7 +537,13 @@ async fn handle_rename(
     }
 }
 
-async fn handle_create_upload(session: &WsSession, id: &str, path: &str, size: u64) -> WsResponse {
+async fn handle_create_upload(
+    session: &WsSession,
+    id: &str,
+    path: &str,
+    size: u64,
+    mode: Option<u32>,
+) -> WsResponse {
     if let Err((code, msg)) = validate_path(path) {
         return WsResponse::error(id, code, msg);
     }
@@ -522,7 +562,11 @@ async fn handle_create_upload(session: &WsSession, id: &str, path: &str, size: u
         }
     };
 
-    match session.backend.create_upload(path, size).await {
+    match session
+        .backend
+        .create_upload(path, size, mode.map(|m| m & 0o7777))
+        .await
+    {
         Ok(upload) => {
             let upload_token = upload.upload_token.clone();
             let payload = match serde_json::to_value(CreateUploadResponse {
@@ -965,12 +1009,12 @@ async fn handle_batch_write(
                 ),
             );
         }
-        decoded_files.push((file.path.clone(), data));
+        decoded_files.push((file.path.clone(), data, file.mode.map(|m| m & 0o7777)));
     }
 
     let batch_files = decoded_files
         .into_iter()
-        .map(|(path, data)| FsBatchWriteFile { path, data })
+        .map(|(path, data, mode)| FsBatchWriteFile { path, data, mode })
         .collect::<Vec<_>>();
     let results = match session.backend.batch_write(batch_files).await {
         Ok(results) => results,

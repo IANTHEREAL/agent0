@@ -935,7 +935,7 @@ impl EmbeddedPageFs {
 
                 for file in files {
                     let inode_id = self.alloc_inode_id().await?;
-                    let mut inode = Inode::new_file(inode_id, 0o644);
+                    let mut inode = Inode::new_file(inode_id, file.mode.unwrap_or(0o644));
                     inode.nlink = 0;
                     inode.data = DataRef::None;
                     inode.size = u64::try_from(file.data.len()).map_err(|_| {
@@ -1047,6 +1047,8 @@ impl EmbeddedPageFs {
                 publish_generation = existing_inode.generation.checked_add(1).ok_or_else(|| {
                     anyhow!(EmbeddedFsError::internal("inode generation overflow"))
                 })?;
+                // Preserve existing file's mode on overwrite (new-inode-only semantics).
+                staging_inode.mode = existing_inode.mode;
                 retire_inode_data_ref(
                     &mut txn,
                     existing_inode_id,
@@ -2892,7 +2894,12 @@ impl EmbeddedPageFs {
         Ok(())
     }
 
-    pub(crate) async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+    pub(crate) async fn write_file(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: Option<u32>,
+    ) -> Result<usize> {
         if !data.is_empty() && !can_store_inline_len(data.len()) {
             if !self.has_object_storage() {
                 return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
@@ -2908,6 +2915,7 @@ impl EmbeddedPageFs {
                         expected_size: Some(u64::try_from(data.len()).map_err(|_| {
                             anyhow!(EmbeddedFsError::internal("write length exceeds u64"))
                         })?),
+                        mode,
                     },
                 )
                 .await?;
@@ -2919,7 +2927,7 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = prepare_replace_file_txn(self, &mut txn, path).await?;
+        let (inode_id, mut inode) = prepare_replace_file_txn(self, &mut txn, path, mode).await?;
 
         if data.is_empty() {
             inode.data = DataRef::None;
@@ -2976,7 +2984,8 @@ impl EmbeddedPageFs {
         let mut entries = Vec::with_capacity(files.len());
         for file in files {
             let path = file.path;
-            let result = self.write_file(&path, &file.data).await;
+            let mode = file.mode;
+            let result = self.write_file(&path, &file.data, mode).await;
             entries.push(FsBatchWriteEntry { path, result });
         }
         Ok(entries)
@@ -3187,7 +3196,7 @@ impl EmbeddedPageFs {
                 };
 
                 let now = current_unix_timestamp();
-                let mut inode = Inode::new_file(inode_id, 0o644);
+                let mut inode = Inode::new_file(inode_id, opts.mode.unwrap_or(0o644));
                 inode.nlink = 0;
                 inode.size = opts.expected_size.unwrap_or(0);
                 inode.data = DataRef::Object {
@@ -3253,7 +3262,7 @@ impl EmbeddedPageFs {
         for attempt in 0..attempts {
             let mut txn = self.begin().await?;
             let inode_id = self.alloc_inode_id().await?;
-            let mut inode = Inode::new_file(inode_id, 0o644);
+            let mut inode = Inode::new_file(inode_id, opts.mode.unwrap_or(0o644));
             inode.nlink = 0;
             save_inode(&mut txn, &inode).await?;
             let now = current_unix_timestamp();
@@ -3291,6 +3300,7 @@ impl EmbeddedPageFs {
         &self,
         path: &str,
         expected_size: u64,
+        mode: Option<u32>,
     ) -> Result<FsCreateUpload> {
         if expected_size == 0 {
             return Err(anyhow!(EmbeddedFsError::InvalidInput(
@@ -3392,7 +3402,7 @@ impl EmbeddedPageFs {
                 }
             };
 
-            let mut inode = Inode::new_file(inode_id, 0o644);
+            let mut inode = Inode::new_file(inode_id, mode.unwrap_or(0o644));
             inode.nlink = 0;
             inode.size = expected_size;
             inode.data = DataRef::Object {
@@ -3620,7 +3630,7 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = prepare_write_at_file_txn(self, &mut txn, path).await?;
+        let (inode_id, mut inode) = prepare_write_at_file_txn(self, &mut txn, path, None).await?;
         apply_inline_write_at(
             &mut txn,
             inode_id,
@@ -3642,7 +3652,7 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = prepare_write_at_file_txn(self, &mut txn, path).await?;
+        let (inode_id, mut inode) = prepare_write_at_file_txn(self, &mut txn, path, None).await?;
         let offset = inode.size;
         apply_inline_write_at(
             &mut txn,
@@ -3764,7 +3774,7 @@ impl EmbeddedPageFs {
         Ok(removed)
     }
 
-    pub(crate) async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
+    pub(crate) async fn mkdir(&self, path: &str, recursive: bool, mode: Option<u32>) -> Result<()> {
         let normalized = normalize_path(path);
         if normalized == "/" {
             return Ok(());
@@ -3781,7 +3791,7 @@ impl EmbeddedPageFs {
                     }
 
                     let new_inode_id = self.alloc_inode_id().await?;
-                    let inode = Inode::new_directory(new_inode_id, 0o755);
+                    let inode = Inode::new_directory(new_inode_id, mode.unwrap_or(0o755));
                     save_inode(&mut txn, &inode).await?;
                     link(&mut txn, parent_inode, &name, new_inode_id).await?;
                     txn.commit().await?;
@@ -3790,8 +3800,9 @@ impl EmbeddedPageFs {
 
                 let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
                 let mut current_inode = ROOT_INODE;
+                let last_idx = parts.len().saturating_sub(1);
 
-                for part in parts {
+                for (i, part) in parts.iter().enumerate() {
                     if let Some(next_inode_id) = lookup(&mut txn, current_inode, part).await? {
                         let next_inode = load_inode(&mut txn, next_inode_id)
                             .await?
@@ -3802,7 +3813,14 @@ impl EmbeddedPageFs {
                         current_inode = next_inode_id;
                     } else {
                         let new_inode_id = self.alloc_inode_id().await?;
-                        let inode = Inode::new_directory(new_inode_id, 0o755);
+                        // Only the leaf directory gets the requested mode;
+                        // intermediate directories always use 0o755.
+                        let dir_mode = if i == last_idx {
+                            mode.unwrap_or(0o755)
+                        } else {
+                            0o755
+                        };
+                        let inode = Inode::new_directory(new_inode_id, dir_mode);
                         save_inode(&mut txn, &inode).await?;
                         link(&mut txn, current_inode, part, new_inode_id).await?;
                         current_inode = new_inode_id;
@@ -4156,6 +4174,8 @@ impl EmbeddedPageFs {
                 publish_generation = existing_inode.generation.checked_add(1).ok_or_else(|| {
                     anyhow!(EmbeddedFsError::internal("inode generation overflow"))
                 })?;
+                // Preserve existing file's mode on overwrite (new-inode-only semantics).
+                staging_inode.mode = existing_inode.mode;
                 existing_inode.nlink = 0;
                 save_inode(&mut txn, &existing_inode).await?;
                 match &existing_inode.data {
@@ -4536,6 +4556,33 @@ impl EmbeddedPageFs {
         )))
     }
 
+    pub(crate) async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let normalized = normalize_path(path);
+        let attempts = fs9_config().tikv_commit_retry_attempts.max(1);
+        for attempt in 0..attempts {
+            let mut txn = self.begin().await?;
+            let result: Result<()> = async {
+                let (_inode_id, mut inode) = resolve_path(&mut txn, &normalized).await?;
+                inode.mode = mode;
+                inode.touch_mtime();
+                save_inode(&mut txn, &inode).await?;
+                txn.commit().await?;
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < attempts => {
+                    fs9_commit_backoff(attempt).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(anyhow!(EmbeddedFsError::internal("chmod retry exhausted")))
+    }
+
     pub(crate) async fn readlink(&self, path: &str) -> Result<String> {
         let mut txn = self.begin_read().await?;
         let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
@@ -4560,6 +4607,7 @@ async fn prepare_replace_file_txn(
     fs: &EmbeddedPageFs,
     txn: &mut Transaction,
     path: &str,
+    mode: Option<u32>,
 ) -> Result<(u64, Inode)> {
     let (parent_inode, name) = ensure_parents_and_resolve_parent(fs, txn, path).await?;
 
@@ -4589,7 +4637,7 @@ async fn prepare_replace_file_txn(
         Ok((existing_inode_id, inode))
     } else {
         let inode_id = fs.alloc_inode_id().await?;
-        let mut inode = Inode::new_file(inode_id, 0o644);
+        let mut inode = Inode::new_file(inode_id, mode.unwrap_or(0o644));
         inode.data = DataRef::None;
         link(txn, parent_inode, &name, inode_id).await?;
         Ok((inode_id, inode))
@@ -4600,6 +4648,7 @@ async fn prepare_write_at_file_txn(
     fs: &EmbeddedPageFs,
     txn: &mut Transaction,
     path: &str,
+    mode: Option<u32>,
 ) -> Result<(u64, Inode)> {
     let (parent_inode, name) = ensure_parents_and_resolve_parent(fs, txn, path).await?;
 
@@ -4620,7 +4669,7 @@ async fn prepare_write_at_file_txn(
         Ok((existing_inode_id, inode))
     } else {
         let inode_id = fs.alloc_inode_id().await?;
-        let inode = Inode::new_file(inode_id, 0o644);
+        let inode = Inode::new_file(inode_id, mode.unwrap_or(0o644));
         save_inode(txn, &inode).await?;
         link(txn, parent_inode, &name, inode_id).await?;
         Ok((inode_id, inode))
@@ -7986,7 +8035,7 @@ mod tests {
 
     /// Helper: ensure directory exists (idempotent).
     async fn ensure_dir(fs: &EmbeddedPageFs, path: &str) {
-        let _ = fs.mkdir(path, true).await;
+        let _ = fs.mkdir(path, true, None).await;
     }
 
     /// Helper: clean up a path (file or dir) — best effort.
@@ -8028,7 +8077,7 @@ mod tests {
     #[ignore]
     async fn test_maintenance_probe_detects_superblock_replacement() {
         let fs = make_fs().await;
-        fs.write_file("/stale.txt", b"stale").await.unwrap();
+        fs.write_file("/stale.txt", b"stale", None).await.unwrap();
 
         let mut txn = fs.begin_unchecked().await.unwrap();
         let mut superblock = load_superblock(&mut txn).await.unwrap();
@@ -8048,7 +8097,7 @@ mod tests {
         use crate::extensions::fs::embedded::EmbeddedFsBackend;
 
         let fs = make_fs().await;
-        fs.write_file("/stale.txt", b"stale").await.unwrap();
+        fs.write_file("/stale.txt", b"stale", None).await.unwrap();
 
         let mut txn = fs.begin_unchecked().await.unwrap();
         let mut superblock = load_superblock(&mut txn).await.unwrap();
@@ -8108,7 +8157,7 @@ mod tests {
         }
         let path = &format!("{base}/tiny.bin");
         let data: Vec<u8> = (0..inline_max.min(32)).map(|v| (v % 251) as u8).collect();
-        fs.write_file(path, &data).await.unwrap();
+        fs.write_file(path, &data, None).await.unwrap();
 
         let inode = fs.stat(path).await.unwrap();
         assert_eq!(inode.data, DataRef::InlineBlob);
@@ -8151,12 +8200,12 @@ mod tests {
         cleanup(&fs, &batch_dir).await;
         ensure_dir(&fs, &batch_dir).await;
 
-        fs.write_file(&root_file_1, b"hello").await.unwrap();
-        fs.write_file(&root_file_2, b"\x00\x01\x02\x03")
+        fs.write_file(&root_file_1, b"hello", None).await.unwrap();
+        fs.write_file(&root_file_2, b"\x00\x01\x02\x03", None)
             .await
             .unwrap();
         for name in batch_file_names {
-            fs.write_file(&format!("{batch_dir}/{name}"), name.as_bytes())
+            fs.write_file(&format!("{batch_dir}/{name}"), name.as_bytes(), None)
                 .await
                 .unwrap();
         }
@@ -8199,7 +8248,7 @@ mod tests {
         let base = "/test_readdir_invalid_entries";
         cleanup(&fs, base).await;
         ensure_dir(&fs, base).await;
-        fs.write_file(&format!("{base}/hello.txt"), b"hello")
+        fs.write_file(&format!("{base}/hello.txt"), b"hello", None)
             .await
             .unwrap();
 
@@ -8254,19 +8303,19 @@ mod tests {
         ensure_dir(&fs, &dir_c).await;
         ensure_dir(&fs, &dir_batch).await;
 
-        fs.write_file(&format!("{base}/root.txt"), b"root")
+        fs.write_file(&format!("{base}/root.txt"), b"root", None)
             .await
             .unwrap();
-        fs.write_file(&format!("{dir_a}/alpha.txt"), b"alpha")
+        fs.write_file(&format!("{dir_a}/alpha.txt"), b"alpha", None)
             .await
             .unwrap();
-        fs.write_file(&format!("{dir_b}/beta.txt"), b"beta")
+        fs.write_file(&format!("{dir_b}/beta.txt"), b"beta", None)
             .await
             .unwrap();
-        fs.write_file(&format!("{dir_c}/charlie.txt"), b"charlie")
+        fs.write_file(&format!("{dir_c}/charlie.txt"), b"charlie", None)
             .await
             .unwrap();
-        fs.write_file(&format!("{dir_batch}/delta.txt"), b"delta")
+        fs.write_file(&format!("{dir_batch}/delta.txt"), b"delta", None)
             .await
             .unwrap();
 
@@ -8319,7 +8368,7 @@ mod tests {
 
         cleanup(&fs, &base).await;
         ensure_dir(&fs, &base).await;
-        fs.write_file(&format!("{base}/bb.txt"), b"ok")
+        fs.write_file(&format!("{base}/bb.txt"), b"ok", None)
             .await
             .unwrap();
 
@@ -8372,7 +8421,7 @@ mod tests {
         }
         let path = &format!("{base}/large.bin");
         let data: Vec<u8> = (0..(inline_max + 1)).map(|v| (v % 251) as u8).collect();
-        fs.write_file(path, &data).await.unwrap();
+        fs.write_file(path, &data, None).await.unwrap();
 
         let inode = fs.stat(path).await.unwrap();
         assert!(matches!(inode.data, DataRef::Object { .. }));
@@ -8411,7 +8460,7 @@ mod tests {
 
         let path = &format!("{base}/replace.bin");
         let original: Vec<u8> = (0..(inline_max + 1)).map(|idx| (idx % 251) as u8).collect();
-        fs.write_file(path, &original).await.unwrap();
+        fs.write_file(path, &original, None).await.unwrap();
 
         let original_inode = fs.stat(path).await.unwrap();
         assert!(
@@ -8432,7 +8481,7 @@ mod tests {
         );
 
         let replacement = b"replacement-inline".to_vec();
-        fs.write_file(path, &replacement).await.unwrap();
+        fs.write_file(path, &replacement, None).await.unwrap();
 
         let replaced_inode = fs.stat(path).await.unwrap();
         assert_eq!(
@@ -8474,7 +8523,7 @@ mod tests {
 
         let path = &format!("{base}/inline.txt");
         let data = b"inline-read-regression".to_vec();
-        fs.write_file(path, &data).await.unwrap();
+        fs.write_file(path, &data, None).await.unwrap();
 
         let inode = fs.stat(path).await.unwrap();
         assert_eq!(inode.data, DataRef::InlineBlob);
@@ -8530,10 +8579,12 @@ mod tests {
                 FsBatchWriteFile {
                     path: first_path.clone(),
                     data: first_data.clone(),
+                    mode: None,
                 },
                 FsBatchWriteFile {
                     path: second_path.clone(),
                     data: second_data,
+                    mode: None,
                 },
             ])
             .await
@@ -8593,10 +8644,12 @@ mod tests {
                 FsBatchWriteFile {
                     path: first_path.clone(),
                     data: first_data.clone(),
+                    mode: None,
                 },
                 FsBatchWriteFile {
                     path: second_path.clone(),
                     data: second_data.clone(),
+                    mode: None,
                 },
             ])
             .await
@@ -8643,7 +8696,7 @@ mod tests {
 
         let path = &format!("{base}/object.bin");
         let data: Vec<u8> = (0..(inline_max + 1)).map(|idx| (idx % 251) as u8).collect();
-        fs.write_file(path, &data).await.unwrap();
+        fs.write_file(path, &data, None).await.unwrap();
 
         let inode = fs.stat(path).await.unwrap();
         assert!(
@@ -8695,7 +8748,7 @@ mod tests {
 
         let path = format!("{base}/object.bin");
         let data: Vec<u8> = (0..(inline_max + 1)).map(|idx| (idx % 251) as u8).collect();
-        fs.write_file(&path, &data).await.unwrap();
+        fs.write_file(&path, &data, None).await.unwrap();
 
         let inode = fs.stat(&path).await.unwrap();
         assert!(matches!(inode.data, DataRef::Object { .. }));
@@ -8818,7 +8871,7 @@ mod tests {
             return;
         }
         let path = &format!("{base}/file.bin");
-        fs.write_file(path, b"hello").await.unwrap();
+        fs.write_file(path, b"hello", None).await.unwrap();
 
         let err = fs
             .truncate(path, u64::try_from(inline_max + 1).unwrap())
@@ -8847,7 +8900,7 @@ mod tests {
             return;
         }
         let path = &format!("{base}/file.bin");
-        fs.write_file(path, b"hello").await.unwrap();
+        fs.write_file(path, b"hello", None).await.unwrap();
 
         let err = fs
             .write_file_at(path, u64::try_from(inline_max + 1).unwrap(), b"X")
@@ -8878,8 +8931,8 @@ mod tests {
         }
         let src = &format!("{base}/src.bin");
         let dst = &format!("{base}/dst.bin");
-        fs.write_file(src, b"source").await.unwrap();
-        fs.write_file(dst, b"dest").await.unwrap();
+        fs.write_file(src, b"source", None).await.unwrap();
+        fs.write_file(dst, b"dest", None).await.unwrap();
 
         let dst_inode = fs.stat(dst).await.unwrap();
         assert_eq!(dst_inode.data, DataRef::InlineBlob);
@@ -8918,7 +8971,7 @@ mod tests {
 
         let old = &format!("{dir}/a.txt");
         let new = &format!("{dir}/b.txt");
-        fs.write_file(old, b"hello").await.unwrap();
+        fs.write_file(old, b"hello", None).await.unwrap();
 
         fs.rename(old, new).await.unwrap();
 
@@ -8942,7 +8995,7 @@ mod tests {
 
         let old = &format!("{base}/src/file.txt");
         let new = &format!("{base}/dst/file.txt");
-        fs.write_file(old, b"cross").await.unwrap();
+        fs.write_file(old, b"cross", None).await.unwrap();
 
         fs.rename(old, new).await.unwrap();
 
@@ -8964,7 +9017,7 @@ mod tests {
         let data: Vec<u8> = (0..(PAGE_SIZE * 6 + 123))
             .map(|idx| (idx % 251) as u8)
             .collect();
-        fs.write_file(path, &data).await.unwrap();
+        fs.write_file(path, &data, None).await.unwrap();
 
         let mut reader = fs.read_file_stream(path, data.len()).await.unwrap();
         let mut streamed = Vec::new();
@@ -8993,6 +9046,7 @@ mod tests {
                 path,
                 FsWriteStreamOptions {
                     expected_size: Some(data.len() as u64),
+                    ..Default::default()
                 },
             )
             .await
@@ -9021,7 +9075,7 @@ mod tests {
         let target = format!("{base}/target.txt");
         let link = format!("{base}/link");
         let renamed = format!("{base}/link-renamed");
-        fs.write_file(&target, b"payload").await.unwrap();
+        fs.write_file(&target, b"payload", None).await.unwrap();
         fs.symlink(&link, &target).await.unwrap();
 
         let inode = fs.stat(&link).await.unwrap();
@@ -9094,7 +9148,7 @@ mod tests {
         // Create a symlink — this should bump superblock to v5.
         let target = format!("{base}/target.txt");
         let link = format!("{base}/link");
-        fs.write_file(&target, b"data").await.unwrap();
+        fs.write_file(&target, b"data", None).await.unwrap();
         fs.symlink(&link, &target).await.unwrap();
 
         let mut txn = fs.begin().await.unwrap();
@@ -9117,10 +9171,12 @@ mod tests {
         ensure_dir(&fs, base).await;
 
         // Write regular files only — no symlinks.
-        fs.write_file(&format!("{base}/file.txt"), b"hello")
+        fs.write_file(&format!("{base}/file.txt"), b"hello", None)
             .await
             .unwrap();
-        fs.mkdir(&format!("{base}/subdir"), false).await.unwrap();
+        fs.mkdir(&format!("{base}/subdir"), false, None)
+            .await
+            .unwrap();
 
         let mut txn = fs.begin().await.unwrap();
         let sb = load_superblock(&mut txn).await.unwrap();
@@ -9155,6 +9211,7 @@ mod tests {
                 path,
                 FsWriteStreamOptions {
                     expected_size: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -9190,13 +9247,14 @@ mod tests {
 
         let path = &format!("{base}/existing.bin");
         let original = b"hello-inline";
-        fs.write_file(path, original).await.unwrap();
+        fs.write_file(path, original, None).await.unwrap();
 
         let err = fs
             .begin_write_stream(
                 path,
                 FsWriteStreamOptions {
                     expected_size: Some((fs9_config().inline_max_bytes + 1) as u64),
+                    ..Default::default()
                 },
             )
             .await
@@ -9239,6 +9297,7 @@ mod tests {
                 path,
                 FsWriteStreamOptions {
                     expected_size: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -9303,13 +9362,14 @@ mod tests {
 
         let path = &format!("{base}/stable.bin");
         let original = b"stable-before-abort".to_vec();
-        fs.write_file(path, &original).await.unwrap();
+        fs.write_file(path, &original, None).await.unwrap();
 
         let mut writer = fs
             .begin_write_stream(
                 path,
                 FsWriteStreamOptions {
                     expected_size: Some(32),
+                    ..Default::default()
                 },
             )
             .await
@@ -9339,7 +9399,7 @@ mod tests {
 
         let path = &format!("{base}/object.bin");
         let upload = fs
-            .create_upload(path, fs9_config().object_min_bytes as u64)
+            .create_upload(path, fs9_config().object_min_bytes as u64, None)
             .await
             .unwrap();
         let claims = verify_upload_token(&upload.upload_token).unwrap();
@@ -9384,7 +9444,7 @@ mod tests {
         let data: Vec<u8> = (0..(fs9_config().inline_max_bytes + 1))
             .map(|idx| (idx % 251) as u8)
             .collect();
-        fs.write_file(path, &data).await.unwrap();
+        fs.write_file(path, &data, None).await.unwrap();
 
         let inode = fs.stat(path).await.unwrap();
         assert!(matches!(inode.data, DataRef::Object { .. }));
@@ -9423,7 +9483,7 @@ mod tests {
         ensure_dir(&fs, base).await;
 
         let path = &format!("{base}/replace.bin");
-        fs.write_file(path, b"old-data").await.unwrap();
+        fs.write_file(path, b"old-data", None).await.unwrap();
 
         let new_data: Vec<u8> = (0..(PAGE_SIZE * 4 + 19))
             .map(|idx| (idx % 251) as u8)
@@ -9433,6 +9493,7 @@ mod tests {
                 path,
                 FsWriteStreamOptions {
                     expected_size: Some(new_data.len() as u64),
+                    ..Default::default()
                 },
             )
             .await
@@ -9455,7 +9516,7 @@ mod tests {
         let base = "/test_rename_dir";
         cleanup(&fs, base).await;
         ensure_dir(&fs, &format!("{base}/old_dir")).await;
-        fs.write_file(&format!("{base}/old_dir/child.txt"), b"nested")
+        fs.write_file(&format!("{base}/old_dir/child.txt"), b"nested", None)
             .await
             .unwrap();
 
@@ -9573,7 +9634,7 @@ mod tests {
         cleanup(&fs, base).await;
         ensure_dir(&fs, base).await;
         let path = &format!("{base}/f.txt");
-        fs.write_file(path, b"stable").await.unwrap();
+        fs.write_file(path, b"stable", None).await.unwrap();
 
         // trailing slash on destination requires a directory target
         let err = fs.rename(path, &format!("{path}/")).await.unwrap_err();
@@ -9599,7 +9660,7 @@ mod tests {
         ensure_dir(&fs, base).await;
         let src = &format!("{base}/f.txt");
         let dst = &format!("{base}/missing/");
-        fs.write_file(src, b"stable").await.unwrap();
+        fs.write_file(src, b"stable", None).await.unwrap();
 
         let err = fs.rename(src, dst).await.unwrap_err();
         let fs_err = err
@@ -9629,7 +9690,7 @@ mod tests {
         ensure_dir(&fs, &format!("{base}/existing_dir")).await;
         let src = &format!("{base}/f.txt");
         let dst = &format!("{base}/existing_dir/");
-        fs.write_file(src, b"stable").await.unwrap();
+        fs.write_file(src, b"stable", None).await.unwrap();
 
         let err = fs.rename(src, dst).await.unwrap_err();
         let fs_err = err

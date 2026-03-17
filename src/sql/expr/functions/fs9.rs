@@ -164,7 +164,7 @@ pub fn fs9_write(args: Vec<Value>) -> Result<Value> {
     }
 
     let client = get_client_sync()?;
-    let len = run_async(client.write_file(&path, &content))?;
+    let len = run_async(client.write_file(&path, &content, None))?;
     Ok(Value::Int64(len as i64))
 }
 
@@ -259,7 +259,7 @@ pub fn fs9_mkdir(args: Vec<Value>) -> Result<Value> {
     };
 
     let client = get_client_sync()?;
-    run_async(client.mkdir(&path, recursive))?;
+    run_async(client.mkdir(&path, recursive, None))?;
     Ok(Value::Boolean(true))
 }
 
@@ -695,11 +695,11 @@ mod tests {
             Ok((before - files.len()) as u64)
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             Ok(())
         }
 
-        async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, path: &str, data: &[u8], _mode: Option<u32>) -> Result<usize> {
             self.files.lock().unwrap().insert(
                 normalize_mock_path(path),
                 MockFile {
@@ -792,7 +792,12 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+            _mode: Option<u32>,
+        ) -> Result<FsCreateUpload> {
             anyhow::bail!("not implemented")
         }
 
@@ -827,6 +832,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             anyhow::bail!("not implemented")
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 
@@ -952,7 +961,7 @@ mod tests {
             assert_eq!(ws_read, b"written by sql".to_vec());
 
             backend
-                .write_file("/from_ws.txt", b"written by ws")
+                .write_file("/from_ws.txt", b"written by ws", None)
                 .await
                 .expect("backend write");
             let sql_read = fs9_read(vec![Value::Text("/from_ws.txt".to_string())])

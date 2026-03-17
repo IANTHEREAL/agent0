@@ -410,7 +410,8 @@ where
                         content,
                         streaming: true,
                         size,
-                        ..
+                        mode,
+                        encoding: _,
                     } => {
                         if let Err((code, msg)) = validate_path(&path) {
                             let _ =
@@ -449,6 +450,7 @@ where
                                 &path,
                                 FsWriteStreamOptions {
                                     expected_size: size,
+                                    mode: mode.map(|m| m & 0o7777),
                                 },
                             )
                             .await

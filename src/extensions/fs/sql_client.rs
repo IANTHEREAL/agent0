@@ -52,8 +52,13 @@ impl SqlFsClient {
         )
     }
 
-    pub(crate) async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
-        self.backend.write_file(path, data).await
+    pub(crate) async fn write_file(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: Option<u32>,
+    ) -> Result<usize> {
+        self.backend.write_file(path, data, mode).await
     }
 
     pub(crate) async fn write_file_at(
@@ -85,8 +90,8 @@ impl SqlFsClient {
         self.backend.stat(path).await
     }
 
-    pub(crate) async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
-        self.backend.mkdir(path, recursive).await
+    pub(crate) async fn mkdir(&self, path: &str, recursive: bool, mode: Option<u32>) -> Result<()> {
+        self.backend.mkdir(path, recursive, mode).await
     }
 
     pub(crate) async fn remove(&self, path: &str, recursive: bool) -> Result<i64> {
@@ -253,11 +258,11 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             anyhow::bail!("not implemented")
         }
 
-        async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, path: &str, data: &[u8], _mode: Option<u32>) -> Result<usize> {
             self.files.lock().unwrap().insert(
                 path.to_string(),
                 MockFile {
@@ -360,7 +365,12 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+            _mode: Option<u32>,
+        ) -> Result<FsCreateUpload> {
             anyhow::bail!("not implemented")
         }
 
@@ -395,6 +405,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             anyhow::bail!("not implemented")
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 

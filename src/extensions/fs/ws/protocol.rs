@@ -98,6 +98,8 @@ pub(crate) enum WsRequest {
         path: String,
         #[serde(default)]
         recursive: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
     },
     Unlink {
         id: String,
@@ -130,6 +132,8 @@ pub(crate) enum WsRequest {
         streaming: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         size: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
     },
     Pwrite {
         id: String,
@@ -161,6 +165,8 @@ pub(crate) enum WsRequest {
         id: String,
         path: String,
         size: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<u32>,
     },
     #[serde(rename = "presign_part")]
     PresignPart {
@@ -194,6 +200,11 @@ pub(crate) enum WsRequest {
     Readlink {
         id: String,
         path: String,
+    },
+    Chmod {
+        id: String,
+        path: String,
+        mode: u32,
     },
     /// BatchStat is a bounded helper that returns per-path results.
     ///
@@ -261,6 +272,7 @@ impl WsRequest {
             | Self::PrepareDownload { id, .. }
             | Self::Symlink { id, .. }
             | Self::Readlink { id, .. }
+            | Self::Chmod { id, .. }
             | Self::BatchStat { id, .. }
             | Self::BatchInlineRead { id, .. }
             | Self::BatchWrite { id, .. } => id,
@@ -395,6 +407,8 @@ pub(crate) struct BatchWriteFileRequest {
     pub content: String,
     #[serde(default = "default_encoding")]
     pub encoding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +646,7 @@ mod tests {
                 encoding,
                 streaming,
                 size,
+                mode,
             } => {
                 assert_eq!(id, "8");
                 assert_eq!(path, "/data/file.csv");
@@ -639,6 +654,22 @@ mod tests {
                 assert_eq!(encoding, "base64");
                 assert!(!streaming);
                 assert_eq!(size, None);
+                assert_eq!(mode, None);
+            }
+            _ => panic!("expected write request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_write_with_mode() {
+        let payload = r#"{"id":"8b","op":"write","path":"/bin/run.sh","content":"IyEvYmluL3No","encoding":"base64","mode":493}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("write+mode request should parse");
+        match req {
+            WsRequest::Write { id, path, mode, .. } => {
+                assert_eq!(id, "8b");
+                assert_eq!(path, "/bin/run.sh");
+                assert_eq!(mode, Some(0o755));
             }
             _ => panic!("expected write request"),
         }
@@ -653,10 +684,34 @@ mod tests {
                 id,
                 path,
                 recursive,
+                mode,
             } => {
                 assert_eq!(id, "4");
                 assert_eq!(path, "/data/subdir");
                 assert!(!recursive);
+                assert_eq!(mode, None);
+            }
+            _ => panic!("expected mkdir request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_mkdir_with_mode() {
+        let payload =
+            r#"{"id":"4b","op":"mkdir","path":"/data/subdir","recursive":true,"mode":493}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("mkdir+mode request should parse");
+        match req {
+            WsRequest::Mkdir {
+                id,
+                path,
+                recursive,
+                mode,
+            } => {
+                assert_eq!(id, "4b");
+                assert_eq!(path, "/data/subdir");
+                assert!(recursive);
+                assert_eq!(mode, Some(0o755));
             }
             _ => panic!("expected mkdir request"),
         }
@@ -781,10 +836,16 @@ mod tests {
         let req: WsRequest =
             serde_json::from_str(payload).expect("create_upload request should parse");
         match req {
-            WsRequest::CreateUpload { id, path, size } => {
+            WsRequest::CreateUpload {
+                id,
+                path,
+                size,
+                mode,
+            } => {
                 assert_eq!(id, "12");
                 assert_eq!(path, "/data/large.bin");
                 assert_eq!(size, 10 * 1024 * 1024);
+                assert_eq!(mode, None);
             }
             _ => panic!("expected create_upload request"),
         }
@@ -961,6 +1022,20 @@ mod tests {
                 assert_eq!(path, "/data/link");
             }
             _ => panic!("expected readlink request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_chmod() {
+        let payload = r#"{"id":"22","op":"chmod","path":"/data/script.sh","mode":493}"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("chmod request should parse");
+        match req {
+            WsRequest::Chmod { id, path, mode } => {
+                assert_eq!(id, "22");
+                assert_eq!(path, "/data/script.sh");
+                assert_eq!(mode, 0o755);
+            }
+            _ => panic!("expected chmod request"),
         }
     }
 

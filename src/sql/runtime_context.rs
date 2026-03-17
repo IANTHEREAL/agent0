@@ -189,11 +189,11 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             anyhow::bail!("not implemented")
         }
 
-        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, _path: &str, _data: &[u8], _mode: Option<u32>) -> Result<usize> {
             anyhow::bail!("not implemented")
         }
 
@@ -225,7 +225,12 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+            _mode: Option<u32>,
+        ) -> Result<FsCreateUpload> {
             anyhow::bail!("not implemented")
         }
 
@@ -260,6 +265,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             anyhow::bail!("not implemented")
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 

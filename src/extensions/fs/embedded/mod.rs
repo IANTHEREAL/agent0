@@ -148,12 +148,12 @@ impl FsBackend for EmbeddedFsBackend {
         self.pagefs.remove_recursive(path).await
     }
 
-    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
-        self.pagefs.mkdir(path, recursive).await
+    async fn mkdir(&self, path: &str, recursive: bool, mode: Option<u32>) -> Result<()> {
+        self.pagefs.mkdir(path, recursive, mode).await
     }
 
-    async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
-        self.pagefs.write_file(path, data).await
+    async fn write_file(&self, path: &str, data: &[u8], mode: Option<u32>) -> Result<usize> {
+        self.pagefs.write_file(path, data, mode).await
     }
 
     async fn batch_write(&self, files: Vec<FsBatchWriteFile>) -> Result<Vec<FsBatchWriteEntry>> {
@@ -188,8 +188,13 @@ impl FsBackend for EmbeddedFsBackend {
         self.pagefs.rename(old_path, new_path).await
     }
 
-    async fn create_upload(&self, path: &str, expected_size: u64) -> Result<FsCreateUpload> {
-        self.pagefs.create_upload(path, expected_size).await
+    async fn create_upload(
+        &self,
+        path: &str,
+        expected_size: u64,
+        mode: Option<u32>,
+    ) -> Result<FsCreateUpload> {
+        self.pagefs.create_upload(path, expected_size, mode).await
     }
 
     async fn presign_upload_part(
@@ -227,6 +232,10 @@ impl FsBackend for EmbeddedFsBackend {
 
     async fn readlink(&self, path: &str) -> Result<String> {
         self.pagefs.readlink(path).await
+    }
+
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        self.pagefs.chmod(path, mode).await
     }
 }
 

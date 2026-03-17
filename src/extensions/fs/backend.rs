@@ -33,6 +33,7 @@ pub(crate) struct FsFileInfo {
 pub(crate) struct FsBatchWriteFile {
     pub path: String,
     pub data: Vec<u8>,
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -78,6 +79,7 @@ pub(crate) fn batch_inline_read_payload_too_large_error(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FsWriteStreamOptions {
     pub expected_size: Option<u64>,
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,13 +297,13 @@ pub(crate) trait FsBackend: Send + Sync {
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>>;
     async fn remove(&self, path: &str) -> Result<()>;
     async fn remove_recursive(&self, path: &str) -> Result<u64>;
-    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()>;
-    async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize>;
+    async fn mkdir(&self, path: &str, recursive: bool, mode: Option<u32>) -> Result<()>;
+    async fn write_file(&self, path: &str, data: &[u8], mode: Option<u32>) -> Result<usize>;
     async fn batch_write(&self, files: Vec<FsBatchWriteFile>) -> Result<Vec<FsBatchWriteEntry>> {
         let mut entries = Vec::with_capacity(files.len());
         for file in files {
             let path = file.path;
-            let result = self.write_file(&path, &file.data).await;
+            let result = self.write_file(&path, &file.data, file.mode).await;
             entries.push(FsBatchWriteEntry { path, result });
         }
         Ok(entries)
@@ -316,7 +318,12 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize>;
     async fn truncate(&self, path: &str, size: u64) -> Result<()>;
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()>;
-    async fn create_upload(&self, path: &str, expected_size: u64) -> Result<FsCreateUpload>;
+    async fn create_upload(
+        &self,
+        path: &str,
+        expected_size: u64,
+        mode: Option<u32>,
+    ) -> Result<FsCreateUpload>;
     async fn presign_upload_part(
         &self,
         upload_token: &str,
@@ -332,6 +339,7 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload>;
     async fn symlink(&self, path: &str, target: &str) -> Result<()>;
     async fn readlink(&self, path: &str) -> Result<String>;
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()>;
 }
 
 pub(crate) fn is_backend_available() -> bool {
@@ -455,11 +463,11 @@ mod tests {
             unreachable!("remove_recursive is not used in these tests");
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             unreachable!("mkdir is not used in these tests");
         }
 
-        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, _path: &str, _data: &[u8], _mode: Option<u32>) -> Result<usize> {
             unreachable!("write_file is not used in these tests");
         }
 
@@ -491,7 +499,12 @@ mod tests {
             unreachable!("rename is not used in these tests");
         }
 
-        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+            _mode: Option<u32>,
+        ) -> Result<FsCreateUpload> {
             unreachable!("create_upload is not used in these tests");
         }
 
@@ -526,6 +539,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             unreachable!("readlink is not used in these tests");
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 
@@ -563,11 +580,11 @@ mod tests {
             unreachable!("remove_recursive is not used in these tests");
         }
 
-        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
             unreachable!("mkdir is not used in these tests");
         }
 
-        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+        async fn write_file(&self, _path: &str, _data: &[u8], _mode: Option<u32>) -> Result<usize> {
             unreachable!("write_file is not used in these tests");
         }
 
@@ -599,7 +616,12 @@ mod tests {
             unreachable!("rename is not used in these tests");
         }
 
-        async fn create_upload(&self, _path: &str, _expected_size: u64) -> Result<FsCreateUpload> {
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+            _mode: Option<u32>,
+        ) -> Result<FsCreateUpload> {
             unreachable!("create_upload is not used in these tests");
         }
 
@@ -634,6 +656,10 @@ mod tests {
 
         async fn readlink(&self, _path: &str) -> Result<String> {
             unreachable!("readlink is not used in these tests");
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unreachable!("chmod is not used in these tests");
         }
     }
 
