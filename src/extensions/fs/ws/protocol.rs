@@ -186,6 +186,15 @@ pub(crate) enum WsRequest {
         id: String,
         path: String,
     },
+    Symlink {
+        id: String,
+        path: String,
+        target: String,
+    },
+    Readlink {
+        id: String,
+        path: String,
+    },
     /// BatchStat is a bounded helper that returns per-path results.
     ///
     /// The top-level WS response `ok` only indicates request-level parsing/validation success.
@@ -250,6 +259,8 @@ impl WsRequest {
             | Self::CompleteUpload { id, .. }
             | Self::AbortUpload { id, .. }
             | Self::PrepareDownload { id, .. }
+            | Self::Symlink { id, .. }
+            | Self::Readlink { id, .. }
             | Self::BatchStat { id, .. }
             | Self::BatchInlineRead { id, .. }
             | Self::BatchWrite { id, .. } => id,
@@ -333,7 +344,9 @@ impl From<FsFileInfo> for FileInfoResponse {
     fn from(value: FsFileInfo) -> Self {
         Self {
             path: value.path,
-            file_type: if value.is_dir {
+            file_type: if value.is_symlink {
+                "symlink".to_string()
+            } else if value.is_dir {
                 "dir".to_string()
             } else {
                 "file".to_string()
@@ -922,5 +935,50 @@ mod tests {
         assert!(result.is_err());
         let (code, _) = result.expect_err("empty path must fail");
         assert_eq!(code, WsErrorCode::Einval);
+    }
+
+    #[test]
+    fn test_request_deserialize_symlink() {
+        let payload = r#"{"id":"20","op":"symlink","path":"/data/link","target":"/data/real.txt"}"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("symlink request should parse");
+        match req {
+            WsRequest::Symlink { id, path, target } => {
+                assert_eq!(id, "20");
+                assert_eq!(path, "/data/link");
+                assert_eq!(target, "/data/real.txt");
+            }
+            _ => panic!("expected symlink request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_readlink() {
+        let payload = r#"{"id":"21","op":"readlink","path":"/data/link"}"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("readlink request should parse");
+        match req {
+            WsRequest::Readlink { id, path } => {
+                assert_eq!(id, "21");
+                assert_eq!(path, "/data/link");
+            }
+            _ => panic!("expected readlink request"),
+        }
+    }
+
+    #[test]
+    fn test_file_info_from_symlink() {
+        let src = FsFileInfo {
+            path: "/data/link".to_string(),
+            is_dir: false,
+            is_symlink: true,
+            size: 15,
+            mode: 0o777,
+            mtime: 0,
+            storage: None,
+            sealed: Some(false),
+        };
+
+        let dst = FileInfoResponse::from(src);
+        assert_eq!(dst.file_type, "symlink");
+        assert_eq!(dst.size, 15);
     }
 }

@@ -387,6 +387,14 @@ mod tests {
         ) -> Result<crate::extensions::fs::backend::FsPreparedDownload> {
             anyhow::bail!("not implemented for test backend")
         }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            anyhow::bail!("not implemented for test backend")
+        }
     }
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);

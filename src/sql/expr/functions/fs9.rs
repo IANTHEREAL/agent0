@@ -820,6 +820,14 @@ mod tests {
         async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
             anyhow::bail!("not implemented")
         }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            anyhow::bail!("not implemented")
+        }
     }
 
     fn normalize_mock_path(path: &str) -> String {

@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) const PAGE_SIZE: usize = 16 * 1024;
 pub(crate) const ROOT_INODE: u64 = 1;
 pub(crate) const FS9_STORAGE_FORMAT_VERSION: u32 = 4;
+pub(crate) const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ObjectStoreBinding {
@@ -63,6 +64,7 @@ impl Default for Superblock {
 pub(crate) enum InodeType {
     File,
     Directory,
+    Symlink,
 }
 
 /// Durable reference to where file content is stored.
@@ -158,8 +160,31 @@ impl Inode {
         }
     }
 
+    pub(crate) fn new_symlink(id: u64, mode: u32, target_len: u64) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        Self {
+            id,
+            inode_type: InodeType::Symlink,
+            mode,
+            size: target_len,
+            generation: 1,
+            data: DataRef::InlineBlob,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            nlink: 1,
+        }
+    }
+
     pub(crate) fn is_directory(&self) -> bool {
         self.inode_type == InodeType::Directory
+    }
+
+    pub(crate) fn is_symlink(&self) -> bool {
+        self.inode_type == InodeType::Symlink
     }
 
     pub(crate) fn touch_mtime(&mut self) {
@@ -305,6 +330,31 @@ mod tests {
     }
 
     #[test]
+    fn inode_new_symlink_initializes_expected_fields() {
+        let inode = Inode::new_symlink(99, 0o777, 12);
+        assert_eq!(inode.id, 99);
+        assert_eq!(inode.inode_type, InodeType::Symlink);
+        assert_eq!(inode.mode, 0o777);
+        assert_eq!(inode.size, 12);
+        assert_eq!(inode.generation, 1);
+        assert_eq!(inode.data, DataRef::InlineBlob);
+        assert_eq!(inode.nlink, 1);
+        assert!(inode.is_symlink());
+        assert!(!inode.is_directory());
+        assert!(inode.atime > 0);
+        assert!(inode.mtime > 0);
+        assert!(inode.ctime > 0);
+    }
+
+    #[test]
+    fn inode_is_symlink_returns_false_for_non_symlinks() {
+        let file = Inode::new_file(1, 0o644);
+        assert!(!file.is_symlink());
+        let dir = Inode::new_directory(2, 0o755);
+        assert!(!dir.is_symlink());
+    }
+
+    #[test]
     fn touch_methods_update_timestamps() {
         let mut inode = Inode::new_file(1, 0o600);
 
@@ -353,6 +403,16 @@ mod tests {
             e.to_string(),
             "embedded_fs: RestartRequired: restart db9-server"
         );
+    }
+
+    #[test]
+    fn inode_symlink_json_round_trip() {
+        let inode = Inode::new_symlink(42, 0o777, 15);
+        let json = serde_json::to_string(&inode).expect("symlink inode must serialize");
+        let restored: Inode = serde_json::from_str(&json).expect("symlink inode must round-trip");
+        assert_eq!(restored.inode_type, InodeType::Symlink);
+        assert_eq!(restored.size, 15);
+        assert_eq!(restored.data, DataRef::InlineBlob);
     }
 
     #[test]

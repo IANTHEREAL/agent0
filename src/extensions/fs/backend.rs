@@ -247,6 +247,13 @@ pub(crate) trait FsBackend: Send + Sync {
                         continue;
                     }
 
+                    if info.is_symlink {
+                        entries[idx] = Some(Err(anyhow!(EmbeddedFsError::InvalidInput(
+                            "cannot read symlink as file; use readlink".to_string(),
+                        ))));
+                        continue;
+                    }
+
                     if info.size > max_file_bytes as u64 {
                         entries[idx] = Some(Err(batch_inline_read_entry_too_large_error(
                             info.size,
@@ -323,6 +330,8 @@ pub(crate) trait FsBackend: Send + Sync {
     ) -> Result<usize>;
     async fn abort_upload(&self, upload_token: &str) -> Result<()>;
     async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload>;
+    async fn symlink(&self, path: &str, target: &str) -> Result<()>;
+    async fn readlink(&self, path: &str) -> Result<String>;
 }
 
 pub(crate) fn is_backend_available() -> bool {
@@ -510,6 +519,14 @@ mod tests {
         async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
             unreachable!("prepare_download is not used in these tests");
         }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            unreachable!("symlink is not used in these tests");
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            unreachable!("readlink is not used in these tests");
+        }
     }
 
     #[async_trait]
@@ -609,6 +626,14 @@ mod tests {
 
         async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
             unreachable!("prepare_download is not used in these tests");
+        }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            unreachable!("symlink is not used in these tests");
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            unreachable!("readlink is not used in these tests");
         }
     }
 
@@ -732,6 +757,61 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("NotFound"));
+    }
+
+    #[tokio::test]
+    async fn default_batch_inline_read_rejects_symlink_entries() {
+        let backend = BatchInlineReadTestBackend::new(
+            HashMap::from([
+                (
+                    "/link".to_string(),
+                    Ok(FsFileInfo {
+                        path: "/link".to_string(),
+                        is_dir: false,
+                        is_symlink: true,
+                        size: 11,
+                        mode: 0o777,
+                        mtime: 0,
+                        storage: None,
+                        sealed: Some(false),
+                    }),
+                ),
+                (
+                    "/ok".to_string(),
+                    Ok(FsFileInfo {
+                        path: "/ok".to_string(),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: 5,
+                        mode: 0o644,
+                        mtime: 0,
+                        storage: Some(FsStorage::Inline),
+                        sealed: Some(false),
+                    }),
+                ),
+            ]),
+            HashMap::from([
+                ("/link".to_string(), Ok(b"target-path".to_vec())),
+                ("/ok".to_string(), Ok(b"hello".to_vec())),
+            ]),
+        );
+
+        let results = backend
+            .batch_inline_read(&["/link".to_string(), "/ok".to_string()], 32, 64)
+            .await
+            .expect("batch_inline_read should succeed with per-entry errors");
+
+        assert_eq!(results.len(), 2);
+        let symlink_err = results[0]
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("symlink entry should remain a typed error");
+        assert!(matches!(
+            symlink_err,
+            EmbeddedFsError::InvalidInput(msg) if msg == "cannot read symlink as file; use readlink"
+        ));
+        assert_eq!(results[1].as_ref().unwrap(), b"hello");
     }
 
     #[tokio::test]

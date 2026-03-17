@@ -969,6 +969,14 @@ mod tests {
         ) -> Result<crate::extensions::fs::backend::FsPreparedDownload> {
             anyhow::bail!("not implemented for test backend")
         }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            anyhow::bail!("not implemented for test backend")
+        }
     }
 
     #[async_trait]
@@ -1107,6 +1115,14 @@ mod tests {
             _path: &str,
         ) -> Result<crate::extensions::fs::backend::FsPreparedDownload> {
             unreachable!("prepare_download is not used in this test");
+        }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            unreachable!("symlink is not used in this test");
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            unreachable!("readlink is not used in this test");
         }
     }
 

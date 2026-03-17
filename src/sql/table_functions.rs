@@ -419,6 +419,12 @@ pub(crate) async fn infer_fs9_table_function_schema(
         async fn rename(&self, _old_path: &str, _new_path: &str) -> AnyResult<()> {
             anyhow::bail!("not implemented for test backend")
         }
+        async fn symlink(&self, _path: &str, _target: &str) -> AnyResult<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+        async fn readlink(&self, _path: &str) -> AnyResult<String> {
+            anyhow::bail!("not implemented for test backend")
+        }
     }
 
     let backend: Box<dyn crate::extensions::fs::backend::FsBackend> = Box::new(TestLocalBackend);

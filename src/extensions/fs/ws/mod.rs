@@ -712,6 +712,19 @@ async fn handle_ws_read_tx(
         return Ok(());
     }
 
+    if file_info.is_symlink {
+        send_response_tx(
+            out_tx,
+            &WsResponse::error(
+                id,
+                WsErrorCode::Einval,
+                format!("cannot read symlink as file; use readlink: {path}"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let actual_size = match compute_read_size(id, file_info.size, offset, length) {
         Ok(size) => size,
         Err(resp) => {

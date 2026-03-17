@@ -114,6 +114,8 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             handle_abort_upload(session, id, upload_token).await
         }
         WsRequest::PrepareDownload { id, path } => handle_prepare_download(session, id, path).await,
+        WsRequest::Symlink { id, path, target } => handle_symlink(session, id, path, target).await,
+        WsRequest::Readlink { id, path } => handle_readlink(session, id, path).await,
         WsRequest::BatchStat { id, paths } => handle_batch_stat(session, id, paths).await,
         WsRequest::BatchInlineRead { id, paths } => {
             handle_batch_inline_read(session, id, paths).await
@@ -238,6 +240,46 @@ async fn handle_mkdir(session: &WsSession, id: &str, path: &str, recursive: bool
     let result = session.backend.mkdir(path, recursive).await;
     match result {
         Ok(()) => WsResponse::success_empty(id),
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            WsResponse::error(id, code, msg)
+        }
+    }
+}
+
+async fn handle_symlink(session: &WsSession, id: &str, path: &str, target: &str) -> WsResponse {
+    if let Err((code, msg)) = validate_path(path) {
+        return WsResponse::error(id, code, msg);
+    }
+    if target.is_empty() {
+        return WsResponse::error(id, WsErrorCode::Einval, "symlink target must not be empty");
+    }
+    if target.contains('\0') {
+        return WsResponse::error(
+            id,
+            WsErrorCode::Einval,
+            "symlink target must not contain NUL bytes",
+        );
+    }
+
+    let result = session.backend.symlink(path, target).await;
+    match result {
+        Ok(()) => WsResponse::success_empty(id),
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            WsResponse::error(id, code, msg)
+        }
+    }
+}
+
+async fn handle_readlink(session: &WsSession, id: &str, path: &str) -> WsResponse {
+    if let Err((code, msg)) = validate_path(path) {
+        return WsResponse::error(id, code, msg);
+    }
+
+    let result = session.backend.readlink(path).await;
+    match result {
+        Ok(target) => WsResponse::success(id, json!({ "target": target })),
         Err(err) => {
             let (code, msg) = map_fs_error(&err);
             WsResponse::error(id, code, msg)

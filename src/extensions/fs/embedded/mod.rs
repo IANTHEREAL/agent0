@@ -220,10 +220,19 @@ impl FsBackend for EmbeddedFsBackend {
     async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload> {
         self.pagefs.prepare_download(path).await
     }
+
+    async fn symlink(&self, path: &str, target: &str) -> Result<()> {
+        self.pagefs.symlink(path, target).await
+    }
+
+    async fn readlink(&self, path: &str) -> Result<String> {
+        self.pagefs.readlink(path).await
+    }
 }
 
 fn inode_to_file_info(path: &str, inode: &Inode) -> Result<FsFileInfo> {
-    let (storage, sealed) = if inode.inode_type == InodeType::Directory {
+    let is_symlink = inode.inode_type == InodeType::Symlink;
+    let (storage, sealed) = if inode.inode_type == InodeType::Directory || is_symlink {
         (None, Some(false))
     } else {
         match &inode.data {
@@ -242,7 +251,7 @@ fn inode_to_file_info(path: &str, inode: &Inode) -> Result<FsFileInfo> {
     Ok(FsFileInfo {
         path: path.to_string(),
         is_dir: inode.inode_type == InodeType::Directory,
-        is_symlink: false,
+        is_symlink,
         size: inode.size,
         mode: inode.mode,
         mtime: inode.mtime as u64,

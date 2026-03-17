@@ -1038,6 +1038,11 @@ impl EmbeddedPageFs {
                 if existing_inode.is_directory() {
                     return Err(anyhow!(EmbeddedFsError::is_directory(&file.path)));
                 }
+                if existing_inode.is_symlink() {
+                    return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                        "cannot write to symlink as file; use readlink".to_string()
+                    )));
+                }
 
                 publish_generation = existing_inode.generation.checked_add(1).ok_or_else(|| {
                     anyhow!(EmbeddedFsError::internal("inode generation overflow"))
@@ -2056,6 +2061,13 @@ impl EmbeddedPageFs {
                 continue;
             }
 
+            if inode.is_symlink() {
+                results[idx] = Some(Err(anyhow!(EmbeddedFsError::InvalidInput(
+                    "cannot read symlink as file; use readlink".to_string()
+                ))));
+                continue;
+            }
+
             if inode.size > max_file_bytes as u64 {
                 results[idx] = Some(Err(batch_inline_read_entry_too_large_error(
                     inode.size,
@@ -2400,6 +2412,11 @@ impl EmbeddedPageFs {
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
         }
+        if inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "cannot read symlink as file; use readlink".to_string()
+            )));
+        }
 
         let file_len = usize::try_from(inode.size).map_err(|_| {
             anyhow!(EmbeddedFsError::internal(
@@ -2481,6 +2498,11 @@ impl EmbeddedPageFs {
     ) -> Result<FileRangeReadPlan> {
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+        if inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "cannot read symlink as file; use readlink".to_string()
+            )));
         }
 
         if offset >= inode.size || length == 0 {
@@ -2607,6 +2629,11 @@ impl EmbeddedPageFs {
         let (inode_id, inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+        if inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "cannot read symlink as file; use readlink".to_string()
+            )));
         }
 
         let file_len = usize::try_from(inode.size).map_err(|_| {
@@ -3100,12 +3127,18 @@ impl EmbeddedPageFs {
         path: &str,
         opts: FsWriteStreamOptions,
     ) -> Result<Box<dyn FsWriteStream>> {
-        // Validate early that the target is not a directory.
+        // Validate early that the target is not a directory or symlink.
         let mut check_txn = self.begin().await?;
         match resolve_path(&mut check_txn, path).await {
             Ok((_, inode)) if inode.is_directory() => {
                 let _ = check_txn.rollback().await;
                 return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+            }
+            Ok((_, inode)) if inode.is_symlink() => {
+                let _ = check_txn.rollback().await;
+                return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                    "cannot write to symlink as file; use readlink".to_string()
+                )));
             }
             Ok(_) => {}
             Err(err) if !is_not_found_error(&err) => {
@@ -3294,6 +3327,11 @@ impl EmbeddedPageFs {
                     Ok((inode_id, inode)) => {
                         if inode.is_directory() {
                             return Err(anyhow!(EmbeddedFsError::is_directory(&normalized)));
+                        }
+                        if inode.is_symlink() {
+                            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                                "cannot write to symlink as file; use readlink".to_string()
+                            )));
                         }
                         (Some(inode_id), Some(inode.generation))
                     }
@@ -3540,6 +3578,12 @@ impl EmbeddedPageFs {
                 return Err(anyhow!(EmbeddedFsError::is_directory(&normalized)));
             }
 
+            if inode.is_symlink() {
+                return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                    "cannot download symlink; use readlink".to_string()
+                )));
+            }
+
             let (key, storage) = match &inode.data {
                 DataRef::Object { key, .. } => (key.clone(), FsStorage::Object),
                 _ => {
@@ -3620,6 +3664,11 @@ impl EmbeddedPageFs {
         let (inode_id, mut inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+        if inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "cannot truncate symlink; use readlink".to_string()
+            )));
         }
         if matches!(
             inode.data,
@@ -4098,6 +4147,12 @@ impl EmbeddedPageFs {
                     return Err(anyhow!(EmbeddedFsError::is_directory(path)));
                 }
 
+                if existing_inode.is_symlink() {
+                    return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                        "cannot write to symlink as file; use readlink".to_string()
+                    )));
+                }
+
                 publish_generation = existing_inode.generation.checked_add(1).ok_or_else(|| {
                     anyhow!(EmbeddedFsError::internal("inode generation overflow"))
                 })?;
@@ -4405,6 +4460,78 @@ impl EmbeddedPageFs {
             }
         });
     }
+
+    pub(crate) async fn symlink(&self, path: &str, target: &str) -> Result<()> {
+        if target.is_empty() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "symlink target must not be empty".to_string()
+            )));
+        }
+        if target.contains('\0') {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "symlink target must not contain NUL bytes".to_string()
+            )));
+        }
+        if target.len() > MAX_SYMLINK_TARGET_BYTES {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
+                "symlink target exceeds maximum length of {} bytes",
+                MAX_SYMLINK_TARGET_BYTES
+            ))));
+        }
+
+        let normalized = normalize_path(path);
+        let attempts = fs9_config().tikv_commit_retry_attempts.max(1);
+        for attempt in 0..attempts {
+            let mut txn = self.begin().await?;
+            let result: Result<()> = async {
+                let (parent_inode, name) = resolve_parent(&mut txn, &normalized).await?;
+                if lookup(&mut txn, parent_inode, &name).await?.is_some() {
+                    return Err(anyhow!(EmbeddedFsError::already_exists(&normalized)));
+                }
+
+                let new_inode_id = self.alloc_inode_id().await?;
+                let inode = Inode::new_symlink(new_inode_id, 0o777, target.len() as u64);
+                save_inode(&mut txn, &inode).await?;
+                txn.put(keys::blob_key(new_inode_id), target.as_bytes().to_vec())
+                    .await?;
+                link(&mut txn, parent_inode, &name, new_inode_id).await?;
+                txn.commit().await?;
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < attempts => {
+                    fs9_commit_backoff(attempt).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(anyhow!(EmbeddedFsError::internal(
+            "symlink retry exhausted"
+        )))
+    }
+
+    pub(crate) async fn readlink(&self, path: &str) -> Result<String> {
+        let mut txn = self.begin_read().await?;
+        let (_inode_id, inode) = resolve_path(&mut txn, path).await?;
+        if !inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
+                "not a symlink: {path}"
+            ))));
+        }
+        let blob = txn
+            .get(keys::blob_key(inode.id))
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("symlink target blob missing")))?;
+        String::from_utf8(blob).map_err(|_| {
+            anyhow!(EmbeddedFsError::internal(
+                "symlink target is not valid UTF-8"
+            ))
+        })
+    }
 }
 
 async fn prepare_replace_file_txn(
@@ -4421,6 +4548,11 @@ async fn prepare_replace_file_txn(
 
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+        if inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "cannot write to symlink as file; use readlink".to_string()
+            )));
         }
 
         retire_inode_data_ref(
@@ -4456,6 +4588,11 @@ async fn prepare_write_at_file_txn(
 
         if inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+        if inode.is_symlink() {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                "cannot write to symlink as file; use readlink".to_string()
+            )));
         }
 
         Ok((existing_inode_id, inode))
@@ -7669,26 +7806,22 @@ mod tests {
         format!("fs9_behavioral_{}_{}", std::process::id(), seq)
     }
 
-    async fn ensure_behavioral_test_keyspace(pd: &str, keyspace: &str) {
+    async fn ensure_behavioral_test_keyspace(pd_addrs: &[String], keyspace: &str) {
         if std::env::var("TIKV_CA_PATH").is_ok() {
             return;
         }
 
-        let pd_primary = pd
-            .split(',')
-            .next()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .expect("PD_ENDPOINTS must include at least one endpoint");
-        let base = format!("http://{}/pd/api/v2/keyspaces", pd_primary);
-        let keyspace_url = format!("{}/{}", base, keyspace);
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("failed to build PD HTTP client for behavioral tests");
 
         let mut last_err = String::new();
-        for _ in 0..15 {
+        for attempt in 0..15 {
+            let pd = &pd_addrs[attempt % pd_addrs.len()];
+            let base = format!("http://{}/pd/api/v2/keyspaces", pd);
+            let keyspace_url = format!("{}/{}", base, keyspace);
+
             if let Ok(resp) = client
                 .post(&base)
                 .json(&serde_json::json!({ "name": keyspace }))
@@ -7706,10 +7839,14 @@ mod tests {
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    last_err = format!("verify keyspace status={}, body={}", status.as_u16(), body);
+                    last_err = format!(
+                        "verify keyspace via {pd} status={}, body={}",
+                        status.as_u16(),
+                        body
+                    );
                 }
                 Err(err) => {
-                    last_err = format!("verify keyspace error: {err}");
+                    last_err = format!("verify keyspace via {pd} error: {err}");
                 }
             }
 
@@ -7717,17 +7854,24 @@ mod tests {
         }
 
         panic!(
-            "unable to provision behavioral fs9 keyspace '{}' via {}: {}",
-            keyspace, pd_primary, last_err
+            "unable to provision behavioral fs9 keyspace '{}' via {:?}: {}",
+            keyspace, pd_addrs, last_err
         );
     }
 
-    async fn make_fs() -> EmbeddedPageFs {
-        let pd = std::env::var("PD_ENDPOINTS").unwrap_or("127.0.0.1:2379".into());
-        let keyspace = behavioral_test_keyspace();
-        ensure_behavioral_test_keyspace(&pd, &keyspace).await;
-        let config = tikv_client::Config::default().with_keyspace(&keyspace);
-        let client = TransactionClient::new_with_config(vec![pd], config)
+    async fn make_fs_for_keyspace(keyspace: String) -> EmbeddedPageFs {
+        let pd_raw = std::env::var("PD_ENDPOINTS").unwrap_or("127.0.0.1:2379".into());
+        let pd_addrs: Vec<String> = pd_raw.split(',').map(|s| s.trim().to_string()).collect();
+        ensure_behavioral_test_keyspace(&pd_addrs, &keyspace).await;
+        let mut config = tikv_client::Config::default().with_keyspace(&keyspace);
+        if let (Ok(ca), Ok(cert), Ok(key)) = (
+            std::env::var("TIKV_CA_PATH"),
+            std::env::var("TIKV_CERT_PATH"),
+            std::env::var("TIKV_KEY_PATH"),
+        ) {
+            config = config.with_security(ca, cert, key);
+        }
+        let client = TransactionClient::new_with_config(pd_addrs, config)
             .await
             .expect("TiKV connection required for behavioral tests");
         let client = Arc::new(client);
@@ -7737,6 +7881,10 @@ mod tests {
         let fs = EmbeddedPageFs::new(client, keyspace, &superblock);
         fs.init_filesystem().await.expect("init_filesystem");
         fs
+    }
+
+    async fn make_fs() -> EmbeddedPageFs {
+        make_fs_for_keyspace(behavioral_test_keyspace()).await
     }
 
     /// Helper: ensure directory exists (idempotent).
@@ -8761,6 +8909,72 @@ mod tests {
         assert_eq!(fs.read_file(path).await.unwrap(), data);
 
         cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_symlink_behavioral_persists_across_reopen_and_preserves_rename_unlink_semantics()
+    {
+        let fs = make_fs().await;
+        let keyspace = fs.keyspace.clone();
+        let base = "/test_symlink_reopen_round_trip";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let target = format!("{base}/target.txt");
+        let link = format!("{base}/link");
+        let renamed = format!("{base}/link-renamed");
+        fs.write_file(&target, b"payload").await.unwrap();
+        fs.symlink(&link, &target).await.unwrap();
+
+        let inode = fs.stat(&link).await.unwrap();
+        assert!(inode.is_symlink(), "newly created inode must be a symlink");
+        assert_eq!(inode.size, target.len() as u64);
+        assert_eq!(fs.readlink(&link).await.unwrap(), target);
+
+        let reopened = make_fs_for_keyspace(keyspace).await;
+        let reopened_inode = reopened.stat(&link).await.unwrap();
+        assert!(
+            reopened_inode.is_symlink(),
+            "reopened filesystem must preserve symlink type"
+        );
+        assert_eq!(
+            reopened.readlink(&link).await.unwrap(),
+            target,
+            "reopened filesystem must preserve symlink target"
+        );
+
+        reopened.rename(&link, &renamed).await.unwrap();
+        assert_eq!(
+            reopened.readlink(&renamed).await.unwrap(),
+            target,
+            "rename must move the symlink itself, not rewrite its target"
+        );
+        let missing = reopened.stat(&link).await.unwrap_err();
+        assert!(
+            matches!(
+                missing.downcast_ref::<EmbeddedFsError>(),
+                Some(EmbeddedFsError::NotFound(_))
+            ),
+            "old path must be gone after rename: {missing}"
+        );
+
+        reopened.remove(&renamed).await.unwrap();
+        assert_eq!(
+            reopened.read_file(&target).await.unwrap(),
+            b"payload",
+            "unlinking a symlink must not remove the target file"
+        );
+        let removed = reopened.readlink(&renamed).await.unwrap_err();
+        assert!(
+            matches!(
+                removed.downcast_ref::<EmbeddedFsError>(),
+                Some(EmbeddedFsError::NotFound(_))
+            ),
+            "removed symlink path must be gone: {removed}"
+        );
+
+        cleanup(&reopened, base).await;
     }
 
     #[tokio::test]

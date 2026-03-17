@@ -87,7 +87,16 @@ pub(crate) fn decode_directory(entries: Vec<FsFileInfo>) -> DecodedRows {
 
             Row::new(vec![
                 Value::Text(entry.path),
-                Value::Text(if entry.is_dir { "dir" } else { "file" }.to_string()),
+                Value::Text(
+                    if entry.is_symlink {
+                        "symlink"
+                    } else if entry.is_dir {
+                        "dir"
+                    } else {
+                        "file"
+                    }
+                    .to_string(),
+                ),
                 Value::Int64(entry.size as i64),
                 Value::Int64(entry.mode as i64),
                 Value::Text(mtime),
@@ -467,6 +476,26 @@ mod tests {
         assert_eq!(decoded.rows.len(), 2);
         assert_eq!(decoded.rows[0].values[1], Value::Text("file".to_string()));
         assert_eq!(decoded.rows[1].values[1], Value::Text("dir".to_string()));
+    }
+
+    #[test]
+    fn test_decode_directory_emits_symlink_type() {
+        let decoded = decode_directory(vec![FsFileInfo {
+            path: "/tmp/link".to_string(),
+            is_dir: false,
+            is_symlink: true,
+            size: 15,
+            mode: 0o777,
+            mtime: 1705312200,
+            storage: None,
+            sealed: Some(false),
+        }]);
+
+        assert_eq!(decoded.rows.len(), 1);
+        assert_eq!(
+            decoded.rows[0].values[1],
+            Value::Text("symlink".to_string())
+        );
     }
 
     #[test]
