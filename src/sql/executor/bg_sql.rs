@@ -8,7 +8,9 @@ use tikv_client::Transaction;
 
 pub(crate) fn is_bg_sql_function(func_name: &str) -> bool {
     let upper = func_name.to_uppercase();
-    upper == "PG_BACKGROUND_LAUNCH" || upper == "PG_BACKGROUND_RESULT"
+    upper == "PG_BACKGROUND_LAUNCH"
+        || upper == "PG_BACKGROUND_RESULT"
+        || upper == "DB9_REFRESH_STORAGE_STATS"
 }
 
 pub(crate) fn try_execute_bg_sql_function(
@@ -22,6 +24,9 @@ pub(crate) fn try_execute_bg_sql_function(
         ))),
         "PG_BACKGROUND_RESULT" => Some(Err(anyhow!(
             "pg_background_result must be evaluated during execution"
+        ))),
+        "DB9_REFRESH_STORAGE_STATS" => Some(Err(anyhow!(
+            "db9_refresh_storage_stats must be evaluated during execution"
         ))),
         _ => None,
     }
@@ -42,6 +47,9 @@ pub(crate) async fn execute_bg_sql_function(
             Some(execute_bg_launch(db_id, current_user, keyspace, args).await)
         }
         "PG_BACKGROUND_RESULT" => Some(execute_bg_result(keyspace, db_id, args).await),
+        "DB9_REFRESH_STORAGE_STATS" => {
+            Some(execute_refresh_storage_stats(db_id, current_user, keyspace).await)
+        }
         _ => None,
     }
 }
@@ -96,6 +104,25 @@ async fn execute_bg_launch(
     Ok(Value::Int64(task_id))
 }
 
+async fn execute_refresh_storage_stats(
+    db_id: u64,
+    current_user: &str,
+    keyspace: &str,
+) -> Result<Value> {
+    if current_user != "admin" {
+        return Err(anyhow!(
+            "db9_refresh_storage_stats: permission denied (superuser required)"
+        ));
+    }
+
+    let system_store = get_system_store()
+        .ok_or_else(|| anyhow!("db9_refresh_storage_stats: worker engine not available"))?;
+
+    crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
+
+    Ok(Value::Text("storage scan enqueued".to_string()))
+}
+
 async fn execute_bg_result(keyspace: &str, db_id: u64, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(anyhow!(
@@ -144,6 +171,8 @@ mod tests {
     fn is_bg_sql_function_is_case_insensitive() {
         assert!(is_bg_sql_function("pg_background_launch"));
         assert!(is_bg_sql_function("PG_BACKGROUND_RESULT"));
+        assert!(is_bg_sql_function("db9_refresh_storage_stats"));
+        assert!(is_bg_sql_function("DB9_REFRESH_STORAGE_STATS"));
         assert!(!is_bg_sql_function("pg_sleep"));
     }
 
@@ -224,6 +253,24 @@ mod tests {
     /// task_id is now sourced from TiKV CAS counter (not timestamp), so no inline
     /// timestamp fallback exists. The launch path errors at system_store acquisition,
     /// confirming the CAS allocator is the sole task_id source.
+    #[tokio::test]
+    async fn execute_refresh_storage_stats_requires_superuser() {
+        let err = execute_refresh_storage_stats(1, "regular_user", "ks")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn execute_refresh_storage_stats_requires_worker_engine() {
+        let err = execute_refresh_storage_stats(1, "admin", "ks")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worker engine not available"));
+    }
+
     #[tokio::test]
     async fn execute_bg_launch_uses_system_store_for_task_id() {
         let err = execute_bg_launch(1, "u", "ks", &[Value::Text("select 1".to_string())])

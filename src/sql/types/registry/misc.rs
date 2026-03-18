@@ -139,6 +139,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "PG_BACKGROUND_RESULT",
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
     );
+    r.register(
+        "DB9_REFRESH_STORAGE_STATS",
+        FunctionSignature::fixed(DataType::Text).with_args(0, Some(0)),
+    );
 
     // Full-text search functions
     r.register(
