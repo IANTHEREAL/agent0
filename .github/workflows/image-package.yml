@@ -18,6 +18,11 @@ on:
       - '.github/workflows/governance-lint.yml'
       - '.github/workflows/doc-*.yml'
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Optional source ref/SHA to package (default: workflow ref SHA)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -43,31 +48,41 @@ jobs:
       AWS_ROLE_TO_ASSUME: ${{ vars.DB9_SERVER_IMAGE_PACKAGE_ROLE_ARN }}
     steps:
       - name: Reject manual dispatches from non-master refs
-        if: github.event_name == 'workflow_dispatch' && github.ref_name != 'master'
+        if: github.event_name == 'workflow_dispatch' && github.ref_name != 'master' && github.event.inputs.source_ref == ''
         run: |
-          echo "::error::Server image packaging always runs against master. Re-run workflow_dispatch from master."
+          echo "::error::Non-master workflow_dispatch requires inputs.source_ref."
           echo "## Server Image Package" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Workflow ref**: ${GITHUB_REF}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Result**: rejected because workflow_dispatch was not started from master" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Result**: rejected because non-master workflow_dispatch did not provide source_ref" >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
       - name: Checkout source payload
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref != '' && github.event.inputs.source_ref || github.sha }}
           fetch-depth: 0
 
       - name: Resolve packaging metadata
         id: meta
         shell: bash
+        env:
+          REQUESTED_SOURCE_REF: ${{ github.event.inputs.source_ref }}
         run: |
           set -euo pipefail
 
-          SOURCE_BRANCH="master"
-          SOURCE_REF="refs/heads/${SOURCE_BRANCH}"
           SOURCE_SHA="$(git rev-parse HEAD)"
           SOURCE_SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          if [[ -n "${REQUESTED_SOURCE_REF:-}" ]]; then
+            SOURCE_REF="${REQUESTED_SOURCE_REF}"
+          else
+            SOURCE_REF="${GITHUB_REF}"
+          fi
+
+          SOURCE_BRANCH="${SOURCE_REF#refs/heads/}"
+          if [[ "${SOURCE_BRANCH}" == "${SOURCE_REF}" ]]; then
+            SOURCE_BRANCH="detached"
+          fi
           IMAGE_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
           IMAGE_TAG="sha-${SOURCE_SHORT_SHA}"
           IMAGE_REF_TAG="${IMAGE_REPOSITORY}:${IMAGE_TAG}"

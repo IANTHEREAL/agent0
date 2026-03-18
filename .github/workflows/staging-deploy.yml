@@ -7,6 +7,27 @@ on:
       - Server Image Package
     types:
       - completed
+  workflow_dispatch:
+    inputs:
+      image_ref_digest:
+        description: "Server image digest ref (ECR@sha256:...)"
+        required: true
+        type: string
+      source_sha:
+        description: "Optional source SHA for summary"
+        required: false
+        default: ""
+        type: string
+      cluster_name:
+        description: "EKS cluster name"
+        required: true
+        default: "staging-us-west-2-f02"
+        type: string
+      rollout_timeout_minutes:
+        description: "Rollout timeout (minutes)"
+        required: true
+        default: "10"
+        type: string
 
 permissions:
   actions: read
@@ -215,6 +236,109 @@ jobs:
             echo "- **Rolled Back Image**: ${{ steps.rollback.outputs.rolled_back_image }}"
             echo "- **Health Gate**: kubectl rollout status only"
             echo "- **Cluster**: ${EKS_CLUSTER_NAME}"
+            echo "- **Namespace**: ${K8S_NAMESPACE}"
+            echo "- **Deployment**: ${K8S_DEPLOYMENT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-manual:
+    name: Deploy server to shared staging [manual]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      AWS_ROLE_TO_ASSUME: ${{ vars.DB9_SERVER_IMAGE_PACKAGE_ROLE_ARN }}
+      MANUAL_IMAGE_REF_DIGEST: ${{ github.event.inputs.image_ref_digest }}
+    steps:
+      - name: Validate AWS role configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${AWS_ROLE_TO_ASSUME}" ]]; then
+            echo "::error::Repository variable DB9_SERVER_IMAGE_PACKAGE_ROLE_ARN must be set for staging-deploy.yml"
+            exit 1
+          fi
+
+      - name: Validate manual digest input
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_PREFIX="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}@sha256:"
+          [[ "${MANUAL_IMAGE_REF_DIGEST}" == ${EXPECTED_PREFIX}* ]] || {
+            echo "::error::image_ref_digest must start with ${EXPECTED_PREFIX}"
+            exit 1
+          }
+          [[ "${MANUAL_IMAGE_REF_DIGEST}" =~ ^[a-z0-9./:-]+@sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::invalid digest ref: ${MANUAL_IMAGE_REF_DIGEST}"
+            exit 1
+          }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: db9-server-staging-deploy-manual
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig for staging EKS
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "${{ github.event.inputs.cluster_name }}" --region "${AWS_REGION}"
+          kubectl config current-context
+
+      - name: Capture current shared staging image
+        id: current
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREV_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          echo "previous_image=${PREV_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Roll out manual image to shared staging
+        id: rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "${K8S_NAMESPACE}" set image "deployment/${K8S_DEPLOYMENT}" "${K8S_CONTAINER}=${MANUAL_IMAGE_REF_DIGEST}"
+          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout="${{ github.event.inputs.rollout_timeout_minutes }}m"
+          DEPLOYED_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          echo "deployed_image=${DEPLOYED_IMAGE}" >> "$GITHUB_OUTPUT"
+          if [[ "${DEPLOYED_IMAGE}" != "${MANUAL_IMAGE_REF_DIGEST}" ]]; then
+            echo "::error::deployment image mismatch after rollout"
+            echo "- expected: ${MANUAL_IMAGE_REF_DIGEST}"
+            echo "- actual: ${DEPLOYED_IMAGE}"
+            exit 1
+          fi
+
+      - name: Roll back failed rollout
+        id: rollback
+        if: failure() && steps.rollout.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice::attempting automatic rollback via kubectl rollout undo"
+          kubectl -n "${K8S_NAMESPACE}" rollout undo "deployment/${K8S_DEPLOYMENT}" || true
+          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout=10m || true
+          ROLLED_BACK_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          echo "rolled_back_image=${ROLLED_BACK_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize manual shared staging deploy
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Server Shared Staging Deploy (manual)"
+            echo ""
+            echo "- **Source SHA (input)**: ${{ github.event.inputs.source_sha }}"
+            echo "- **Image (digest)**: ${MANUAL_IMAGE_REF_DIGEST}"
+            echo "- **Previous Image**: ${{ steps.current.outputs.previous_image }}"
+            echo "- **Deployed Image**: ${{ steps.rollout.outputs.deployed_image }}"
+            echo "- **Rolled Back Image**: ${{ steps.rollback.outputs.rolled_back_image }}"
+            echo "- **Health Gate**: kubectl rollout status only"
+            echo "- **Cluster**: ${{ github.event.inputs.cluster_name }}"
             echo "- **Namespace**: ${K8S_NAMESPACE}"
             echo "- **Deployment**: ${K8S_DEPLOYMENT}"
           } >> "$GITHUB_STEP_SUMMARY"
