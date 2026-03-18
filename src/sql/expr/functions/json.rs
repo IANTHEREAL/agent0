@@ -30,7 +30,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSONB_SET", jsonb_set);
     map.insert("JSON_SET", jsonb_set);
     map.insert("JSONB_ARRAY_ELEMENTS", jsonb_array_elements);
-    map.insert("JSON_ARRAY_ELEMENTS", jsonb_array_elements);
+    map.insert("JSON_ARRAY_ELEMENTS", json_array_elements);
     map.insert("JSONB_ARRAY_ELEMENTS_TEXT", jsonb_array_elements_text);
     map.insert("JSON_ARRAY_ELEMENTS_TEXT", jsonb_array_elements_text);
     map.insert("JSONB_EACH", jsonb_each);
@@ -627,10 +627,23 @@ pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn jsonb_array_elements(args: Vec<Value>) -> Result<Value> {
+    jsonb_array_elements_impl(args, true)
+}
+
+pub fn json_array_elements(args: Vec<Value>) -> Result<Value> {
+    jsonb_array_elements_impl(args, false)
+}
+
+fn jsonb_array_elements_impl(args: Vec<Value>, is_jsonb: bool) -> Result<Value> {
+    let func_name = if is_jsonb {
+        "jsonb_array_elements"
+    } else {
+        "json_array_elements"
+    };
     let json_str = match args.into_iter().next() {
         Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("jsonb_array_elements requires json/jsonb argument")),
+        _ => return Err(anyhow!("{} requires json/jsonb argument", func_name)),
     };
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
@@ -638,7 +651,13 @@ pub fn jsonb_array_elements(args: Vec<Value>) -> Result<Value> {
         serde_json::Value::Array(arr) => {
             let elements: Vec<Value> = arr
                 .into_iter()
-                .map(|v| Value::Jsonb(v.to_string()))
+                .map(|v| {
+                    if is_jsonb {
+                        Value::Jsonb(v.to_string())
+                    } else {
+                        Value::Json(v.to_string())
+                    }
+                })
                 .collect();
             Ok(Value::Array(elements))
         }

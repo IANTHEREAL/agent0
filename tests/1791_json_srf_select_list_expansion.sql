@@ -4,8 +4,12 @@
 -- 1. json_object_keys in SELECT list → row expansion
 SELECT json_object_keys('{"a":1,"b":2}'::json);
 
--- 2. json_array_elements in SELECT list → row expansion
+-- 2. json_array_elements in SELECT list → row expansion (numeric)
 SELECT json_array_elements('[1,2,3]'::json);
 
 -- 3. json_array_elements_text in SELECT list → row expansion
 SELECT json_array_elements_text('["x","y"]'::json);
+
+-- 4. json_array_elements with object/array elements preserves JSON key order
+-- PostgreSQL returns {"b":1,"a":2} (original key order), not JSONB-canonicalized {"a":2,"b":1}
+SELECT json_array_elements('[{"b":1,"a":2},[3,4]]'::json);
