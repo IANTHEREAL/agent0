@@ -649,7 +649,7 @@ fn jsonb_array_elements_impl(args: Vec<Value>, is_jsonb: bool) -> Result<Value> 
     // Parse the array to get element count and structure
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-    
+
     match json_val {
         serde_json::Value::Array(arr) => {
             // For JSON (non-JSONB), preserve original key order by extracting raw substrings.
@@ -678,12 +678,12 @@ fn extract_json_array_elements_raw(json_str: &str) -> Vec<String> {
     if chars.is_empty() || chars[0] != '[' {
         return elements;
     }
-    
+
     let mut depth = 0;
     let mut in_string = false;
     let mut escape = false;
     let mut start = 1; // Skip opening '['
-    
+
     for (i, &c) in chars.iter().enumerate() {
         if escape {
             escape = false;
@@ -723,7 +723,7 @@ fn extract_json_array_elements_raw(json_str: &str) -> Vec<String> {
             start = i + 1;
         }
     }
-    
+
     elements
 }
 
