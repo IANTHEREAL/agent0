@@ -36,6 +36,7 @@ const DB_SYS_STATS_PREFIX: &[u8] = b"sys_stats_";
 const DB_SYS_COLLATION_PREFIX: &[u8] = b"sys_collation_";
 const DB_SYS_POLICY_PREFIX: &[u8] = b"sys_policy_";
 const DB_SYS_NEXT_POLICY_OID: &[u8] = b"sys_next_policy_oid";
+const DB_SYS_STORAGE_STATS: &[u8] = b"sys_storage_stats";
 const DB_SYS_TSC_PREFIX: &[u8] = b"sys_tsc_";
 const DB_SYS_CRON_JOB_PREFIX_V2: &[u8] = b"sys_cron_job_";
 const DB_SYS_CRON_RUN_PREFIX_V2: &[u8] = b"sys_cron_run_";
@@ -180,6 +181,20 @@ pub fn encode_collation_key_v2(db_id: u64, name: &str) -> Vec<u8> {
 pub fn encode_collation_prefix_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_COLLATION_PREFIX);
+    key
+}
+
+// ============================================================================
+// Storage stats key
+// ============================================================================
+
+/// Key: `d_{db_id:8bytes}_sys_storage_stats`
+///
+/// Stored under the database keyspace so `DROP DATABASE` range-delete cleans
+/// up stats automatically.
+pub fn encode_storage_stats_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_STORAGE_STATS);
     key
 }
 
