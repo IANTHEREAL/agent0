@@ -294,9 +294,7 @@ impl Executor {
             return Ok((schema, vec![row]));
         }
 
-        if t_upper == "_DB9_SYS_STORAGE_STATS"
-            || t_upper.ends_with("._DB9_SYS_STORAGE_STATS")
-        {
+        if t_upper == "_DB9_SYS_STORAGE_STATS" || t_upper.ends_with("._DB9_SYS_STORAGE_STATS") {
             let mut schema = virtual_table_schema("_DB9_SYS_STORAGE_STATS").unwrap();
             schema.name = table_name.to_string();
 

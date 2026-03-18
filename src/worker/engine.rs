@@ -1041,12 +1041,8 @@ impl WorkerEngine {
             tenant_txn.rollback().await.ok();
 
             for db in databases {
-                if let Err(e) = enqueue_storage_scan(
-                    &self.system_store,
-                    &entry.keyspace,
-                    db.id,
-                )
-                .await
+                if let Err(e) =
+                    enqueue_storage_scan(&self.system_store, &entry.keyspace, db.id).await
                 {
                     warn!(
                         "Failed to enqueue storage scan for keyspace={} db_id={}: {}",
@@ -1514,24 +1510,24 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
                 KeyCategory::Data => {
                     data_bytes += entry_bytes;
                     if let Some(table_id) = classification.table_id {
-                        let ts = table_stats.entry(table_id).or_insert_with(|| {
-                            TableStorageStats {
+                        let ts = table_stats
+                            .entry(table_id)
+                            .or_insert_with(|| TableStorageStats {
                                 table_id,
                                 ..Default::default()
-                            }
-                        });
+                            });
                         ts.data_bytes += entry_bytes;
                     }
                 }
                 KeyCategory::Index => {
                     index_bytes += entry_bytes;
                     if let Some(table_id) = classification.table_id {
-                        let ts = table_stats.entry(table_id).or_insert_with(|| {
-                            TableStorageStats {
+                        let ts = table_stats
+                            .entry(table_id)
+                            .or_insert_with(|| TableStorageStats {
                                 table_id,
                                 ..Default::default()
-                            }
-                        });
+                            });
                         ts.index_bytes += entry_bytes;
                     }
                 }
@@ -1582,11 +1578,7 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
 
     info!(
         db_id,
-        data_bytes,
-        index_bytes,
-        metadata_bytes,
-        scan_duration_ms,
-        "Storage size scan complete"
+        data_bytes, index_bytes, metadata_bytes, scan_duration_ms, "Storage size scan complete"
     );
 
     Ok(())
