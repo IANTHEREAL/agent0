@@ -100,6 +100,20 @@ impl WorkerEngine {
             );
         }
 
+        if let Err(e) = warm_load_storage_stats(&self.pool, &self.system_store).await {
+            warn!(
+                "Storage stats warm-load failed (engine will continue): {}",
+                e
+            );
+        }
+
+        if let Err(e) = self.reconcile_storage_scans().await {
+            warn!(
+                "Storage scan reconciliation failed (engine will continue): {}",
+                e
+            );
+        }
+
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
         loop {
             tokio::select! {
@@ -814,9 +828,11 @@ impl WorkerEngine {
         let tx_start_ms = now_epoch_ms();
         let statement_memory_accountant = handle.memory_accountant();
 
-        // HnswMerge tasks consolidate delta entries into the base graph.
-        // They run outside the normal SQL executor path and are exempt from
-        // statement_timeout (merge may be long-running on large backlogs).
+        if entry.task_type == TaskType::StorageSizeScan {
+            execute_storage_size_scan(&store, entry.db_id).await?;
+            return Ok(1);
+        }
+
         if entry.task_type == TaskType::HnswMerge && entry.command.starts_with("__hnsw_merge ") {
             let (table_id, index_id) = parse_hnsw_merge_command(&entry.command)?;
             execute_hnsw_merge(&store, entry.db_id, table_id, index_id).await?;
@@ -1007,8 +1023,47 @@ impl WorkerEngine {
         Ok(())
     }
 
-    /// Startup reconciliation: scan ALL worker registry entries for HNSW
-    /// indexes with pending deltas and enqueue merge tasks.
+    /// Enqueue storage size scan tasks for all known databases.
+    async fn reconcile_storage_scans(&self) -> Result<()> {
+        let mut txn = self.system_store.begin().await?;
+        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        let mut total_enqueued = 0u32;
+        for entry in &registry_entries {
+            let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let store = handle.store().clone();
+            let mut tenant_txn = store.begin().await?;
+            let databases = store.list_databases(&mut tenant_txn).await?;
+            tenant_txn.rollback().await.ok();
+
+            for db in databases {
+                if let Err(e) = enqueue_storage_scan(
+                    &self.system_store,
+                    &entry.keyspace,
+                    db.id,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to enqueue storage scan for keyspace={} db_id={}: {}",
+                        entry.keyspace, db.id, e
+                    );
+                } else {
+                    total_enqueued += 1;
+                }
+            }
+        }
+
+        if total_enqueued > 0 {
+            info!(total_enqueued, "Storage scan reconciliation complete");
+        }
+        Ok(())
+    }
+
     async fn reconcile_hnsw_merges(&self) -> Result<()> {
         let mut txn = self.system_store.begin().await?;
         let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
@@ -1404,6 +1459,201 @@ async fn execute_hnsw_merge(
             elapsed_ms = merge_start.elapsed().as_millis() as u64,
             "HNSW merge complete"
         );
+    }
+    Ok(())
+}
+
+/// Page size for storage size scan: keys per TiKV scan request.
+const STORAGE_SCAN_PAGE_SIZE: u32 = 4096;
+
+/// Rate-limit sleep between scan pages to avoid interfering with foreground traffic.
+const STORAGE_SCAN_RATE_LIMIT_MS: u64 = 5;
+
+/// Execute a storage size scan for a single database.
+///
+/// Performs a full paginated range scan over `[d_{db_id}_, d_{db_id+1}_)`,
+/// classifies each key by prefix, and accumulates logical sizes (key.len + value.len).
+/// Results are persisted to TiKV and cached in memory.
+async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result<()> {
+    use crate::storage::encode_database_data_range;
+    use crate::storage_stats::{
+        classify_key, global_storage_stats_cache, serialize_storage_stats, DbStorageStats,
+        KeyCategory, TableStorageStats,
+    };
+    use tikv_client::BoundRange;
+
+    let scan_start = std::time::Instant::now();
+    let (range_start, range_end) = encode_database_data_range(db_id);
+
+    let mut data_bytes: u64 = 0;
+    let mut index_bytes: u64 = 0;
+    let mut metadata_bytes: u64 = 0;
+    let mut table_stats: std::collections::HashMap<u64, TableStorageStats> =
+        std::collections::HashMap::new();
+
+    let mut txn = store.begin_optimistic().await?;
+    let mut cursor = range_start;
+
+    loop {
+        let range: BoundRange = (cursor.clone()..range_end.clone()).into();
+        let kv_pairs: Vec<tikv_client::KvPair> =
+            txn.scan(range, STORAGE_SCAN_PAGE_SIZE).await?.collect();
+        let page_count = kv_pairs.len();
+
+        if page_count == 0 {
+            break;
+        }
+
+        for pair in &kv_pairs {
+            let key: Vec<u8> = pair.key().clone().into();
+            let value: &[u8] = pair.value();
+            let entry_bytes = (key.len() + value.len()) as u64;
+
+            let classification = classify_key(&key);
+            match classification.category {
+                KeyCategory::Data => {
+                    data_bytes += entry_bytes;
+                    if let Some(table_id) = classification.table_id {
+                        let ts = table_stats.entry(table_id).or_insert_with(|| {
+                            TableStorageStats {
+                                table_id,
+                                ..Default::default()
+                            }
+                        });
+                        ts.data_bytes += entry_bytes;
+                    }
+                }
+                KeyCategory::Index => {
+                    index_bytes += entry_bytes;
+                    if let Some(table_id) = classification.table_id {
+                        let ts = table_stats.entry(table_id).or_insert_with(|| {
+                            TableStorageStats {
+                                table_id,
+                                ..Default::default()
+                            }
+                        });
+                        ts.index_bytes += entry_bytes;
+                    }
+                }
+                KeyCategory::Metadata => {
+                    metadata_bytes += entry_bytes;
+                }
+                KeyCategory::Unknown => {
+                    metadata_bytes += entry_bytes;
+                }
+            }
+        }
+
+        let last_key: Vec<u8> = kv_pairs.last().unwrap().key().clone().into();
+        cursor = last_key;
+        cursor.push(0x00);
+
+        if (page_count as u32) < STORAGE_SCAN_PAGE_SIZE {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(STORAGE_SCAN_RATE_LIMIT_MS)).await;
+    }
+
+    // Read-only transaction — just drop it, no commit needed.
+    txn.rollback().await.ok();
+
+    let scan_duration_ms = scan_start.elapsed().as_millis() as i64;
+    let scanned_at_ms = now_epoch_ms();
+
+    let stats = DbStorageStats {
+        database_id: db_id,
+        data_bytes,
+        index_bytes,
+        metadata_bytes,
+        tables: table_stats,
+        scanned_at_ms,
+        scan_duration_ms,
+    };
+
+    let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
+    let stats_value = serialize_storage_stats(&stats);
+    let mut persist_txn = store.begin().await?;
+    crate::txn::txn_put(&mut persist_txn, stats_key, stats_value).await?;
+    persist_txn.commit().await?;
+
+    let keyspace = store.keyspace().unwrap_or("default");
+    global_storage_stats_cache().put(keyspace, db_id, stats);
+
+    info!(
+        db_id,
+        data_bytes,
+        index_bytes,
+        metadata_bytes,
+        scan_duration_ms,
+        "Storage size scan complete"
+    );
+
+    Ok(())
+}
+
+/// Enqueue a storage size scan task for a specific database.
+///
+/// Called by `db9_refresh_storage_stats()` and by the periodic reconciler.
+pub(crate) async fn enqueue_storage_scan(
+    system_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+) -> Result<()> {
+    let entry = TaskQueueEntry::new(
+        keyspace.to_string(),
+        db_id,
+        db_id as i64,
+        TaskType::StorageSizeScan,
+        String::new(),
+        "system".to_string(),
+        200, // low priority — background housekeeping
+    );
+    let fire_time = now_epoch_ms();
+    let mut txn = system_store.begin().await?;
+    system_store
+        .put_worker_queue_entry(&mut txn, &entry, fire_time)
+        .await?;
+    txn.commit().await?;
+    crate::worker::wake_worker();
+    Ok(())
+}
+
+/// Warm-load persisted storage stats into the in-memory cache on startup.
+pub(crate) async fn warm_load_storage_stats(
+    pool: &TikvClientPool,
+    system_store: &TikvStore,
+) -> Result<()> {
+    use crate::storage_stats::{deserialize_storage_stats, global_storage_stats_cache};
+
+    let mut sys_txn = system_store.begin().await?;
+    let registry_entries = system_store.list_worker_registry(&mut sys_txn).await?;
+    sys_txn.commit().await?;
+
+    let mut loaded = 0u32;
+    for entry in registry_entries {
+        let handle = match pool.acquire(Some(entry.keyspace.clone())).await {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        let store = handle.store().clone();
+        let mut txn = store.begin().await?;
+
+        let databases = store.list_databases(&mut txn).await?;
+        for db in databases {
+            let stats_key = crate::storage::encode_storage_stats_key_v2(db.id);
+            if let Some(data) = txn.get(stats_key).await? {
+                if let Some(stats) = deserialize_storage_stats(&data) {
+                    global_storage_stats_cache().put(&entry.keyspace, db.id, stats);
+                    loaded += 1;
+                }
+            }
+        }
+        txn.rollback().await.ok();
+    }
+
+    if loaded > 0 {
+        info!(loaded, "Warm-loaded persisted storage stats into cache");
     }
     Ok(())
 }
