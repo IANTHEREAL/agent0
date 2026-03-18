@@ -645,24 +645,86 @@ fn jsonb_array_elements_impl(args: Vec<Value>, is_jsonb: bool) -> Result<Value> 
         Some(Value::Null) => return Ok(Value::Null),
         _ => return Err(anyhow!("{} requires json/jsonb argument", func_name)),
     };
+
+    // Parse the array to get element count and structure
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+    
     match json_val {
         serde_json::Value::Array(arr) => {
-            let elements: Vec<Value> = arr
-                .into_iter()
-                .map(|v| {
-                    if is_jsonb {
-                        Value::Jsonb(v.to_string())
-                    } else {
-                        Value::Json(v.to_string())
-                    }
-                })
-                .collect();
+            // For JSON (non-JSONB), preserve original key order by extracting raw substrings.
+            // For JSONB, canonicalize by re-serializing.
+            let elements: Vec<Value> = if !is_jsonb {
+                // Extract raw JSON strings for each element to preserve key order
+                extract_json_array_elements_raw(&json_str)
+                    .into_iter()
+                    .map(Value::Json)
+                    .collect()
+            } else {
+                arr.into_iter()
+                    .map(|v| Value::Jsonb(v.to_string()))
+                    .collect()
+            };
             Ok(Value::Array(elements))
         }
         _ => Err(anyhow!("cannot extract elements from a non-array")),
     }
+}
+
+/// Extract raw JSON element strings from a JSON array string, preserving original formatting.
+fn extract_json_array_elements_raw(json_str: &str) -> Vec<String> {
+    let mut elements = Vec::new();
+    let chars: Vec<char> = json_str.trim().chars().collect();
+    if chars.is_empty() || chars[0] != '[' {
+        return elements;
+    }
+    
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = 1; // Skip opening '['
+    
+    for (i, &c) in chars.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '[' || c == '{' {
+            depth += 1;
+            continue;
+        }
+        if c == ']' || c == '}' {
+            depth -= 1;
+            if depth == 0 && c == ']' {
+                // End of array
+                if i > start {
+                    elements.push(chars[start..i].iter().collect());
+                }
+                break;
+            }
+            continue;
+        }
+        if c == ',' && depth == 1 {
+            // Element separator at top level of array
+            if i > start {
+                elements.push(chars[start..i].iter().collect());
+            }
+            start = i + 1;
+        }
+    }
+    
+    elements
 }
 
 pub fn jsonb_array_elements_text(args: Vec<Value>) -> Result<Value> {
