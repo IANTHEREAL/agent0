@@ -294,6 +294,99 @@ impl Executor {
             return Ok((schema, vec![row]));
         }
 
+        if t_upper == "_DB9_SYS_STORAGE_STATS"
+            || t_upper.ends_with("._DB9_SYS_STORAGE_STATS")
+        {
+            let mut schema = virtual_table_schema("_DB9_SYS_STORAGE_STATS").unwrap();
+            schema.name = table_name.to_string();
+
+            let cache = crate::storage_stats::global_storage_stats_cache();
+            let all_stats = cache.get_all_for_keyspace(self.tenant_keyspace());
+            let mut rows = Vec::new();
+            for stats in all_stats {
+                let db_name = self
+                    .store()
+                    .get_database_by_id(txn, stats.database_id)
+                    .await?
+                    .map(|db| db.name)
+                    .unwrap_or_else(|| format!("db_{}", stats.database_id));
+
+                let scanned_at = if stats.scanned_at_ms > 0 {
+                    Value::Text(
+                        chrono::DateTime::from_timestamp_millis(stats.scanned_at_ms)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    Value::Null
+                };
+
+                rows.push(Row::new(vec![
+                    Value::Int64(stats.database_id as i64),
+                    Value::Text(db_name),
+                    Value::Int64(stats.data_bytes as i64),
+                    Value::Int64(stats.index_bytes as i64),
+                    Value::Int64(stats.metadata_bytes as i64),
+                    Value::Int64(stats.total_bytes() as i64),
+                    scanned_at,
+                    Value::Int64(stats.scan_duration_ms),
+                ]));
+            }
+            return Ok((schema, rows));
+        }
+
+        if t_upper == "_DB9_SYS_TABLE_STORAGE_STATS"
+            || t_upper.ends_with("._DB9_SYS_TABLE_STORAGE_STATS")
+        {
+            let mut schema = virtual_table_schema("_DB9_SYS_TABLE_STORAGE_STATS").unwrap();
+            schema.name = table_name.to_string();
+
+            let cache = crate::storage_stats::global_storage_stats_cache();
+            let db_stats = cache.get(self.tenant_keyspace(), db_id);
+
+            let mut rows = Vec::new();
+            if let Some(stats) = db_stats {
+                let scanned_at = if stats.scanned_at_ms > 0 {
+                    Value::Text(
+                        chrono::DateTime::from_timestamp_millis(stats.scanned_at_ms)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    Value::Null
+                };
+
+                let table_names = self.store().list_tables(txn, db_id).await?;
+                let mut id_to_name: HashMap<u64, String> = HashMap::new();
+                for tname in &table_names {
+                    if let Some(ts) = self.store().get_schema(txn, db_id, tname).await? {
+                        id_to_name.insert(ts.table_id, tname.clone());
+                    }
+                }
+
+                let mut table_entries: Vec<_> = stats.tables.values().collect();
+                table_entries.sort_by_key(|t| t.table_id);
+
+                for ts in table_entries {
+                    let tname = id_to_name
+                        .get(&ts.table_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("table_{}", ts.table_id));
+
+                    rows.push(Row::new(vec![
+                        Value::Int64(stats.database_id as i64),
+                        Value::Int64(ts.table_id as i64),
+                        Value::Text(tname),
+                        Value::Int64(ts.data_bytes as i64),
+                        Value::Int64(ts.index_bytes as i64),
+                        Value::Int64(ts.total_bytes() as i64),
+                        scanned_at.clone(),
+                    ]));
+                }
+            }
+            return Ok((schema, rows));
+        }
+
         if t_upper == "_DB9_SYS_TRIGGER_DLQ" || t_upper.ends_with("._DB9_SYS_TRIGGER_DLQ") {
             let mut schema = virtual_table_schema("_DB9_SYS_TRIGGER_DLQ").unwrap();
             schema.name = table_name.to_string();
