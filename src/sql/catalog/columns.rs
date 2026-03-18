@@ -144,6 +144,7 @@ impl VirtualTable for Columns {
                     DataType::Int64 => (null_val(), int_val(64), int_val(0)),
                     DataType::Float64 => (null_val(), int_val(53), null_val()),
                     DataType::Text => (null_val(), null_val(), null_val()),
+                    DataType::Varchar(0) => (null_val(), null_val(), null_val()),
                     DataType::Varchar(n) => (int_val(*n as i64), null_val(), null_val()),
                     DataType::Numeric { precision, scale } => {
                         let p = precision.map(|v| int_val(v as i64)).unwrap_or(null_val());

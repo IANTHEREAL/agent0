@@ -14,7 +14,8 @@ pub(super) fn parse_plpgsql_type(type_str: &str) -> DataType {
         "bigint" | "int8" => DataType::Int64,
         "smallint" | "int2" => DataType::Int32,
         "boolean" | "bool" => DataType::Boolean,
-        "text" | "varchar" | "character varying" => DataType::Text,
+        "text" => DataType::Text,
+        "varchar" | "character varying" => DataType::Varchar(0),
         "real" | "float4" | "double precision" | "float8" | "float" => DataType::Float64,
         "timestamp"
         | "timestamptz"
@@ -24,7 +25,7 @@ pub(super) fn parse_plpgsql_type(type_str: &str) -> DataType {
         "uuid" => DataType::Uuid,
         "json" | "jsonb" => DataType::Json,
         "bytea" => DataType::Bytes,
-        _ if t.starts_with("varchar") || t.starts_with("character") => DataType::Text,
+        _ if t.starts_with("varchar") || t.starts_with("character varying") => DataType::Varchar(0),
         _ if t.starts_with("numeric") || t.starts_with("decimal") => DataType::Float64,
         _ => DataType::Text,
     }

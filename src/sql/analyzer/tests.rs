@@ -844,7 +844,7 @@ fn analyze_any_non_empty_array_respects_explicit_text_array_cast() {
     assert!(matches!(
         err,
         AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
-            if operator == "=" && left == "integer" && right == "text"
+            if operator == "=" && left == "integer" && right == "character varying"
     ));
 }
 
@@ -854,7 +854,7 @@ fn analyze_ne_any_non_empty_array_respects_explicit_text_array_cast() {
     assert!(matches!(
         err,
         AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
-            if operator == "<>" && left == "integer" && right == "text"
+            if operator == "<>" && left == "integer" && right == "character varying"
     ));
 }
 

@@ -246,8 +246,8 @@ impl<'a> Analyzer<'a> {
                     comparison_target_type(&target, &when_expr.data_type).ok_or_else(|| {
                         AnalyzerError::OperatorTypeMismatch {
                             operator: "=".to_string(),
-                            left: target.to_string().to_lowercase(),
-                            right: when_expr.data_type.to_string().to_lowercase(),
+                            left: target.pg_display_name(),
+                            right: when_expr.data_type.pg_display_name(),
                         }
                     })?;
             }

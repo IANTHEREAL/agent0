@@ -44,6 +44,7 @@ fn push_system_attribute_rows(rows: &mut Vec<Row>, attrelid: i64) {
 
 fn atttypmod_for_datatype(data_type: &DataType) -> i64 {
     match data_type {
+        DataType::Varchar(0) => -1,
         DataType::Varchar(n) => *n as i64 + 4,
         DataType::Numeric {
             precision: Some(p),
@@ -230,5 +231,17 @@ impl VirtualTable for PgAttribute {
         }
 
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atttypmod_for_datatype;
+    use crate::model::DataType;
+
+    #[test]
+    fn bare_varchar_has_no_typmod() {
+        assert_eq!(atttypmod_for_datatype(&DataType::Varchar(0)), -1);
+        assert_eq!(atttypmod_for_datatype(&DataType::Varchar(5)), 9);
     }
 }

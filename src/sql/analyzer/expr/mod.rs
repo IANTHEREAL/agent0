@@ -619,8 +619,8 @@ impl<'a> Analyzer<'a> {
                         other => {
                             return Err(AnalyzerError::OperatorTypeMismatch {
                                 operator: "[]".to_string(),
-                                left: other.to_string().to_lowercase(),
-                                right: idx.data_type.to_string().to_lowercase(),
+                                left: other.pg_display_name(),
+                                right: idx.data_type.pg_display_name(),
                             });
                         }
                     };
@@ -822,11 +822,11 @@ impl<'a> Analyzer<'a> {
                                     if matches!(&r.kind, TypedExprKind::Constant(Value::Text(_))) {
                                         "unknown".to_string()
                                     } else {
-                                        r.data_type.to_string().to_lowercase()
+                                        r.data_type.pg_display_name()
                                     };
                                 return Err(AnalyzerError::OperatorTypeMismatch {
                                     operator: op_str.to_string(),
-                                    left: other.to_string().to_lowercase(),
+                                    left: other.pg_display_name(),
                                     right: right_type,
                                 });
                             }
@@ -1049,8 +1049,8 @@ impl<'a> Analyzer<'a> {
                                 .comparison_target_type_for_any(&left_expr, &elem_type)
                                 .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                                     operator: compare_op.to_string(),
-                                    left: left_expr.data_type.to_string().to_lowercase(),
-                                    right: elem_type.to_string().to_lowercase(),
+                                    left: left_expr.data_type.pg_display_name(),
+                                    right: elem_type.pg_display_name(),
                                 })?;
                             let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                             return Ok(TypedExpr::new(
@@ -1077,8 +1077,8 @@ impl<'a> Analyzer<'a> {
                             )
                             .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                                 operator: compare_op.to_string(),
-                                left: left_expr.data_type.to_string().to_lowercase(),
-                                right: elem_type.to_string().to_lowercase(),
+                                left: left_expr.data_type.pg_display_name(),
+                                right: elem_type.pg_display_name(),
                             })?;
                         let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                         let list = elems
@@ -1114,8 +1114,8 @@ impl<'a> Analyzer<'a> {
                                 .comparison_target_type_for_any(&left_expr, &elem_type)
                                 .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                                     operator: compare_op.to_string(),
-                                    left: left_expr.data_type.to_string().to_lowercase(),
-                                    right: elem_type.to_string().to_lowercase(),
+                                    left: left_expr.data_type.pg_display_name(),
+                                    right: elem_type.pg_display_name(),
                                 })?;
                             let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                             let op = self.any_all_compare_op(compare_op)?;
@@ -1144,8 +1144,8 @@ impl<'a> Analyzer<'a> {
                             )
                             .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                                 operator: compare_op.to_string(),
-                                left: left_expr.data_type.to_string().to_lowercase(),
-                                right: elem_type.to_string().to_lowercase(),
+                                left: left_expr.data_type.pg_display_name(),
+                                right: elem_type.pg_display_name(),
                             })?;
                         let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                         let coerced_elems = elems

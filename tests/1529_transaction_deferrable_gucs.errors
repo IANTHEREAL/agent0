@@ -1,0 +1,7 @@
+# db9-specific guardrail: PostgreSQL mutates these GUCs instead of rejecting them.
+parameter "transaction_deferrable" cannot be changed
+parameter "default_transaction_deferrable" cannot be changed
+parameter "transaction_deferrable" cannot be changed
+parameter "default_transaction_deferrable" cannot be changed
+parameter "transaction_deferrable" cannot be changed
+parameter "default_transaction_deferrable" cannot be changed

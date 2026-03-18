@@ -827,8 +827,8 @@ impl<'a> Analyzer<'a> {
                     let unified_type = common_type(&left_col.data_type, &right_col.data_type)
                         .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                             operator: "=".to_string(),
-                            left: left_col.data_type.to_string().to_lowercase(),
-                            right: right_col.data_type.to_string().to_lowercase(),
+                            left: left_col.data_type.pg_display_name(),
+                            right: right_col.data_type.pg_display_name(),
                         })?;
 
                     resolved.push(ResolvedUsingColumn {
@@ -868,8 +868,8 @@ impl<'a> Analyzer<'a> {
                             common_type(&lc.data_type, &rc.data_type).ok_or_else(|| {
                                 AnalyzerError::OperatorTypeMismatch {
                                     operator: "=".to_string(),
-                                    left: lc.data_type.to_string().to_lowercase(),
-                                    right: rc.data_type.to_string().to_lowercase(),
+                                    left: lc.data_type.pg_display_name(),
+                                    right: rc.data_type.pg_display_name(),
                                 }
                             })?;
                         resolved.push(ResolvedUsingColumn {

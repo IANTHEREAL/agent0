@@ -198,8 +198,8 @@ impl<'a> Analyzer<'a> {
             })
             .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                 operator: op_display.clone(),
-                left: l.data_type.to_string().to_lowercase(),
-                right: r.data_type.to_string().to_lowercase(),
+                left: l.data_type.pg_display_name(),
+                right: r.data_type.pg_display_name(),
             })?;
 
         // Insert implicit casts when operand types differ and a target type exists.
@@ -544,8 +544,8 @@ impl<'a> Analyzer<'a> {
             let Some(target) = self.comparison_target_type_for_any(&left_expr, &right_type) else {
                 return Err(AnalyzerError::OperatorTypeMismatch {
                     operator: compare_op.to_string(),
-                    left: left_expr.data_type.to_string().to_lowercase(),
-                    right: right_type.to_string().to_lowercase(),
+                    left: left_expr.data_type.pg_display_name(),
+                    right: right_type.pg_display_name(),
                 });
             };
             left_expr = self.coerce_if_needed(left_expr, &target)?;

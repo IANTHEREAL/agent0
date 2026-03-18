@@ -88,15 +88,15 @@ fn sql_datatype_to_internal_impl(
             Ok(DataType::Varchar(*length))
         }
         SqlDataType::Nvarchar(Some(length)) => Ok(DataType::Varchar(*length)),
+        SqlDataType::Varchar(None)
+        | SqlDataType::CharacterVarying(None)
+        | SqlDataType::CharVarying(None)
+        | SqlDataType::Nvarchar(None) => Ok(DataType::Varchar(0)),
 
         SqlDataType::Text
         | SqlDataType::String(_)
-        | SqlDataType::Varchar(_)
-        | SqlDataType::Nvarchar(_)
         | SqlDataType::Character(_)
         | SqlDataType::Char(_)
-        | SqlDataType::CharacterVarying(_)
-        | SqlDataType::CharVarying(_)
         | SqlDataType::CharacterLargeObject(_)
         | SqlDataType::CharLargeObject(_)
         | SqlDataType::Clob(_) => Ok(DataType::Text),
@@ -203,7 +203,12 @@ fn convert_custom_type(
         "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => {
             Ok(DataType::Float64)
         }
-        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" => Ok(DataType::Text),
+        "TEXT" | "CHAR" | "CHARACTER" => Ok(DataType::Text),
+        "VARCHAR" | "CHARACTER VARYING" => Ok(modifiers
+            .first()
+            .and_then(|m| m.parse::<u64>().ok())
+            .map(DataType::Varchar)
+            .unwrap_or(DataType::Varchar(0))),
         "NUMERIC" | "DECIMAL" => Ok(DataType::Numeric {
             precision: None,
             scale: None,
@@ -237,5 +242,28 @@ fn convert_custom_type(
             UnknownCustomMode::Text => Ok(DataType::Text),
             UnknownCustomMode::UserDefined => Ok(DataType::UserDefined(full_name)),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sql_datatype_to_internal_strict;
+    use crate::model::DataType;
+    use sqlparser::ast::{ArrayElemTypeDef, DataType as SqlDataType};
+
+    #[test]
+    fn bare_varchar_preserves_varchar_identity() {
+        let ty = sql_datatype_to_internal_strict(&SqlDataType::Varchar(None))
+            .expect("bare varchar should map");
+        assert_eq!(ty, DataType::Varchar(0));
+    }
+
+    #[test]
+    fn bare_varchar_array_preserves_varchar_element_type() {
+        let ty = sql_datatype_to_internal_strict(&SqlDataType::Array(
+            ArrayElemTypeDef::AngleBracket(Box::new(SqlDataType::Varchar(None))),
+        ))
+        .expect("varchar[] should map");
+        assert_eq!(ty, DataType::Array(Box::new(DataType::Varchar(0))));
     }
 }

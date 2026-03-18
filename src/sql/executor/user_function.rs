@@ -315,7 +315,8 @@ fn parse_returns_table_columns(ret_lower: &str) -> Option<Vec<(String, crate::mo
             "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => {
                 DataType::Float64
             }
-            "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" => DataType::Text,
+            "TEXT" | "CHAR" | "CHARACTER" => DataType::Text,
+            "VARCHAR" | "CHARACTER VARYING" => DataType::Varchar(0),
             "NUMERIC" | "DECIMAL" => DataType::Numeric {
                 precision: None,
                 scale: None,

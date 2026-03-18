@@ -343,7 +343,8 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
             "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => {
                 DataType::Float64
             }
-            "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" => DataType::Text,
+            "TEXT" | "CHAR" | "CHARACTER" => DataType::Text,
+            "VARCHAR" | "CHARACTER VARYING" => DataType::Varchar(0),
             "NUMERIC" | "DECIMAL" => DataType::Numeric {
                 precision: None,
                 scale: None,
@@ -903,7 +904,13 @@ mod tests {
         for idx in [6usize, 7, 8] {
             assert!(matches!(schema.columns[idx].data_type, DataType::Float64));
         }
-        for idx in [9usize, 10, 11, 12] {
+        for idx in [9usize, 10] {
+            assert!(matches!(
+                schema.columns[idx].data_type,
+                DataType::Varchar(0)
+            ));
+        }
+        for idx in [11usize, 12] {
             assert!(matches!(schema.columns[idx].data_type, DataType::Text));
         }
     }

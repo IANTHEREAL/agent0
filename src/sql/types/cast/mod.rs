@@ -113,6 +113,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         // ===== To Varchar(n) =====
         (v, DataType::Varchar(max_len)) => {
             let s = v.to_string();
+            if *max_len == 0 {
+                // PostgreSQL bare VARCHAR has no typmod limit. We preserve the
+                // type identity as Varchar(0) in metadata, but runtime coercion
+                // must behave like unbounded character varying.
+                return Ok(Value::Text(s));
+            }
             match context {
                 CastContext::Explicit => {
                     let truncated: String = s.chars().take(*max_len as usize).collect();

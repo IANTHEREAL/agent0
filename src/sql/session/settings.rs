@@ -1222,6 +1222,13 @@ impl SessionSettings {
         }
     }
 
+    pub(crate) fn resettable_unknown_guc(name: &str) -> bool {
+        matches!(
+            Self::canonical_setting_name(name),
+            "session_replication_role"
+        )
+    }
+
     /// Return the effective post-reset display value for a GUC.
     ///
     /// Like `boot_default_show_value()` but uses the session's configured

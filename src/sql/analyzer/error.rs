@@ -296,8 +296,8 @@ impl fmt::Display for AnalyzerError {
                 f,
                 "column \"{}\" is of type {} but expression is of type {}",
                 column,
-                expected.to_string().to_lowercase(),
-                found.to_string().to_lowercase(),
+                expected.pg_display_name(),
+                found.pg_display_name(),
             ),
             Self::DmlWhereNotBoolean { found } => {
                 write!(

@@ -117,6 +117,7 @@ impl fmt::Display for DataType {
             DataType::TimestampTz => write!(f, "TIMESTAMPTZ"),
             DataType::Tsvector => write!(f, "TSVECTOR"),
             DataType::Tsquery => write!(f, "TSQUERY"),
+            DataType::Varchar(0) => write!(f, "VARCHAR"),
             DataType::Varchar(n) => write!(f, "VARCHAR({})", n),
         }
     }
@@ -134,6 +135,8 @@ impl DataType {
             DataType::Int64 => "bigint".to_string(),
             DataType::Float64 => "double precision".to_string(),
             DataType::Numeric { .. } => "numeric".to_string(),
+            DataType::Array(elem_type) => format!("{}[]", elem_type.pg_display_name()),
+            DataType::Varchar(_) => "character varying".to_string(),
             _ => self.to_string().to_lowercase(),
         }
     }
@@ -1057,6 +1060,16 @@ mod tests {
         assert!(db.created_at >= 0);
         assert!(db.allow_conn);
         assert!(!db.is_template);
+    }
+
+    #[test]
+    fn pg_display_name_preserves_character_varying_canonical_name() {
+        assert_eq!(DataType::Varchar(0).pg_display_name(), "character varying");
+        assert_eq!(DataType::Varchar(42).pg_display_name(), "character varying");
+        assert_eq!(
+            DataType::Array(Box::new(DataType::Varchar(3))).pg_display_name(),
+            "character varying[]"
+        );
     }
 }
 

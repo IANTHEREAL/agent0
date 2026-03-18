@@ -1,0 +1,4 @@
+# The phase labels make the "still off after failed writes" contract explicit.
+phase|transaction_deferrable|default_transaction_deferrable
+initial|off|off
+final|off|off

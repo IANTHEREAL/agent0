@@ -499,6 +499,28 @@ fn null_varchar_passthrough() {
     assert_eq!(r, Value::Null);
 }
 
+#[test]
+fn explicit_bare_varchar_does_not_truncate() {
+    let r = cast(
+        Value::Text("hello".into()),
+        &DataType::Varchar(0),
+        CastContext::Explicit,
+    )
+    .unwrap();
+    assert_eq!(r, Value::Text("hello".into()));
+}
+
+#[test]
+fn assignment_bare_varchar_accepts_unbounded_value() {
+    let r = cast(
+        Value::Text("hello".into()),
+        &DataType::Varchar(0),
+        CastContext::Assignment,
+    )
+    .unwrap();
+    assert_eq!(r, Value::Text("hello".into()));
+}
+
 // ---- SQLSTATE roundtrip tests ----
 
 #[test]
