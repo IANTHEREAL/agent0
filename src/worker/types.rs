@@ -11,6 +11,7 @@ pub const TASK_TYPE_AUTO_ANALYZE: u8 = 0x04;
 pub const TASK_TYPE_BG_DDL: u8 = 0x08;
 pub const TASK_TYPE_BG_SQL: u8 = 0x10;
 pub const TASK_TYPE_HNSW_MERGE: u8 = 0x20;
+pub const TASK_TYPE_STORAGE_SIZE_SCAN: u8 = 0x40;
 
 // ============================================================================
 // TaskType Enum
@@ -24,6 +25,7 @@ pub enum TaskType {
     BgDdl,
     BgSql,
     HnswMerge,
+    StorageSizeScan,
 }
 
 impl TaskType {
@@ -37,6 +39,7 @@ impl TaskType {
             TaskType::BgDdl => TASK_TYPE_BG_DDL,
             TaskType::BgSql => TASK_TYPE_BG_SQL,
             TaskType::HnswMerge => TASK_TYPE_HNSW_MERGE,
+            TaskType::StorageSizeScan => TASK_TYPE_STORAGE_SIZE_SCAN,
         }
     }
 
@@ -55,6 +58,8 @@ impl TaskType {
             Some(TaskType::BgSql)
         } else if mask & TASK_TYPE_HNSW_MERGE != 0 {
             Some(TaskType::HnswMerge)
+        } else if mask & TASK_TYPE_STORAGE_SIZE_SCAN != 0 {
+            Some(TaskType::StorageSizeScan)
         } else {
             None
         }
@@ -204,8 +209,22 @@ impl TaskRegistryEntry {
         self.task_types &= !TASK_TYPE_HNSW_MERGE;
     }
 
-    /// Check if any task type is registered
-    #[allow(dead_code)] // forward-compat: symmetric bitmask API
+    #[allow(dead_code)]
+    pub fn has_storage_size_scan(&self) -> bool {
+        self.task_types & TASK_TYPE_STORAGE_SIZE_SCAN != 0
+    }
+
+    #[allow(dead_code)]
+    pub fn set_storage_size_scan(&mut self) {
+        self.task_types |= TASK_TYPE_STORAGE_SIZE_SCAN;
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_storage_size_scan(&mut self) {
+        self.task_types &= !TASK_TYPE_STORAGE_SIZE_SCAN;
+    }
+
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.task_types == 0
     }

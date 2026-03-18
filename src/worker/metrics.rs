@@ -93,6 +93,7 @@ impl WorkerMetrics {
                 TaskType::BgDdl => self.bg_ddl_executed_ok.fetch_add(1, Ordering::Relaxed),
                 TaskType::BgSql => self.bg_sql_executed_ok.fetch_add(1, Ordering::Relaxed),
                 TaskType::HnswMerge => self.hnsw_merge_executed_ok.fetch_add(1, Ordering::Relaxed),
+                TaskType::StorageSizeScan => 0,
             };
         } else {
             self.tasks_executed_err.fetch_add(1, Ordering::Relaxed);
@@ -107,6 +108,7 @@ impl WorkerMetrics {
                 TaskType::BgDdl => self.bg_ddl_executed_err.fetch_add(1, Ordering::Relaxed),
                 TaskType::BgSql => self.bg_sql_executed_err.fetch_add(1, Ordering::Relaxed),
                 TaskType::HnswMerge => self.hnsw_merge_executed_err.fetch_add(1, Ordering::Relaxed),
+                TaskType::StorageSizeScan => 0,
             };
         }
     }

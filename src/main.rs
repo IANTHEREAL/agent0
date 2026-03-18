@@ -19,6 +19,7 @@ mod protocol;
 mod session_context;
 mod sql;
 mod storage;
+mod storage_stats;
 mod tls;
 mod txn;
 mod worker;

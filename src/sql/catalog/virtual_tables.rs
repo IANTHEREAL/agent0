@@ -98,6 +98,25 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
             col("avg_latency_ms", DataType::Float64),
             col("events_per_min", DataType::Int64),
         ],
+        "_DB9_SYS_STORAGE_STATS" => vec![
+            col("database_id", DataType::Int64),
+            col("database_name", DataType::Text),
+            col("data_bytes", DataType::Int64),
+            col("index_bytes", DataType::Int64),
+            col("metadata_bytes", DataType::Int64),
+            col("total_bytes", DataType::Int64),
+            col_nullable("scanned_at", DataType::Text),
+            col("scan_duration_ms", DataType::Int64),
+        ],
+        "_DB9_SYS_TABLE_STORAGE_STATS" => vec![
+            col("database_id", DataType::Int64),
+            col("table_id", DataType::Int64),
+            col("table_name", DataType::Text),
+            col("data_bytes", DataType::Int64),
+            col("index_bytes", DataType::Int64),
+            col("total_bytes", DataType::Int64),
+            col_nullable("scanned_at", DataType::Text),
+        ],
         "_DB9_SYS_TRIGGER_DLQ" => vec![
             col("id", DataType::Int64),
             col("trigger_name", DataType::Text),
@@ -132,7 +151,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_seven_tables_resolve() {
+    fn all_virtual_tables_resolve() {
         let names = [
             "_DB9_SYS_OBSERVABILITY",
             "_DB9_SYS_QUERY_SAMPLES",
@@ -141,6 +160,8 @@ mod tests {
             "_DB9_SYS_RECORD_MIGRATION",
             "_DB9_SYS_TRIGGER_QUEUE_STATS",
             "_DB9_SYS_TRIGGER_DLQ",
+            "_DB9_SYS_STORAGE_STATS",
+            "_DB9_SYS_TABLE_STORAGE_STATS",
         ];
         for name in names {
             assert!(
