@@ -261,6 +261,27 @@ pub(crate) fn decode_jsonl(data: &[u8], path: &str, max_rows: usize) -> DecodedR
     DecodedRows { schema, rows }
 }
 
+/// Extract user-visible column names from an fs9 CSV schema,
+/// excluding synthetic columns (_line_number, _path).
+pub(crate) fn csv_user_column_names(schema: &TableSchema) -> Vec<&str> {
+    schema
+        .columns
+        .iter()
+        .filter(|c| c.name != "_line_number" && c.name != "_path")
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
+/// Decode only the CSV header from the given data, returning the schema.
+/// Used for glob header validation without reading all rows.
+pub(crate) fn decode_csv_header_only(
+    data: &[u8],
+    path: &str,
+    delimiter: Option<char>,
+) -> Result<TableSchema> {
+    decode_csv(data, path, delimiter, Some(true), 0).map(|d| d.schema)
+}
+
 fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
