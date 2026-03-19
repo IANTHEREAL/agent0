@@ -109,6 +109,57 @@ pub fn classify_key(key: &[u8]) -> KeyClassification {
     }
 }
 
+/// Parse the `table_id` from a legacy HNSW key suffix.
+///
+/// Legacy HNSW storage uses string-formatted keys (decimal IDs) instead of the
+/// binary `encode_database_data_prefix()` layout, e.g.:
+/// - `d_{db_id}_hnsw_{table_id}_{index_id}_graph`
+/// - `d_{db_id}_hnsw_{table_id}_{index_id}_delta_{writer_id}_{seq}`
+/// - `d_{db_id}_hnsw_rid_pk2rid_{table_id}_...`
+/// - `d_{db_id}_hnsw_rid_rid2pk_{table_id}_...`
+/// - `d_{db_id}_hnsw_rid_seq_{table_id}`
+///
+/// This helper is used by the storage accounting scanner to attribute legacy
+/// HNSW bytes to per-table index usage.
+pub(crate) fn parse_legacy_hnsw_table_id(remainder: &[u8]) -> Option<u64> {
+    const RID_PK2RID: &[u8] = b"rid_pk2rid_";
+    const RID_RID2PK: &[u8] = b"rid_rid2pk_";
+    const RID_SEQ: &[u8] = b"rid_seq_";
+
+    fn parse_decimal_u64_prefix(bytes: &[u8]) -> Option<(u64, usize)> {
+        let mut value: u64 = 0;
+        let mut len: usize = 0;
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                break;
+            }
+            value = value.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+            len += 1;
+        }
+        if len == 0 {
+            None
+        } else {
+            Some((value, len))
+        }
+    }
+
+    let (digits, require_trailing_underscore) = if remainder.starts_with(RID_PK2RID) {
+        (&remainder[RID_PK2RID.len()..], true)
+    } else if remainder.starts_with(RID_RID2PK) {
+        (&remainder[RID_RID2PK.len()..], true)
+    } else if remainder.starts_with(RID_SEQ) {
+        (&remainder[RID_SEQ.len()..], false)
+    } else {
+        (remainder, true)
+    };
+
+    let (table_id, n) = parse_decimal_u64_prefix(digits)?;
+    if require_trailing_underscore && digits.get(n) != Some(&b'_') {
+        return None;
+    }
+    Some(table_id)
+}
+
 // ============================================================================
 // Stats data types
 // ============================================================================
@@ -479,5 +530,42 @@ mod tests {
         let result = classify_key(&key);
         assert_eq!(result.category, KeyCategory::Metadata);
         assert_eq!(result.table_id, None);
+    }
+
+    #[test]
+    fn parse_legacy_hnsw_table_id_parses_graph_suffix() {
+        assert_eq!(parse_legacy_hnsw_table_id(b"123_456_graph"), Some(123));
+    }
+
+    #[test]
+    fn parse_legacy_hnsw_table_id_parses_delta_suffix() {
+        assert_eq!(
+            parse_legacy_hnsw_table_id(b"99_3_delta_deadbeef00000000_0000000000000001"),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn parse_legacy_hnsw_table_id_parses_rid_mapping_suffix() {
+        assert_eq!(
+            parse_legacy_hnsw_table_id(b"rid_pk2rid_7_deadbeef"),
+            Some(7)
+        );
+        assert_eq!(
+            parse_legacy_hnsw_table_id(b"rid_rid2pk_7_0000000000000001"),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn parse_legacy_hnsw_table_id_parses_rid_seq_suffix() {
+        assert_eq!(parse_legacy_hnsw_table_id(b"rid_seq_42"), Some(42));
+    }
+
+    #[test]
+    fn parse_legacy_hnsw_table_id_rejects_invalid() {
+        assert_eq!(parse_legacy_hnsw_table_id(b"rid_seq_"), None);
+        assert_eq!(parse_legacy_hnsw_table_id(b"not_a_key"), None);
+        assert_eq!(parse_legacy_hnsw_table_id(b"123no_underscore"), None);
     }
 }
