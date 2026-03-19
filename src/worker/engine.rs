@@ -116,8 +116,7 @@ impl WorkerEngine {
 
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
         let mut last_storage_reconcile = tokio::time::Instant::now();
-        let storage_scan_interval =
-            Duration::from_secs(self.config.storage_scan_interval_sec);
+        let storage_scan_interval = Duration::from_secs(self.config.storage_scan_interval_sec);
 
         loop {
             tokio::select! {

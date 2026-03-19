@@ -274,7 +274,10 @@ mod tests {
         assert_eq!(cfg.auto_analyze_threshold, DEFAULT_AUTO_ANALYZE_THRESHOLD);
         assert_eq!(cfg.gc_interval_sec, DEFAULT_GC_INTERVAL_SEC);
         assert_eq!(cfg.hnsw_sweep_interval_sec, DEFAULT_HNSW_SWEEP_INTERVAL_SEC);
-        assert_eq!(cfg.storage_scan_interval_sec, DEFAULT_STORAGE_SCAN_INTERVAL_SEC);
+        assert_eq!(
+            cfg.storage_scan_interval_sec,
+            DEFAULT_STORAGE_SCAN_INTERVAL_SEC
+        );
         assert_eq!(cfg.system_keyspace, DEFAULT_SYSTEM_KEYSPACE);
 
         for (key, value) in saved {
