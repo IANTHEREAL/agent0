@@ -1,0 +1,58 @@
+name: Start TiKV Cluster
+description: Start a TiKV playground cluster and wait for readiness
+
+inputs:
+  pd-host:
+    description: PD bind host
+    required: false
+    default: '127.0.0.1'
+  pd-port:
+    description: PD bind port
+    required: false
+    default: '2379'
+
+runs:
+  using: composite
+  steps:
+    - name: Start TiKV cluster
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cat > /tmp/tikv.toml <<'EOF'
+        [storage]
+        api-version = 2
+        enable-ttl = true
+        EOF
+
+        PLAYGROUND_LOG=/tmp/tiup-playground.log
+        rm -f "$PLAYGROUND_LOG"
+
+        tiup playground \
+          --mode tikv-slim \
+          --without-monitor \
+          --pd.host ${{ inputs.pd-host }} \
+          --pd.port ${{ inputs.pd-port }} \
+          --kv.host ${{ inputs.pd-host }} \
+          --kv.config /tmp/tikv.toml \
+          --kv 1 >"$PLAYGROUND_LOG" 2>&1 &
+        PLAYGROUND_PID=$!
+
+        for i in $(seq 1 120); do
+          if ! kill -0 "$PLAYGROUND_PID" 2>/dev/null; then
+            echo "tiup playground exited early:"
+            cat "$PLAYGROUND_LOG" || true
+            exit 1
+          fi
+
+          if curl -sf http://${{ inputs.pd-host }}:${{ inputs.pd-port }}/pd/api/v1/health > /dev/null 2>&1; then
+            if curl -sf http://${{ inputs.pd-host }}:${{ inputs.pd-port }}/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]'; then
+              echo "TiKV ready after $i seconds"
+              break
+            fi
+          fi
+          sleep 1
+        done
+
+        curl -sf http://${{ inputs.pd-host }}:${{ inputs.pd-port }}/pd/api/v1/health || (cat "$PLAYGROUND_LOG" && exit 1)
+        curl -sf http://${{ inputs.pd-host }}:${{ inputs.pd-port }}/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]' || (cat "$PLAYGROUND_LOG" && exit 1)
