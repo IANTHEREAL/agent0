@@ -330,11 +330,17 @@ pub fn json_object_keys(args: Vec<Value>) -> Result<Value> {
         Some(Value::Null) => return Ok(Value::Null),
         _ => return Err(anyhow!("json_object_keys requires json/jsonb argument")),
     };
-    // Validate it's an object
-    let json_val: serde_json::Value =
-        serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-    if !json_val.is_object() {
-        return Err(anyhow!("cannot call json_object_keys on a non-object"));
+    // Validate it's an object — PostgreSQL distinguishes array vs. scalar errors
+    let json_val: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
+    match &json_val {
+        serde_json::Value::Object(_) => {}
+        serde_json::Value::Array(_) => {
+            return Err(anyhow!("cannot call json_object_keys on an array"));
+        }
+        _ => {
+            return Err(anyhow!("cannot call json_object_keys on a scalar"));
+        }
     }
     let keys = extract_json_object_keys_raw(&json_str);
     Ok(Value::Array(keys.into_iter().map(Value::Text).collect()))
@@ -763,7 +769,7 @@ fn jsonb_array_elements_impl(args: Vec<Value>, is_jsonb: bool) -> Result<Value> 
             };
             Ok(Value::Array(elements))
         }
-        _ => Err(anyhow!("cannot extract elements from a non-array")),
+        _ => Err(anyhow!("cannot call {} on a non-array", func_name)),
     }
 }
 
@@ -853,7 +859,9 @@ pub fn jsonb_array_elements_text(args: Vec<Value>) -> Result<Value> {
                 .collect();
             Ok(Value::Array(elements))
         }
-        _ => Err(anyhow!("cannot extract elements from a non-array")),
+        _ => Err(anyhow!(
+            "cannot call jsonb_array_elements_text on a non-array"
+        )),
     }
 }
 
@@ -869,10 +877,12 @@ pub fn json_array_elements_text(args: Vec<Value>) -> Result<Value> {
         }
     };
     // Validate it's an array
-    let json_val: serde_json::Value =
-        serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+    let json_val: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
     if !json_val.is_array() {
-        return Err(anyhow!("cannot extract elements from a non-array"));
+        return Err(anyhow!(
+            "cannot call json_array_elements_text on a non-array"
+        ));
     }
     // Use raw extraction to preserve key order in object elements
     let raw_elements = extract_json_array_elements_raw(&json_str);

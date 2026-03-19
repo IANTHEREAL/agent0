@@ -33,3 +33,15 @@ SELECT json_array_elements_text('[{"b":1,"a":2}]'::json);
 
 -- 10. json_array_elements_text with mixed element types
 SELECT json_array_elements_text('[1,"hello",null,true,{"z":1,"a":2}]'::json);
+
+-- 11. Error: json_object_keys on an array → PG: "cannot call json_object_keys on an array"
+SELECT json_object_keys('[1,2]'::json);
+
+-- 12. Error: json_object_keys on a scalar → PG: "cannot call json_object_keys on a scalar"
+SELECT json_object_keys('"hello"'::json);
+
+-- 13. Error: json_array_elements on a non-array → PG: "cannot call json_array_elements on a non-array"
+SELECT json_array_elements('{"a":1}'::json);
+
+-- 14. Error: json_array_elements_text on a non-array → PG: "cannot call json_array_elements_text on a non-array"
+SELECT json_array_elements_text('{"a":1}'::json);

@@ -1,0 +1,4 @@
+cannot call json_object_keys on an array
+cannot call json_object_keys on a scalar
+cannot call json_array_elements on a non-array
+cannot call json_array_elements_text on a non-array
