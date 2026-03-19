@@ -634,7 +634,7 @@ async fn start_glob_stream_with_budget_for_backend(
                     continue;
                 }
             };
-            let file_schema = match decoders::decode_csv_header_only(&data, file_path, delim) {
+            let file_schema = match decoders::decode_csv_header_only(&data, file_path, delim, header) {
                 Ok(s) => s,
                 Err(err) => {
                     warn!(
@@ -2008,6 +2008,60 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("glob schema mismatch"), "unexpected error: {msg}");
         assert!(msg.contains("b.csv"), "error should mention mismatching file: {msg}");
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_no_header_same_col_count_succeeds() {
+        let dir = unique_base("glob-csv-noheader-ok");
+        fs::write(dir.join("a.csv"), "1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "2,bob\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(false),
+            exclude: None,
+        };
+
+        let (_schema, rows) = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("no-header CSVs with same column count should succeed");
+
+        assert_eq!(rows.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_no_header_different_col_count_errors() {
+        let dir = unique_base("glob-csv-noheader-diff");
+        fs::write(dir.join("a.csv"), "1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "2,bob,extra\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(false),
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("no-header CSVs with different column count should error");
+
+        assert!(err.to_string().contains("glob schema mismatch"));
         cleanup(&dir);
     }
 }

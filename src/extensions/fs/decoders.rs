@@ -278,8 +278,9 @@ pub(crate) fn decode_csv_header_only(
     data: &[u8],
     path: &str,
     delimiter: Option<char>,
+    header: Option<bool>,
 ) -> Result<TableSchema> {
-    decode_csv(data, path, delimiter, Some(true), 0).map(|d| d.schema)
+    decode_csv(data, path, delimiter, header, 0).map(|d| d.schema)
 }
 
 fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
