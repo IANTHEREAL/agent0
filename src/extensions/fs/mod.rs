@@ -634,16 +634,17 @@ async fn start_glob_stream_with_budget_for_backend(
                     continue;
                 }
             };
-            let file_schema = match decoders::decode_csv_header_only(&data, file_path, delim, header) {
-                Ok(s) => s,
-                Err(err) => {
-                    warn!(
-                        "fs9: skipping {} during header validation: {}",
-                        file_path, err
-                    );
-                    continue;
-                }
-            };
+            let file_schema =
+                match decoders::decode_csv_header_only(&data, file_path, delim, header) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!(
+                            "fs9: skipping {} during header validation: {}",
+                            file_path, err
+                        );
+                        continue;
+                    }
+                };
             let file_cols = decoders::csv_user_column_names(&file_schema);
             if base_cols != file_cols {
                 return Err(anyhow!(
@@ -1871,9 +1872,18 @@ mod tests {
         .expect_err("different column names should error");
 
         let msg = err.to_string();
-        assert!(msg.contains("glob schema mismatch"), "unexpected error: {msg}");
-        assert!(msg.contains("b.csv"), "error should mention mismatching file: {msg}");
-        assert!(msg.contains("a.csv"), "error should mention base file: {msg}");
+        assert!(
+            msg.contains("glob schema mismatch"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("b.csv"),
+            "error should mention mismatching file: {msg}"
+        );
+        assert!(
+            msg.contains("a.csv"),
+            "error should mention base file: {msg}"
+        );
         cleanup(&dir);
     }
 
@@ -2006,8 +2016,14 @@ mod tests {
         .expect_err("streaming CSV mismatch should error");
 
         let msg = err.to_string();
-        assert!(msg.contains("glob schema mismatch"), "unexpected error: {msg}");
-        assert!(msg.contains("b.csv"), "error should mention mismatching file: {msg}");
+        assert!(
+            msg.contains("glob schema mismatch"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("b.csv"),
+            "error should mention mismatching file: {msg}"
+        );
         cleanup(&dir);
     }
 
