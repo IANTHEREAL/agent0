@@ -92,6 +92,7 @@
 |---|---|---|---|
 | `DB9_STATEMENT_TIMEOUT_MS` | `60000` | `src/config.rs` | Default statement timeout applied to new sessions. |
 | `DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS` | `60000` | `src/config.rs` | Default idle-in-transaction timeout applied to new sessions. |
+| `DB9_TCP_KEEPALIVE_IDLE_MS` | `60000` | `src/config.rs`, `src/main.rs` | TCP keepalive idle time for pgwire sockets; `0` disables keepalive. |
 | `DB9_MAX_CONNECTIONS` | `1000` | `src/config.rs`, `src/main.rs` | Enforced with a connection semaphore; excess connections receive SQLSTATE `53300`. |
 | `DB9_TENANT_QPS_LIMIT` | `0` (disabled) | `src/pool.rs` | Per-tenant QPS limiter. |
 | `DB9_TENANT_MEMORY_QUOTA_BYTES` | `0` (unlimited) | `src/pool.rs` | Per-tenant aggregate statement memory quota. |

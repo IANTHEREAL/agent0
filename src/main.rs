@@ -29,9 +29,11 @@ use anyhow::Result;
 use pgwire::tokio::process_socket;
 use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;
+use socket2::{SockRef, TcpKeepalive};
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, TryAcquireError};
 use tokio_rustls::TlsAcceptor;
@@ -116,14 +118,13 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let dev_mode = config::env_bool("DB9_DEV");
     let insecure_mode = config::env_bool("DB9_INSECURE");
     let server_config = ServerConfig::from_env().shared();
+    let initial_server_config = server_config.read().unwrap().clone();
     config::init_embedding_config();
     info!(
-        "Statement timeout default: {}ms, idle-in-transaction timeout default: {}ms",
-        server_config.read().unwrap().statement_timeout_ms,
-        server_config
-            .read()
-            .unwrap()
-            .idle_in_transaction_session_timeout_ms
+        "Statement timeout default: {}ms, idle-in-transaction timeout default: {}ms, pgwire TCP keepalive idle: {}ms",
+        initial_server_config.statement_timeout_ms,
+        initial_server_config.idle_in_transaction_session_timeout_ms,
+        initial_server_config.tcp_keepalive_idle_ms
     );
 
     let tls_cert = cli_args.tls_cert.or_else(|| env::var("PG_TLS_CERT").ok());
@@ -369,6 +370,11 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
     loop {
         let (socket, peer_addr) = listener.accept().await?;
+        let accept_config = server_config.read().unwrap().clone();
+
+        if let Err(e) = configure_pgwire_socket_keepalive(&socket, &accept_config) {
+            warn!("Failed to configure TCP keepalive for {}: {}", peer_addr, e);
+        }
 
         let permit = match conn_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -407,6 +413,21 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             }
         });
     }
+}
+
+fn configure_pgwire_socket_keepalive(
+    socket: &tokio::net::TcpStream,
+    server_config: &ServerConfig,
+) -> std::io::Result<()> {
+    let socket_ref = SockRef::from(socket);
+    if server_config.tcp_keepalive_idle_ms == 0 {
+        socket_ref.set_keepalive(false)?;
+        return Ok(());
+    }
+
+    let keepalive =
+        TcpKeepalive::new().with_time(Duration::from_millis(server_config.tcp_keepalive_idle_ms));
+    socket_ref.set_tcp_keepalive(&keepalive)
 }
 
 fn is_loopback_listen_addr(addr: &str) -> bool {
@@ -455,6 +476,7 @@ async fn reject_over_limit(mut socket: tokio::net::TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket2::SockRef;
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
@@ -545,5 +567,45 @@ mod tests {
         for h in handles {
             h.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn test_configure_pgwire_socket_keepalive_applies_and_disables_keepalive() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return;
+            }
+            Err(e) => panic!("failed to bind test listener: {e}"),
+        };
+        let addr = listener.local_addr().unwrap();
+
+        let client =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap();
+
+        let mut cfg = ServerConfig {
+            tcp_keepalive_idle_ms: 4_000,
+            ..Default::default()
+        };
+        configure_pgwire_socket_keepalive(&server, &cfg).unwrap();
+
+        let socket_ref = SockRef::from(&server);
+        assert!(socket_ref.keepalive().unwrap());
+        #[cfg(not(any(
+            windows,
+            target_os = "haiku",
+            target_os = "openbsd",
+            target_os = "vita"
+        )))]
+        assert_eq!(
+            socket_ref.tcp_keepalive_time().unwrap(),
+            Duration::from_secs(4)
+        );
+
+        cfg.tcp_keepalive_idle_ms = 0;
+        configure_pgwire_socket_keepalive(&server, &cfg).unwrap();
+        assert!(!socket_ref.keepalive().unwrap());
     }
 }

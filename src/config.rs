@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_TCP_KEEPALIVE_IDLE_MS: u64 = 60_000;
 const DEFAULT_MAX_CONNECTIONS: u32 = 1000;
 const DEFAULT_EMBEDDING_ENDPOINT: &str =
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings";
@@ -188,6 +189,7 @@ pub fn init_embedding_config() {
 pub struct ServerConfig {
     pub statement_timeout_ms: u64,
     pub idle_in_transaction_session_timeout_ms: u64,
+    pub tcp_keepalive_idle_ms: u64,
     pub max_connections: u32,
 }
 
@@ -196,6 +198,7 @@ impl Default for ServerConfig {
         Self {
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
             idle_in_transaction_session_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS,
+            tcp_keepalive_idle_ms: DEFAULT_TCP_KEEPALIVE_IDLE_MS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
@@ -213,6 +216,9 @@ impl ServerConfig {
                 .parse::<u64>()
                 .ok()
                 .unwrap_or(cfg.idle_in_transaction_session_timeout_ms);
+        }
+        if let Ok(v) = env::var("DB9_TCP_KEEPALIVE_IDLE_MS") {
+            cfg.tcp_keepalive_idle_ms = v.parse::<u64>().ok().unwrap_or(cfg.tcp_keepalive_idle_ms);
         }
         if let Ok(v) = env::var("DB9_MAX_CONNECTIONS") {
             cfg.max_connections = v
@@ -248,6 +254,7 @@ mod tests {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 60_000);
+        assert_eq!(cfg.tcp_keepalive_idle_ms, 60_000);
         assert_eq!(cfg.max_connections, 1000);
     }
 
@@ -258,6 +265,7 @@ mod tests {
         let keys = [
             "DB9_STATEMENT_TIMEOUT_MS",
             "DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
+            "DB9_TCP_KEEPALIVE_IDLE_MS",
             "DB9_MAX_CONNECTIONS",
         ];
 
@@ -275,6 +283,7 @@ mod tests {
         let cfg = ServerConfig::from_env();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 60_000);
+        assert_eq!(cfg.tcp_keepalive_idle_ms, 60_000);
         assert_eq!(cfg.max_connections, 1000);
 
         for (key, value) in saved {
@@ -326,6 +335,7 @@ mod tests {
         let cfg = ServerConfig::from_env();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 45_000);
+        assert_eq!(cfg.tcp_keepalive_idle_ms, 60_000);
 
         match saved {
             Some(v) => unsafe {
@@ -349,6 +359,54 @@ mod tests {
         }
         let cfg = ServerConfig::from_env();
         assert_eq!(cfg.statement_timeout_ms, 0);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+    }
+
+    #[test]
+    fn test_tcp_keepalive_idle_env_override() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_TCP_KEEPALIVE_IDLE_MS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "45000");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.statement_timeout_ms, 60_000);
+        assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 60_000);
+        assert_eq!(cfg.tcp_keepalive_idle_ms, 45_000);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+    }
+
+    #[test]
+    fn test_tcp_keepalive_idle_zero_disables_keepalive() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_TCP_KEEPALIVE_IDLE_MS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "0");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.tcp_keepalive_idle_ms, 0);
 
         match saved {
             Some(v) => unsafe {
@@ -457,6 +515,7 @@ mod tests {
         let cfg = ServerConfig {
             statement_timeout_ms: 30_000,
             idle_in_transaction_session_timeout_ms: 45_000,
+            tcp_keepalive_idle_ms: 20_000,
             max_connections: 500,
         };
         let shared = cfg.shared();
@@ -465,6 +524,7 @@ mod tests {
             let read_cfg = shared.read().unwrap();
             assert_eq!(read_cfg.statement_timeout_ms, 30_000);
             assert_eq!(read_cfg.idle_in_transaction_session_timeout_ms, 45_000);
+            assert_eq!(read_cfg.tcp_keepalive_idle_ms, 20_000);
         }
 
         {
@@ -475,6 +535,7 @@ mod tests {
         {
             let read_cfg = shared.read().unwrap();
             assert_eq!(read_cfg.statement_timeout_ms, 20_000);
+            assert_eq!(read_cfg.tcp_keepalive_idle_ms, 20_000);
         }
     }
 
