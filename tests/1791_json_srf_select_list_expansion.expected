@@ -37,3 +37,23 @@
 ---------------------
 (0 rows)
 
+ json_object_keys
+------------------
+ b
+ a
+(2 rows)
+
+ json_array_elements_text
+--------------------------
+ {"b":1,"a":2}
+(1 row)
+
+ json_array_elements_text
+--------------------------
+ 1
+ hello
+
+ true
+ {"z":1,"a":2}
+(5 rows)
+

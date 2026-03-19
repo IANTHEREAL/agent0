@@ -22,3 +22,14 @@ SELECT json_array_elements('[ ]'::json);
 
 -- 7. Empty array (minified) → zero rows
 SELECT json_array_elements('[]'::json);
+
+-- 8. json_object_keys preserves original key order (b before a)
+-- PostgreSQL 17.9: returns b, a (not sorted)
+SELECT json_object_keys('{"b":1,"a":2}'::json);
+
+-- 9. json_array_elements_text preserves key order in object elements
+-- PostgreSQL 17.9: returns {"b":1,"a":2} (not JSONB-canonicalized {"a":2,"b":1})
+SELECT json_array_elements_text('[{"b":1,"a":2}]'::json);
+
+-- 10. json_array_elements_text with mixed element types
+SELECT json_array_elements_text('[1,"hello",null,true,{"z":1,"a":2}]'::json);
