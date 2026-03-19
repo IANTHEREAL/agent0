@@ -154,10 +154,8 @@ pub(crate) fn parse_legacy_hnsw_table_id(remainder: &[u8]) -> Option<u64> {
     };
 
     let (table_id, n) = parse_decimal_u64_prefix(digits)?;
-    if require_trailing_underscore {
-        if digits.get(n) != Some(&b'_') {
-            return None;
-        }
+    if require_trailing_underscore && digits.get(n) != Some(&b'_') {
+        return None;
     }
     Some(table_id)
 }
