@@ -57,3 +57,8 @@
  {"z":1,"a":2}
 (5 rows)
 
+ERROR:  cannot call json_object_keys on an array
+ERROR:  cannot call json_object_keys on a scalar
+ERROR:  cannot call json_array_elements on a non-array
+ERROR:  cannot call json_array_elements_text on a non-array
+
