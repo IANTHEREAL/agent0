@@ -151,14 +151,19 @@ See [docs/worker.md](docs/worker.md) for configuration, deployment, and troubles
 
 ```bash
 # 1. Start TiKV
-tiup playground --mode tikv-slim
+tiup playground --mode tikv-slim --kv.config deploy/e2e/config/tikv.toml
 
 # 2. Start db9-server
+PD_ENDPOINTS=127.0.0.1:2379 \
+DB9_BOOTSTRAP_ADMIN_PASSWORD=admin \
 cargo run
 
 # 3. Connect
-psql -h 127.0.0.1 -p 5433 -d postgres
+PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres
 ```
+
+`db9-server` requires TiKV API v2. `deploy/e2e/config/tikv.toml` sets `api-version = 2`
+and `enable-ttl = true`, which are required for local development.
 
 ### Example Session
 
