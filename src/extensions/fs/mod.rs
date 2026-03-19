@@ -239,6 +239,7 @@ async fn execute_table_function_with_budget_for_backend(
 
             let mut all_rows: Vec<Row> = Vec::new();
             let mut result_schema: Option<TableSchema> = None;
+            let mut base_file_path: Option<String> = None;
             let mut total_bytes_read: usize = 0;
 
             for (files_read_count, file_path) in matching_files.iter().enumerate() {
@@ -282,8 +283,25 @@ async fn execute_table_function_with_budget_for_backend(
                     _ => decoders::decode_raw_text(&data, file_path, usize::MAX),
                 };
 
-                if result_schema.is_none() {
-                    result_schema = Some(decoded.schema.clone());
+                match &result_schema {
+                    None => {
+                        base_file_path = Some(file_path.clone());
+                        result_schema = Some(decoded.schema.clone());
+                    }
+                    Some(base_schema) if fmt == "csv" || fmt == "tsv" => {
+                        let base_cols = decoders::csv_user_column_names(base_schema);
+                        let cur_cols = decoders::csv_user_column_names(&decoded.schema);
+                        if base_cols != cur_cols {
+                            return Err(anyhow!(
+                                "fs9 glob schema mismatch: '{}' has columns {:?} but '{}' has columns {:?}",
+                                file_path,
+                                cur_cols,
+                                base_file_path.as_deref().unwrap_or("(first file)"),
+                                base_cols
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
 
                 all_rows.extend(decoded.rows);
@@ -532,7 +550,7 @@ async fn start_glob_stream_with_budget_for_backend(
 
     // Probe schema from first readable file; skip oversized/unreadable
     // files with a warning instead of failing the entire query.
-    let schema = {
+    let (schema, probe_file) = {
         let mut found = None;
         for probe_path in &matching_files {
             let reader = match backend
@@ -574,7 +592,7 @@ async fn start_glob_stream_with_budget_for_backend(
             };
             match result {
                 Ok(s) => {
-                    found = Some(s);
+                    found = Some((s, probe_path.clone()));
                     break;
                 }
                 Err(err) => {
@@ -589,6 +607,56 @@ async fn start_glob_stream_with_budget_for_backend(
             )
         })?
     };
+
+    // For CSV/TSV globs, validate that all files have the same header before
+    // starting the streaming task. This catches schema mismatches early and
+    // avoids silent column misalignment.
+    if fmt == "csv" || fmt == "tsv" {
+        let base_cols = decoders::csv_user_column_names(&schema);
+        let delim = if fmt == "tsv" && delimiter.is_none() {
+            Some('\t')
+        } else {
+            delimiter
+        };
+
+        const HEADER_PROBE_BYTES: usize = 8192;
+        for file_path in &matching_files {
+            if *file_path == probe_file {
+                continue;
+            }
+            let data = match backend.read_file(file_path, HEADER_PROBE_BYTES).await {
+                Ok(d) => d,
+                Err(err) => {
+                    warn!(
+                        "fs9: skipping {} during header validation: {}",
+                        file_path, err
+                    );
+                    continue;
+                }
+            };
+            let file_schema =
+                match decoders::decode_csv_header_only(&data, file_path, delim, header) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!(
+                            "fs9: skipping {} during header validation: {}",
+                            file_path, err
+                        );
+                        continue;
+                    }
+                };
+            let file_cols = decoders::csv_user_column_names(&file_schema);
+            if base_cols != file_cols {
+                return Err(anyhow!(
+                    "fs9 glob schema mismatch: '{}' has columns {:?} but '{}' has columns {:?}",
+                    file_path,
+                    file_cols,
+                    probe_file,
+                    base_cols
+                ));
+            }
+        }
+    }
 
     let (tx, rx) = mpsc::channel(256);
     let fmt_owned = fmt.to_string();
@@ -1748,6 +1816,268 @@ mod tests {
 
         assert_eq!(lines, vec!["hello", "world"]);
 
+        cleanup(&dir);
+    }
+
+    // --- glob CSV schema mismatch tests (#1928) ---
+
+    #[tokio::test]
+    async fn test_glob_csv_identical_headers_succeeds() {
+        let dir = unique_base("glob-csv-same-schema");
+        fs::write(dir.join("a.csv"), "id,name\n1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "id,name\n2,bob\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(true),
+            exclude: None,
+        };
+
+        let (_schema, rows) = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("identical CSV headers should succeed");
+
+        assert_eq!(rows.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_different_column_names_errors() {
+        let dir = unique_base("glob-csv-diff-names");
+        fs::write(dir.join("a.csv"), "id,name\n1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "id,email\n2,bob@x.com\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(true),
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("different column names should error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("glob schema mismatch"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("b.csv"),
+            "error should mention mismatching file: {msg}"
+        );
+        assert!(
+            msg.contains("a.csv"),
+            "error should mention base file: {msg}"
+        );
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_different_column_count_errors() {
+        let dir = unique_base("glob-csv-diff-count");
+        fs::write(dir.join("a.csv"), "a,b\n1,2\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "a,b,c\n1,2,3\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(true),
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("different column count should error");
+
+        assert!(err.to_string().contains("glob schema mismatch"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_reordered_columns_errors() {
+        let dir = unique_base("glob-csv-reorder");
+        fs::write(dir.join("a.csv"), "x,y,z\n1,2,3\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "z,y,x\n3,2,1\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(true),
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("reordered columns should error");
+
+        assert!(err.to_string().contains("glob schema mismatch"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_tsv_mismatch_errors() {
+        let dir = unique_base("glob-tsv-diff");
+        fs::write(dir.join("a.tsv"), "id\tname\n1\talice\n").expect("write a.tsv");
+        fs::write(dir.join("b.tsv"), "id\tage\n2\t30\n").expect("write b.tsv");
+
+        let pattern = format!("{}/*.tsv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("tsv".to_string()),
+            delimiter: None,
+            header: Some(true),
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("TSV mismatch should error");
+
+        assert!(err.to_string().contains("glob schema mismatch"));
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_jsonl_heterogeneous_succeeds() {
+        let dir = unique_base("glob-jsonl-hetero");
+        fs::write(dir.join("a.jsonl"), "{\"x\":1}\n").expect("write a.jsonl");
+        fs::write(dir.join("b.jsonl"), "{\"y\":2,\"z\":3}\n").expect("write b.jsonl");
+
+        let pattern = format!("{}/*.jsonl", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("jsonl".to_string()),
+            delimiter: None,
+            header: None,
+            exclude: None,
+        };
+
+        let (_schema, rows) = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("heterogeneous JSONL should succeed");
+
+        assert_eq!(rows.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_stream_csv_mismatch_errors() {
+        let dir = unique_base("glob-stream-csv-mismatch");
+        fs::write(dir.join("a.csv"), "id,name\n1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "id,email\n2,bob@x.com\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+
+        let err = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            Some("csv"),
+            None,
+            Some(true),
+            None,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("streaming CSV mismatch should error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("glob schema mismatch"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("b.csv"),
+            "error should mention mismatching file: {msg}"
+        );
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_no_header_same_col_count_succeeds() {
+        let dir = unique_base("glob-csv-noheader-ok");
+        fs::write(dir.join("a.csv"), "1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "2,bob\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(false),
+            exclude: None,
+        };
+
+        let (_schema, rows) = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("no-header CSVs with same column count should succeed");
+
+        assert_eq!(rows.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_csv_no_header_different_col_count_errors() {
+        let dir = unique_base("glob-csv-noheader-diff");
+        fs::write(dir.join("a.csv"), "1,alice\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "2,bob,extra\n").expect("write b.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: Some("csv".to_string()),
+            delimiter: None,
+            header: Some(false),
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("no-header CSVs with different column count should error");
+
+        assert!(err.to_string().contains("glob schema mismatch"));
         cleanup(&dir);
     }
 }
