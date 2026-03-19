@@ -115,11 +115,22 @@ impl WorkerEngine {
         }
 
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
+        let mut last_storage_reconcile = tokio::time::Instant::now();
+        let storage_scan_interval = Duration::from_secs(self.config.storage_scan_interval_sec);
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = self.notify.notified() => {}
             }
+
+            if last_storage_reconcile.elapsed() >= storage_scan_interval {
+                if let Err(e) = self.reconcile_storage_scans().await {
+                    warn!("Periodic storage scan reconciliation failed: {}", e);
+                }
+                last_storage_reconcile = tokio::time::Instant::now();
+            }
+
             if let Err(e) = self.tick().await {
                 warn!("Worker tick error: {}", e);
             }

@@ -12,6 +12,8 @@ const DEFAULT_GC_INTERVAL_SEC: u64 = 600;
 const MIN_GC_INTERVAL_SEC: u64 = 30;
 const DEFAULT_HNSW_SWEEP_INTERVAL_SEC: u64 = 600;
 const MIN_HNSW_SWEEP_INTERVAL_SEC: u64 = 30;
+const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 1800;
+const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,7 @@ pub struct WorkerConfig {
     pub auto_analyze_threshold: u64,
     pub gc_interval_sec: u64,
     pub hnsw_sweep_interval_sec: u64,
+    pub storage_scan_interval_sec: u64,
     pub system_keyspace: String,
 }
 
@@ -50,6 +53,7 @@ impl Default for WorkerConfig {
             auto_analyze_threshold: DEFAULT_AUTO_ANALYZE_THRESHOLD,
             gc_interval_sec: DEFAULT_GC_INTERVAL_SEC,
             hnsw_sweep_interval_sec: DEFAULT_HNSW_SWEEP_INTERVAL_SEC,
+            storage_scan_interval_sec: DEFAULT_STORAGE_SCAN_INTERVAL_SEC,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
         }
     }
@@ -185,6 +189,28 @@ impl WorkerConfig {
                 }
             }
         }
+        if let Ok(v) = env::var("DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_STORAGE_SCAN_INTERVAL_SEC => {
+                    cfg.storage_scan_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_STORAGE_SCAN_INTERVAL_SEC,
+                        cfg.storage_scan_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.storage_scan_interval_sec
+                    );
+                }
+            }
+        }
         if let Ok(v) = env::var("DB9_WORKER_SYSTEM_KEYSPACE") {
             cfg.system_keyspace = v;
         }
@@ -220,6 +246,7 @@ mod tests {
             "DB9_AUTO_ANALYZE_THRESHOLD",
             "DB9_WORKER_GC_INTERVAL_SEC",
             "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC",
+            "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC",
             "DB9_WORKER_SYSTEM_KEYSPACE",
         ];
 
@@ -247,6 +274,10 @@ mod tests {
         assert_eq!(cfg.auto_analyze_threshold, DEFAULT_AUTO_ANALYZE_THRESHOLD);
         assert_eq!(cfg.gc_interval_sec, DEFAULT_GC_INTERVAL_SEC);
         assert_eq!(cfg.hnsw_sweep_interval_sec, DEFAULT_HNSW_SWEEP_INTERVAL_SEC);
+        assert_eq!(
+            cfg.storage_scan_interval_sec,
+            DEFAULT_STORAGE_SCAN_INTERVAL_SEC
+        );
         assert_eq!(cfg.system_keyspace, DEFAULT_SYSTEM_KEYSPACE);
 
         for (key, value) in saved {
@@ -369,6 +400,7 @@ mod tests {
         assert_eq!(cfg.auto_analyze_threshold, 50);
         assert_eq!(cfg.gc_interval_sec, 600);
         assert_eq!(cfg.hnsw_sweep_interval_sec, 600);
+        assert_eq!(cfg.storage_scan_interval_sec, 1800);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
     }
 
