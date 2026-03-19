@@ -60,4 +60,7 @@ ERROR:  cannot call json_object_keys on an array
 ERROR:  cannot call json_object_keys on a scalar
 ERROR:  cannot call json_array_elements on a non-array
 ERROR:  cannot call json_array_elements_text on a non-array
+ERROR:  function json_object_keys(jsonb) does not exist
+ERROR:  function json_array_elements(jsonb) does not exist
+ERROR:  function json_array_elements_text(jsonb) does not exist
 

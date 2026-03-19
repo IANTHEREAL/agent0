@@ -45,3 +45,12 @@ SELECT json_array_elements('{"a":1}'::json);
 
 -- 14. Error: json_array_elements_text on a non-array → PG: "cannot call json_array_elements_text on a non-array"
 SELECT json_array_elements_text('{"a":1}'::json);
+
+-- 15. Error: json_object_keys on jsonb input → PG: "function json_object_keys(jsonb) does not exist"
+SELECT json_object_keys('{"a":1}'::jsonb);
+
+-- 16. Error: json_array_elements on jsonb input → PG: "function json_array_elements(jsonb) does not exist"
+SELECT json_array_elements('[1,2]'::jsonb);
+
+-- 17. Error: json_array_elements_text on jsonb input → PG: "function json_array_elements_text(jsonb) does not exist"
+SELECT json_array_elements_text('[1,2]'::jsonb);

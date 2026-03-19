@@ -324,11 +324,15 @@ pub fn jsonb_object_keys(args: Vec<Value>) -> Result<Value> {
 }
 
 /// json_object_keys for JSON type — preserves original key order by parsing raw string.
+/// PostgreSQL only defines json_object_keys(json); jsonb input must use jsonb_object_keys(jsonb).
 pub fn json_object_keys(args: Vec<Value>) -> Result<Value> {
     let json_str = match args.into_iter().next() {
-        Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+        Some(Value::Text(s)) | Some(Value::Json(s)) => s,
+        Some(Value::Jsonb(_)) => {
+            return Err(SqlError::FunctionNotFound("json_object_keys(jsonb)".into()).into())
+        }
         Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("json_object_keys requires json/jsonb argument")),
+        _ => return Err(anyhow!("json_object_keys requires json argument")),
     };
     // Validate it's an object — PostgreSQL distinguishes array vs. scalar errors
     let json_val: serde_json::Value = serde_json::from_str(&json_str)
@@ -743,9 +747,17 @@ fn jsonb_array_elements_impl(args: Vec<Value>, is_jsonb: bool) -> Result<Value> 
         "json_array_elements"
     };
     let json_str = match args.into_iter().next() {
-        Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+        Some(Value::Jsonb(s)) => {
+            if !is_jsonb {
+                // PostgreSQL only defines json_array_elements(json); jsonb input must use
+                // jsonb_array_elements(jsonb).
+                return Err(SqlError::FunctionNotFound("json_array_elements(jsonb)".into()).into());
+            }
+            s
+        }
+        Some(Value::Text(s)) | Some(Value::Json(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("{} requires json/jsonb argument", func_name)),
+        _ => return Err(anyhow!("{} requires json argument", func_name)),
     };
 
     // Parse the array to get element count and structure
@@ -866,15 +878,16 @@ pub fn jsonb_array_elements_text(args: Vec<Value>) -> Result<Value> {
 }
 
 /// json_array_elements_text for JSON type — preserves original key order in object elements.
+/// PostgreSQL only defines json_array_elements_text(json); jsonb input must use
+/// jsonb_array_elements_text(jsonb).
 pub fn json_array_elements_text(args: Vec<Value>) -> Result<Value> {
     let json_str = match args.into_iter().next() {
-        Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
-        Some(Value::Null) => return Ok(Value::Null),
-        _ => {
-            return Err(anyhow!(
-                "json_array_elements_text requires json/jsonb argument"
-            ))
+        Some(Value::Text(s)) | Some(Value::Json(s)) => s,
+        Some(Value::Jsonb(_)) => {
+            return Err(SqlError::FunctionNotFound("json_array_elements_text(jsonb)".into()).into())
         }
+        Some(Value::Null) => return Ok(Value::Null),
+        _ => return Err(anyhow!("json_array_elements_text requires json argument")),
     };
     // Validate it's an array
     let json_val: serde_json::Value = serde_json::from_str(&json_str)
