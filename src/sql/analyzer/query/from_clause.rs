@@ -15,6 +15,317 @@ use super::super::types::*;
 use super::super::Analyzer;
 
 impl<'a> Analyzer<'a> {
+    fn analyze_table_function_args(
+        &mut self,
+        func_args: &[ast::FunctionArg],
+    ) -> Result<Vec<TypedFunctionArg>, AnalyzerError> {
+        self.validate_no_positional_after_named(func_args)?;
+        let mut typed_args = Vec::with_capacity(func_args.len());
+        for arg in func_args {
+            match arg {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                    typed_args.push(TypedFunctionArg::Positional(self.analyze_expr(e)?));
+                }
+                ast::FunctionArg::Named {
+                    name,
+                    arg: ast::FunctionArgExpr::Expr(e),
+                    ..
+                } => {
+                    typed_args.push(TypedFunctionArg::Named {
+                        name: crate::sql::names::normalize_ident(name),
+                        expr: self.analyze_expr(e)?,
+                    });
+                }
+                _ => {
+                    return Err(AnalyzerError::Unsupported(
+                        "unsupported table function argument".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(typed_args)
+    }
+
+    fn analyze_named_table_function(
+        &mut self,
+        name: &ast::ObjectName,
+        alias: Option<&ast::TableAlias>,
+        func_args: &[ast::FunctionArg],
+    ) -> Result<AnalyzedTableRef, AnalyzerError> {
+        let (schema_opt, obj_name) =
+            split_object_name(name).map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+        let alias_str = alias
+            .as_ref()
+            .map(|a| normalize_ident(&a.name))
+            .unwrap_or_else(|| obj_name.clone());
+        let dispatch_name = if obj_name.eq_ignore_ascii_case("generate_series")
+            || obj_name.eq_ignore_ascii_case("unnest")
+            || obj_name.eq_ignore_ascii_case("_db9_sys_record_migration")
+            || obj_name.eq_ignore_ascii_case("current_schema")
+            || obj_name.eq_ignore_ascii_case("current_database")
+            || obj_name.eq_ignore_ascii_case("current_user")
+            || obj_name.eq_ignore_ascii_case("session_user")
+            || obj_name.eq_ignore_ascii_case("user")
+            || obj_name.eq_ignore_ascii_case("jsonb_object_keys")
+            || obj_name.eq_ignore_ascii_case("json_object_keys")
+            || obj_name.eq_ignore_ascii_case("jsonb_array_elements")
+            || obj_name.eq_ignore_ascii_case("json_array_elements")
+            || obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
+            || obj_name.eq_ignore_ascii_case("json_array_elements_text")
+            || obj_name.eq_ignore_ascii_case("jsonb_each")
+            || obj_name.eq_ignore_ascii_case("json_each")
+            || obj_name.eq_ignore_ascii_case("jsonb_each_text")
+            || obj_name.eq_ignore_ascii_case("json_each_text")
+            || obj_name.eq_ignore_ascii_case("chunk_text")
+        {
+            // Built-in table/scalar-in-FROM functions should keep their canonical
+            // dispatch name even when schema-qualified in SQL (e.g. pg_catalog.unnest).
+            obj_name.clone()
+        } else {
+            match &schema_opt {
+                Some(schema) => format!("{}.{}", schema, obj_name),
+                None => obj_name.clone(),
+            }
+        };
+
+        let typed_args = self.analyze_table_function_args(func_args)?;
+
+        let key = table_function_key(name, func_args);
+        let mut output_cols: Vec<(String, DataType, bool, Option<String>)> = if let Some(schema) =
+            self.catalog.resolve_table_function(&key)
+        {
+            schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.data_type.clone(),
+                        c.nullable,
+                        c.collation.clone(),
+                    )
+                })
+                .collect()
+        } else if obj_name.eq_ignore_ascii_case("generate_series") {
+            // generate_series(start, stop [, step]) returns a single column.
+            let positional: Vec<&TypedExpr> = typed_args
+                .iter()
+                .filter_map(|a| match a {
+                    TypedFunctionArg::Positional(e) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            if positional.len() < 2 {
+                return Err(AnalyzerError::Unsupported(
+                    "generate_series requires at least 2 arguments".to_string(),
+                ));
+            }
+
+            let start_ty = &positional[0].data_type;
+            let stop_ty = &positional[1].data_type;
+            let out_ty = if matches!(start_ty, DataType::Date) && matches!(stop_ty, DataType::Date)
+            {
+                DataType::TimestampTz
+            } else if matches!(start_ty, DataType::Timestamp)
+                && matches!(stop_ty, DataType::Timestamp)
+            {
+                DataType::Timestamp
+            } else if matches!(start_ty, DataType::Int32) && matches!(stop_ty, DataType::Int32) {
+                DataType::Int32
+            } else if matches!(start_ty, DataType::Int64) && matches!(stop_ty, DataType::Int64) {
+                DataType::Int64
+            } else if matches!(start_ty, DataType::Float64) && matches!(stop_ty, DataType::Float64)
+            {
+                DataType::Float64
+            } else if matches!(start_ty, DataType::Numeric { .. })
+                && matches!(stop_ty, DataType::Numeric { .. })
+            {
+                start_ty.clone()
+            } else if let Some(common) = common_type(start_ty, stop_ty) {
+                common
+            } else {
+                DataType::Text
+            };
+
+            // Column name semantics:
+            // - `FROM generate_series(...) AS n` -> column name "n"
+            // - `FROM generate_series(...) AS t(col)` -> column name "col"
+            let col_name = if let Some(ta) = alias {
+                if !ta.columns.is_empty() {
+                    crate::sql::names::normalize_ident(&ta.columns[0])
+                } else {
+                    crate::sql::names::normalize_ident(&ta.name)
+                }
+            } else {
+                "generate_series".to_string()
+            };
+
+            vec![(col_name, out_ty, false, None)]
+        } else if obj_name.eq_ignore_ascii_case("unnest") {
+            // unnest(array) as table-valued function (e.g. FROM pg_catalog.unnest(...))
+            let positional: Vec<&TypedExpr> = typed_args
+                .iter()
+                .filter_map(|a| match a {
+                    TypedFunctionArg::Positional(e) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            if positional.is_empty() {
+                return Err(AnalyzerError::Unsupported(
+                    "unnest requires at least 1 argument".to_string(),
+                ));
+            }
+            let elem_type = match &positional[0].data_type {
+                DataType::Array(inner) => inner.as_ref().clone(),
+                _ => DataType::Text,
+            };
+            let col_name = alias
+                .as_ref()
+                .map(|ta| {
+                    if !ta.columns.is_empty() {
+                        crate::sql::names::normalize_ident(&ta.columns[0])
+                    } else {
+                        crate::sql::names::normalize_ident(&ta.name)
+                    }
+                })
+                .unwrap_or_else(|| "unnest".to_string());
+            vec![(col_name, elem_type, true, None)]
+        } else if obj_name.eq_ignore_ascii_case("current_schema")
+            || obj_name.eq_ignore_ascii_case("current_database")
+            || obj_name.eq_ignore_ascii_case("current_user")
+            || obj_name.eq_ignore_ascii_case("session_user")
+            || obj_name.eq_ignore_ascii_case("user")
+        {
+            // Scalar functions used in FROM return a single-row, single-column relation.
+            let col_name = obj_name.to_lowercase();
+            vec![(col_name, DataType::Text, false, None)]
+        } else if obj_name.eq_ignore_ascii_case("jsonb_object_keys")
+            || obj_name.eq_ignore_ascii_case("json_object_keys")
+        {
+            let col_name = if let Some(ta) = alias {
+                if !ta.columns.is_empty() {
+                    crate::sql::names::normalize_ident(&ta.columns[0])
+                } else {
+                    crate::sql::names::normalize_ident(&ta.name)
+                }
+            } else {
+                obj_name.to_lowercase()
+            };
+            vec![(col_name, DataType::Text, false, None)]
+        } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements")
+            || obj_name.eq_ignore_ascii_case("json_array_elements")
+        {
+            let out_ty = if obj_name.eq_ignore_ascii_case("json_array_elements") {
+                DataType::Json
+            } else {
+                DataType::Jsonb
+            };
+            vec![("value".to_string(), out_ty, false, None)]
+        } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
+            || obj_name.eq_ignore_ascii_case("json_array_elements_text")
+        {
+            vec![("value".to_string(), DataType::Text, true, None)]
+        } else if obj_name.eq_ignore_ascii_case("jsonb_each")
+            || obj_name.eq_ignore_ascii_case("json_each")
+        {
+            let val_ty = if obj_name.eq_ignore_ascii_case("json_each") {
+                DataType::Json
+            } else {
+                DataType::Jsonb
+            };
+            vec![
+                ("key".to_string(), DataType::Text, false, None),
+                ("value".to_string(), val_ty, false, None),
+            ]
+        } else if obj_name.eq_ignore_ascii_case("jsonb_each_text")
+            || obj_name.eq_ignore_ascii_case("json_each_text")
+        {
+            vec![
+                ("key".to_string(), DataType::Text, false, None),
+                ("value".to_string(), DataType::Text, true, None),
+            ]
+        } else if obj_name.eq_ignore_ascii_case("chunk_text") {
+            // Require at least 1 arg (positional or named "content")
+            let has_content = typed_args
+                .iter()
+                .any(|a| matches!(a, TypedFunctionArg::Positional(_)))
+                || typed_args.iter().any(
+                    |a| matches!(a, TypedFunctionArg::Named { name, .. } if name == "content"),
+                );
+            if !has_content {
+                return Err(AnalyzerError::Unsupported(
+                    "chunk_text requires at least 1 argument (content TEXT)".to_string(),
+                ));
+            }
+            vec![
+                ("chunk_index".to_string(), DataType::Int32, false, None),
+                ("chunk_text".to_string(), DataType::Text, false, None),
+                ("chunk_pos".to_string(), DataType::Int32, false, None),
+            ]
+        } else if obj_name.eq_ignore_ascii_case("_db9_sys_record_migration") {
+            vec![
+                ("name".to_string(), DataType::Text, false, None),
+                ("applied_at".to_string(), DataType::Text, false, None),
+                ("status".to_string(), DataType::Text, false, None),
+            ]
+        } else {
+            return Err(AnalyzerError::Unsupported(format!(
+                "unsupported table-valued function: {}",
+                obj_name
+            )));
+        };
+
+        // Apply alias column list (renames output columns).
+        if let Some(ta) = alias {
+            if !ta.columns.is_empty() {
+                if ta.columns.len() != output_cols.len() {
+                    return Err(AnalyzerError::Unsupported(format!(
+                        "table function alias column count mismatch: expected {}, got {}",
+                        output_cols.len(),
+                        ta.columns.len()
+                    )));
+                }
+                for (i, ident) in ta.columns.iter().enumerate() {
+                    output_cols[i].0 = crate::sql::names::normalize_ident(ident);
+                }
+            }
+        }
+
+        let col_start = self.scopes.current().column_count();
+        self.scopes
+            .current_mut()
+            .add_table_without_system_columns(&alias_str, &output_cols);
+        let col_end = self.scopes.current().column_count();
+        self.scopes
+            .current_mut()
+            .set_table_source_relation(&alias_str, "", col_start..col_end);
+        if output_cols.len() == 1 {
+            self.scopes
+                .current_mut()
+                .register_single_column_function_alias(&alias_str, col_start);
+        }
+
+        let output_columns: Vec<(String, DataType)> = output_cols
+            .iter()
+            .map(|(n, dt, _, _)| (n.clone(), dt.clone()))
+            .collect();
+
+        let func = ResolvedFunction {
+            name: dispatch_name,
+            kind: FunctionKind::Builtin,
+            return_type: DataType::Text,
+        };
+
+        Ok(AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Function {
+                func,
+                args: typed_args,
+                output_columns,
+            },
+            alias: Some(alias_str),
+        })
+    }
+
     pub(super) fn analyze_from(
         &mut self,
         from: &[TableWithJoins],
@@ -84,310 +395,20 @@ impl<'a> Analyzer<'a> {
                 alias,
                 args: Some(func_args),
                 ..
-            } => {
-                // Table-valued function call in FROM.
+            } => self.analyze_named_table_function(name, alias.as_ref(), func_args),
 
-                let (schema_opt, obj_name) = split_object_name(name)
-                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
-                let alias_str = alias
-                    .as_ref()
-                    .map(|a| normalize_ident(&a.name))
-                    .unwrap_or_else(|| obj_name.clone());
-                let dispatch_name = if obj_name.eq_ignore_ascii_case("generate_series")
-                    || obj_name.eq_ignore_ascii_case("unnest")
-                    || obj_name.eq_ignore_ascii_case("_db9_sys_record_migration")
-                    || obj_name.eq_ignore_ascii_case("current_schema")
-                    || obj_name.eq_ignore_ascii_case("current_database")
-                    || obj_name.eq_ignore_ascii_case("current_user")
-                    || obj_name.eq_ignore_ascii_case("session_user")
-                    || obj_name.eq_ignore_ascii_case("user")
-                    || obj_name.eq_ignore_ascii_case("jsonb_object_keys")
-                    || obj_name.eq_ignore_ascii_case("json_object_keys")
-                    || obj_name.eq_ignore_ascii_case("jsonb_array_elements")
-                    || obj_name.eq_ignore_ascii_case("json_array_elements")
-                    || obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
-                    || obj_name.eq_ignore_ascii_case("json_array_elements_text")
-                    || obj_name.eq_ignore_ascii_case("jsonb_each")
-                    || obj_name.eq_ignore_ascii_case("json_each")
-                    || obj_name.eq_ignore_ascii_case("jsonb_each_text")
-                    || obj_name.eq_ignore_ascii_case("json_each_text")
-                    || obj_name.eq_ignore_ascii_case("chunk_text")
-                {
-                    // Built-in table/scalar-in-FROM functions should keep their canonical
-                    // dispatch name even when schema-qualified in SQL (e.g. pg_catalog.unnest).
-                    obj_name.clone()
-                } else {
-                    match &schema_opt {
-                        Some(schema) => format!("{}.{}", schema, obj_name),
-                        None => obj_name.clone(),
-                    }
-                };
+            TableFactor::Function {
+                name, args, alias, ..
+            } => self.analyze_named_table_function(name, alias.as_ref(), args),
 
-                // Analyze function arguments, preserving named parameters.
-                self.validate_no_positional_after_named(func_args)?;
-                let mut typed_args = Vec::with_capacity(func_args.len());
-                for arg in func_args {
-                    match arg {
-                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                            typed_args.push(TypedFunctionArg::Positional(self.analyze_expr(e)?));
-                        }
-                        ast::FunctionArg::Named {
-                            name,
-                            arg: ast::FunctionArgExpr::Expr(e),
-                            ..
-                        } => {
-                            typed_args.push(TypedFunctionArg::Named {
-                                name: crate::sql::names::normalize_ident(name),
-                                expr: self.analyze_expr(e)?,
-                            });
-                        }
-                        _ => {
-                            return Err(AnalyzerError::Unsupported(
-                                "unsupported table function argument".to_string(),
-                            ));
-                        }
-                    }
+            TableFactor::TableFunction { expr, alias } => match expr {
+                ast::Expr::Function(func) => {
+                    self.analyze_named_table_function(&func.name, alias.as_ref(), &func.args)
                 }
-
-                let key = table_function_key(name, func_args);
-                let mut output_cols: Vec<(String, DataType, bool, Option<String>)> =
-                    if let Some(schema) = self.catalog.resolve_table_function(&key) {
-                        schema
-                            .columns
-                            .iter()
-                            .map(|c| {
-                                (
-                                    c.name.clone(),
-                                    c.data_type.clone(),
-                                    c.nullable,
-                                    c.collation.clone(),
-                                )
-                            })
-                            .collect()
-                    } else if obj_name.eq_ignore_ascii_case("generate_series") {
-                        // generate_series(start, stop [, step]) returns a single column.
-                        let positional: Vec<&TypedExpr> = typed_args
-                            .iter()
-                            .filter_map(|a| match a {
-                                TypedFunctionArg::Positional(e) => Some(e),
-                                _ => None,
-                            })
-                            .collect();
-                        if positional.len() < 2 {
-                            return Err(AnalyzerError::Unsupported(
-                                "generate_series requires at least 2 arguments".to_string(),
-                            ));
-                        }
-
-                        let start_ty = &positional[0].data_type;
-                        let stop_ty = &positional[1].data_type;
-                        let out_ty = if matches!(start_ty, DataType::Date)
-                            && matches!(stop_ty, DataType::Date)
-                        {
-                            DataType::TimestampTz
-                        } else if matches!(start_ty, DataType::Timestamp)
-                            && matches!(stop_ty, DataType::Timestamp)
-                        {
-                            DataType::Timestamp
-                        } else if matches!(start_ty, DataType::Int32)
-                            && matches!(stop_ty, DataType::Int32)
-                        {
-                            DataType::Int32
-                        } else if matches!(start_ty, DataType::Int64)
-                            && matches!(stop_ty, DataType::Int64)
-                        {
-                            DataType::Int64
-                        } else if matches!(start_ty, DataType::Float64)
-                            && matches!(stop_ty, DataType::Float64)
-                        {
-                            DataType::Float64
-                        } else if matches!(start_ty, DataType::Numeric { .. })
-                            && matches!(stop_ty, DataType::Numeric { .. })
-                        {
-                            start_ty.clone()
-                        } else if let Some(common) = common_type(start_ty, stop_ty) {
-                            common
-                        } else {
-                            DataType::Text
-                        };
-
-                        // Column name semantics:
-                        // - `FROM generate_series(...) AS n` -> column name "n"
-                        // - `FROM generate_series(...) AS t(col)` -> column name "col"
-                        let col_name = if let Some(ta) = alias {
-                            if !ta.columns.is_empty() {
-                                crate::sql::names::normalize_ident(&ta.columns[0])
-                            } else {
-                                crate::sql::names::normalize_ident(&ta.name)
-                            }
-                        } else {
-                            "generate_series".to_string()
-                        };
-
-                        vec![(col_name, out_ty, false, None)]
-                    } else if obj_name.eq_ignore_ascii_case("unnest") {
-                        // unnest(array) as table-valued function (e.g. FROM pg_catalog.unnest(...))
-                        let positional: Vec<&TypedExpr> = typed_args
-                            .iter()
-                            .filter_map(|a| match a {
-                                TypedFunctionArg::Positional(e) => Some(e),
-                                _ => None,
-                            })
-                            .collect();
-                        if positional.is_empty() {
-                            return Err(AnalyzerError::Unsupported(
-                                "unnest requires at least 1 argument".to_string(),
-                            ));
-                        }
-                        let elem_type = match &positional[0].data_type {
-                            DataType::Array(inner) => inner.as_ref().clone(),
-                            _ => DataType::Text,
-                        };
-                        let col_name = alias
-                            .as_ref()
-                            .map(|ta| {
-                                if !ta.columns.is_empty() {
-                                    crate::sql::names::normalize_ident(&ta.columns[0])
-                                } else {
-                                    crate::sql::names::normalize_ident(&ta.name)
-                                }
-                            })
-                            .unwrap_or_else(|| "unnest".to_string());
-                        vec![(col_name, elem_type, true, None)]
-                    } else if obj_name.eq_ignore_ascii_case("current_schema")
-                        || obj_name.eq_ignore_ascii_case("current_database")
-                        || obj_name.eq_ignore_ascii_case("current_user")
-                        || obj_name.eq_ignore_ascii_case("session_user")
-                        || obj_name.eq_ignore_ascii_case("user")
-                    {
-                        // Scalar functions used in FROM return a single-row, single-column relation.
-                        let col_name = obj_name.to_lowercase();
-                        vec![(col_name, DataType::Text, false, None)]
-                    } else if obj_name.eq_ignore_ascii_case("jsonb_object_keys")
-                        || obj_name.eq_ignore_ascii_case("json_object_keys")
-                    {
-                        let col_name = if let Some(ta) = alias {
-                            if !ta.columns.is_empty() {
-                                crate::sql::names::normalize_ident(&ta.columns[0])
-                            } else {
-                                crate::sql::names::normalize_ident(&ta.name)
-                            }
-                        } else {
-                            obj_name.to_lowercase()
-                        };
-                        vec![(col_name, DataType::Text, false, None)]
-                    } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements")
-                        || obj_name.eq_ignore_ascii_case("json_array_elements")
-                    {
-                        let out_ty = if obj_name.eq_ignore_ascii_case("json_array_elements") {
-                            DataType::Json
-                        } else {
-                            DataType::Jsonb
-                        };
-                        vec![("value".to_string(), out_ty, false, None)]
-                    } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
-                        || obj_name.eq_ignore_ascii_case("json_array_elements_text")
-                    {
-                        vec![("value".to_string(), DataType::Text, true, None)]
-                    } else if obj_name.eq_ignore_ascii_case("jsonb_each")
-                        || obj_name.eq_ignore_ascii_case("json_each")
-                    {
-                        let val_ty = if obj_name.eq_ignore_ascii_case("json_each") {
-                            DataType::Json
-                        } else {
-                            DataType::Jsonb
-                        };
-                        vec![
-                            ("key".to_string(), DataType::Text, false, None),
-                            ("value".to_string(), val_ty, false, None),
-                        ]
-                    } else if obj_name.eq_ignore_ascii_case("jsonb_each_text")
-                        || obj_name.eq_ignore_ascii_case("json_each_text")
-                    {
-                        vec![
-                            ("key".to_string(), DataType::Text, false, None),
-                            ("value".to_string(), DataType::Text, true, None),
-                        ]
-                    } else if obj_name.eq_ignore_ascii_case("chunk_text") {
-                        // Require at least 1 arg (positional or named "content")
-                        let has_content = typed_args
-                            .iter()
-                            .any(|a| matches!(a, TypedFunctionArg::Positional(_)))
-                            || typed_args.iter().any(|a| {
-                                matches!(a,
-                                TypedFunctionArg::Named { name, .. } if name == "content")
-                            });
-                        if !has_content {
-                            return Err(AnalyzerError::Unsupported(
-                                "chunk_text requires at least 1 argument (content TEXT)"
-                                    .to_string(),
-                            ));
-                        }
-                        vec![
-                            ("chunk_index".to_string(), DataType::Int32, false, None),
-                            ("chunk_text".to_string(), DataType::Text, false, None),
-                            ("chunk_pos".to_string(), DataType::Int32, false, None),
-                        ]
-                    } else if obj_name.eq_ignore_ascii_case("_db9_sys_record_migration") {
-                        vec![
-                            ("name".to_string(), DataType::Text, false, None),
-                            ("applied_at".to_string(), DataType::Text, false, None),
-                            ("status".to_string(), DataType::Text, false, None),
-                        ]
-                    } else {
-                        return Err(AnalyzerError::Unsupported(format!(
-                            "unsupported table-valued function: {}",
-                            obj_name
-                        )));
-                    };
-
-                // Apply alias column list (renames output columns).
-                if let Some(ta) = alias {
-                    if !ta.columns.is_empty() {
-                        if ta.columns.len() != output_cols.len() {
-                            return Err(AnalyzerError::Unsupported(format!(
-                                "table function alias column count mismatch: expected {}, got {}",
-                                output_cols.len(),
-                                ta.columns.len()
-                            )));
-                        }
-                        for (i, ident) in ta.columns.iter().enumerate() {
-                            output_cols[i].0 = crate::sql::names::normalize_ident(ident);
-                        }
-                    }
-                }
-
-                let col_start = self.scopes.current().column_count();
-                self.scopes
-                    .current_mut()
-                    .add_table_without_system_columns(&alias_str, &output_cols);
-                let col_end = self.scopes.current().column_count();
-                self.scopes.current_mut().set_table_source_relation(
-                    &alias_str,
-                    "",
-                    col_start..col_end,
-                );
-
-                let output_columns: Vec<(String, DataType)> = output_cols
-                    .iter()
-                    .map(|(n, dt, _, _)| (n.clone(), dt.clone()))
-                    .collect();
-
-                let func = ResolvedFunction {
-                    name: dispatch_name,
-                    kind: FunctionKind::Builtin,
-                    return_type: DataType::Text,
-                };
-
-                Ok(AnalyzedTableRef {
-                    kind: AnalyzedTableRefKind::Function {
-                        func,
-                        args: typed_args,
-                        output_columns,
-                    },
-                    alias: Some(alias_str),
-                })
-            }
+                _ => Err(AnalyzerError::Unsupported(
+                    "TABLE(expr) requires a function call".to_string(),
+                )),
+            },
 
             TableFactor::Table {
                 name,
@@ -443,6 +464,11 @@ impl<'a> Analyzer<'a> {
                             "",
                             col_start..col_end,
                         );
+                        if output_cols.len() == 1 {
+                            self.scopes
+                                .current_mut()
+                                .register_single_column_function_alias(&alias_str, col_start);
+                        }
 
                         let output_columns: Vec<(String, DataType)> = output_cols
                             .iter()
@@ -657,6 +683,11 @@ impl<'a> Analyzer<'a> {
                     "",
                     col_start..col_end,
                 );
+                if output_cols.len() == 1 {
+                    self.scopes
+                        .current_mut()
+                        .register_single_column_function_alias(&alias_str, col_start);
+                }
 
                 let output_columns: Vec<(String, DataType)> = output_cols
                     .iter()

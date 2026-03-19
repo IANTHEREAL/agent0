@@ -272,6 +272,26 @@ fn test_extract_table_function_calls_skips_regular_tables() {
 }
 
 #[test]
+fn test_extract_table_function_calls_from_lateral_function_variant() {
+    let query = parse_query(
+        "SELECT * FROM users u, LATERAL jsonb_array_elements_text(u.tags::jsonb) AS e(val)",
+    );
+    let calls = extract_table_function_calls(&query);
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected lateral function call to be collected"
+    );
+    let call = &calls[0];
+    assert_eq!(
+        call.name_parts,
+        vec!["jsonb_array_elements_text".to_string()]
+    );
+    assert_eq!(call.args.len(), 1);
+    assert!(call.key.contains("jsonb_array_elements_text"));
+}
+
+#[test]
 fn test_extract_scalar_functions_dedup_with_qualified_names() {
     let query = parse_query(
         "SELECT public.my_udf(v), public.my_udf(v + 1), pg_catalog.lower(name), lower(name) FROM t",

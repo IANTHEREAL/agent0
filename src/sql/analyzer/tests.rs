@@ -1555,6 +1555,143 @@ fn analyze_rejects_positional_after_named_in_scalar_call_with_42601() {
     assert_eq!(sql.sqlstate(), "42601");
 }
 
+#[test]
+fn analyze_lateral_json_array_elements_text_with_column_alias() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "claw_tasks",
+            vec![
+                ("id", DataType::Int32, false),
+                ("title", DataType::Text, true),
+                ("skills", DataType::Jsonb, true),
+                ("attachments", DataType::Jsonb, true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat(
+        "SELECT t.title, e.val \
+         FROM claw_tasks t, LATERAL jsonb_array_elements_text(t.skills) AS e(val)",
+    );
+
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    assert_eq!(select.from.len(), 2);
+    assert_eq!(select.projection[1].output_name, "val");
+    assert_eq!(select.projection[1].expr.data_type, DataType::Text);
+
+    let lateral_ref = &select.from[1];
+    assert_eq!(lateral_ref.alias.as_deref(), Some("e"));
+    let AnalyzedTableRefKind::Function {
+        func,
+        args,
+        output_columns,
+    } = &lateral_ref.kind
+    else {
+        panic!("expected function table ref");
+    };
+
+    assert_eq!(func.name, "jsonb_array_elements_text");
+    assert_eq!(output_columns, &vec![("val".to_string(), DataType::Text)]);
+    assert_eq!(args.len(), 1);
+    match &args[0] {
+        TypedFunctionArg::Positional(expr) => {
+            assert_eq!(expr.data_type, DataType::Jsonb);
+            match &expr.kind {
+                TypedExprKind::ColumnRef { column_name, .. } => {
+                    assert_eq!(column_name, "skills");
+                }
+                other => panic!(
+                    "expected ColumnRef arg, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            }
+        }
+        other => panic!("expected positional arg, got {other:?}"),
+    }
+}
+
+#[test]
+fn analyze_single_column_table_function_alias_resolves_as_scalar() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "claw_tasks",
+            vec![
+                ("id", DataType::Int32, false),
+                ("title", DataType::Text, true),
+                ("skills", DataType::Jsonb, true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat(
+        "SELECT skill \
+         FROM claw_tasks, jsonb_array_elements_text(skills) AS skill",
+    );
+
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    assert_eq!(select.projection[0].output_name, "skill");
+    assert_eq!(select.projection[0].expr.data_type, DataType::Text);
+    match &select.projection[0].expr.kind {
+        TypedExprKind::ColumnRef { column_name, .. } => assert_eq!(column_name, "value"),
+        other => panic!(
+            "expected ColumnRef, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_single_column_json_table_function_alias_supports_arrow_ops() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "claw_tasks",
+            vec![
+                ("id", DataType::Int32, false),
+                ("attachments", DataType::Jsonb, true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat(
+        "SELECT att->>'name' \
+         FROM claw_tasks, jsonb_array_elements(attachments) AS att",
+    );
+
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    assert_eq!(select.projection[0].expr.data_type, DataType::Text);
+}
+
+#[test]
+fn analyze_real_column_beats_single_column_function_alias() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "alias_shadow_test",
+            vec![
+                ("skill", DataType::Text, true),
+                ("skills", DataType::Jsonb, true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat(
+        "SELECT skill \
+         FROM alias_shadow_test, jsonb_array_elements_text(skills) AS skill",
+    );
+
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    match &select.projection[0].expr.kind {
+        TypedExprKind::ColumnRef { column_name, .. } => assert_eq!(column_name, "skill"),
+        other => panic!(
+            "expected ColumnRef, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
 // ── Implicit cast insertion ─────────────────────────────────
 
 #[test]
@@ -1966,6 +2103,42 @@ fn analyze_join_using_incompatible_types_rejected() {
     let query = parse_query("SELECT * FROM a JOIN b USING (id)");
     let err = analyzer.analyze_query(&query).unwrap_err();
     assert!(matches!(err, AnalyzerError::OperatorTypeMismatch { .. }));
+}
+
+#[test]
+fn analyze_join_using_mismatch_uses_pg_display_names() {
+    let catalog = MockCatalog::builder()
+        .table("a", vec![("id", DataType::Float64, false)])
+        .table("b", vec![("id", DataType::Date, false)])
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM a JOIN b USING (id)");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "="
+                && left == "double precision"
+                && right == "date"
+    ));
+}
+
+#[test]
+fn analyze_natural_join_mismatch_uses_pg_display_names() {
+    let catalog = MockCatalog::builder()
+        .table("a", vec![("id", DataType::Float64, false)])
+        .table("b", vec![("id", DataType::Date, false)])
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM a NATURAL JOIN b");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "="
+                && left == "double precision"
+                && right == "date"
+    ));
 }
 
 #[test]

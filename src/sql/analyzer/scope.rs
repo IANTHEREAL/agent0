@@ -105,6 +105,10 @@ pub struct Scope {
     /// changing row-width accounting for unrelated queries.
     table_source_relations: HashMap<String, Vec<(String, Range<usize>)>>,
 
+    /// Single-column table-function aliases that PostgreSQL allows to resolve
+    /// as bare scalar identifiers (e.g. `SELECT gs FROM generate_series(...) AS gs`).
+    single_column_function_aliases: HashMap<String, Vec<usize>>,
+
     /// Whether aggregate functions are allowed in expressions at this level.
     pub allow_aggregates: bool,
 
@@ -136,6 +140,7 @@ impl Scope {
             cte_schemas: HashMap::new(),
             table_source_schemas: HashMap::new(),
             table_source_relations: HashMap::new(),
+            single_column_function_aliases: HashMap::new(),
             allow_aggregates: false,
             allow_windows: false,
             add_system_columns: false,
@@ -177,6 +182,15 @@ impl Scope {
             .entry(alias.to_string())
             .or_default()
             .push((relation.to_lowercase(), col_range));
+    }
+
+    /// Register a table-function alias that should resolve as a scalar when it
+    /// produces exactly one column, matching PostgreSQL behavior.
+    pub fn register_single_column_function_alias(&mut self, alias: &str, column_index: usize) {
+        self.single_column_function_aliases
+            .entry(alias.to_string())
+            .or_default()
+            .push(column_index);
     }
 
     fn alias_matches_relation_ident(&self, table: &Ident, relation: &str) -> bool {
@@ -412,6 +426,43 @@ impl Scope {
         })
     }
 
+    pub fn resolve_single_column_function_alias_ident(
+        &self,
+        ident: &Ident,
+    ) -> Result<Option<ResolvedColumnRef>, AnalyzerError> {
+        let positions: Vec<usize> = self
+            .single_column_function_aliases
+            .iter()
+            .filter(|(alias, _)| Self::ident_matches_name(alias, ident))
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect();
+
+        match positions.as_slice() {
+            [] => Ok(None),
+            [only] => {
+                let col = &self.columns[*only];
+                Ok(Some(ResolvedColumnRef {
+                    scope_depth: 0,
+                    column_index: col.column_index,
+                    column_name: col.column_name.clone(),
+                    data_type: col.data_type.clone(),
+                    merged_using: None,
+                    collation: col.collation.clone(),
+                }))
+            }
+            _ => {
+                let tables: Vec<String> = positions
+                    .iter()
+                    .filter_map(|&pos| self.columns[pos].table_alias.clone())
+                    .collect();
+                Err(AnalyzerError::AmbiguousColumn {
+                    name: ident.value.clone(),
+                    tables,
+                })
+            }
+        }
+    }
+
     /// Return all columns for a table alias identified by SQL identifier rules.
     pub fn columns_for_table_alias_ident(&self, table: &Ident) -> Vec<&ScopeColumn> {
         self.columns
@@ -531,19 +582,27 @@ impl ScopeStack {
     /// Resolve a column reference with SQL identifier semantics.
     pub fn resolve_column_ident(&self, ident: &Ident) -> Result<ResolvedColumnRef, AnalyzerError> {
         for (i, scope) in self.scopes.iter().rev().enumerate() {
-            match scope.resolve_unqualified_with_ident(ident)? {
-                Some(mut resolved) => {
-                    resolved.scope_depth = i as u32;
-                    return Ok(ResolvedColumnRef {
-                        scope_depth: resolved.scope_depth,
-                        column_index: resolved.column_index,
-                        column_name: resolved.column_name,
-                        data_type: resolved.data_type,
-                        merged_using: resolved.merged_using,
-                        collation: resolved.collation,
-                    });
-                }
-                None => continue,
+            if let Some(mut resolved) = scope.resolve_unqualified_with_ident(ident)? {
+                resolved.scope_depth = i as u32;
+                return Ok(ResolvedColumnRef {
+                    scope_depth: resolved.scope_depth,
+                    column_index: resolved.column_index,
+                    column_name: resolved.column_name,
+                    data_type: resolved.data_type,
+                    merged_using: resolved.merged_using,
+                    collation: resolved.collation,
+                });
+            }
+            if let Some(mut resolved) = scope.resolve_single_column_function_alias_ident(ident)? {
+                resolved.scope_depth = i as u32;
+                return Ok(ResolvedColumnRef {
+                    scope_depth: resolved.scope_depth,
+                    column_index: resolved.column_index,
+                    column_name: resolved.column_name,
+                    data_type: resolved.data_type,
+                    merged_using: resolved.merged_using,
+                    collation: resolved.collation,
+                });
             }
         }
 

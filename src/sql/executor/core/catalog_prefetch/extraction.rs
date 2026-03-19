@@ -75,24 +75,35 @@ struct TableFunctionCollector {
     calls: Vec<TableFunctionCall>,
 }
 
+impl TableFunctionCollector {
+    fn push_call(&mut self, name: &ObjectName, args: &[sqlparser::ast::FunctionArg]) {
+        let key = table_function_key(name, args);
+        let name_parts: Vec<String> = name.0.iter().map(names::normalize_ident).collect();
+        self.calls.push(TableFunctionCall {
+            key,
+            name: name.clone(),
+            name_parts,
+            args: args.to_vec(),
+        });
+    }
+}
+
 impl Visitor for TableFunctionCollector {
     type Break = ();
 
     fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
-        if let TableFactor::Table {
-            name,
-            args: Some(args),
-            ..
-        } = table_factor
-        {
-            let key = table_function_key(name, args);
-            let name_parts: Vec<String> = name.0.iter().map(names::normalize_ident).collect();
-            self.calls.push(TableFunctionCall {
-                key,
-                name: name.clone(),
-                name_parts,
-                args: args.clone(),
-            });
+        match table_factor {
+            TableFactor::Table {
+                name,
+                args: Some(args),
+                ..
+            }
+            | TableFactor::Function { name, args, .. } => self.push_call(name, args),
+            TableFactor::TableFunction {
+                expr: sqlparser::ast::Expr::Function(func),
+                ..
+            } => self.push_call(&func.name, &func.args),
+            _ => {}
         }
         ControlFlow::Continue(())
     }
