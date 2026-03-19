@@ -131,9 +131,7 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "JSON_OBJECT_KEYS",
-        FunctionSignature::fixed(DataType::Text)
-            .with_args(1, Some(1))
-            .with_arg_types(vec![DataType::Json]),
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
     );
     r.register(
         "JSONB_ARRAY_ELEMENTS",
@@ -141,9 +139,7 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "JSON_ARRAY_ELEMENTS",
-        FunctionSignature::fixed(DataType::Json)
-            .with_args(1, Some(1))
-            .with_arg_types(vec![DataType::Json]),
+        FunctionSignature::fixed(DataType::Json).with_args(1, Some(1)),
     );
     r.register(
         "JSONB_ARRAY_ELEMENTS_TEXT",
@@ -151,9 +147,7 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "JSON_ARRAY_ELEMENTS_TEXT",
-        FunctionSignature::fixed(DataType::Text)
-            .with_args(1, Some(1))
-            .with_arg_types(vec![DataType::Json]),
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
     );
     r.register(
         "JSONB_EACH",

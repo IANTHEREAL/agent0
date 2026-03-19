@@ -26,11 +26,8 @@ pub(crate) fn detect_srf(expr: &TypedExpr) -> Option<SrfKind> {
         "UNNEST" => Some(SrfKind::Unnest),
         "REGEXP_SPLIT_TO_TABLE" => Some(SrfKind::RegexpSplitToTable),
         "REGEXP_MATCHES" => Some(SrfKind::RegexpMatches),
-        "JSON_OBJECT_KEYS"
-        | "JSONB_OBJECT_KEYS"
-        | "JSON_ARRAY_ELEMENTS"
+        "JSONB_OBJECT_KEYS"
         | "JSONB_ARRAY_ELEMENTS"
-        | "JSON_ARRAY_ELEMENTS_TEXT"
         | "JSONB_ARRAY_ELEMENTS_TEXT"
         | "JSON_EACH"
         | "JSONB_EACH"

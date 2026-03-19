@@ -406,21 +406,6 @@ impl<'a> Analyzer<'a> {
                 }
             }
 
-            // json_object_keys, json_array_elements, json_array_elements_text only
-            // accept json, not jsonb.  PostgreSQL rejects jsonb at function resolution
-            // (SQLSTATE 42883), not at execution time.
-            if matches!(
-                func_name.as_str(),
-                "JSON_OBJECT_KEYS" | "JSON_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT"
-            ) {
-                if let Some(DataType::Jsonb) = arg_types.first() {
-                    return Err(AnalyzerError::FunctionNotFound {
-                        name: func_name.to_lowercase(),
-                        arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
-                    });
-                }
-            }
-
             // Reject window-only functions used without OVER clause.
             // Functions like ROW_NUMBER(), RANK() are meaningless without a window.
             if sig.is_window && !sig.is_aggregate && func.over.is_none() {

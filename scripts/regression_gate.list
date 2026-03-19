@@ -121,8 +121,6 @@ tests/246_jsonb_path_filter.sql
 tests/280_jsonb_concat_operator_issue1473.sql
 tests/72_json_advanced.sql
 tests/277_jsonb_each_error_name.sql
-# #1791 – JSON SRFs in SELECT-list expansion parity
-tests/1791_json_srf_select_list_expansion.sql
 tests/73_system_functions.sql
 # COPY FROM (protocol correctness)
 tests/110_copy_from_stdin_column_mismatch.sql

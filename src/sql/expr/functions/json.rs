@@ -18,7 +18,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSONB_EXISTS_ANY", jsonb_exists_any);
     map.insert("JSONB_EXISTS_ALL", jsonb_exists_all);
     map.insert("JSONB_OBJECT_KEYS", jsonb_object_keys);
-    map.insert("JSON_OBJECT_KEYS", json_object_keys);
+    map.insert("JSON_OBJECT_KEYS", jsonb_object_keys);
     map.insert("JSONB_EXTRACT_PATH", jsonb_extract_path);
     map.insert("JSON_EXTRACT_PATH", jsonb_extract_path);
     map.insert("JSONB_EXTRACT_PATH_TEXT", jsonb_extract_path_text);
@@ -30,9 +30,9 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSONB_SET", jsonb_set);
     map.insert("JSON_SET", jsonb_set);
     map.insert("JSONB_ARRAY_ELEMENTS", jsonb_array_elements);
-    map.insert("JSON_ARRAY_ELEMENTS", json_array_elements);
+    map.insert("JSON_ARRAY_ELEMENTS", jsonb_array_elements);
     map.insert("JSONB_ARRAY_ELEMENTS_TEXT", jsonb_array_elements_text);
-    map.insert("JSON_ARRAY_ELEMENTS_TEXT", json_array_elements_text);
+    map.insert("JSON_ARRAY_ELEMENTS_TEXT", jsonb_array_elements_text);
     map.insert("JSONB_EACH", jsonb_each);
     map.insert("JSON_EACH", json_each);
     map.insert("JSONB_EACH_TEXT", jsonb_each_text);
@@ -321,112 +321,6 @@ pub fn jsonb_object_keys(args: Vec<Value>) -> Result<Value> {
         }
         _ => Err(anyhow!("cannot call jsonb_object_keys on a non-object")),
     }
-}
-
-/// json_object_keys for JSON type — preserves original key order by parsing raw string.
-/// PostgreSQL only defines json_object_keys(json); jsonb input must use jsonb_object_keys(jsonb).
-pub fn json_object_keys(args: Vec<Value>) -> Result<Value> {
-    let json_str = match args.into_iter().next() {
-        Some(Value::Text(s)) | Some(Value::Json(s)) => s,
-        Some(Value::Jsonb(_)) => {
-            return Err(SqlError::FunctionNotFound("json_object_keys(jsonb)".into()).into())
-        }
-        Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("json_object_keys requires json argument")),
-    };
-    // Validate it's an object — PostgreSQL distinguishes array vs. scalar errors
-    let json_val: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
-    match &json_val {
-        serde_json::Value::Object(_) => {}
-        serde_json::Value::Array(_) => {
-            return Err(anyhow!("cannot call json_object_keys on an array"));
-        }
-        _ => {
-            return Err(anyhow!("cannot call json_object_keys on a scalar"));
-        }
-    }
-    let keys = extract_json_object_keys_raw(&json_str);
-    Ok(Value::Array(keys.into_iter().map(Value::Text).collect()))
-}
-
-/// Extract object keys from a raw JSON object string, preserving original order.
-fn extract_json_object_keys_raw(json_str: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let chars: Vec<char> = json_str.trim().chars().collect();
-    if chars.is_empty() || chars[0] != '{' {
-        return keys;
-    }
-
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut expect_key = true; // After '{' or ',' at depth 1, next string is a key
-
-    for (i, &c) in chars.iter().enumerate() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            if !in_string {
-                in_string = true;
-                if depth == 1 && expect_key {
-                    // Start of a key — find the closing quote
-                    let key_start = i + 1;
-                    let mut key_end = key_start;
-                    let mut esc = false;
-                    for (j, &kc) in chars[key_start..].iter().enumerate() {
-                        if esc {
-                            esc = false;
-                            continue;
-                        }
-                        if kc == '\\' {
-                            esc = true;
-                            continue;
-                        }
-                        if kc == '"' {
-                            key_end = key_start + j;
-                            break;
-                        }
-                    }
-                    let raw_key: String = chars[key_start..key_end].iter().collect();
-                    // Unescape JSON string escapes
-                    if let Ok(serde_json::Value::String(unescaped)) =
-                        serde_json::from_str(&format!("\"{}\"", raw_key))
-                    {
-                        keys.push(unescaped);
-                    } else {
-                        keys.push(raw_key);
-                    }
-                    expect_key = false;
-                }
-            } else {
-                in_string = false;
-            }
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if c == '{' || c == '[' {
-            depth += 1;
-            continue;
-        }
-        if c == '}' || c == ']' {
-            depth -= 1;
-            continue;
-        }
-        if c == ',' && depth == 1 {
-            expect_key = true;
-        }
-    }
-
-    keys
 }
 
 pub fn jsonb_extract_path(args: Vec<Value>) -> Result<Value> {
@@ -733,118 +627,23 @@ pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn jsonb_array_elements(args: Vec<Value>) -> Result<Value> {
-    jsonb_array_elements_impl(args, true)
-}
-
-pub fn json_array_elements(args: Vec<Value>) -> Result<Value> {
-    jsonb_array_elements_impl(args, false)
-}
-
-fn jsonb_array_elements_impl(args: Vec<Value>, is_jsonb: bool) -> Result<Value> {
-    let func_name = if is_jsonb {
-        "jsonb_array_elements"
-    } else {
-        "json_array_elements"
-    };
     let json_str = match args.into_iter().next() {
-        Some(Value::Jsonb(s)) => {
-            if !is_jsonb {
-                // PostgreSQL only defines json_array_elements(json); jsonb input must use
-                // jsonb_array_elements(jsonb).
-                return Err(SqlError::FunctionNotFound("json_array_elements(jsonb)".into()).into());
-            }
-            s
-        }
-        Some(Value::Text(s)) | Some(Value::Json(s)) => s,
+        Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("{} requires json argument", func_name)),
+        _ => return Err(anyhow!("jsonb_array_elements requires json/jsonb argument")),
     };
-
-    // Parse the array to get element count and structure
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-
     match json_val {
         serde_json::Value::Array(arr) => {
-            // For JSON (non-JSONB), preserve original key order by extracting raw substrings.
-            // For JSONB, canonicalize by re-serializing.
-            let elements: Vec<Value> = if !is_jsonb {
-                // Extract raw JSON strings for each element to preserve key order
-                extract_json_array_elements_raw(&json_str)
-                    .into_iter()
-                    .map(Value::Json)
-                    .collect()
-            } else {
-                arr.into_iter()
-                    .map(|v| Value::Jsonb(v.to_string()))
-                    .collect()
-            };
+            let elements: Vec<Value> = arr
+                .into_iter()
+                .map(|v| Value::Jsonb(v.to_string()))
+                .collect();
             Ok(Value::Array(elements))
         }
-        _ => Err(anyhow!("cannot call {} on a non-array", func_name)),
+        _ => Err(anyhow!("cannot extract elements from a non-array")),
     }
-}
-
-/// Extract raw JSON element strings from a JSON array string, preserving original formatting.
-fn extract_json_array_elements_raw(json_str: &str) -> Vec<String> {
-    let mut elements = Vec::new();
-    let chars: Vec<char> = json_str.trim().chars().collect();
-    if chars.is_empty() || chars[0] != '[' {
-        return elements;
-    }
-
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut start = 1; // Skip opening '['
-
-    for (i, &c) in chars.iter().enumerate() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if c == '[' || c == '{' {
-            depth += 1;
-            continue;
-        }
-        if c == ']' || c == '}' {
-            depth -= 1;
-            if depth == 0 && c == ']' {
-                // End of array
-                if i > start {
-                    let elem: String = chars[start..i].iter().collect::<String>();
-                    let trimmed = elem.trim();
-                    if !trimmed.is_empty() {
-                        elements.push(trimmed.to_string());
-                    }
-                }
-                break;
-            }
-            continue;
-        }
-        if c == ',' && depth == 1 {
-            // Element separator at top level of array
-            let elem: String = chars[start..i].iter().collect::<String>();
-            let trimmed = elem.trim();
-            if !trimmed.is_empty() {
-                elements.push(trimmed.to_string());
-            }
-            start = i + 1;
-        }
-    }
-
-    elements
 }
 
 pub fn jsonb_array_elements_text(args: Vec<Value>) -> Result<Value> {
@@ -871,54 +670,8 @@ pub fn jsonb_array_elements_text(args: Vec<Value>) -> Result<Value> {
                 .collect();
             Ok(Value::Array(elements))
         }
-        _ => Err(anyhow!(
-            "cannot call jsonb_array_elements_text on a non-array"
-        )),
+        _ => Err(anyhow!("cannot extract elements from a non-array")),
     }
-}
-
-/// json_array_elements_text for JSON type — preserves original key order in object elements.
-/// PostgreSQL only defines json_array_elements_text(json); jsonb input must use
-/// jsonb_array_elements_text(jsonb).
-pub fn json_array_elements_text(args: Vec<Value>) -> Result<Value> {
-    let json_str = match args.into_iter().next() {
-        Some(Value::Text(s)) | Some(Value::Json(s)) => s,
-        Some(Value::Jsonb(_)) => {
-            return Err(SqlError::FunctionNotFound("json_array_elements_text(jsonb)".into()).into())
-        }
-        Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("json_array_elements_text requires json argument")),
-    };
-    // Validate it's an array
-    let json_val: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
-    if !json_val.is_array() {
-        return Err(anyhow!(
-            "cannot call json_array_elements_text on a non-array"
-        ));
-    }
-    // Use raw extraction to preserve key order in object elements
-    let raw_elements = extract_json_array_elements_raw(&json_str);
-    let elements: Vec<Value> = raw_elements
-        .into_iter()
-        .map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed == "null" {
-                Value::Null
-            } else if trimmed.starts_with('"') {
-                // JSON string — parse to get unescaped value
-                if let Ok(serde_json::Value::String(s)) = serde_json::from_str(trimmed) {
-                    Value::Text(s)
-                } else {
-                    Value::Text(trimmed.to_string())
-                }
-            } else {
-                // Numbers, booleans, objects, arrays — return raw text (preserves key order)
-                Value::Text(trimmed.to_string())
-            }
-        })
-        .collect();
-    Ok(Value::Array(elements))
 }
 
 /// Quote a field for PostgreSQL composite (record) output.
