@@ -709,7 +709,11 @@ fn extract_json_array_elements_raw(json_str: &str) -> Vec<String> {
             if depth == 0 && c == ']' {
                 // End of array
                 if i > start {
-                    elements.push(chars[start..i].iter().collect());
+                    let elem: String = chars[start..i].iter().collect::<String>();
+                    let trimmed = elem.trim();
+                    if !trimmed.is_empty() {
+                        elements.push(trimmed.to_string());
+                    }
                 }
                 break;
             }
@@ -717,8 +721,10 @@ fn extract_json_array_elements_raw(json_str: &str) -> Vec<String> {
         }
         if c == ',' && depth == 1 {
             // Element separator at top level of array
-            if i > start {
-                elements.push(chars[start..i].iter().collect());
+            let elem: String = chars[start..i].iter().collect::<String>();
+            let trimmed = elem.trim();
+            if !trimmed.is_empty() {
+                elements.push(trimmed.to_string());
             }
             start = i + 1;
         }

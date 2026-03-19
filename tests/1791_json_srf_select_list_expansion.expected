@@ -23,3 +23,17 @@
  [3,4]
 (2 rows)
 
+ json_array_elements
+---------------------
+ {"a":1}
+ 2
+(2 rows)
+
+ json_array_elements
+---------------------
+(0 rows)
+
+ json_array_elements
+---------------------
+(0 rows)
+
