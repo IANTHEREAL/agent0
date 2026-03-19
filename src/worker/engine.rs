@@ -1473,8 +1473,8 @@ const STORAGE_SCAN_RATE_LIMIT_MS: u64 = 5;
 async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result<()> {
     use crate::storage::encode_database_data_range;
     use crate::storage_stats::{
-        classify_key, global_storage_stats_cache, serialize_storage_stats, DbStorageStats,
-        KeyCategory, TableStorageStats,
+        classify_key, global_storage_stats_cache, parse_legacy_hnsw_table_id,
+        serialize_storage_stats, DbStorageStats, KeyCategory, TableStorageStats,
     };
     use tikv_client::BoundRange;
 
@@ -1543,6 +1543,59 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
         let last_key: Vec<u8> = kv_pairs.last().unwrap().key().clone().into();
         cursor = last_key;
         cursor.push(0x00);
+
+        if (page_count as u32) < STORAGE_SCAN_PAGE_SIZE {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(STORAGE_SCAN_RATE_LIMIT_MS)).await;
+    }
+
+    // Legacy: HNSW index KV is encoded as string keys (decimal IDs) outside the
+    // v2 database range, so we need an extra scan for those bytes.
+    //
+    // Example prefix: `d_{db_id}_hnsw_...`
+    let hnsw_prefix: Vec<u8> = format!("d_{db_id}_hnsw_").into_bytes();
+    let mut hnsw_end = hnsw_prefix.clone();
+    if let Some(last) = hnsw_end.last_mut() {
+        *last = last.wrapping_add(1);
+    }
+    let mut hnsw_cursor = hnsw_prefix.clone();
+
+    loop {
+        let range: BoundRange = (hnsw_cursor.clone()..hnsw_end.clone()).into();
+        let kv_pairs: Vec<tikv_client::KvPair> =
+            txn.scan(range, STORAGE_SCAN_PAGE_SIZE).await?.collect();
+        let page_count = kv_pairs.len();
+
+        if page_count == 0 {
+            break;
+        }
+
+        for pair in &kv_pairs {
+            let key: Vec<u8> = pair.key().clone().into();
+            let value: &[u8] = pair.value();
+            let entry_bytes = (key.len() + value.len()) as u64;
+
+            index_bytes += entry_bytes;
+
+            // Best-effort table attribution for legacy HNSW keys.
+            if key.len() >= hnsw_prefix.len() && key[..hnsw_prefix.len()] == hnsw_prefix[..] {
+                if let Some(table_id) = parse_legacy_hnsw_table_id(&key[hnsw_prefix.len()..]) {
+                    let ts = table_stats
+                        .entry(table_id)
+                        .or_insert_with(|| TableStorageStats {
+                            table_id,
+                            ..Default::default()
+                        });
+                    ts.index_bytes += entry_bytes;
+                }
+            }
+        }
+
+        let last_key: Vec<u8> = kv_pairs.last().unwrap().key().clone().into();
+        hnsw_cursor = last_key;
+        hnsw_cursor.push(0x00);
 
         if (page_count as u32) < STORAGE_SCAN_PAGE_SIZE {
             break;
