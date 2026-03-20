@@ -152,6 +152,7 @@ pub(crate) trait FsBackend: Send + Sync {
 
         let mut entries = Vec::new();
         let mut truncated = false;
+        let mut depth_exhausted = false;
         let mut total_dirs_scanned = 0usize;
         let root = normalize_readdir_path(path);
         let mut frontier = VecDeque::from([(root.clone(), 0usize)]);
@@ -196,12 +197,12 @@ pub(crate) trait FsBackend: Send + Sync {
                         continue;
                     }
 
-                    if entry.is_dir
-                        && dir_depth < opts.max_depth
-                        && !entry.is_symlink
-                        && visited.insert(entry.path.clone())
-                    {
-                        frontier.push_back((entry.path.clone(), dir_depth + 1));
+                    if entry.is_dir && !entry.is_symlink {
+                        if dir_depth < opts.max_depth && visited.insert(entry.path.clone()) {
+                            frontier.push_back((entry.path.clone(), dir_depth + 1));
+                        } else if dir_depth >= opts.max_depth {
+                            depth_exhausted = true;
+                        }
                     }
 
                     if entries.len() >= opts.max_entries {
@@ -225,7 +226,7 @@ pub(crate) trait FsBackend: Send + Sync {
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(FsRecursiveReaddirResult {
             entries,
-            truncated,
+            truncated: truncated || depth_exhausted,
             total_dirs_scanned,
         })
     }

@@ -2308,6 +2308,7 @@ impl EmbeddedPageFs {
 
         let mut entries = Vec::new();
         let mut truncated = false;
+        let mut depth_exhausted = false;
         let mut total_dirs_scanned = 0usize;
         let mut visited_dirs = HashSet::from([root_inode_id]);
         let mut frontier = VecDeque::from([(normalized, root_inode_id, 0usize)]);
@@ -2374,11 +2375,12 @@ impl EmbeddedPageFs {
                         break;
                     }
 
-                    if child_inode.is_directory()
-                        && dir_depth < opts.max_depth
-                        && visited_dirs.insert(child_inode.id)
-                    {
-                        frontier.push_back((child_path.clone(), child_inode.id, dir_depth + 1));
+                    if child_inode.is_directory() {
+                        if dir_depth < opts.max_depth && visited_dirs.insert(child_inode.id) {
+                            frontier.push_back((child_path.clone(), child_inode.id, dir_depth + 1));
+                        } else if dir_depth >= opts.max_depth {
+                            depth_exhausted = true;
+                        }
                     }
 
                     entries.push((child_path, child_inode));
@@ -2397,7 +2399,7 @@ impl EmbeddedPageFs {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(PageFsRecursiveReaddirResult {
             entries,
-            truncated,
+            truncated: truncated || depth_exhausted,
             total_dirs_scanned,
         })
     }
