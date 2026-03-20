@@ -190,6 +190,9 @@ tests/288_copy_csv_header.sql
 # #1573 – string_agg NULL delimiter treated as empty string
 tests/1573_string_agg_null_delimiter.sql
 # #1592 – aggregate ORDER BY semantics (string_agg, array_agg)
+# #1572 / #1674 – subquery-bearing aggregate expressions (PartialEq derive) - unit tests in src/sql/optimizer/build/tests.rs
+# #1942 – CTE ref PartialEq must compare CTE names (table_id=0 sentinel)
+tests/1942_cte_ref_partial_eq.sql
 tests/297_aggregate_order_by.sql
 # #1572 – DISTINCT aggregate ORDER BY validation
 tests/294_string_agg_order_by.sql

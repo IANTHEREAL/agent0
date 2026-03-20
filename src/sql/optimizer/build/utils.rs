@@ -16,34 +16,7 @@ pub(crate) fn normalize_string_agg_delimiter(expr: &TypedExpr) -> Option<String>
 
 /// Find the index of a GROUP BY expression that matches `expr`.
 pub(crate) fn find_matching_group_by(expr: &TypedExpr, group_by: &[TypedExpr]) -> Option<usize> {
-    // Fast path: ColumnRef-to-ColumnRef matching by column_index + name
-    for (i, gb) in group_by.iter().enumerate() {
-        if let (
-            TypedExprKind::ColumnRef {
-                column_index: ei,
-                column_name: en,
-                ..
-            },
-            TypedExprKind::ColumnRef {
-                column_index: gi,
-                column_name: gn,
-                ..
-            },
-        ) = (&expr.kind, &gb.kind)
-        {
-            if ei == gi && en == gn {
-                return Some(i);
-            }
-        }
-    }
-    // Slow path: structural comparison via Display for expression GROUP BY keys
-    let expr_display = format!("{}", expr);
-    for (i, gb) in group_by.iter().enumerate() {
-        if format!("{}", gb) == expr_display && expr.data_type == gb.data_type {
-            return Some(i);
-        }
-    }
-    None
+    group_by.iter().position(|gb| gb == expr)
 }
 
 /// Recursively collect AggregateCall nodes from a TypedExpr.

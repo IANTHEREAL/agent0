@@ -1,0 +1,2 @@
+# CTE ref PartialEq: SUM over c1 (=1) and SUM over c2 (=2) must be distinct
+1|2

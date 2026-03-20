@@ -4,6 +4,7 @@
 //! positional indices, function calls carry resolved return types, and all
 //! syntax sugar is normalized to canonical forms.
 
+pub mod alpha_eq;
 mod display;
 
 use crate::model::{DataType, Value};
@@ -19,6 +20,41 @@ use crate::sql::types::CastContext;
 pub struct TypedExpr {
     pub kind: TypedExprKind,
     pub data_type: DataType,
+}
+
+/// Custom PartialEq that ignores binder-local `column_name` in ColumnRef.
+///
+/// After analysis, column references are fully positional (`scope_depth` +
+/// `column_index`). The `column_name` field is retained only for EXPLAIN /
+/// error messages and is NOT execution-semantic. Two alpha-equivalent
+/// expressions that differ only in binder-assigned column names must compare
+/// equal so that `find_matching_group_by` and aggregate deduplication work
+/// correctly for subquery-bearing expressions.
+impl PartialEq for TypedExpr {
+    fn eq(&self, other: &Self) -> bool {
+        if self.data_type != other.data_type {
+            return false;
+        }
+        match (&self.kind, &other.kind) {
+            (
+                TypedExprKind::ColumnRef {
+                    scope_depth: sd1,
+                    column_index: ci1,
+                    ..
+                },
+                TypedExprKind::ColumnRef {
+                    scope_depth: sd2,
+                    column_index: ci2,
+                    ..
+                },
+            ) => sd1 == sd2 && ci1 == ci2,
+            // All other variants: delegate to TypedExprKind's derived PartialEq.
+            // Nested TypedExpr values inside those variants recursively use this
+            // custom impl (via Box<TypedExpr>::eq → TypedExpr::eq), so column_name
+            // is ignored at every depth.
+            _ => self.kind == other.kind,
+        }
+    }
 }
 
 impl TypedExpr {
@@ -47,7 +83,7 @@ impl TypedExpr {
 ///
 /// All syntax sugar (SUBSTRING, TRIM, POSITION, EXTRACT, AT TIME ZONE, OVERLAY,
 /// CEIL, FLOOR) is normalized to `FunctionCall` by the Analyzer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprKind {
     // ── Leaf nodes ──────────────────────────────────────
     /// A constant value. Typed literals (`DATE '2024-01-01'`) are parsed to
@@ -404,6 +440,12 @@ pub struct ResolvedFunction {
     pub return_type: DataType,
 }
 
+impl PartialEq for ResolvedFunction {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.kind == other.kind && self.return_type == other.return_type
+    }
+}
+
 /// Function origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionKind {
@@ -414,7 +456,7 @@ pub enum FunctionKind {
 }
 
 /// A typed argument to a table-valued function (FROM ... func(...)).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypedFunctionArg {
     /// Positional argument: `func(expr)`.
     Positional(TypedExpr),
@@ -425,7 +467,7 @@ pub enum TypedFunctionArg {
 // ── ORDER BY ────────────────────────────────────────────────
 
 /// ORDER BY expression with resolved sort key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypedOrderByExpr {
     pub expr: TypedExpr,
     pub asc: bool,
@@ -435,7 +477,7 @@ pub struct TypedOrderByExpr {
 // ── Window frame ────────────────────────────────────────────
 
 /// Window frame specification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WindowFrame {
     pub units: WindowFrameUnits,
     pub start: WindowFrameBound,
@@ -451,7 +493,7 @@ pub enum WindowFrameUnits {
 }
 
 /// Window frame bound specification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WindowFrameBound {
     CurrentRow,
     /// UNBOUNDED or N PRECEDING (`None` = UNBOUNDED).
@@ -489,11 +531,35 @@ pub struct AnalyzedQuery {
     )>,
 }
 
+/// Alpha-equivalence comparison for AnalyzedQuery.
+///
+/// Two queries that differ only in binder-local names (column names, table
+/// aliases, CTE names, projection output names, output schema column names)
+/// compare equal. Normalizes both sides to canonical form before comparing
+/// structurally. Nested `AnalyzedQuery` values (inside CTEs, subqueries, set
+/// operations) skip re-normalization to preserve scope-qualified CTE names.
+impl PartialEq for AnalyzedQuery {
+    fn eq(&self, other: &Self) -> bool {
+        if alpha_eq::is_comparing_normalized() {
+            // Already inside a normalized comparison — compare structurally.
+            self.ctes == other.ctes
+                && self.body == other.body
+                && self.order_by == other.order_by
+                && self.limit == other.limit
+                && self.offset == other.offset
+                && self.output_schema == other.output_schema
+        } else {
+            // Top-level comparison — normalize for alpha-equivalence.
+            alpha_eq::alpha_eq(self, other)
+        }
+    }
+}
+
 /// The body of an analyzed query.
 ///
 /// Each variant produces rows with a schema matching
 /// `AnalyzedQuery::output_schema`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum AnalyzedQueryBody {
     /// A SELECT statement.
@@ -515,7 +581,7 @@ pub enum AnalyzedQueryBody {
 ///
 /// Contains all SELECT-specific clauses: projection, FROM, WHERE,
 /// GROUP BY, HAVING, and DISTINCT mode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnalyzedSelect {
     /// Output columns (SELECT list).
     pub projection: Vec<AnalyzedProjection>,
@@ -532,7 +598,7 @@ pub struct AnalyzedSelect {
 }
 
 /// DISTINCT mode for a SELECT.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AnalyzedDistinct {
     /// No DISTINCT — return all rows.
     All,
@@ -543,12 +609,22 @@ pub enum AnalyzedDistinct {
 }
 
 /// A resolved SELECT-list item (output column).
+///
+/// `PartialEq` compares only `expr`, not `output_name`, because PostgreSQL
+/// treats `(SELECT 1 AS x)` and `(SELECT 1 AS y)` as equal for GROUP BY
+/// matching — the alias is presentational, not semantic.
 #[derive(Debug, Clone)]
 pub struct AnalyzedProjection {
     /// The analyzed expression.
     pub expr: TypedExpr,
     /// The output column name (user alias or auto-inferred).
     pub output_name: String,
+}
+
+impl PartialEq for AnalyzedProjection {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr == other.expr
+    }
 }
 
 // ── Table references ────────────────────────────────────────
@@ -558,6 +634,18 @@ pub struct AnalyzedProjection {
 pub struct AnalyzedTableRef {
     pub kind: AnalyzedTableRefKind,
     pub alias: Option<String>,
+}
+
+/// Custom PartialEq that ignores binder-local `alias`.
+///
+/// After analysis, all column references from this table ref are positional
+/// (`column_index`). The alias is used only for name resolution (already
+/// complete) and EXPLAIN output. `FROM t AS x` and `FROM t AS y` are
+/// structurally identical.
+impl PartialEq for AnalyzedTableRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+    }
 }
 
 /// Kinds of table references.
@@ -590,6 +678,76 @@ pub enum AnalyzedTableRefKind {
     },
 }
 
+/// Custom PartialEq that ignores binder-local names where safe.
+///
+/// For `Table` with a nonzero `table_id` (base tables), the name is
+/// presentational — structural equality uses `table_id` via `schema`.
+/// For `Table` with `table_id == 0` (CTE references), the CTE name IS
+/// semantic identity — it distinguishes which CTE is referenced — so it
+/// must participate in comparison.
+/// For `Function`, output column names are binder-local; only types matter.
+impl PartialEq for AnalyzedTableRefKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Table {
+                    name: n1,
+                    schema: s1,
+                },
+                Self::Table {
+                    name: n2,
+                    schema: s2,
+                },
+            ) => {
+                // CTE refs have table_id == 0 (sentinel). The CTE name is
+                // the only thing that distinguishes which CTE is referenced,
+                // so it must be compared. For base tables (table_id != 0),
+                // the table_id alone is authoritative.
+                let cte_names_match = s1.table_id != 0 || s2.table_id != 0 || n1 == n2;
+                cte_names_match && s1 == s2
+            }
+            (Self::Subquery(q1), Self::Subquery(q2)) => q1 == q2,
+            (
+                Self::Join {
+                    left: l1,
+                    right: r1,
+                    join_type: jt1,
+                    condition: c1,
+                    left_col_start: lcs1,
+                },
+                Self::Join {
+                    left: l2,
+                    right: r2,
+                    join_type: jt2,
+                    condition: c2,
+                    left_col_start: lcs2,
+                },
+            ) => l1 == l2 && r1 == r2 && jt1 == jt2 && c1 == c2 && lcs1 == lcs2,
+            (
+                Self::Function {
+                    func: f1,
+                    args: a1,
+                    output_columns: oc1,
+                },
+                Self::Function {
+                    func: f2,
+                    args: a2,
+                    output_columns: oc2,
+                },
+            ) => {
+                f1 == f2
+                    && a1 == a2
+                    && oc1.len() == oc2.len()
+                    && oc1
+                        .iter()
+                        .zip(oc2.iter())
+                        .all(|((_, dt1), (_, dt2))| dt1 == dt2)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Resolved schema information for a base table reference.
 #[derive(Debug, Clone)]
 pub struct TableRefSchema {
@@ -598,6 +756,24 @@ pub struct TableRefSchema {
     /// (column_name, data_type, nullable)
     #[allow(dead_code)] // framework: typed IR variant
     pub columns: Vec<(String, DataType, bool)>,
+}
+
+/// Custom PartialEq that ignores binder-local column names.
+///
+/// Column names are used only for name resolution (already complete) and
+/// EXPLAIN output. Structural equality compares `table_id` (semantic
+/// identifier — 0 for CTEs, nonzero for base tables) and column types +
+/// nullability at each position.
+impl PartialEq for TableRefSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.table_id == other.table_id
+            && self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(other.columns.iter())
+                .all(|((_, dt1, n1), (_, dt2, n2))| dt1 == dt2 && n1 == n2)
+    }
 }
 
 // ── JOIN types ──────────────────────────────────────────────
@@ -613,7 +789,7 @@ pub enum JoinType {
 }
 
 /// JOIN condition (resolved).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JoinCondition {
     /// ON expression (type-checked to boolean).
     On(TypedExpr),
@@ -638,6 +814,20 @@ pub struct ResolvedUsingColumn {
     pub left_type: DataType,
     /// Original right column type (before coercion).
     pub right_type: DataType,
+}
+
+/// Custom PartialEq that ignores binder-local `name`.
+///
+/// The `name` field is "for EXPLAIN / error messages" only. Structural equality
+/// is determined by positional indices and types.
+impl PartialEq for ResolvedUsingColumn {
+    fn eq(&self, other: &Self) -> bool {
+        self.left_index == other.left_index
+            && self.right_index == other.right_index
+            && self.data_type == other.data_type
+            && self.left_type == other.left_type
+            && self.right_type == other.right_type
+    }
 }
 
 // ── JOIN condition reindexing ────────────────────────────────
@@ -737,6 +927,25 @@ pub struct AnalyzedCte {
     /// Whether the CTE is materialized (`None` = unspecified / optimizer decides).
     #[allow(dead_code)] // framework: typed IR variant
     pub materialized: Option<bool>,
+}
+
+/// Custom PartialEq that ignores binder-local CTE `name` and column names.
+///
+/// After analysis, CTE references are positional. The CTE name and column names
+/// are binder-local identifiers used only for name resolution (which is already
+/// complete) and EXPLAIN output. Two alpha-equivalent CTEs with different names
+/// must compare equal.
+impl PartialEq for AnalyzedCte {
+    fn eq(&self, other: &Self) -> bool {
+        self.query == other.query
+            && self.materialized == other.materialized
+            && self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(other.columns.iter())
+                .all(|((_, dt1, coll1), (_, dt2, coll2))| dt1 == dt2 && coll1 == coll2)
+    }
 }
 
 // ── Set operations ──────────────────────────────────────────

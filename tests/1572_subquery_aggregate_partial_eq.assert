@@ -1,0 +1,5 @@
+# Expected output assertions for subquery aggregate PartialEq test
+# Query 1: SUM((SELECT 1)) + SUM((SELECT 1)) should return 2
+2
+# Query 2: GROUP BY (SELECT 1) should group all rows, yielding count=2
+1|2

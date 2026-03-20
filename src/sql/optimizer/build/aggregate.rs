@@ -9,225 +9,6 @@ use crate::model::DataType;
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind, TypedOrderByExpr};
 use crate::sql::operators::{AggregateExpr, BoxedOperator, HashAggregateOperator, ProjectOperator};
 
-/// Structural equality comparison for `TypedExpr` nodes.
-///
-/// Compares the full semantic structure of two expressions, unlike `Display`
-/// which loses information (e.g. `scope_depth`, `column_index`, `cast_context`).
-/// Used for aggregate identity matching to prevent false positives from
-/// expressions that render identically but differ structurally.
-fn typed_expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
-    if a.data_type != b.data_type {
-        return false;
-    }
-    typed_expr_kind_eq(&a.kind, &b.kind)
-}
-
-fn typed_expr_kind_eq(a: &TypedExprKind, b: &TypedExprKind) -> bool {
-    use TypedExprKind::*;
-    match (a, b) {
-        (Constant(va), Constant(vb)) => va == vb,
-        (
-            ColumnRef {
-                scope_depth: sd_a,
-                column_index: ci_a,
-                column_name: cn_a,
-            },
-            ColumnRef {
-                scope_depth: sd_b,
-                column_index: ci_b,
-                column_name: cn_b,
-            },
-        ) => sd_a == sd_b && ci_a == ci_b && cn_a == cn_b,
-        (
-            BinaryOp {
-                left: la,
-                op: oa,
-                right: ra,
-            },
-            BinaryOp {
-                left: lb,
-                op: ob,
-                right: rb,
-            },
-        ) => oa == ob && typed_expr_eq(la, lb) && typed_expr_eq(ra, rb),
-        (
-            UnaryOp {
-                op: oa,
-                operand: xa,
-            },
-            UnaryOp {
-                op: ob,
-                operand: xb,
-            },
-        ) => oa == ob && typed_expr_eq(xa, xb),
-        (
-            Cast {
-                expr: ea,
-                target_type: ta,
-                cast_context: ca,
-            },
-            Cast {
-                expr: eb,
-                target_type: tb,
-                cast_context: cb,
-            },
-        ) => ca == cb && ta == tb && typed_expr_eq(ea, eb),
-        (
-            IsTest {
-                expr: ea,
-                test: ta,
-                negated: na,
-            },
-            IsTest {
-                expr: eb,
-                test: tb,
-                negated: nb,
-            },
-        ) => ta == tb && na == nb && typed_expr_eq(ea, eb),
-        (
-            Between {
-                expr: ea,
-                low: la,
-                high: ha,
-                negated: na,
-            },
-            Between {
-                expr: eb,
-                low: lb,
-                high: hb,
-                negated: nb,
-            },
-        ) => na == nb && typed_expr_eq(ea, eb) && typed_expr_eq(la, lb) && typed_expr_eq(ha, hb),
-        (
-            InList {
-                expr: ea,
-                list: la,
-                negated: na,
-            },
-            InList {
-                expr: eb,
-                list: lb,
-                negated: nb,
-            },
-        ) => {
-            na == nb
-                && typed_expr_eq(ea, eb)
-                && la.len() == lb.len()
-                && la.iter().zip(lb.iter()).all(|(x, y)| typed_expr_eq(x, y))
-        }
-        // SAFETY: `order_by` and `filter` are intentionally ignored via `..` because
-        // `typed_expr_eq` is only called from `aggregate_identity_matches`, which
-        // already compares `order_by` and `filter` at the top-level aggregate.
-        // Nested FunctionCall nodes inside aggregate arguments never carry
-        // independent order_by/filter that would affect identity.
-        (
-            FunctionCall {
-                func: fa, args: aa, ..
-            },
-            FunctionCall {
-                func: fb, args: ab, ..
-            },
-        ) => {
-            fa.name == fb.name
-                && aa.len() == ab.len()
-                && aa.iter().zip(ab.iter()).all(|(x, y)| typed_expr_eq(x, y))
-        }
-        // SAFETY: `order_by` and `filter` are intentionally ignored via `..` for
-        // the same reason as FunctionCall above — `aggregate_identity_matches`
-        // compares them at the top level before calling `typed_expr_eq` on args.
-        (
-            AggregateCall {
-                func: fa,
-                args: aa,
-                distinct: da,
-                ..
-            },
-            AggregateCall {
-                func: fb,
-                args: ab,
-                distinct: db,
-                ..
-            },
-        ) => {
-            fa.name == fb.name
-                && da == db
-                && aa.len() == ab.len()
-                && aa.iter().zip(ab.iter()).all(|(x, y)| typed_expr_eq(x, y))
-        }
-        (
-            Case {
-                operand: oa,
-                when_clauses: wa,
-                else_result: ea,
-            },
-            Case {
-                operand: ob,
-                when_clauses: wb,
-                else_result: eb,
-            },
-        ) => {
-            opt_typed_expr_eq(oa.as_deref(), ob.as_deref())
-                && opt_typed_expr_eq(ea.as_deref(), eb.as_deref())
-                && wa.len() == wb.len()
-                && wa
-                    .iter()
-                    .zip(wb.iter())
-                    .all(|((w1, t1), (w2, t2))| typed_expr_eq(w1, w2) && typed_expr_eq(t1, t2))
-        }
-        (Coalesce(aa), Coalesce(ab)) => {
-            aa.len() == ab.len() && aa.iter().zip(ab.iter()).all(|(x, y)| typed_expr_eq(x, y))
-        }
-        (NullIf(a1, a2), NullIf(b1, b2)) => typed_expr_eq(a1, b1) && typed_expr_eq(a2, b2),
-        (
-            ArrayIndex {
-                array: aa,
-                index: ia,
-            },
-            ArrayIndex {
-                array: ab,
-                index: ib,
-            },
-        ) => typed_expr_eq(aa, ab) && typed_expr_eq(ia, ib),
-        (
-            JsonAccess {
-                expr: ea,
-                path: pa,
-                operator: oa,
-            },
-            JsonAccess {
-                expr: eb,
-                path: pb,
-                operator: ob,
-            },
-        ) => oa == ob && typed_expr_eq(ea, eb) && typed_expr_eq(pa, pb),
-        (Parameter { index: ia }, Parameter { index: ib }) => ia == ib,
-        (Default, Default) => true,
-        // For any variant pair not explicitly handled, fall back to Display comparison
-        // to avoid false negatives. This is safe: false positives are the correctness
-        // concern, and unhandled variants are rare edge cases in aggregate contexts.
-        _ => {
-            let dummy_type = DataType::Boolean;
-            let ea = TypedExpr {
-                kind: a.clone(),
-                data_type: dummy_type.clone(),
-            };
-            let eb = TypedExpr {
-                kind: b.clone(),
-                data_type: dummy_type,
-            };
-            format!("{ea}") == format!("{eb}")
-        }
-    }
-}
-
-fn opt_typed_expr_eq(a: Option<&TypedExpr>, b: Option<&TypedExpr>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => typed_expr_eq(x, y),
-        _ => false,
-    }
-}
-
 /// Check whether an `AggregateExpr` matches the identity of an `AggregateCall`.
 ///
 /// Compares all 6 identity fields: `func_name`, `distinct`, `arg`, `delimiter`,
@@ -253,7 +34,7 @@ pub(crate) fn aggregate_identity_matches(
     let arg_matches = match (&ae.arg, args.first()) {
         (None, None) => true,
         (Some(_), None) | (None, Some(_)) => false,
-        (Some(stored), Some(current)) => typed_expr_eq(stored, current),
+        (Some(stored), Some(current)) => stored == current,
     };
     if !arg_matches {
         return false;
@@ -270,7 +51,7 @@ pub(crate) fn aggregate_identity_matches(
     // 5. filter
     let filter_matches = match (&ae.filter, filter) {
         (None, None) => true,
-        (Some(stored), Some(current)) => typed_expr_eq(stored, current),
+        (Some(stored), Some(current)) => stored == current.as_ref(),
         _ => false,
     };
     if !filter_matches {
@@ -281,7 +62,7 @@ pub(crate) fn aggregate_identity_matches(
         return false;
     }
     for (stored, current) in ae.order_by.iter().zip(order_by.iter()) {
-        if !typed_expr_eq(&stored.expr, &current.expr)
+        if stored.expr != current.expr
             || stored.asc != current.asc
             || stored.nulls_first != current.nulls_first
         {
