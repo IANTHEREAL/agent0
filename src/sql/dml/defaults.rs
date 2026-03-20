@@ -7,9 +7,10 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
-use crate::model::{DataType, TableSchema, Value};
+use crate::model::{DataType, TableSchema, UserTypeDef, Value};
+use crate::sql::analyzer::CatalogSnapshot;
 use crate::sql::error::SqlError;
-use crate::sql::expr::compile::compile_const_expr;
+use crate::sql::expr::compile::{compile_const_expr, compile_const_expr_with_catalog};
 use crate::sql::expr::static_eval::{eval_static_typed_expr, needs_async_materialization};
 use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
@@ -17,6 +18,53 @@ use crate::sql::sequences;
 use crate::sql::sequences::{classify_serial_default, SequenceSession, SerialDefaultBehavior};
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
+
+/// Build a `CatalogSnapshot` populated with all UDTs in the database so that
+/// default expressions containing enum casts (e.g. `'happy'::mood`) can be
+/// resolved by the analyzer.
+async fn build_udt_catalog(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+) -> Result<CatalogSnapshot> {
+    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
+    let types: Vec<UserTypeDef> = store.list_types(txn, db_id).await?;
+    for udt in types {
+        catalog.add_schema(&udt.schema);
+        let full_name = format!("{}.{}", udt.schema, udt.name);
+        catalog.add_type(&full_name, udt);
+    }
+    Ok(catalog)
+}
+
+fn data_type_has_custom_type(data_type: &sqlparser::ast::DataType) -> bool {
+    match data_type {
+        sqlparser::ast::DataType::Custom(..) => true,
+        sqlparser::ast::DataType::Array(inner) => match inner {
+            sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)
+            | sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner) => {
+                data_type_has_custom_type(inner)
+            }
+            sqlparser::ast::ArrayElemTypeDef::None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Returns true if the parsed expression contains a `DataType::Custom` cast
+/// that would require catalog lookup (e.g. `'happy'::mood`).
+fn expr_has_custom_type_cast(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Cast {
+            data_type,
+            expr: inner,
+            ..
+        } => data_type_has_custom_type(data_type) || expr_has_custom_type_cast(inner),
+        _ => false,
+    }
+}
 
 async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
@@ -45,7 +93,16 @@ async fn eval_default_expr_maybe_sequence(
 
     let qctx = QueryContext::from_task_locals();
     let expr = parse_default_expr(expr_str)?;
-    let typed = compile_const_expr(&expr, &qctx)?;
+
+    // If the expression contains a custom type cast (e.g. 'happy'::mood),
+    // build a catalog with UDTs so the analyzer can resolve enum types.
+    let typed = if expr_has_custom_type_cast(&expr) {
+        let catalog = build_udt_catalog(store, txn, db_id, search_path).await?;
+        compile_const_expr_with_catalog(&expr, &qctx, &catalog)?
+    } else {
+        compile_const_expr(&expr, &qctx)?
+    };
+
     if needs_async_materialization(&typed) {
         let materialized = materialize_sequences_in_typed_expr(
             store,
@@ -263,6 +320,25 @@ pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut [Value]
 mod tests {
     use super::*;
     use crate::model::ColumnDef;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
+        let sql = format!("SELECT {sql}");
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, &sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = ast.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+            select.projection.into_iter().next()
+        else {
+            panic!("expected expression projection");
+        };
+        expr
+    }
 
     fn test_schema(nullable_second: bool) -> TableSchema {
         TableSchema {
@@ -343,5 +419,22 @@ mod tests {
         coerce_row_values_allow_null(&schema, &mut row_vals).unwrap();
         assert_eq!(row_vals[0], Value::Int32(1));
         assert_eq!(row_vals[1], Value::Null);
+    }
+
+    #[test]
+    fn expr_has_custom_type_cast_detects_enum_cast() {
+        assert!(expr_has_custom_type_cast(&parse_expr("'happy'::mood")));
+    }
+
+    #[test]
+    fn expr_has_custom_type_cast_detects_enum_array_cast() {
+        assert!(expr_has_custom_type_cast(&parse_expr(
+            "ARRAY['happy']::mood[]"
+        )));
+    }
+
+    #[test]
+    fn expr_has_custom_type_cast_ignores_builtin_cast() {
+        assert!(!expr_has_custom_type_cast(&parse_expr("'happy'::text")));
     }
 }

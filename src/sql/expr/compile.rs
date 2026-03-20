@@ -1,6 +1,6 @@
 use crate::model::TableSchema;
 use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::analyzer::{Analyzer, NullCatalog, Scope};
+use crate::sql::analyzer::{Analyzer, Catalog, NullCatalog, Scope};
 use crate::sql::error::SqlError;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
@@ -11,6 +11,17 @@ pub fn compile_const_expr(expr: &sqlparser::ast::Expr, qctx: &QueryContext) -> R
     let catalog = NullCatalog;
     let typed =
         Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr).map_err(SqlError::from)?;
+    Ok(fold_typed_expr(&typed, qctx))
+}
+
+/// Compile an AST expression with a catalog for UDT resolution (e.g. enum casts in defaults).
+pub fn compile_const_expr_with_catalog(
+    expr: &sqlparser::ast::Expr,
+    qctx: &QueryContext,
+    catalog: &dyn Catalog,
+) -> Result<TypedExpr> {
+    let typed =
+        Analyzer::analyze_expr_with_scope(catalog, Scope::new(), expr).map_err(SqlError::from)?;
     Ok(fold_typed_expr(&typed, qctx))
 }
 
@@ -42,4 +53,62 @@ pub fn analyze_row_expr_for_table(
     let scope = Scope::from_table_schema(alias, schema);
     let typed = Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(SqlError::from)?;
     Ok(typed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DataType, UserTypeKind};
+    use crate::sql::analyzer::catalog::MockCatalog;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
+        let sql = format!("SELECT {sql}");
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, &sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = ast.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+            select.projection.into_iter().next()
+        else {
+            panic!("expected expression projection");
+        };
+        expr
+    }
+
+    #[test]
+    fn compile_const_expr_with_catalog_resolves_enum_cast() {
+        let catalog = MockCatalog::builder()
+            .user_defined_type(
+                "public",
+                "mood",
+                UserTypeKind::Enum {
+                    labels: vec!["happy".to_string(), "sad".to_string()],
+                },
+            )
+            .build();
+        let expr = parse_expr("'happy'::mood");
+        let qctx = QueryContext::from_task_locals();
+
+        let typed = compile_const_expr_with_catalog(&expr, &qctx, &catalog).unwrap();
+
+        assert_eq!(
+            typed.data_type,
+            DataType::UserDefined("public.mood".to_string())
+        );
+    }
+
+    #[test]
+    fn compile_const_expr_without_catalog_rejects_enum_cast() {
+        let expr = parse_expr("'happy'::mood");
+        let qctx = QueryContext::from_task_locals();
+
+        let err = compile_const_expr(&expr, &qctx).unwrap_err().to_string();
+
+        assert!(err.contains("type \"mood\" does not exist"));
+    }
 }
