@@ -16,7 +16,9 @@ fn serial_resolves_in_ddl_column_context_only() {
     assert_eq!(dt, DataType::Int32);
     assert!(is_serial);
 
-    // In NonDdl context, serial is not special — raises 42704 without catalog.
+    // In DDL-nested and NonDdl contexts, serial is not special.
+    let err = resolve_custom_type(TypeResolutionContext::DdlOther, &name, &[], None);
+    assert!(err.is_err());
     let err = resolve_custom_type(TypeResolutionContext::NonDdl, &name, &[], None);
     assert!(err.is_err());
 }

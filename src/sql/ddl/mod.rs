@@ -32,7 +32,7 @@ use super::names;
 use super::names::normalize_ident;
 use super::sequences;
 use super::types::sql_datatype_to_internal_strict;
-use super::types::{resolve_custom_type, TypeResolutionContext};
+use super::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
 use super::value_coercion::coerce_value_for_column;
 
 use crate::model::{
@@ -161,7 +161,7 @@ fn resolve_nested_column_data_type<'a>(
                             db_id,
                             search_path,
                             inner_type,
-                            TypeResolutionContext::NonDdl,
+                            TypeResolutionContext::DdlOther,
                         )
                         .await?
                         .0
@@ -171,46 +171,20 @@ fn resolve_nested_column_data_type<'a>(
                 Ok((DataType::Array(Box::new(inner_type)), false))
             }
             SqlDataType::Custom(name, modifiers) => {
-                // Catalog lookup for UDTs.
-                let catalog_resolved =
-                    resolve_catalog_udt(store, txn, db_id, name, search_path).await?;
-
-                resolve_custom_type(context, name, modifiers, catalog_resolved)
+                resolve_custom_type_with_catalog(
+                    context,
+                    store,
+                    txn,
+                    db_id,
+                    search_path,
+                    name,
+                    modifiers,
+                )
+                .await
             }
             _ => Ok((sql_datatype_to_internal_strict(sql_type)?, false)),
         }
     })
-}
-
-/// Perform catalog lookup for a Custom type name, returning `Some(DataType::UserDefined(...))`
-/// if a user-defined type is found, or `None` if not found or if it resolves to a built-in.
-pub(crate) async fn resolve_catalog_udt(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    name: &ObjectName,
-    search_path: &[String],
-) -> Result<Option<DataType>> {
-    let resolved_type =
-        names::resolve_existing_type_name(store.as_ref(), txn, db_id, name, search_path).await?;
-    let Some(resolved_type) = resolved_type else {
-        return Ok(None);
-    };
-    // Built-in types (pg_catalog) fall through to step 3 (built-in mapping).
-    if resolved_type.is_builtin() {
-        return Ok(None);
-    }
-
-    let full_name = resolved_type.resolved_name().full.clone();
-    match store.get_type(txn, db_id, &full_name).await? {
-        Some(def) => match def.kind {
-            crate::model::UserTypeKind::Enum { .. }
-            | crate::model::UserTypeKind::Composite { .. } => {
-                Ok(Some(DataType::UserDefined(full_name)))
-            }
-        },
-        None => Ok(None),
-    }
 }
 
 pub(super) async fn validate_generated_column_expr(

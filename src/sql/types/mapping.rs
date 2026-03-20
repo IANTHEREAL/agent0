@@ -5,15 +5,21 @@ use sqlparser::ast::{
     ArrayElemTypeDef, CharacterLength, DataType as SqlDataType, ExactNumberInfo, ObjectName,
     TimezoneInfo,
 };
+use std::sync::Arc;
+use tikv_client::Transaction;
 
 use crate::model::DataType;
 use crate::sql::error::SqlError;
+use crate::sql::names;
+use crate::storage::TikvStore;
 
 /// Context in which a `DataType::Custom` is being resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeResolutionContext {
     /// DDL column definition — serial pseudo-types expand to Int32/Int64.
     DdlColumn,
+    /// DDL context where serial names are not special (array element/composite field/etc).
+    DdlOther,
     /// All other contexts — serial names are NOT special.
     NonDdl,
 }
@@ -66,6 +72,53 @@ pub(crate) fn resolve_custom_type(
         .collect::<Vec<_>>()
         .join(".");
     Err(SqlError::UndefinedObject(format!("type \"{}\" does not exist", full_name)).into())
+}
+
+/// Resolve `DataType::Custom` with search_path-aware catalog lookup, then run it
+/// through the unified 4-step pipeline.
+pub(crate) async fn resolve_custom_type_with_catalog(
+    context: TypeResolutionContext,
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    name: &ObjectName,
+    modifiers: &[String],
+) -> Result<(DataType, bool)> {
+    let catalog_resolved =
+        resolve_catalog_udt(store.as_ref(), txn, db_id, name, search_path).await?;
+    resolve_custom_type(context, name, modifiers, catalog_resolved)
+}
+
+async fn resolve_catalog_udt(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    name: &ObjectName,
+    search_path: &[String],
+) -> Result<Option<DataType>> {
+    let resolved_type =
+        names::resolve_existing_type_name(store, txn, db_id, name, search_path).await?;
+    let Some(resolved_type) = resolved_type else {
+        return Ok(None);
+    };
+
+    // Built-in types still go through step 3 so PostgreSQL built-ins win only
+    // after catalog lookup misses user-defined types on the search_path.
+    if resolved_type.is_builtin() {
+        return Ok(None);
+    }
+
+    let full_name = resolved_type.resolved_name().full.clone();
+    match store.get_type(txn, db_id, &full_name).await? {
+        Some(def) => match def.kind {
+            crate::model::UserTypeKind::Enum { .. }
+            | crate::model::UserTypeKind::Composite { .. } => {
+                Ok(Some(DataType::UserDefined(full_name)))
+            }
+        },
+        None => Ok(None),
+    }
 }
 
 /// Strict type mapping used by DDL — validates numeric precision/scale.
@@ -173,7 +226,7 @@ fn sql_datatype_to_internal_impl(
         SqlDataType::JSON => Ok(DataType::Json),
 
         // Postgres-ish oddballs (best-effort compatibility)
-        SqlDataType::Regclass => Ok(DataType::Text),
+        SqlDataType::Regclass => Ok(DataType::UserDefined("pg_catalog.regclass".to_string())),
 
         // Arrays
         SqlDataType::Array(inner) => match inner {
@@ -269,6 +322,11 @@ fn convert_custom_builtin(type_name: &str, modifiers: &[String]) -> Option<DataT
         "TSVECTOR" => Some(DataType::Tsvector),
         "TSQUERY" => Some(DataType::Tsquery),
         "NAME" => Some(DataType::Name),
+        "REGCLASS" => Some(DataType::UserDefined("pg_catalog.regclass".to_string())),
+        "REGTYPE" => Some(DataType::UserDefined("pg_catalog.regtype".to_string())),
+        "OID" => Some(DataType::UserDefined("oid".to_string())),
+        "INT2VECTOR" => Some(DataType::UserDefined("int2vector".to_string())),
+        "OIDVECTOR" => Some(DataType::UserDefined("oidvector".to_string())),
         "VECTOR" => {
             // 0 means "any dimension" (bare `vector` without `(N)` modifier).
             // DDL CREATE TABLE with bare `vector` and explicit CAST both use 0;
@@ -285,9 +343,9 @@ fn convert_custom_builtin(type_name: &str, modifiers: &[String]) -> Option<DataT
 
 #[cfg(test)]
 mod tests {
-    use super::sql_datatype_to_internal_strict;
+    use super::{resolve_custom_type, sql_datatype_to_internal_strict, TypeResolutionContext};
     use crate::model::DataType;
-    use sqlparser::ast::{ArrayElemTypeDef, DataType as SqlDataType};
+    use sqlparser::ast::{ArrayElemTypeDef, DataType as SqlDataType, Ident, ObjectName};
 
     #[test]
     fn bare_varchar_preserves_varchar_identity() {
@@ -303,5 +361,21 @@ mod tests {
         ))
         .expect("varchar[] should map");
         assert_eq!(ty, DataType::Array(Box::new(DataType::Varchar(0))));
+    }
+
+    #[test]
+    fn regclass_variant_maps_to_pg_catalog_regclass() {
+        let ty =
+            sql_datatype_to_internal_strict(&SqlDataType::Regclass).expect("regclass should map");
+        assert_eq!(ty, DataType::UserDefined("pg_catalog.regclass".to_string()));
+    }
+
+    #[test]
+    fn custom_regtype_maps_to_pg_catalog_regtype() {
+        let name = ObjectName(vec![Ident::new("regtype")]);
+        let (ty, is_serial) = resolve_custom_type(TypeResolutionContext::NonDdl, &name, &[], None)
+            .expect("regtype should map");
+        assert_eq!(ty, DataType::UserDefined("pg_catalog.regtype".to_string()));
+        assert!(!is_serial);
     }
 }

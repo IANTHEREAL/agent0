@@ -7,7 +7,7 @@ use tikv_client::Transaction;
 use super::names;
 use super::names::normalize_ident;
 use super::types::sql_datatype_to_internal_strict;
-use super::types::{resolve_custom_type, TypeResolutionContext};
+use super::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
 use super::ExecuteResult;
 use crate::model::{UserTypeDef, UserTypeKind};
 use crate::storage::TikvStore;
@@ -160,14 +160,16 @@ async fn resolve_composite_field_type(
 ) -> Result<crate::model::DataType> {
     match sql_type {
         sqlparser::ast::DataType::Custom(name, modifiers) => {
-            let catalog_resolved =
-                super::ddl::resolve_catalog_udt(store, txn, db_id, name, search_path).await?;
-            let (dt, _) = resolve_custom_type(
-                TypeResolutionContext::NonDdl,
+            let (dt, _) = resolve_custom_type_with_catalog(
+                TypeResolutionContext::DdlOther,
+                store,
+                txn,
+                db_id,
+                search_path,
                 name,
                 modifiers,
-                catalog_resolved,
-            )?;
+            )
+            .await?;
             Ok(dt)
         }
         _ => sql_datatype_to_internal_strict(sql_type),

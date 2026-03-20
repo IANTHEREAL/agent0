@@ -11,7 +11,7 @@ use crate::sql::runtime_context::{wrap_with_statement_runtime_context, Statement
 use crate::sql::scanner::count_sql_parameters;
 use crate::sql::sequences::SequenceSession;
 use crate::sql::types::sql_datatype_to_internal_strict;
-use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
+use crate::sql::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1129,14 +1129,16 @@ async fn resolve_prepare_param_type(
 ) -> Result<DataType> {
     match sql_type {
         sqlparser::ast::DataType::Custom(name, modifiers) => {
-            let catalog_resolved =
-                crate::sql::ddl::resolve_catalog_udt(store, txn, db_id, name, search_path).await?;
-            let (dt, _) = resolve_custom_type(
+            let (dt, _) = resolve_custom_type_with_catalog(
                 TypeResolutionContext::NonDdl,
+                store,
+                txn,
+                db_id,
+                search_path,
                 name,
                 modifiers,
-                catalog_resolved,
-            )?;
+            )
+            .await?;
             Ok(dt)
         }
         _ => sql_datatype_to_internal_strict(sql_type),
