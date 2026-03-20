@@ -51,13 +51,25 @@ pub(crate) fn resolve_custom_type(
     // Schema-qualified names (e.g. s1.serial, s1.jsonb) skip serial expansion
     // and builtin fallback — they go straight to catalog lookup, then 42704.
     // PostgreSQL rejects `s1.serial` with "type s1.serial does not exist".
+    // Exception: pg_catalog.* built-in types are always valid.
     if is_schema_qualified {
         if let Some(resolved) = catalog_resolved {
             return Ok((resolved, false));
         }
-        return Err(
-            SqlError::UndefinedObject(format!("type \"{}\" does not exist", full_name)).into(),
-        );
+        // Allow pg_catalog.* built-in types through to step 3.
+        let is_pg_catalog = name
+            .0
+            .first()
+            .map(|i| i.value.eq_ignore_ascii_case("pg_catalog"))
+            .unwrap_or(false);
+        if !is_pg_catalog {
+            return Err(SqlError::UndefinedObject(format!(
+                "type \"{}\" does not exist",
+                full_name
+            ))
+            .into());
+        }
+        // Fall through to step 3 for pg_catalog.* types.
     }
 
     let Some(last_ident) = name.0.last() else {
