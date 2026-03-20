@@ -481,9 +481,7 @@ pub(super) async fn prefetch_type_references(
         let Some(def) = store.get_type(txn, db_id, &full_name).await? else {
             continue;
         };
-        let bare_name = def.name.clone();
-        snapshot.add_type(&full_name, def.clone());
-        snapshot.add_type(&bare_name, def);
+        snapshot.add_type(&full_name, def);
     }
 
     Ok(())

@@ -2,4 +2,4 @@ type "serial" does not exist
 type "serial" does not exist
 type "serial" does not exist
 type "serial" does not exist
-type "serial" does not exist
+type "serial[]" does not exist

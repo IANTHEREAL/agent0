@@ -40,6 +40,26 @@ pub(crate) fn resolve_custom_type(
     modifiers: &[String],
     catalog_resolved: Option<DataType>,
 ) -> Result<(DataType, bool)> {
+    let full_name = name
+        .0
+        .iter()
+        .map(|i| i.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    let is_schema_qualified = name.0.len() > 1;
+
+    // Schema-qualified names (e.g. s1.serial, s1.jsonb) skip serial expansion
+    // and builtin fallback — they go straight to catalog lookup, then 42704.
+    // PostgreSQL rejects `s1.serial` with "type s1.serial does not exist".
+    if is_schema_qualified {
+        if let Some(resolved) = catalog_resolved {
+            return Ok((resolved, false));
+        }
+        return Err(
+            SqlError::UndefinedObject(format!("type \"{}\" does not exist", full_name)).into(),
+        );
+    }
+
     let Some(last_ident) = name.0.last() else {
         return Err(SqlError::UndefinedObject("type \"\" does not exist".to_string()).into());
     };
@@ -65,12 +85,6 @@ pub(crate) fn resolve_custom_type(
     }
 
     // Step 4: Unknown — raise 42704.
-    let full_name = name
-        .0
-        .iter()
-        .map(|i| i.value.as_str())
-        .collect::<Vec<_>>()
-        .join(".");
     Err(SqlError::UndefinedObject(format!("type \"{}\" does not exist", full_name)).into())
 }
 

@@ -33,8 +33,7 @@ async fn build_udt_catalog(
     for udt in types {
         catalog.add_schema(&udt.schema);
         let full_name = format!("{}.{}", udt.schema, udt.name);
-        catalog.add_type(&full_name, udt.clone());
-        catalog.add_type(&udt.name.clone(), udt);
+        catalog.add_type(&full_name, udt);
     }
     Ok(catalog)
 }
