@@ -601,19 +601,20 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
             // Handle double-quoted schema-qualified names: "schema"."table"
             // This format is used by TypeORM and other ORMs.
-            let name_to_lookup: Cow<str> = if trimmed.starts_with('"') {
+            let name_to_lookup: Cow<str> = if let Some(trimmed_stripped) = trimmed.strip_prefix('"')
+            {
                 // Parse "schema"."table" format
                 // Find the closing quote of schema, then the dot, then the opening quote of table
-                if let Some(first_close) = trimmed[1..].find('"') {
+                if let Some(first_close) = trimmed_stripped.find('"') {
                     let after_schema = &trimmed[first_close + 1..];
                     let after_schema = after_schema.trim_start();
-                    if after_schema.starts_with('.') {
-                        let after_dot = after_schema[1..].trim_start();
-                        if after_dot.starts_with('"') {
+                    if let Some(after_dot) = after_schema.strip_prefix('.') {
+                        let after_dot = after_dot.trim_start();
+                        if let Some(after_dot_stripped) = after_dot.strip_prefix('"') {
                             // Extract table name between quotes
-                            if let Some(table_close) = after_dot[1..].find('"') {
+                            if let Some(table_close) = after_dot_stripped.find('"') {
                                 // Successfully parsed "schema"."table" - use just the table name
-                                Cow::Borrowed(&after_dot[1..table_close + 1])
+                                Cow::Borrowed(&after_dot_stripped[..table_close])
                             } else {
                                 Cow::Borrowed(trimmed)
                             }
