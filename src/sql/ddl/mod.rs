@@ -140,6 +140,7 @@ pub(super) async fn resolve_column_data_type(
     .await
 }
 
+#[allow(clippy::type_complexity)]
 fn resolve_nested_column_data_type<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
