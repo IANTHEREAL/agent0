@@ -4,17 +4,21 @@ use super::*;
 use crate::worker::types::IndexState;
 
 #[test]
-fn serial_column_type_is_top_level_only() {
-    use sqlparser::ast::{ArrayElemTypeDef, DataType as SqlDataType, Ident, ObjectName};
+fn serial_resolves_in_ddl_column_context_only() {
+    use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
+    use sqlparser::ast::{Ident, ObjectName};
 
-    let serial = SqlDataType::Custom(ObjectName(vec![Ident::new("SERIAL")]), vec![]);
-    assert_eq!(
-        serial_column_type(&serial).unwrap(),
-        Some((DataType::Int32, true))
-    );
+    let name = ObjectName(vec![Ident::new("SERIAL")]);
 
-    let serial_array = SqlDataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(serial)));
-    assert_eq!(serial_column_type(&serial_array).unwrap(), None);
+    // In DdlColumn context, serial expands to Int32.
+    let (dt, is_serial) =
+        resolve_custom_type(TypeResolutionContext::DdlColumn, &name, &[], None).unwrap();
+    assert_eq!(dt, DataType::Int32);
+    assert!(is_serial);
+
+    // In NonDdl context, serial is not special — raises 42704 without catalog.
+    let err = resolve_custom_type(TypeResolutionContext::NonDdl, &name, &[], None);
+    assert!(err.is_err());
 }
 
 #[test]

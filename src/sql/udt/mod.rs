@@ -7,6 +7,7 @@ use tikv_client::Transaction;
 use super::names;
 use super::names::normalize_ident;
 use super::types::sql_datatype_to_internal_strict;
+use super::types::{resolve_custom_type, TypeResolutionContext};
 use super::ExecuteResult;
 use crate::model::{UserTypeDef, UserTypeKind};
 use crate::storage::TikvStore;
@@ -55,7 +56,9 @@ pub async fn execute_create_type(
                         field_name
                     ));
                 }
-                let field_type = sql_datatype_to_internal_strict(&attr.data_type)?;
+                let field_type =
+                    resolve_composite_field_type(store, txn, db_id, search_path, &attr.data_type)
+                        .await?;
                 fields.push((field_name, field_type));
             }
             UserTypeKind::Composite { fields }
@@ -145,4 +148,28 @@ pub async fn drop_types(
         store.drop_type(txn, db_id, full_name).await?;
     }
     Ok(ExecuteResult::CommandComplete { tag: "DROP TYPE" })
+}
+
+/// Resolve a composite field type with catalog access for UDTs.
+async fn resolve_composite_field_type(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &sqlparser::ast::DataType,
+) -> Result<crate::model::DataType> {
+    match sql_type {
+        sqlparser::ast::DataType::Custom(name, modifiers) => {
+            let catalog_resolved =
+                super::ddl::resolve_catalog_udt(store, txn, db_id, name, search_path).await?;
+            let (dt, _) = resolve_custom_type(
+                TypeResolutionContext::NonDdl,
+                name,
+                modifiers,
+                catalog_resolved,
+            )?;
+            Ok(dt)
+        }
+        _ => sql_datatype_to_internal_strict(sql_type),
+    }
 }

@@ -12,6 +12,7 @@ pub(crate) mod registry;
 
 pub(crate) use cast::CastContext;
 pub(crate) use mapping::sql_datatype_to_internal_strict;
+pub(crate) use mapping::{resolve_custom_type, TypeResolutionContext};
 
 // Re-exports for tests
 #[cfg(test)]

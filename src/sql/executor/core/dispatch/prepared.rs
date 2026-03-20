@@ -11,8 +11,10 @@ use crate::sql::runtime_context::{wrap_with_statement_runtime_context, Statement
 use crate::sql::scanner::count_sql_parameters;
 use crate::sql::sequences::SequenceSession;
 use crate::sql::types::sql_datatype_to_internal_strict;
+use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -915,17 +917,27 @@ impl Executor {
         let prepared_sql = statement.to_string();
         let param_count = count_sql_parameters(&prepared_sql).max(data_types.len());
 
-        let mut client_oids: Vec<Option<DataType>> = Vec::with_capacity(data_types.len());
-        for sql_type in data_types {
-            client_oids.push(Some(sql_datatype_to_internal_strict(sql_type)?));
-        }
-
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
             session.begin().await?;
         }
 
+        // Resolve parameter types with catalog access for UDTs.
         let db_id = session.current_database_id();
+        let client_oids = {
+            let (txn, _sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+            let mut oids: Vec<Option<DataType>> = Vec::with_capacity(data_types.len());
+            for sql_type in data_types {
+                let dt =
+                    resolve_prepare_param_type(&self.store(), txn, db_id, search_path, sql_type)
+                        .await?;
+                oids.push(Some(dt));
+            }
+            oids
+        };
+
         let analysis_result = {
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
@@ -1104,6 +1116,33 @@ impl Executor {
         Ok(vec![ExecuteResult::CommandComplete { tag: "DEALLOCATE" }])
     }
 }
+
+/// Resolve a PREPARE parameter type with catalog access for UDTs.
+/// Non-Custom types use the standard strict mapping; Custom types go through
+/// the unified 4-step pipeline with catalog lookup.
+async fn resolve_prepare_param_type(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut tikv_client::Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &sqlparser::ast::DataType,
+) -> Result<DataType> {
+    match sql_type {
+        sqlparser::ast::DataType::Custom(name, modifiers) => {
+            let catalog_resolved =
+                crate::sql::ddl::resolve_catalog_udt(store, txn, db_id, name, search_path).await?;
+            let (dt, _) = resolve_custom_type(
+                TypeResolutionContext::NonDdl,
+                name,
+                modifiers,
+                catalog_resolved,
+            )?;
+            Ok(dt)
+        }
+        _ => sql_datatype_to_internal_strict(sql_type),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
