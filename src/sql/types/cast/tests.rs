@@ -453,7 +453,8 @@ fn regclass_text_catalog_name_resolves_to_oid() {
         Value::Text("nonexistent_table".into()),
         &regclass,
         CastContext::Explicit,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(matches!(result, Value::Int64(_)));
     // Verify the synthetic OID is in the expected range (100B+)
     if let Value::Int64(oid) = result {

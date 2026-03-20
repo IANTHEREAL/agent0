@@ -640,7 +640,8 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
             // For user tables (not in pg_catalog), return a synthetic OID based on name hash.
             // This allows ORM introspection queries like obj_description('table'::regclass) to work.
-            let synthetic_oid = 100_000_000_000i64 + (fnv1a_64(name.as_bytes()) % 1_000_000_000) as i64;
+            let synthetic_oid =
+                100_000_000_000i64 + (fnv1a_64(name.as_bytes()) % 1_000_000_000) as i64;
             Ok(Value::Int64(synthetic_oid))
         }
         (Value::Int32(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
