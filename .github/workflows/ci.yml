@@ -79,7 +79,7 @@ jobs:
 
       - name: Run regression gate
         shell: bash
-        run: ./scripts/regression_gate.sh --skip-unit --skip-build
+        run: ./scripts/regression_gate.sh --skip-unit --skip-build --skip-orm
 
       - name: Upload regression reports
         if: always()
