@@ -917,12 +917,7 @@ impl Executor {
         let prepared_sql = statement.to_string();
         let param_count = count_sql_parameters(&prepared_sql).max(data_types.len());
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
-
-        // Resolve parameter types with catalog access for UDTs.
+        // Resolve parameter types with catalog access for UDTs (before starting transaction).
         let db_id = session.current_database_id();
         let client_oids = {
             let (txn, _sequence_values, search_path) = session
@@ -937,6 +932,11 @@ impl Executor {
             }
             oids
         };
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
 
         let analysis_result = {
             let (txn, _sequence_values, search_path) = session
@@ -1120,6 +1120,7 @@ impl Executor {
 /// Resolve a PREPARE parameter type with catalog access for UDTs.
 /// Non-Custom types use the standard strict mapping; Custom types go through
 /// the unified 4-step pipeline with catalog lookup.
+/// Arrays of custom types (e.g. mood[]) recurse into the inner type.
 async fn resolve_prepare_param_type(
     store: &Arc<crate::storage::TikvStore>,
     txn: &mut tikv_client::Transaction,
@@ -1140,6 +1141,35 @@ async fn resolve_prepare_param_type(
             )
             .await?;
             Ok(dt)
+        }
+        sqlparser::ast::DataType::Array(inner) => {
+            let inner_sql_type = match inner {
+                sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
+                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t) => t.as_ref(),
+                sqlparser::ast::ArrayElemTypeDef::None => {
+                    return sql_datatype_to_internal_strict(&sqlparser::ast::DataType::Array(
+                        sqlparser::ast::ArrayElemTypeDef::None,
+                    ));
+                }
+            };
+            // Handle array inner type with catalog lookup for Custom types.
+            let inner_dt = match inner_sql_type {
+                sqlparser::ast::DataType::Custom(name, modifiers) => {
+                    let (dt, _) = resolve_custom_type_with_catalog(
+                        TypeResolutionContext::NonDdl,
+                        store,
+                        txn,
+                        db_id,
+                        search_path,
+                        name,
+                        modifiers,
+                    )
+                    .await?;
+                    dt
+                }
+                _ => sql_datatype_to_internal_strict(inner_sql_type)?,
+            };
+            Ok(DataType::Array(Box::new(inner_dt)))
         }
         _ => sql_datatype_to_internal_strict(sql_type),
     }

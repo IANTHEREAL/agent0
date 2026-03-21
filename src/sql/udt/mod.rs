@@ -151,6 +151,7 @@ pub async fn drop_types(
 }
 
 /// Resolve a composite field type with catalog access for UDTs.
+/// Arrays of custom types (e.g. mood[]) recurse into the inner type.
 async fn resolve_composite_field_type(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -171,6 +172,35 @@ async fn resolve_composite_field_type(
             )
             .await?;
             Ok(dt)
+        }
+        sqlparser::ast::DataType::Array(inner) => {
+            let inner_sql_type = match inner {
+                sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
+                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t) => t.as_ref(),
+                sqlparser::ast::ArrayElemTypeDef::None => {
+                    return sql_datatype_to_internal_strict(&sqlparser::ast::DataType::Array(
+                        sqlparser::ast::ArrayElemTypeDef::None,
+                    ));
+                }
+            };
+            // Handle array inner type with catalog lookup for Custom types.
+            let inner_dt = match inner_sql_type {
+                sqlparser::ast::DataType::Custom(name, modifiers) => {
+                    let (dt, _) = resolve_custom_type_with_catalog(
+                        TypeResolutionContext::DdlOther,
+                        store,
+                        txn,
+                        db_id,
+                        search_path,
+                        name,
+                        modifiers,
+                    )
+                    .await?;
+                    dt
+                }
+                _ => sql_datatype_to_internal_strict(inner_sql_type)?,
+            };
+            Ok(crate::model::DataType::Array(Box::new(inner_dt)))
         }
         _ => sql_datatype_to_internal_strict(sql_type),
     }
