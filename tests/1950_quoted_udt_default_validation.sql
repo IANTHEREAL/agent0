@@ -16,6 +16,12 @@ CREATE TABLE qg1950_create_default_ok (c mood DEFAULT 'happy'::mood);
 INSERT INTO qg1950_create_default_ok DEFAULT VALUES;
 SELECT 'create_default_insert' AS check_name, c::text FROM qg1950_create_default_ok;
 
+CREATE TABLE qg1950_nested_default_ok (
+    c mood DEFAULT coalesce('happy'::mood, 'sad'::mood)
+);
+INSERT INTO qg1950_nested_default_ok DEFAULT VALUES;
+SELECT 'nested_default_insert' AS check_name, c::text FROM qg1950_nested_default_ok;
+
 CREATE TABLE qg1950_add_default_ok (id int);
 ALTER TABLE qg1950_add_default_ok ADD COLUMN c mood DEFAULT 'happy'::mood;
 INSERT INTO qg1950_add_default_ok (id) VALUES (1);
@@ -44,6 +50,7 @@ ALTER TABLE qg1950_using_bad ALTER COLUMN c TYPE mood USING c::"MOOD";
 
 DROP TABLE IF EXISTS qg1950_create_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_create_default_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_nested_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_add_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_add_default_bad CASCADE;
 DROP TABLE IF EXISTS qg1950_set_default_ok CASCADE;

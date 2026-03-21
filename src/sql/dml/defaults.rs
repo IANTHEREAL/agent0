@@ -55,15 +55,30 @@ fn data_type_has_custom_type(data_type: &sqlparser::ast::DataType) -> bool {
 /// Returns true if the parsed expression contains a `DataType::Custom` cast
 /// that would require catalog lookup (e.g. `'happy'::mood`).
 fn expr_has_custom_type_cast(expr: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Cast {
-            data_type,
-            expr: inner,
-            ..
-        } => data_type_has_custom_type(data_type) || expr_has_custom_type_cast(inner),
-        _ => false,
-    }
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{visit_expressions, Expr};
+
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if found {
+            return ControlFlow::Break(());
+        }
+
+        match e {
+            Expr::Cast { data_type, .. }
+            | Expr::TryCast { data_type, .. }
+            | Expr::SafeCast { data_type, .. } => {
+                if data_type_has_custom_type(data_type) {
+                    found = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            _ => {}
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+    found
 }
 
 async fn eval_default_expr_maybe_sequence(
@@ -430,6 +445,13 @@ mod tests {
     fn expr_has_custom_type_cast_detects_enum_array_cast() {
         assert!(expr_has_custom_type_cast(&parse_expr(
             "ARRAY['happy']::mood[]"
+        )));
+    }
+
+    #[test]
+    fn expr_has_custom_type_cast_detects_nested_enum_cast() {
+        assert!(expr_has_custom_type_cast(&parse_expr(
+            "coalesce('happy'::mood, 'sad'::mood)"
         )));
     }
 
