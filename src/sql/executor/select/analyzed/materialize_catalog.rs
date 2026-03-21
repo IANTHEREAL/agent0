@@ -1319,8 +1319,8 @@ impl Executor {
             self.store().as_ref(),
             txn,
             db_id,
-            schema_opt.as_deref(),
-            &name,
+            schema_opt,
+            name,
             search_path,
         )
         .await?;
@@ -1368,8 +1368,8 @@ impl Executor {
                     self.store().as_ref(),
                     txn,
                     db_id,
-                    schema_opt.as_deref(),
-                    &name,
+                    schema_opt,
+                    name,
                     search_path,
                 )
                 .await?;
