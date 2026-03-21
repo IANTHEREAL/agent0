@@ -66,7 +66,7 @@ pub(crate) fn resolve_custom_type(
     // to prevent UDTs from shadowing builtins. PostgreSQL's pg_catalog always has precedence
     // over user schemas for builtins like 'jsonb', 'tsvector', etc.
     if is_unqualified || is_pg_catalog {
-        if let Some(dt) = convert_custom_builtin(&type_name, modifiers) {
+        if let Some(dt) = convert_custom_builtin(type_name, modifiers) {
             return Ok((dt, false));
         }
     }

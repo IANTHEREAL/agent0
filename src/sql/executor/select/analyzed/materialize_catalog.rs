@@ -481,6 +481,28 @@ impl Executor {
                         )
                         .await?;
 
+                    if matches!(
+                        target_type,
+                        DataType::UserDefined(name)
+                            if name.eq_ignore_ascii_case("regclass")
+                                || name.eq_ignore_ascii_case("pg_catalog.regclass")
+                    ) {
+                        let val = self
+                            .eval_regclass_cast(
+                                &materialized_inner,
+                                row,
+                                txn,
+                                db_id,
+                                search_path,
+                                qctx,
+                            )
+                            .await?;
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(val),
+                            expr.data_type.clone(),
+                        ));
+                    }
+
                     if *target_type == DataType::Text
                         && matches!(
                             &materialized_inner.data_type,
@@ -1287,6 +1309,68 @@ impl Executor {
         )
         .await?;
         Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
+    }
+
+    async fn eval_regclass_cast(
+        &self,
+        inner: &TypedExpr,
+        row: &Row,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let input = eval_typed_expr(inner, row, qctx)?;
+        match input {
+            Value::Null => Ok(Value::Null),
+            Value::Int32(n) => Ok(Value::Int64(n as i64)),
+            Value::Int64(n) => Ok(Value::Int64(n)),
+            Value::Text(raw) => {
+                let trimmed = raw.trim();
+                if let Ok(n) = trimmed.parse::<i64>() {
+                    return Ok(Value::Int64(n));
+                }
+
+                let (schema_opt, name) =
+                    crate::sql::names::parse_regclass_input(trimmed).map_err(|input| {
+                        SqlError::Unsupported(format!(
+                            "cross-database references are not implemented: \"{}\"",
+                            input
+                        ))
+                    })?;
+
+                if name.is_empty() {
+                    return Err(SqlError::InvalidInputSyntax {
+                        type_name: "regclass".into(),
+                        value: raw,
+                    }
+                    .into());
+                }
+
+                let oid = crate::sql::names::resolve_existing_relation_oid(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    schema_opt.as_deref(),
+                    &name,
+                    search_path,
+                )
+                .await?;
+
+                oid.map(Value::Int64).ok_or_else(|| {
+                    SqlError::InvalidInputSyntax {
+                        type_name: "regclass".into(),
+                        value: raw,
+                    }
+                    .into()
+                })
+            }
+            other => Err(SqlError::InvalidInputSyntax {
+                type_name: "regclass".into(),
+                value: other.to_string(),
+            }
+            .into()),
+        }
     }
 
     async fn eval_pg_get_serial_sequence(
