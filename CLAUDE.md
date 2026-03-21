@@ -56,130 +56,11 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - All persistent data must be isolated per keyspace (`_sys_*`, table rows, indexes, auth, and future stats).
 - Process-level global state is limited to in-memory caches/config/logging.
 
-## Completed Milestones
+## Current Sprint & Issue Tracking
 
-### Sprint 1 — Analyzer + Legacy Cleanup
+- **Epic:** #1959 — Open Issue Triage: Refactoring Groups and Execution Plan (80 issues)
+- **Sprint W17:** #1961 — Concentrated Refactoring (Type Resolution, GUC Architecture, Code Quality)
 
-- **Task 1:** Analyzer → Typed IR pipeline (single execution path for all SELECT queries)
-- **#56** NLJ streaming — NLJ now streams outer side, materializes only build side (`src/sql/operators/join.rs`)
-- **#609** SELECT privilege enforcement — `require_table_privilege(Select)` on every base table
-- **#634/#635** COPY CSV fixes — order-independent option parsing, ESCAPE self-escaping
-- Legacy removal: `infer_expr_type`, `executor/subquery.rs`, boolean validator, comparison coercion fallback
-- All 10 legacy code items fully resolved (#772)
-
-### CBO — Planner Unification + Optimizer Pipeline (#778, #815)
-
-- `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator` pipeline implemented in `src/sql/optimizer/`.
-- **Planner dual-path resolved:** TypedExpr path has full expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion → Analyzer → typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
-- **GIN index status:** planner can produce GIN scan plans (visible in EXPLAIN), but the runtime operator falls back to table scan (`src/sql/optimizer/build/scan.rs`) — GIN execution operator is not yet implemented.
-- Coverage: single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON.
-- `db9.use_optimizer` GUC retained for compatibility (always-on, no-op when set to off).
-- Handler decomposed: monolithic `dynamic.rs` split into `dynamic/` module (mod.rs, query.rs, copy.rs, startup.rs).
-- Index name uniqueness enforced within schema (#777).
-
-### CBO Phase 2–3 — Statistics + Join Optimization (#706, #705, #908, #937)
-
-- Phase 2: Table statistics (#706) — COMPLETE (ANALYZE, persistence, warmup, invalidation).
-- Phase 3: Join optimization (#705) — ALL DONE: predicate pushdown, cross-join elimination, hash join selection, cost-based join reordering via DPccp (#908), subquery decorrelation EXISTS/NOT EXISTS → SemiJoin/AntiJoin (#937).
-- Index selection in optimizer path — COMPLETE (btree parity: point, range, bounded-range, in-list, expression indexes, partial indexes; GIN excluded).
-
-### Protocol — Prepared Statement Unification + Hardening (#865, #471, #579)
-
-- Prepared-statement semantic contract unified (#865): all 9 sub-issues closed — text substitution removed (#867), Analyzer-backed Describe (#868), god files split (#869/#875), TypedExpr visitor API (#870/#899), error handling unified (#871/#900), regex cache + NULL guard dedup (#872/#873/#880).
-- Protocol production readiness (#471): secure defaults (#401), COPY txn semantics (#32), Extended Query binary Bind (#355/#403), pgwire robustness (#421 — 6 sub-tasks). All closed.
-- Protocol hardening (#579): SQLSTATE mapping, memory/stack guards (#929), dynamic.rs split into sub-modules (#917/#919/#921). All closed.
-- Prepared execute parity (#902/#906/#935): runtime context, role gating, timeout, recursive CTE, Cow optimization. All closed.
-
-### Other Recent
-
-- **Worker engine** (`src/worker/`): unified async task engine — Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql. Global TiKV queue, pessimistic locking, GC.
-- **Cron scheduler** (`src/cron/`): pg_cron-compatible expressions, job management, virtual tables (`cron_job`, `cron_job_run_details`, `cron_running_jobs`).
-- **Prisma ORM** binary wire protocol (#841/#842).
-- **PL/pgSQL** execution: SELECT INTO, FOR loops, EXIT, correlated table functions (#863).
-- **Cron** runtime management: job timeout, cancel, process list (#896), status command (#913), --file + dollar-quoting (#892).
-- **fs9** file system: `fs9_read`, `fs9_write`, `fs9_exists`, `fs9_size`, `fs9_mtime`, `fs9_remove`, remote backend routing, SDK API (#851/#853/#855/#878).
-- **SQL functions**: json_agg/jsonb_agg, hashtext (#930), RETURNS TABLE syntax (#895).
-- **FTS** Chinese tokenizer support for GIN full-text search (#774).
-- **Infra**: SQL execution timeout protection (#860), stack overflow prevention (#929), information_schema.columns optimization (#936), unified SqlError with SQLSTATE (#900).
-- **HNSW vector index** (#1220/#1241): pgvector-compatible HNSW ANN index — CREATE INDEX USING hnsw, 3 distance metrics (L2/cosine/inner product), k-NN query via `ORDER BY <-> LIMIT k`, `hnsw.ef_search` GUC, DML maintenance (INSERT/DELETE), EXPLAIN support, process-level LRU cache. New modules: `src/sql/hnsw/`, `src/sql/operators/hnsw_scan.rs`, `src/sql/planner/hnsw_predicate.rs`.
-- **Refactoring**: dispatch_raw! macro for executor dispatch (#966), deduplicated utility functions (#964), LogicalPlan::map_children() (#963), IndexScanBase coverage (#970).
-
-### Phase 1 — Core Correctness (ALL DONE)
-
-- **FK cluster** (#925, #923, #924, #922): ref_columns validation, NULL MATCH SIMPLE, stale snapshots, self-referential constraints — all fixed in `src/sql/dml/foreign_keys.rs`.
-- **Analyzer/operators** (#910, #911): SQLSTATE 42725 parity for mixed unknown binary ops + test coverage.
-- **GUC** (#601, #884): SET LOCAL (transaction-scoped), `current_setting()`, SET LOCAL rollback.
-- **SHOW** (#600, #599): PostgreSQL-compatible SHOW defaults + SHOW ALL.
-- **SQL parity** (#408): UNNEST(...) as JOIN relation.
-- **JSONB** (#281): JSON/JSONB canonicalization (key order, whitespace).
-- **CLI** (#920): db9 login --api-key 401 auth fix.
-
-## Open Issues (Active)
-
-### Correctness — SQL parity
-
-- **#397/#396** Collated string index test mismatches.
-- **#395** ALTER TYPE test mismatch.
-
-### Usability — ORM compatibility
-
-- **#885** Activepieces drop-in compatibility. Depends on: remaining syntax gaps.
-- **#840** Prisma ORM remaining test gaps (upsert, JSONB path, SERIALIZABLE).
-- **#375** Dify compatibility (introspection, RETURNING, JSONB operators).
-
-### Performance (deferred)
-
-- **#857** Pre-materialization runs unconditionally/twice on top-level SELECT. → **#707** (plan cache).
-- **#707** Plan cache for prepared statements. Independent of #708.
-- **#708** Parallel/distributed query execution framework (long-term, independent track).
-
-### Architecture / Code quality
-
-- **#696** Statement-type detection duplicated in query_parser.rs and dispatch.rs.
-- **#695** Dual type module hierarchy (src/model/ vs src/sql/types/).
-- **#694** bincode serialization in SQL layer couples to storage encoding.
-- **#693** Version column name rewriting in wire encoding layer.
-- **#779** Per-tenant resource governance: connection caps → tenant QPS → timeout enforcement → memory/backpressure.
-- **#700** Admin portal credential encryption falls back to plaintext. → **#699** (tenant creation refactor).
-
-### Testing / Infra
-
-- **#898** Handler-level on_parse fallback-path tests.
-- **#411** Enforce clippy policy.
-- **#317** integration_test NO_COLOR + diff on golden mismatch.
-- **#419** doc-lint should validate code_entrypoint symbols exist.
-
-## Issue Resolution Map (Execution Order)
-
-```
-Phase 0 — Quick wins (start now, parallel lanes)
-├── Lane T1: #898 || #317 || #419 || #411    [auto_testing/infra, independent]
-├── Lane T2: #920                              [db9 CLI auth, independent]
-└── Lane T3: #700 → #699                      [admin portal: security before refactor]
-    Validation: cargo test, db9 CLI smoke, admin-portal E2E
-
-Phase 1 — SQL parity (remaining)
-└── #395 || #396 || #397             [collated index + ALTER TYPE mismatches]
-    Validation: cargo test + SQL integration + golden file diff vs PG 17.7
-
-Phase 2 — ORM compatibility
-├── #840 Prisma
-├── #375 Dify
-└── #885 Activepieces (depends on #840 + #375)
-    Validation: cargo test + orm-tests (npm test) + Activepieces migration suite
-
-Phase 3 — Performance
-├── #857 → #707 (pre-materialization dedup, then plan cache)
-└── #708 (parallel execution, independent long-term track)
-    Validation: cargo test + cargo bench + SQL integration
-
-Phase 4 — Architecture debt (parallel)
-├── Independent: #696 || #695 || #694 || #693
-└── #779 (sequential: connection caps → tenant QPS → timeout → memory)
-    Validation: cargo test + cargo clippy
-```
-
-<!-- Canonical source: docs/ARCHITECTURE.md — kept inline because CLAUDE.md must be self-contained for LLM context -->
 ## Repository Layout (stable)
 
 ```
@@ -311,6 +192,39 @@ cd orm-tests && npm test
 - Always enforce deterministic output (`ORDER BY`, fixed values, no random-dependent assertions).
 - Do not update expected outputs blindly; validate against real PostgreSQL first.
 - **Before changing any `.expected`, `.errors`, or `.assert` file, you MUST run the corresponding `.sql` against real PostgreSQL 17.7 and verify the new expected output matches PG's actual output.** No exceptions — guessing what PG returns is not acceptable.
+
+## Agent Team Methodology (must follow)
+
+When using multi-agent teams for issue triage, planning, refactoring analysis, or any code investigation:
+
+### 1. Evidence over opinion
+- Every agent **must read actual source code** (file paths, line numbers, function signatures) before making claims.
+- Use `grep`, `git log`, `git blame`, and file reads — not just `gh issue view`.
+- Conclusions without code evidence are rejected.
+
+### 2. Verify, don't assume
+- Agents must **check current master** to confirm whether an issue is actually fixed or still present.
+- Run targeted searches (e.g., grep for the function name, read the specific file) rather than trusting issue descriptions at face value.
+- If an agent claims "this is fixed," it must cite the merged PR **and** verify the fix exists on master.
+
+### 3. Agents must challenge each other
+- When multiple agents analyze overlapping areas, they must **find and surface disagreements**.
+- Consensus without debate is a red flag — push agents to argue from different perspectives.
+- The final output should reflect resolved disagreements, not rubber-stamped agreement.
+
+### 4. Realistic time estimates
+- Estimates must be grounded in **actual codebase metrics**: file sizes (lines of code), module coupling (how many callers/callees), test coverage gaps, CI turnaround time.
+- Factor in network latency, build times, and dependency chains.
+- No hand-waving. If an agent says "2 days," it must explain why (e.g., "mapping.rs is 400 lines, 6 call sites to update, 3 integration tests to add, CI takes ~15 min").
+
+### 5. Structured output with evidence
+- Final output must include **evidence tables**: issue number, affected file:line, current state on master, recommended action, estimated effort with justification.
+- Group issues by **code hotspot** (which module/file), not by issue type — the goal is to find concentrated refactoring targets that batch-resolve multiple issues.
+- Prioritize by **issues resolved per refactoring effort** (bang for buck).
+
+### 6. Test hypotheses
+- When feasible, agents should **run commands** to validate claims (e.g., `cargo test`, `grep` for patterns, count occurrences of duplicated code).
+- "I believe this is duplicated 15 times" must become "I confirmed 15 occurrences in these files: [list]."
 
 ## Documentation
 
