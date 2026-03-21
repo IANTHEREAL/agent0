@@ -53,6 +53,9 @@ pub(crate) fn resolve_custom_type(
     };
     let type_name = last_ident.value.to_uppercase();
 
+    let is_unqualified = name.0.len() == 1;
+    let is_pg_catalog = name.0.len() == 2 && name.0[0].value.eq_ignore_ascii_case("pg_catalog");
+
     // Step 1: Serial check — only in DDL column context AND only for unqualified names.
     // Schema-qualified names (e.g. pg_catalog.serial, s1.serial) NEVER trigger serial expansion.
     // PostgreSQL rejects `pg_catalog.serial` with 42704 "type pg_catalog.serial does not exist".
@@ -64,21 +67,19 @@ pub(crate) fn resolve_custom_type(
         }
     }
 
-    // Step 2: Catalog lookup — pre-resolved UDT takes precedence.
-    if let Some(resolved) = catalog_resolved {
-        return Ok((resolved, false));
-    }
-
-    // Step 3: Built-in mapping.
-    // Only applies to unqualified names or pg_catalog.* qualified names.
-    // For other schema-qualified names (e.g. s1.jsonb, public.serial), skip builtin mapping
-    // and go straight to 42704 if catalog lookup missed.
-    let is_unqualified = name.0.len() == 1;
-    let is_pg_catalog = name.0.len() == 2 && name.0[0].value.eq_ignore_ascii_case("pg_catalog");
+    // Step 2: Built-in mapping for unqualified/pg_catalog names — MUST come before catalog
+    // to prevent UDTs from shadowing builtins. PostgreSQL's pg_catalog always has precedence
+    // over user schemas for builtins like 'jsonb', 'tsvector', etc.
     if is_unqualified || is_pg_catalog {
         if let Some(dt) = convert_custom_builtin(&type_name, modifiers) {
             return Ok((dt, false));
         }
+    }
+
+    // Step 3: Catalog lookup — UDTs take precedence for schema-qualified names or when
+    // builtin mapping didn't match.
+    if let Some(resolved) = catalog_resolved {
+        return Ok((resolved, false));
     }
 
     // Step 4: Unknown — raise 42704.

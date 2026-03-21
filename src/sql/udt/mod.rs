@@ -174,7 +174,29 @@ async fn resolve_composite_field_type(
             Ok(dt)
         }
         sqlparser::ast::DataType::Array(inner) => {
-            let inner_sql_type = match inner {
+            // Unwrap all Array layers to find the leaf type, then resolve it with catalog lookup.
+            // This handles multi-dimensional arrays like mood[][] correctly.
+            let mut leaf_type = inner;
+            let mut array_depth = 1;
+            loop {
+                match leaf_type {
+                    sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
+                    | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t) => match t.as_ref() {
+                        sqlparser::ast::DataType::Array(nested) => {
+                            leaf_type = nested;
+                            array_depth += 1;
+                        }
+                        _ => break,
+                    },
+                    sqlparser::ast::ArrayElemTypeDef::None => {
+                        return sql_datatype_to_internal_strict(&sqlparser::ast::DataType::Array(
+                            sqlparser::ast::ArrayElemTypeDef::None,
+                        ));
+                    }
+                }
+            }
+            // Now resolve the leaf type with catalog lookup.
+            let leaf_sql_type = match leaf_type {
                 sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
                 | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t) => t.as_ref(),
                 sqlparser::ast::ArrayElemTypeDef::None => {
@@ -183,8 +205,7 @@ async fn resolve_composite_field_type(
                     ));
                 }
             };
-            // Handle array inner type with catalog lookup for Custom types.
-            let inner_dt = match inner_sql_type {
+            let leaf_dt = match leaf_sql_type {
                 sqlparser::ast::DataType::Custom(name, modifiers) => {
                     let (dt, _) = resolve_custom_type_with_catalog(
                         TypeResolutionContext::DdlOther,
@@ -198,9 +219,14 @@ async fn resolve_composite_field_type(
                     .await?;
                     dt
                 }
-                _ => sql_datatype_to_internal_strict(inner_sql_type)?,
+                _ => sql_datatype_to_internal_strict(leaf_sql_type)?,
             };
-            Ok(crate::model::DataType::Array(Box::new(inner_dt)))
+            // Re-wrap with all array layers.
+            let mut result_dt = leaf_dt;
+            for _ in 0..array_depth {
+                result_dt = crate::model::DataType::Array(Box::new(result_dt));
+            }
+            Ok(result_dt)
         }
         _ => sql_datatype_to_internal_strict(sql_type),
     }
