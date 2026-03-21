@@ -1,0 +1,51 @@
+SET
+ statement_timeout_ok
+
+SET
+ lock_timeout_ok
+
+SET
+ idle_in_txn_ok
+
+SET
+ client_encoding_ok
+
+SET
+ scs_on_ok
+
+SET
+ check_fn_bodies_ok
+
+SET
+ client_min_messages_ok
+
+SET
+ row_security_ok
+
+SET
+ default_tablespace_empty_ok
+
+SET
+ default_tam_heap_ok
+
+SET
+ datestyle_ok
+
+ on
+
+ off
+
+ 
+
+ heap
+
+RESET
+RESET
+RESET
+RESET
+RESET
+RESET
+RESET
+RESET
+RESET
+RESET

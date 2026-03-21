@@ -1,0 +1,12 @@
+commit_in_txn|Asia/Shanghai
+commit_after|Asia/Shanghai
+local_in_txn|Asia/Shanghai
+local_after_commit|UTC
+local_in_txn_rb|Asia/Shanghai
+local_after_rollback|UTC
+sp_inner|America/New_York
+sp_restored|Asia/Shanghai
+sp_after_commit|UTC
+autocommit|Asia/Shanghai
+before_regular_set|local_val
+after_regular_set|regular_val
