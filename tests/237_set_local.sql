@@ -48,13 +48,13 @@ COMMIT;
 SHOW application_name;
 
 -- 6) RESET ALL clears local overrides
-RESET standard_conforming_strings;
+RESET row_security;
 BEGIN;
-SET LOCAL standard_conforming_strings = off;
+SET LOCAL row_security = off;
 RESET ALL;
-SHOW standard_conforming_strings;
+SHOW row_security;
 COMMIT;
-SHOW standard_conforming_strings;
+SHOW row_security;
 
 -- 7) SET then SET LOCAL: local in txn, SET value after COMMIT
 SET timezone = 'Asia/Shanghai';
@@ -114,16 +114,16 @@ COMMIT;
 SHOW timezone;
 
 -- 13) RESET ALL inside savepoint, then ROLLBACK TO restores local snapshots
-RESET standard_conforming_strings;
+RESET row_security;
 BEGIN;
-SET LOCAL standard_conforming_strings = off;
+SET LOCAL row_security = off;
 SAVEPOINT rs;
 RESET ALL;
-SHOW standard_conforming_strings;
+SHOW row_security;
 ROLLBACK TO rs;
-SHOW standard_conforming_strings;
+SHOW row_security;
 COMMIT;
-SHOW standard_conforming_strings;
+SHOW row_security;
 
 -- 14) SET LOCAL search_path inside transaction reverts at COMMIT
 SET search_path = public;

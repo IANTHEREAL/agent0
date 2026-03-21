@@ -12,330 +12,901 @@ use std::time::Duration;
 use super::{DEFAULT_DML_TABLE_SCAN_MAX_ROWS, DEFAULT_MAX_SORT_BYTES};
 const DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND: usize = i64::MAX as usize;
 
-/// Metadata for a single known GUC parameter.
-pub(crate) struct GucMeta {
+// ── GUC type classification ──────────────────────────────────────────────
+
+/// Semantic type of a GUC parameter. Used for type-level validation before
+/// any custom `validate_fn` is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Real: reserved for future GUCs
+pub(crate) enum GucType {
+    Bool,
+    Int,
+    Real,
+    String,
+    Enum,
+    Timeout,
+    ByteSize,
+}
+
+/// Determines who may SET a GUC and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Suset: used in P4 for session_replication_role
+pub(crate) enum GucContext {
+    /// Immutable server properties (server_version, server_encoding, etc.).
+    /// Cannot be changed at runtime.
+    Internal,
+    /// Superuser-only at runtime.
+    Suset,
+    /// Any user may SET.
+    Userset,
+}
+
+// ── GUC flags ────────────────────────────────────────────────────────────
+
+/// GUC is accepted for driver/pg_dump compatibility but has no runtime effect.
+#[allow(dead_code)] // used in P2+ for HOLLOW dispatch
+pub(crate) const GUC_HOLLOW: u32 = 1 << 0;
+/// GUC value changes should be reported to the client via ParameterStatus.
+#[allow(dead_code)] // used in P2+ for REPORT dispatch
+pub(crate) const GUC_REPORT: u32 = 1 << 1;
+/// Boot default is computed at runtime (not a compile-time constant).
+#[allow(dead_code)] // used in P2+ for runtime default handling
+pub(crate) const GUC_RUNTIME_DEFAULT: u32 = 1 << 2;
+/// Excluded from RESET ALL.
+#[allow(dead_code)]
+pub(crate) const GUC_NO_RESET_ALL: u32 = 1 << 3;
+
+// ── GucDef ───────────────────────────────────────────────────────────────
+
+/// Declarative definition of a single GUC parameter.
+#[allow(dead_code)] // flags: used in P2+ for HOLLOW/REPORT dispatch
+pub(crate) struct GucDef {
     pub(crate) name: &'static str,
-    immutable: bool,
-    description: &'static str,
-    /// Static default for GUCs handled in the default_value fallback path.
-    /// `None` for GUCs whose value is computed from typed struct fields in show_value().
-    static_default: Option<&'static str>,
+    pub(crate) guc_type: GucType,
+    pub(crate) context: GucContext,
+    pub(crate) description: &'static str,
+    pub(crate) boot_default: &'static str,
+    pub(crate) flags: u32,
+    /// Custom validator. Called AFTER type-level validation.
+    /// If `None`, type-level validation is sufficient.
+    pub(crate) validate_fn: Option<fn(&str) -> Result<String>>,
+}
+
+// ── Standalone validator functions ───────────────────────────────────────
+
+fn validate_timezone(value: &str) -> Result<String> {
+    crate::model::timestamp::TimeZoneSpec::try_parse(value)?;
+    Ok(value.to_string())
+}
+
+fn validate_client_encoding(value: &str) -> Result<String> {
+    let enc = value.trim();
+    if enc.eq_ignore_ascii_case("utf8") || enc.eq_ignore_ascii_case("utf-8") {
+        Ok("UTF8".to_string())
+    } else {
+        Err(SqlError::Unsupported(format!(
+            "unsupported client_encoding '{}'; only UTF8 is supported",
+            value
+        ))
+        .into())
+    }
+}
+
+fn validate_standard_conforming_strings(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "on" | "true" | "yes" | "1" => Ok("on".to_string()),
+        "off" | "false" | "no" | "0" => Err(SqlError::Unsupported(
+            "standard_conforming_strings = off is not supported; \
+             the parser always treats backslashes literally"
+                .to_string(),
+        )
+        .into()),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: "parameter \"standard_conforming_strings\" requires a Boolean value".into(),
+        }
+        .into()),
+    }
+}
+
+fn validate_transaction_isolation(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "read uncommitted" | "read committed" => {
+            tracing::warn!(
+                requested = normalized.as_str(),
+                actual = "repeatable read",
+                "TiKV provides snapshot isolation (REPEATABLE READ); \
+                 the requested isolation level has been upgraded"
+            );
+            // Store user-requested value for SHOW readback (PG parity).
+            // Internal behavior always uses repeatable read regardless.
+            Ok(normalized)
+        }
+        "repeatable read" => Ok("repeatable read".to_string()),
+        "serializable" => {
+            tracing::warn!(
+                requested = "serializable",
+                actual = "repeatable read",
+                "TiKV cannot provide PostgreSQL SERIALIZABLE semantics; \
+                 the requested isolation level has been downgraded"
+            );
+            Ok(normalized)
+        }
+        _ => Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"transaction_isolation\": \"{}\"",
+                value
+            ),
+        }
+        .into()),
+    }
+}
+
+fn validate_default_tablespace(value: &str) -> Result<String> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("pg_default") {
+        Ok(String::new()) // normalized to empty
+    } else {
+        Err(SqlError::UndefinedObject(format!("tablespace \"{}\" does not exist", v)).into())
+    }
+}
+
+fn validate_datestyle(value: &str) -> Result<String> {
+    let v = value.trim();
+    // db9 only supports ISO, MDY output format.
+    if v.eq_ignore_ascii_case("ISO, MDY") || v.eq_ignore_ascii_case("ISO") {
+        Ok("ISO, MDY".to_string())
+    } else {
+        Err(SqlError::InvalidParameterValue {
+            message: format!("invalid value for parameter \"DateStyle\": \"{}\"", v),
+        }
+        .into())
+    }
+}
+
+fn validate_intervalstyle(value: &str) -> Result<String> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("postgres") {
+        Ok("postgres".to_string())
+    } else {
+        Err(SqlError::InvalidParameterValue {
+            message: format!("invalid value for parameter \"IntervalStyle\": \"{}\"", v),
+        }
+        .into())
+    }
+}
+
+fn validate_session_replication_role(value: &str) -> Result<String> {
+    // session_replication_role has real trigger-suppression semantics in
+    // PostgreSQL that db9 does not implement.  Reject explicitly instead
+    // of silently storing it through the generic GUC path (#1535).
+    let _ = value;
+    Err(SqlError::Unsupported(
+        "session_replication_role is not supported; \
+         triggers always fire as in \"origin\" mode"
+            .to_string(),
+    )
+    .into())
+}
+
+fn validate_default_transaction_deferrable(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "off" | "false" | "no" | "0" => Ok("off".to_string()),
+        "on" | "true" | "yes" | "1" => Err(SqlError::Unsupported(
+            "DEFERRABLE transactions are not supported \
+             (requires SERIALIZABLE isolation)"
+                .to_string(),
+        )
+        .into()),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: "parameter \"default_transaction_deferrable\" requires a Boolean value".into(),
+        }
+        .into()),
+    }
+}
+
+fn validate_transaction_deferrable(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "off" | "false" | "no" | "0" => Ok("off".to_string()),
+        "on" | "true" | "yes" | "1" => Err(SqlError::Unsupported(
+            "DEFERRABLE transactions are not supported \
+             (requires SERIALIZABLE isolation)"
+                .to_string(),
+        )
+        .into()),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: "parameter \"transaction_deferrable\" requires a Boolean value".into(),
+        }
+        .into()),
+    }
+}
+
+fn validate_default_transaction_read_only(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "on" | "true" | "yes" | "1" => Ok("on".to_string()),
+        "off" | "false" | "no" | "0" => Ok("off".to_string()),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: "parameter \"default_transaction_read_only\" requires a Boolean value".into(),
+        }
+        .into()),
+    }
+}
+
+fn validate_bytea_output(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "hex" | "escape" => Ok(normalized),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"bytea_output\": \"{}\"; \
+                 available values: \"hex\", \"escape\"",
+                value
+            ),
+        }
+        .into()),
+    }
+}
+
+fn validate_db9_use_optimizer(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "on" | "true" | "yes" | "1" => Ok(value.to_string()),
+        "off" | "false" | "no" | "0" => {
+            tracing::info!(
+                "NOTICE: optimizer cannot be disabled; \
+                 db9.use_optimizer setting ignored"
+            );
+            Ok(value.to_string())
+        }
+        _ => Err(SqlError::InvalidParameterValue {
+            message: "parameter \"db9.use_optimizer\" requires a Boolean value".into(),
+        }
+        .into()),
+    }
+}
+
+fn validate_embedding_dimensions(value: &str) -> Result<String> {
+    let v: u32 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"embedding.dimensions\": \"{}\"",
+                value
+            ),
+        })?;
+    if v == 0 {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"embedding.dimensions\": \"{}\" must be at least 1",
+                value
+            ),
+        }
+        .into());
+    }
+    Ok(v.to_string())
+}
+
+fn validate_embedding_model(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SqlError::InvalidParameterValue {
+            message: "embedding.model must not be empty".into(),
+        }
+        .into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_embedding_provider(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "openai" | "openai_compatible" | "openai-compatible" => Ok("openai".to_string()),
+        "bedrock" | "aws_bedrock" | "aws-bedrock" => Ok("bedrock".to_string()),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"embedding.provider\": \"{}\"; \
+                 expected 'openai' or 'bedrock'",
+                value
+            ),
+        }
+        .into()),
+    }
+}
+
+fn validate_embedding_endpoint(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SqlError::InvalidParameterValue {
+            message: "embedding.endpoint must not be empty".into(),
+        }
+        .into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_embedding_api_key(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SqlError::InvalidParameterValue {
+            message: "embedding.api_key must not be empty".into(),
+        }
+        .into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_embedding_positive_u32(value: &str) -> Result<String> {
+    let v: u32 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!("invalid value for parameter: \"{}\"", value),
+        })?;
+    if v == 0 {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter: \"{}\" must be at least 1",
+                value
+            ),
+        }
+        .into());
+    }
+    Ok(v.to_string())
+}
+
+fn validate_hnsw_ef_search(value: &str) -> Result<String> {
+    let v: u16 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"hnsw.ef_search\": \"{}\"",
+                value
+            ),
+        })?;
+    if !(1..=1000).contains(&v) {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!("hnsw.ef_search must be between 1 and 1000, got {}", v),
+        }
+        .into());
+    }
+    Ok(v.to_string())
+}
+
+fn validate_db9_retry_max_attempts(value: &str) -> Result<String> {
+    let v: u64 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"db9.retry_max_attempts\": \"{}\"",
+                value
+            ),
+        })?;
+    if v == 0 {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"db9.retry_max_attempts\": \"{}\" must be at least 1",
+                value
+            ),
+        }
+        .into());
+    }
+    Ok(v.to_string())
+}
+
+fn validate_db9_dml_table_scan_max_rows(value: &str) -> Result<String> {
+    let v: u128 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"db9.dml_table_scan_max_rows\": \"{}\"",
+                value
+            ),
+        })?;
+    if v > DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND as u128 {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"db9.dml_table_scan_max_rows\": \"{}\" (must be between 0 and {})",
+                value, DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND
+            ),
+        }
+        .into());
+    }
+    Ok(v.to_string())
+}
+
+fn validate_db9_positive_u64(value: &str) -> Result<String> {
+    let v: u64 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!("invalid value for parameter: \"{}\"", value),
+        })?;
+    Ok(v.to_string())
+}
+
+/// Look up a GUC definition by canonical name.
+pub(crate) fn find_guc_def(canonical: &str) -> Option<&'static GucDef> {
+    GUC_TABLE.iter().find(|g| g.name == canonical)
 }
 
 /// Single source of truth for all known GUC parameters. MUST be sorted alphabetically by name.
-pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
-    GucMeta {
+pub(crate) const GUC_TABLE: &[GucDef] = &[
+    GucDef {
         name: "application_name",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "",
+        flags: GUC_REPORT,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "bytea_output",
-        immutable: false,
+        guc_type: GucType::Enum,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("hex"),
+        boot_default: "hex",
+        flags: 0,
+        validate_fn: Some(validate_bytea_output),
     },
-    GucMeta {
+    GucDef {
         name: "check_function_bodies",
-        immutable: false,
-        description: "",
-        static_default: None,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
+        description: "pg_dump compat; no PL/pgSQL body validation implemented",
+        boot_default: "on",
+        flags: GUC_HOLLOW,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "client_encoding",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "UTF8",
+        flags: GUC_REPORT,
+        validate_fn: Some(validate_client_encoding),
     },
-    GucMeta {
+    GucDef {
         name: "client_min_messages",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "notice",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "datestyle",
-        immutable: true,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "ISO, MDY",
+        flags: GUC_REPORT,
+        validate_fn: Some(validate_datestyle),
     },
-    GucMeta {
+    GucDef {
         name: "db9.dml_table_scan_max_rows",
-        immutable: false,
+        guc_type: GucType::String, // uses custom validator with u128 range
+        context: GucContext::Userset,
         description:
             "Maximum rows per auxiliary source and combined cross-product cap for UPDATE FROM / DELETE USING (0 = unlimited)",
-        static_default: None,
+        boot_default: "", // runtime default from DEFAULT_DML_TABLE_SCAN_MAX_ROWS
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: Some(validate_db9_dml_table_scan_max_rows),
     },
-    GucMeta {
+    GucDef {
         name: "db9.max_sort_bytes",
-        immutable: false,
+        guc_type: GucType::ByteSize,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "", // runtime default from DEFAULT_MAX_SORT_BYTES
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "db9.prepared_plan_cache_min_exec",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("5"),
+        boot_default: "5",
+        flags: 0,
+        validate_fn: Some(validate_db9_positive_u64),
     },
-    GucMeta {
+    GucDef {
         name: "db9.prepared_plan_cache_size",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("128"),
+        boot_default: "128",
+        flags: 0,
+        validate_fn: Some(validate_db9_positive_u64),
     },
-    GucMeta {
+    GucDef {
         name: "db9.retry_max_attempts",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "Maximum retry attempts for autocommit DML/DDL on write conflict",
-        static_default: None,
+        boot_default: "64",
+        flags: 0,
+        validate_fn: Some(validate_db9_retry_max_attempts),
     },
-    GucMeta {
+    GucDef {
         name: "db9.retry_timeout",
-        immutable: false,
+        guc_type: GucType::Timeout,
+        context: GucContext::Userset,
         description: "Maximum wall-time for retries per statement (0 = no limit)",
-        static_default: None,
+        boot_default: "0",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "db9.use_optimizer",
-        immutable: true,
-        description: "",
-        static_default: None,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
+        description: "Always-on optimizer (accepted for compat, SET off is a no-op)",
+        boot_default: "on",
+        flags: GUC_HOLLOW,
+        validate_fn: Some(validate_db9_use_optimizer),
     },
-    GucMeta {
+    GucDef {
         name: "default_table_access_method",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "heap",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "default_tablespace",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "",
+        flags: 0,
+        validate_fn: Some(validate_default_tablespace),
     },
-    GucMeta {
+    GucDef {
         name: "default_text_search_config",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "", // runtime default from fts_tokenizers
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "default_transaction_deferrable",
-        immutable: true,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
         description: "DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported",
-        static_default: Some("off"),
+        boot_default: "off",
+        flags: 0,
+        validate_fn: Some(validate_default_transaction_deferrable),
     },
-    GucMeta {
+    GucDef {
         name: "default_transaction_isolation",
-        immutable: true,
+        guc_type: GucType::Enum,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "read committed",
+        flags: 0,
+        validate_fn: Some(validate_transaction_isolation),
     },
-    GucMeta {
+    GucDef {
         name: "default_transaction_read_only",
-        immutable: false,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "off",
+        flags: 0,
+        validate_fn: Some(validate_default_transaction_read_only),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.api_key",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "Embedding service API key (session override)",
-        static_default: None,
+        boot_default: "",
+        flags: 0,
+        validate_fn: Some(validate_embedding_api_key),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.concurrency",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("5"),
+        boot_default: "5",
+        flags: 0,
+        validate_fn: Some(validate_embedding_positive_u32),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.dimensions",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "",
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: Some(validate_embedding_dimensions),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.endpoint",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "Embedding service endpoint URL (session override)",
-        static_default: None,
+        boot_default: "",
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: Some(validate_embedding_endpoint),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.max_calls",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("100"),
+        boot_default: "100",
+        flags: 0,
+        validate_fn: Some(validate_embedding_positive_u32),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.model",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "",
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: Some(validate_embedding_model),
     },
-    GucMeta {
+    GucDef {
         name: "embedding.provider",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "Embedding provider: openai or bedrock (session override)",
-        static_default: None,
+        boot_default: "",
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: Some(validate_embedding_provider),
     },
-    GucMeta {
+    GucDef {
         name: "extra_float_digits",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("1"),
+        boot_default: "1",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "hnsw.ef_search",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
         description: "Sets the size of the dynamic candidate list for HNSW index search.",
-        static_default: Some("40"),
+        boot_default: "40",
+        flags: 0,
+        validate_fn: Some(validate_hnsw_ef_search),
     },
-    GucMeta {
+    GucDef {
         name: "idle_in_transaction_session_timeout",
-        immutable: false,
+        guc_type: GucType::Timeout,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "0",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "in_hot_standby",
-        immutable: false,
+        guc_type: GucType::Bool,
+        context: GucContext::Internal,
         description: "",
-        static_default: Some("off"),
+        boot_default: "off",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "integer_datetimes",
-        immutable: true,
+        guc_type: GucType::Bool,
+        context: GucContext::Internal,
         description: "",
-        static_default: None,
+        boot_default: "on",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "intervalstyle",
-        immutable: true,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "postgres",
+        flags: GUC_REPORT,
+        validate_fn: Some(validate_intervalstyle),
     },
-    GucMeta {
+    GucDef {
         name: "lc_messages",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Suset,
         description: "",
-        static_default: Some("C"),
+        boot_default: "C",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "lc_monetary",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("C"),
+        boot_default: "C",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "lc_numeric",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("C"),
+        boot_default: "C",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "lc_time",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("C"),
+        boot_default: "C",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "lock_timeout",
-        immutable: false,
+        guc_type: GucType::Timeout,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "0",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "max_identifier_length",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Internal,
         description: "",
-        static_default: Some("63"),
+        boot_default: "63",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "max_index_keys",
-        immutable: false,
+        guc_type: GucType::Int,
+        context: GucContext::Internal,
         description: "",
-        static_default: Some("32"),
+        boot_default: "32",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "password_encryption",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("scram-sha-256"),
+        boot_default: "scram-sha-256",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "row_security",
-        immutable: false,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "on",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "search_path",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "\"$user\", public",
+        flags: GUC_REPORT,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "server_encoding",
-        immutable: true,
+        guc_type: GucType::String,
+        context: GucContext::Internal,
         description: "",
-        static_default: None,
+        boot_default: "UTF8",
+        flags: GUC_REPORT,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "server_version",
-        immutable: true,
+        guc_type: GucType::String,
+        context: GucContext::Internal,
         description: "",
-        static_default: None,
+        boot_default: "16.0",
+        flags: GUC_REPORT,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "server_version_num",
-        immutable: true,
+        guc_type: GucType::Int,
+        context: GucContext::Internal,
         description: "",
-        static_default: None,
+        boot_default: "160000",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "standard_conforming_strings",
-        immutable: false,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "on",
+        flags: GUC_REPORT,
+        validate_fn: Some(validate_standard_conforming_strings),
     },
-    GucMeta {
+    GucDef {
         name: "statement_timeout",
-        immutable: false,
+        guc_type: GucType::Timeout,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "0",
+        flags: 0,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "timezone",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "UTC",
+        flags: GUC_REPORT,
+        validate_fn: Some(validate_timezone),
     },
-    GucMeta {
+    GucDef {
         name: "transaction_deferrable",
-        immutable: true,
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
         description: "DEFERRABLE transactions require SERIALIZABLE isolation, which is not supported",
-        static_default: Some("off"),
+        boot_default: "off",
+        flags: 0,
+        validate_fn: Some(validate_transaction_deferrable),
     },
-    GucMeta {
+    GucDef {
         name: "transaction_isolation",
-        immutable: false,
+        guc_type: GucType::Enum,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "repeatable read",
+        flags: 0,
+        validate_fn: Some(validate_transaction_isolation),
     },
-    GucMeta {
+    GucDef {
         name: "work_mem",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: Some("4MB"),
+        boot_default: "4MB",
+        flags: GUC_HOLLOW,
+        validate_fn: None,
     },
-    GucMeta {
+    GucDef {
         name: "xmloption",
-        immutable: false,
+        guc_type: GucType::String,
+        context: GucContext::Userset,
         description: "",
-        static_default: None,
+        boot_default: "content",
+        flags: 0,
+        validate_fn: None,
     },
 ];
 
@@ -469,7 +1040,9 @@ impl SessionSettings {
     }
 
     fn is_immutable_setting(name: &str) -> bool {
-        KNOWN_GUCS.iter().any(|g| g.name == name && g.immutable)
+        GUC_TABLE
+            .iter()
+            .any(|g| g.name == name && g.context == GucContext::Internal)
     }
 
     pub(crate) fn new() -> Self {
@@ -636,280 +1209,91 @@ impl SessionSettings {
     }
 
     pub(crate) fn validate_and_normalize_value(name: &str, value: &str) -> Result<String> {
-        match Self::canonical_setting_name(name) {
-            "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
-                let ms = Self::parse_timeout_millis(value)?;
-                Ok(Self::format_timeout_show(ms))
+        let canonical = Self::canonical_setting_name(name);
+
+        // session_replication_role is not in GUC_TABLE (not a known GUC) but
+        // must be explicitly rejected rather than accepted through the generic
+        // unknown-GUC path (#1535).
+        if canonical == "session_replication_role" {
+            return validate_session_replication_role(value);
+        }
+
+        // Look up the GUC definition.
+        if let Some(def) = find_guc_def(canonical) {
+            // 0. Context check — Internal GUCs cannot be SET.
+            if def.context == GucContext::Internal {
+                return Err(SqlError::CantChangeRuntimeParam {
+                    message: format!("parameter \"{}\" cannot be changed", canonical),
+                }
+                .into());
             }
-            "db9.dml_table_scan_max_rows" => {
-                let v: u128 =
-                    value
-                        .trim()
-                        .parse()
+
+            // 1. Type-level validation.
+            let type_validated = match def.guc_type {
+                GucType::Timeout => {
+                    let ms = Self::parse_timeout_millis(value)?;
+                    Self::format_timeout_show(ms)
+                }
+                GucType::ByteSize => {
+                    let bytes = Self::parse_byte_size(value)?;
+                    bytes.to_string()
+                }
+                GucType::Bool => {
+                    let normalized = value.trim().to_lowercase();
+                    match normalized.as_str() {
+                        "on" | "true" | "yes" | "1" => "on".to_string(),
+                        "off" | "false" | "no" | "0" => "off".to_string(),
+                        _ => {
+                            return Err(SqlError::InvalidParameterValue {
+                                message: format!(
+                                    "parameter \"{}\" requires a Boolean value",
+                                    canonical
+                                ),
+                            }
+                            .into())
+                        }
+                    }
+                }
+                GucType::Int => {
+                    let trimmed = value.trim();
+                    trimmed
+                        .parse::<i64>()
                         .map_err(|_| SqlError::InvalidParameterValue {
                             message: format!(
                                 "invalid value for parameter \"{}\": \"{}\"",
-                                name, value
+                                canonical, value
                             ),
                         })?;
-                if v > DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND as u128 {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"{}\": \"{}\" (must be between 0 and {})",
-                            name, value, DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND
-                        ),
-                    }
-                    .into());
+                    trimmed.to_string()
                 }
-                Ok(v.to_string())
-            }
-            "db9.max_sort_bytes" => {
-                let bytes = Self::parse_byte_size(value)?;
-                Ok(bytes.to_string())
-            }
-            "db9.prepared_plan_cache_size" | "db9.prepared_plan_cache_min_exec" => {
-                let v: u64 = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| SqlError::InvalidParameterValue {
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
-                    })?;
-                Ok(v.to_string())
-            }
-            "db9.retry_max_attempts" => {
-                let v: u64 = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| SqlError::InvalidParameterValue {
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
-                    })?;
-                if v == 0 {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"{}\": \"{}\" must be at least 1",
-                            name, value
-                        ),
-                    }
-                    .into());
+                GucType::Real => {
+                    let trimmed = value.trim();
+                    trimmed
+                        .parse::<f64>()
+                        .map_err(|_| SqlError::InvalidParameterValue {
+                            message: format!(
+                                "invalid value for parameter \"{}\": \"{}\"",
+                                canonical, value
+                            ),
+                        })?;
+                    trimmed.to_string()
                 }
-                Ok(v.to_string())
-            }
-            "db9.retry_timeout" => {
-                let ms = Self::parse_timeout_millis(value)?;
-                Ok(Self::format_timeout_show(ms))
-            }
-            "embedding.dimensions" => {
-                let v: u32 = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| SqlError::InvalidParameterValue {
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
-                    })?;
-                if v == 0 {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"{}\": \"{}\" must be at least 1",
-                            name, value
-                        ),
-                    }
-                    .into());
+                GucType::Enum => {
+                    // Enum validation is handled by validate_fn; pass through here.
+                    value.to_string()
                 }
-                Ok(v.to_string())
+                GucType::String => value.to_string(),
+            };
+
+            // 2. Custom validation (via function pointer).
+            if let Some(vfn) = def.validate_fn {
+                vfn(&type_validated)
+            } else {
+                Ok(type_validated)
             }
-            "embedding.model" => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: "embedding.model must not be empty".into(),
-                    }
-                    .into());
-                }
-                Ok(trimmed.to_string())
-            }
-            "embedding.provider" => {
-                let normalized = value.trim().to_lowercase();
-                match normalized.as_str() {
-                    "openai" | "openai_compatible" | "openai-compatible" => {
-                        Ok("openai".to_string())
-                    }
-                    "bedrock" | "aws_bedrock" | "aws-bedrock" => Ok("bedrock".to_string()),
-                    _ => Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"embedding.provider\": \"{}\"; \
-                             expected 'openai' or 'bedrock'",
-                            value
-                        ),
-                    }
-                    .into()),
-                }
-            }
-            "embedding.endpoint" => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: "embedding.endpoint must not be empty".into(),
-                    }
-                    .into());
-                }
-                Ok(trimmed.to_string())
-            }
-            "embedding.api_key" => {
-                // Accept any non-empty string. Value is stored as-is but
-                // SHOW will return '****' for security.
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: "embedding.api_key must not be empty".into(),
-                    }
-                    .into());
-                }
-                Ok(trimmed.to_string())
-            }
-            "embedding.max_calls" | "embedding.concurrency" => {
-                let v: u32 = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| SqlError::InvalidParameterValue {
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
-                    })?;
-                if v == 0 {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"{}\": \"{}\" must be at least 1",
-                            name, value
-                        ),
-                    }
-                    .into());
-                }
-                Ok(v.to_string())
-            }
-            "bytea_output" => {
-                let normalized = value.trim().to_lowercase();
-                match normalized.as_str() {
-                    "hex" | "escape" => Ok(normalized),
-                    _ => Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"bytea_output\": \"{}\"; \
-                             available values: \"hex\", \"escape\"",
-                            value
-                        ),
-                    }
-                    .into()),
-                }
-            }
-            "hnsw.ef_search" => {
-                let v: u16 = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| SqlError::InvalidParameterValue {
-                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
-                    })?;
-                if !(1..=1000).contains(&v) {
-                    return Err(SqlError::InvalidParameterValue {
-                        message: format!("hnsw.ef_search must be between 1 and 1000, got {}", v),
-                    }
-                    .into());
-                }
-                Ok(v.to_string())
-            }
-            "db9.use_optimizer" => {
-                let normalized = value.trim().to_lowercase();
-                match normalized.as_str() {
-                    "on" | "true" | "yes" | "1" => Ok(value.to_string()),
-                    "off" | "false" | "no" | "0" => {
-                        tracing::info!(
-                            "NOTICE: optimizer cannot be disabled; \
-                             db9.use_optimizer setting ignored"
-                        );
-                        Ok(value.to_string())
-                    }
-                    _ => Err(SqlError::InvalidParameterValue {
-                        message: "parameter \"db9.use_optimizer\" requires a Boolean value".into(),
-                    }
-                    .into()),
-                }
-            }
-            "timezone" => {
-                crate::model::timestamp::TimeZoneSpec::try_parse(value)?;
-                Ok(value.to_string())
-            }
-            "client_encoding" => {
-                let enc = value.trim();
-                if enc.eq_ignore_ascii_case("utf8") || enc.eq_ignore_ascii_case("utf-8") {
-                    Ok("UTF8".to_string())
-                } else {
-                    Err(SqlError::Unsupported(format!(
-                        "unsupported client_encoding '{}'; only UTF8 is supported",
-                        value
-                    ))
-                    .into())
-                }
-            }
-            "transaction_deferrable" | "default_transaction_deferrable" => {
-                Err(SqlError::CantChangeRuntimeParam {
-                    message: format!(
-                        "parameter \"{}\" cannot be changed \
-                         (DEFERRABLE transactions require SERIALIZABLE isolation, \
-                         which is not supported)",
-                        name
-                    ),
-                }
-                .into())
-            }
-            "transaction_isolation" => {
-                let normalized = value.trim().to_lowercase();
-                match normalized.as_str() {
-                    "read uncommitted" | "read committed" => {
-                        tracing::warn!(
-                            requested = normalized.as_str(),
-                            actual = "repeatable read",
-                            "TiKV provides snapshot isolation (REPEATABLE READ); \
-                             the requested isolation level has been upgraded"
-                        );
-                        Ok("repeatable read".to_string())
-                    }
-                    "repeatable read" => Ok("repeatable read".to_string()),
-                    "serializable" => {
-                        tracing::warn!(
-                            requested = "serializable",
-                            actual = "repeatable read",
-                            "TiKV cannot provide PostgreSQL SERIALIZABLE semantics; \
-                             the requested isolation level has been downgraded"
-                        );
-                        Ok("repeatable read".to_string())
-                    }
-                    _ => Err(SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"transaction_isolation\": \"{}\"",
-                            value
-                        ),
-                    }
-                    .into()),
-                }
-            }
-            "default_transaction_read_only" => {
-                let normalized = value.trim().to_lowercase();
-                match normalized.as_str() {
-                    "on" | "true" | "yes" | "1" => Ok("on".to_string()),
-                    "off" | "false" | "no" | "0" => Ok("off".to_string()),
-                    _ => Err(SqlError::InvalidParameterValue {
-                        message:
-                            "parameter \"default_transaction_read_only\" requires a Boolean value"
-                                .into(),
-                    }
-                    .into()),
-                }
-            }
-            // session_replication_role has real trigger-suppression semantics in
-            // PostgreSQL that db9 does not implement.  Reject explicitly instead
-            // of silently storing it through the generic GUC path (#1535).
-            "session_replication_role" => Err(SqlError::Unsupported(
-                "session_replication_role is not supported; \
-                 triggers always fire as in \"origin\" mode"
-                    .to_string(),
-            )
-            .into()),
-            _ => Ok(value.to_string()),
+        } else {
+            // Unknown GUC: accept as-is.
+            Ok(value.to_string())
         }
     }
 
@@ -1060,6 +1444,9 @@ impl SessionSettings {
         self.local_overrides.clear();
         self.local_search_path = None;
         self.settings_savepoint_stack.clear();
+        // transaction_isolation is transaction-scoped (set by BEGIN ISOLATION LEVEL).
+        // Revert to None so SHOW falls back to the default "repeatable read".
+        self.transaction_isolation = None;
     }
 
     pub(crate) fn remove_local_override(&mut self, name: &str) {
@@ -1211,12 +1598,17 @@ impl SessionSettings {
             "integer_datetimes" => "on".to_string(),
             "intervalstyle" => "postgres".to_string(),
             _ => {
-                // Fall back to static_default from KNOWN_GUCS registry.
-                KNOWN_GUCS
+                // Fall back to boot_default from GUC_TABLE registry.
+                GUC_TABLE
                     .iter()
                     .find(|g| g.name == canonical)
-                    .and_then(|g| g.static_default)
-                    .map(String::from)
+                    .map(|g| {
+                        if g.boot_default.is_empty() {
+                            String::new()
+                        } else {
+                            g.boot_default.to_string()
+                        }
+                    })
                     .unwrap_or_default()
             }
         }
@@ -1255,11 +1647,11 @@ impl SessionSettings {
         }
 
         // ── Structural reverse guard ──
-        // If the name is not in KNOWN_GUCS and not in dynamic maps, return None early.
+        // If the name is not in GUC_TABLE and not in dynamic maps, return None early.
         // This is a best-effort runtime guard: any typed-field match arm below for an
         // unregistered name would be unreachable dead code, nudging developers to add
-        // new GUCs to KNOWN_GUCS first.
-        let is_registered = KNOWN_GUCS.iter().any(|g| g.name == canonical);
+        // new GUCs to GUC_TABLE first.
+        let is_registered = GUC_TABLE.iter().any(|g| g.name == canonical);
         if !is_registered
             && !self.server_reserved_settings.contains_key(canonical)
             && !self.extra_settings.contains_key(canonical)
@@ -1390,7 +1782,12 @@ impl SessionSettings {
                     .unwrap_or("repeatable read")
                     .to_string(),
             ),
-            "default_transaction_isolation" => Some("read committed".to_string()),
+            "default_transaction_isolation" => Some(
+                self.extra_settings
+                    .get("default_transaction_isolation")
+                    .cloned()
+                    .unwrap_or_else(|| "read committed".to_string()),
+            ),
             "default_transaction_read_only" => Some(
                 self.default_transaction_read_only
                     .as_deref()
@@ -1409,11 +1806,11 @@ impl SessionSettings {
                             crate::sql::fts_tokenizers::default_text_search_config().to_string(),
                         );
                     }
-                    KNOWN_GUCS
+                    GUC_TABLE
                         .iter()
                         .find(|g| g.name == canonical)
-                        .and_then(|g| g.static_default)
-                        .map(String::from)
+                        .filter(|g| !g.boot_default.is_empty())
+                        .map(|g| g.boot_default.to_string())
                 }),
         }
     }
@@ -1424,7 +1821,7 @@ impl SessionSettings {
         let mut result = BTreeMap::new();
 
         // 1. All registered GUCs (respects local_override > typed field > default precedence)
-        for guc in KNOWN_GUCS {
+        for guc in GUC_TABLE {
             if let Some(value) = self.show_value(guc.name) {
                 result.insert(guc.name.to_string(), (value, guc.description.to_string()));
             }

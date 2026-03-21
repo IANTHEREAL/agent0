@@ -16,20 +16,15 @@ pub(in crate::sql::executor::core) fn validate_transaction_modes(
     for mode in modes {
         match mode {
             TransactionMode::IsolationLevel(level) => {
+                // Pass through the user-requested level. The validator in
+                // validate_transaction_isolation() handles normalization
+                // logging and stores the user-facing value for SHOW readback.
                 let level_str = match level {
-                    TransactionIsolationLevel::ReadUncommitted
-                    | TransactionIsolationLevel::ReadCommitted => "read committed",
+                    TransactionIsolationLevel::ReadUncommitted => "read uncommitted",
+                    TransactionIsolationLevel::ReadCommitted => "read committed",
                     TransactionIsolationLevel::RepeatableRead => "repeatable read",
-                    TransactionIsolationLevel::Serializable => "repeatable read",
+                    TransactionIsolationLevel::Serializable => "serializable",
                 };
-                if matches!(level, TransactionIsolationLevel::Serializable) {
-                    tracing::warn!(
-                        requested = "serializable",
-                        actual = "repeatable read",
-                        "TiKV cannot provide PostgreSQL SERIALIZABLE semantics; \
-                         BEGIN/START TRANSACTION request has been downgraded"
-                    );
-                }
                 session.set_known_setting("transaction_isolation", level_str.to_string())?;
             }
             TransactionMode::AccessMode(access_mode) => {
@@ -172,7 +167,7 @@ pub(in crate::sql::executor::core) fn apply_pending_set_config_mutations(
                 // NULL reset preserves the setting as empty string rather
                 // than removing it.  reset_setting() removes custom GUCs
                 // from extra_settings, so use set_known_setting("") instead.
-                let is_known = crate::sql::session::settings::KNOWN_GUCS
+                let is_known = crate::sql::session::settings::GUC_TABLE
                     .iter()
                     .any(|g| g.name == mutation.name);
                 if is_known {
@@ -277,11 +272,13 @@ mod tests {
         )
         .unwrap();
 
+        // SHOW returns user-set value (PG parity). Internal behavior is
+        // always repeatable read regardless.
         assert_eq!(
             session
                 .show_setting_value("transaction_isolation")
                 .as_deref(),
-            Some("repeatable read")
+            Some("read committed")
         );
         assert_eq!(
             session
@@ -301,11 +298,12 @@ mod tests {
             )],
         )
         .unwrap();
+        // SHOW returns user-set value (PG parity).
         assert_eq!(
             session
                 .show_setting_value("transaction_isolation")
                 .as_deref(),
-            Some("repeatable read")
+            Some("serializable")
         );
     }
 

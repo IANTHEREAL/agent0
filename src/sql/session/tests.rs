@@ -361,16 +361,21 @@ mod tests {
             Some("off")
         );
 
-        // SERIALIZABLE is accepted but downgraded to REPEATABLE READ
+        // SERIALIZABLE is accepted — SHOW returns user-set value (PG parity).
+        // Internal behavior always uses repeatable read regardless.
         assert!(settings
             .set_known_setting("transaction_isolation", "serializable".to_string())
             .unwrap());
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("serializable")
+        );
         assert!(settings
             .set_known_setting("transaction_isolation", "SERIALIZABLE".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("serializable")
         );
 
         // Garbage values must be rejected
@@ -381,22 +386,22 @@ mod tests {
             .set_known_setting("transaction_isolation", "snapshot".to_string())
             .is_err());
 
-        // READ UNCOMMITTED is upgraded to REPEATABLE READ (TiKV snapshot isolation)
+        // READ UNCOMMITTED — SHOW returns user-set value
         assert!(settings
             .set_known_setting("transaction_isolation", "read uncommitted".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("read uncommitted")
         );
 
-        // READ COMMITTED is also upgraded to REPEATABLE READ
+        // READ COMMITTED — SHOW returns user-set value
         assert!(settings
             .set_known_setting("transaction_isolation", "read committed".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("read committed")
         );
 
         // default_transaction_read_only: boolean aliases
@@ -457,19 +462,27 @@ mod tests {
             "off"
         );
 
-        // SET must be rejected with SQLSTATE 55P02.
+        // SET = off must succeed (it's the only supported value).
         let mut settings = SessionSettings::new();
+        assert!(settings
+            .set_known_setting("transaction_deferrable", "off".to_string())
+            .is_ok());
+        assert!(settings
+            .set_known_setting("default_transaction_deferrable", "off".to_string())
+            .is_ok());
+
+        // SET = on must be rejected with SQLSTATE 0A000 (feature not supported).
         let err = settings
             .set_known_setting("transaction_deferrable", "on".to_string())
             .unwrap_err();
         let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
-        assert_eq!(sql_err.sqlstate(), "55P02");
+        assert_eq!(sql_err.sqlstate(), "0A000");
 
         let err = settings
             .set_known_setting("default_transaction_deferrable", "on".to_string())
             .unwrap_err();
         let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
-        assert_eq!(sql_err.sqlstate(), "55P02");
+        assert_eq!(sql_err.sqlstate(), "0A000");
 
         // SHOW must still be "off" after rejected SET.
         assert_eq!(
@@ -886,13 +899,13 @@ mod tests {
 
     #[test]
     fn test_known_gucs_sorted() {
-        use crate::sql::session::settings::KNOWN_GUCS;
-        let names: Vec<&str> = KNOWN_GUCS.iter().map(|g| g.name).collect();
+        use crate::sql::session::settings::GUC_TABLE;
+        let names: Vec<&str> = GUC_TABLE.iter().map(|g| g.name).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(
             names, sorted,
-            "KNOWN_GUCS must be sorted alphabetically by name"
+            "GUC_TABLE must be sorted alphabetically by name"
         );
     }
 
@@ -1209,12 +1222,12 @@ mod tests {
 
     #[test]
     fn test_show_value_covers_all_known_gucs() {
-        use crate::sql::session::settings::KNOWN_GUCS;
+        use crate::sql::session::settings::GUC_TABLE;
         let settings = SessionSettings::new();
-        for guc in KNOWN_GUCS {
+        for guc in GUC_TABLE {
             assert!(
                 settings.show_value(guc.name).is_some(),
-                "show_value({:?}) returned None — add a typed-field match arm or static_default for this GUC",
+                "show_value({:?}) returned None — add a typed-field match arm or boot_default for this GUC",
                 guc.name
             );
         }

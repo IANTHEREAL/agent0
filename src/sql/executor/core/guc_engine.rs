@@ -2,7 +2,7 @@
 
 use crate::auth::AuthManager;
 use crate::sql::error::SqlError;
-use crate::sql::session::settings::KNOWN_GUCS;
+use crate::sql::session::settings::GUC_TABLE;
 use crate::sql::session::SessionSettings;
 use crate::storage::TikvStore;
 use anyhow::Result;
@@ -50,7 +50,7 @@ pub(super) fn classify_guc(name: &str) -> GucKind {
     if canonical == "search_path" {
         return GucKind::SearchPath;
     }
-    if KNOWN_GUCS.iter().any(|g| g.name == canonical) {
+    if GUC_TABLE.iter().any(|g| g.name == canonical) {
         return GucKind::Known;
     }
     GucKind::UnknownCompat
