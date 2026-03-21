@@ -447,7 +447,7 @@ fn regclass_text_catalog_name_resolves_to_oid() {
         .unwrap(),
         Value::Int64(1259)
     );
-    // Unknown name should error
+    // Unknown name should error (no synthetic OID generation).
     assert!(cast(
         Value::Text("nonexistent_table".into()),
         &regclass,
