@@ -447,13 +447,19 @@ fn regclass_text_catalog_name_resolves_to_oid() {
         .unwrap(),
         Value::Int64(1259)
     );
-    // Unknown name should error (no synthetic OID generation).
-    assert!(cast(
+    // Unknown table names return a synthetic OID for ORM compatibility
+    // (db9 doesn't have full pg_class catalog yet, so we accept any valid identifier)
+    let result = cast(
         Value::Text("nonexistent_table".into()),
         &regclass,
-        CastContext::Explicit
+        CastContext::Explicit,
     )
-    .is_err());
+    .unwrap();
+    assert!(matches!(result, Value::Int64(_)));
+    // Verify the synthetic OID is in the expected range (100B+)
+    if let Value::Int64(oid) = result {
+        assert!(oid >= 100_000_000_000);
+    }
 }
 
 // ---- VARCHAR(n) ----

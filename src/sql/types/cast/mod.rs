@@ -22,6 +22,20 @@ fn is_regtype_udt(udt: &str) -> bool {
     udt.eq_ignore_ascii_case("regtype") || udt.eq_ignore_ascii_case("pg_catalog.regtype")
 }
 
+/// FNV-1a 64-bit hash for generating synthetic OIDs for user tables.
+/// This allows ORM introspection queries like obj_description('table'::regclass) to work
+/// even when db9 doesn't have a full pg_class catalog.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// Controls which type conversions are allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastContext {
@@ -626,12 +640,11 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             if let Some(oid) = crate::sql::catalog_oids::pg_catalog_relation_oid(name) {
                 return Ok(Value::Int64(oid));
             }
-            // Unknown names error - no synthetic OID generation (scope creep).
-            Err(SqlError::InvalidInputSyntax {
-                type_name: "regclass".into(),
-                value: s,
-            }
-            .into())
+            // For user tables (not in pg_catalog), return a synthetic OID based on name hash.
+            // This allows ORM introspection queries like obj_description('table'::regclass) to work.
+            let synthetic_oid =
+                100_000_000_000i64 + (fnv1a_64(name.as_bytes()) % 1_000_000_000) as i64;
+            Ok(Value::Int64(synthetic_oid))
         }
         (Value::Int32(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
             Ok(Value::Int64(n as i64))
