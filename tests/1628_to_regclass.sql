@@ -52,13 +52,19 @@ SET search_path = sp2, public;
 SELECT to_regclass('t1') IS NOT NULL AS found;
 RESET search_path;
 
--- 14. Wrong arg type produces error
+-- 14. Current-database-qualified quoted three-part lookup succeeds
+SELECT to_regclass('"' || replace(current_database(), '"', '""') || '"."public"."regclass_test"') IS NOT NULL AS found;
+
+-- 15. Current-database-qualified quoted three-part regclass cast succeeds
+SELECT ('"' || replace(current_database(), '"', '""') || '"."public"."regclass_test"')::regclass::text = 'regclass_test' AS cast_found;
+
+-- 16. Wrong arg type produces error
 SELECT to_regclass(42);
 
--- 15. Three-part name (cross-database reference) produces error
+-- 17. Three-part name (cross-database reference) produces error
 SELECT to_regclass('a.b.c');
 
--- 16. Non-pg_catalog schema-qualified call produces error
+-- 18. Non-pg_catalog schema-qualified call produces error
 SELECT public.to_regclass('regclass_test');
 
 -- Cleanup

@@ -98,6 +98,22 @@ fn pg_get_serial_sequence_accepts_text_arg(arg: &TypedExpr) -> bool {
     )
 }
 
+fn regclass_lookup_parts<'a>(
+    parsed: &'a crate::sql::names::ParsedRegclassInput,
+    current_database: &str,
+    input: &str,
+) -> Result<(Option<&'a str>, &'a str)> {
+    if !parsed.is_current_database(current_database) {
+        return Err(SqlError::Unsupported(format!(
+            "cross-database references are not implemented: \"{}\"",
+            input.trim()
+        ))
+        .into());
+    }
+
+    Ok(parsed.relation_lookup_parts())
+}
+
 impl Executor {
     pub(super) fn materialize_catalog_functions<'a>(
         &'a self,
@@ -1288,13 +1304,13 @@ impl Executor {
             _ => return Err(anyhow!("function to_regclass(text) does not exist")),
         };
 
-        let (schema_opt, name) =
-            crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
-                SqlError::Unsupported(format!(
-                    "cross-database references are not implemented: \"{}\"",
-                    input
-                ))
-            })?;
+        let parsed = crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
+            SqlError::Unsupported(format!(
+                "cross-database references are not implemented: \"{}\"",
+                input
+            ))
+        })?;
+        let (schema_opt, name) = regclass_lookup_parts(&parsed, qctx.database_name.as_ref(), &raw)?;
         if name.is_empty() {
             return Ok(Value::Null);
         }
@@ -1331,13 +1347,14 @@ impl Executor {
                     return Ok(Value::Int64(n));
                 }
 
+                let parsed = crate::sql::names::parse_regclass_input(trimmed).map_err(|input| {
+                    SqlError::Unsupported(format!(
+                        "cross-database references are not implemented: \"{}\"",
+                        input
+                    ))
+                })?;
                 let (schema_opt, name) =
-                    crate::sql::names::parse_regclass_input(trimmed).map_err(|input| {
-                        SqlError::Unsupported(format!(
-                            "cross-database references are not implemented: \"{}\"",
-                            input
-                        ))
-                    })?;
+                    regclass_lookup_parts(&parsed, qctx.database_name.as_ref(), trimmed)?;
 
                 if name.is_empty() {
                     return Err(SqlError::InvalidInputSyntax {
@@ -2011,7 +2028,8 @@ mod tests {
         hstore_extension_oid_for_name, is_pg_get_serial_sequence_function_name,
         non_pg_catalog_qualified_pg_get_serial_sequence_signature,
         pg_get_serial_sequence_accepts_text_arg, pg_get_serial_sequence_arg_type_name,
-        regtype_search_path_schemas, value_to_bool_strict, value_to_i64, value_to_i64_strict,
+        regclass_lookup_parts, regtype_search_path_schemas, value_to_bool_strict, value_to_i64,
+        value_to_i64_strict,
     };
     use crate::model::{ColumnDef, DataType, TableSchema, Value};
     use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
@@ -2104,6 +2122,24 @@ mod tests {
             advisory_lock_timeout(Some(Duration::ZERO), Some(&settings)),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn regclass_lookup_parts_accepts_current_database_qualification() {
+        let parsed = crate::sql::names::parse_regclass_input("postgres.public.rel").unwrap();
+        let (schema, name) =
+            regclass_lookup_parts(&parsed, "postgres", "postgres.public.rel").unwrap();
+        assert_eq!(schema, Some("public"));
+        assert_eq!(name, "rel");
+    }
+
+    #[test]
+    fn regclass_lookup_parts_rejects_foreign_database_qualification() {
+        let parsed = crate::sql::names::parse_regclass_input("other.public.rel").unwrap();
+        let err = regclass_lookup_parts(&parsed, "postgres", "other.public.rel").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cross-database references are not implemented: \"other.public.rel\""));
     }
 
     #[test]

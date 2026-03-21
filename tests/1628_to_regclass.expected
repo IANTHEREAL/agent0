@@ -37,6 +37,12 @@ t
 found
 t
 (1 row)
+found
+t
+(1 row)
+cast_found
+t
+(1 row)
 ERROR:  function to_regclass(integer) does not exist
 ERROR:  cross-database references are not implemented: "a.b.c"
 ERROR:  function public.to_regclass(unknown) does not exist
