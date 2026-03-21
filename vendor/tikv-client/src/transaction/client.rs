@@ -250,6 +250,29 @@ impl Client {
         Ok(res)
     }
 
+    /// Update the GC safepoint in PD without resolving locks.
+    ///
+    /// This is a lighter alternative to [`gc`](Client::gc) that only advances PD's
+    /// known safepoint so TiKV's compaction filter can reclaim old MVCC versions.
+    /// It does **not** scan or resolve any locks, making it safe to call without
+    /// risk of interfering with any transaction state.
+    ///
+    /// PD guarantees monotonic advancement: if the proposed safepoint is lower
+    /// than the current one, PD keeps the higher value and returns it.
+    /// Returns `true` if PD accepted the exact proposed value.
+    pub async fn update_safepoint(&self, safepoint: Timestamp) -> Result<bool> {
+        debug!("updating gc safepoint without lock resolution");
+        let res: bool = self
+            .pd
+            .clone()
+            .update_safepoint(safepoint.version())
+            .await?;
+        if !res {
+            info!("new safepoint != user-specified safepoint (PD kept higher value)");
+        }
+        Ok(res)
+    }
+
     pub async fn cleanup_locks(
         &self,
         range: impl Into<BoundRange>,

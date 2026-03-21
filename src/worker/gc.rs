@@ -9,7 +9,8 @@ use anyhow::Result;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tikv_client::{Timestamp, TimestampExt};
+use tracing::{debug, info, warn};
 
 pub struct WorkerGc {
     system_store: Arc<TikvStore>,
@@ -39,15 +40,18 @@ impl WorkerGc {
         }
     }
 
-    /// Start two independent timer loops:
+    /// Start independent timer loops:
     /// - GC tick (orphan claims + cron cleanup): `DB9_WORKER_GC_INTERVAL_SEC` (default 600s)
     /// - HNSW delta sweep: `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` (default 600s)
+    /// - TiKV GC safepoint advancement: `DB9_GC_SAFEPOINT_INTERVAL_SEC` (default 300s)
     ///
     /// Each runs in its own spawned task so a long HNSW sweep cannot delay
     /// orphan/cron GC (and vice versa).
     pub fn spawn(self: Arc<Self>) {
         let gc_self = self.clone();
+        let sp_self = self.clone();
         tokio::spawn(async move { gc_self.run_gc_loop().await });
+        tokio::spawn(async move { sp_self.run_safepoint_advance_loop().await });
         tokio::spawn(async move { self.run_hnsw_sweep_loop().await });
     }
 
@@ -75,6 +79,100 @@ impl WorkerGc {
             if let Err(e) = self.sweep_hnsw_delta_backlogs().await {
                 warn!("HNSW sweep error: {}", e);
             }
+        }
+    }
+
+    /// Periodically advance the TiKV GC safepoint so TiKV's compaction
+    /// filter can reclaim old MVCC versions.
+    ///
+    /// Only calls `update_safepoint()` — no lock resolution (cleanup_locks).
+    /// Uses V1 `UpdateGCSafePoint` which drives TiKV's global compaction filter.
+    async fn run_safepoint_advance_loop(&self) {
+        if !self.config.gc_safepoint_enabled {
+            info!("TiKV GC safepoint advancement disabled");
+            return;
+        }
+
+        // Random jitter to avoid multiple db9 instances hitting PD simultaneously.
+        let jitter = rand_jitter_secs(60);
+        tokio::time::sleep(Duration::from_secs(jitter)).await;
+
+        info!(
+            interval_sec = self.config.gc_safepoint_interval_sec,
+            life_time_sec = self.config.gc_life_time_sec,
+            "TiKV GC safepoint advancement loop started"
+        );
+
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(self.config.gc_safepoint_interval_sec));
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.advance_gc_safepoint().await {
+                warn!("TiKV GC safepoint advance failed: {}", e);
+                self.metrics
+                    .gc_safepoint_advance_err
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Compute safepoint = current_tso - gc_life_time and report to PD.
+    ///
+    /// Only advances the safepoint — does not resolve locks or delete ranges.
+    async fn advance_gc_safepoint(&self) -> Result<()> {
+        let client = self
+            .system_store
+            .transaction_client()
+            .ok_or_else(|| anyhow::anyhow!("no TransactionClient available (test stub?)"))?;
+
+        // Get current TSO from PD.
+        let current_ts = client
+            .current_timestamp()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
+
+        let current_version = current_ts.version();
+        let safepoint_version =
+            compute_safepoint_version(current_version, self.config.gc_life_time_sec);
+
+        if safepoint_version == 0 {
+            info!("GC safepoint would be 0; skipping (cluster just started?)");
+            return Ok(());
+        }
+
+        let safepoint = Timestamp::from_version(safepoint_version);
+
+        // Only advance safepoint in PD — no lock resolution.
+        // PD takes max(current, proposed) so this is idempotent and safe
+        // to call from multiple db9 instances concurrently.
+        // update_safepoint returns true if PD accepted our exact proposal,
+        // false if PD already had a higher value (another instance advanced it).
+        match client.update_safepoint(safepoint).await {
+            Ok(accepted) => {
+                if accepted {
+                    // Only update the gauge when this instance actually advanced
+                    // the cluster safepoint. Otherwise the gauge would reflect
+                    // "last proposal" rather than "cluster safepoint".
+                    self.metrics
+                        .gc_safepoint_last_version
+                        .store(safepoint_version, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics
+                        .gc_safepoint_advance_ok
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        safepoint_version,
+                        life_time_sec = self.config.gc_life_time_sec,
+                        "TiKV GC safepoint advanced by this instance"
+                    );
+                } else {
+                    debug!(
+                        safepoint_version,
+                        "TiKV GC safepoint proposal accepted, PD already at higher value"
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!("update_safepoint failed: {}", e)),
         }
     }
 
@@ -284,6 +382,15 @@ where
     Ok((total_cleaned, batch_count))
 }
 
+/// Compute the GC safepoint version from the current TSO version and retention window.
+///
+/// TSO version layout: `physical_ms << 18 | logical`.
+/// Returns 0 if the subtraction would underflow (cluster just started).
+pub(crate) fn compute_safepoint_version(current_version: u64, life_time_sec: u64) -> u64 {
+    let life_time_ms = life_time_sec * 1000;
+    current_version.saturating_sub(life_time_ms << 18)
+}
+
 /// Generate random jitter in seconds (0..max_secs) using time-based seed.
 fn rand_jitter_secs(max_secs: u64) -> u64 {
     use std::time::SystemTime;
@@ -306,6 +413,53 @@ fn effective_cron_orphan_timeout_sec(
 mod tests {
     use super::*;
     use std::future;
+
+    // --- GC safepoint computation tests ---
+
+    #[test]
+    fn compute_safepoint_basic() {
+        // TSO version: physical_ms << 18 | logical
+        // Simulate a current_version corresponding to ~1 hour of physical time.
+        let physical_ms: u64 = 3_600_000; // 1 hour
+        let current_version = physical_ms << 18;
+        let life_time_sec = 600; // 10 minutes
+
+        let sp = compute_safepoint_version(current_version, life_time_sec);
+        // Expected: (3_600_000 - 600_000) << 18 = 3_000_000 << 18
+        let expected = (physical_ms - life_time_sec * 1000) << 18;
+        assert_eq!(sp, expected);
+    }
+
+    #[test]
+    fn compute_safepoint_saturates_to_zero() {
+        // current_version is smaller than the life_time offset.
+        let current_version = 1000_u64 << 18;
+        let life_time_sec = 86400; // 24 hours — way more than 1 second of TSO
+
+        let sp = compute_safepoint_version(current_version, life_time_sec);
+        assert_eq!(sp, 0, "should saturate to 0, not underflow");
+    }
+
+    #[test]
+    fn compute_safepoint_zero_life_time() {
+        let current_version = 999_999_u64 << 18;
+        let sp = compute_safepoint_version(current_version, 0);
+        assert_eq!(sp, current_version, "zero life_time means no offset");
+    }
+
+    #[test]
+    fn compute_safepoint_preserves_logical_bits() {
+        // current_version with some logical bits set
+        let physical_ms: u64 = 7_200_000;
+        let logical: u64 = 42;
+        let current_version = (physical_ms << 18) | logical;
+        let life_time_sec = 3600; // 1 hour
+
+        let sp = compute_safepoint_version(current_version, life_time_sec);
+        // The subtraction is on the whole version, so logical bits are preserved
+        let expected = current_version - ((life_time_sec * 1000) << 18);
+        assert_eq!(sp, expected);
+    }
 
     #[test]
     fn test_orphan_timeout_calc() {

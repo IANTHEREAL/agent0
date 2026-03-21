@@ -43,6 +43,13 @@ pub struct WorkerMetrics {
 
     /// Counter: cumulative sweeper enqueue failures (system store write errors).
     pub hnsw_sweep_enqueue_errors: AtomicU64,
+
+    /// Gauge: last successfully reported TiKV GC safepoint (TSO version).
+    pub gc_safepoint_last_version: AtomicU64,
+    /// Counter: successful GC safepoint advancements.
+    pub gc_safepoint_advance_ok: AtomicU64,
+    /// Counter: failed GC safepoint advancement attempts.
+    pub gc_safepoint_advance_err: AtomicU64,
 }
 
 impl WorkerMetrics {
@@ -75,6 +82,10 @@ impl WorkerMetrics {
             hnsw_sweep_enqueued: AtomicU64::new(0),
             hnsw_scan_deltas_applied: AtomicU64::new(0),
             hnsw_sweep_enqueue_errors: AtomicU64::new(0),
+
+            gc_safepoint_last_version: AtomicU64::new(0),
+            gc_safepoint_advance_ok: AtomicU64::new(0),
+            gc_safepoint_advance_err: AtomicU64::new(0),
         }
     }
 
@@ -151,6 +162,9 @@ mod tests {
         assert_eq!(m.hnsw_sweep_enqueued.load(Ordering::Relaxed), 0);
         assert_eq!(m.hnsw_scan_deltas_applied.load(Ordering::Relaxed), 0);
         assert_eq!(m.hnsw_sweep_enqueue_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(m.gc_safepoint_last_version.load(Ordering::Relaxed), 0);
+        assert_eq!(m.gc_safepoint_advance_ok.load(Ordering::Relaxed), 0);
+        assert_eq!(m.gc_safepoint_advance_err.load(Ordering::Relaxed), 0);
     }
 
     #[test]

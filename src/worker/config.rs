@@ -16,6 +16,20 @@ const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 1800;
 const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 
+// GC safepoint defaults — controls TiKV MVCC version cleanup.
+// Without periodic safepoint advancement, TiKV never GCs old MVCC versions,
+// causing unbounded storage growth and eventual compaction failure / worker panic.
+const DEFAULT_GC_SAFEPOINT_ENABLED: bool = true;
+const DEFAULT_GC_SAFEPOINT_INTERVAL_SEC: u64 = 300; // 5 minutes
+const MIN_GC_SAFEPOINT_INTERVAL_SEC: u64 = 30;
+// 24 hours — intentionally very conservative. db9 does not yet have active
+// transaction tracking, so we rely on a fixed window. The goal of this first
+// version is to move the safepoint from 0 to non-zero so TiKV can start
+// reclaiming old MVCC versions at all. Can be tightened later (6h → 1h)
+// once active transaction tracking is in place.
+const DEFAULT_GC_LIFE_TIME_SEC: u64 = 86400;
+const MIN_GC_LIFE_TIME_SEC: u64 = 600; // TiDB enforces minimum 10 minutes
+
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub enabled: bool,
@@ -32,6 +46,11 @@ pub struct WorkerConfig {
     pub hnsw_sweep_interval_sec: u64,
     pub storage_scan_interval_sec: u64,
     pub system_keyspace: String,
+
+    // TiKV MVCC GC safepoint advancement
+    pub gc_safepoint_enabled: bool,
+    pub gc_safepoint_interval_sec: u64,
+    pub gc_life_time_sec: u64,
 }
 
 impl Default for WorkerConfig {
@@ -55,6 +74,10 @@ impl Default for WorkerConfig {
             hnsw_sweep_interval_sec: DEFAULT_HNSW_SWEEP_INTERVAL_SEC,
             storage_scan_interval_sec: DEFAULT_STORAGE_SCAN_INTERVAL_SEC,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
+
+            gc_safepoint_enabled: DEFAULT_GC_SAFEPOINT_ENABLED,
+            gc_safepoint_interval_sec: DEFAULT_GC_SAFEPOINT_INTERVAL_SEC,
+            gc_life_time_sec: DEFAULT_GC_LIFE_TIME_SEC,
         }
     }
 }
@@ -215,7 +238,87 @@ impl WorkerConfig {
             cfg.system_keyspace = v;
         }
 
+        // GC safepoint configuration
+        if let Ok(v) = env::var("DB9_GC_SAFEPOINT_ENABLED") {
+            cfg.gc_safepoint_enabled = parse_bool(&v).unwrap_or(cfg.gc_safepoint_enabled);
+        }
+        if let Ok(v) = env::var("DB9_GC_SAFEPOINT_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_GC_SAFEPOINT_INTERVAL_SEC => {
+                    cfg.gc_safepoint_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_GC_SAFEPOINT_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_GC_SAFEPOINT_INTERVAL_SEC,
+                        cfg.gc_safepoint_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_GC_SAFEPOINT_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.gc_safepoint_interval_sec
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_GC_LIFE_TIME_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_GC_LIFE_TIME_SEC => {
+                    cfg.gc_life_time_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_GC_LIFE_TIME_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_GC_LIFE_TIME_SEC,
+                        cfg.gc_life_time_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_GC_LIFE_TIME_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.gc_life_time_sec
+                    );
+                }
+            }
+        }
+
         cfg
+    }
+
+    /// Validate GC safepoint configuration invariants. Panics on unsafe
+    /// combinations to prevent silent data-safety violations.
+    ///
+    /// Must be called at startup before spawning the GC loop.
+    pub fn validate_gc_config(&self) {
+        if !self.gc_safepoint_enabled {
+            return;
+        }
+
+        // gc_life_time must cover the longest possible task/transaction.
+        let cron_timeout_sec = self.cron_job_timeout_ms.saturating_add(999) / 1000;
+        if self.gc_life_time_sec < cron_timeout_sec {
+            panic!(
+                "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < cron_job_timeout ({}s). \
+                 GC could reclaim data needed by running cron jobs. \
+                 Either increase DB9_GC_LIFE_TIME_SEC or decrease DB9_CRON_JOB_TIMEOUT_MS.",
+                self.gc_life_time_sec, cron_timeout_sec,
+            );
+        }
+
+        // Advancement interval must be shorter than the retention window;
+        // otherwise the safepoint would stale for longer than the window itself.
+        if self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
+            panic!(
+                "UNSAFE CONFIG: DB9_GC_SAFEPOINT_INTERVAL_SEC ({}) >= DB9_GC_LIFE_TIME_SEC ({}). \
+                 The advancement interval must be shorter than the retention window.",
+                self.gc_safepoint_interval_sec, self.gc_life_time_sec,
+            );
+        }
     }
 }
 
@@ -533,5 +636,56 @@ mod tests {
             Some(v) => unsafe { env::set_var(hnsw_key, v) },
             None => unsafe { env::remove_var(hnsw_key) },
         }
+    }
+
+    // --- GC safepoint config validation tests ---
+
+    #[test]
+    fn gc_config_defaults_pass_validation() {
+        let cfg = WorkerConfig::default();
+        cfg.validate_gc_config(); // should not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_life_time_below_cron_timeout() {
+        let cfg = WorkerConfig {
+            gc_safepoint_enabled: true,
+            gc_life_time_sec: 600,          // 10 min
+            cron_job_timeout_ms: 1_800_000, // 30 min — exceeds gc_life_time
+            ..Default::default()
+        };
+        cfg.validate_gc_config();
+    }
+
+    #[test]
+    #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_interval_ge_life_time() {
+        let cfg = WorkerConfig {
+            gc_safepoint_enabled: true,
+            gc_safepoint_interval_sec: 86400,
+            gc_life_time_sec: 86400, // interval == life_time
+            ..Default::default()
+        };
+        cfg.validate_gc_config();
+    }
+
+    #[test]
+    fn gc_config_validation_skipped_when_disabled() {
+        let cfg = WorkerConfig {
+            gc_safepoint_enabled: false,
+            gc_life_time_sec: 1, // obviously unsafe, but disabled
+            cron_job_timeout_ms: 999_999_999,
+            ..Default::default()
+        };
+        cfg.validate_gc_config(); // should not panic
+    }
+
+    #[test]
+    fn gc_config_default_values() {
+        let cfg = WorkerConfig::default();
+        assert!(cfg.gc_safepoint_enabled);
+        assert_eq!(cfg.gc_safepoint_interval_sec, 300);
+        assert_eq!(cfg.gc_life_time_sec, 86400);
     }
 }

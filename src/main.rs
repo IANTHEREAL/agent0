@@ -231,6 +231,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     {
         let worker_config = worker::config::WorkerConfig::from_env();
         if worker_config.enabled {
+            worker_config.validate_gc_config();
             match worker::init_system_store(pd_addrs.clone(), &worker_config).await {
                 Ok(Some(system_store)) => {
                     worker::set_system_store(system_store.clone());
