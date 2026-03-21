@@ -3,6 +3,25 @@
 use super::*;
 use crate::worker::types::IndexState;
 
+fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let sql = format!("SELECT {sql}");
+    let ast = Parser::parse_sql(&PostgreSqlDialect {}, &sql).unwrap();
+    let sqlparser::ast::Statement::Query(query) = ast.into_iter().next().unwrap() else {
+        panic!("expected query");
+    };
+    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+        panic!("expected select");
+    };
+    let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) = select.projection.into_iter().next()
+    else {
+        panic!("expected expression projection");
+    };
+    expr
+}
+
 #[test]
 fn serial_resolves_in_ddl_column_context_only() {
     use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
@@ -310,6 +329,34 @@ fn coerce_json_to_text_preserves_raw_format() {
         coerce_value_for_type_change(Value::Json(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
     // JSON preserves the original string verbatim
     assert_eq!(result, Value::Text(r#"{"b":1,"a":2}"#.to_string()));
+}
+
+#[test]
+fn validate_static_enum_subexpressions_rejects_nested_invalid_enum_casts() {
+    use crate::model::UserTypeKind;
+    use crate::sql::analyzer::catalog::MockCatalog;
+
+    let catalog = MockCatalog::builder()
+        .user_defined_type(
+            "public",
+            "mood",
+            UserTypeKind::Enum {
+                labels: vec!["happy".to_string(), "sad".to_string()],
+            },
+        )
+        .build();
+    let qctx = QueryContext::from_task_locals();
+    let typed = Analyzer::analyze_expr_with_scope(
+        &catalog,
+        Scope::new(),
+        &parse_expr("coalesce(('bogus'::mood)::text, 'fallback')"),
+    )
+    .unwrap();
+
+    let err = validate_static_enum_subexpressions(&typed, &catalog, &qctx)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid input value for enum mood: \"bogus\""));
 }
 
 #[test]

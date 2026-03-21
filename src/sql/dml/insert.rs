@@ -197,50 +197,12 @@ pub(crate) fn validate_enum_values(
         };
 
         let bare_type = udt_name.rsplit('.').next().unwrap_or(udt_name);
-
-        match (&col.data_type, value) {
-            // Scalar enum: validate single label.
-            (DataType::UserDefined(_), Value::Text(s)) => {
-                if !labels.contains(s) {
-                    return Err(anyhow!(
-                        "invalid input value for enum {}: \"{}\"",
-                        bare_type,
-                        s
-                    ));
-                }
-            }
-            // Enum array: validate each element label.
-            (DataType::Array(_), Value::Array(elements)) => {
-                for elem in elements {
-                    match elem {
-                        Value::Null => {} // NULL elements are valid in PG
-                        Value::Text(s) => {
-                            if !labels.contains(s) {
-                                return Err(anyhow!(
-                                    "invalid input value for enum {}: \"{}\"",
-                                    bare_type,
-                                    s
-                                ));
-                            }
-                        }
-                        other => {
-                            return Err(anyhow!(
-                                "invalid input value for enum {}: {}",
-                                bare_type,
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            (_, other) => {
-                return Err(anyhow!(
-                    "invalid input value for enum {}: {}",
-                    bare_type,
-                    other
-                ));
-            }
-        }
+        crate::sql::udt::validate_enum_value_against_labels(
+            &col.data_type,
+            value,
+            labels,
+            bare_type,
+        )?;
     }
 
     Ok(())

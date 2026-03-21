@@ -18,9 +18,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Once};
 
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
-use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
+use crate::sql::analyzer::{Analyzer, Catalog, CatalogSnapshot, Scope};
 use crate::sql::error::SqlError;
-use crate::sql::expr::compile::compile_const_expr_with_catalog;
+use crate::sql::expr::classify::is_volatile;
+use crate::sql::expr::static_eval::{
+    eval_static_typed_expr, is_row_dependent, needs_async_materialization,
+};
+use crate::sql::expr::traverse::visit_any;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::generated_columns::compile_generated_column;
@@ -40,7 +44,7 @@ use super::value_coercion::coerce_value_for_column;
 
 use crate::model::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
-    TableSchema, Value,
+    TableSchema, UserTypeKind, Value,
 };
 use crate::storage::TikvStore;
 use crate::txn::txn_delete;
@@ -163,6 +167,72 @@ pub(crate) fn coerce_ddl_expr_to_column(
     ))
 }
 
+fn enum_udt_full_name(data_type: &DataType) -> Option<&str> {
+    match data_type {
+        DataType::UserDefined(name) => Some(name.as_str()),
+        DataType::Array(inner) => enum_udt_full_name(inner.as_ref()),
+        _ => None,
+    }
+}
+
+fn validate_static_enum_subexpressions(
+    expr: &TypedExpr,
+    catalog: &dyn Catalog,
+    qctx: &QueryContext,
+) -> Result<()> {
+    let mut validation_err = None;
+
+    visit_any(expr, |node| {
+        let Some(full_name) = enum_udt_full_name(&node.data_type) else {
+            return false;
+        };
+        let Ok((schema, type_name)) = names::parse_full_name(full_name) else {
+            return false;
+        };
+        if is_row_dependent(node) || is_volatile(node) || needs_async_materialization(node) {
+            return false;
+        }
+
+        let Some(def) = (match catalog.resolve_type(&type_name, Some(&schema)) {
+            Ok(def) => def,
+            Err(err) => {
+                validation_err = Some(anyhow!(err.to_string()));
+                return true;
+            }
+        }) else {
+            return false;
+        };
+        let UserTypeKind::Enum { labels } = def.kind else {
+            return false;
+        };
+
+        let value = match eval_static_typed_expr(node, qctx) {
+            Ok(value) => value,
+            Err(err) => {
+                validation_err = Some(err);
+                return true;
+            }
+        };
+        let labels: HashSet<String> = labels.into_iter().collect();
+        if let Err(err) = crate::sql::udt::validate_enum_value_against_labels(
+            &node.data_type,
+            &value,
+            &labels,
+            &type_name,
+        ) {
+            validation_err = Some(err);
+            return true;
+        }
+
+        false
+    });
+
+    if let Some(err) = validation_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
 pub(super) async fn analyze_row_level_expr_with_udts(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -203,8 +273,23 @@ pub(super) async fn validate_column_default_expr(
 ) -> Result<TypedExpr> {
     let catalog = build_udt_catalog_snapshot(store, txn, db_id, search_path).await?;
     let qctx = QueryContext::from_task_locals();
-    let typed = compile_const_expr_with_catalog(expr, &qctx, &catalog)?;
-    coerce_ddl_expr_to_column(typed, col, "default expression")
+    let typed =
+        Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr).map_err(SqlError::from)?;
+    let typed = coerce_ddl_expr_to_column(typed, col, "default expression")?;
+
+    // Validate immutable enum-typed subexpressions with catalog label sets so
+    // explicit casts like 'bogus'::mood fail during DDL, even when nested
+    // inside a larger expression whose runtime evaluator preserves UDT text.
+    validate_static_enum_subexpressions(&typed, &catalog, &qctx)?;
+    let typed = fold_typed_expr(&typed, &qctx);
+
+    // PostgreSQL validates constant default expressions at DDL time, but must
+    // not execute volatile, async, or side-effecting defaults like nextval().
+    if !is_volatile(&typed) && !needs_async_materialization(&typed) {
+        let _ = eval_static_typed_expr(&typed, &qctx)?;
+    }
+
+    Ok(typed)
 }
 
 pub(super) fn eval_row_level_expr(

@@ -5,9 +5,12 @@ DROP TABLE IF EXISTS qg1950_create_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_create_default_bad CASCADE;
 DROP TABLE IF EXISTS qg1950_add_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_add_default_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_invalid_default_add CASCADE;
 DROP TABLE IF EXISTS qg1950_set_default_ok CASCADE;
+DROP TABLE IF EXISTS qg1950_invalid_default_set CASCADE;
 DROP TABLE IF EXISTS qg1950_using_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_using_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_invalid_default_create CASCADE;
 DROP TYPE IF EXISTS mood CASCADE;
 
 CREATE TYPE mood AS ENUM ('happy', 'sad');
@@ -32,6 +35,12 @@ ALTER TABLE qg1950_set_default_ok ALTER COLUMN c SET DEFAULT 'happy'::mood;
 INSERT INTO qg1950_set_default_ok DEFAULT VALUES;
 SELECT 'set_default_insert' AS check_name, c::text FROM qg1950_set_default_ok;
 
+CREATE TABLE qg1950_invalid_default_add (id int);
+ALTER TABLE qg1950_invalid_default_add ADD COLUMN c mood DEFAULT 'bogus'::mood;
+
+CREATE TABLE qg1950_invalid_default_set (c mood);
+ALTER TABLE qg1950_invalid_default_set ALTER COLUMN c SET DEFAULT 'bogus'::mood;
+
 CREATE TABLE qg1950_using_ok (c text);
 INSERT INTO qg1950_using_ok VALUES ('happy');
 ALTER TABLE qg1950_using_ok ALTER COLUMN c TYPE mood USING c::mood;
@@ -41,6 +50,7 @@ FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'qg1950_using_ok' AND column_name = 'c';
 
 CREATE TABLE qg1950_create_default_bad (c mood DEFAULT 'happy'::"MOOD");
+CREATE TABLE qg1950_invalid_default_create (c mood DEFAULT 'bogus'::mood);
 CREATE TABLE qg1950_add_default_bad (id int);
 ALTER TABLE qg1950_add_default_bad ADD COLUMN c mood DEFAULT 'happy'::"MOOD";
 ALTER TABLE qg1950_set_default_ok ALTER COLUMN c SET DEFAULT 'happy'::"MOOD";
@@ -53,7 +63,10 @@ DROP TABLE IF EXISTS qg1950_create_default_bad CASCADE;
 DROP TABLE IF EXISTS qg1950_nested_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_add_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_add_default_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_invalid_default_add CASCADE;
 DROP TABLE IF EXISTS qg1950_set_default_ok CASCADE;
+DROP TABLE IF EXISTS qg1950_invalid_default_set CASCADE;
 DROP TABLE IF EXISTS qg1950_using_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_using_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_invalid_default_create CASCADE;
 DROP TYPE IF EXISTS mood CASCADE;
