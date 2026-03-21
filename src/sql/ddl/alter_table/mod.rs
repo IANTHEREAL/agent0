@@ -20,7 +20,8 @@ use crate::storage::TikvStore;
 
 use super::{
     assign_generated_check_constraint_names, check_expr_references_column, constraint_name_exists,
-    find_check_constraint_index, rewrite_check_expr_column, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    find_check_constraint_index, rewrite_check_expr_column, validate_column_default_expr,
+    KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 
 use columns::{
@@ -259,10 +260,24 @@ pub async fn execute_alter_table(
                 .ok_or_else(|| anyhow!("Invalid table name"))?;
             let (schema_name, _) = names::parse_full_name(&t)?;
             let new_full = format!("{}.{}", schema_name, new_table);
+            // Unified namespace check: reserve the new name before renaming.
+            super::create_table::check_relation_name_available(
+                store,
+                txn,
+                db_id,
+                &schema_name,
+                &new_table,
+                super::create_table::RelationKind::Table,
+                false,
+                None,
+            )
+            .await?;
             store.rename_table_schema(txn, db_id, &t, &new_full).await?;
             store
                 .rename_table_metadata(txn, db_id, &t, &new_full)
                 .await?;
+            // Release the old name's reservation key (no-op if missing).
+            store.release_relation_name(txn, db_id, &t).await?;
             result_table_name = new_full.clone();
 
             // Update referencing-side metadata (FKs store ref_table as a string).
@@ -356,6 +371,15 @@ pub async fn execute_alter_table(
                         ))
                         .into());
                     }
+                    validate_column_default_expr(
+                        store,
+                        txn,
+                        value,
+                        &schema.columns[col_idx],
+                        db_id,
+                        search_path,
+                    )
+                    .await?;
                     schema.columns[col_idx].default_expr = Some(value.to_string());
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;

@@ -18,7 +18,7 @@ use crate::sql::sequences::SequenceSession;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
 
-use super::create_table::check_relation_name_available;
+use super::create_table::{check_relation_name_available, RelationKind};
 use super::{
     advance_implicit_sequences_for_seeded_rows, create_implicit_sequences_for_schema,
     drop_dependent_views, drop_owned_sequences_for_table, was_cascade_dropped,
@@ -299,6 +299,10 @@ pub async fn execute_drop_view(
         if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
             return Err(anyhow!("view \"{}\" does not exist", resolved.full));
         }
+        // Release unified namespace reservation key (no-op if missing).
+        store
+            .release_relation_name(txn, db_id, &resolved.full)
+            .await?;
         last = resolved.full;
     }
     Ok(ExecuteResult::DropView { view_name: last })
@@ -377,6 +381,7 @@ pub async fn execute_create_materialized_view(
             db_id,
             &resolved.schema,
             pk_name,
+            RelationKind::Index,
             false,
             Some(&view_name),
         )
@@ -458,6 +463,10 @@ pub async fn execute_drop_materialized_view(
                 sequence_values.defer_sequence_drop(seq);
             }
             store.drop_table(txn, db_id, &resolved.full).await?;
+            // Release unified namespace reservation key (no-op if missing).
+            store
+                .release_relation_name(txn, db_id, &resolved.full)
+                .await?;
         }
         last = resolved.full;
     }

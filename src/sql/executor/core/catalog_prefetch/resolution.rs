@@ -1,7 +1,7 @@
 //! Table, view, and function resolution through the search path, plus view
 //! schema inference via the Analyzer.
 
-use crate::model::{ColumnDef, Row, TableSchema, ViewDef};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, ViewDef};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::executor::table_utils::create_sequence_state_table_schema;
 use crate::sql::names;
@@ -671,6 +671,45 @@ pub(super) async fn prefetch_table_function_schemas(
     Ok(())
 }
 
+/// Extract `UserDefined` type names from a table schema's column definitions.
+fn extract_udt_names_from_schema(schema: &TableSchema) -> Vec<String> {
+    schema
+        .columns
+        .iter()
+        .filter_map(|col| match &col.data_type {
+            DataType::UserDefined(name) => Some(name.clone()),
+            DataType::Array(inner) => {
+                if let DataType::UserDefined(name) = inner.as_ref() {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fetch and add user-defined types referenced by table columns to the snapshot.
+async fn prefetch_column_udts(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    snapshot: &mut CatalogSnapshot,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for type_name in extract_udt_names_from_schema(schema) {
+        if !seen.insert(type_name.clone()) {
+            continue;
+        }
+        if let Some(def) = store.get_type(txn, db_id, &type_name).await? {
+            snapshot.add_type(&type_name, def);
+        }
+    }
+    Ok(())
+}
+
 /// Inner implementation with cycle detection for recursive view expansion.
 pub(super) async fn build_catalog_snapshot_inner(
     store: &TikvStore,
@@ -717,6 +756,7 @@ pub(super) async fn build_catalog_snapshot_inner(
         for candidate in &relation_candidates {
             if let Some(table_schema) = store.get_schema(txn, db_id, candidate).await? {
                 let alias_name = raw_name.rsplit('.').next().unwrap_or(raw_name).to_string();
+                prefetch_column_udts(store, txn, db_id, &table_schema, &mut snapshot).await?;
                 snapshot.add_table(&alias_name, candidate.clone(), table_schema.clone());
                 snapshot.add_table(raw_name, candidate.clone(), table_schema);
                 resolved_relation = true;

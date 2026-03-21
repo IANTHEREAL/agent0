@@ -166,7 +166,7 @@ impl CatalogSnapshot {
     /// Add a user-defined type to the snapshot.
     #[allow(dead_code)] // forward-compat: user-defined type resolution
     pub fn add_type(&mut self, name: &str, udt: UserTypeDef) {
-        self.types.insert(name.to_lowercase(), udt);
+        self.types.insert(name.to_string(), udt);
     }
 
     /// Add a user-defined collation to the snapshot.
@@ -354,6 +354,20 @@ impl CatalogSnapshot {
 
         None
     }
+
+    fn resolve_type_name(&self, name: &str, schema: Option<&str>) -> Option<&UserTypeDef> {
+        if let Some(schema_name) = schema {
+            return self.types.get(&format!("{}.{}", schema_name, name));
+        }
+
+        for schema_name in crate::sql::names::type_search_path_schemas(&self.search_path) {
+            if let Some(udt) = self.types.get(&format!("{}.{}", schema_name, name)) {
+                return Some(udt);
+            }
+        }
+
+        None
+    }
 }
 
 impl Catalog for CatalogSnapshot {
@@ -387,7 +401,7 @@ impl Catalog for CatalogSnapshot {
         name: &str,
         schema: Option<&str>,
     ) -> Result<Option<UserTypeDef>, CatalogError> {
-        Ok(self.resolve_name(&self.types, name, schema).cloned())
+        Ok(self.resolve_type_name(name, schema).cloned())
     }
 
     fn resolve_table_function(&self, key: &str) -> Option<&TableSchema> {
@@ -757,6 +771,18 @@ impl MockCatalogBuilder {
 mod tests {
     use super::*;
 
+    fn test_udt(oid: u32, schema: &str, name: &str) -> UserTypeDef {
+        UserTypeDef {
+            oid,
+            schema: schema.to_string(),
+            name: name.to_string(),
+            kind: UserTypeKind::Enum {
+                labels: vec!["happy".to_string(), "sad".to_string()],
+            },
+            owner: "postgres".to_string(),
+        }
+    }
+
     #[test]
     fn mock_catalog_basic() {
         let catalog = MockCatalog::builder()
@@ -816,5 +842,54 @@ mod tests {
             .resolve_table("nonexistent", None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn catalog_snapshot_resolve_type_respects_quoted_case() {
+        let mut snapshot = CatalogSnapshot::new(vec!["public".to_string()], 1);
+        snapshot.add_schema("public");
+        snapshot.add_type("public.mood", test_udt(1, "public", "mood"));
+
+        let resolved = snapshot
+            .resolve_type("mood", None)
+            .unwrap()
+            .expect("unquoted lowercase should resolve");
+        assert_eq!(resolved.schema, "public");
+        assert_eq!(resolved.name, "mood");
+
+        assert!(
+            snapshot.resolve_type("MOOD", None).unwrap().is_none(),
+            "quoted uppercase should not match lowercase UDT"
+        );
+        assert!(
+            snapshot
+                .resolve_type("mood", Some("PUBLIC"))
+                .unwrap()
+                .is_none(),
+            "quoted uppercase schema should not match lowercase schema"
+        );
+        assert!(
+            snapshot
+                .resolve_type("MOOD", Some("public"))
+                .unwrap()
+                .is_none(),
+            "quoted uppercase type name should not match lowercase UDT"
+        );
+    }
+
+    #[test]
+    fn catalog_snapshot_resolve_type_uses_search_path_order() {
+        let mut snapshot = CatalogSnapshot::new(vec!["s2".to_string(), "s1".to_string()], 1);
+        snapshot.add_schema("s1");
+        snapshot.add_schema("s2");
+        snapshot.add_type("s1.mood", test_udt(1, "s1", "mood"));
+        snapshot.add_type("s2.mood", test_udt(2, "s2", "mood"));
+
+        let resolved = snapshot
+            .resolve_type("mood", None)
+            .unwrap()
+            .expect("search_path should resolve a type");
+        assert_eq!(resolved.oid, 2);
+        assert_eq!(resolved.schema, "s2");
     }
 }

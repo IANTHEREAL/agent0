@@ -1,12 +1,11 @@
 use crate::model::{ColumnDef, TableSchema};
 use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
+use crate::sql::ddl::coerce_ddl_expr_to_column;
 use crate::sql::error::SqlError;
 use crate::sql::expr::compile::compile_row_expr_for_table;
 use crate::sql::expr::traverse::visit_any;
 use crate::sql::expr::typed_fold::is_volatile_or_side_effecting_builtin;
 use crate::sql::query_context::QueryContext;
-use crate::sql::types::cast::CastContext;
-use crate::sql::types::coercion::is_assignment_compatible;
 use anyhow::{anyhow, Result};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -68,30 +67,7 @@ pub(crate) fn compile_generated_column(
 }
 
 fn coerce_generated_expr_to_column(expr: TypedExpr, col: &ColumnDef) -> Result<TypedExpr> {
-    if expr.data_type == col.data_type {
-        return Ok(expr);
-    }
-    if expr.is_null_constant() {
-        return Ok(TypedExpr::null(col.data_type.clone()));
-    }
-    if !is_assignment_compatible(&expr.data_type, &col.data_type) {
-        return Err(SqlError::DataTypeMismatch {
-            message: format!(
-                "column \"{}\" is of type {} but generation expression is of type {}",
-                col.name, col.data_type, expr.data_type
-            ),
-        }
-        .into());
-    }
-
-    Ok(TypedExpr::new(
-        TypedExprKind::Cast {
-            expr: Box::new(expr),
-            target_type: col.data_type.clone(),
-            cast_context: CastContext::Assignment,
-        },
-        col.data_type.clone(),
-    ))
+    coerce_ddl_expr_to_column(expr, col, "generation expression")
 }
 
 fn is_non_immutable_generated_builtin(name: &str) -> bool {

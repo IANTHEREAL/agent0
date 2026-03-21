@@ -17,13 +17,20 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Once};
 
-use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
+use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::analyzer::{Analyzer, Catalog, CatalogSnapshot, Scope};
 use crate::sql::error::SqlError;
+use crate::sql::expr::classify::is_volatile;
+use crate::sql::expr::static_eval::{
+    eval_static_typed_expr, is_row_dependent, needs_async_materialization,
+};
+use crate::sql::expr::traverse::visit_any;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::generated_columns::compile_generated_column;
 use crate::sql::query_context::QueryContext;
+use crate::sql::types::cast::CastContext;
+use crate::sql::types::coercion::is_assignment_compatible;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{DataType as SqlDataType, Expr, ObjectName};
 use tikv_client::Transaction;
@@ -32,11 +39,12 @@ use super::names;
 use super::names::normalize_ident;
 use super::sequences;
 use super::types::sql_datatype_to_internal_strict;
+use super::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
 use super::value_coercion::coerce_value_for_column;
 
 use crate::model::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
-    TableSchema, Value,
+    TableSchema, UserTypeKind, Value,
 };
 use crate::storage::TikvStore;
 use crate::txn::txn_delete;
@@ -48,6 +56,7 @@ pub use create_table::create_table_from_query_result;
 pub use create_table::create_table_from_select_into;
 pub use create_table::create_table_from_stream;
 pub use create_table::execute_create_table;
+pub use create_table::RelationKind;
 // has_legacy_name_conflict is used internally by create_table, not re-exported
 
 pub use create_index::backfill_index_by_name;
@@ -110,7 +119,180 @@ pub(super) fn analyze_row_level_expr(
     )
     .map_err(SqlError::from)?;
     let qctx = QueryContext::from_task_locals();
+    validate_static_enum_subexpressions(&typed, &catalog, &qctx)?;
     Ok(fold_typed_expr(&typed, &qctx))
+}
+
+async fn build_udt_catalog_snapshot(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+) -> Result<CatalogSnapshot> {
+    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
+    for udt in store.list_types(txn, db_id).await? {
+        catalog.add_schema(&udt.schema);
+        let full_name = format!("{}.{}", udt.schema, udt.name);
+        catalog.add_type(&full_name, udt);
+    }
+    Ok(catalog)
+}
+
+pub(crate) fn coerce_ddl_expr_to_column(
+    expr: TypedExpr,
+    col: &ColumnDef,
+    expr_kind: &str,
+) -> Result<TypedExpr> {
+    if expr.data_type == col.data_type {
+        return Ok(expr);
+    }
+    if expr.is_null_constant() {
+        return Ok(TypedExpr::null(col.data_type.clone()));
+    }
+    if !is_assignment_compatible(&expr.data_type, &col.data_type) {
+        return Err(SqlError::DataTypeMismatch {
+            message: format!(
+                "column \"{}\" is of type {} but {} is of type {}",
+                col.name, col.data_type, expr_kind, expr.data_type
+            ),
+        }
+        .into());
+    }
+
+    Ok(TypedExpr::new(
+        TypedExprKind::Cast {
+            expr: Box::new(expr),
+            target_type: col.data_type.clone(),
+            cast_context: CastContext::Assignment,
+        },
+        col.data_type.clone(),
+    ))
+}
+
+fn enum_udt_full_name(data_type: &DataType) -> Option<&str> {
+    match data_type {
+        DataType::UserDefined(name) => Some(name.as_str()),
+        DataType::Array(inner) => enum_udt_full_name(inner.as_ref()),
+        _ => None,
+    }
+}
+
+fn validate_static_enum_subexpressions(
+    expr: &TypedExpr,
+    catalog: &dyn Catalog,
+    qctx: &QueryContext,
+) -> Result<()> {
+    let mut validation_err = None;
+
+    visit_any(expr, |node| {
+        let Some(full_name) = enum_udt_full_name(&node.data_type) else {
+            return false;
+        };
+        let Ok((schema, type_name)) = names::parse_full_name(full_name) else {
+            return false;
+        };
+        if is_row_dependent(node) || is_volatile(node) || needs_async_materialization(node) {
+            return false;
+        }
+
+        let Some(def) = (match catalog.resolve_type(&type_name, Some(&schema)) {
+            Ok(def) => def,
+            Err(err) => {
+                validation_err = Some(anyhow!(err.to_string()));
+                return true;
+            }
+        }) else {
+            return false;
+        };
+        let UserTypeKind::Enum { labels } = def.kind else {
+            return false;
+        };
+
+        let value = match eval_static_typed_expr(node, qctx) {
+            Ok(value) => value,
+            Err(err) => {
+                validation_err = Some(err);
+                return true;
+            }
+        };
+        let labels: HashSet<String> = labels.into_iter().collect();
+        if let Err(err) = crate::sql::udt::validate_enum_value_against_labels(
+            &node.data_type,
+            &value,
+            &labels,
+            &type_name,
+        ) {
+            validation_err = Some(err);
+            return true;
+        }
+
+        false
+    });
+
+    if let Some(err) = validation_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
+pub(super) async fn analyze_row_level_expr_with_udts(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    expr: &Expr,
+    schema: &TableSchema,
+    db_id: u64,
+    search_path: &[String],
+    collations: &[crate::sql::collation::CollationDef],
+) -> Result<TypedExpr> {
+    let mut catalog = build_udt_catalog_snapshot(store, txn, db_id, search_path).await?;
+
+    let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+    catalog.add_table(table_name, schema.name.clone(), schema.clone());
+    if let Some(alias) = &schema.from_alias {
+        catalog.add_table(alias, schema.name.clone(), schema.clone());
+    }
+    for def in collations {
+        catalog.add_collation(&def.name, def.clone());
+    }
+
+    let typed = Analyzer::analyze_expr_with_scope(
+        &catalog,
+        Scope::from_table_schema(table_name, schema),
+        expr,
+    )
+    .map_err(SqlError::from)?;
+    let qctx = QueryContext::from_task_locals();
+    validate_static_enum_subexpressions(&typed, &catalog, &qctx)?;
+    Ok(fold_typed_expr(&typed, &qctx))
+}
+
+pub(super) async fn validate_column_default_expr(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    expr: &Expr,
+    col: &ColumnDef,
+    db_id: u64,
+    search_path: &[String],
+) -> Result<TypedExpr> {
+    let catalog = build_udt_catalog_snapshot(store, txn, db_id, search_path).await?;
+    let qctx = QueryContext::from_task_locals();
+    let typed =
+        Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr).map_err(SqlError::from)?;
+    let typed = coerce_ddl_expr_to_column(typed, col, "default expression")?;
+
+    // Validate immutable enum-typed subexpressions with catalog label sets so
+    // explicit casts like 'bogus'::mood fail during DDL, even when nested
+    // inside a larger expression whose runtime evaluator preserves UDT text.
+    validate_static_enum_subexpressions(&typed, &catalog, &qctx)?;
+    let typed = fold_typed_expr(&typed, &qctx);
+
+    // PostgreSQL validates constant default expressions at DDL time, but must
+    // not execute volatile, async, or side-effecting defaults like nextval().
+    if !is_volatile(&typed) && !needs_async_materialization(&typed) {
+        let _ = eval_static_typed_expr(&typed, &qctx)?;
+    }
+
+    Ok(typed)
 }
 
 pub(super) fn eval_row_level_expr(
@@ -128,79 +310,82 @@ pub(super) async fn resolve_column_data_type(
     search_path: &[String],
     sql_type: &SqlDataType,
 ) -> Result<(DataType, bool)> {
-    if let Some(serial_type) = serial_column_type(sql_type)? {
-        return Ok(serial_type);
-    }
-
-    Ok((
-        resolve_nested_column_data_type(store, txn, db_id, search_path, sql_type).await?,
-        false,
-    ))
+    resolve_nested_column_data_type(
+        store,
+        txn,
+        db_id,
+        search_path,
+        sql_type,
+        TypeResolutionContext::DdlColumn,
+    )
+    .await
 }
 
-fn serial_column_type(sql_type: &SqlDataType) -> Result<Option<(DataType, bool)>> {
-    let SqlDataType::Custom(name, _) = sql_type else {
-        return Ok(None);
-    };
-
-    let type_ident = name.0.last().ok_or_else(|| anyhow!("Invalid type name"))?;
-    let type_name = type_ident.value.to_uppercase();
-    let resolved = match type_name.as_str() {
-        "SERIAL" => Some((DataType::Int32, true)),
-        "BIGSERIAL" => Some((DataType::Int64, true)),
-        _ => None,
-    };
-    Ok(resolved)
+pub(super) async fn resolve_alter_column_set_data_type(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &SqlDataType,
+) -> Result<(DataType, bool)> {
+    resolve_nested_column_data_type(
+        store,
+        txn,
+        db_id,
+        search_path,
+        sql_type,
+        TypeResolutionContext::DdlOther,
+    )
+    .await
 }
 
+#[allow(clippy::type_complexity)]
 fn resolve_nested_column_data_type<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     db_id: u64,
     search_path: &'a [String],
     sql_type: &'a SqlDataType,
-) -> Pin<Box<dyn Future<Output = Result<DataType>> + Send + 'a>> {
+    context: TypeResolutionContext,
+) -> Pin<Box<dyn Future<Output = Result<(DataType, bool)>> + Send + 'a>> {
     Box::pin(async move {
         match sql_type {
             SqlDataType::Array(inner) => {
                 let inner_type = match inner {
                     sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner_type)
                     | sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner_type) => {
-                        resolve_nested_column_data_type(store, txn, db_id, search_path, inner_type)
-                            .await?
+                        // Array elements are never in DDL column context for serial expansion.
+                        resolve_nested_column_data_type(
+                            store,
+                            txn,
+                            db_id,
+                            search_path,
+                            inner_type,
+                            TypeResolutionContext::DdlOther,
+                        )
+                        .await
+                        .map_err(|e| {
+                            crate::sql::types::wrap_undefined_object_for_sql_type(sql_type, e)
+                        })?
+                        .0
                     }
                     sqlparser::ast::ArrayElemTypeDef::None => DataType::Text,
                 };
-                Ok(DataType::Array(Box::new(inner_type)))
+                Ok((DataType::Array(Box::new(inner_type)), false))
             }
-            SqlDataType::Custom(name, _) => {
-                let resolved_type = names::resolve_existing_type_name(
-                    store.as_ref(),
+            SqlDataType::Custom(name, modifiers) => {
+                resolve_custom_type_with_catalog(
+                    context,
+                    store,
                     txn,
                     db_id,
-                    name,
                     search_path,
+                    name,
+                    modifiers,
                 )
-                .await?;
-                let Some(resolved_type) = resolved_type else {
-                    return sql_datatype_to_internal_strict(sql_type);
-                };
-                if resolved_type.is_builtin() {
-                    return sql_datatype_to_internal_strict(sql_type);
-                }
-
-                let full_name = resolved_type.resolved_name().full.clone();
-                match store.get_type(txn, db_id, &full_name).await? {
-                    Some(def) => match def.kind {
-                        crate::model::UserTypeKind::Enum { .. }
-                        | crate::model::UserTypeKind::Composite { .. } => {
-                            Ok(DataType::UserDefined(full_name))
-                        }
-                    },
-                    None => sql_datatype_to_internal_strict(sql_type),
-                }
+                .await
             }
-            _ => sql_datatype_to_internal_strict(sql_type),
+            _ => Ok((sql_datatype_to_internal_strict(sql_type)?, false)),
         }
     })
 }
@@ -339,52 +524,6 @@ pub(super) async fn advance_implicit_sequences_for_seeded_rows(
     Ok(())
 }
 
-async fn relation_name_taken_in_schema(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    schema_name: &str,
-    relation_name: &str,
-    exclude_table: Option<&str>,
-) -> Result<bool> {
-    let full_name = format!("{}.{}", schema_name, relation_name);
-
-    if store.table_exists(txn, db_id, &full_name).await? {
-        return Ok(true);
-    }
-    if store.get_view(txn, db_id, &full_name).await?.is_some() {
-        return Ok(true);
-    }
-    if store
-        .get_materialized_view(txn, db_id, &full_name)
-        .await?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    if store.get_sequence(txn, db_id, &full_name).await?.is_some() {
-        return Ok(true);
-    }
-
-    let schema_prefix = format!("{}.", schema_name);
-    let mut table_schemas: Vec<(String, TableSchema)> = Vec::new();
-    for table_name in store.list_tables(txn, db_id).await? {
-        if !table_name.starts_with(&schema_prefix) {
-            continue;
-        }
-        if let Some(tbl_schema) = store.get_schema(txn, db_id, &table_name).await? {
-            table_schemas.push((table_name, tbl_schema));
-        }
-    }
-
-    Ok(create_table::has_legacy_name_conflict(
-        table_schemas.iter().map(|(n, s)| (n.as_str(), s)),
-        schema_name,
-        relation_name,
-        exclude_table,
-    ))
-}
-
 pub(super) async fn allocate_implicit_sequence_name(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -398,8 +537,21 @@ pub(super) async fn allocate_implicit_sequence_name(
         .unwrap_or(("public", table_full_name));
     let base_name = sequences::implicit_sequence_name(table_name, column_name);
 
-    if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &base_name, exclude_table)
-        .await?
+    // Use check_relation_name_available with if_not_exists=true so taken names
+    // return Ok(false) without error. Ok(true) means available AND reservation
+    // key written (TOCTOU-safe via TiKV pessimistic write-write detection).
+    // Note: Ok(false) returns BEFORE reserve_relation_name — no orphaned keys.
+    if create_table::check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        schema_name,
+        &base_name,
+        create_table::RelationKind::Sequence,
+        true,
+        exclude_table,
+    )
+    .await?
     {
         return Ok(base_name);
     }
@@ -407,8 +559,17 @@ pub(super) async fn allocate_implicit_sequence_name(
     for suffix in 1_u32..=u32::MAX {
         let candidate =
             sequences::implicit_sequence_name_with_suffix(table_name, column_name, suffix);
-        if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &candidate, exclude_table)
-            .await?
+        if create_table::check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            schema_name,
+            &candidate,
+            create_table::RelationKind::Sequence,
+            true,
+            exclude_table,
+        )
+        .await?
         {
             return Ok(candidate);
         }
@@ -436,6 +597,8 @@ pub(super) async fn drop_owned_sequences_for_table(
         if owned_table == table_name {
             let name = def.full_name();
             store.drop_sequence(txn, db_id, &name).await?;
+            // Release unified namespace reservation key (no-op if missing).
+            store.release_relation_name(txn, db_id, &name).await?;
             dropped.push(name);
         }
     }
@@ -893,6 +1056,7 @@ pub(super) async fn drop_dependent_views(
             }
             if pending.iter().any(|p| view.deps.contains(p)) {
                 store.drop_view(txn, db_id, &full).await?;
+                store.release_relation_name(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
             }
@@ -913,6 +1077,7 @@ pub(super) async fn drop_dependent_views(
                 let seqs = drop_owned_sequences_for_table(store, txn, db_id, &full).await?;
                 dropped_sequences.extend(seqs);
                 store.drop_table(txn, db_id, &full).await?;
+                store.release_relation_name(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
             }

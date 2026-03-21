@@ -10,9 +10,10 @@ use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 use crate::sql::scanner::count_sql_parameters;
 use crate::sql::sequences::SequenceSession;
-use crate::sql::types::sql_datatype_to_internal_strict;
+use crate::sql::types::TypeResolutionContext;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tracing::warn;
 
 #[derive(Debug)]
@@ -915,106 +916,126 @@ impl Executor {
         let prepared_sql = statement.to_string();
         let param_count = count_sql_parameters(&prepared_sql).max(data_types.len());
 
-        let mut client_oids: Vec<Option<DataType>> = Vec::with_capacity(data_types.len());
-        for sql_type in data_types {
-            client_oids.push(Some(sql_datatype_to_internal_strict(sql_type)?));
-        }
-
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
             session.begin().await?;
         }
 
-        let db_id = session.current_database_id();
-        let analysis_result = {
-            let (txn, _sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
-            self.analyze_for_prepared(
-                txn,
-                db_id,
-                search_path,
-                &prepared_sql,
-                param_count,
-                &client_oids,
-            )
-            .await
-        };
+        let prepared_stmt_result: Result<PreparedStatement> = async {
+            // Resolve parameter types with catalog access for UDTs.
+            let db_id = session.current_database_id();
+            let client_oids: Vec<Option<DataType>> = {
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+                let mut oids: Vec<Option<DataType>> = Vec::with_capacity(data_types.len());
+                for sql_type in data_types {
+                    let dt = resolve_prepare_param_type(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        search_path,
+                        sql_type,
+                    )
+                    .await?;
+                    oids.push(Some(dt));
+                }
+                oids
+            };
 
-        let analysis = match analysis_result {
-            Ok(analysis) => {
-                if is_autocommit {
+            let analysis = {
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+                self.analyze_for_prepared(
+                    txn,
+                    db_id,
+                    search_path,
+                    &prepared_sql,
+                    param_count,
+                    &client_oids,
+                )
+                .await?
+            };
+
+            let prepared_stmt = match analysis {
+                PreparedAnalysis::Query {
+                    analyzed,
+                    locks,
+                    select_into,
+                    output_schema,
+                    param_types,
+                    base_table_names,
+                    table_versions,
+                    has_recursive_cte,
+                    rls_sensitive,
+                } => {
+                    let required_privileges = base_table_names
+                        .into_iter()
+                        .map(|t| (t, crate::auth::Privilege::Select))
+                        .collect();
+                    PreparedStatement {
+                        sql: prepared_sql,
+                        exec: PreparedExec::AnalyzedQuery {
+                            analyzed,
+                            locks,
+                            select_into,
+                            required_privileges,
+                            has_recursive_cte,
+                        },
+                        output_schema,
+                        param_data_types: param_types,
+                        table_versions,
+                        rls_sensitive,
+                    }
+                }
+                PreparedAnalysis::Dml {
+                    analyzed,
+                    output_schema,
+                    param_types,
+                    table_versions,
+                    rls_sensitive,
+                } => {
+                    let required_privileges = PreparedStatement::compute_privileges(&analyzed, &[]);
+                    PreparedStatement {
+                        sql: prepared_sql,
+                        exec: PreparedExec::AnalyzedDml {
+                            analyzed,
+                            required_privileges,
+                        },
+                        output_schema,
+                        param_data_types: param_types,
+                        table_versions,
+                        rls_sensitive,
+                    }
+                }
+                PreparedAnalysis::Utility => {
+                    return Err(SqlError::Unsupported(
+                        "PREPARE only supports SELECT/INSERT/UPDATE/DELETE statements".to_string(),
+                    )
+                    .into());
+                }
+            };
+
+            Ok(prepared_stmt)
+        }
+        .await;
+
+        let prepared_stmt = match prepared_stmt_result {
+            Ok(prepared_stmt) => {
+                if is_autocommit && session.is_in_transaction() {
                     session.commit().await?;
                     self.flush_trigger_activations();
                     self.flush_pending_hnsw_merges();
                 }
-                analysis
+                prepared_stmt
             }
             Err(err) => {
-                if is_autocommit {
+                if is_autocommit && session.is_in_transaction() {
                     session.rollback().await?;
                     self.clear_trigger_activations();
                 }
                 return Err(err);
-            }
-        };
-
-        let prepared_stmt = match analysis {
-            PreparedAnalysis::Query {
-                analyzed,
-                locks,
-                select_into,
-                output_schema,
-                param_types,
-                base_table_names,
-                table_versions,
-                has_recursive_cte,
-                rls_sensitive,
-            } => {
-                let required_privileges = base_table_names
-                    .into_iter()
-                    .map(|t| (t, crate::auth::Privilege::Select))
-                    .collect();
-                PreparedStatement {
-                    sql: prepared_sql,
-                    exec: PreparedExec::AnalyzedQuery {
-                        analyzed,
-                        locks,
-                        select_into,
-                        required_privileges,
-                        has_recursive_cte,
-                    },
-                    output_schema,
-                    param_data_types: param_types,
-                    table_versions,
-                    rls_sensitive,
-                }
-            }
-            PreparedAnalysis::Dml {
-                analyzed,
-                output_schema,
-                param_types,
-                table_versions,
-                rls_sensitive,
-            } => {
-                let required_privileges = PreparedStatement::compute_privileges(&analyzed, &[]);
-                PreparedStatement {
-                    sql: prepared_sql,
-                    exec: PreparedExec::AnalyzedDml {
-                        analyzed,
-                        required_privileges,
-                    },
-                    output_schema,
-                    param_data_types: param_types,
-                    table_versions,
-                    rls_sensitive,
-                }
-            }
-            PreparedAnalysis::Utility => {
-                return Err(SqlError::Unsupported(
-                    "PREPARE only supports SELECT/INSERT/UPDATE/DELETE statements".to_string(),
-                )
-                .into());
             }
         };
 
@@ -1104,6 +1125,29 @@ impl Executor {
         Ok(vec![ExecuteResult::CommandComplete { tag: "DEALLOCATE" }])
     }
 }
+
+/// Resolve a PREPARE parameter type with catalog access for UDTs.
+/// Non-Custom types use the standard strict mapping; Custom types go through
+/// the unified 4-step pipeline with catalog lookup.
+/// Arrays of custom types (e.g. mood[]) recurse into the inner type.
+async fn resolve_prepare_param_type(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut tikv_client::Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &sqlparser::ast::DataType,
+) -> Result<DataType> {
+    crate::sql::types::resolve_sql_type_with_catalog(
+        TypeResolutionContext::NonDdl,
+        store,
+        txn,
+        db_id,
+        search_path,
+        sql_type,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

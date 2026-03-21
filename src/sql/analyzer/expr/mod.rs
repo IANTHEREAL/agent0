@@ -241,20 +241,40 @@ impl<'a> Analyzer<'a> {
             ast::DataType::Array(inner) => {
                 let inner_type = match inner {
                     ast::ArrayElemTypeDef::AngleBracket(inner_type)
-                    | ast::ArrayElemTypeDef::SquareBracket(inner_type) => {
-                        self.resolve_sql_data_type(inner_type)?
-                    }
+                    | ast::ArrayElemTypeDef::SquareBracket(inner_type) => self
+                        .resolve_sql_data_type(inner_type)
+                        .map_err(|err| match err {
+                            AnalyzerError::Unsupported(message)
+                                if crate::sql::types::normalized_sql_type_name(data_type)
+                                    .is_some()
+                                    && message.starts_with("type \"")
+                                    && message.ends_with(" does not exist") =>
+                            {
+                                let type_name =
+                                    crate::sql::types::normalized_sql_type_name(data_type)
+                                        .expect("checked above");
+                                AnalyzerError::Unsupported(format!(
+                                    "type \"{}\" does not exist",
+                                    type_name
+                                ))
+                            }
+                            other => other,
+                        })?,
                     ast::ArrayElemTypeDef::None => DataType::Text,
                 };
                 Ok(DataType::Array(Box::new(inner_type)))
             }
-            ast::DataType::Custom(name, _) => {
-                if let Some(resolved) = self.resolve_catalog_custom_type(name)? {
-                    Ok(resolved)
-                } else {
-                    crate::sql::types::mapping::sql_datatype_to_internal(data_type)
-                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))
-                }
+            ast::DataType::Custom(name, modifiers) => {
+                // Catalog lookup for UDTs (step 2), then unified pipeline.
+                let catalog_resolved = self.resolve_catalog_custom_type(name)?;
+                let (dt, _is_serial) = crate::sql::types::resolve_custom_type(
+                    crate::sql::types::TypeResolutionContext::NonDdl,
+                    name,
+                    modifiers,
+                    catalog_resolved,
+                )
+                .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                Ok(dt)
             }
             _ => crate::sql::types::mapping::sql_datatype_to_internal(data_type)
                 .map_err(|e| AnalyzerError::Unsupported(e.to_string())),

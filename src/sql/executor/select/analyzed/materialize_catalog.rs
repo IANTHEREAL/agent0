@@ -98,6 +98,22 @@ fn pg_get_serial_sequence_accepts_text_arg(arg: &TypedExpr) -> bool {
     )
 }
 
+fn regclass_lookup_parts<'a>(
+    parsed: &'a crate::sql::names::ParsedRegclassInput,
+    current_database: &str,
+    input: &str,
+) -> Result<(Option<&'a str>, &'a str)> {
+    if !parsed.is_current_database(current_database) {
+        return Err(SqlError::Unsupported(format!(
+            "cross-database references are not implemented: \"{}\"",
+            input.trim()
+        ))
+        .into());
+    }
+
+    Ok(parsed.relation_lookup_parts())
+}
+
 impl Executor {
     pub(super) fn materialize_catalog_functions<'a>(
         &'a self,
@@ -480,6 +496,28 @@ impl Executor {
                             qctx,
                         )
                         .await?;
+
+                    if matches!(
+                        target_type,
+                        DataType::UserDefined(name)
+                            if name.eq_ignore_ascii_case("regclass")
+                                || name.eq_ignore_ascii_case("pg_catalog.regclass")
+                    ) {
+                        let val = self
+                            .eval_regclass_cast(
+                                &materialized_inner,
+                                row,
+                                txn,
+                                db_id,
+                                search_path,
+                                qctx,
+                            )
+                            .await?;
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(val),
+                            expr.data_type.clone(),
+                        ));
+                    }
 
                     if *target_type == DataType::Text
                         && matches!(
@@ -1266,13 +1304,13 @@ impl Executor {
             _ => return Err(anyhow!("function to_regclass(text) does not exist")),
         };
 
-        let (schema_opt, name) =
-            crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
-                SqlError::Unsupported(format!(
-                    "cross-database references are not implemented: \"{}\"",
-                    input
-                ))
-            })?;
+        let parsed = crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
+            SqlError::Unsupported(format!(
+                "cross-database references are not implemented: \"{}\"",
+                input
+            ))
+        })?;
+        let (schema_opt, name) = regclass_lookup_parts(&parsed, qctx.database_name.as_ref(), &raw)?;
         if name.is_empty() {
             return Ok(Value::Null);
         }
@@ -1281,12 +1319,75 @@ impl Executor {
             self.store().as_ref(),
             txn,
             db_id,
-            schema_opt.as_deref(),
-            &name,
+            schema_opt,
+            name,
             search_path,
         )
         .await?;
         Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
+    }
+
+    async fn eval_regclass_cast(
+        &self,
+        inner: &TypedExpr,
+        row: &Row,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let input = eval_typed_expr(inner, row, qctx)?;
+        match input {
+            Value::Null => Ok(Value::Null),
+            Value::Int32(n) => Ok(Value::Int64(n as i64)),
+            Value::Int64(n) => Ok(Value::Int64(n)),
+            Value::Text(raw) => {
+                let trimmed = raw.trim();
+                if let Ok(n) = trimmed.parse::<i64>() {
+                    return Ok(Value::Int64(n));
+                }
+
+                let parsed = crate::sql::names::parse_regclass_input(trimmed).map_err(|input| {
+                    SqlError::Unsupported(format!(
+                        "cross-database references are not implemented: \"{}\"",
+                        input
+                    ))
+                })?;
+                let (schema_opt, name) =
+                    regclass_lookup_parts(&parsed, qctx.database_name.as_ref(), trimmed)?;
+
+                if name.is_empty() {
+                    return Err(SqlError::InvalidInputSyntax {
+                        type_name: "regclass".into(),
+                        value: raw,
+                    }
+                    .into());
+                }
+
+                let oid = crate::sql::names::resolve_existing_relation_oid(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    schema_opt,
+                    name,
+                    search_path,
+                )
+                .await?;
+
+                oid.map(Value::Int64).ok_or_else(|| {
+                    SqlError::InvalidInputSyntax {
+                        type_name: "regclass".into(),
+                        value: raw,
+                    }
+                    .into()
+                })
+            }
+            other => Err(SqlError::InvalidInputSyntax {
+                type_name: "regclass".into(),
+                value: other.to_string(),
+            }
+            .into()),
+        }
     }
 
     async fn eval_pg_get_serial_sequence(
@@ -1927,7 +2028,8 @@ mod tests {
         hstore_extension_oid_for_name, is_pg_get_serial_sequence_function_name,
         non_pg_catalog_qualified_pg_get_serial_sequence_signature,
         pg_get_serial_sequence_accepts_text_arg, pg_get_serial_sequence_arg_type_name,
-        regtype_search_path_schemas, value_to_bool_strict, value_to_i64, value_to_i64_strict,
+        regclass_lookup_parts, regtype_search_path_schemas, value_to_bool_strict, value_to_i64,
+        value_to_i64_strict,
     };
     use crate::model::{ColumnDef, DataType, TableSchema, Value};
     use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
@@ -2020,6 +2122,24 @@ mod tests {
             advisory_lock_timeout(Some(Duration::ZERO), Some(&settings)),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn regclass_lookup_parts_accepts_current_database_qualification() {
+        let parsed = crate::sql::names::parse_regclass_input("postgres.public.rel").unwrap();
+        let (schema, name) =
+            regclass_lookup_parts(&parsed, "postgres", "postgres.public.rel").unwrap();
+        assert_eq!(schema, Some("public"));
+        assert_eq!(name, "rel");
+    }
+
+    #[test]
+    fn regclass_lookup_parts_rejects_foreign_database_qualification() {
+        let parsed = crate::sql::names::parse_regclass_input("other.public.rel").unwrap();
+        let err = regclass_lookup_parts(&parsed, "postgres", "other.public.rel").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cross-database references are not implemented: \"other.public.rel\""));
     }
 
     #[test]

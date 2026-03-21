@@ -12,6 +12,7 @@ use tikv_client::Transaction;
 
 use super::helpers::{expr_has_unqualified_type_cast, query_has_unqualified_type_cast};
 use crate::model::{build_predicate_conjunct_cache, DataType, TableSchema, UserTypeKind};
+use crate::sql::ddl::{check_relation_name_available, RelationKind};
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
 use crate::sql::ExecuteResult;
@@ -163,10 +164,18 @@ pub async fn alter_type_rename(
     let schema_part = old_full.split('.').next().unwrap_or("public");
     let new_full = format!("{}.{}", schema_part, new_name);
 
-    // Check that nothing else (table or type) already owns the new name.
-    if store.get_schema(txn, db_id, &new_full).await?.is_some() {
-        return Err(anyhow!("type \"{}\" already exists", new_name));
-    }
+    // Unified namespace check: reserve the new name before renaming.
+    check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        schema_part,
+        new_name,
+        RelationKind::Type,
+        false,
+        None,
+    )
+    .await?;
 
     // Single-part type names (`::mood`) are only rewritten when that bare name
     // maps uniquely to the renamed type in this database. This prevents
@@ -180,6 +189,8 @@ pub async fn alter_type_rename(
     store
         .rename_type(txn, db_id, old_full, &new_full, def)
         .await?;
+    // Release the old name's reservation key (no-op if missing).
+    store.release_relation_name(txn, db_id, old_full).await?;
 
     // Update all table schemas that reference the old type name.
     // This covers DataType::UserDefined references AND SQL string artifacts

@@ -19,9 +19,10 @@ use crate::storage::TikvStore;
 use crate::txn::txn_put;
 
 use super::super::{
-    analyze_row_level_expr, check_expr_references_column, coerce_value_for_type_change,
-    delete_range, eval_row_level_expr, index_prefix_range, resolve_column_data_type,
-    validate_generated_column_expr, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    analyze_row_level_expr_with_udts, check_expr_references_column, coerce_value_for_type_change,
+    delete_range, eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
+    resolve_column_data_type, validate_column_default_expr, validate_generated_column_expr,
+    KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
@@ -71,6 +72,7 @@ pub(super) async fn alter_table_add_column(
         resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type).await?;
     let mut nullable = true;
     let mut default_expr = None;
+    let mut default_expr_ast = None;
     let mut identity_generated_as: Option<GeneratedAs> = None;
     let mut generation_expr_str: Option<String> = None;
     let mut generation_expr_authorized_by: Option<String> = None;
@@ -85,6 +87,7 @@ pub(super) async fn alter_table_add_column(
                     ))
                     .into());
                 }
+                default_expr_ast = Some(expr.clone());
                 default_expr = Some(expr.to_string());
             }
             ColumnOption::Generated {
@@ -195,7 +198,7 @@ pub(super) async fn alter_table_add_column(
         }
     }
 
-    schema.columns.push(crate::model::ColumnDef {
+    let new_col = crate::model::ColumnDef {
         name: col_name,
         data_type,
         nullable,
@@ -206,7 +209,12 @@ pub(super) async fn alter_table_add_column(
         generation_expr: generation_expr_str,
         generation_expr_authorized_by,
         collation: None,
-    });
+    };
+    if let Some(default_expr_ast) = default_expr_ast.as_ref() {
+        validate_column_default_expr(store, txn, default_expr_ast, &new_col, db_id, search_path)
+            .await?;
+    }
+    schema.columns.push(new_col);
     if is_serial {
         let serial_col_name = schema
             .columns
@@ -266,6 +274,13 @@ pub(super) async fn alter_table_add_column(
         .and_then(|c| c.generation_expr.clone())
     {
         let new_col_idx = schema.columns.len() - 1;
+        let enum_validator = crate::sql::udt::load_enum_value_validator(
+            store,
+            txn,
+            db_id,
+            &schema.columns[new_col_idx].data_type,
+        )
+        .await?;
         let qctx = QueryContext::from_task_locals();
         let compiled = compile_generated_column(schema, new_col_idx, &qctx)?.ok_or_else(|| {
             anyhow!(
@@ -288,8 +303,15 @@ pub(super) async fn alter_table_add_column(
                 } else {
                     eval_typed_expr(&compiled.expr, &row, &qctx)?
                 };
-                row.values[new_col_idx] =
-                    coerce_value_for_column(val, &schema.columns[new_col_idx])?;
+                row.values[new_col_idx] = crate::sql::udt::coerce_and_validate_value_for_column(
+                    store,
+                    txn,
+                    db_id,
+                    val,
+                    &schema.columns[new_col_idx],
+                    enum_validator.as_ref(),
+                )
+                .await?;
                 let row_data = crate::storage::serialize_row(&row)?;
                 txn_put(txn, key.into(), row_data).await?;
             }
@@ -420,7 +442,8 @@ pub(super) async fn alter_table_alter_column_set_data_type(
         ));
     }
 
-    let (new_type, _) = resolve_column_data_type(store, txn, db_id, search_path, data_type).await?;
+    let (new_type, _) =
+        resolve_alter_column_set_data_type(store, txn, db_id, search_path, data_type).await?;
     let type_changed =
         should_invalidate_stats_for_type_change(&schema.columns[col_idx].data_type, &new_type);
     if !type_changed {
@@ -441,14 +464,22 @@ pub(super) async fn alter_table_alter_column_set_data_type(
 
     let mut target_col = schema.columns[col_idx].clone();
     target_col.data_type = new_type.clone();
+    let enum_validator =
+        crate::sql::udt::load_enum_value_validator(store, txn, db_id, &target_col.data_type)
+            .await?;
     let typed_using_expr = if let Some(using_expr) = &using {
-        Some(analyze_row_level_expr(
-            using_expr,
-            schema,
-            db_id,
-            search_path,
-            collations,
-        )?)
+        Some(
+            analyze_row_level_expr_with_udts(
+                store,
+                txn,
+                using_expr,
+                schema,
+                db_id,
+                search_path,
+                collations,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -474,10 +505,22 @@ pub(super) async fn alter_table_alter_column_set_data_type(
 
             let new_val = if let Some(using_expr) = &typed_using_expr {
                 let result = eval_row_level_expr(using_expr, &row, &qctx)?;
-                coerce_value_for_column(result, &target_col)?
+                crate::sql::udt::coerce_and_validate_value_for_column(
+                    store,
+                    txn,
+                    db_id,
+                    result,
+                    &target_col,
+                    enum_validator.as_ref(),
+                )
+                .await?
             } else {
                 let old_val = std::mem::replace(&mut row.values[col_idx], Value::Null);
-                coerce_value_for_type_change(old_val, &target_col)?
+                let coerced = coerce_value_for_type_change(old_val, &target_col)?;
+                if let Some(validator) = &enum_validator {
+                    validator.validate(&coerced)?;
+                }
+                coerced
             };
             row.values[col_idx] = new_val;
 

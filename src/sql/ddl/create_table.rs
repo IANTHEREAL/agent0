@@ -27,8 +27,22 @@ use crate::worker::types::IndexState;
 use super::{
     advance_implicit_sequences_for_seeded_rows, assign_generated_check_constraint_names,
     create_implicit_sequences_for_schema, parse_referential_action, resolve_column_data_type,
-    validate_generated_column_expr, warn_legacy_relname_conflict_scan_once,
+    validate_column_default_expr, validate_generated_column_expr,
+    warn_legacy_relname_conflict_scan_once,
 };
+
+/// The kind of relation object being created/reserved. Controls `IF NOT EXISTS`
+/// suppression (same-kind only) and error code selection (42710 for types,
+/// 42P07 for relations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+    Index,
+    Type,
+}
 
 fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
@@ -102,6 +116,7 @@ pub async fn execute_create_table(
         let mut nullable = true;
         let mut unique = false;
         let mut default_expr = None;
+        let mut default_expr_ast = None;
         let collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
         let mut generation_expr_str: Option<String> = None;
         let mut identity_generated_as: Option<GeneratedAs> = None;
@@ -127,6 +142,7 @@ pub async fn execute_create_table(
                         ))
                         .into());
                     }
+                    default_expr_ast = Some(expr.clone());
                     default_expr = Some(expr.to_string());
                 }
                 ColumnOption::Check(expr) => {
@@ -276,7 +292,7 @@ pub async fn execute_create_table(
             nullable = false;
         }
 
-        col_defs.push(ColumnDef {
+        let column_def = ColumnDef {
             name: col_name,
             data_type,
             nullable,
@@ -287,7 +303,19 @@ pub async fn execute_create_table(
             generation_expr: generation_expr_str,
             generation_expr_authorized_by: None,
             collation,
-        });
+        };
+        if let Some(default_expr_ast) = default_expr_ast.as_ref() {
+            validate_column_default_expr(
+                store,
+                txn,
+                default_expr_ast,
+                &column_def,
+                db_id,
+                search_path,
+            )
+            .await?;
+        }
+        col_defs.push(column_def);
     }
 
     let mut pk_indices = Vec::new();
@@ -555,6 +583,7 @@ pub async fn execute_create_table(
             db_id,
             &table_schema_name,
             pk_name,
+            RelationKind::Index,
             false,
             Some(&table_full_name),
         )
@@ -567,6 +596,7 @@ pub async fn execute_create_table(
             db_id,
             &table_schema_name,
             &idx.name,
+            RelationKind::Index,
             false,
             Some(&table_full_name),
         )
@@ -934,12 +964,18 @@ pub(crate) fn has_legacy_name_conflict<'a>(
 /// is already taken (caller should return silently).  Returns an error with
 /// `SqlError::DuplicateRelation` when the name is taken and `if_not_exists`
 /// is false.
+///
+/// `caller_kind` controls `IF NOT EXISTS` suppression: only same-kind conflicts
+/// are suppressed (matching PostgreSQL semantics). Cross-kind conflicts always error.
+/// Type conflicts use SQLSTATE 42710 (`DuplicateObject`); relation conflicts use
+/// 42P07 (`DuplicateRelation`).
 pub async fn check_relation_name_available(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
     schema_name: &str,
     name: &str,
+    caller_kind: RelationKind,
     if_not_exists: bool,
     exclude_table: Option<&str>,
 ) -> Result<bool> {
@@ -947,7 +983,7 @@ pub async fn check_relation_name_available(
 
     // 1. Table
     if store.table_exists(txn, db_id, &full_name).await? {
-        if if_not_exists {
+        if if_not_exists && caller_kind == RelationKind::Table {
             return Ok(false);
         }
         return Err(SqlError::DuplicateRelation(name.to_string()).into());
@@ -955,7 +991,7 @@ pub async fn check_relation_name_available(
 
     // 2. View
     if store.get_view(txn, db_id, &full_name).await?.is_some() {
-        if if_not_exists {
+        if if_not_exists && caller_kind == RelationKind::View {
             return Ok(false);
         }
         return Err(SqlError::DuplicateRelation(name.to_string()).into());
@@ -967,7 +1003,7 @@ pub async fn check_relation_name_available(
         .await?
         .is_some()
     {
-        if if_not_exists {
+        if if_not_exists && caller_kind == RelationKind::MaterializedView {
             return Ok(false);
         }
         return Err(SqlError::DuplicateRelation(name.to_string()).into());
@@ -975,13 +1011,21 @@ pub async fn check_relation_name_available(
 
     // 4. Sequence
     if store.get_sequence(txn, db_id, &full_name).await?.is_some() {
-        if if_not_exists {
+        if if_not_exists && caller_kind == RelationKind::Sequence {
             return Ok(false);
         }
         return Err(SqlError::DuplicateRelation(name.to_string()).into());
     }
 
-    // 5. Legacy-safe: scan all table schemas in this namespace for
+    // 5. User-defined type (SQLSTATE 42710 per PostgreSQL)
+    if store.get_type(txn, db_id, &full_name).await?.is_some() {
+        if if_not_exists && caller_kind == RelationKind::Type {
+            return Ok(false);
+        }
+        return Err(SqlError::DuplicateObject(format!("type \"{}\" already exists", name)).into());
+    }
+
+    // 6. Legacy-safe: scan all table schemas in this namespace for
     //    indexes / PK constraints with the same name.  Covers data
     //    created before sys_relname_ enforcement (issue #775).
     //    Sunset policy: remove after 2026-12-31 once all clusters have

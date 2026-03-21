@@ -3,18 +3,61 @@
 use super::*;
 use crate::worker::types::IndexState;
 
+fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let sql = format!("SELECT {sql}");
+    let ast = Parser::parse_sql(&PostgreSqlDialect {}, &sql).unwrap();
+    let sqlparser::ast::Statement::Query(query) = ast.into_iter().next().unwrap() else {
+        panic!("expected query");
+    };
+    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+        panic!("expected select");
+    };
+    let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) = select.projection.into_iter().next()
+    else {
+        panic!("expected expression projection");
+    };
+    expr
+}
+
 #[test]
-fn serial_column_type_is_top_level_only() {
-    use sqlparser::ast::{ArrayElemTypeDef, DataType as SqlDataType, Ident, ObjectName};
+fn serial_resolves_in_ddl_column_context_only() {
+    use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
+    use sqlparser::ast::{Ident, ObjectName};
 
-    let serial = SqlDataType::Custom(ObjectName(vec![Ident::new("SERIAL")]), vec![]);
-    assert_eq!(
-        serial_column_type(&serial).unwrap(),
-        Some((DataType::Int32, true))
-    );
+    let name = ObjectName(vec![Ident::new("SERIAL")]);
 
-    let serial_array = SqlDataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(serial)));
-    assert_eq!(serial_column_type(&serial_array).unwrap(), None);
+    // In DdlColumn context, serial expands to Int32.
+    let (dt, is_serial) =
+        resolve_custom_type(TypeResolutionContext::DdlColumn, &name, &[], None).unwrap();
+    assert_eq!(dt, DataType::Int32);
+    assert!(is_serial);
+
+    // In DDL-nested and NonDdl contexts, serial is not special.
+    let err = resolve_custom_type(TypeResolutionContext::DdlOther, &name, &[], None);
+    assert!(err.is_err());
+    let err = resolve_custom_type(TypeResolutionContext::NonDdl, &name, &[], None);
+    assert!(err.is_err());
+}
+
+#[test]
+fn serial_udt_can_resolve_in_non_column_ddl_context() {
+    use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
+    use sqlparser::ast::{Ident, ObjectName};
+
+    let name = ObjectName(vec![Ident::new("serial")]);
+    let (dt, is_serial) = resolve_custom_type(
+        TypeResolutionContext::DdlOther,
+        &name,
+        &[],
+        Some(DataType::UserDefined("serial".to_string())),
+    )
+    .expect("ALTER COLUMN TYPE serial should resolve catalog UDT, not pseudo-type");
+
+    assert_eq!(dt, DataType::UserDefined("serial".to_string()));
+    assert!(!is_serial);
 }
 
 #[test]
@@ -286,6 +329,34 @@ fn coerce_json_to_text_preserves_raw_format() {
         coerce_value_for_type_change(Value::Json(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
     // JSON preserves the original string verbatim
     assert_eq!(result, Value::Text(r#"{"b":1,"a":2}"#.to_string()));
+}
+
+#[test]
+fn validate_static_enum_subexpressions_rejects_nested_invalid_enum_casts() {
+    use crate::model::UserTypeKind;
+    use crate::sql::analyzer::catalog::MockCatalog;
+
+    let catalog = MockCatalog::builder()
+        .user_defined_type(
+            "public",
+            "mood",
+            UserTypeKind::Enum {
+                labels: vec!["happy".to_string(), "sad".to_string()],
+            },
+        )
+        .build();
+    let qctx = QueryContext::from_task_locals();
+    let typed = Analyzer::analyze_expr_with_scope(
+        &catalog,
+        Scope::new(),
+        &parse_expr("coalesce(('bogus'::mood)::text, 'fallback')"),
+    )
+    .unwrap();
+
+    let err = validate_static_enum_subexpressions(&typed, &catalog, &qctx)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid input value for enum mood: \"bogus\""));
 }
 
 #[test]

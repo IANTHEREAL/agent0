@@ -28,7 +28,7 @@ use crate::storage::TikvStore;
 use crate::txn::{txn_delete, txn_put};
 use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DDL};
 
-use super::create_table::check_relation_name_available;
+use super::create_table::{check_relation_name_available, RelationKind};
 use super::{
     analyze_row_level_expr, delete_range, index_prefix_range, maybe_rotate_backfill_txn,
     KvScanBatches, DDL_SCAN_BATCH_SIZE,
@@ -142,6 +142,7 @@ pub async fn execute_create_index(
         db_id,
         owning_schema,
         &idx_name_str,
+        RelationKind::Index,
         if_not_exists,
         None,
     )

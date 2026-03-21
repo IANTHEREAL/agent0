@@ -1,0 +1,6 @@
+create_default_insert|happy
+nested_default_insert|happy
+add_default_insert|1|happy
+set_default_insert|happy
+alter_using_value|happy
+alter_using_type|mood

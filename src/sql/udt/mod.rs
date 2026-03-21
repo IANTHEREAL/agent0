@@ -6,9 +6,10 @@ use tikv_client::Transaction;
 
 use super::names;
 use super::names::normalize_ident;
-use super::types::sql_datatype_to_internal_strict;
+use super::types::TypeResolutionContext;
 use super::ExecuteResult;
 use crate::model::{UserTypeDef, UserTypeKind};
+use crate::sql::ddl::{check_relation_name_available, RelationKind};
 use crate::storage::TikvStore;
 
 mod enum_rewrite;
@@ -17,9 +18,14 @@ mod helpers;
 mod rename;
 #[cfg(test)]
 mod tests;
+mod validation;
 
 pub use enum_values::{alter_type_add_value, alter_type_rename_value};
 pub use rename::alter_type_rename;
+pub(crate) use validation::{
+    coerce_and_validate_value_for_column, load_enum_value_validator,
+    validate_enum_value_against_labels,
+};
 
 pub(crate) fn resolve_type_name(
     name: &ObjectName,
@@ -55,12 +61,28 @@ pub async fn execute_create_type(
                         field_name
                     ));
                 }
-                let field_type = sql_datatype_to_internal_strict(&attr.data_type)?;
+                let field_type =
+                    resolve_composite_field_type(store, txn, db_id, search_path, &attr.data_type)
+                        .await?;
                 fields.push((field_name, field_type));
             }
             UserTypeKind::Composite { fields }
         }
     };
+
+    // Unified namespace check: ensure no table/view/matview/sequence/type/index
+    // already holds this name. Writes a sys_relname_ reservation key on success.
+    check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        &schema,
+        &type_name,
+        RelationKind::Type,
+        false,
+        None,
+    )
+    .await?;
 
     let oid = store.next_type_oid(txn, db_id).await?;
     let def = UserTypeDef {
@@ -94,6 +116,20 @@ pub async fn create_enum_type(
             ));
         }
     }
+
+    // Unified namespace check.
+    check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        &schema,
+        &type_name,
+        RelationKind::Type,
+        false,
+        None,
+    )
+    .await?;
+
     let oid = store.next_type_oid(txn, db_id).await?;
     let def = UserTypeDef {
         oid,
@@ -143,6 +179,28 @@ pub async fn drop_types(
         }
 
         store.drop_type(txn, db_id, full_name).await?;
+        // Release unified namespace reservation key (no-op if missing).
+        store.release_relation_name(txn, db_id, full_name).await?;
     }
     Ok(ExecuteResult::CommandComplete { tag: "DROP TYPE" })
+}
+
+/// Resolve a composite field type with catalog access for UDTs.
+/// Arrays of custom types (e.g. mood[]) recurse into the inner type.
+async fn resolve_composite_field_type(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &sqlparser::ast::DataType,
+) -> Result<crate::model::DataType> {
+    crate::sql::types::resolve_sql_type_with_catalog(
+        TypeResolutionContext::DdlOther,
+        store,
+        txn,
+        db_id,
+        search_path,
+        sql_type,
+    )
+    .await
 }

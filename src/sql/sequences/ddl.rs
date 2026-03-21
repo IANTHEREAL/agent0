@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::{eval_i64, normalize_sequence_name, ExecuteResult};
+use crate::sql::ddl::{check_relation_name_available, RelationKind};
 
 fn parse_minmax(value: &MinMaxValue) -> Result<Option<i64>> {
     match value {
@@ -33,7 +34,20 @@ pub(crate) async fn execute_create_sequence(
         return Err(anyhow!("schema '{}' does not exist", schema));
     }
 
-    if if_not_exists && store.get_sequence(txn, db_id, &full_name).await?.is_some() {
+    // Unified namespace check: ensure no table/view/matview/sequence/type/index
+    // already holds this name. Writes a sys_relname_ reservation key on success.
+    if !check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        &schema,
+        &seq_name,
+        RelationKind::Sequence,
+        if_not_exists,
+        None,
+    )
+    .await?
+    {
         return Ok(ExecuteResult::CommandComplete {
             tag: "CREATE SEQUENCE",
         });
@@ -135,6 +149,10 @@ pub(crate) async fn execute_drop_sequence(
         if !existed && !if_exists {
             return Err(SqlError::SequenceNotFound(resolved.full.clone()).into());
         }
+        // Release unified namespace reservation key (no-op if key doesn't exist).
+        store
+            .release_relation_name(txn, db_id, &resolved.full)
+            .await?;
         sequence_session.defer_sequence_drop(resolved.full.clone());
     }
     Ok(ExecuteResult::CommandComplete {
