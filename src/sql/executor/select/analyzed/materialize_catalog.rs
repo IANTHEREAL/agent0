@@ -1288,13 +1288,23 @@ impl Executor {
             _ => return Err(anyhow!("function to_regclass(text) does not exist")),
         };
 
-        let (schema_opt, name) =
-            crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
-                SqlError::Unsupported(format!(
+        let parsed = crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
+            SqlError::Unsupported(format!(
+                "cross-database references are not implemented: \"{}\"",
+                input
+            ))
+        })?;
+        if let Some(database) = parsed.database.as_deref() {
+            if database != qctx.database_name.as_ref() {
+                return Err(SqlError::Unsupported(format!(
                     "cross-database references are not implemented: \"{}\"",
-                    input
+                    raw.trim()
                 ))
-            })?;
+                .into());
+            }
+        }
+        let schema_opt = parsed.schema.as_deref();
+        let name = parsed.name;
         if name.is_empty() {
             return Ok(Value::Null);
         }
@@ -1303,7 +1313,7 @@ impl Executor {
             self.store().as_ref(),
             txn,
             db_id,
-            schema_opt.as_deref(),
+            schema_opt,
             &name,
             search_path,
         )
@@ -1331,15 +1341,23 @@ impl Executor {
                     return Ok(Value::Int64(n));
                 }
 
-                let (schema_opt, name) =
-                    crate::sql::names::parse_regclass_input(trimmed).map_err(|input| {
-                        SqlError::Unsupported(format!(
+                let parsed = crate::sql::names::parse_regclass_input(trimmed).map_err(|input| {
+                    SqlError::Unsupported(format!(
+                        "cross-database references are not implemented: \"{}\"",
+                        input
+                    ))
+                })?;
+                if let Some(database) = parsed.database.as_deref() {
+                    if database != qctx.database_name.as_ref() {
+                        return Err(SqlError::Unsupported(format!(
                             "cross-database references are not implemented: \"{}\"",
-                            input
+                            trimmed
                         ))
-                    })?;
+                        .into());
+                    }
+                }
 
-                if name.is_empty() {
+                if parsed.name.is_empty() {
                     return Err(SqlError::InvalidInputSyntax {
                         type_name: "regclass".into(),
                         value: raw,
@@ -1351,8 +1369,8 @@ impl Executor {
                     self.store().as_ref(),
                     txn,
                     db_id,
-                    schema_opt.as_deref(),
-                    &name,
+                    parsed.schema.as_deref(),
+                    &parsed.name,
                     search_path,
                 )
                 .await?;

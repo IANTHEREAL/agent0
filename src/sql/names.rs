@@ -68,6 +68,13 @@ impl ResolvedTypeName {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedRegclassInput {
+    pub(crate) database: Option<String>,
+    pub(crate) schema: Option<String>,
+    pub(crate) name: String,
+}
+
 pub(crate) fn default_schema(search_path: &[String]) -> &str {
     search_path
         .iter()
@@ -518,7 +525,7 @@ pub(crate) async fn resolve_visible_type_full_name(
     resolve_existing_type_full_name(store, txn, db_id, schema_opt, name, search_path).await
 }
 
-/// Parse a `to_regclass(text)` input string into `(Option<schema>, name)`.
+/// Parse a `to_regclass(text)` / `::regclass` input string.
 ///
 /// Handles PostgreSQL identifier quoting rules:
 /// - Unquoted identifiers are lowercased via [`normalize_ident_str`].
@@ -526,23 +533,36 @@ pub(crate) async fn resolve_visible_type_full_name(
 ///   escaped double-quote character.
 /// - A dot inside `"..."` is literal (not a separator).
 ///
-/// Returns `None` for the schema component when the input is unqualified.
-/// Returns `Err(input)` for three-or-more part names (cross-database references).
-pub(crate) fn parse_regclass_input(input: &str) -> Result<(Option<String>, String), String> {
+/// Returns `Err(input)` for four-or-more part names.
+pub(crate) fn parse_regclass_input(input: &str) -> Result<ParsedRegclassInput, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Ok((None, String::new()));
+        return Ok(ParsedRegclassInput {
+            database: None,
+            schema: None,
+            name: String::new(),
+        });
     }
 
     let parts = split_dotted_ident(trimmed);
     match parts.as_slice() {
-        [single] => Ok((None, normalize_ident_part(single))),
-        [schema, name] => Ok((
-            Some(normalize_ident_part(schema)),
-            normalize_ident_part(name),
-        )),
+        [single] => Ok(ParsedRegclassInput {
+            database: None,
+            schema: None,
+            name: normalize_ident_part(single),
+        }),
+        [schema, name] => Ok(ParsedRegclassInput {
+            database: None,
+            schema: Some(normalize_ident_part(schema)),
+            name: normalize_ident_part(name),
+        }),
+        [database, schema, name] => Ok(ParsedRegclassInput {
+            database: Some(normalize_ident_part(database)),
+            schema: Some(normalize_ident_part(schema)),
+            name: normalize_ident_part(name),
+        }),
         _ => {
-            // Three-or-more parts: cross-database reference, not supported in PG.
+            // Four-or-more parts are invalid for relation lookup text inputs.
             Err(trimmed.to_string())
         }
     }
@@ -644,50 +664,64 @@ mod tests {
 
     #[test]
     fn parse_regclass_input_unqualified_lowercased() {
-        let (schema, name) = parse_regclass_input("MyTable").unwrap();
-        assert_eq!(schema, None);
-        assert_eq!(name, "mytable");
+        let parsed = parse_regclass_input("MyTable").unwrap();
+        assert_eq!(parsed.database, None);
+        assert_eq!(parsed.schema, None);
+        assert_eq!(parsed.name, "mytable");
     }
 
     #[test]
     fn parse_regclass_input_quoted_preserves_case() {
-        let (schema, name) = parse_regclass_input("\"MixedCase\"").unwrap();
-        assert_eq!(schema, None);
-        assert_eq!(name, "MixedCase");
+        let parsed = parse_regclass_input("\"MixedCase\"").unwrap();
+        assert_eq!(parsed.database, None);
+        assert_eq!(parsed.schema, None);
+        assert_eq!(parsed.name, "MixedCase");
     }
 
     #[test]
     fn parse_regclass_input_schema_qualified() {
-        let (schema, name) = parse_regclass_input("public.my_table").unwrap();
-        assert_eq!(schema, Some("public".to_string()));
-        assert_eq!(name, "my_table");
+        let parsed = parse_regclass_input("public.my_table").unwrap();
+        assert_eq!(parsed.database, None);
+        assert_eq!(parsed.schema, Some("public".to_string()));
+        assert_eq!(parsed.name, "my_table");
     }
 
     #[test]
     fn parse_regclass_input_quoted_schema_qualified() {
-        let (schema, name) = parse_regclass_input("\"MySchema\".\"MyTable\"").unwrap();
-        assert_eq!(schema, Some("MySchema".to_string()));
-        assert_eq!(name, "MyTable");
+        let parsed = parse_regclass_input("\"MySchema\".\"MyTable\"").unwrap();
+        assert_eq!(parsed.database, None);
+        assert_eq!(parsed.schema, Some("MySchema".to_string()));
+        assert_eq!(parsed.name, "MyTable");
+    }
+
+    #[test]
+    fn parse_regclass_input_current_database_qualified() {
+        let parsed = parse_regclass_input("\"postgres\".\"public\".\"MyTable\"").unwrap();
+        assert_eq!(parsed.database, Some("postgres".to_string()));
+        assert_eq!(parsed.schema, Some("public".to_string()));
+        assert_eq!(parsed.name, "MyTable");
     }
 
     #[test]
     fn parse_regclass_input_escaped_double_quote() {
-        let (schema, name) = parse_regclass_input("\"has\"\"quote\"").unwrap();
-        assert_eq!(schema, None);
-        assert_eq!(name, "has\"quote");
+        let parsed = parse_regclass_input("\"has\"\"quote\"").unwrap();
+        assert_eq!(parsed.database, None);
+        assert_eq!(parsed.schema, None);
+        assert_eq!(parsed.name, "has\"quote");
     }
 
     #[test]
     fn parse_regclass_input_dot_inside_quoted_name() {
-        let (schema, name) = parse_regclass_input("\"schema.table\"").unwrap();
-        assert_eq!(schema, None);
-        assert_eq!(name, "schema.table");
+        let parsed = parse_regclass_input("\"schema.table\"").unwrap();
+        assert_eq!(parsed.database, None);
+        assert_eq!(parsed.schema, None);
+        assert_eq!(parsed.name, "schema.table");
     }
 
     #[test]
-    fn parse_regclass_input_three_parts_is_cross_database_error() {
-        let err = parse_regclass_input("a.b.c").unwrap_err();
-        assert_eq!(err, "a.b.c");
+    fn parse_regclass_input_four_parts_is_cross_database_error() {
+        let err = parse_regclass_input("a.b.c.d").unwrap_err();
+        assert_eq!(err, "a.b.c.d");
     }
 
     #[test]
