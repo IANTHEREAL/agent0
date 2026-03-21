@@ -17,13 +17,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Once};
 
-use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
 use crate::sql::error::SqlError;
+use crate::sql::expr::compile::compile_const_expr_with_catalog;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::generated_columns::compile_generated_column;
 use crate::sql::query_context::QueryContext;
+use crate::sql::types::cast::CastContext;
+use crate::sql::types::coercion::is_assignment_compatible;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{DataType as SqlDataType, Expr, ObjectName};
 use tikv_client::Transaction;
@@ -114,6 +117,52 @@ pub(super) fn analyze_row_level_expr(
     Ok(fold_typed_expr(&typed, &qctx))
 }
 
+async fn build_udt_catalog_snapshot(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+) -> Result<CatalogSnapshot> {
+    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
+    for udt in store.list_types(txn, db_id).await? {
+        catalog.add_schema(&udt.schema);
+        let full_name = format!("{}.{}", udt.schema, udt.name);
+        catalog.add_type(&full_name, udt);
+    }
+    Ok(catalog)
+}
+
+pub(crate) fn coerce_ddl_expr_to_column(
+    expr: TypedExpr,
+    col: &ColumnDef,
+    expr_kind: &str,
+) -> Result<TypedExpr> {
+    if expr.data_type == col.data_type {
+        return Ok(expr);
+    }
+    if expr.is_null_constant() {
+        return Ok(TypedExpr::null(col.data_type.clone()));
+    }
+    if !is_assignment_compatible(&expr.data_type, &col.data_type) {
+        return Err(SqlError::DataTypeMismatch {
+            message: format!(
+                "column \"{}\" is of type {} but {} is of type {}",
+                col.name, col.data_type, expr_kind, expr.data_type
+            ),
+        }
+        .into());
+    }
+
+    Ok(TypedExpr::new(
+        TypedExprKind::Cast {
+            expr: Box::new(expr),
+            target_type: col.data_type.clone(),
+            cast_context: CastContext::Assignment,
+        },
+        col.data_type.clone(),
+    ))
+}
+
 pub(super) async fn analyze_row_level_expr_with_udts(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -123,12 +172,7 @@ pub(super) async fn analyze_row_level_expr_with_udts(
     search_path: &[String],
     collations: &[crate::sql::collation::CollationDef],
 ) -> Result<TypedExpr> {
-    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
-    for udt in store.list_types(txn, db_id).await? {
-        catalog.add_schema(&udt.schema);
-        let full_name = format!("{}.{}", udt.schema, udt.name);
-        catalog.add_type(&full_name, udt);
-    }
+    let mut catalog = build_udt_catalog_snapshot(store, txn, db_id, search_path).await?;
 
     let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
     catalog.add_table(table_name, schema.name.clone(), schema.clone());
@@ -147,6 +191,20 @@ pub(super) async fn analyze_row_level_expr_with_udts(
     .map_err(SqlError::from)?;
     let qctx = QueryContext::from_task_locals();
     Ok(fold_typed_expr(&typed, &qctx))
+}
+
+pub(super) async fn validate_column_default_expr(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    expr: &Expr,
+    col: &ColumnDef,
+    db_id: u64,
+    search_path: &[String],
+) -> Result<TypedExpr> {
+    let catalog = build_udt_catalog_snapshot(store, txn, db_id, search_path).await?;
+    let qctx = QueryContext::from_task_locals();
+    let typed = compile_const_expr_with_catalog(expr, &qctx, &catalog)?;
+    coerce_ddl_expr_to_column(typed, col, "default expression")
 }
 
 pub(super) fn eval_row_level_expr(

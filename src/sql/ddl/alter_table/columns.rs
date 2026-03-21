@@ -21,7 +21,8 @@ use crate::txn::txn_put;
 use super::super::{
     analyze_row_level_expr_with_udts, check_expr_references_column, coerce_value_for_type_change,
     delete_range, eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
-    resolve_column_data_type, validate_generated_column_expr, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    resolve_column_data_type, validate_column_default_expr, validate_generated_column_expr,
+    KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
@@ -71,6 +72,7 @@ pub(super) async fn alter_table_add_column(
         resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type).await?;
     let mut nullable = true;
     let mut default_expr = None;
+    let mut default_expr_ast = None;
     let mut identity_generated_as: Option<GeneratedAs> = None;
     let mut generation_expr_str: Option<String> = None;
     let mut generation_expr_authorized_by: Option<String> = None;
@@ -85,6 +87,7 @@ pub(super) async fn alter_table_add_column(
                     ))
                     .into());
                 }
+                default_expr_ast = Some(expr.clone());
                 default_expr = Some(expr.to_string());
             }
             ColumnOption::Generated {
@@ -195,7 +198,7 @@ pub(super) async fn alter_table_add_column(
         }
     }
 
-    schema.columns.push(crate::model::ColumnDef {
+    let new_col = crate::model::ColumnDef {
         name: col_name,
         data_type,
         nullable,
@@ -206,7 +209,12 @@ pub(super) async fn alter_table_add_column(
         generation_expr: generation_expr_str,
         generation_expr_authorized_by,
         collation: None,
-    });
+    };
+    if let Some(default_expr_ast) = default_expr_ast.as_ref() {
+        validate_column_default_expr(store, txn, default_expr_ast, &new_col, db_id, search_path)
+            .await?;
+    }
+    schema.columns.push(new_col);
     if is_serial {
         let serial_col_name = schema
             .columns

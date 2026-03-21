@@ -111,4 +111,25 @@ mod tests {
 
         assert!(err.contains("type \"mood\" does not exist"));
     }
+
+    #[test]
+    fn compile_const_expr_with_catalog_rejects_case_mismatched_quoted_udt() {
+        let catalog = MockCatalog::builder()
+            .user_defined_type(
+                "public",
+                "mood",
+                UserTypeKind::Enum {
+                    labels: vec!["happy".to_string(), "sad".to_string()],
+                },
+            )
+            .build();
+        let expr = parse_expr("'happy'::\"MOOD\"");
+        let qctx = QueryContext::from_task_locals();
+
+        let err = compile_const_expr_with_catalog(&expr, &qctx, &catalog)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("type \"MOOD\" does not exist"));
+    }
 }

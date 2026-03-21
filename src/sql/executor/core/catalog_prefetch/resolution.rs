@@ -700,12 +700,11 @@ async fn prefetch_column_udts(
 ) -> Result<()> {
     let mut seen = HashSet::new();
     for type_name in extract_udt_names_from_schema(schema) {
-        let lower = type_name.to_lowercase();
-        if !seen.insert(lower.clone()) {
+        if !seen.insert(type_name.clone()) {
             continue;
         }
-        if let Some(def) = store.get_type(txn, db_id, &lower).await? {
-            snapshot.add_type(&lower, def);
+        if let Some(def) = store.get_type(txn, db_id, &type_name).await? {
+            snapshot.add_type(&type_name, def);
         }
     }
     Ok(())

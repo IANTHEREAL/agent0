@@ -20,7 +20,8 @@ use crate::storage::TikvStore;
 
 use super::{
     assign_generated_check_constraint_names, check_expr_references_column, constraint_name_exists,
-    find_check_constraint_index, rewrite_check_expr_column, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    find_check_constraint_index, rewrite_check_expr_column, validate_column_default_expr,
+    KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 
 use columns::{
@@ -356,6 +357,15 @@ pub async fn execute_alter_table(
                         ))
                         .into());
                     }
+                    validate_column_default_expr(
+                        store,
+                        txn,
+                        value,
+                        &schema.columns[col_idx],
+                        db_id,
+                        search_path,
+                    )
+                    .await?;
                     schema.columns[col_idx].default_expr = Some(value.to_string());
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
