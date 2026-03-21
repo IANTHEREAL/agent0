@@ -11,6 +11,7 @@ DROP TABLE IF EXISTS qg1950_invalid_default_set CASCADE;
 DROP TABLE IF EXISTS qg1950_using_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_using_bad CASCADE;
 DROP TABLE IF EXISTS qg1950_using_invalid_literal CASCADE;
+DROP TABLE IF EXISTS qg1950_using_empty CASCADE;
 DROP TABLE IF EXISTS qg1950_using_invalid_row CASCADE;
 DROP TABLE IF EXISTS qg1950_invalid_default_create CASCADE;
 DROP TYPE IF EXISTS mood CASCADE;
@@ -55,6 +56,10 @@ CREATE TABLE qg1950_using_invalid_literal (c text);
 INSERT INTO qg1950_using_invalid_literal VALUES ('happy');
 ALTER TABLE qg1950_using_invalid_literal ALTER COLUMN c TYPE mood USING 'bogus'::mood;
 
+-- Empty table: enum validation must still reject invalid static casts upfront
+CREATE TABLE qg1950_using_empty (c text);
+ALTER TABLE qg1950_using_empty ALTER COLUMN c TYPE mood USING 'bogus'::mood;
+
 CREATE TABLE qg1950_using_invalid_row (c text);
 INSERT INTO qg1950_using_invalid_row VALUES ('bogus');
 ALTER TABLE qg1950_using_invalid_row ALTER COLUMN c TYPE mood USING c::mood;
@@ -79,6 +84,7 @@ DROP TABLE IF EXISTS qg1950_invalid_default_set CASCADE;
 DROP TABLE IF EXISTS qg1950_using_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_using_bad CASCADE;
 DROP TABLE IF EXISTS qg1950_using_invalid_literal CASCADE;
+DROP TABLE IF EXISTS qg1950_using_empty CASCADE;
 DROP TABLE IF EXISTS qg1950_using_invalid_row CASCADE;
 DROP TABLE IF EXISTS qg1950_invalid_default_create CASCADE;
 DROP TYPE IF EXISTS mood CASCADE;
