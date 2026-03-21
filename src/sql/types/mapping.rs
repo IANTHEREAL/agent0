@@ -56,6 +56,7 @@ pub(crate) fn resolve_custom_type(
     // PostgreSQL rejects `pg_catalog.serial` with 42704 "type pg_catalog.serial does not exist".
     if context == TypeResolutionContext::DdlColumn && !is_schema_qualified {
         match type_name {
+            "smallserial" | "serial2" => return Ok((DataType::Int32, true)),
             "serial" | "serial4" => return Ok((DataType::Int32, true)),
             "bigserial" | "serial8" => return Ok((DataType::Int64, true)),
             _ => {}

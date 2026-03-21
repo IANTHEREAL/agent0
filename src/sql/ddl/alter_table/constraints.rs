@@ -18,7 +18,7 @@ use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::worker::types::IndexState;
 
-use super::super::create_table::check_relation_name_available;
+use super::super::create_table::{check_relation_name_available, RelationKind};
 use super::super::{
     analyze_row_level_expr, constraint_name_exists, delete_range, eval_row_level_expr,
     extract_first_column_from_check_expr, find_check_constraint_index, index_prefix_range,
@@ -61,6 +61,7 @@ pub(super) async fn alter_table_add_primary_key(
         db_id,
         owning_schema,
         &pk_constraint,
+        RelationKind::Index,
         false,
         None,
     )
@@ -103,8 +104,17 @@ pub(super) async fn alter_table_add_unique_constraint(
 
     // Schema-wide namespace uniqueness check.
     let owning_schema = full_table_name.split('.').next().unwrap_or("public");
-    check_relation_name_available(store, txn, db_id, owning_schema, &index_name, false, None)
-        .await?;
+    check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        owning_schema,
+        &index_name,
+        RelationKind::Index,
+        false,
+        None,
+    )
+    .await?;
 
     let new_index = crate::model::IndexDef {
         id: schema

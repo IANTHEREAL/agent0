@@ -52,6 +52,7 @@ use crate::txn::txn_delete;
 // ── Re-exports (preserve pub(crate) surface) ───────────────────────────────
 
 pub use create_table::check_relation_name_available;
+pub use create_table::RelationKind;
 pub use create_table::create_table_from_query_result;
 pub use create_table::create_table_from_select_into;
 pub use create_table::create_table_from_stream;
@@ -522,52 +523,6 @@ pub(super) async fn advance_implicit_sequences_for_seeded_rows(
     Ok(())
 }
 
-async fn relation_name_taken_in_schema(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    schema_name: &str,
-    relation_name: &str,
-    exclude_table: Option<&str>,
-) -> Result<bool> {
-    let full_name = format!("{}.{}", schema_name, relation_name);
-
-    if store.table_exists(txn, db_id, &full_name).await? {
-        return Ok(true);
-    }
-    if store.get_view(txn, db_id, &full_name).await?.is_some() {
-        return Ok(true);
-    }
-    if store
-        .get_materialized_view(txn, db_id, &full_name)
-        .await?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    if store.get_sequence(txn, db_id, &full_name).await?.is_some() {
-        return Ok(true);
-    }
-
-    let schema_prefix = format!("{}.", schema_name);
-    let mut table_schemas: Vec<(String, TableSchema)> = Vec::new();
-    for table_name in store.list_tables(txn, db_id).await? {
-        if !table_name.starts_with(&schema_prefix) {
-            continue;
-        }
-        if let Some(tbl_schema) = store.get_schema(txn, db_id, &table_name).await? {
-            table_schemas.push((table_name, tbl_schema));
-        }
-    }
-
-    Ok(create_table::has_legacy_name_conflict(
-        table_schemas.iter().map(|(n, s)| (n.as_str(), s)),
-        schema_name,
-        relation_name,
-        exclude_table,
-    ))
-}
-
 pub(super) async fn allocate_implicit_sequence_name(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -581,8 +536,21 @@ pub(super) async fn allocate_implicit_sequence_name(
         .unwrap_or(("public", table_full_name));
     let base_name = sequences::implicit_sequence_name(table_name, column_name);
 
-    if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &base_name, exclude_table)
-        .await?
+    // Use check_relation_name_available with if_not_exists=true so taken names
+    // return Ok(false) without error. Ok(true) means available AND reservation
+    // key written (TOCTOU-safe via TiKV pessimistic write-write detection).
+    // Note: Ok(false) returns BEFORE reserve_relation_name — no orphaned keys.
+    if create_table::check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        schema_name,
+        &base_name,
+        create_table::RelationKind::Sequence,
+        true,
+        exclude_table,
+    )
+    .await?
     {
         return Ok(base_name);
     }
@@ -590,8 +558,17 @@ pub(super) async fn allocate_implicit_sequence_name(
     for suffix in 1_u32..=u32::MAX {
         let candidate =
             sequences::implicit_sequence_name_with_suffix(table_name, column_name, suffix);
-        if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &candidate, exclude_table)
-            .await?
+        if create_table::check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            schema_name,
+            &candidate,
+            create_table::RelationKind::Sequence,
+            true,
+            exclude_table,
+        )
+        .await?
         {
             return Ok(candidate);
         }
@@ -619,6 +596,8 @@ pub(super) async fn drop_owned_sequences_for_table(
         if owned_table == table_name {
             let name = def.full_name();
             store.drop_sequence(txn, db_id, &name).await?;
+            // Release unified namespace reservation key (no-op if missing).
+            store.release_relation_name(txn, db_id, &name).await?;
             dropped.push(name);
         }
     }
@@ -1076,6 +1055,7 @@ pub(super) async fn drop_dependent_views(
             }
             if pending.iter().any(|p| view.deps.contains(p)) {
                 store.drop_view(txn, db_id, &full).await?;
+                store.release_relation_name(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
             }
@@ -1096,6 +1076,7 @@ pub(super) async fn drop_dependent_views(
                 let seqs = drop_owned_sequences_for_table(store, txn, db_id, &full).await?;
                 dropped_sequences.extend(seqs);
                 store.drop_table(txn, db_id, &full).await?;
+                store.release_relation_name(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
             }

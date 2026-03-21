@@ -837,6 +837,7 @@ impl Executor {
             db_id,
             owning_schema,
             &new_idx_name,
+            ddl::RelationKind::Index,
             false,
             None,
         )

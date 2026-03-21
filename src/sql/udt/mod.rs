@@ -10,6 +10,7 @@ use super::types::sql_datatype_to_internal_strict;
 use super::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
 use super::ExecuteResult;
 use crate::model::{UserTypeDef, UserTypeKind};
+use crate::sql::ddl::{check_relation_name_available, RelationKind};
 use crate::storage::TikvStore;
 
 mod enum_rewrite;
@@ -70,6 +71,20 @@ pub async fn execute_create_type(
         }
     };
 
+    // Unified namespace check: ensure no table/view/matview/sequence/type/index
+    // already holds this name. Writes a sys_relname_ reservation key on success.
+    check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        &schema,
+        &type_name,
+        RelationKind::Type,
+        false,
+        None,
+    )
+    .await?;
+
     let oid = store.next_type_oid(txn, db_id).await?;
     let def = UserTypeDef {
         oid,
@@ -102,6 +117,20 @@ pub async fn create_enum_type(
             ));
         }
     }
+
+    // Unified namespace check.
+    check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        &schema,
+        &type_name,
+        RelationKind::Type,
+        false,
+        None,
+    )
+    .await?;
+
     let oid = store.next_type_oid(txn, db_id).await?;
     let def = UserTypeDef {
         oid,
@@ -151,6 +180,10 @@ pub async fn drop_types(
         }
 
         store.drop_type(txn, db_id, full_name).await?;
+        // Release unified namespace reservation key (no-op if missing).
+        store
+            .release_relation_name(txn, db_id, full_name)
+            .await?;
     }
     Ok(ExecuteResult::CommandComplete { tag: "DROP TYPE" })
 }

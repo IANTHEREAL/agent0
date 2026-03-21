@@ -294,22 +294,26 @@ impl TikvStore {
 
         for view in self.list_views(txn, db_id).await? {
             if view.schema == schema {
-                let _ = self.drop_view(txn, db_id, &view.full_name()).await?;
+                let full = view.full_name();
+                let _ = self.drop_view(txn, db_id, &full).await?;
+                let _ = self.release_relation_name(txn, db_id, &full).await;
             }
         }
 
         for matview in self.list_materialized_views(txn, db_id).await? {
             if matview.schema == schema {
-                let _ = self
-                    .drop_materialized_view(txn, db_id, &matview.full_name())
-                    .await?;
+                let full = matview.full_name();
+                let _ = self.drop_materialized_view(txn, db_id, &full).await?;
+                let _ = self.release_relation_name(txn, db_id, &full).await;
             }
         }
 
         let sequences = self.list_sequences(txn, db_id).await?;
         for def in &sequences {
             if def.schema == schema {
-                let _ = self.drop_sequence(txn, db_id, &def.full_name()).await?;
+                let full = def.full_name();
+                let _ = self.drop_sequence(txn, db_id, &full).await?;
+                let _ = self.release_relation_name(txn, db_id, &full).await;
             }
         }
 
@@ -356,6 +360,7 @@ impl TikvStore {
             if ty.schema == schema {
                 let full_name = format!("{}.{}", ty.schema, ty.name);
                 let _ = self.drop_type(txn, db_id, &full_name).await?;
+                let _ = self.release_relation_name(txn, db_id, &full_name).await;
             }
         }
 
