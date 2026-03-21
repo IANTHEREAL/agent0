@@ -917,9 +917,14 @@ impl Executor {
         let prepared_sql = statement.to_string();
         let param_count = count_sql_parameters(&prepared_sql).max(data_types.len());
 
-        // Resolve parameter types with catalog access for UDTs (before starting transaction).
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        // Resolve parameter types with catalog access for UDTs.
         let db_id = session.current_database_id();
-        let client_oids = {
+        let client_oids_result: Result<Vec<Option<DataType>>> = {
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
@@ -930,13 +935,19 @@ impl Executor {
                         .await?;
                 oids.push(Some(dt));
             }
-            oids
+            Ok(oids)
         };
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
+        let client_oids = match client_oids_result {
+            Ok(oids) => oids,
+            Err(err) => {
+                if is_autocommit {
+                    session.rollback().await?;
+                    self.clear_trigger_activations();
+                }
+                return Err(err);
+            }
+        };
 
         let analysis_result = {
             let (txn, _sequence_values, search_path) = session
