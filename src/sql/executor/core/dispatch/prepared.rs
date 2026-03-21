@@ -10,8 +10,7 @@ use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 use crate::sql::scanner::count_sql_parameters;
 use crate::sql::sequences::SequenceSession;
-use crate::sql::types::sql_datatype_to_internal_strict;
-use crate::sql::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
+use crate::sql::types::TypeResolutionContext;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1138,82 +1137,15 @@ async fn resolve_prepare_param_type(
     search_path: &[String],
     sql_type: &sqlparser::ast::DataType,
 ) -> Result<DataType> {
-    match sql_type {
-        sqlparser::ast::DataType::Custom(name, modifiers) => {
-            let (dt, _) = resolve_custom_type_with_catalog(
-                TypeResolutionContext::NonDdl,
-                store,
-                txn,
-                db_id,
-                search_path,
-                name,
-                modifiers,
-            )
-            .await?;
-            Ok(dt)
-        }
-        sqlparser::ast::DataType::Array(inner) => {
-            // Unwrap all Array layers to find the leaf type, then resolve it with catalog lookup.
-            // This handles multi-dimensional arrays like mood[][] correctly.
-            let mut leaf_type = inner;
-            let mut array_depth = 1;
-            loop {
-                match leaf_type {
-                    sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
-                    | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t) => match t.as_ref() {
-                        sqlparser::ast::DataType::Array(nested) => {
-                            leaf_type = nested;
-                            array_depth += 1;
-                        }
-                        _ => break,
-                    },
-                    sqlparser::ast::ArrayElemTypeDef::None => {
-                        return sql_datatype_to_internal_strict(&sqlparser::ast::DataType::Array(
-                            sqlparser::ast::ArrayElemTypeDef::None,
-                        ));
-                    }
-                }
-            }
-            // Now resolve the leaf type with catalog lookup.
-            let leaf_sql_type = match leaf_type {
-                sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
-                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t) => t.as_ref(),
-                sqlparser::ast::ArrayElemTypeDef::None => {
-                    return sql_datatype_to_internal_strict(&sqlparser::ast::DataType::Array(
-                        sqlparser::ast::ArrayElemTypeDef::None,
-                    ));
-                }
-            };
-            let leaf_dt = match leaf_sql_type {
-                sqlparser::ast::DataType::Custom(name, modifiers) => {
-                    let (dt, _) = resolve_custom_type_with_catalog(
-                        TypeResolutionContext::NonDdl,
-                        store,
-                        txn,
-                        db_id,
-                        search_path,
-                        name,
-                        modifiers,
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::sql::types::wrap_undefined_object_for_sql_type(sql_type, e)
-                    })?;
-                    dt
-                }
-                _ => sql_datatype_to_internal_strict(leaf_sql_type).map_err(|e| {
-                    crate::sql::types::wrap_undefined_object_for_sql_type(sql_type, e)
-                })?,
-            };
-            // Re-wrap with all array layers.
-            let mut result_dt = leaf_dt;
-            for _ in 0..array_depth {
-                result_dt = DataType::Array(Box::new(result_dt));
-            }
-            Ok(result_dt)
-        }
-        _ => sql_datatype_to_internal_strict(sql_type),
-    }
+    crate::sql::types::resolve_sql_type_with_catalog(
+        TypeResolutionContext::NonDdl,
+        store,
+        txn,
+        db_id,
+        search_path,
+        sql_type,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -169,6 +169,84 @@ async fn resolve_catalog_udt(
     }
 }
 
+/// Resolve any SQL data type (including arrays of custom types) with catalog
+/// lookup. Handles multi-dimensional arrays by unwinding all Array layers,
+/// resolving the leaf type through the unified pipeline, then re-wrapping.
+///
+/// This is the shared implementation for composite field resolution (DDL) and
+/// PREPARE parameter resolution (non-DDL). The `context` parameter controls
+/// serial pseudo-type expansion.
+pub(crate) async fn resolve_sql_type_with_catalog(
+    context: TypeResolutionContext,
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &SqlDataType,
+) -> Result<DataType> {
+    match sql_type {
+        SqlDataType::Custom(name, modifiers) => {
+            let (dt, _) = resolve_custom_type_with_catalog(
+                context, store, txn, db_id, search_path, name, modifiers,
+            )
+            .await?;
+            Ok(dt)
+        }
+        SqlDataType::Array(inner) => {
+            // Unwrap all Array layers to find the leaf type, then resolve it
+            // with catalog lookup. Handles multi-dimensional arrays like mood[][].
+            let mut leaf_type = inner;
+            let mut array_depth = 1;
+            loop {
+                match leaf_type {
+                    ArrayElemTypeDef::AngleBracket(t) | ArrayElemTypeDef::SquareBracket(t) => {
+                        match t.as_ref() {
+                            SqlDataType::Array(nested) => {
+                                leaf_type = nested;
+                                array_depth += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    ArrayElemTypeDef::None => {
+                        return sql_datatype_to_internal_strict(&SqlDataType::Array(
+                            ArrayElemTypeDef::None,
+                        ));
+                    }
+                }
+            }
+            let leaf_sql_type = match leaf_type {
+                ArrayElemTypeDef::AngleBracket(t) | ArrayElemTypeDef::SquareBracket(t) => {
+                    t.as_ref()
+                }
+                ArrayElemTypeDef::None => {
+                    return sql_datatype_to_internal_strict(&SqlDataType::Array(
+                        ArrayElemTypeDef::None,
+                    ));
+                }
+            };
+            let leaf_dt = match leaf_sql_type {
+                SqlDataType::Custom(name, modifiers) => {
+                    let (dt, _) = resolve_custom_type_with_catalog(
+                        context, store, txn, db_id, search_path, name, modifiers,
+                    )
+                    .await
+                    .map_err(|e| wrap_undefined_object_for_sql_type(sql_type, e))?;
+                    dt
+                }
+                _ => sql_datatype_to_internal_strict(leaf_sql_type)
+                    .map_err(|e| wrap_undefined_object_for_sql_type(sql_type, e))?,
+            };
+            let mut result_dt = leaf_dt;
+            for _ in 0..array_depth {
+                result_dt = DataType::Array(Box::new(result_dt));
+            }
+            Ok(result_dt)
+        }
+        _ => sql_datatype_to_internal_strict(sql_type),
+    }
+}
+
 /// Strict type mapping used by DDL — validates numeric precision/scale.
 /// Unknown custom types raise 42704.
 pub(crate) fn sql_datatype_to_internal_strict(sql_type: &SqlDataType) -> Result<DataType> {
