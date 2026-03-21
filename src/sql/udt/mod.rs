@@ -22,7 +22,10 @@ mod validation;
 
 pub use enum_values::{alter_type_add_value, alter_type_rename_value};
 pub use rename::alter_type_rename;
-pub(crate) use validation::validate_enum_value_against_labels;
+pub(crate) use validation::{
+    coerce_and_validate_value_for_column, load_enum_value_validator,
+    validate_enum_value_against_labels,
+};
 
 pub(crate) fn resolve_type_name(
     name: &ObjectName,

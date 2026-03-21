@@ -118,6 +118,7 @@ pub(super) fn analyze_row_level_expr(
     )
     .map_err(SqlError::from)?;
     let qctx = QueryContext::from_task_locals();
+    validate_static_enum_subexpressions(&typed, &catalog, &qctx)?;
     Ok(fold_typed_expr(&typed, &qctx))
 }
 

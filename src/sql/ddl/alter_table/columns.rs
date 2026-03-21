@@ -274,6 +274,13 @@ pub(super) async fn alter_table_add_column(
         .and_then(|c| c.generation_expr.clone())
     {
         let new_col_idx = schema.columns.len() - 1;
+        let enum_validator = crate::sql::udt::load_enum_value_validator(
+            store,
+            txn,
+            db_id,
+            &schema.columns[new_col_idx].data_type,
+        )
+        .await?;
         let qctx = QueryContext::from_task_locals();
         let compiled = compile_generated_column(schema, new_col_idx, &qctx)?.ok_or_else(|| {
             anyhow!(
@@ -296,8 +303,15 @@ pub(super) async fn alter_table_add_column(
                 } else {
                     eval_typed_expr(&compiled.expr, &row, &qctx)?
                 };
-                row.values[new_col_idx] =
-                    coerce_value_for_column(val, &schema.columns[new_col_idx])?;
+                row.values[new_col_idx] = crate::sql::udt::coerce_and_validate_value_for_column(
+                    store,
+                    txn,
+                    db_id,
+                    val,
+                    &schema.columns[new_col_idx],
+                    enum_validator.as_ref(),
+                )
+                .await?;
                 let row_data = crate::storage::serialize_row(&row)?;
                 txn_put(txn, key.into(), row_data).await?;
             }
@@ -450,6 +464,9 @@ pub(super) async fn alter_table_alter_column_set_data_type(
 
     let mut target_col = schema.columns[col_idx].clone();
     target_col.data_type = new_type.clone();
+    let enum_validator =
+        crate::sql::udt::load_enum_value_validator(store, txn, db_id, &target_col.data_type)
+            .await?;
     let typed_using_expr = if let Some(using_expr) = &using {
         Some(
             analyze_row_level_expr_with_udts(
@@ -488,10 +505,22 @@ pub(super) async fn alter_table_alter_column_set_data_type(
 
             let new_val = if let Some(using_expr) = &typed_using_expr {
                 let result = eval_row_level_expr(using_expr, &row, &qctx)?;
-                coerce_value_for_column(result, &target_col)?
+                crate::sql::udt::coerce_and_validate_value_for_column(
+                    store,
+                    txn,
+                    db_id,
+                    result,
+                    &target_col,
+                    enum_validator.as_ref(),
+                )
+                .await?
             } else {
                 let old_val = std::mem::replace(&mut row.values[col_idx], Value::Null);
-                coerce_value_for_type_change(old_val, &target_col)?
+                let coerced = coerce_value_for_type_change(old_val, &target_col)?;
+                if let Some(validator) = &enum_validator {
+                    validator.validate(&coerced)?;
+                }
+                coerced
             };
             row.values[col_idx] = new_val;
 

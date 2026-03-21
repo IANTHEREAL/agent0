@@ -10,6 +10,8 @@ DROP TABLE IF EXISTS qg1950_set_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_invalid_default_set CASCADE;
 DROP TABLE IF EXISTS qg1950_using_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_using_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_using_invalid_literal CASCADE;
+DROP TABLE IF EXISTS qg1950_using_invalid_row CASCADE;
 DROP TABLE IF EXISTS qg1950_invalid_default_create CASCADE;
 DROP TYPE IF EXISTS mood CASCADE;
 
@@ -49,6 +51,14 @@ SELECT 'alter_using_type' AS check_name, udt_name
 FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'qg1950_using_ok' AND column_name = 'c';
 
+CREATE TABLE qg1950_using_invalid_literal (c text);
+INSERT INTO qg1950_using_invalid_literal VALUES ('happy');
+ALTER TABLE qg1950_using_invalid_literal ALTER COLUMN c TYPE mood USING 'bogus'::mood;
+
+CREATE TABLE qg1950_using_invalid_row (c text);
+INSERT INTO qg1950_using_invalid_row VALUES ('bogus');
+ALTER TABLE qg1950_using_invalid_row ALTER COLUMN c TYPE mood USING c::mood;
+
 CREATE TABLE qg1950_create_default_bad (c mood DEFAULT 'happy'::"MOOD");
 CREATE TABLE qg1950_invalid_default_create (c mood DEFAULT 'bogus'::mood);
 CREATE TABLE qg1950_add_default_bad (id int);
@@ -68,5 +78,7 @@ DROP TABLE IF EXISTS qg1950_set_default_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_invalid_default_set CASCADE;
 DROP TABLE IF EXISTS qg1950_using_ok CASCADE;
 DROP TABLE IF EXISTS qg1950_using_bad CASCADE;
+DROP TABLE IF EXISTS qg1950_using_invalid_literal CASCADE;
+DROP TABLE IF EXISTS qg1950_using_invalid_row CASCADE;
 DROP TABLE IF EXISTS qg1950_invalid_default_create CASCADE;
 DROP TYPE IF EXISTS mood CASCADE;

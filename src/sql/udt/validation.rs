@@ -1,8 +1,75 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use tikv_client::Transaction;
 
-use crate::model::{DataType, Value};
+use crate::model::{ColumnDef, DataType, UserTypeKind, Value};
+use crate::sql::value_coercion::coerce_value_for_column;
+use crate::storage::TikvStore;
+
+#[derive(Debug, Clone)]
+pub(crate) struct EnumValueValidator {
+    data_type: DataType,
+    labels: HashSet<String>,
+    bare_type: String,
+}
+
+impl EnumValueValidator {
+    pub(crate) fn validate(&self, value: &Value) -> Result<()> {
+        validate_enum_value_against_labels(&self.data_type, value, &self.labels, &self.bare_type)
+    }
+}
+
+fn enum_leaf_full_name(data_type: &DataType) -> Option<&str> {
+    match data_type {
+        DataType::UserDefined(name) => Some(name.as_str()),
+        DataType::Array(inner) => enum_leaf_full_name(inner.as_ref()),
+        _ => None,
+    }
+}
+
+pub(crate) async fn load_enum_value_validator(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    data_type: &DataType,
+) -> Result<Option<EnumValueValidator>> {
+    let Some(full_name) = enum_leaf_full_name(data_type) else {
+        return Ok(None);
+    };
+    let Some(def) = store.get_type(txn, db_id, full_name).await? else {
+        return Ok(None);
+    };
+    let UserTypeKind::Enum { labels } = def.kind else {
+        return Ok(None);
+    };
+
+    Ok(Some(EnumValueValidator {
+        data_type: data_type.clone(),
+        labels: labels.into_iter().collect(),
+        bare_type: def.name,
+    }))
+}
+
+pub(crate) async fn coerce_and_validate_value_for_column(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    value: Value,
+    col: &ColumnDef,
+    enum_validator: Option<&EnumValueValidator>,
+) -> Result<Value> {
+    let coerced = coerce_value_for_column(value, col)?;
+    if let Some(validator) = enum_validator {
+        validator.validate(&coerced)?;
+    } else if let Some(validator) =
+        load_enum_value_validator(store, txn, db_id, &col.data_type).await?
+    {
+        validator.validate(&coerced)?;
+    }
+    Ok(coerced)
+}
 
 /// Validate a value assigned to an enum-typed slot using the resolved label set.
 ///
@@ -73,6 +140,22 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
+
+        assert!(err.contains("invalid input value for enum mood: \"bogus\""));
+    }
+
+    #[test]
+    fn enum_value_validator_rejects_invalid_scalar() {
+        let validator = EnumValueValidator {
+            data_type: DataType::UserDefined("public.mood".to_string()),
+            labels: HashSet::from(["happy".to_string(), "sad".to_string()]),
+            bare_type: "mood".to_string(),
+        };
+
+        let err = validator
+            .validate(&Value::Text("bogus".to_string()))
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("invalid input value for enum mood: \"bogus\""));
     }

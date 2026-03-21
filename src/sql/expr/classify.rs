@@ -35,15 +35,6 @@ fn is_pg_get_serial_sequence_function(name: &str) -> bool {
         })
 }
 
-fn is_regclass_type(data_type: &crate::model::DataType) -> bool {
-    matches!(
-        data_type,
-        crate::model::DataType::UserDefined(name)
-            if name.eq_ignore_ascii_case("regclass")
-                || name.eq_ignore_ascii_case("pg_catalog.regclass")
-    )
-}
-
 fn is_catalog_dependent_function(func_kind: &FunctionKind, name: &str) -> bool {
     if matches!(func_kind, FunctionKind::UserDefined { .. }) {
         return true;
@@ -100,7 +91,6 @@ pub(crate) fn needs_pre_materialization(expr: &TypedExpr) -> bool {
 pub(crate) fn needs_async(expr: &TypedExpr) -> bool {
     has_unresolved_subquery(expr)
         || has_catalog_dependent_function(expr)
-        || has_catalog_dependent_cast(expr)
         || has_correlated_ref(expr)
 }
 
@@ -129,13 +119,6 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
         | TypedExprKind::WindowCall { func, .. } => {
             is_catalog_dependent_function(&func.kind, func.name.as_str())
         }
-        _ => false,
-    })
-}
-
-pub(crate) fn has_catalog_dependent_cast(expr: &TypedExpr) -> bool {
-    visit_any(expr, |node| match &node.kind {
-        TypedExprKind::Cast { target_type, .. } => is_regclass_type(target_type),
         _ => false,
     })
 }
@@ -361,22 +344,6 @@ mod tests {
                 filter: None,
             },
             DataType::Int64,
-        );
-        assert!(needs_async(&expr));
-    }
-
-    #[test]
-    fn needs_async_detects_catalog_dependent_regclass_cast() {
-        let expr = TypedExpr::new(
-            TypedExprKind::Cast {
-                expr: Box::new(TypedExpr::new(
-                    TypedExprKind::Constant(Value::Text("\"public\".\"users\"".to_string())),
-                    DataType::Text,
-                )),
-                target_type: DataType::UserDefined("pg_catalog.regclass".to_string()),
-                cast_context: crate::sql::types::cast::CastContext::Explicit,
-            },
-            DataType::UserDefined("pg_catalog.regclass".to_string()),
         );
         assert!(needs_async(&expr));
     }

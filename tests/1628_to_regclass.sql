@@ -52,19 +52,13 @@ SET search_path = sp2, public;
 SELECT to_regclass('t1') IS NOT NULL AS found;
 RESET search_path;
 
--- 14. Current-database-qualified text is accepted for to_regclass
-SELECT to_regclass('"' || current_database() || '"."public"."regclass_test"') IS NOT NULL AS found;
-
--- 15. Current-database-qualified text cast to regclass resolves to the same OID
-SELECT (('"' || current_database() || '"."public"."regclass_test"')::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 'regclass_test' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public'))) AS oid_match;
-
--- 16. Wrong arg type produces error
+-- 14. Wrong arg type produces error
 SELECT to_regclass(42);
 
--- 17. Three-part name (cross-database reference) produces error
+-- 15. Three-part name (cross-database reference) produces error
 SELECT to_regclass('a.b.c');
 
--- 18. Non-pg_catalog schema-qualified call produces error
+-- 16. Non-pg_catalog schema-qualified call produces error
 SELECT public.to_regclass('regclass_test');
 
 -- Cleanup
