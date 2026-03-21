@@ -180,9 +180,7 @@ pub async fn drop_types(
 
         store.drop_type(txn, db_id, full_name).await?;
         // Release unified namespace reservation key (no-op if missing).
-        store
-            .release_relation_name(txn, db_id, full_name)
-            .await?;
+        store.release_relation_name(txn, db_id, full_name).await?;
     }
     Ok(ExecuteResult::CommandComplete { tag: "DROP TYPE" })
 }

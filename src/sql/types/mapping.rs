@@ -187,7 +187,13 @@ pub(crate) async fn resolve_sql_type_with_catalog(
     match sql_type {
         SqlDataType::Custom(name, modifiers) => {
             let (dt, _) = resolve_custom_type_with_catalog(
-                context, store, txn, db_id, search_path, name, modifiers,
+                context,
+                store,
+                txn,
+                db_id,
+                search_path,
+                name,
+                modifiers,
             )
             .await?;
             Ok(dt)
@@ -228,7 +234,13 @@ pub(crate) async fn resolve_sql_type_with_catalog(
             let leaf_dt = match leaf_sql_type {
                 SqlDataType::Custom(name, modifiers) => {
                     let (dt, _) = resolve_custom_type_with_catalog(
-                        context, store, txn, db_id, search_path, name, modifiers,
+                        context,
+                        store,
+                        txn,
+                        db_id,
+                        search_path,
+                        name,
+                        modifiers,
                     )
                     .await
                     .map_err(|e| wrap_undefined_object_for_sql_type(sql_type, e))?;

@@ -52,11 +52,11 @@ use crate::txn::txn_delete;
 // ── Re-exports (preserve pub(crate) surface) ───────────────────────────────
 
 pub use create_table::check_relation_name_available;
-pub use create_table::RelationKind;
 pub use create_table::create_table_from_query_result;
 pub use create_table::create_table_from_select_into;
 pub use create_table::create_table_from_stream;
 pub use create_table::execute_create_table;
+pub use create_table::RelationKind;
 // has_legacy_name_conflict is used internally by create_table, not re-exported
 
 pub use create_index::backfill_index_by_name;

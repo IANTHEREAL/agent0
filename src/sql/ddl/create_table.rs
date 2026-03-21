@@ -1022,9 +1022,7 @@ pub async fn check_relation_name_available(
         if if_not_exists && caller_kind == RelationKind::Type {
             return Ok(false);
         }
-        return Err(
-            SqlError::DuplicateObject(format!("type \"{}\" already exists", name)).into(),
-        );
+        return Err(SqlError::DuplicateObject(format!("type \"{}\" already exists", name)).into());
     }
 
     // 6. Legacy-safe: scan all table schemas in this namespace for
