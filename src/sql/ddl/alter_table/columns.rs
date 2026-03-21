@@ -19,9 +19,9 @@ use crate::storage::TikvStore;
 use crate::txn::txn_put;
 
 use super::super::{
-    analyze_row_level_expr, check_expr_references_column, coerce_value_for_type_change,
-    delete_range, eval_row_level_expr, index_prefix_range, resolve_column_data_type,
-    validate_generated_column_expr, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    analyze_row_level_expr_with_udts, check_expr_references_column, coerce_value_for_type_change,
+    delete_range, eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
+    resolve_column_data_type, validate_generated_column_expr, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
@@ -420,7 +420,8 @@ pub(super) async fn alter_table_alter_column_set_data_type(
         ));
     }
 
-    let (new_type, _) = resolve_column_data_type(store, txn, db_id, search_path, data_type).await?;
+    let (new_type, _) =
+        resolve_alter_column_set_data_type(store, txn, db_id, search_path, data_type).await?;
     let type_changed =
         should_invalidate_stats_for_type_change(&schema.columns[col_idx].data_type, &new_type);
     if !type_changed {
@@ -442,13 +443,18 @@ pub(super) async fn alter_table_alter_column_set_data_type(
     let mut target_col = schema.columns[col_idx].clone();
     target_col.data_type = new_type.clone();
     let typed_using_expr = if let Some(using_expr) = &using {
-        Some(analyze_row_level_expr(
-            using_expr,
-            schema,
-            db_id,
-            search_path,
-            collations,
-        )?)
+        Some(
+            analyze_row_level_expr_with_udts(
+                store,
+                txn,
+                using_expr,
+                schema,
+                db_id,
+                search_path,
+                collations,
+            )
+            .await?,
+        )
     } else {
         None
     };

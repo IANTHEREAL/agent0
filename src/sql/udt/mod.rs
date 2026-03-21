@@ -216,10 +216,15 @@ async fn resolve_composite_field_type(
                         name,
                         modifiers,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| {
+                        crate::sql::types::wrap_undefined_object_for_sql_type(sql_type, e)
+                    })?;
                     dt
                 }
-                _ => sql_datatype_to_internal_strict(leaf_sql_type)?,
+                _ => sql_datatype_to_internal_strict(leaf_sql_type).map_err(|e| {
+                    crate::sql::types::wrap_undefined_object_for_sql_type(sql_type, e)
+                })?,
             };
             // Re-wrap with all array layers.
             let mut result_dt = leaf_dt;

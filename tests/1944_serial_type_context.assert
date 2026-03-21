@@ -1,11 +1,16 @@
 ddl_serial_columns|id:integer,big_id:bigint
 ddl_serial_insert|1|1
+ddl_quoted_serial_lower|integer
 builtin_jsonb|jsonb
+builtin_quoted_jsonb|jsonb
+builtin_quoted_pg_catalog_jsonb|jsonb
 builtin_tsvector|tsvector
 builtin_timestamptz|timestamp with time zone
 builtin_name|name
 builtin_regclass|regclass
+builtin_quoted_regclass|regclass
 builtin_regtype|regtype
+builtin_quoted_oid|oid
 enum_default_insert|happy,sad
 serial_udt_cast|t
 serial_udt_prepare|ok

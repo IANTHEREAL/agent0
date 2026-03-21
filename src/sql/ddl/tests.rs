@@ -24,6 +24,24 @@ fn serial_resolves_in_ddl_column_context_only() {
 }
 
 #[test]
+fn serial_udt_can_resolve_in_non_column_ddl_context() {
+    use crate::sql::types::{resolve_custom_type, TypeResolutionContext};
+    use sqlparser::ast::{Ident, ObjectName};
+
+    let name = ObjectName(vec![Ident::new("serial")]);
+    let (dt, is_serial) = resolve_custom_type(
+        TypeResolutionContext::DdlOther,
+        &name,
+        &[],
+        Some(DataType::UserDefined("serial".to_string())),
+    )
+    .expect("ALTER COLUMN TYPE serial should resolve catalog UDT, not pseudo-type");
+
+    assert_eq!(dt, DataType::UserDefined("serial".to_string()));
+    assert!(!is_serial);
+}
+
+#[test]
 fn create_table_default_current_timestamp_precision_is_preserved() {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;

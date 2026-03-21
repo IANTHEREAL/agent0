@@ -166,10 +166,7 @@ describe('TypeORM Schema & Metadata Compatibility [db9-server]', () => {
   });
 
   describe('synchronize idempotency', () => {
-    // SKIP: This test uses regclass with double-quoted names which requires synthetic OID.
-    // The synthetic OID feature was reverted per QG mandate (scope creep).
-    // TODO: Fix this test to not rely on regclass synthetic OID.
-    it.skip('should handle synchronize idempotently (second init succeeds)', async () => {
+    it('should handle synchronize idempotently (second init succeeds)', async () => {
       const ds2 = createDataSource({ synchronize: true });
       await ds2.initialize(); // Must succeed — tables already exist from beforeAll
       await ds2.destroy();

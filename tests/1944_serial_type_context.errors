@@ -1,5 +1,9 @@
+type "SERIAL" does not exist
 type "serial" does not exist
 type "serial" does not exist
 type "serial" does not exist
 type "serial" does not exist
 type "serial[]" does not exist
+type "JSONB" does not exist
+type "REGCLASS" does not exist
+type "OID" does not exist

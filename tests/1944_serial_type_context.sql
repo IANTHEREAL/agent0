@@ -3,6 +3,7 @@
 -- then built-in mapping, and fail with 42704 on unknown types.
 
 DROP TABLE IF EXISTS serial_ctx_seq CASCADE;
+DROP TABLE IF EXISTS serial_ctx_quoted_lower CASCADE;
 DROP TABLE IF EXISTS serial_ctx_pseudo_wins CASCADE;
 DROP TABLE IF EXISTS mood_alt_tbl CASCADE;
 DROP TABLE IF EXISTS mood_tbl CASCADE;
@@ -26,18 +27,33 @@ SELECT 'ddl_serial_insert' AS check_name, id, big_id
 FROM serial_ctx_seq
 ORDER BY id;
 
-ALTER TABLE serial_ctx_seq ALTER COLUMN id TYPE serial;
+CREATE TABLE serial_ctx_quoted_lower (c "serial");
+SELECT 'ddl_quoted_serial_lower' AS check_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'serial_ctx_quoted_lower' AND column_name = 'c';
+
+CREATE TABLE serial_ctx_quoted_upper (c "SERIAL");
+
+ALTER TABLE serial_ctx_seq ALTER COLUMN big_id TYPE serial;
 SELECT NULL::serial;
 PREPARE serial_param(serial) AS SELECT $1;
 CREATE TYPE bad_composite AS (f serial);
 SELECT NULL::serial[];
 
 SELECT 'builtin_jsonb' AS check_name, pg_typeof(NULL::jsonb)::text AS type_name;
+SELECT 'builtin_quoted_jsonb' AS check_name, pg_typeof(NULL::"jsonb")::text AS type_name;
+SELECT 'builtin_quoted_pg_catalog_jsonb' AS check_name,
+       pg_typeof(NULL::"pg_catalog".jsonb)::text AS type_name;
+SELECT NULL::"JSONB";
 SELECT 'builtin_tsvector' AS check_name, pg_typeof(NULL::tsvector)::text AS type_name;
 SELECT 'builtin_timestamptz' AS check_name, pg_typeof(NULL::timestamptz)::text AS type_name;
 SELECT 'builtin_name' AS check_name, pg_typeof(NULL::name)::text AS type_name;
 SELECT 'builtin_regclass' AS check_name, pg_typeof(NULL::regclass)::text AS type_name;
+SELECT 'builtin_quoted_regclass' AS check_name, pg_typeof(NULL::"regclass")::text AS type_name;
+SELECT NULL::"REGCLASS";
 SELECT 'builtin_regtype' AS check_name, pg_typeof(NULL::regtype)::text AS type_name;
+SELECT 'builtin_quoted_oid' AS check_name, pg_typeof(NULL::"oid")::text AS type_name;
+SELECT NULL::"OID";
 
 CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral');
 CREATE TABLE mood_tbl (m mood DEFAULT 'happy'::mood);
@@ -70,6 +86,7 @@ FROM information_schema.columns
 WHERE table_schema = 'public' AND table_name = 'serial_ctx_pseudo_wins' AND column_name = 'c';
 
 DROP TABLE IF EXISTS serial_ctx_seq CASCADE;
+DROP TABLE IF EXISTS serial_ctx_quoted_lower CASCADE;
 DROP TABLE IF EXISTS serial_ctx_pseudo_wins CASCADE;
 DROP TABLE IF EXISTS mood_alt_tbl CASCADE;
 DROP TABLE IF EXISTS mood_tbl CASCADE;

@@ -114,6 +114,41 @@ pub(super) fn analyze_row_level_expr(
     Ok(fold_typed_expr(&typed, &qctx))
 }
 
+pub(super) async fn analyze_row_level_expr_with_udts(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    expr: &Expr,
+    schema: &TableSchema,
+    db_id: u64,
+    search_path: &[String],
+    collations: &[crate::sql::collation::CollationDef],
+) -> Result<TypedExpr> {
+    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
+    for udt in store.list_types(txn, db_id).await? {
+        catalog.add_schema(&udt.schema);
+        let full_name = format!("{}.{}", udt.schema, udt.name);
+        catalog.add_type(&full_name, udt);
+    }
+
+    let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+    catalog.add_table(table_name, schema.name.clone(), schema.clone());
+    if let Some(alias) = &schema.from_alias {
+        catalog.add_table(alias, schema.name.clone(), schema.clone());
+    }
+    for def in collations {
+        catalog.add_collation(&def.name, def.clone());
+    }
+
+    let typed = Analyzer::analyze_expr_with_scope(
+        &catalog,
+        Scope::from_table_schema(table_name, schema),
+        expr,
+    )
+    .map_err(SqlError::from)?;
+    let qctx = QueryContext::from_task_locals();
+    Ok(fold_typed_expr(&typed, &qctx))
+}
+
 pub(super) fn eval_row_level_expr(
     typed_expr: &TypedExpr,
     row: &Row,
@@ -136,6 +171,24 @@ pub(super) async fn resolve_column_data_type(
         search_path,
         sql_type,
         TypeResolutionContext::DdlColumn,
+    )
+    .await
+}
+
+pub(super) async fn resolve_alter_column_set_data_type(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    sql_type: &SqlDataType,
+) -> Result<(DataType, bool)> {
+    resolve_nested_column_data_type(
+        store,
+        txn,
+        db_id,
+        search_path,
+        sql_type,
+        TypeResolutionContext::DdlOther,
     )
     .await
 }
@@ -164,7 +217,10 @@ fn resolve_nested_column_data_type<'a>(
                             inner_type,
                             TypeResolutionContext::DdlOther,
                         )
-                        .await?
+                        .await
+                        .map_err(|e| {
+                            crate::sql::types::wrap_undefined_object_for_sql_type(sql_type, e)
+                        })?
                         .0
                     }
                     sqlparser::ast::ArrayElemTypeDef::None => DataType::Text,
