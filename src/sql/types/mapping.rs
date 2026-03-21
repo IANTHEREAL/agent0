@@ -48,37 +48,15 @@ pub(crate) fn resolve_custom_type(
         .join(".");
     let is_schema_qualified = name.0.len() > 1;
 
-    // Schema-qualified names (e.g. s1.serial, s1.jsonb) skip serial expansion
-    // and builtin fallback — they go straight to catalog lookup, then 42704.
-    // PostgreSQL rejects `s1.serial` with "type s1.serial does not exist".
-    // Exception: pg_catalog.* built-in types are always valid.
-    if is_schema_qualified {
-        if let Some(resolved) = catalog_resolved {
-            return Ok((resolved, false));
-        }
-        // Allow pg_catalog.* built-in types through to step 3.
-        let is_pg_catalog = name
-            .0
-            .first()
-            .map(|i| i.value.eq_ignore_ascii_case("pg_catalog"))
-            .unwrap_or(false);
-        if !is_pg_catalog {
-            return Err(SqlError::UndefinedObject(format!(
-                "type \"{}\" does not exist",
-                full_name
-            ))
-            .into());
-        }
-        // Fall through to step 3 for pg_catalog.* types.
-    }
-
     let Some(last_ident) = name.0.last() else {
         return Err(SqlError::UndefinedObject("type \"\" does not exist".to_string()).into());
     };
     let type_name = last_ident.value.to_uppercase();
 
-    // Step 1: Serial check — only in DDL column context.
-    if context == TypeResolutionContext::DdlColumn {
+    // Step 1: Serial check — only in DDL column context AND only for unqualified names.
+    // Schema-qualified names (e.g. pg_catalog.serial, s1.serial) NEVER trigger serial expansion.
+    // PostgreSQL rejects `pg_catalog.serial` with 42704 "type pg_catalog.serial does not exist".
+    if context == TypeResolutionContext::DdlColumn && !is_schema_qualified {
         match type_name.as_str() {
             "SERIAL" | "SERIAL4" => return Ok((DataType::Int32, true)),
             "BIGSERIAL" | "SERIAL8" => return Ok((DataType::Int64, true)),
@@ -92,7 +70,23 @@ pub(crate) fn resolve_custom_type(
     }
 
     // Step 3: Built-in mapping.
+    // For schema-qualified names, skip pseudo-types (SERIAL/BIGSERIAL) — they are not valid
+    // when qualified. PostgreSQL rejects `pg_catalog.serial` with 42704.
     if let Some(dt) = convert_custom_builtin(&type_name, modifiers) {
+        if is_schema_qualified && matches!(dt, DataType::Int32 | DataType::Int64) {
+            // Check if this was a pseudo-type match (SERIAL/BIGSERIAL).
+            // These are not valid when schema-qualified.
+            match type_name.as_str() {
+                "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8" => {
+                    return Err(SqlError::UndefinedObject(format!(
+                        "type \"{}\" does not exist",
+                        full_name
+                    ))
+                    .into());
+                }
+                _ => {}
+            }
+        }
         return Ok((dt, false));
     }
 
