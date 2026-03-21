@@ -201,6 +201,10 @@ impl DynamicPgHandler {
             ),
         };
         session.set_server_config(self.server_config.clone());
+        // Wire GC active transaction registry — unconditional for all interactive sessions.
+        if let Some(registry) = crate::worker::active_txn_registry::global_registry() {
+            session.set_active_txn_registry(registry.clone());
+        }
 
         self.auth_state
             .set(AuthenticatedState {

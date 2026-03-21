@@ -346,7 +346,8 @@ verify_worker_startup() {
   local log_file="/tmp/db9-regression.log"
 
   for _ in $(seq 1 20); do
-    if grep -Fq "WorkerEngine and GC started" "$log_file" 2>/dev/null; then
+    if grep -Fq "WorkerEngine and GC started" "$log_file" 2>/dev/null \
+      || grep -Fq "WorkerEngine started (cron/triggers/HNSW/DDL)" "$log_file" 2>/dev/null; then
       echo "Worker startup verified."
       return 0
     fi

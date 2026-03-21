@@ -1,3 +1,4 @@
+pub mod active_txn_registry;
 pub mod config;
 pub mod engine;
 pub mod gc;
@@ -12,7 +13,16 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+/// Worker engine system store — set only when DB9_WORKER_ENABLED=true.
+/// Used by: triggers, cron, HNSW, DDL, BgSql feature gates.
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
+
+/// GC registry system store — ALWAYS initialized for SQL-serving processes.
+/// Used only by: GcRegistryPublisher (unconditional) + GcSafepointAdvancer (optional).
+/// Separate from SYSTEM_STORE so that `get_system_store().is_some()` remains
+/// the worker-engine feature gate (triggers, cron, HNSW, DDL).
+static GC_REGISTRY_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
+
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static WORKER_METRICS: OnceLock<Arc<metrics::WorkerMetrics>> = OnceLock::new();
 
@@ -26,8 +36,21 @@ pub fn set_system_store(store: Arc<TikvStore>) {
 }
 
 /// Get the global system store. Returns None if worker is disabled.
+/// Used by triggers, cron, HNSW, DDL — NOT for GC registry.
 pub fn get_system_store() -> Option<&'static Arc<TikvStore>> {
     SYSTEM_STORE.get()
+}
+
+/// Set the GC registry store. Called unconditionally at startup for all
+/// SQL-serving processes.
+pub fn set_gc_registry_store(store: Arc<TikvStore>) {
+    GC_REGISTRY_STORE.set(store).ok();
+}
+
+/// Get the GC registry store. Returns None only if init failed at startup.
+#[allow(dead_code)] // Will be used by GcRegistryPublisher in Phase 2
+pub fn get_gc_registry_store() -> Option<&'static Arc<TikvStore>> {
+    GC_REGISTRY_STORE.get()
 }
 
 pub fn set_worker_notify(notify: Arc<tokio::sync::Notify>) {
@@ -136,6 +159,38 @@ async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &str) -> Resu
     ))
 }
 
+/// Initialize the GC registry store. Called unconditionally for all SQL-serving
+/// processes. Uses the same `_sys_worker` keyspace but does NOT set
+/// `SYSTEM_STORE` (which gates worker features like triggers/cron/HNSW).
+pub async fn init_gc_registry_store(
+    pd_endpoints: Vec<String>,
+    config: &WorkerConfig,
+) -> Result<Arc<TikvStore>> {
+    info!(
+        "Initializing GC registry store for keyspace: {}",
+        config.system_keyspace
+    );
+
+    if let Err(e) = ensure_system_keyspace(&pd_endpoints, &config.system_keyspace).await {
+        warn!(
+            "Failed to ensure GC registry keyspace '{}': {}. Proceeding with direct init.",
+            config.system_keyspace, e
+        );
+    }
+
+    let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to initialize GC registry keyspace '{}'",
+                config.system_keyspace
+            )
+        })?;
+    let store = Arc::new(store);
+    info!("GC registry store initialized successfully");
+    Ok(store)
+}
+
 /// Initialize the system store for the unified worker engine.
 ///
 /// Attempts to ensure the system keyspace exists in PD (best-effort) and then
@@ -143,6 +198,7 @@ async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &str) -> Resu
 /// worker metadata remains isolated.
 ///
 /// Returns None if worker is disabled via config.
+#[allow(dead_code)] // Used by tests and engine integration tests
 pub async fn init_system_store(
     pd_endpoints: Vec<String>,
     config: &WorkerConfig,

@@ -4,6 +4,7 @@ use crate::sql::error::SqlError;
 use crate::sql::query_context::XactAdvisoryLockRecord;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::Ordering;
+use tikv_client::TimestampExt;
 
 use super::{Session, TransactionState};
 
@@ -154,6 +155,12 @@ impl Session {
                 let txn = self.store.begin().await?;
                 self.savepoints.reset().await?;
                 self.reset_xact_advisory_savepoint_tracker().await;
+                // Register start_ts in GC active transaction registry before
+                // setting state to Active. This ensures the GC safepoint
+                // advancer sees this transaction before it can be affected.
+                if let Some(ref registry) = self.active_txn_registry {
+                    registry.register(self.connection_id, txn.start_timestamp().version());
+                }
                 self.state = TransactionState::Active(txn);
                 self.extension_delta = super::ExtensionDelta::default();
                 self.extension_delta_savepoints.clear();
@@ -191,9 +198,15 @@ impl Session {
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.apply_pending_drops();
                         self.observability.record_commit();
+                        // Unregister only after definitive commit success.
+                        if let Some(ref registry) = self.active_txn_registry {
+                            registry.unregister(self.connection_id);
+                        }
                         Ok(())
                     }
                     Err(e) => {
+                        // State restored to Failed — start_ts still valid,
+                        // keep registered in GC registry.
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.discard_pending_drops();
@@ -209,6 +222,10 @@ impl Session {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.discard_pending_drops();
+                        // Unregister only after definitive rollback success.
+                        if let Some(ref registry) = self.active_txn_registry {
+                            registry.unregister(self.connection_id);
+                        }
                         Ok(())
                     }
                     Err(e) => {
@@ -243,6 +260,9 @@ impl Session {
                         // may have been optimistically invalidated, but the DDL
                         // itself was reverted — stale entries must not survive.
                         self.clear_plan_cache();
+                        if let Some(ref registry) = self.active_txn_registry {
+                            registry.unregister(self.connection_id);
+                        }
                         Ok(())
                     }
                     Err(e) => {
@@ -263,6 +283,9 @@ impl Session {
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.discard_pending_drops();
                         self.clear_plan_cache();
+                        if let Some(ref registry) = self.active_txn_registry {
+                            registry.unregister(self.connection_id);
+                        }
                         Ok(())
                     }
                     Err(e) => {

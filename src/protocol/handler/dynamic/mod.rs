@@ -103,6 +103,12 @@ impl Drop for DynamicPgHandler {
         self.cancel_token.cancel(); // stop idle-in-transaction watchdog
         crate::sql::advisory_locks::global_lock_manager()
             .release_all_for_connection(self.connection_id);
+        // Unregister from GC active transaction registry before Session drops.
+        // This is the primary cleanup point for connection disconnect — Session::Drop
+        // is the safety net (may be delayed if the watchdog task holds an Arc).
+        if let Some(registry) = crate::worker::active_txn_registry::global_registry() {
+            registry.unregister(self.connection_id);
+        }
     }
 }
 

@@ -22,11 +22,11 @@ const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 const DEFAULT_GC_SAFEPOINT_ENABLED: bool = true;
 const DEFAULT_GC_SAFEPOINT_INTERVAL_SEC: u64 = 300; // 5 minutes
 const MIN_GC_SAFEPOINT_INTERVAL_SEC: u64 = 30;
-// 24 hours — intentionally very conservative. db9 does not yet have active
-// transaction tracking, so we rely on a fixed window. The goal of this first
-// version is to move the safepoint from 0 to non-zero so TiKV can start
-// reclaiming old MVCC versions at all. Can be tightened later (6h → 1h)
-// once active transaction tracking is in place.
+// 24 hours — conservative default. Interactive SQL transactions are tracked
+// via ActiveTxnRegistry and protected regardless of this value. This window
+// covers untracked worker transactions (cron, BgSql) whose max duration is
+// bounded by cron_job_timeout (default 30 min) and statement_timeout (default
+// 5 min). Can be tightened to match max(cron_timeout, statement_timeout).
 const DEFAULT_GC_LIFE_TIME_SEC: u64 = 86400;
 const MIN_GC_LIFE_TIME_SEC: u64 = 600; // TiDB enforces minimum 10 minutes
 
@@ -290,29 +290,64 @@ impl WorkerConfig {
         cfg
     }
 
-    /// Validate GC safepoint configuration invariants. Panics on unsafe
-    /// combinations to prevent silent data-safety violations.
+    /// Validate GC configuration invariants.
     ///
-    /// Must be called at startup before spawning the GC loop.
+    /// **Key insight**: BgDdl and HnswMerge bypass statement_timeout but do NOT
+    /// hold long-lived TiKV transactions. BgDdl rotates transactions every
+    /// `DDL_BACKFILL_COMMIT_SIZE` (5000) writes. HnswMerge begins a new
+    /// transaction per merge batch. Each sub-transaction lasts seconds, not hours.
+    /// Therefore gc_life_time only needs to cover the longest **single transaction**,
+    /// not the total task duration. cron_job_timeout (default 30 min) remains the
+    /// binding constraint.
     pub fn validate_gc_config(&self) {
-        if !self.gc_safepoint_enabled {
-            return;
+        // Worker timeout checks: only when this node runs worker tasks.
+        if self.enabled {
+            if self.cron_job_timeout_ms == 0 {
+                // Cron transactions are NOT tracked in the active txn registry
+                // (they use store.begin() directly, not Session). Without a finite
+                // timeout, gc_life_time cannot cover them, and an advancer (on this
+                // or any other node) may push safepoint past a running cron job.
+                panic!(
+                    "UNSAFE CONFIG: DB9_CRON_JOB_TIMEOUT_MS=0 (no timeout) while worker \
+                     is enabled. Cron job transactions are not tracked in the GC registry \
+                     and require a finite timeout for GC safety. \
+                     Set DB9_CRON_JOB_TIMEOUT_MS > 0.",
+                );
+            } else {
+                let cron_timeout_sec = self.cron_job_timeout_ms.saturating_add(999) / 1000;
+                if self.gc_life_time_sec < cron_timeout_sec {
+                    panic!(
+                        "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < cron_job_timeout ({}s). \
+                         GC could reclaim data needed by running cron jobs. \
+                         Either increase DB9_GC_LIFE_TIME_SEC or decrease DB9_CRON_JOB_TIMEOUT_MS.",
+                        self.gc_life_time_sec, cron_timeout_sec,
+                    );
+                }
+            }
+
+            if self.statement_timeout_ms == 0 {
+                panic!(
+                    "UNSAFE CONFIG: DB9_WORKER_STATEMENT_TIMEOUT_MS=0 (no timeout) while \
+                     worker is enabled. Worker task transactions (BgSql, AutoAnalyze) are \
+                     not tracked in the GC registry and require a finite timeout for GC safety. \
+                     Set DB9_WORKER_STATEMENT_TIMEOUT_MS > 0.",
+                );
+            } else {
+                let stmt_timeout_sec = self.statement_timeout_ms.saturating_add(999) / 1000;
+                if self.gc_life_time_sec < stmt_timeout_sec {
+                    panic!(
+                        "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < statement_timeout ({}s). \
+                         Worker tasks (BgSql, AutoAnalyze) use statement_timeout and open \
+                         TiKV transactions directly without session registry tracking. \
+                         Either increase DB9_GC_LIFE_TIME_SEC or decrease DB9_WORKER_STATEMENT_TIMEOUT_MS.",
+                        self.gc_life_time_sec, stmt_timeout_sec,
+                    );
+                }
+            }
         }
 
-        // gc_life_time must cover the longest possible task/transaction.
-        let cron_timeout_sec = self.cron_job_timeout_ms.saturating_add(999) / 1000;
-        if self.gc_life_time_sec < cron_timeout_sec {
-            panic!(
-                "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < cron_job_timeout ({}s). \
-                 GC could reclaim data needed by running cron jobs. \
-                 Either increase DB9_GC_LIFE_TIME_SEC or decrease DB9_CRON_JOB_TIMEOUT_MS.",
-                self.gc_life_time_sec, cron_timeout_sec,
-            );
-        }
-
-        // Advancement interval must be shorter than the retention window;
-        // otherwise the safepoint would stale for longer than the window itself.
-        if self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
+        // Advancer interval check.
+        if self.gc_safepoint_enabled && self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
             panic!(
                 "UNSAFE CONFIG: DB9_GC_SAFEPOINT_INTERVAL_SEC ({}) >= DB9_GC_LIFE_TIME_SEC ({}). \
                  The advancement interval must be shorter than the retention window.",
@@ -660,6 +695,28 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_cron_timeout_zero() {
+        let cfg = WorkerConfig {
+            enabled: true,
+            cron_job_timeout_ms: 0,
+            ..Default::default()
+        };
+        cfg.validate_gc_config();
+    }
+
+    #[test]
+    #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_statement_timeout_zero() {
+        let cfg = WorkerConfig {
+            enabled: true,
+            statement_timeout_ms: 0,
+            ..Default::default()
+        };
+        cfg.validate_gc_config();
+    }
+
+    #[test]
+    #[should_panic(expected = "UNSAFE CONFIG")]
     fn gc_config_rejects_interval_ge_life_time() {
         let cfg = WorkerConfig {
             gc_safepoint_enabled: true,
@@ -671,11 +728,26 @@ mod tests {
     }
 
     #[test]
-    fn gc_config_validation_skipped_when_disabled() {
+    fn gc_config_advancer_only_node_passes_with_short_life_time() {
+        // Advancer-only nodes (no worker) don't need 24h minimum.
+        // BgDdl/HnswMerge rotate transactions per batch — each sub-txn
+        // is seconds, not hours. gc_life_time only covers single-txn duration.
+        let cfg = WorkerConfig {
+            enabled: false,
+            gc_safepoint_enabled: true,
+            gc_life_time_sec: 3600, // 1h — safe for advancer-only
+            gc_safepoint_interval_sec: 300,
+            ..Default::default()
+        };
+        cfg.validate_gc_config(); // should not panic
+    }
+
+    #[test]
+    fn gc_config_interval_check_skipped_when_advancer_disabled() {
         let cfg = WorkerConfig {
             gc_safepoint_enabled: false,
-            gc_life_time_sec: 1, // obviously unsafe, but disabled
-            cron_job_timeout_ms: 999_999_999,
+            gc_safepoint_interval_sec: 86400,
+            gc_life_time_sec: 86400,
             ..Default::default()
         };
         cfg.validate_gc_config(); // should not panic

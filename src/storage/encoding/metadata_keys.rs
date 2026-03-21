@@ -51,6 +51,7 @@ pub(super) const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
 pub(super) const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
 pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
+pub(super) const GC_INSTANCE_STATE_PREFIX: &[u8] = b"_gc_instance_";
 pub(super) const WORKER_BG_TASK_SEQ_PREFIX: &[u8] = b"_worker_bg_task_seq_";
 
 // ============================================================================
@@ -485,6 +486,20 @@ pub fn encode_worker_claim_key(
 /// Encode the prefix for all worker claim keys (global).
 pub fn encode_worker_claim_prefix() -> Vec<u8> {
     WORKER_CLAIM_PREFIX.to_vec()
+}
+
+/// Encode a GC instance state key.
+/// Format: `_gc_instance_{instance_id_bytes}`
+pub fn encode_gc_instance_state_key(instance_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(GC_INSTANCE_STATE_PREFIX.len() + instance_id.len());
+    key.extend_from_slice(GC_INSTANCE_STATE_PREFIX);
+    key.extend_from_slice(instance_id.as_bytes());
+    key
+}
+
+/// Encode the prefix for all GC instance state keys.
+pub fn encode_gc_instance_state_prefix() -> Vec<u8> {
+    GC_INSTANCE_STATE_PREFIX.to_vec()
 }
 
 /// Encode a worker background result key (global).

@@ -2,6 +2,16 @@ use super::*;
 use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim};
 
+/// Published GC instance state read back from `_sys_worker`.
+pub struct GcInstanceState {
+    pub instance_id: String,
+    pub min_start_ts: Option<u64>,
+    pub updated_at_version: u64,
+    /// Max of cron_job_timeout and statement_timeout on this instance (seconds).
+    /// The advancer uses max(all instances' values) as effective gc_life_time floor.
+    pub max_untracked_timeout_sec: u64,
+}
+
 impl TikvStore {
     // ========================================================================
     // Registry methods
@@ -407,6 +417,82 @@ impl TikvStore {
             )),
             None => Ok(None),
         }
+    }
+
+    // ========================================================================
+    // GC instance state methods (shared cross-instance registry)
+    // ========================================================================
+
+    /// GC instance state stored in `_sys_worker` for cross-instance coordination.
+    pub async fn put_gc_instance_state(
+        &self,
+        txn: &mut Transaction,
+        instance_id: &str,
+        min_start_ts: Option<u64>,
+        updated_at_version: u64,
+        max_untracked_timeout_sec: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_gc_instance_state_key(instance_id));
+        // Encoding: 1 byte has_min + 8 bytes min_ts + 8 bytes updated_at + 8 bytes max_timeout
+        let mut data = Vec::with_capacity(25);
+        match min_start_ts {
+            Some(ts) => {
+                data.push(1);
+                data.extend_from_slice(&ts.to_be_bytes());
+            }
+            None => {
+                data.push(0);
+                data.extend_from_slice(&0u64.to_be_bytes());
+            }
+        }
+        data.extend_from_slice(&updated_at_version.to_be_bytes());
+        data.extend_from_slice(&max_untracked_timeout_sec.to_be_bytes());
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    /// Scan all GC instance states from the shared registry.
+    pub async fn scan_gc_instance_states(
+        &self,
+        txn: &mut Transaction,
+    ) -> Result<Vec<GcInstanceState>> {
+        let prefix = self.key(&encode_gc_instance_state_prefix());
+        let range = prefix.clone()..;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
+
+        let mut results = Vec::new();
+        for pair in pairs {
+            let key_bytes: &[u8] = pair.key().as_ref().into();
+            if !key_bytes.starts_with(&prefix) {
+                break;
+            }
+            let id_bytes = &key_bytes[prefix.len()..];
+            let instance_id = String::from_utf8_lossy(id_bytes).to_string();
+
+            let val = pair.value();
+            // Support both old format (17 bytes) and new format (25 bytes)
+            if val.len() >= 17 {
+                let has_min = val[0] == 1;
+                let min_ts = if has_min {
+                    Some(u64::from_be_bytes(val[1..9].try_into().unwrap_or([0; 8])))
+                } else {
+                    None
+                };
+                let updated_at = u64::from_be_bytes(val[9..17].try_into().unwrap_or([0; 8]));
+                let max_timeout = if val.len() >= 25 {
+                    u64::from_be_bytes(val[17..25].try_into().unwrap_or([0; 8]))
+                } else {
+                    0 // Old format: assume 0 (no timeout info)
+                };
+                results.push(GcInstanceState {
+                    instance_id,
+                    min_start_ts: min_ts,
+                    updated_at_version: updated_at,
+                    max_untracked_timeout_sec: max_timeout,
+                });
+            }
+        }
+        Ok(results)
     }
 }
 

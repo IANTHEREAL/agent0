@@ -40,18 +40,11 @@ impl WorkerGc {
         }
     }
 
-    /// Start independent timer loops:
-    /// - GC tick (orphan claims + cron cleanup): `DB9_WORKER_GC_INTERVAL_SEC` (default 600s)
-    /// - HNSW delta sweep: `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` (default 600s)
-    /// - TiKV GC safepoint advancement: `DB9_GC_SAFEPOINT_INTERVAL_SEC` (default 300s)
-    ///
-    /// Each runs in its own spawned task so a long HNSW sweep cannot delay
-    /// orphan/cron GC (and vice versa).
-    pub fn spawn(self: Arc<Self>) {
+    /// Spawn worker-only GC loops (orphan claims + cron cleanup + HNSW sweep).
+    /// Publisher and advancer are spawned separately at the top level of main.rs.
+    pub fn spawn_worker_gc_only(self: Arc<Self>) {
         let gc_self = self.clone();
-        let sp_self = self.clone();
         tokio::spawn(async move { gc_self.run_gc_loop().await });
-        tokio::spawn(async move { sp_self.run_safepoint_advance_loop().await });
         tokio::spawn(async move { self.run_hnsw_sweep_loop().await });
     }
 
@@ -81,101 +74,211 @@ impl WorkerGc {
             }
         }
     }
+}
 
-    /// Periodically advance the TiKV GC safepoint so TiKV's compaction
-    /// filter can reclaim old MVCC versions.
-    ///
-    /// Only calls `update_safepoint()` — no lock resolution (cleanup_locks).
-    /// Uses V1 `UpdateGCSafePoint` which drives TiKV's global compaction filter.
-    async fn run_safepoint_advance_loop(&self) {
-        if !self.config.gc_safepoint_enabled {
-            info!("TiKV GC safepoint advancement disabled");
-            return;
+// ============================================================================
+// Free functions: GC publisher + advancer, spawned at top level of main.rs.
+// These are NOT methods on WorkerGc — they live outside any config-gated block.
+// ============================================================================
+
+/// GC registry publisher loop — UNCONDITIONAL for every SQL-serving process.
+/// Publishes this instance's min_start_ts to `_sys_worker` every interval.
+pub async fn run_gc_publisher_loop(store: &TikvStore, config: &WorkerConfig) {
+    let jitter = rand_jitter_secs(60);
+    tokio::time::sleep(Duration::from_secs(jitter)).await;
+
+    info!(
+        interval_sec = config.gc_safepoint_interval_sec,
+        "GC registry publisher started (unconditional)"
+    );
+
+    let mut interval = tokio::time::interval(Duration::from_secs(config.gc_safepoint_interval_sec));
+    loop {
+        interval.tick().await;
+        if let Err(e) = publish_gc_instance_state(store, config).await {
+            warn!("GC registry publish failed: {}", e);
         }
+    }
+}
 
-        // Random jitter to avoid multiple db9 instances hitting PD simultaneously.
-        let jitter = rand_jitter_secs(60);
-        tokio::time::sleep(Duration::from_secs(jitter)).await;
+/// GC safepoint advancer loop — OPTIONAL, controlled by gc_safepoint_enabled.
+/// Reads all instances' states, computes global min, advances PD safepoint.
+pub async fn run_gc_advancer_loop(
+    store: &TikvStore,
+    config: &WorkerConfig,
+    metrics: &WorkerMetrics,
+) {
+    let jitter = rand_jitter_secs(60);
+    tokio::time::sleep(Duration::from_secs(jitter)).await;
 
+    info!(
+        interval_sec = config.gc_safepoint_interval_sec,
+        life_time_sec = config.gc_life_time_sec,
+        "GC safepoint advancer started"
+    );
+
+    let mut interval = tokio::time::interval(Duration::from_secs(config.gc_safepoint_interval_sec));
+    loop {
+        interval.tick().await;
+        if let Err(e) = advance_gc_safepoint(store, config, metrics).await {
+            warn!("TiKV GC safepoint advance failed: {}", e);
+            metrics
+                .gc_safepoint_advance_err
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<()> {
+    let client = store
+        .transaction_client()
+        .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
+
+    let current_ts = client
+        .current_timestamp()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
+
+    let local_min =
+        crate::worker::active_txn_registry::global_registry().and_then(|r| r.min_start_ts());
+
+    // Publish this instance's max untracked transaction timeout so advancers
+    // on other nodes can use it as a gc_life_time floor.
+    let max_untracked_timeout_sec = if config.enabled {
+        let cron_sec = config.cron_job_timeout_ms.saturating_add(999) / 1000;
+        let stmt_sec = config.statement_timeout_ms.saturating_add(999) / 1000;
+        cron_sec.max(stmt_sec)
+    } else {
+        0 // Non-worker nodes have no untracked transactions
+    };
+
+    let mut txn = store.begin().await?;
+    store
+        .put_gc_instance_state(
+            &mut txn,
+            &config.worker_id,
+            local_min,
+            current_ts.version(),
+            max_untracked_timeout_sec,
+        )
+        .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+async fn advance_gc_safepoint(
+    store: &TikvStore,
+    config: &WorkerConfig,
+    metrics: &WorkerMetrics,
+) -> Result<()> {
+    let client = store
+        .transaction_client()
+        .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
+
+    let current_ts = client
+        .current_timestamp()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
+
+    let current_version = current_ts.version();
+
+    // Read ALL instances' states from shared registry.
+    let mut global_max_timeout_sec = 0u64;
+    let stale_threshold_version =
+        compute_safepoint_version(current_version, config.gc_life_time_sec);
+
+    let all_states = {
+        let mut txn = store.begin().await?;
+        let states = store.scan_gc_instance_states(&mut txn).await?;
+        txn.rollback().await.ok();
+        states
+    };
+
+    // First pass: compute effective gc_life_time from cluster-wide max timeout.
+    for state in &all_states {
+        if state.updated_at_version >= stale_threshold_version {
+            global_max_timeout_sec = global_max_timeout_sec.max(state.max_untracked_timeout_sec);
+        }
+    }
+
+    // Effective gc_life_time: at least cover the longest untracked transaction
+    // timeout across ALL live instances in the cluster.
+    let effective_life_time_sec = config.gc_life_time_sec.max(global_max_timeout_sec);
+    let mut safepoint_version = compute_safepoint_version(current_version, effective_life_time_sec);
+
+    if effective_life_time_sec > config.gc_life_time_sec {
         info!(
-            interval_sec = self.config.gc_safepoint_interval_sec,
-            life_time_sec = self.config.gc_life_time_sec,
-            "TiKV GC safepoint advancement loop started"
+            local_life_time = config.gc_life_time_sec,
+            cluster_max_timeout = global_max_timeout_sec,
+            effective_life_time = effective_life_time_sec,
+            "GC life_time raised to cover cluster-wide untracked transaction timeout"
         );
+    }
 
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.gc_safepoint_interval_sec));
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.advance_gc_safepoint().await {
-                warn!("TiKV GC safepoint advance failed: {}", e);
-                self.metrics
-                    .gc_safepoint_advance_err
+    // Second pass: clamp safepoint to protect active tracked transactions.
+    for state in &all_states {
+        if state.updated_at_version < stale_threshold_version {
+            debug!(
+                instance_id = state.instance_id,
+                updated_at = state.updated_at_version,
+                "Ignoring stale GC instance state"
+            );
+            continue;
+        }
+        if let Some(ts) = state.min_start_ts {
+            let txn_floor = ts.saturating_sub(1);
+            if txn_floor < safepoint_version {
+                info!(
+                    instance_id = state.instance_id,
+                    min_active_start_ts = ts,
+                    time_based = safepoint_version,
+                    clamped_to = txn_floor,
+                    "GC safepoint clamped by active transaction on instance"
+                );
+                safepoint_version = txn_floor;
+            }
+        }
+    }
+
+    if safepoint_version == 0 {
+        info!("GC safepoint would be 0; skipping (cluster just started?)");
+        return Ok(());
+    }
+
+    let safepoint = Timestamp::from_version(safepoint_version);
+
+    // Only advance safepoint in PD — no lock resolution.
+    // PD takes max(current, proposed) so this is idempotent and safe
+    // to call from multiple db9 instances concurrently.
+    // update_safepoint returns true if PD accepted our exact proposal,
+    // false if PD already had a higher value (another instance advanced it).
+    match client.update_safepoint(safepoint).await {
+        Ok(accepted) => {
+            if accepted {
+                metrics
+                    .gc_safepoint_last_version
+                    .store(safepoint_version, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .gc_safepoint_advance_ok
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    safepoint_version,
+                    life_time_sec = config.gc_life_time_sec,
+                    "TiKV GC safepoint advanced by this instance"
+                );
+            } else {
+                debug!(
+                    safepoint_version,
+                    "TiKV GC safepoint proposal accepted, PD already at higher value"
+                );
             }
+            Ok(())
         }
+        Err(e) => Err(anyhow::anyhow!("update_safepoint failed: {}", e)),
     }
+}
 
-    /// Compute safepoint = current_tso - gc_life_time and report to PD.
-    ///
-    /// Only advances the safepoint — does not resolve locks or delete ranges.
-    async fn advance_gc_safepoint(&self) -> Result<()> {
-        let client = self
-            .system_store
-            .transaction_client()
-            .ok_or_else(|| anyhow::anyhow!("no TransactionClient available (test stub?)"))?;
-
-        // Get current TSO from PD.
-        let current_ts = client
-            .current_timestamp()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
-
-        let current_version = current_ts.version();
-        let safepoint_version =
-            compute_safepoint_version(current_version, self.config.gc_life_time_sec);
-
-        if safepoint_version == 0 {
-            info!("GC safepoint would be 0; skipping (cluster just started?)");
-            return Ok(());
-        }
-
-        let safepoint = Timestamp::from_version(safepoint_version);
-
-        // Only advance safepoint in PD — no lock resolution.
-        // PD takes max(current, proposed) so this is idempotent and safe
-        // to call from multiple db9 instances concurrently.
-        // update_safepoint returns true if PD accepted our exact proposal,
-        // false if PD already had a higher value (another instance advanced it).
-        match client.update_safepoint(safepoint).await {
-            Ok(accepted) => {
-                if accepted {
-                    // Only update the gauge when this instance actually advanced
-                    // the cluster safepoint. Otherwise the gauge would reflect
-                    // "last proposal" rather than "cluster safepoint".
-                    self.metrics
-                        .gc_safepoint_last_version
-                        .store(safepoint_version, std::sync::atomic::Ordering::Relaxed);
-                    self.metrics
-                        .gc_safepoint_advance_ok
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        safepoint_version,
-                        life_time_sec = self.config.gc_life_time_sec,
-                        "TiKV GC safepoint advanced by this instance"
-                    );
-                } else {
-                    debug!(
-                        safepoint_version,
-                        "TiKV GC safepoint proposal accepted, PD already at higher value"
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => Err(anyhow::anyhow!("update_safepoint failed: {}", e)),
-        }
-    }
-
+impl WorkerGc {
     async fn gc_tick(&self) -> Result<()> {
         self.cleanup_orphan_claims().await?;
         self.cleanup_cron_runs().await?;

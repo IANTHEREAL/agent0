@@ -148,6 +148,10 @@ pub struct Session {
     /// Savepoint-scoped snapshots of session authorization identity.
     /// Used to restore identity on ROLLBACK TO SAVEPOINT (PG parity).
     session_auth_savepoints: Vec<SessionAuthSavepoint>,
+    /// GC active transaction registry. When Some, begin/commit/rollback
+    /// register/unregister this session's start_ts. Set for interactive
+    /// SQL connections; None for worker/background sessions.
+    active_txn_registry: Option<Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -223,6 +227,7 @@ impl Session {
             pending_notices: Vec::new(),
             local_session_auth_save: None,
             session_auth_savepoints: Vec::new(),
+            active_txn_registry: None,
         }
     }
 
@@ -288,7 +293,17 @@ impl Session {
             pending_notices: Vec::new(),
             local_session_auth_save: None,
             session_auth_savepoints: Vec::new(),
+            active_txn_registry: None,
         }
+    }
+
+    /// Set the GC active transaction registry. Called once after construction
+    /// for interactive SQL connections. Worker/background sessions leave this None.
+    pub fn set_active_txn_registry(
+        &mut self,
+        registry: Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>,
+    ) {
+        self.active_txn_registry = Some(registry);
     }
 
     pub fn current_user(&self) -> Option<&str> {
@@ -950,5 +965,16 @@ impl Session {
     /// notices before an error response or at statement completion.
     pub fn drain_pending_notices(&mut self) -> Vec<(String, String, String)> {
         std::mem::take(&mut self.pending_notices)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Safety net: ensure active transaction's start_ts is unregistered
+        // from the GC registry even if commit/rollback was never called
+        // (e.g., connection dropped, panic).
+        if let Some(ref registry) = self.active_txn_registry {
+            registry.unregister(self.connection_id);
+        }
     }
 }

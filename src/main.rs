@@ -227,46 +227,109 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
     client_pool.spawn_reaper();
 
-    // Unified worker engine (system-keyspace task queue + GC)
+    // ================================================================
+    // GC registry: UNCONDITIONAL for all SQL-serving processes.
+    // This is a cluster invariant — not gated by any config flag.
+    // Every process that accepts SQL connections MUST publish its
+    // min_start_ts so other instances' safepoint advancement doesn't
+    // overrun active transactions.
+    // ================================================================
+    let active_txn_registry = Arc::new(worker::active_txn_registry::ActiveTxnRegistry::new());
+    worker::active_txn_registry::set_global_registry(active_txn_registry.clone());
+
+    let worker_config = worker::config::WorkerConfig::from_env();
+
+    // GC registry store — init unconditionally. Fail-fast if unavailable.
+    let gc_store = worker::init_gc_registry_store(pd_addrs.clone(), &worker_config)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to initialize GC registry store: {}. \
+                 Every SQL-serving db9 process must participate in the GC registry.",
+                e
+            )
+        })?;
+    worker::set_gc_registry_store(gc_store.clone());
+
+    // GC registry publisher — UNCONDITIONAL. Runs on every SQL-serving node.
+    // Publishes this instance's min_start_ts to _sys_worker every interval.
+    // This is NOT inside any if-block — it always runs.
     {
-        let worker_config = worker::config::WorkerConfig::from_env();
+        let publisher_store = gc_store.clone();
+        let publisher_config = worker_config.clone();
+        tokio::spawn(async move {
+            worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config).await;
+        });
+        info!("GC registry publisher started (unconditional)");
+    }
+
+    // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
+    // the safepoint, another node in the cluster might. This node's worker
+    // timeouts (cron, statement) must be covered by gc_life_time.
+    worker_config.validate_gc_config();
+
+    // ================================================================
+    // GC safepoint advancer: OPTIONAL — reads all instances' states
+    // from shared registry, computes global min, advances PD safepoint.
+    // ================================================================
+    if worker_config.gc_safepoint_enabled {
+        let advancer_store = gc_store.clone();
+        let advancer_config = worker_config.clone();
+        let advancer_metrics = Arc::new(worker::metrics::WorkerMetrics::new());
+        let advancer_metrics_clone = advancer_metrics.clone();
+        tokio::spawn(async move {
+            worker::gc::run_gc_advancer_loop(
+                &advancer_store,
+                &advancer_config,
+                &advancer_metrics_clone,
+            )
+            .await;
+        });
+        info!("GC safepoint advancer started");
+    }
+
+    // ================================================================
+    // Worker engine: OPTIONAL — cron, triggers, HNSW, DDL, BgSql.
+    // ================================================================
+    {
         if worker_config.enabled {
-            worker_config.validate_gc_config();
-            match worker::init_system_store(pd_addrs.clone(), &worker_config).await {
-                Ok(Some(system_store)) => {
-                    worker::set_system_store(system_store.clone());
-
-                    let engine = worker::engine::WorkerEngine::new(
-                        worker_config.clone(),
-                        system_store.clone(),
-                        client_pool.clone(),
-                    );
-                    let metrics = engine.metrics().clone();
-                    worker::set_worker_metrics(metrics.clone());
-                    tokio::spawn(async move { engine.run().await });
-
-                    let gc = Arc::new(worker::gc::WorkerGc::new(
-                        system_store,
-                        client_pool.clone(),
-                        worker_config,
-                        metrics,
-                    ));
-                    gc.spawn();
-
-                    info!("WorkerEngine and GC started");
-                }
-                Ok(None) => {
-                    info!("Worker engine disabled");
-                }
+            let system_store = match worker::init_system_store(pd_addrs.clone(), &worker_config)
+                .await
+            {
+                Ok(Some(system_store)) => system_store,
+                Ok(None) => unreachable!("worker init returned None while worker is enabled"),
                 Err(e) => {
                     return Err(anyhow::anyhow!(
-                        "Failed to initialize system store: {}. \
-                         Worker is enabled (DB9_WORKER_ENABLED=true) but cannot start. \
-                         Either fix the system store connection or set DB9_WORKER_ENABLED=false.",
-                        e
-                    ));
+                            "Failed to initialize system store: {}. \
+                             Worker is enabled (DB9_WORKER_ENABLED=true) but cannot start. \
+                             Either fix the system store connection or set DB9_WORKER_ENABLED=false.",
+                            e
+                        ));
                 }
-            }
+            };
+
+            worker::set_system_store(system_store.clone());
+
+            let engine = worker::engine::WorkerEngine::new(
+                worker_config.clone(),
+                system_store.clone(),
+                client_pool.clone(),
+            );
+            let metrics = engine.metrics().clone();
+            worker::set_worker_metrics(metrics.clone());
+            tokio::spawn(async move { engine.run().await });
+
+            // WorkerGc: orphan claims + cron cleanup + HNSW sweep ONLY.
+            // Publisher and advancer are spawned above, not here.
+            let gc = Arc::new(worker::gc::WorkerGc::new(
+                system_store,
+                client_pool.clone(),
+                worker_config,
+                metrics,
+            ));
+            gc.spawn_worker_gc_only();
+
+            info!("WorkerEngine started (cron/triggers/HNSW/DDL)");
         }
     }
 
