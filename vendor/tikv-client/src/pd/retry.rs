@@ -48,6 +48,16 @@ pub trait RetryClientTrait {
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool>;
 
+    /// Register or refresh a per-service GC safe point with TTL lease.
+    /// Setting `ttl_secs = 0` removes the service safe point.
+    /// Returns the minimum safe point across all services.
+    async fn update_service_safepoint(
+        self: Arc<Self>,
+        service_id: &str,
+        ttl_secs: i64,
+        safe_point: u64,
+    ) -> Result<u64>;
+
     async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta>;
 }
 /// Client for communication with a PD cluster. Has the facility to reconnect to the cluster.
@@ -249,6 +259,21 @@ impl RetryClientTrait for RetryClient<Cluster> {
                 .update_safepoint(safepoint, self.timeout)
                 .await
                 .map(|resp| resp.new_safe_point == safepoint)
+        })
+    }
+
+    async fn update_service_safepoint(
+        self: Arc<Self>,
+        service_id: &str,
+        ttl_secs: i64,
+        safe_point: u64,
+    ) -> Result<u64> {
+        let sid = service_id.to_owned();
+        retry_mut!(self, "update_service_gc_safepoint", |cluster| async {
+            cluster
+                .update_service_safepoint(&sid, ttl_secs, safe_point, self.timeout)
+                .await
+                .map(|resp| resp.min_safe_point)
         })
     }
 

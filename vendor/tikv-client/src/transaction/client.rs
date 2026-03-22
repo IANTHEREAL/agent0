@@ -283,6 +283,25 @@ impl Client {
         Ok(res)
     }
 
+    /// Register or refresh a per-service GC safe point in PD.
+    ///
+    /// Each active export snapshot should maintain its own service safe point
+    /// so that TiKV GC does not reclaim MVCC versions needed for the export.
+    ///
+    /// Setting `ttl_secs = 0` removes the service safe point.
+    /// Returns the minimum safe point across all registered services.
+    pub async fn update_service_safepoint(
+        &self,
+        service_id: &str,
+        ttl_secs: i64,
+        safe_point: u64,
+    ) -> Result<u64> {
+        self.pd
+            .clone()
+            .update_service_safepoint(service_id, ttl_secs, safe_point)
+            .await
+    }
+
     pub async fn cleanup_locks(
         &self,
         range: impl Into<BoundRange>,

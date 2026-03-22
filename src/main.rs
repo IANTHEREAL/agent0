@@ -11,6 +11,7 @@ mod auth;
 mod cli;
 mod config;
 mod cron;
+mod export;
 mod extensions;
 mod model;
 mod observability;
@@ -331,6 +332,25 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
             info!("WorkerEngine started (cron/triggers/HNSW/DDL)");
         }
+    }
+
+    // Export snapshot janitor (Backup v2 prerequisite).
+    // Runs unconditionally — lightweight no-op when no export snapshots exist.
+    if let Some(tikv_client) = store.transaction_client() {
+        let registry = Arc::new(export::registry::ExportSnapshotRegistry::new(tikv_client));
+
+        // Crash recovery: expire any stale snapshots from previous run.
+        if let Err(e) = export::lifecycle::recover_stale_snapshots(&registry).await {
+            warn!("export snapshot crash recovery failed: {e}");
+        }
+
+        let janitor_registry = registry.clone();
+        tokio::spawn(async move {
+            export::lifecycle::export_snapshot_janitor_loop(janitor_registry).await;
+        });
+
+        export::set_global_registry(registry);
+        info!("Export snapshot janitor started");
     }
 
     // fs9 WebSocket server

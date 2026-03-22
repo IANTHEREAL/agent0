@@ -68,6 +68,16 @@ pub trait PdClient: Send + Sync + 'static {
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool>;
 
+    /// Register or refresh a per-service GC safe point with TTL lease.
+    /// Setting `ttl_secs = 0` removes the service safe point.
+    /// Returns the minimum safe point across all services.
+    async fn update_service_safepoint(
+        self: Arc<Self>,
+        service_id: &str,
+        ttl_secs: i64,
+        safe_point: u64,
+    ) -> Result<u64>;
+
     async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta>;
 
     /// In transactional API, `key` is in raw format
@@ -264,6 +274,18 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {
         self.pd.clone().update_safepoint(safepoint).await
+    }
+
+    async fn update_service_safepoint(
+        self: Arc<Self>,
+        service_id: &str,
+        ttl_secs: i64,
+        safe_point: u64,
+    ) -> Result<u64> {
+        self.pd
+            .clone()
+            .update_service_safepoint(service_id, ttl_secs, safe_point)
+            .await
     }
 
     async fn update_leader(&self, ver_id: RegionVerId, leader: metapb::Peer) -> Result<()> {

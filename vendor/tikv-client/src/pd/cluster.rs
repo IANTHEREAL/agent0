@@ -102,6 +102,27 @@ impl Cluster {
         req.send(&mut self.client, timeout).await
     }
 
+    /// Register or refresh a per-service GC safe point in PD.
+    ///
+    /// Unlike `update_safepoint` (global GC safe point), this pins a per-service
+    /// safe point with an independent TTL lease. PD will not advance GC past
+    /// any live service safe point.
+    ///
+    /// Setting `ttl = 0` removes the service safe point.
+    pub async fn update_service_safepoint(
+        &mut self,
+        service_id: &str,
+        ttl_secs: i64,
+        safe_point: u64,
+        timeout: Duration,
+    ) -> Result<pdpb::UpdateServiceGcSafePointResponse> {
+        let mut req = pd_request!(self.id, pdpb::UpdateServiceGcSafePointRequest);
+        req.service_id = service_id.as_bytes().to_vec();
+        req.ttl = ttl_secs;
+        req.safe_point = safe_point;
+        req.send(&mut self.client, timeout).await
+    }
+
     pub async fn load_keyspace(
         &mut self,
         keyspace: &str,
@@ -417,6 +438,16 @@ impl PdMessage for pdpb::UpdateGcSafePointRequest {
 }
 
 #[async_trait]
+impl PdMessage for pdpb::UpdateServiceGcSafePointRequest {
+    type Client = pdpb::pd_client::PdClient<Channel>;
+    type Response = pdpb::UpdateServiceGcSafePointResponse;
+
+    async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
+        Ok(client.update_service_gc_safe_point(req).await?.into_inner())
+    }
+}
+
+#[async_trait]
 impl PdMessage for keyspacepb::LoadKeyspaceRequest {
     type Client = keyspacepb::keyspace_client::KeyspaceClient<Channel>;
     type Response = keyspacepb::LoadKeyspaceResponse;
@@ -449,6 +480,12 @@ impl PdResponse for pdpb::GetAllStoresResponse {
 }
 
 impl PdResponse for pdpb::UpdateGcSafePointResponse {
+    fn header(&self) -> &pdpb::ResponseHeader {
+        self.header.as_ref().unwrap()
+    }
+}
+
+impl PdResponse for pdpb::UpdateServiceGcSafePointResponse {
     fn header(&self) -> &pdpb::ResponseHeader {
         self.header.as_ref().unwrap()
     }

@@ -206,6 +206,15 @@ impl PdClient for MockPdClient {
         unimplemented!()
     }
 
+    async fn update_service_safepoint(
+        self: Arc<Self>,
+        _service_id: &str,
+        _ttl_secs: i64,
+        _safe_point: u64,
+    ) -> Result<u64> {
+        unimplemented!()
+    }
+
     async fn update_leader(
         &self,
         _ver_id: crate::region::RegionVerId,
