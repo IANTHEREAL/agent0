@@ -12,6 +12,11 @@ use std::time::Duration;
 use tikv_client::{Timestamp, TimestampExt};
 use tracing::{debug, info, warn};
 
+/// Timeout for PD TSO requests in GC loops. We route this through the
+/// tikv-client timeout API so GC gets a bounded wait on a dedicated TSO stream
+/// without disturbing the shared timestamp stream used by foreground traffic.
+const TSO_TIMEOUT_SEC: u64 = 30;
+
 pub struct WorkerGc {
     system_store: Arc<TikvStore>,
     pool: Arc<TikvClientPool>,
@@ -135,7 +140,7 @@ async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> 
         .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
 
     let current_ts = client
-        .current_timestamp()
+        .current_timestamp_with_timeout(Duration::from_secs(TSO_TIMEOUT_SEC))
         .await
         .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
 
@@ -176,7 +181,7 @@ async fn advance_gc_safepoint(
         .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
 
     let current_ts = client
-        .current_timestamp()
+        .current_timestamp_with_timeout(Duration::from_secs(TSO_TIMEOUT_SEC))
         .await
         .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
 
@@ -663,6 +668,25 @@ mod tests {
             !prod_source.contains("delete_worker_queue_entry"),
             "gc.rs production code must NOT call delete_worker_queue_entry — \
              claim keys require delete_worker_claim_by_raw_key"
+        );
+    }
+
+    #[test]
+    fn gc_tso_timeout_uses_dedicated_client_timeout_path() {
+        let source = include_str!("gc.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs must contain #[cfg(test)]");
+        assert!(
+            prod_source.contains("current_timestamp_with_timeout"),
+            "gc.rs must use TransactionClient::current_timestamp_with_timeout so \
+             GC TSO probes stay on the dedicated timed path"
+        );
+        assert!(
+            !prod_source.contains("tokio::time::timeout(\n        Duration::from_secs(TSO_TIMEOUT_SEC),\n        client.current_timestamp(),"),
+            "gc.rs must not wrap client.current_timestamp() directly; that bypasses \
+             the dedicated timed TSO path"
         );
     }
 

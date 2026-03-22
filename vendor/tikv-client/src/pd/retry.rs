@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
+use crate::internal_err;
 use crate::pd::Cluster;
 use crate::pd::Connection;
 use crate::proto::keyspacepb;
@@ -122,6 +123,38 @@ macro_rules! retry {
     }};
 }
 
+macro_rules! retry_core_with_timeout {
+    ($self: ident, $tag: literal, $timeout: expr, $call: expr) => {{
+        let timeout = $timeout;
+        tokio::time::timeout(timeout, async {
+            let stats = pd_stats($tag);
+            let mut last_err = Ok(());
+            for _ in 0..LEADER_CHANGE_RETRY {
+                let res = $call;
+
+                match stats.done(res) {
+                    Ok(r) => return Ok(r),
+                    Err(e) => last_err = Err(e),
+                }
+
+                let mut reconnect_count = MAX_REQUEST_COUNT;
+                while let Err(e) = $self.reconnect(RECONNECT_INTERVAL_SEC).await {
+                    reconnect_count -= 1;
+                    if reconnect_count == 0 {
+                        return Err(e);
+                    }
+                    sleep(Duration::from_secs(RECONNECT_INTERVAL_SEC)).await;
+                }
+            }
+
+            last_err?;
+            unreachable!();
+        })
+        .await
+        .map_err(|_| internal_err!("{} timed out after {:?}", $tag, timeout))?
+    }};
+}
+
 impl RetryClient<Cluster> {
     pub async fn connect(
         endpoints: &[String],
@@ -137,6 +170,24 @@ impl RetryClient<Cluster> {
             cluster,
             connection,
             timeout,
+        })
+    }
+
+    pub(crate) async fn get_timestamp_with_timeout(
+        self: Arc<Self>,
+        timeout: Duration,
+    ) -> Result<Timestamp> {
+        let deadline = Instant::now() + timeout;
+        retry_core_with_timeout!(self, "get_timestamp_with_timeout", timeout, {
+            // Cap each attempt to 2/3 of the original budget. This allows
+            // slow-but-healthy PD responses (e.g. leader election ~10s) to
+            // succeed on the first attempt, while still reserving 1/3 of the
+            // total budget for at least one reconnect + retry cycle when PD
+            // is truly hung.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let per_attempt = remaining.min(timeout * 2 / 3);
+            let cluster = &self.cluster.read().await.0;
+            cluster.get_timestamp_with_timeout(per_attempt).await
         })
     }
 }
@@ -383,5 +434,216 @@ mod test {
             assert!(retry_max_ok(client.clone(), max_retries).await.is_ok());
             assert_eq!(client.cluster.read().await.0.load(Ordering::SeqCst), 2);
         })
+    }
+
+    #[tokio::test]
+    async fn timed_retry_reconnects_before_deadline() {
+        struct MockClient {
+            attempts: AtomicUsize,
+            reconnect_count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Reconnect for MockClient {
+            type Cl = ();
+
+            async fn reconnect(&self, _: u64) -> Result<()> {
+                self.reconnect_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        async fn retry_timed(client: Arc<MockClient>) -> Result<()> {
+            retry_core_with_timeout!(client, "test_timed", Duration::from_millis(50), {
+                let attempt = client.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(internal_err!("whoops"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        let client = Arc::new(MockClient {
+            attempts: AtomicUsize::new(0),
+            reconnect_count: AtomicUsize::new(0),
+        });
+
+        retry_timed(client.clone())
+            .await
+            .expect("second attempt after reconnect should succeed");
+        assert_eq!(client.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(client.reconnect_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn timed_retry_succeeds_after_slow_first_attempt() {
+        // Verifies that when the first attempt truly times out (consumes its
+        // per-attempt budget), the retry loop still has enough remaining budget
+        // to reconnect and succeed on the second attempt.
+        //
+        // With the old code (per_attempt = full timeout), the first attempt
+        // would consume the entire budget, leaving zero time for retry.
+        // With the fix (per_attempt = remaining.min(timeout*2/3)), the first
+        // attempt only consumes ~2/3 of the budget.
+        struct MockClient {
+            attempts: AtomicUsize,
+            reconnect_count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Reconnect for MockClient {
+            type Cl = ();
+
+            async fn reconnect(&self, _: u64) -> Result<()> {
+                self.reconnect_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let total_timeout = Duration::from_millis(300);
+
+        async fn retry_timed(client: Arc<MockClient>, total_timeout: Duration) -> Result<()> {
+            let deadline = Instant::now() + total_timeout;
+            retry_core_with_timeout!(client, "test_timed", total_timeout, {
+                // Mirror the production pattern: cap per-attempt to timeout*2/3
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let per_attempt = remaining.min(total_timeout * 2 / 3);
+                let attempt = client.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // First attempt: simulate a hung RPC that fully exhausts
+                    // its per-attempt budget
+                    tokio::time::sleep(per_attempt).await;
+                    Err(internal_err!("per-attempt timeout"))
+                } else {
+                    // Second attempt: PD has recovered, succeed immediately
+                    Ok(())
+                }
+            })
+        }
+
+        let client = Arc::new(MockClient {
+            attempts: AtomicUsize::new(0),
+            reconnect_count: AtomicUsize::new(0),
+        });
+
+        let start = Instant::now();
+        retry_timed(client.clone(), total_timeout)
+            .await
+            .expect("should succeed on second attempt after slow first attempt");
+
+        // Must have attempted twice (first slow fail, second success)
+        assert_eq!(client.attempts.load(Ordering::SeqCst), 2);
+        // Must have reconnected once between attempts
+        assert_eq!(client.reconnect_count.load(Ordering::SeqCst), 1);
+        // Must complete within the total budget
+        assert!(
+            start.elapsed() < total_timeout,
+            "entire operation should complete within the total timeout budget",
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_retry_allows_slow_successful_first_attempt() {
+        // Verifies that a slow-but-healthy PD response (taking more than
+        // timeout/3 but less than the per-attempt cap of timeout*2/3)
+        // succeeds on the first attempt without unnecessary retries.
+        // This guards against over-aggressive per-attempt caps that would
+        // reject responses from a slow but functioning PD (e.g. during
+        // leader election).
+        struct MockClient {
+            attempts: AtomicUsize,
+            reconnect_count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Reconnect for MockClient {
+            type Cl = ();
+
+            async fn reconnect(&self, _: u64) -> Result<()> {
+                self.reconnect_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let total_timeout = Duration::from_millis(300);
+
+        async fn retry_timed(client: Arc<MockClient>, total_timeout: Duration) -> Result<()> {
+            let deadline = Instant::now() + total_timeout;
+            retry_core_with_timeout!(client, "test_timed", total_timeout, {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let per_attempt = remaining.min(total_timeout * 2 / 3);
+                let _attempt = client.attempts.fetch_add(1, Ordering::SeqCst);
+                // Simulate slow PD: responds at 150ms (> timeout/3=100ms but
+                // within per_attempt cap of timeout*2/3=200ms)
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok(())
+            })
+        }
+
+        let client = Arc::new(MockClient {
+            attempts: AtomicUsize::new(0),
+            reconnect_count: AtomicUsize::new(0),
+        });
+
+        retry_timed(client.clone(), total_timeout)
+            .await
+            .expect("slow but healthy PD response should succeed on first attempt");
+        assert_eq!(
+            client.attempts.load(Ordering::SeqCst),
+            1,
+            "should succeed on first attempt without retry",
+        );
+        assert_eq!(
+            client.reconnect_count.load(Ordering::SeqCst),
+            0,
+            "should not trigger reconnect for slow-but-successful response",
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_retry_uses_total_timeout_budget() {
+        struct MockClient {
+            reconnect_count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Reconnect for MockClient {
+            type Cl = ();
+
+            async fn reconnect(&self, _: u64) -> Result<()> {
+                self.reconnect_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        async fn retry_timed(client: Arc<MockClient>) -> Result<()> {
+            retry_core_with_timeout!(client, "test_timed", Duration::from_millis(25), {
+                std::future::pending::<Result<()>>().await
+            })
+        }
+
+        let client = Arc::new(MockClient {
+            reconnect_count: AtomicUsize::new(0),
+        });
+
+        let start = Instant::now();
+        let err = retry_timed(client.clone())
+            .await
+            .expect_err("timed retry should stop when the total budget expires");
+
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "total timeout should bound the whole retry operation",
+        );
+        assert_eq!(
+            client.reconnect_count.load(Ordering::SeqCst),
+            0,
+            "outer timeout should stop the operation before reconnect begins",
+        );
+        assert!(
+            err.to_string().contains("timed out after"),
+            "unexpected error: {err}",
+        );
     }
 }

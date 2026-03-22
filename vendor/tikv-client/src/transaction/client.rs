@@ -1,6 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::debug;
 use log::info;
@@ -213,6 +214,15 @@ impl Client {
     /// ```
     pub async fn current_timestamp(&self) -> Result<Timestamp> {
         self.pd.clone().get_timestamp().await
+    }
+
+    /// Retrieve the current [`Timestamp`] with a caller-provided timeout.
+    ///
+    /// This is primarily useful for long-lived background tasks that need a
+    /// bounded wait without perturbing the shared long-lived TSO stream used by
+    /// regular timestamp requests.
+    pub async fn current_timestamp_with_timeout(&self, timeout: Duration) -> Result<Timestamp> {
+        self.pd.clone().get_timestamp_with_timeout(timeout).await
     }
 
     /// Request garbage collection (GC) of the TiKV cluster.

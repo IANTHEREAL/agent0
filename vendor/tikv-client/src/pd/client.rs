@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::prelude::*;
@@ -295,6 +296,13 @@ impl PdRpcClient<TikvConnect, Cluster> {
             enable_codec,
         )
         .await
+    }
+
+    pub(crate) async fn get_timestamp_with_timeout(
+        self: Arc<Self>,
+        timeout: Duration,
+    ) -> Result<Timestamp> {
+        self.pd.clone().get_timestamp_with_timeout(timeout).await
     }
 }
 

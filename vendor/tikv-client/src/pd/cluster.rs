@@ -82,7 +82,14 @@ impl Cluster {
     }
 
     pub async fn get_timestamp(&self) -> Result<Timestamp> {
-        self.tso.clone().get_timestamp().await
+        self.tso.get_timestamp().await
+    }
+
+    pub async fn get_timestamp_with_timeout(&self, timeout: Duration) -> Result<Timestamp> {
+        // Timed callers use a dedicated TSO stream so a bounded background probe
+        // does not interfere with the shared long-lived timestamp stream.
+        let oracle = TimestampOracle::new(self.id, &self.client)?;
+        oracle.get_timestamp_with_timeout(timeout).await
     }
 
     pub async fn update_safepoint(

@@ -14,6 +14,7 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::pin_mut;
 use futures::prelude::*;
@@ -26,6 +27,7 @@ use pin_project::pin_project;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 use tonic::transport::Channel;
 
 use crate::internal_err;
@@ -44,12 +46,23 @@ type TimestampRequest = oneshot::Sender<Timestamp>;
 /// The timestamp oracle (TSO) which provides monotonically increasing timestamps.
 #[derive(Clone)]
 pub(crate) struct TimestampOracle {
+    inner: Arc<TimestampOracleInner>,
+}
+
+struct TimestampOracleInner {
     /// The transmitter of a bounded channel which transports requests of getting a single
     /// timestamp to the TSO working thread. A bounded channel is used to prevent using
     /// too much memory unexpectedly.
     /// In the working thread, the `TimestampRequest`, which is actually a one channel sender,
     /// is used to send back the timestamp result.
     request_tx: mpsc::Sender<TimestampRequest>,
+    task_abort: AbortHandle,
+}
+
+impl Drop for TimestampOracleInner {
+    fn drop(&mut self) {
+        self.task_abort.abort();
+    }
 }
 
 impl TimestampOracle {
@@ -58,19 +71,41 @@ impl TimestampOracle {
         let (request_tx, request_rx) = mpsc::channel(MAX_BATCH_SIZE);
 
         // Start a background thread to handle TSO requests and responses
-        tokio::spawn(run_tso(cluster_id, pd_client, request_rx));
+        let task = tokio::spawn(run_tso(cluster_id, pd_client, request_rx));
 
-        Ok(TimestampOracle { request_tx })
+        Ok(TimestampOracle {
+            inner: Arc::new(TimestampOracleInner {
+                request_tx,
+                task_abort: task.abort_handle(),
+            }),
+        })
     }
 
-    pub(crate) async fn get_timestamp(self) -> Result<Timestamp> {
+    #[cfg(test)]
+    fn new_for_test(request_tx: mpsc::Sender<TimestampRequest>, task_abort: AbortHandle) -> Self {
+        Self {
+            inner: Arc::new(TimestampOracleInner {
+                request_tx,
+                task_abort,
+            }),
+        }
+    }
+
+    pub(crate) async fn get_timestamp(&self) -> Result<Timestamp> {
         debug!("getting current timestamp");
         let (request, response) = oneshot::channel();
-        self.request_tx
+        self.inner
+            .request_tx
             .send(request)
             .await
             .map_err(|_| internal_err!("TimestampRequest channel is closed"))?;
         Ok(response.await?)
+    }
+
+    pub(crate) async fn get_timestamp_with_timeout(&self, timeout: Duration) -> Result<Timestamp> {
+        tokio::time::timeout(timeout, self.get_timestamp())
+            .await
+            .map_err(|_| internal_err!("timestamp request timed out after {:?}", timeout))?
     }
 }
 
@@ -215,4 +250,59 @@ fn allocate_timestamps(
         return Err(internal_err!("PD gives more TsoResponse than expected"));
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_timestamp_times_out_when_pd_never_replies() {
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let _request = request_rx.recv().await;
+            futures::future::pending::<()>().await;
+        });
+        let oracle = TimestampOracle::new_for_test(request_tx, task.abort_handle());
+
+        let err = oracle
+            .get_timestamp_with_timeout(Duration::from_millis(10))
+            .await
+            .expect_err("TSO request should time out");
+
+        assert!(
+            err.to_string().contains("timestamp request timed out"),
+            "unexpected error: {err}",
+        );
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn get_timestamp_timeout_covers_blocked_channel_send() {
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (blocking_request, _blocking_response) = oneshot::channel();
+        request_tx
+            .send(blocking_request)
+            .await
+            .expect("test setup should fill request queue");
+
+        let task = tokio::spawn(async move {
+            let _kept_full = request_rx.recv().await;
+            futures::future::pending::<()>().await;
+        });
+        let oracle = TimestampOracle::new_for_test(request_tx, task.abort_handle());
+
+        let err = oracle
+            .get_timestamp_with_timeout(Duration::from_millis(10))
+            .await
+            .expect_err("blocked queue send should time out");
+
+        assert!(
+            err.to_string().contains("timestamp request timed out"),
+            "unexpected error: {err}",
+        );
+
+        task.abort();
+    }
 }
