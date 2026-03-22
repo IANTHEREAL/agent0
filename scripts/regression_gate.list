@@ -238,6 +238,8 @@ tests/hnsw_large_liveness_coverage.py
 tests/hnsw_bg_concurrent_liveness.py
 tests/fs9_ws_symlink_contract_1873.py
 tests/fs9_ws_mode_on_create_1902.py
+# #1969 – HNSW graph freeze on oversize (raft-entry-max-size)
+tests/hnsw_frozen_oversize_1969.py
 [orm]
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts

@@ -1132,7 +1132,9 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
     keyspace: &str,
     db_id: u64,
 ) -> Result<HnswSweepResult> {
-    use crate::sql::hnsw::storage::{hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_merge_task_id};
+    use crate::sql::hnsw::storage::{
+        hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_merge_task_id, hnsw_meta_key, HnswMeta,
+    };
     use rand::Rng;
     use tikv_client::BoundRange;
 
@@ -1152,6 +1154,16 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
         for index in &schema.indexes {
             if !index.is_hnsw() {
                 continue;
+            }
+
+            // Check if index is frozen — skip enqueue entirely.
+            let mk = hnsw_meta_key(db_id, schema.table_id, index.id);
+            if let Some(meta_bytes) = txn.get(mk).await? {
+                if let Ok(meta) = serde_json::from_slice::<HnswMeta>(&meta_bytes) {
+                    if should_skip_frozen_merge(&meta) {
+                        continue;
+                    }
+                }
             }
 
             // Probe for pending deltas (limit=1, just checking existence)
@@ -1311,6 +1323,32 @@ fn background_statement_extension_context(
 /// Maximum deltas to process in a single merge transaction.
 const MERGE_BATCH_SIZE: usize = 5000;
 
+/// Maximum serialized graph size (bytes) before freezing the index.
+/// Set below TiKV's default `raft-entry-max-size` (16 MB) with margin.
+pub(crate) const HNSW_GRAPH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Returns `true` if the merge should be skipped because the index is frozen.
+/// Used at the top of `execute_hnsw_merge` and testable independently.
+pub(crate) fn should_skip_frozen_merge(meta: &crate::sql::hnsw::storage::HnswMeta) -> bool {
+    meta.frozen
+}
+
+/// Checks whether a serialized graph exceeds the safe size limit and should
+/// trigger a freeze. Returns `Some(frozen_meta_bytes)` if the index must be
+/// frozen (caller should persist these bytes and abort the merge), or `None`
+/// if the graph is within limits.
+pub(crate) fn check_graph_oversize_freeze(
+    graph_len: usize,
+    meta: &crate::sql::hnsw::storage::HnswMeta,
+) -> Option<Vec<u8>> {
+    if graph_len <= HNSW_GRAPH_MAX_BYTES {
+        return None;
+    }
+    let mut frozen_meta = meta.clone();
+    frozen_meta.frozen = true;
+    serde_json::to_vec(&frozen_meta).ok()
+}
+
 /// Execute HNSW merge in batches. Each batch is a separate TiKV transaction
 /// that processes up to MERGE_BATCH_SIZE deltas, writes the consolidated base
 /// graph, deletes consumed deltas, and updates meta — all atomically.
@@ -1345,6 +1383,11 @@ async fn execute_hnsw_merge(
             break;
         };
         let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
+        if should_skip_frozen_merge(&meta) {
+            txn.rollback().await.ok();
+            info!(table_id, index_id, "HNSW merge skipped: index is frozen");
+            return Ok(());
+        }
         if meta.storage_version != 1 {
             txn.rollback().await.ok();
             return Err(anyhow!(
@@ -1429,6 +1472,24 @@ async fn execute_hnsw_merge(
         updated_meta.capacity = index.capacity() as u64;
         let (graph_bytes, meta_bytes_new) =
             serialize_hnsw_snapshot(db_id, table_id, index_id, index.deref(), &updated_meta)?;
+
+        // 5a. If the serialized graph exceeds the raft-entry-safe limit,
+        //     freeze this index: persist frozen=true in meta, skip writing
+        //     the oversized graph, and stop merging.
+        if let Some(frozen_meta_bytes) =
+            check_graph_oversize_freeze(graph_bytes.len(), &updated_meta)
+        {
+            warn!(
+                table_id,
+                index_id,
+                graph_bytes = graph_bytes.len(),
+                limit = HNSW_GRAPH_MAX_BYTES,
+                "HNSW graph exceeds size limit — freezing index"
+            );
+            txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
+            txn.commit().await?;
+            return Ok(());
+        }
 
         // 6. Atomic write: new base graph + delete consumed deltas + update meta.
         txn_put(
@@ -2102,5 +2163,169 @@ mod tests {
         );
 
         txn.rollback().await.ok();
+    }
+
+    // ── frozen hotfix: engine entry-point helper tests ────────────
+
+    #[test]
+    fn should_skip_frozen_merge_returns_true_for_frozen_index() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        let meta = HnswMeta {
+            count: 5000,
+            capacity: 10000,
+            dimensions: 1536,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+            frozen: true,
+        };
+        // This is the exact function called in execute_hnsw_merge dispatch.
+        assert!(super::should_skip_frozen_merge(&meta));
+    }
+
+    #[test]
+    fn should_skip_frozen_merge_returns_false_for_normal_index() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        let meta = HnswMeta {
+            count: 100,
+            capacity: 200,
+            dimensions: 128,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+            frozen: false,
+        };
+        assert!(!super::should_skip_frozen_merge(&meta));
+    }
+
+    #[test]
+    fn check_graph_oversize_freeze_returns_none_for_small_graph() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        let meta = HnswMeta {
+            count: 10,
+            capacity: 20,
+            dimensions: 3,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+            frozen: false,
+        };
+        // Small graph: no freeze.
+        let result = super::check_graph_oversize_freeze(1024, &meta);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_graph_oversize_freeze_returns_frozen_meta_for_oversized_graph() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        let meta = HnswMeta {
+            count: 5000,
+            capacity: 10000,
+            dimensions: 1536,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+            frozen: false,
+        };
+        // Oversized graph: should return frozen meta bytes.
+        let result = super::check_graph_oversize_freeze(super::HNSW_GRAPH_MAX_BYTES + 1, &meta);
+        assert!(result.is_some());
+        // The returned bytes should deserialize to frozen=true.
+        let frozen: HnswMeta = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert!(frozen.frozen);
+        assert_eq!(frozen.count, 5000);
+        assert_eq!(frozen.dimensions, 1536);
+    }
+
+    #[test]
+    fn check_graph_oversize_freeze_at_exact_boundary_does_not_freeze() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        let meta = HnswMeta {
+            count: 100,
+            capacity: 200,
+            dimensions: 128,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+            frozen: false,
+        };
+        // Exactly at boundary: not oversize (uses >).
+        let result = super::check_graph_oversize_freeze(super::HNSW_GRAPH_MAX_BYTES, &meta);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn frozen_skip_in_sweep_uses_should_skip_frozen_merge() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        // Simulates the sweep loop: for each index, read meta, check frozen.
+        let metas = [
+            (
+                "frozen_idx",
+                HnswMeta {
+                    count: 5000,
+                    capacity: 10000,
+                    dimensions: 1536,
+                    distance_metric: "l2".to_string(),
+                    m: 16,
+                    ef_construction: 200,
+                    storage_version: 1,
+                    label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+                    frozen: true,
+                },
+            ),
+            (
+                "normal_idx",
+                HnswMeta {
+                    count: 100,
+                    capacity: 200,
+                    dimensions: 128,
+                    distance_metric: "l2".to_string(),
+                    m: 16,
+                    ef_construction: 200,
+                    storage_version: 1,
+                    label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
+                    frozen: false,
+                },
+            ),
+        ];
+        // The real sweep loop calls should_skip_frozen_merge for each index.
+        let enqueued: Vec<_> = metas
+            .iter()
+            .filter(|(_, meta)| !super::should_skip_frozen_merge(meta))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(enqueued, vec!["normal_idx"]);
+    }
+
+    #[test]
+    fn recovery_unfreeze_then_skip_check_returns_false() {
+        use crate::sql::hnsw::storage::HnswMeta;
+        // Frozen index: dispatch skips.
+        let frozen_json = r#"{
+            "count": 5000, "capacity": 10000, "dimensions": 1536,
+            "distance_metric": "l2", "m": 16, "ef_construction": 200,
+            "storage_version": 1, "frozen": true
+        }"#;
+        let meta: HnswMeta = serde_json::from_str(frozen_json).unwrap();
+        assert!(super::should_skip_frozen_merge(&meta));
+
+        // Operator unfreeze: same meta with frozen=false.
+        let unfrozen_json = r#"{
+            "count": 5000, "capacity": 10000, "dimensions": 1536,
+            "distance_metric": "l2", "m": 16, "ef_construction": 200,
+            "storage_version": 1, "frozen": false
+        }"#;
+        let meta2: HnswMeta = serde_json::from_str(unfrozen_json).unwrap();
+        assert!(!super::should_skip_frozen_merge(&meta2));
     }
 }

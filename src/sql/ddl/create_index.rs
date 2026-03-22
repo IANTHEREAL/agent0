@@ -558,6 +558,7 @@ pub async fn execute_create_index(
                     ef_construction,
                     storage_version: 1, // New indexes use delta-log from the start
                     label_mode,
+                    frozen: false,
                 };
                 serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
                     .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?
@@ -584,6 +585,18 @@ pub async fn execute_create_index(
                     )
                     .await?;
                 sys_txn.commit().await?;
+            }
+
+            // Guard: reject CREATE INDEX if the initial graph would exceed
+            // the raft-entry-safe limit. This prevents the same oversized
+            // monolithic write that the merge-path freeze guards against.
+            if graph_bytes.len() > crate::worker::engine::HNSW_GRAPH_MAX_BYTES {
+                return Err(anyhow!(
+                    "HNSW index too large for initial build ({} bytes, limit {} bytes). \
+                     Reduce table size or vector dimensions before creating the index.",
+                    graph_bytes.len(),
+                    crate::worker::engine::HNSW_GRAPH_MAX_BYTES
+                ));
             }
 
             txn_put(

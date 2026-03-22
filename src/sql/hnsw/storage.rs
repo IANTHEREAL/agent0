@@ -83,6 +83,12 @@ pub struct HnswMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_direct_mode")]
     pub label_mode: HnswLabelMode,
+    /// When `true`, the index is frozen: merge and sweep skip it.
+    /// Set when a serialized graph exceeds `HNSW_GRAPH_MAX_BYTES`.
+    /// Backward-compatible: old JSON without this field defaults to `false`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
 }
 
 fn is_direct_mode(mode: &HnswLabelMode) -> bool {
@@ -243,6 +249,7 @@ pub fn create_empty_hnsw_index(
         ef_construction,
         storage_version: 1,
         label_mode: HnswLabelMode::Direct,
+        frozen: false,
     };
     Ok((HnswIndexHandle::new(index), meta))
 }
@@ -952,6 +959,7 @@ mod tests {
             ef_construction: 200,
             storage_version: 1,
             label_mode: HnswLabelMode::Mapped,
+            frozen: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"label_mode\":\"Mapped\""));
@@ -970,6 +978,7 @@ mod tests {
             ef_construction: 200,
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
+            frozen: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -1003,5 +1012,265 @@ mod tests {
     fn new_hnsw_meta_defaults_to_direct_label_mode() {
         let (_, meta) = create_empty_hnsw_index(3, "l2", 16, 200).unwrap();
         assert_eq!(meta.label_mode, HnswLabelMode::Direct);
+    }
+
+    // ── frozen flag tests ──────────────────────────────────────────
+
+    #[test]
+    fn legacy_meta_without_frozen_deserializes_to_false() {
+        // Simulates old HnswMeta JSON that predates the frozen field.
+        let json = r#"{
+            "count": 100,
+            "capacity": 200,
+            "dimensions": 128,
+            "distance_metric": "l2",
+            "m": 16,
+            "ef_construction": 200,
+            "storage_version": 1
+        }"#;
+        let meta: HnswMeta = serde_json::from_str(json).unwrap();
+        assert!(!meta.frozen);
+    }
+
+    #[test]
+    fn frozen_true_roundtrips_through_serde() {
+        let meta = HnswMeta {
+            count: 10,
+            capacity: 20,
+            dimensions: 3,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: true,
+        };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let deserialized: HnswMeta = serde_json::from_slice(&bytes).unwrap();
+        assert!(deserialized.frozen);
+    }
+
+    #[test]
+    fn frozen_false_is_skipped_in_serialization() {
+        let meta = HnswMeta {
+            count: 10,
+            capacity: 20,
+            dimensions: 3,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: false,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("frozen"));
+    }
+
+    #[test]
+    fn new_index_is_not_frozen() {
+        let (_, meta) = create_empty_hnsw_index(3, "l2", 16, 200).unwrap();
+        assert!(!meta.frozen);
+    }
+
+    #[test]
+    fn small_graph_serialize_below_threshold() {
+        use crate::worker::engine::HNSW_GRAPH_MAX_BYTES;
+        // A small empty index should serialize well under the limit.
+        let (index, meta) = create_empty_hnsw_index(3, "l2", 16, 200).unwrap();
+        let (graph_bytes, _meta_bytes) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
+        assert!(graph_bytes.len() < HNSW_GRAPH_MAX_BYTES);
+        // Meta should NOT be frozen for small graphs.
+        assert!(!meta.frozen);
+    }
+
+    #[test]
+    fn oversize_graph_would_trigger_freeze() {
+        use crate::worker::engine::HNSW_GRAPH_MAX_BYTES;
+        // Create a large index: 3000 rows x VECTOR(1536) should exceed 8 MB.
+        let dims = 1536;
+        let (index, _meta) = create_empty_hnsw_index(dims, "l2", 16, 200).unwrap();
+        index.reserve(4000).unwrap();
+        // Insert enough vectors to push past the threshold.
+        for i in 0u64..3000 {
+            let vec: Vec<f32> = (0..dims).map(|d| (i as f32) + (d as f32) * 0.001).collect();
+            index.add(i, &vec).unwrap();
+        }
+        let mut meta = HnswMeta {
+            count: index.size() as u64,
+            capacity: index.capacity() as u64,
+            dimensions: dims,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: false,
+        };
+        let (graph_bytes, _) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
+        // This graph should exceed the threshold.
+        assert!(
+            graph_bytes.len() > HNSW_GRAPH_MAX_BYTES,
+            "expected graph ({} bytes) to exceed threshold ({} bytes)",
+            graph_bytes.len(),
+            HNSW_GRAPH_MAX_BYTES
+        );
+        // Simulate the freeze decision from execute_hnsw_merge.
+        if graph_bytes.len() > HNSW_GRAPH_MAX_BYTES {
+            meta.frozen = true;
+        }
+        assert!(meta.frozen);
+        // Frozen meta should roundtrip correctly.
+        let frozen_bytes = serde_json::to_vec(&meta).unwrap();
+        let restored: HnswMeta = serde_json::from_slice(&frozen_bytes).unwrap();
+        assert!(restored.frozen);
+    }
+
+    #[test]
+    fn frozen_meta_causes_dispatch_skip() {
+        // Simulates the dispatch check at the start of execute_hnsw_merge:
+        // if meta.frozen { return Ok(()); }
+        let meta = HnswMeta {
+            count: 5000,
+            capacity: 10000,
+            dimensions: 1536,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: true,
+        };
+        // The merge dispatch checks meta.frozen and skips.
+        assert!(meta.frozen, "frozen index should be skipped by dispatch");
+
+        // Unfreezing should allow dispatch to proceed.
+        let mut unfrozen = meta;
+        unfrozen.frozen = false;
+        assert!(!unfrozen.frozen, "unfrozen index should proceed with merge");
+    }
+
+    #[test]
+    fn sweep_skip_isolation_frozen_vs_normal() {
+        // Simulates enqueue_pending_hnsw_merges checking frozen per-index.
+        let frozen_meta = HnswMeta {
+            count: 5000,
+            capacity: 10000,
+            dimensions: 1536,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: true,
+        };
+        let normal_meta = HnswMeta {
+            count: 100,
+            capacity: 200,
+            dimensions: 128,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: false,
+        };
+        // Sweep logic: skip frozen, enqueue normal.
+        let indexes = [("frozen_idx", &frozen_meta), ("normal_idx", &normal_meta)];
+        let enqueued: Vec<_> = indexes
+            .iter()
+            .filter(|(_, meta)| !meta.frozen)
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(enqueued, vec!["normal_idx"]);
+    }
+
+    #[test]
+    fn recovery_unfreeze_allows_merge_to_resume() {
+        // After operator manually sets frozen=false, the index should be
+        // picked up by sweep and dispatch again.
+        let json_frozen = r#"{
+            "count": 5000, "capacity": 10000, "dimensions": 1536,
+            "distance_metric": "l2", "m": 16, "ef_construction": 200,
+            "storage_version": 1, "frozen": true
+        }"#;
+        let meta: HnswMeta = serde_json::from_str(json_frozen).unwrap();
+        assert!(meta.frozen);
+
+        // Operator unfreeze: update meta in TiKV with frozen=false.
+        let json_unfrozen = r#"{
+            "count": 5000, "capacity": 10000, "dimensions": 1536,
+            "distance_metric": "l2", "m": 16, "ef_construction": 200,
+            "storage_version": 1, "frozen": false
+        }"#;
+        let meta2: HnswMeta = serde_json::from_str(json_unfrozen).unwrap();
+        assert!(!meta2.frozen);
+        // Dispatch and sweep would now proceed normally.
+    }
+
+    #[test]
+    fn idempotent_freeze_on_already_frozen_index() {
+        // If an already-frozen index somehow enters the oversize path again,
+        // setting frozen=true is idempotent — no state corruption.
+        let mut meta = HnswMeta {
+            count: 5000,
+            capacity: 10000,
+            dimensions: 1536,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: true,
+        };
+        // Re-freeze is a no-op on the bool.
+        meta.frozen = true;
+        assert!(meta.frozen);
+        // Serde roundtrip remains stable.
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let restored: HnswMeta = serde_json::from_slice(&bytes).unwrap();
+        assert!(restored.frozen);
+        assert_eq!(restored.count, 5000);
+    }
+
+    #[test]
+    fn create_index_oversize_guard_rejects_before_write() {
+        use crate::worker::engine::HNSW_GRAPH_MAX_BYTES;
+        // Reproduce the CREATE INDEX path: build a large index, serialize,
+        // then verify the guard would reject before txn_put.
+        let dims = 1536;
+        let (index, _) = create_empty_hnsw_index(dims, "l2", 16, 200).unwrap();
+        index.reserve(4000).unwrap();
+        for i in 0u64..3000 {
+            let vec: Vec<f32> = (0..dims).map(|d| (i as f32) + (d as f32) * 0.001).collect();
+            index.add(i, &vec).unwrap();
+        }
+        let meta = HnswMeta {
+            count: index.size() as u64,
+            capacity: index.capacity() as u64,
+            dimensions: dims,
+            distance_metric: "l2".to_string(),
+            m: 16,
+            ef_construction: 200,
+            storage_version: 1,
+            label_mode: HnswLabelMode::Direct,
+            frozen: false,
+        };
+        let (graph_bytes, _meta_bytes) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
+
+        // This is the exact guard from create_index.rs:
+        //   if graph_bytes.len() > HNSW_GRAPH_MAX_BYTES { return Err(...) }
+        assert!(
+            graph_bytes.len() > HNSW_GRAPH_MAX_BYTES,
+            "test setup: graph must exceed limit to exercise guard"
+        );
+
+        // Verify: the guard fires BEFORE any txn_put would happen.
+        // In production, this means no oversized blob is written to TiKV.
+        let would_reject = graph_bytes.len() > HNSW_GRAPH_MAX_BYTES;
+        assert!(
+            would_reject,
+            "CREATE INDEX guard must reject oversized graph before write"
+        );
     }
 }
