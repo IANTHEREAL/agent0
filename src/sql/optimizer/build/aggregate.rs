@@ -6,7 +6,7 @@ use super::utils::{
     collect_agg_exprs_from, find_matching_group_by, normalize_string_agg_delimiter,
 };
 use crate::model::DataType;
-use crate::sql::analyzer::types::{TypedExpr, TypedExprKind, TypedOrderByExpr};
+use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::operators::{AggregateExpr, BoxedOperator, HashAggregateOperator, ProjectOperator};
 
 /// Check whether an `AggregateExpr` matches the identity of an `AggregateCall`.
@@ -165,69 +165,19 @@ pub(super) fn build_hash_aggregate(
 }
 
 /// Check if a TypedExpr contains any AggregateCall.
+/// Uses `for_each_child` (exhaustive over all TypedExprKind variants) for child
+/// traversal, so new variants are automatically covered.
 fn contains_aggregate(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::AggregateCall { .. } => true,
-        TypedExprKind::IsTest { expr, .. } => contains_aggregate(expr),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        TypedExprKind::InList { expr, list, .. }
-        | TypedExprKind::ScalarArrayCmp {
-            expr, elems: list, ..
-        } => contains_aggregate(expr) || list.iter().any(contains_aggregate),
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            contains_aggregate(expr)
-                || contains_aggregate(pattern)
-                || escape.as_ref().is_some_and(|e| contains_aggregate(e))
-        }
-        TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            contains_aggregate(expr)
-                || contains_aggregate(pattern)
-                || escape.as_ref().is_some_and(|e| contains_aggregate(e))
-        }
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. } => contains_aggregate(operand),
-        TypedExprKind::Cast { expr: inner, .. } => contains_aggregate(inner),
-        TypedExprKind::FunctionCall { args, .. } => args.iter().any(contains_aggregate),
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|o| contains_aggregate(o))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
-                || else_result.as_ref().is_some_and(|e| contains_aggregate(e))
-        }
-        TypedExprKind::AnyAll { expr, .. } => contains_aggregate(expr),
-        TypedExprKind::Coalesce(args) => args.iter().any(contains_aggregate),
-        TypedExprKind::NullIf(a, b) => contains_aggregate(a) || contains_aggregate(b),
-        TypedExprKind::MinMax { args, .. } => args.iter().any(contains_aggregate),
-        TypedExprKind::ArrayLiteral(items) | TypedExprKind::Row(items) => {
-            items.iter().any(contains_aggregate)
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            contains_aggregate(array) || contains_aggregate(index)
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            contains_aggregate(expr) || contains_aggregate(path)
-        }
-        _ => false,
+    if matches!(expr.kind, TypedExprKind::AggregateCall { .. }) {
+        return true;
     }
+    let mut found = false;
+    crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+        if contains_aggregate(child) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Rewrite a projection expression for post-aggregate evaluation.
@@ -293,430 +243,31 @@ pub(crate) fn rewrite_post_aggregate_expr(
                 data_type: expr.data_type.clone(),
             })
         }
-        TypedExprKind::IsTest {
-            expr: inner,
-            test,
-            negated,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::IsTest {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                test: *test,
-                negated: *negated,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::Between {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                low: Box::new(rewrite_post_aggregate_expr(
-                    low,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                high: Box::new(rewrite_post_aggregate_expr(
-                    high,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                negated: *negated,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::InList {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                list: list
-                    .iter()
-                    .map(|e| {
-                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                negated: *negated,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::ScalarArrayCmp {
-            expr: inner,
-            elems,
-            op,
-            use_or,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::ScalarArrayCmp {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                elems: elems
-                    .iter()
-                    .map(|e| {
-                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                op: op.clone(),
-                use_or: *use_or,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::Like {
-            expr: inner,
-            pattern,
-            escape,
-            case_insensitive,
-            negated,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::Like {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                pattern: Box::new(rewrite_post_aggregate_expr(
-                    pattern,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                escape: escape
-                    .as_ref()
-                    .map(|e| {
-                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                            .map(Box::new)
-                    })
-                    .transpose()?,
-                case_insensitive: *case_insensitive,
-                negated: *negated,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::SimilarTo {
-            expr: inner,
-            pattern,
-            escape,
-            negated,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::SimilarTo {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                pattern: Box::new(rewrite_post_aggregate_expr(
-                    pattern,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                escape: escape
-                    .as_ref()
-                    .map(|e| {
-                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                            .map(Box::new)
-                    })
-                    .transpose()?,
-                negated: *negated,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        // Recurse into wrapping expressions.
-        TypedExprKind::BinaryOp { left, op, right } => Ok(TypedExpr {
-            kind: TypedExprKind::BinaryOp {
-                left: Box::new(rewrite_post_aggregate_expr(
-                    left,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                op: op.clone(),
-                right: Box::new(rewrite_post_aggregate_expr(
-                    right,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::UnaryOp { op, operand } => Ok(TypedExpr {
-            kind: TypedExprKind::UnaryOp {
-                op: *op,
-                operand: Box::new(rewrite_post_aggregate_expr(
-                    operand,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::Cast {
-            expr: inner,
-            target_type,
-            cast_context,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::Cast {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                target_type: target_type.clone(),
-                cast_context: *cast_context,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::FunctionCall {
-            func,
-            args,
-            order_by,
-            filter,
-        } => {
-            let rewritten_args: Vec<TypedExpr> = args
-                .iter()
-                .map(|a| rewrite_post_aggregate_expr(a, group_by, group_by_count, aggregate_exprs))
-                .collect::<Result<Vec<_>>>()?;
+        // All other variants: recursively rewrite children using map_children
+        // (exhaustive over all TypedExprKind variants). This covers Collate,
+        // IsDistinctFrom, WindowCall, leaf nodes, and any future variants.
+        _ => {
+            let mut err: Option<anyhow::Error> = None;
+            let kind = crate::sql::expr::traverse::map_children(expr, &mut |child| {
+                if err.is_some() {
+                    return child.clone();
+                }
+                match rewrite_post_aggregate_expr(child, group_by, group_by_count, aggregate_exprs)
+                {
+                    Ok(rewritten) => rewritten,
+                    Err(e) => {
+                        err = Some(e);
+                        child.clone()
+                    }
+                }
+            });
+            if let Some(e) = err {
+                return Err(e);
+            }
             Ok(TypedExpr {
-                kind: TypedExprKind::FunctionCall {
-                    func: func.clone(),
-                    args: rewritten_args,
-                    order_by: order_by.clone(),
-                    filter: filter.clone(),
-                },
+                kind,
                 data_type: expr.data_type.clone(),
             })
         }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            let rewritten_operand = operand
-                .as_ref()
-                .map(|o| {
-                    rewrite_post_aggregate_expr(o, group_by, group_by_count, aggregate_exprs)
-                        .map(Box::new)
-                })
-                .transpose()?;
-            let rewritten_whens: Vec<(TypedExpr, TypedExpr)> = when_clauses
-                .iter()
-                .map(|(w, t)| {
-                    Ok((
-                        rewrite_post_aggregate_expr(w, group_by, group_by_count, aggregate_exprs)?,
-                        rewrite_post_aggregate_expr(t, group_by, group_by_count, aggregate_exprs)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let rewritten_else = else_result
-                .as_ref()
-                .map(|e| {
-                    rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                        .map(Box::new)
-                })
-                .transpose()?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::Case {
-                    operand: rewritten_operand,
-                    when_clauses: rewritten_whens,
-                    else_result: rewritten_else,
-                },
-                data_type: expr.data_type.clone(),
-            })
-        }
-        TypedExprKind::Coalesce(args) => {
-            let rewritten: Vec<TypedExpr> = args
-                .iter()
-                .map(|a| rewrite_post_aggregate_expr(a, group_by, group_by_count, aggregate_exprs))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::Coalesce(rewritten),
-                data_type: expr.data_type.clone(),
-            })
-        }
-        TypedExprKind::NullIf(a, b) => Ok(TypedExpr {
-            kind: TypedExprKind::NullIf(
-                Box::new(rewrite_post_aggregate_expr(
-                    a,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                Box::new(rewrite_post_aggregate_expr(
-                    b,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-            ),
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::MinMax { args, is_greatest } => {
-            let rewritten: Vec<TypedExpr> = args
-                .iter()
-                .map(|a| rewrite_post_aggregate_expr(a, group_by, group_by_count, aggregate_exprs))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::MinMax {
-                    args: rewritten,
-                    is_greatest: *is_greatest,
-                },
-                data_type: expr.data_type.clone(),
-            })
-        }
-        TypedExprKind::AnyAll {
-            expr: inner,
-            op,
-            subquery,
-            is_all,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::AnyAll {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                op: op.clone(),
-                subquery: subquery.clone(),
-                is_all: *is_all,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::ArrayLiteral(items) => Ok(TypedExpr {
-            kind: TypedExprKind::ArrayLiteral(
-                items
-                    .iter()
-                    .map(|e| {
-                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::Row(items) => Ok(TypedExpr {
-            kind: TypedExprKind::Row(
-                items
-                    .iter()
-                    .map(|e| {
-                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::ArrayIndex { array, index } => Ok(TypedExpr {
-            kind: TypedExprKind::ArrayIndex {
-                array: Box::new(rewrite_post_aggregate_expr(
-                    array,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                index: Box::new(rewrite_post_aggregate_expr(
-                    index,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        TypedExprKind::JsonAccess {
-            expr: inner,
-            path,
-            operator,
-        } => Ok(TypedExpr {
-            kind: TypedExprKind::JsonAccess {
-                expr: Box::new(rewrite_post_aggregate_expr(
-                    inner,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                path: Box::new(rewrite_post_aggregate_expr(
-                    path,
-                    group_by,
-                    group_by_count,
-                    aggregate_exprs,
-                )?),
-                operator: *operator,
-            },
-            data_type: expr.data_type.clone(),
-        }),
-        // WindowCall: preserve the wrapper but recurse into children (args,
-        // partition_by, order_by) to rewrite any aggregate/group-by references.
-        // This handles mixed expressions like `LAG(COUNT(*)) OVER (ORDER BY dept)`.
-        TypedExprKind::WindowCall {
-            func,
-            args,
-            partition_by,
-            order_by,
-            window_frame,
-        } => {
-            let rewritten_args: Vec<TypedExpr> = args
-                .iter()
-                .map(|a| rewrite_post_aggregate_expr(a, group_by, group_by_count, aggregate_exprs))
-                .collect::<Result<Vec<_>>>()?;
-            let rewritten_partition: Vec<TypedExpr> = partition_by
-                .iter()
-                .map(|e| rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs))
-                .collect::<Result<Vec<_>>>()?;
-            let rewritten_order: Vec<TypedOrderByExpr> = order_by
-                .iter()
-                .map(|ob| {
-                    Ok(TypedOrderByExpr {
-                        expr: rewrite_post_aggregate_expr(
-                            &ob.expr,
-                            group_by,
-                            group_by_count,
-                            aggregate_exprs,
-                        )?,
-                        asc: ob.asc,
-                        nulls_first: ob.nulls_first,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::WindowCall {
-                    func: func.clone(),
-                    args: rewritten_args,
-                    partition_by: rewritten_partition,
-                    order_by: rewritten_order,
-                    window_frame: window_frame.clone(),
-                },
-                data_type: expr.data_type.clone(),
-            })
-        }
-        // Leaf nodes (constants, etc.) pass through unchanged.
-        _ => Ok(expr.clone()),
     }
 }

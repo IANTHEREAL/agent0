@@ -58,130 +58,13 @@ pub(crate) fn collect_agg_exprs_from(
                 agg_types.push(expr.data_type.clone());
             }
         }
-        TypedExprKind::IsTest { expr, .. } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+        // All other variants: recursively collect from children using for_each_child
+        // (exhaustive over all TypedExprKind variants). Covers Collate, IsDistinctFrom,
+        // WindowCall, leaf nodes, and any future variants.
+        _ => {
+            crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+                collect_agg_exprs_from(child, output_name, agg_exprs, agg_names, agg_types);
+            });
         }
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(low, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(high, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::InList { expr, list, .. }
-        | TypedExprKind::ScalarArrayCmp {
-            expr, elems: list, ..
-        } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
-            for item in list {
-                collect_agg_exprs_from(item, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(pattern, output_name, agg_exprs, agg_names, agg_types);
-            if let Some(e) = escape {
-                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(pattern, output_name, agg_exprs, agg_names, agg_types);
-            if let Some(e) = escape {
-                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        // Recurse into sub-expressions (e.g., CAST(COUNT(*) AS int))
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            collect_agg_exprs_from(left, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(right, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::UnaryOp { operand, .. } => {
-            collect_agg_exprs_from(operand, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::Cast { expr: inner, .. } => {
-            collect_agg_exprs_from(inner, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            if let Some(op) = operand {
-                collect_agg_exprs_from(op, output_name, agg_exprs, agg_names, agg_types);
-            }
-            for (w, t) in when_clauses {
-                collect_agg_exprs_from(w, output_name, agg_exprs, agg_names, agg_types);
-                collect_agg_exprs_from(t, output_name, agg_exprs, agg_names, agg_types);
-            }
-            if let Some(e) = else_result {
-                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::Coalesce(args) => {
-            for arg in args {
-                collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::NullIf(a, b) => {
-            collect_agg_exprs_from(a, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(b, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::MinMax { args, .. } => {
-            for arg in args {
-                collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::AnyAll { expr, .. } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::ArrayLiteral(items) | TypedExprKind::Row(items) => {
-            for item in items {
-                collect_agg_exprs_from(item, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            collect_agg_exprs_from(array, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(index, output_name, agg_exprs, agg_names, agg_types);
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
-            collect_agg_exprs_from(path, output_name, agg_exprs, agg_names, agg_types);
-        }
-        // WindowCall: recurse into children to find aggregate sub-expressions.
-        // Handles cases like `ROW_NUMBER() OVER (ORDER BY COUNT(*))` and
-        // `LAG(COUNT(*)) OVER (...)`.
-        TypedExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
-            }
-            for e in partition_by {
-                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
-            }
-            for ob in order_by {
-                collect_agg_exprs_from(&ob.expr, output_name, agg_exprs, agg_names, agg_types);
-            }
-        }
-        _ => {}
     }
 }

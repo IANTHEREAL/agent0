@@ -113,70 +113,30 @@ pub(super) fn find_aggregate_typed_expr(
 }
 
 /// Search an expression tree for an `AggregateCall` matching the given `AggregateExpr`.
+/// Uses `for_each_child` (exhaustive over all TypedExprKind variants) for child
+/// traversal, so new variants like Collate/IsDistinctFrom are automatically covered.
 pub(super) fn find_agg_in_expr(expr: &TypedExpr, target: &AggregateExpr) -> Option<TypedExpr> {
-    match &expr.kind {
-        TypedExprKind::AggregateCall {
-            func,
-            args,
-            distinct,
-            filter,
-            order_by,
-        } => {
-            if super::super::build::aggregate_identity_matches(
-                target, func, args, *distinct, filter, order_by,
-            ) {
-                return Some(expr.clone());
-            }
-            None
+    if let TypedExprKind::AggregateCall {
+        func,
+        args,
+        distinct,
+        filter,
+        order_by,
+    } = &expr.kind
+    {
+        if super::super::build::aggregate_identity_matches(
+            target, func, args, *distinct, filter, order_by,
+        ) {
+            return Some(expr.clone());
         }
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            find_agg_in_expr(left, target).or_else(|| find_agg_in_expr(right, target))
-        }
-        TypedExprKind::UnaryOp { operand, .. } | TypedExprKind::Cast { expr: operand, .. } => {
-            find_agg_in_expr(operand, target)
-        }
-        TypedExprKind::FunctionCall { args, .. } => {
-            args.iter().find_map(|a| find_agg_in_expr(a, target))
-        }
-        TypedExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => args
-            .iter()
-            .chain(partition_by.iter())
-            .find_map(|a| find_agg_in_expr(a, target))
-            .or_else(|| {
-                order_by
-                    .iter()
-                    .find_map(|ob| find_agg_in_expr(&ob.expr, target))
-            }),
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => operand
-            .as_ref()
-            .and_then(|o| find_agg_in_expr(o, target))
-            .or_else(|| {
-                when_clauses.iter().find_map(|(w, t)| {
-                    find_agg_in_expr(w, target).or_else(|| find_agg_in_expr(t, target))
-                })
-            })
-            .or_else(|| {
-                else_result
-                    .as_ref()
-                    .and_then(|e| find_agg_in_expr(e, target))
-            }),
-        TypedExprKind::Coalesce(args) | TypedExprKind::MinMax { args, .. } => {
-            args.iter().find_map(|a| find_agg_in_expr(a, target))
-        }
-        TypedExprKind::NullIf(a, b) => {
-            find_agg_in_expr(a, target).or_else(|| find_agg_in_expr(b, target))
-        }
-        _ => None,
     }
+    let mut found = None;
+    crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+        if found.is_none() {
+            found = find_agg_in_expr(child, target);
+        }
+    });
+    found
 }
 
 /// Find the original `TypedExpr` for an `AggregateExpr` in HAVING/ORDER BY trees.
@@ -326,67 +286,17 @@ pub(super) fn has_aggregates(projections: &[AnalyzedProjection]) -> bool {
     projections.iter().any(|p| expr_has_aggregate(&p.expr))
 }
 
+/// Uses `for_each_child` (exhaustive over all TypedExprKind variants) for child
+/// traversal, so new variants like Collate/IsDistinctFrom are automatically covered.
 pub(crate) fn expr_has_aggregate(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::AggregateCall { .. } => true,
-        TypedExprKind::IsTest { expr, .. } => expr_has_aggregate(expr),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
-        TypedExprKind::InList { expr, list, .. }
-        | TypedExprKind::ScalarArrayCmp {
-            expr, elems: list, ..
-        } => expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate),
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_has_aggregate(expr)
-                || expr_has_aggregate(pattern)
-                || escape.as_ref().is_some_and(|e| expr_has_aggregate(e))
-        }
-        TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_has_aggregate(expr)
-                || expr_has_aggregate(pattern)
-                || escape.as_ref().is_some_and(|e| expr_has_aggregate(e))
-        }
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            expr_has_aggregate(left) || expr_has_aggregate(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. } => expr_has_aggregate(operand),
-        TypedExprKind::Cast { expr, .. } => expr_has_aggregate(expr),
-        TypedExprKind::FunctionCall { args, .. } => args.iter().any(expr_has_aggregate),
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| expr_has_aggregate(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
-                || else_result.as_ref().is_some_and(|e| expr_has_aggregate(e))
-        }
-        TypedExprKind::AnyAll { expr, .. } => expr_has_aggregate(expr),
-        TypedExprKind::Coalesce(args) => args.iter().any(expr_has_aggregate),
-        TypedExprKind::NullIf(a, b) => expr_has_aggregate(a) || expr_has_aggregate(b),
-        TypedExprKind::MinMax { args, .. } => args.iter().any(expr_has_aggregate),
-        TypedExprKind::ArrayLiteral(items) | TypedExprKind::Row(items) => {
-            items.iter().any(expr_has_aggregate)
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            expr_has_aggregate(array) || expr_has_aggregate(index)
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            expr_has_aggregate(expr) || expr_has_aggregate(path)
-        }
-        _ => false,
+    if matches!(expr.kind, TypedExprKind::AggregateCall { .. }) {
+        return true;
     }
+    let mut found = false;
+    crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+        if expr_has_aggregate(child) {
+            found = true;
+        }
+    });
+    found
 }

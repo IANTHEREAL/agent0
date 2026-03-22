@@ -504,8 +504,19 @@ pub(super) fn rewrite_for_post_aggregate(
             data_type: expr.data_type.clone(),
         },
 
-        // Opaque/leaf nodes — return as-is.
-        _ => expr.clone(),
+        // All other variants: recursively rewrite children using map_children
+        // (exhaustive over all TypedExprKind variants). Covers Collate,
+        // IsDistinctFrom, leaf nodes, and any future variants.
+        _ => {
+            let kind =
+                crate::sql::expr::traverse::map_children(expr, &mut |child| {
+                    rewrite_for_post_aggregate(child, analysis)
+                });
+            TypedExpr {
+                kind,
+                data_type: expr.data_type.clone(),
+            }
+        }
     }
 }
 
