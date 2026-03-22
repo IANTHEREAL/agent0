@@ -9,6 +9,7 @@
 //! - `response` — COPY TO STDOUT response building
 //! - `fs9`      — fs9 remote COPY support (feature-gated)
 
+mod export;
 mod helpers;
 mod parse;
 mod response;

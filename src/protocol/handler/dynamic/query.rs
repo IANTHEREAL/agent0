@@ -688,6 +688,11 @@ impl SimpleQueryHandler for DynamicPgHandler {
             return Ok(result);
         }
 
+        // Export snapshot COPY: streaming table export at pinned timestamp.
+        if let Some(result) = self.try_handle_export_snapshot_copy(client, query).await? {
+            return Ok(result);
+        }
+
         match DynamicPgHandler::parse_copy_to_command(query) {
             Ok(Some((table_name, columns, copy_opts))) => {
                 debug!(
