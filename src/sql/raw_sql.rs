@@ -69,6 +69,12 @@ pub(crate) enum RawSqlKind {
     DropPolicy,
     /// `ALTER TABLE <table> {ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL SECURITY`
     AlterTableRls,
+    /// `EXPORT SNAPSHOT BEGIN <ttl_secs> '<owner_ref>'`
+    ExportSnapshotBegin,
+    /// `EXPORT SNAPSHOT RELEASE '<snapshot_id>'`
+    ExportSnapshotRelease,
+    /// `EXPORT SNAPSHOT LIST`
+    ExportSnapshotList,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
@@ -445,6 +451,15 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     // Must be checked before generic ALTER TABLE handlers.
     if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("ROW LEVEL SECURITY") {
         return Some(RawSqlKind::AlterTableRls);
+    }
+    if sql_upper.starts_with("EXPORT SNAPSHOT BEGIN") {
+        return Some(RawSqlKind::ExportSnapshotBegin);
+    }
+    if sql_upper.starts_with("EXPORT SNAPSHOT RELEASE") {
+        return Some(RawSqlKind::ExportSnapshotRelease);
+    }
+    if sql_upper.starts_with("EXPORT SNAPSHOT LIST") {
+        return Some(RawSqlKind::ExportSnapshotList);
     }
     if sql_upper.starts_with("ALTER SYSTEM SET ") {
         return Some(RawSqlKind::AlterSystemSet);

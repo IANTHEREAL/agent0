@@ -11,6 +11,8 @@
 pub mod lifecycle;
 #[allow(dead_code)] // S0 infrastructure: public API wired in S1
 pub mod registry;
+#[allow(dead_code)] // S1: export scan, wired in S1 handlers
+pub(crate) mod scan;
 
 use std::sync::{Arc, OnceLock};
 

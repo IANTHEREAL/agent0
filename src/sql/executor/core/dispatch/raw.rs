@@ -133,6 +133,21 @@ impl Executor {
                 let res = self.execute_alter_table_rls_cmd(session, sql).await;
                 Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
             }
+            RawSqlKind::ExportSnapshotBegin => {
+                let start = Instant::now();
+                let res = self.execute_begin_export_snapshot_cmd(session, sql).await;
+                Some(self.finish_raw_multi(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::ExportSnapshotRelease => {
+                let start = Instant::now();
+                let res = self.execute_release_export_snapshot_cmd(session, sql).await;
+                Some(self.finish_raw_multi(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::ExportSnapshotList => {
+                let start = Instant::now();
+                let res = self.execute_list_export_snapshots_cmd(session, sql).await;
+                Some(self.finish_raw_multi(session, &ctx.sql_trimmed, start, res))
+            }
             _ => None,
         }
     }
