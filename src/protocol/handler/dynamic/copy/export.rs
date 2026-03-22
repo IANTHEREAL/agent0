@@ -150,15 +150,23 @@ impl DynamicPgHandler {
         let snapshot_ts = snap.snapshot_ts;
         let db_id = snap.database_id;
 
+        // Resolve bare table name to schema-qualified name. Storage uses
+        // "public.<table>" for tables in the default schema.
+        let qualified_name = if table_name.contains('.') {
+            table_name.clone()
+        } else {
+            format!("public.{}", table_name)
+        };
+
         // Look up table schema at the pinned snapshot.
         let schema =
-            export::scan::get_schema_at_snapshot(&tikv_client, snapshot_ts, db_id, &table_name)
+            export::scan::get_schema_at_snapshot(&tikv_client, snapshot_ts, db_id, &qualified_name)
                 .await
                 .map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         "42P01".to_string(),
-                        format!("failed to get schema for '{}': {e}", table_name),
+                        format!("failed to get schema for '{}': {e}", qualified_name),
                     )))
                 })?;
 
