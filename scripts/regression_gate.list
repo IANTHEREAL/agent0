@@ -236,6 +236,8 @@ tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
 tests/hnsw_large_liveness_coverage.py
 tests/hnsw_bg_concurrent_liveness.py
+# #1968 / #1979 – oversized row writes are rejected pre-flight with actionable errors
+tests/txn_value_size_guard_1968.py
 tests/fs9_ws_symlink_contract_1873.py
 tests/fs9_ws_mode_on_create_1902.py
 # #1969 – HNSW graph freeze on oversize (raft-entry-max-size)

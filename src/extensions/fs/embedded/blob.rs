@@ -20,7 +20,9 @@ pub(crate) async fn read_blob(txn: &mut Transaction, inode_id: u64, size: u64) -
 }
 
 pub(crate) async fn write_blob(txn: &mut Transaction, inode_id: u64, data: &[u8]) -> Result<()> {
-    txn.put(keys::blob_key(inode_id), data.to_vec()).await?;
+    let key = keys::blob_key(inode_id);
+    crate::txn::check_value_size(&key, data)?;
+    txn.put(key, data.to_vec()).await?;
     Ok(())
 }
 

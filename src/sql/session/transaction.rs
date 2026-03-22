@@ -108,6 +108,10 @@ impl Session {
                 entries.sort_by(|(a, _), (b, _)| a.cmp(b));
                 for (key, prev) in entries {
                     match prev {
+                        // Undo records restore values that already existed in
+                        // TiKV — do NOT apply the size guard here. Blocking a
+                        // ROLLBACK TO SAVEPOINT is worse than allowing the
+                        // restore of a pre-existing large value.
                         Some(val) => txn.put(key, val).await.map_err(|e| anyhow!(e))?,
                         None => txn.delete(key).await.map_err(|e| anyhow!(e))?,
                     }
