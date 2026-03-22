@@ -60,6 +60,7 @@
 - **Database partitioning invariant**: user tables, indexes, and database-local metadata MUST remain under the selected database prefix.
 - **Ordering invariant**: scan keys and memcomparable index encodings MUST preserve ordered range-scan behavior.
 - **Serialization invariant**: storage readers MUST reject unsupported schema-format versions instead of silently mis-decoding them.
+- **Value size invariant**: no single KV value written via `txn_put` should exceed TiKV's `raft-entry-max-size` (default 8 MB). Features that persist growable data (indexes, statistics, large rows) MUST use per-row entries or fixed-size pages, not monolithic blobs. See `docs/design/30_tikv_value_size_design_lessons.md` for rationale and audit results.
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`.

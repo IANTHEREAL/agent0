@@ -56,6 +56,12 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - All persistent data must be isolated per keyspace (`_sys_*`, table rows, indexes, auth, and future stats).
 - Process-level global state is limited to in-memory caches/config/logging.
 
+### TiKV Value Size Invariant (Critical)
+
+- No single KV value written via `txn_put` should exceed TiKV's `raft-entry-max-size` (default 8 MB). Features that persist growable data MUST use per-row entries or fixed-size pages, not monolithic blobs.
+- **Known violation:** HNSW graph blob (#1969) — remediation in progress.
+- Design doc: `docs/design/30_tikv_value_size_design_lessons.md`.
+
 ## Current Sprint & Issue Tracking
 
 - **Epic:** #1959 — Open Issue Triage: Refactoring Groups and Execution Plan (80 issues)
