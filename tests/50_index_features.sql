@@ -6,6 +6,7 @@ CREATE TABLE ix_t (id INT PRIMARY KEY, a INT, b TEXT);
 CREATE INDEX ix_t_a_partial ON ix_t (a) WHERE a IS NOT NULL;
 CREATE INDEX ix_t_expr_lower ON ix_t ((lower(b)));
 CREATE INDEX ix_t_gin ON ix_t USING gin (b);
+-- gist is not supported; verify it is rejected
 CREATE INDEX ix_t_gist ON ix_t USING gist (a);
 
 SELECT 'IDXDEF=' || indexname || ':' || lower(indexdef)

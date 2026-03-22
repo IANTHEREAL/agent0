@@ -41,11 +41,11 @@ SELECT 'CREATE_EXPR2:success';
 CREATE INDEX idx_ext_tags_gin ON idx_ext USING gin (tags);
 SELECT 'CREATE_GIN:success';
 
--- GIST index
+-- GIST index (not supported — should be rejected)
 CREATE INDEX idx_ext_data_gist ON idx_ext USING gist (data);
 SELECT 'CREATE_GIST:success';
 
--- Hash index
+-- Hash index (not supported — should be rejected)
 CREATE INDEX idx_ext_name_hash ON idx_ext USING hash (name);
 SELECT 'CREATE_HASH:success';
 

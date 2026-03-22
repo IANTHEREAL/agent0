@@ -1,7 +1,7 @@
 ERROR:  data type text has no default operator class for access method "gin"
 HINT:  You must specify an operator class for the index or define a default operator class for the data type.
-ERROR:  data type integer has no default operator class for access method "gist"
-HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+ERROR:  access method "gist" is not supported
+HINT:  Only btree, gin, and hnsw indexes are currently supported.
 ?column?
 IDXDEF=ix_t_a_partial:create index ix_t_a_partial on public.ix_t using btree (a) where (a is not null)
 IDXDEF=ix_t_expr_lower:create index ix_t_expr_lower on public.ix_t using btree (lower(b))

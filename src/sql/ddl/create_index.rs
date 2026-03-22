@@ -91,7 +91,13 @@ fn resolve_create_index_method(using: Option<&Ident>) -> Result<ResolvedIndexMet
             storage_method: Some("hnsw".to_string()),
             hnsw_variant: Some(HnswMethodVariant::Ip),
         },
-        "btree" | "hash" | "gin" | "gist" | "spgist" | "brin" => ResolvedIndexMethod {
+        "hash" | "gist" | "spgist" | "brin" => {
+            return Err(anyhow!(
+                "access method \"{}\" is not supported\nHINT: Only btree, gin, and hnsw indexes are currently supported.",
+                method_raw
+            ));
+        }
+        "btree" | "gin" => ResolvedIndexMethod {
             storage_method: Some(method_raw),
             hnsw_variant: None,
         },
@@ -276,25 +282,19 @@ pub async fn execute_create_index(
         hnsw_distance_metric = Some(metric);
     }
 
-    // ── Operator class validation for GIN / GIST ────────────────────
+    // ── Operator class validation for GIN ─────────────────────────────
     // PostgreSQL requires a default operator class for the index method.
     // For GIN: only array, jsonb, tsvector have defaults.
-    // For GIST: only geometric/range/tsvector/tsquery types have defaults
-    //           (most of which we don't support yet).
     if let Some(ref m) = method {
-        let needs_opclass_check = matches!(m.as_str(), "gin" | "gist");
+        let needs_opclass_check = matches!(m.as_str(), "gin");
         if needs_opclass_check {
             for col_name in &idx_cols {
                 if let Some(idx) = schema.column_index(col_name) {
                     let dt = &schema.columns[idx].data_type;
-                    let has_default_opclass = match m.as_str() {
-                        "gin" => matches!(
-                            dt,
-                            DataType::Array(_) | DataType::Jsonb | DataType::Tsvector
-                        ),
-                        "gist" => matches!(dt, DataType::Tsvector),
-                        _ => true,
-                    };
+                    let has_default_opclass = matches!(
+                        dt,
+                        DataType::Array(_) | DataType::Jsonb | DataType::Tsvector
+                    );
                     if !has_default_opclass {
                         return Err(anyhow!(
                             "data type {} has no default operator class for access method \"{}\"\nHINT:  You must specify an operator class for the index or define a default operator class for the data type.",
@@ -1526,6 +1526,28 @@ mod tests {
                 .contains("access method \"hnsw__evil\" does not exist"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_create_index_method_rejects_unsupported_methods() {
+        for method in &["hash", "gist", "spgist", "brin"] {
+            let err = resolve_create_index_method(Some(&Ident::new(*method)))
+                .expect_err(&format!("{method} should be rejected"));
+            assert!(
+                err.to_string().contains("is not supported"),
+                "unexpected error for {method}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_create_index_method_accepts_btree_and_gin() {
+        for method in &["btree", "gin"] {
+            let result = resolve_create_index_method(Some(&Ident::new(*method)))
+                .unwrap_or_else(|e| panic!("{method} should be accepted: {e}"));
+            assert_eq!(result.storage_method.as_deref(), Some(*method));
+            assert_eq!(result.hnsw_variant, None);
+        }
     }
 
     #[test]

@@ -18,11 +18,13 @@ HINT:  You must specify an operator class for the index or define a default oper
 ?column?
 CREATE_GIN:success
 (1 row)
-ERROR:  data type text has no default operator class for access method "gist"
-HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+ERROR:  access method "gist" is not supported
+HINT:  Only btree, gin, and hnsw indexes are currently supported.
 ?column?
 CREATE_GIST:success
 (1 row)
+ERROR:  access method "hash" is not supported
+HINT:  Only btree, gin, and hnsw indexes are currently supported.
 ?column?
 CREATE_HASH:success
 (1 row)
