@@ -1163,7 +1163,7 @@ pub async fn backfill_index_by_name(
             // Rollback failed — keep the GC registration so the safepoint
             // does not advance past this potentially live transaction.
             if let Some(g) = txn_guard.as_mut() {
-                g.defuse();
+                g.quarantine();
             }
         }
         return Err(e);
@@ -1390,7 +1390,7 @@ async fn reconcile_index_pass(
             // Rollback failed — keep the GC registration so the safepoint
             // does not advance past this potentially live transaction.
             if let Some(g) = txn_guard.as_mut() {
-                g.defuse();
+                g.quarantine();
             }
         }
         return Err(e);
@@ -1715,10 +1715,10 @@ mod tests {
         );
     }
 
-    /// Worker-path rollback errors must defuse the GC guard so the safepoint
-    /// does not advance past a potentially live transaction.
+    /// Worker-path rollback errors must quarantine the GC guard so the
+    /// safepoint does not advance past a potentially live transaction.
     #[test]
-    fn backfill_and_reconcile_defuse_guard_on_rollback_failure() {
+    fn backfill_and_reconcile_quarantine_guard_on_rollback_failure() {
         let source = include_str!("create_index.rs");
         let prod_source = source
             .split("#[cfg(test)]")
@@ -1737,10 +1737,10 @@ mod tests {
                 "{fn_name}: must not ignore rollback errors"
             );
 
-            // It must defuse the guard when rollback fails.
+            // It must quarantine the guard when rollback fails.
             assert!(
-                fn_body.contains("g.defuse()"),
-                "{fn_name}: must defuse the GC guard when rollback fails"
+                fn_body.contains("g.quarantine()"),
+                "{fn_name}: must quarantine the GC guard when rollback fails"
             );
         }
     }

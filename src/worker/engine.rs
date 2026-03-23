@@ -985,7 +985,7 @@ impl WorkerEngine {
                     // Keep the GC registration so the safepoint does not
                     // advance past this potentially live transaction.
                     if let Some(g) = txn_guard.as_mut() {
-                        g.defuse();
+                        g.quarantine();
                     }
                 }
                 Err(e)
@@ -1431,21 +1431,27 @@ async fn execute_hnsw_merge(
         let Some(meta_bytes) = txn.get(meta_key.clone()).await? else {
             // Index metadata missing — index was dropped. Abort silently.
             if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
             }
             break;
         };
         let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
         if should_skip_frozen_merge(&meta) {
             if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
             }
             info!(table_id, index_id, "HNSW merge skipped: index is frozen");
             return Ok(());
         }
         if meta.storage_version != 1 {
             if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
             }
             return Err(anyhow!(
                 "HNSW index has unsupported storage_version={}; only v1 supported",
@@ -1492,7 +1498,9 @@ async fn execute_hnsw_merge(
 
         if batch_deltas.is_empty() {
             if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
             }
             break; // No more deltas — merge complete.
         }
@@ -1547,7 +1555,9 @@ async fn execute_hnsw_merge(
             );
             txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
             if let Err(e) = txn.commit().await {
-                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
                 return Err(e.into());
             }
             return Ok(());
@@ -1565,7 +1575,9 @@ async fn execute_hnsw_merge(
 
         // 7. Commit.
         if let Err(e) = txn.commit().await {
-            if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+            if let Some(g) = txn_guard.as_mut() {
+                g.quarantine();
+            }
             return Err(e.into());
         }
         total_deltas_merged += batch_count;

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static GLOBAL_REGISTRY: OnceLock<Arc<ActiveTxnRegistry>> = OnceLock::new();
 
@@ -23,6 +24,13 @@ pub fn global_registry() -> Option<&'static Arc<ActiveTxnRegistry>> {
     GLOBAL_REGISTRY.get()
 }
 
+/// How long a quarantined registration stays alive after commit/rollback
+/// failure. Must exceed the longest possible TiKV lock TTL so the
+/// server-side transaction is fully cleaned up before we stop protecting
+/// its `start_ts`. TiKV's default pessimistic lock TTL is ~3 s and max
+/// TTL scales with txn size; 60 s provides generous headroom.
+const QUARANTINE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ActiveTxnKey {
     Connection(i64),
@@ -32,30 +40,39 @@ enum ActiveTxnKey {
 /// RAII guard for a worker/background TiKV transaction published in the
 /// process-local GC registry.
 ///
-/// By default the guard unregisters the transaction when dropped.  Call
-/// [`defuse`](Self::defuse) before dropping to **keep** the registration
-/// alive — use this when commit or rollback failed and the underlying TiKV
-/// transaction may still be live.
+/// By default the guard unregisters the transaction when dropped. Call
+/// [`quarantine`](Self::quarantine) before dropping to **keep** the
+/// registration alive for a bounded duration — use this when commit or
+/// rollback failed and the underlying TiKV transaction may still be live.
+/// The quarantined entry is automatically reaped by the GC publisher loop
+/// after [`QUARANTINE_TTL`].
 pub struct ActiveTxnGuard {
     registry: Arc<ActiveTxnRegistry>,
     handle_id: u64,
-    defused: bool,
+    quarantined: bool,
 }
 
 impl ActiveTxnGuard {
-    /// Prevent this guard from unregistering the transaction on drop.
+    /// Move this guard's registration into a time-bounded quarantine.
     ///
-    /// Call this when the transaction's commit or rollback failed — the
-    /// registration must stay so the GC safepoint does not advance past a
-    /// potentially live transaction.
-    pub fn defuse(&mut self) {
-        self.defused = true;
+    /// The entry stays in the registry (protecting the `start_ts` from GC)
+    /// for [`QUARANTINE_TTL`] after this call, then is automatically reaped
+    /// by [`ActiveTxnRegistry::reap_quarantined`].  The guard's `Drop` will
+    /// no longer unregister — the quarantine takes ownership of cleanup.
+    ///
+    /// Call this when the transaction's commit or rollback failed and the
+    /// underlying TiKV transaction may still be live.
+    pub fn quarantine(&mut self) {
+        if !self.quarantined {
+            self.registry.quarantine_worker(self.handle_id);
+            self.quarantined = true;
+        }
     }
 }
 
 impl Drop for ActiveTxnGuard {
     fn drop(&mut self) {
-        if !self.defused {
+        if !self.quarantined {
             self.registry.unregister_worker(self.handle_id);
         }
     }
@@ -67,6 +84,10 @@ pub struct ActiveTxnRegistry {
     /// tracker key -> start_ts (TiKV TSO version)
     inner: Mutex<HashMap<ActiveTxnKey, u64>>,
     next_worker_handle: AtomicU64,
+    /// Worker registrations moved to quarantine after finalization failure.
+    /// Each entry is (handle_id, quarantine_start_time).  Reaped by the GC
+    /// publisher loop via [`reap_quarantined`](Self::reap_quarantined).
+    quarantined: Mutex<Vec<(u64, Instant)>>,
 }
 
 impl ActiveTxnRegistry {
@@ -74,6 +95,7 @@ impl ActiveTxnRegistry {
         Self {
             inner: Mutex::new(HashMap::new()),
             next_worker_handle: AtomicU64::new(1),
+            quarantined: Mutex::new(Vec::new()),
         }
     }
 
@@ -106,7 +128,7 @@ impl ActiveTxnRegistry {
         ActiveTxnGuard {
             registry: Arc::clone(self),
             handle_id,
-            defused: false,
+            quarantined: false,
         }
     }
 
@@ -116,6 +138,41 @@ impl ActiveTxnRegistry {
             .lock()
             .expect("ActiveTxnRegistry poisoned")
             .remove(&ActiveTxnKey::Worker(handle_id));
+    }
+
+    /// Move a worker entry into the quarantine list. The entry stays in
+    /// `inner` (protecting `min_start_ts`) until reaped.
+    fn quarantine_worker(&self, handle_id: u64) {
+        self.quarantined
+            .lock()
+            .expect("ActiveTxnRegistry poisoned")
+            .push((handle_id, Instant::now()));
+    }
+
+    /// Remove quarantined entries whose TTL has expired.  Called by the GC
+    /// publisher loop on each tick so stale entries don't pin the safepoint
+    /// indefinitely.  Returns the number of entries reaped.
+    pub fn reap_quarantined(&self) -> usize {
+        self.reap_quarantined_with_ttl(QUARANTINE_TTL)
+    }
+
+    fn reap_quarantined_with_ttl(&self, ttl: Duration) -> usize {
+        let mut quarantined = self.quarantined.lock().expect("ActiveTxnRegistry poisoned");
+        if quarantined.is_empty() {
+            return 0;
+        }
+        let mut inner = self.inner.lock().expect("ActiveTxnRegistry poisoned");
+        let now = Instant::now();
+        let before = quarantined.len();
+        quarantined.retain(|&(handle_id, quarantined_at)| {
+            if now.duration_since(quarantined_at) >= ttl {
+                inner.remove(&ActiveTxnKey::Worker(handle_id));
+                false
+            } else {
+                true
+            }
+        });
+        before - quarantined.len()
     }
 
     /// Minimum start_ts across all active transactions, or None if empty.
@@ -128,10 +185,19 @@ impl ActiveTxnRegistry {
             .min()
     }
 
-    /// Number of tracked transactions.
+    /// Number of tracked transactions (including quarantined).
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner.lock().expect("ActiveTxnRegistry poisoned").len()
+    }
+
+    /// Number of entries currently in quarantine.
+    #[allow(dead_code)]
+    pub fn quarantined_len(&self) -> usize {
+        self.quarantined
+            .lock()
+            .expect("ActiveTxnRegistry poisoned")
+            .len()
     }
 }
 
@@ -211,15 +277,48 @@ mod tests {
     }
 
     #[test]
-    fn defused_guard_keeps_registration_on_drop() {
+    fn quarantined_guard_keeps_registration_on_drop() {
         let r = Arc::new(ActiveTxnRegistry::new());
         {
             let mut guard = r.track_worker_txn(42);
             assert_eq!(r.min_start_ts(), Some(42));
-            guard.defuse();
+            guard.quarantine();
         }
-        // Registration survives the drop because guard was defused.
+        // Registration survives the drop because guard was quarantined.
         assert_eq!(r.min_start_ts(), Some(42));
         assert_eq!(r.len(), 1);
+        assert_eq!(r.quarantined_len(), 1);
+    }
+
+    #[test]
+    fn quarantined_entry_reaped_after_ttl() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        {
+            let mut guard = r.track_worker_txn(42);
+            guard.quarantine();
+        }
+        assert_eq!(r.min_start_ts(), Some(42));
+
+        // TTL=0 should reap immediately.
+        let reaped = r.reap_quarantined_with_ttl(Duration::ZERO);
+        assert_eq!(reaped, 1);
+        assert_eq!(r.min_start_ts(), None);
+        assert_eq!(r.len(), 0);
+        assert_eq!(r.quarantined_len(), 0);
+    }
+
+    #[test]
+    fn quarantined_entry_survives_until_ttl() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        {
+            let mut guard = r.track_worker_txn(42);
+            guard.quarantine();
+        }
+
+        // Very long TTL — should NOT reap yet.
+        let reaped = r.reap_quarantined_with_ttl(Duration::from_secs(3600));
+        assert_eq!(reaped, 0);
+        assert_eq!(r.min_start_ts(), Some(42));
+        assert_eq!(r.quarantined_len(), 1);
     }
 }
