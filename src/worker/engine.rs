@@ -1180,6 +1180,11 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
     let handle = pool.acquire(Some(keyspace.to_string())).await?;
     let store = handle.store().clone();
     let mut txn = store.begin().await?;
+    // This read-only snapshot scans all tables, schemas, and per-index delta
+    // prefixes — proportional to tenant size.  Register with the GC safepoint
+    // so GC does not advance past this snapshot while the sweep runs.
+    let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
     let table_names = store.list_tables(&mut txn, db_id).await?;
     let mut observed = 0u32;
@@ -1262,7 +1267,11 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
         }
     }
 
-    txn.rollback().await.ok(); // read-only tenant txn
+    if txn.rollback().await.is_err() {
+        if let Some(g) = txn_guard.as_mut() {
+            g.quarantine();
+        }
+    }
     Ok(HnswSweepResult {
         observed,
         enqueued,
@@ -2155,6 +2164,29 @@ mod tests {
         assert!(
             scan_source.contains("track_worker_txn(txn.start_timestamp().version())"),
             "storage size scan must publish its long-lived scan transaction in the active txn registry"
+        );
+    }
+
+    #[test]
+    fn hnsw_startup_sweep_tracks_its_read_transaction() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let fn_start = prod_source
+            .find("pub(crate) async fn enqueue_pending_hnsw_merges(")
+            .expect("enqueue_pending_hnsw_merges must exist");
+        let fn_end = prod_source[fn_start..]
+            .find("\npub")
+            .map(|offset| fn_start + offset)
+            .unwrap_or(prod_source.len());
+        let fn_source = &prod_source[fn_start..fn_end];
+
+        assert!(
+            fn_source.contains("track_worker_txn(txn.start_timestamp().version())"),
+            "HNSW startup sweep must publish its tenant snapshot in the active txn registry \
+             — the scan is proportional to tenant size and can outlive gc_life_time on large tenants"
         );
     }
 
