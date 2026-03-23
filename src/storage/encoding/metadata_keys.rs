@@ -240,10 +240,41 @@ pub fn encode_table_sequence_value_key_v2(db_id: u64, table_id: u64) -> Vec<u8> 
 /// Encode the key for persisted table statistics (storage format v2, database-scoped).
 ///
 /// Key format: `d_{db_id:8bytes}_sys_stats_{table_id:8bytes}`
+///
+/// Legacy: used for backward-compat reads of the old single-blob format.
 pub fn encode_stats_key_v2(db_id: u64, table_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_STATS_PREFIX);
     key.extend_from_slice(&table_id.to_be_bytes());
+    key
+}
+
+/// Encode the key for the per-table statistics header (row_count, last_analyzed).
+///
+/// Key format: `d_{db_id:8bytes}_sys_stats_{table_id:8bytes}_h`
+pub fn encode_stats_header_key(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_stats_key_v2(db_id, table_id);
+    key.push(b'_');
+    key.push(b'h');
+    key
+}
+
+/// Encode the key for a single column's statistics.
+///
+/// Key format: `d_{db_id:8bytes}_sys_stats_{table_id:8bytes}_c_{column_name}`
+pub fn encode_stats_column_key(db_id: u64, table_id: u64, column_name: &str) -> Vec<u8> {
+    let mut key = encode_stats_key_v2(db_id, table_id);
+    key.extend_from_slice(b"_c_");
+    key.extend_from_slice(column_name.as_bytes());
+    key
+}
+
+/// Encode the prefix for scanning all per-column stats keys of a table.
+///
+/// Key format: `d_{db_id:8bytes}_sys_stats_{table_id:8bytes}_c_`
+pub fn encode_stats_column_prefix(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_stats_key_v2(db_id, table_id);
+    key.extend_from_slice(b"_c_");
     key
 }
 

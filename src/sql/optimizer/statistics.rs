@@ -8,6 +8,14 @@ use crate::model::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Table-level statistics header (stored as a separate KV from per-column stats).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableStatsHeader {
+    pub table_id: u64,
+    pub row_count: usize,
+    pub last_analyzed: i64,
+}
+
 /// Statistics for an entire table, collected by `ANALYZE`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStatistics {

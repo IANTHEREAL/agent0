@@ -27,6 +27,12 @@ const HISTOGRAM_BUCKETS: usize = 100;
 /// Batch size (rows) for streaming table scan.
 const ANALYZE_BATCH_SIZE: u32 = 10_000;
 
+/// Maximum width (bytes) of a value to include in MCV or histogram statistics.
+/// Values wider than this are skipped — they are unlikely to be duplicated
+/// and would inflate the per-column statistics blob.
+/// Matches PostgreSQL's `WIDTH_THRESHOLD` in `analyze.c`.
+const WIDTH_THRESHOLD: usize = 1024;
+
 // ── Table name parsing ──────────────────────────────────────────────────
 
 /// Parse the optional table name from a raw ANALYZE SQL string.
@@ -151,7 +157,12 @@ struct ColumnAccumulator {
     /// Canonical key bytes → (representative Value, frequency count).
     /// The representative Value is stored on first observation — no
     /// deserialization needed at finalization time.
+    /// Only contains values ≤ WIDTH_THRESHOLD bytes.
     value_counts: HashMap<Vec<u8>, (Value, usize)>,
+    /// Count of over-width non-NULL values observed. Each observation is
+    /// assumed distinct (matches PG analyze.c: "Overwidth values are assumed
+    /// to have been distinct"). This avoids storing wide key bytes in memory.
+    wide_value_count: usize,
 }
 
 impl ColumnAccumulator {
@@ -161,6 +172,37 @@ impl ColumnAccumulator {
             non_null_count: 0,
             total_width: 0,
             value_counts: HashMap::new(),
+            wide_value_count: 0,
+        }
+    }
+
+    /// Estimate the datum width of a Value, matching PostgreSQL's
+    /// `pg_column_size` semantics (payload bytes, not encoding overhead).
+    /// Estimate PG-compatible datum width for WIDTH_THRESHOLD comparison.
+    /// Matches `pg_column_size()` semantics used by PG's analyze.c.
+    fn datum_width(value: &Value) -> usize {
+        match value {
+            Value::Null => 0,
+            Value::Boolean(_) => 1,
+            Value::Int32(_) => 4,
+            Value::Int64(_) | Value::Float64(_) => 8,
+            Value::Numeric(_) => 8, // rust_decimal: 128-bit fixed
+            Value::Date(_) => 4,
+            Value::Time(_) | Value::Timestamp(_) => 8,
+            Value::Interval { .. } => 16,
+            Value::Uuid(_) => 16,
+            Value::Text(s) => s.len() + 4,
+            Value::Json(s) | Value::Jsonb(s) => s.len() + 4,
+            Value::Bytes(b) => b.len() + 4,
+            Value::Tsvector(s) | Value::Tsquery(s) => s.len() + 4,
+            Value::Vector(v) => v.len() * 4 + 4, // f32 per dim + header
+            Value::Array(a) => {
+                // PG array: 24-byte header (varlena + ndim + flags + elemtype
+                // + dim/lbound) + per-element datum sizes.
+                // Verified: pg_column_size(array[1]::int4[]) = 28 = 24 + 4.
+                let elem_size: usize = a.iter().map(Self::datum_width).sum();
+                elem_size + 24
+            }
         }
     }
 
@@ -171,10 +213,19 @@ impl ColumnAccumulator {
             self.non_null_count += 1;
             let key_bytes = encode_value_key(value);
             self.total_width += key_bytes.len();
-            self.value_counts
-                .entry(key_bytes)
-                .and_modify(|(_val, count)| *count += 1)
-                .or_insert_with(|| (canonicalize_value(value), 1));
+            // Skip wide values from MCV/histogram collection (matches PG's
+            // WIDTH_THRESHOLD on datum width, not encoding width).
+            // Wide values are still counted for null_fraction, n_distinct,
+            // and avg_width.
+            if Self::datum_width(value) <= WIDTH_THRESHOLD {
+                self.value_counts
+                    .entry(key_bytes)
+                    .and_modify(|(_val, count)| *count += 1)
+                    .or_insert_with(|| (canonicalize_value(value), 1));
+            } else {
+                // Each wide observation assumed distinct (matches PG analyze.c).
+                self.wide_value_count += 1;
+            }
         }
     }
 }
@@ -188,7 +239,11 @@ fn finalize_column(acc: &ColumnAccumulator, row_count: usize) -> ColumnStatistic
     }
 
     let null_fraction = acc.null_count as f64 / row_count as f64;
-    let n_distinct = acc.value_counts.len() as f64;
+    // NDV = narrow distinct values (in value_counts) + wide value observations.
+    // Wide values are excluded from MCVs/histograms but each observation is
+    // assumed distinct (matches PG: "Overwidth values are assumed to have been
+    // distinct"). This may over-count if wide values repeat, but matches PG.
+    let n_distinct = (acc.value_counts.len() + acc.wide_value_count) as f64;
     let avg_width = if acc.non_null_count > 0 {
         acc.total_width / acc.non_null_count
     } else {
