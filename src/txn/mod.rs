@@ -356,7 +356,11 @@ mod tests {
                 // Format the event message to check for the needle.
                 struct Visitor<'a>(&'a str, bool);
                 impl tracing::field::Visit for Visitor<'_> {
-                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
                         if field.name() == "message" {
                             let s = format!("{:?}", value);
                             if s.contains(self.0) {
@@ -368,7 +372,8 @@ mod tests {
                 let mut v = Visitor(self.needle, false);
                 event.record(&mut v);
                 if v.1 {
-                    self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -436,7 +441,8 @@ mod tests {
         let err = check_value_size(&key, &value).unwrap_err();
         // Must downcast to SqlError::ValueTooLarge — this is what
         // sqlstate_for_executor_error uses to map to SQLSTATE 54000.
-        let sql_err = err.downcast_ref::<SqlError>()
+        let sql_err = err
+            .downcast_ref::<SqlError>()
             .expect("check_value_size should return SqlError::ValueTooLarge");
         assert_eq!(sql_err.sqlstate(), "54000");
     }
