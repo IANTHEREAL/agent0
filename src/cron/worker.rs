@@ -4,6 +4,7 @@ use crate::storage::TikvStore;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tikv_client::TimestampExt;
 use tracing::info;
 
 pub(crate) async fn gc_database(
@@ -26,6 +27,11 @@ pub(crate) async fn gc_database(
     );
 
     let mut txn = store.begin().await?;
+    // This transaction scans all cron runs (usize::MAX) and may perform
+    // bulk delete + re-insert — duration is proportional to run history.
+    // Register with GC safepoint so GC does not advance past this snapshot.
+    let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
     let gc_result = async {
         if !store.is_cron_enabled(&mut txn, db_id).await? {
             return Ok((0usize, 0usize));
@@ -113,7 +119,11 @@ pub(crate) async fn gc_database(
             Ok(())
         }
         Err(e) => {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+            }
             Err(e)
         }
     }
@@ -210,6 +220,25 @@ mod tests {
         assert!(
             cutoff <= 0,
             "overflow u64 must clamp to i64::MAX, producing a cutoff no run can exceed"
+        );
+    }
+
+    #[test]
+    fn gc_database_tracks_its_unbounded_scan_transaction() {
+        let source = include_str!("worker.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("cron/worker.rs must contain #[cfg(test)]");
+        let gc_fn = prod_source
+            .split("pub(crate) async fn gc_database(")
+            .nth(1)
+            .expect("gc_database must exist");
+
+        assert!(
+            gc_fn.contains("track_worker_txn(txn.start_timestamp().version())"),
+            "gc_database scans usize::MAX cron runs in a single txn — it must \
+             register with the GC safepoint to prevent GC overrun on large histories"
         );
     }
 }
