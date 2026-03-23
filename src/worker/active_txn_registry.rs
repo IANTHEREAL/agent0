@@ -92,10 +92,11 @@ pub struct ActiveTxnRegistry {
     /// tracker key -> start_ts (TiKV TSO version)
     inner: Mutex<HashMap<ActiveTxnKey, u64>>,
     next_worker_handle: AtomicU64,
-    /// Worker registrations moved to quarantine after finalization failure.
-    /// Each entry is (handle_id, quarantine_start_time).  Reaped by the GC
-    /// publisher loop via [`reap_quarantined`](Self::reap_quarantined).
-    quarantined: Mutex<Vec<(u64, Instant)>>,
+    /// Registrations moved to quarantine after finalization failure or
+    /// session teardown.  Each entry is (key, quarantine_start_time).
+    /// Reaped by the GC publisher loop via
+    /// [`reap_quarantined`](Self::reap_quarantined).
+    quarantined: Mutex<Vec<(ActiveTxnKey, Instant)>>,
 }
 
 impl ActiveTxnRegistry {
@@ -117,12 +118,41 @@ impl ActiveTxnRegistry {
     }
 
     /// Unregister an interactive session transaction. Idempotent.
+    ///
+    /// Used by `Session::commit()`/`rollback()` after **confirmed** TiKV
+    /// finalization.  For `Session::drop` (uncertain teardown), use
+    /// [`quarantine_connection`] instead.
     #[inline]
     pub fn unregister_connection(&self, connection_id: i64) {
         self.inner
             .lock()
             .expect("ActiveTxnRegistry poisoned")
             .remove(&ActiveTxnKey::Connection(connection_id));
+    }
+
+    /// Move a connection's registration into quarantine instead of
+    /// unregistering immediately.  The entry stays in the registry for
+    /// [`QUARANTINE_TTL`], then is reaped by the GC publisher.
+    ///
+    /// Used by `Session::drop` — the vendored tikv-client `Transaction::Drop`
+    /// does not send a rollback RPC, so TiKV-side locks may persist until
+    /// lock TTL (~20 s).  Quarantining keeps the `start_ts` protected during
+    /// that window.
+    pub fn quarantine_connection(&self, connection_id: i64) {
+        let key = ActiveTxnKey::Connection(connection_id);
+        // Only quarantine if the entry actually exists (session may have
+        // already been cleanly committed/rolled back).
+        let exists = self
+            .inner
+            .lock()
+            .expect("ActiveTxnRegistry poisoned")
+            .contains_key(&key);
+        if exists {
+            self.quarantined
+                .lock()
+                .expect("ActiveTxnRegistry poisoned")
+                .push((key, Instant::now()));
+        }
     }
 
     /// Register a worker/background transaction and return a guard that
@@ -154,7 +184,7 @@ impl ActiveTxnRegistry {
         self.quarantined
             .lock()
             .expect("ActiveTxnRegistry poisoned")
-            .push((handle_id, Instant::now()));
+            .push((ActiveTxnKey::Worker(handle_id), Instant::now()));
     }
 
     /// Remove quarantined entries whose TTL has expired.  Called by the GC
@@ -172,9 +202,9 @@ impl ActiveTxnRegistry {
         let mut inner = self.inner.lock().expect("ActiveTxnRegistry poisoned");
         let now = Instant::now();
         let before = quarantined.len();
-        quarantined.retain(|&(handle_id, quarantined_at)| {
+        quarantined.retain(|&(key, quarantined_at)| {
             if now.duration_since(quarantined_at) >= ttl {
-                inner.remove(&ActiveTxnKey::Worker(handle_id));
+                inner.remove(&key);
                 false
             } else {
                 true
@@ -312,6 +342,36 @@ mod tests {
         assert_eq!(reaped, 1);
         assert_eq!(r.min_start_ts(), None);
         assert_eq!(r.len(), 0);
+        assert_eq!(r.quarantined_len(), 0);
+    }
+
+    #[test]
+    fn quarantine_connection_keeps_registration_on_drop_then_reaps() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        r.register_connection(1, 77);
+        assert_eq!(r.min_start_ts(), Some(77));
+
+        // Quarantine instead of unregister.
+        r.quarantine_connection(1);
+        assert_eq!(r.min_start_ts(), Some(77));
+        assert_eq!(r.quarantined_len(), 1);
+
+        // TTL=0 should reap immediately.
+        let reaped = r.reap_quarantined_with_ttl(Duration::ZERO);
+        assert_eq!(reaped, 1);
+        assert_eq!(r.min_start_ts(), None);
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn quarantine_connection_is_noop_when_already_unregistered() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        r.register_connection(1, 77);
+        r.unregister_connection(1);
+        assert_eq!(r.min_start_ts(), None);
+
+        // Quarantine after clean unregister should be a no-op.
+        r.quarantine_connection(1);
         assert_eq!(r.quarantined_len(), 0);
     }
 

@@ -981,11 +981,19 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Safety net: ensure active transaction's start_ts is unregistered
-        // from the GC registry even if commit/rollback was never called
-        // (e.g., connection dropped, panic).
+        // Safety net: if an active transaction was never committed or rolled
+        // back (e.g., client disconnect, panic), quarantine the registration
+        // instead of immediately unregistering.  The vendored tikv-client
+        // Transaction::Drop does NOT send a rollback RPC — TiKV-side locks
+        // persist until lock TTL (~20 s).  Quarantining keeps the start_ts
+        // protected during that window; the GC publisher reaps the entry
+        // after QUARANTINE_TTL.
+        //
+        // If commit/rollback already succeeded, the entry was already removed
+        // from the registry by transaction.rs and quarantine_connection is a
+        // no-op (it checks existence before quarantining).
         if let Some(ref registry) = self.active_txn_registry {
-            registry.unregister_connection(self.connection_id);
+            registry.quarantine_connection(self.connection_id);
         }
     }
 }
@@ -993,7 +1001,7 @@ impl Drop for Session {
 #[cfg(test)]
 mod drop_contract_tests {
     #[test]
-    fn session_drop_remains_gc_registry_cleanup_point() {
+    fn session_drop_quarantines_gc_registration() {
         let source = include_str!("mod.rs");
         let prod_source = source
             .split("#[cfg(test)] mod drop_contract_tests")
@@ -1005,8 +1013,14 @@ mod drop_contract_tests {
             .expect("session/mod.rs must define Session::drop");
 
         assert!(
-            drop_impl.contains("unregister_connection(self.connection_id)"),
-            "Session::drop must unregister the GC registry as the final connection cleanup point"
+            drop_impl.contains("quarantine_connection(self.connection_id)"),
+            "Session::drop must quarantine (not immediately unregister) the GC \
+             registration — tikv-client Transaction::Drop does not send a rollback \
+             RPC, so locks may persist until TiKV lock TTL"
+        );
+        assert!(
+            !drop_impl.contains("unregister_connection(self.connection_id)"),
+            "Session::drop must NOT immediately unregister — use quarantine instead"
         );
     }
 }
