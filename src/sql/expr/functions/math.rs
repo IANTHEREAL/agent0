@@ -288,8 +288,7 @@ pub fn ln(args: Vec<Value>) -> Result<Value> {
             }
             let result = d.checked_ln().ok_or_else(|| {
                 crate::sql::error::SqlError::NumericValueOutOfRange {
-                    message: "value overflows numeric format"
-                        .into(),
+                    message: "value overflows numeric format".into(),
                 }
             })?;
             Ok(Value::Numeric(round_to_significant_digits(result, 16)))
@@ -321,8 +320,7 @@ pub fn log10(args: Vec<Value>) -> Result<Value> {
             }
             let ln_val = d.checked_ln().ok_or_else(|| {
                 crate::sql::error::SqlError::NumericValueOutOfRange {
-                    message: "value overflows numeric format"
-                        .into(),
+                    message: "value overflows numeric format".into(),
                 }
             })?;
             let ln_10 = Decimal::TEN.ln(); // constant, always safe

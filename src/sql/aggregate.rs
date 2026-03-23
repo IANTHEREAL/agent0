@@ -140,14 +140,20 @@ impl Aggregator {
                             if let Some(sf) = sum_float.as_mut() {
                                 *sf += *i as f64;
                             } else {
-                                *sum = crate::sql::expr::numeric::checked_decimal_add(*sum, Decimal::from(*i))?;
+                                *sum = crate::sql::expr::numeric::checked_decimal_add(
+                                    *sum,
+                                    Decimal::from(*i),
+                                )?;
                             }
                         }
                         Value::Int64(i) => {
                             if let Some(sf) = sum_float.as_mut() {
                                 *sf += *i as f64;
                             } else {
-                                *sum = crate::sql::expr::numeric::checked_decimal_add(*sum, Decimal::from(*i))?;
+                                *sum = crate::sql::expr::numeric::checked_decimal_add(
+                                    *sum,
+                                    Decimal::from(*i),
+                                )?;
                             }
                         }
                         Value::Float64(f) => {
@@ -359,22 +365,39 @@ fn value_to_json_str_canonical(v: &Value) -> String {
 
 fn add_values(left: &Value, right: &Value) -> Result<Value> {
     match (left, right) {
-        (Value::Int32(l), Value::Int32(r)) => l
-            .checked_add(*r)
-            .map(Value::Int32)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
-        (Value::Int64(l), Value::Int64(r)) => l
-            .checked_add(*r)
-            .map(Value::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (Value::Int32(l), Value::Int32(r)) => {
+            l.checked_add(*r).map(Value::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            })
+        }
+        (Value::Int64(l), Value::Int64(r)) => {
+            l.checked_add(*r).map(Value::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
+        }
         (Value::Int32(l), Value::Int64(r)) => (*l as i64)
             .checked_add(*r)
             .map(Value::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
-        (Value::Int64(l), Value::Int32(r)) => l
-            .checked_add(*r as i64)
-            .map(Value::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+            .ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            }),
+        (Value::Int64(l), Value::Int32(r)) => {
+            l.checked_add(*r as i64).map(Value::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
+        }
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l + r)),
         (Value::Int32(l), Value::Float64(r)) => Ok(Value::Float64(*l as f64 + r)),
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l + *r as f64)),
@@ -384,8 +407,12 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         (Value::Text(l), Value::Text(r)) => {
             // Try parsing as int first, then float
             match (l.parse::<i64>(), r.parse::<i64>()) {
-                (Ok(li), Ok(ri)) => li.checked_add(ri).map(Value::Int64)
-                    .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+                (Ok(li), Ok(ri)) => li.checked_add(ri).map(Value::Int64).ok_or_else(|| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "bigint out of range".into(),
+                    }
+                    .into()
+                }),
                 _ => match (l.parse::<f64>(), r.parse::<f64>()) {
                     (Ok(lf), Ok(rf)) => Ok(Value::Float64(lf + rf)),
                     _ => Err(anyhow!("Cannot add non-numeric text values")),
@@ -394,8 +421,12 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         }
         (Value::Text(t), Value::Int32(i)) | (Value::Int32(i), Value::Text(t)) => {
             if let Ok(ti) = t.parse::<i32>() {
-                ti.checked_add(*i).map(Value::Int32)
-                    .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into())
+                ti.checked_add(*i).map(Value::Int32).ok_or_else(|| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "integer out of range".into(),
+                    }
+                    .into()
+                })
             } else if let Ok(tf) = t.parse::<f64>() {
                 Ok(Value::Float64(tf + *i as f64))
             } else {
@@ -404,8 +435,12 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         }
         (Value::Text(t), Value::Int64(i)) | (Value::Int64(i), Value::Text(t)) => {
             if let Ok(ti) = t.parse::<i64>() {
-                ti.checked_add(*i).map(Value::Int64)
-                    .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into())
+                ti.checked_add(*i).map(Value::Int64).ok_or_else(|| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "bigint out of range".into(),
+                    }
+                    .into()
+                })
             } else if let Ok(tf) = t.parse::<f64>() {
                 Ok(Value::Float64(tf + *i as f64))
             } else {
@@ -422,12 +457,16 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(
             crate::sql::expr::numeric::checked_decimal_add(*l, *r)?,
         )),
-        (Value::Numeric(d), Value::Int32(i)) | (Value::Int32(i), Value::Numeric(d)) => Ok(
-            Value::Numeric(crate::sql::expr::numeric::checked_decimal_add(*d, Decimal::from(*i))?),
-        ),
-        (Value::Numeric(d), Value::Int64(i)) | (Value::Int64(i), Value::Numeric(d)) => Ok(
-            Value::Numeric(crate::sql::expr::numeric::checked_decimal_add(*d, Decimal::from(*i))?),
-        ),
+        (Value::Numeric(d), Value::Int32(i)) | (Value::Int32(i), Value::Numeric(d)) => {
+            Ok(Value::Numeric(
+                crate::sql::expr::numeric::checked_decimal_add(*d, Decimal::from(*i))?,
+            ))
+        }
+        (Value::Numeric(d), Value::Int64(i)) | (Value::Int64(i), Value::Numeric(d)) => {
+            Ok(Value::Numeric(
+                crate::sql::expr::numeric::checked_decimal_add(*d, Decimal::from(*i))?,
+            ))
+        }
         (Value::Numeric(d), Value::Float64(f)) | (Value::Float64(f), Value::Numeric(d)) => {
             let df = d
                 .to_f64()
