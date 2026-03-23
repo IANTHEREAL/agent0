@@ -9,7 +9,7 @@ use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use super::{DEFAULT_DML_TABLE_SCAN_MAX_ROWS, DEFAULT_MAX_SORT_BYTES};
+use super::{DEFAULT_DML_TABLE_SCAN_MAX_ROWS, DEFAULT_HASH_JOIN_WORK_MEM, DEFAULT_MAX_SORT_BYTES};
 const DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND: usize = i64::MAX as usize;
 
 // ── GUC type classification ──────────────────────────────────────────────
@@ -504,6 +504,15 @@ pub(crate) const GUC_TABLE: &[GucDef] = &[
         validate_fn: Some(validate_db9_dml_table_scan_max_rows),
     },
     GucDef {
+        name: "db9.hash_join_work_mem",
+        guc_type: GucType::ByteSize,
+        context: GucContext::Userset,
+        description: "Maximum memory for hash join build side (0 = unlimited)",
+        boot_default: "", // runtime default from DEFAULT_HASH_JOIN_WORK_MEM
+        flags: GUC_RUNTIME_DEFAULT,
+        validate_fn: None,
+    },
+    GucDef {
         name: "db9.max_sort_bytes",
         guc_type: GucType::ByteSize,
         context: GucContext::Userset,
@@ -925,6 +934,10 @@ struct SettingsSavepoint {
 pub(crate) struct SessionSettings {
     search_path: Vec<String>,
 
+    /// Maximum bytes for hash join build side.
+    /// Default: 256 MB. 0 = unlimited.
+    hash_join_work_mem: usize,
+
     /// Maximum bytes allowed for in-memory sort (ORDER BY).
     /// Default: 256 MB. 0 = unlimited.
     max_sort_bytes: usize,
@@ -1034,6 +1047,7 @@ impl SessionSettings {
     pub(crate) fn canonical_setting_name(name: &str) -> &str {
         match name {
             "transaction.isolation.level" => "transaction_isolation",
+            "db9.hash_join_work_mem" => "db9.hash_join_work_mem",
             "db9.max_sort_bytes" => "db9.max_sort_bytes",
             _ => name,
         }
@@ -1055,6 +1069,7 @@ impl SessionSettings {
     ) -> Self {
         Self {
             search_path: Self::default_search_path(),
+            hash_join_work_mem: DEFAULT_HASH_JOIN_WORK_MEM,
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
             dml_table_scan_max_rows: DEFAULT_DML_TABLE_SCAN_MAX_ROWS,
             prepared_plan_cache_size: 128,
@@ -1328,6 +1343,9 @@ impl SessionSettings {
                     .parse()
                     .unwrap_or(DEFAULT_DML_TABLE_SCAN_MAX_ROWS);
             }
+            "db9.hash_join_work_mem" => {
+                self.hash_join_work_mem = Self::parse_byte_size(&normalized)?;
+            }
             "db9.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(&normalized)?;
             }
@@ -1510,6 +1528,7 @@ impl SessionSettings {
             "db9.dml_table_scan_max_rows" => {
                 self.dml_table_scan_max_rows = DEFAULT_DML_TABLE_SCAN_MAX_ROWS
             }
+            "db9.hash_join_work_mem" => self.hash_join_work_mem = DEFAULT_HASH_JOIN_WORK_MEM,
             "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
             "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
             "db9.prepared_plan_cache_min_exec" => self.prepared_plan_cache_min_exec = 5,
@@ -1571,6 +1590,7 @@ impl SessionSettings {
             | "idle_in_transaction_session_timeout"
             | "db9.retry_timeout" => Self::format_timeout_show(0),
             "db9.dml_table_scan_max_rows" => DEFAULT_DML_TABLE_SCAN_MAX_ROWS.to_string(),
+            "db9.hash_join_work_mem" => DEFAULT_HASH_JOIN_WORK_MEM.to_string(),
             "db9.max_sort_bytes" => DEFAULT_MAX_SORT_BYTES.to_string(),
             "db9.prepared_plan_cache_size" => "128".to_string(),
             "db9.prepared_plan_cache_min_exec" => "5".to_string(),
@@ -1679,6 +1699,7 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms,
             )),
             "db9.dml_table_scan_max_rows" => Some(self.dml_table_scan_max_rows.to_string()),
+            "db9.hash_join_work_mem" => Some(self.hash_join_work_mem.to_string()),
             "db9.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
             "db9.prepared_plan_cache_size" => Some(self.prepared_plan_cache_size.to_string()),
             "db9.prepared_plan_cache_min_exec" => {
@@ -1918,6 +1939,22 @@ impl SessionSettings {
         }
     }
 
+    pub(crate) fn hash_join_work_mem(&self) -> usize {
+        if let Some(v) = self.local_overrides.get("db9.hash_join_work_mem") {
+            match Self::parse_byte_size(v) {
+                Ok(bytes) => return bytes,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local db9.hash_join_work_mem override"
+                    );
+                }
+            }
+        }
+        self.hash_join_work_mem
+    }
+
     pub(crate) fn max_sort_bytes(&self) -> usize {
         if let Some(v) = self.local_overrides.get("db9.max_sort_bytes") {
             match Self::parse_byte_size(v) {
@@ -2002,6 +2039,7 @@ impl SessionSettings {
         "lock_timeout",
         "idle_in_transaction_session_timeout",
         "db9.dml_table_scan_max_rows",
+        "db9.hash_join_work_mem",
         "db9.max_sort_bytes",
         "db9.prepared_plan_cache_size",
         "db9.prepared_plan_cache_min_exec",

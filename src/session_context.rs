@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 use tikv_client::{TimestampExt, Transaction};
 
-use crate::sql::DEFAULT_MAX_SORT_BYTES;
+use crate::sql::{DEFAULT_HASH_JOIN_WORK_MEM, DEFAULT_MAX_SORT_BYTES};
 use crate::storage::TikvStore;
 
 /// Extension transaction delta snapshot: (created_set, dropped_set).
@@ -44,6 +44,10 @@ tokio::task_local! {
 
 tokio::task_local! {
     static MAX_SORT_BYTES: usize;
+}
+
+tokio::task_local! {
+    static HASH_JOIN_WORK_MEM: usize;
 }
 
 tokio::task_local! {
@@ -102,6 +106,12 @@ pub fn current_max_sort_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_SORT_BYTES)
 }
 
+pub fn current_hash_join_work_mem() -> usize {
+    HASH_JOIN_WORK_MEM
+        .try_with(|bytes| *bytes)
+        .unwrap_or(DEFAULT_HASH_JOIN_WORK_MEM)
+}
+
 pub async fn with_timezone<R, Fut>(timezone: Arc<str>, fut: Fut) -> R
 where
     Fut: Future<Output = R>,
@@ -114,6 +124,13 @@ where
     Fut: Future<Output = R>,
 {
     MAX_SORT_BYTES.scope(max_sort_bytes, fut).await
+}
+
+pub async fn with_hash_join_work_mem<R, Fut>(hash_join_work_mem: usize, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    HASH_JOIN_WORK_MEM.scope(hash_join_work_mem, fut).await
 }
 
 pub fn current_search_path_first_schema() -> String {

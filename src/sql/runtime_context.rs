@@ -11,6 +11,7 @@ pub(crate) struct RuntimeSettings {
     pub bypass_rls: bool,
     pub timezone: Arc<str>,
     pub max_sort_bytes: usize,
+    pub hash_join_work_mem: usize,
     pub search_path: Arc<Vec<String>>,
     pub text_search_config: Arc<str>,
 }
@@ -26,6 +27,7 @@ impl RuntimeSettings {
                     .unwrap_or_else(|| "UTC".to_string()),
             ),
             max_sort_bytes: session.max_sort_bytes(),
+            hash_join_work_mem: session.hash_join_work_mem(),
             search_path: Arc::new(session.search_path().to_vec()),
             text_search_config: Arc::from(
                 session
@@ -97,6 +99,8 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
         settings.timezone,
         crate::session_context::with_max_sort_bytes(
             settings.max_sort_bytes,
+            crate::session_context::with_hash_join_work_mem(
+            settings.hash_join_work_mem,
             crate::session_context::with_search_path(
                 settings.search_path,
                 crate::session_context::with_text_search_config(
@@ -128,6 +132,7 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                     ),
                 ),
             ),
+        ),
         ),
     ))
 }
@@ -286,6 +291,7 @@ mod tests {
                 bypass_rls: false,
                 timezone: Arc::from("UTC"),
                 max_sort_bytes: 1234,
+                hash_join_work_mem: 256 * 1024 * 1024,
                 search_path: Arc::new(vec!["$user".to_string(), "public".to_string()]),
                 text_search_config: Arc::from("simple"),
             },
@@ -357,6 +363,7 @@ mod tests {
                 bypass_rls: false,
                 timezone: Arc::from("UTC"),
                 max_sort_bytes: 1234,
+                hash_join_work_mem: 256 * 1024 * 1024,
                 search_path: Arc::new(vec!["public".to_string()]),
                 text_search_config: Arc::from("simple"),
             },
@@ -397,6 +404,7 @@ mod tests {
                 bypass_rls: false,
                 timezone: Arc::from("UTC"),
                 max_sort_bytes: 1234,
+                hash_join_work_mem: 256 * 1024 * 1024,
                 search_path: Arc::new(vec!["public".to_string()]),
                 text_search_config: Arc::from("simple"),
             },

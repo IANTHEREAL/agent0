@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use tikv_client::{TimestampExt, Transaction};
 
 pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const DEFAULT_HASH_JOIN_WORK_MEM: usize = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_DML_TABLE_SCAN_MAX_ROWS: usize = 10_000;
 
 pub enum TransactionState {
@@ -942,6 +943,10 @@ impl Session {
 
     pub(crate) fn lock_timeout(&self) -> Option<Duration> {
         self.settings.lock_timeout()
+    }
+
+    pub(crate) fn hash_join_work_mem(&self) -> usize {
+        self.settings.hash_join_work_mem()
     }
 
     pub(crate) fn max_sort_bytes(&self) -> usize {

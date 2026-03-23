@@ -75,10 +75,15 @@ async fn eval_join_filter(
     }
 }
 
-/// Configuration for hash join planning/execution.
+/// Legacy configuration for hash join planning/execution.
+///
+/// The memory limit is now controlled by the `db9.hash_join_work_mem` session
+/// GUC (read at runtime via `current_hash_join_work_mem()`).  This struct is
+/// retained only for API compatibility with existing callers; the field is not
+/// read at runtime.
 #[derive(Debug, Clone)]
 pub struct HashJoinConfig {
-    /// Maximum memory for the build-side hash table (bytes).
+    #[allow(dead_code)]
     pub max_memory_bytes: usize,
 }
 
@@ -136,6 +141,7 @@ pub struct HashJoinOperator {
     probe_outer: bool,
     filter: Option<TypedExpr>,
     output_schema: TableSchema,
+    #[allow(dead_code)]
     config: HashJoinConfig,
     state: HashJoinState,
 }
@@ -250,15 +256,19 @@ impl PhysicalOperator for HashJoinOperator {
             self.build_child.estimated_rows().unwrap_or(0),
         );
 
+        let max_memory = crate::session_context::current_hash_join_work_mem();
         while let Some(row) = self.build_child.next(ctx).await? {
             let delta = hash_table.insert(row);
             try_grow_statement_memory_scope("operators.hash_join.build", delta)?;
-            if hash_table.memory_bytes() > self.config.max_memory_bytes {
-                tracing::warn!(
-                    "Hash join exceeded memory limit: {} > {}",
+            if max_memory > 0 && hash_table.memory_bytes() > max_memory {
+                return Err(anyhow!(
+                    "hash join build side exceeded memory limit: \
+                     used {} bytes, limit {} bytes (db9.hash_join_work_mem). \
+                     Reduce build-side cardinality with WHERE/LIMIT or \
+                     increase db9.hash_join_work_mem",
                     hash_table.memory_bytes(),
-                    self.config.max_memory_bytes
-                );
+                    max_memory,
+                ));
             }
         }
         hash_table.finalize();

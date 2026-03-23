@@ -111,9 +111,20 @@ impl PhysicalOperator for HashSemiJoinOperator {
             self.right_key_indices.clone(),
             self.right_child.estimated_rows().unwrap_or(0),
         );
+        let max_memory = crate::session_context::current_hash_join_work_mem();
         while let Some(row) = self.right_child.next(ctx).await? {
             let delta = hash_table.insert(row);
             try_grow_statement_memory_scope("operators.hash_semi_join.build", delta)?;
+            if max_memory > 0 && hash_table.memory_bytes() > max_memory {
+                return Err(anyhow::anyhow!(
+                    "hash join build side exceeded memory limit: \
+                     used {} bytes, limit {} bytes (db9.hash_join_work_mem). \
+                     Reduce build-side cardinality with WHERE/LIMIT or \
+                     increase db9.hash_join_work_mem",
+                    hash_table.memory_bytes(),
+                    max_memory,
+                ));
+            }
         }
         hash_table.finalize();
 
