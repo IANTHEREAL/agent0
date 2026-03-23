@@ -922,7 +922,7 @@ impl WorkerEngine {
         let tikv_client = store.transaction_client();
 
         let mut txn = store.begin().await?;
-        let _txn_guard = crate::worker::active_txn_registry::global_registry()
+        let mut txn_guard = crate::worker::active_txn_registry::global_registry()
             .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
         let mut sequence_values = crate::sql::sequences::SequenceSession::new();
         let task_fut = async {
@@ -980,7 +980,14 @@ impl WorkerEngine {
         match result {
             Ok(completed_commands) => Ok(completed_commands),
             Err(e) => {
-                let _ = txn.rollback().await;
+                if txn.rollback().await.is_err() {
+                    // Rollback failed — the txn may still be live in TiKV.
+                    // Keep the GC registration so the safepoint does not
+                    // advance past this potentially live transaction.
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.defuse();
+                    }
+                }
                 Err(e)
             }
         }
@@ -1416,24 +1423,30 @@ async fn execute_hnsw_merge(
 
     loop {
         let mut txn = store.begin().await?;
-        let _txn_guard = crate::worker::active_txn_registry::global_registry()
+        let mut txn_guard = crate::worker::active_txn_registry::global_registry()
             .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
         // 1. Read meta
         let meta_key = hnsw_meta_key(db_id, table_id, index_id);
         let Some(meta_bytes) = txn.get(meta_key.clone()).await? else {
             // Index metadata missing — index was dropped. Abort silently.
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+            }
             break;
         };
         let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
         if should_skip_frozen_merge(&meta) {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+            }
             info!(table_id, index_id, "HNSW merge skipped: index is frozen");
             return Ok(());
         }
         if meta.storage_version != 1 {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+            }
             return Err(anyhow!(
                 "HNSW index has unsupported storage_version={}; only v1 supported",
                 meta.storage_version
@@ -1478,7 +1491,9 @@ async fn execute_hnsw_merge(
         }
 
         if batch_deltas.is_empty() {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+            }
             break; // No more deltas — merge complete.
         }
 
@@ -1531,7 +1546,10 @@ async fn execute_hnsw_merge(
                 "HNSW graph exceeds size limit — freezing index"
             );
             txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
-            txn.commit().await?;
+            if let Err(e) = txn.commit().await {
+                if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+                return Err(e.into());
+            }
             return Ok(());
         }
 
@@ -1546,7 +1564,10 @@ async fn execute_hnsw_merge(
         delete_delta_keys(&mut txn, &batch_keys).await?;
 
         // 7. Commit.
-        txn.commit().await?;
+        if let Err(e) = txn.commit().await {
+            if let Some(g) = txn_guard.as_mut() { g.defuse(); }
+            return Err(e.into());
+        }
         total_deltas_merged += batch_count;
 
         info!(

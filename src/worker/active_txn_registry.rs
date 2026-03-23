@@ -31,14 +31,33 @@ enum ActiveTxnKey {
 
 /// RAII guard for a worker/background TiKV transaction published in the
 /// process-local GC registry.
+///
+/// By default the guard unregisters the transaction when dropped.  Call
+/// [`defuse`](Self::defuse) before dropping to **keep** the registration
+/// alive — use this when commit or rollback failed and the underlying TiKV
+/// transaction may still be live.
 pub struct ActiveTxnGuard {
     registry: Arc<ActiveTxnRegistry>,
     handle_id: u64,
+    defused: bool,
+}
+
+impl ActiveTxnGuard {
+    /// Prevent this guard from unregistering the transaction on drop.
+    ///
+    /// Call this when the transaction's commit or rollback failed — the
+    /// registration must stay so the GC safepoint does not advance past a
+    /// potentially live transaction.
+    pub fn defuse(&mut self) {
+        self.defused = true;
+    }
 }
 
 impl Drop for ActiveTxnGuard {
     fn drop(&mut self) {
-        self.registry.unregister_worker(self.handle_id);
+        if !self.defused {
+            self.registry.unregister_worker(self.handle_id);
+        }
     }
 }
 
@@ -87,6 +106,7 @@ impl ActiveTxnRegistry {
         ActiveTxnGuard {
             registry: Arc::clone(self),
             handle_id,
+            defused: false,
         }
     }
 
@@ -188,5 +208,18 @@ mod tests {
         let _guard = r.track_worker_txn(150);
         assert_eq!(r.min_start_ts(), Some(150));
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn defused_guard_keeps_registration_on_drop() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        {
+            let mut guard = r.track_worker_txn(42);
+            assert_eq!(r.min_start_ts(), Some(42));
+            guard.defuse();
+        }
+        // Registration survives the drop because guard was defused.
+        assert_eq!(r.min_start_ts(), Some(42));
+        assert_eq!(r.len(), 1);
     }
 }
