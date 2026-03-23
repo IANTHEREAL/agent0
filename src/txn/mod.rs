@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 use tikv_client::transaction::Mutation;
 use tikv_client::Transaction;
 
+use crate::sql::error::SqlError;
 use crate::storage::backpressure::tikv_op;
 
 pub(crate) use state::SavepointState;
@@ -100,6 +101,19 @@ pub(crate) fn check_value_size(key: &[u8], value: &[u8]) -> Result<()> {
     }
     let total = key.len() + value.len();
     if total <= guard.limit {
+        // Warn when a value exceeds 50% of the limit — early signal that
+        // a subsystem is producing values that may soon be rejected.
+        if total > guard.limit / 2 {
+            let subsystem = key_subsystem(key);
+            tracing::warn!(
+                subsystem,
+                total_bytes = total,
+                limit_bytes = guard.limit,
+                "KV value approaching size limit (>{} of {} bytes)",
+                guard.limit / 2,
+                guard.limit,
+            );
+        }
         return Ok(());
     }
     let subsystem = key_subsystem(key);
@@ -110,15 +124,15 @@ pub(crate) fn check_value_size(key: &[u8], value: &[u8]) -> Result<()> {
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect();
-    Err(anyhow!(
-        "value too large: {} bytes exceeds limit {} bytes ({}). \
-         Reduce payload size or adjust DB9_TXN_VALUE_SIZE_LIMIT_BYTES. \
-         [key={}]",
-        total,
-        guard.limit,
-        subsystem,
-        key_hex,
-    ))
+    Err(SqlError::ValueTooLarge {
+        message: format!(
+            "value too large: {} bytes exceeds limit {} bytes ({}). \
+             Reduce payload size or adjust DB9_TXN_VALUE_SIZE_LIMIT_BYTES. \
+             [key={}]",
+            total, guard.limit, subsystem, key_hex,
+        ),
+    }
+    .into())
 }
 
 tokio::task_local! {
@@ -324,6 +338,107 @@ mod tests {
         // d_ + 8 bytes + _ + unknown subsystem = "database data"
         let key = db_key(1, b"something_else");
         assert_eq!(key_subsystem(&key), "database data");
+    }
+
+    /// A minimal tracing layer that counts WARN events whose message
+    /// contains a given substring.  Used to assert warning emission.
+    struct WarnCounter {
+        needle: &'static str,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                // Format the event message to check for the needle.
+                struct Visitor<'a>(&'a str, bool);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "message" {
+                            let s = format!("{:?}", value);
+                            if s.contains(self.0) {
+                                self.1 = true;
+                            }
+                        }
+                    }
+                }
+                let mut v = Visitor(self.needle, false);
+                event.record(&mut v);
+                if v.1 {
+                    self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn check_value_size_warns_at_50_percent() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let layer = WarnCounter {
+            needle: "approaching size limit",
+            count: Arc::clone(&count),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let key = db_key(1, b"t_100");
+        let half_limit = DEFAULT_VALUE_SIZE_LIMIT / 2;
+        // total = half_limit + 1 → exceeds 50%, should warn
+        let value = vec![0u8; half_limit - key.len() + 1];
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(check_value_size(&key, &value).is_ok());
+        });
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "expected exactly 1 warning for value exceeding 50% of limit"
+        );
+    }
+
+    #[test]
+    fn check_value_size_no_warn_at_50_percent_boundary() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let layer = WarnCounter {
+            needle: "approaching size limit",
+            count: Arc::clone(&count),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let key = db_key(1, b"t_100");
+        let half_limit = DEFAULT_VALUE_SIZE_LIMIT / 2;
+        // total = exactly half_limit → not > 50%, should NOT warn
+        let value = vec![0u8; half_limit - key.len()];
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(check_value_size(&key, &value).is_ok());
+        });
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "expected no warning for value at exactly 50% of limit"
+        );
+    }
+
+    #[test]
+    fn check_value_size_returns_sql_error_variant() {
+        use crate::sql::error::SqlError;
+        let key = db_key(1, b"t_100");
+        let value = vec![0u8; DEFAULT_VALUE_SIZE_LIMIT + 1];
+        let err = check_value_size(&key, &value).unwrap_err();
+        // Must downcast to SqlError::ValueTooLarge — this is what
+        // sqlstate_for_executor_error uses to map to SQLSTATE 54000.
+        let sql_err = err.downcast_ref::<SqlError>()
+            .expect("check_value_size should return SqlError::ValueTooLarge");
+        assert_eq!(sql_err.sqlstate(), "54000");
     }
 
     #[test]
