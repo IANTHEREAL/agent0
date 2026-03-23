@@ -2523,6 +2523,494 @@ mod tests {
         assert_eq!(enqueued, vec!["normal_idx"]);
     }
 
+    // ── comprehensive GC safepoint regression guard ────────────
+
+    /// Extract all `fn`/`async fn` bodies from Rust source that contain a
+    /// `store.begin()` or `store.begin_optimistic()` call.  Returns
+    /// `(fn_signature_line, fn_body)` pairs.
+    ///
+    /// Heuristic: walk brace depth from the opening `{` of each function.
+    /// All indices are BYTE offsets (safe for str slicing on ASCII-dominated Rust source).
+    fn extract_fns_with_begin(source: &str) -> Vec<(String, String)> {
+        // Match TiKV store begin calls but NOT session.begin() which is a
+        // session-level transaction manager with its own GC registration.
+        let tikv_begin = |body: &str| -> bool {
+            for line in body.lines() {
+                let trimmed = line.trim();
+                // Skip session.begin() — session-managed GC registration.
+                if trimmed.contains("session.begin()") {
+                    continue;
+                }
+                if trimmed.contains(".begin().await")
+                    || trimmed.contains(".begin_optimistic().await")
+                {
+                    return true;
+                }
+            }
+            false
+        };
+
+        let bytes = source.as_bytes();
+        let len = bytes.len();
+        let mut results: Vec<(String, String)> = Vec::new();
+        let mut search_from = 0usize;
+
+        while let Some(rel) = source[search_from..].find("fn ") {
+            let fn_pos = search_from + rel; // byte offset of "fn "
+
+            // Walk backwards to capture `pub`, `async`, attributes on the same line.
+            let sig_start = source[..fn_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+
+            // Find the opening brace after `fn `.
+            let brace_start = match source[fn_pos..].find('{') {
+                Some(offset) => fn_pos + offset,
+                None => {
+                    search_from = fn_pos + 3;
+                    continue;
+                }
+            };
+
+            let sig_line = source[sig_start..brace_start].trim().to_string();
+
+            // Walk brace depth to find the matching closing brace.
+            let mut depth: i32 = 0;
+            let mut k = brace_start;
+            let mut in_line_comment = false;
+            let mut in_string = false;
+            let mut in_raw_string = false;
+            let mut raw_hashes = 0usize;
+
+            loop {
+                if k >= len {
+                    break;
+                }
+                let b = bytes[k];
+
+                if in_line_comment {
+                    if b == b'\n' {
+                        in_line_comment = false;
+                    }
+                    k += 1;
+                    continue;
+                }
+
+                if in_raw_string {
+                    // End of raw string: `"` followed by `raw_hashes` `#`s
+                    if b == b'"' {
+                        let mut h = 0;
+                        while k + 1 + h < len && bytes[k + 1 + h] == b'#' && h < raw_hashes {
+                            h += 1;
+                        }
+                        if h == raw_hashes {
+                            in_raw_string = false;
+                            k += 1 + h;
+                            continue;
+                        }
+                    }
+                    k += 1;
+                    continue;
+                }
+
+                if in_string {
+                    if b == b'\\' {
+                        k += 2; // skip escaped char
+                        continue;
+                    }
+                    if b == b'"' {
+                        in_string = false;
+                    }
+                    k += 1;
+                    continue;
+                }
+
+                // Not inside any literal context.
+                match b {
+                    b'/' if k + 1 < len && bytes[k + 1] == b'/' => {
+                        in_line_comment = true;
+                        k += 2;
+                        continue;
+                    }
+                    b'r' if k + 1 < len => {
+                        // Detect raw string: r#"..."# or r##"..."##, etc.
+                        let mut h = 0;
+                        while k + 1 + h < len && bytes[k + 1 + h] == b'#' {
+                            h += 1;
+                        }
+                        if h > 0 && k + 1 + h < len && bytes[k + 1 + h] == b'"' {
+                            in_raw_string = true;
+                            raw_hashes = h;
+                            k += 2 + h; // skip r###"
+                            continue;
+                        }
+                    }
+                    b'"' => {
+                        in_string = true;
+                        k += 1;
+                        continue;
+                    }
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            k += 1; // include closing brace
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+
+            let fn_body = &source[brace_start..k];
+
+            // Check if this function body contains a TiKV store begin() call.
+            let has_begin = tikv_begin(fn_body);
+            if has_begin {
+                results.push((sig_line, fn_body.to_string()));
+            }
+
+            search_from = k;
+        }
+
+        results
+    }
+
+    /// Extract a short function name from a signature line like
+    /// `pub async fn foo(` -> `"foo"`.
+    fn fn_name_from_sig(sig: &str) -> &str {
+        // Find `fn ` and then the identifier
+        if let Some(fn_pos) = sig.find("fn ") {
+            let after_fn = &sig[fn_pos + 3..];
+            let end = after_fn
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after_fn.len());
+            &after_fn[..end]
+        } else {
+            sig
+        }
+    }
+
+    #[test]
+    fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
+        // ── Source files to scan ────────────────────────────────
+        //
+        // Each tuple: (file label, source text).
+        // We use include_str! so the test tracks the ACTUAL source at compile
+        // time — no runtime file I/O, no chance of stale caches.
+        let sources: &[(&str, &str)] = &[
+            ("worker/engine.rs", include_str!("engine.rs")),
+            ("worker/gc.rs", include_str!("gc.rs")),
+            ("cron/worker.rs", include_str!("../cron/worker.rs")),
+            (
+                "sql/ddl/create_index.rs",
+                include_str!("../sql/ddl/create_index.rs"),
+            ),
+            ("sql/ddl/mod.rs", include_str!("../sql/ddl/mod.rs")),
+            (
+                "sql/executor/bg_sql.rs",
+                include_str!("../sql/executor/bg_sql.rs"),
+            ),
+            (
+                "sql/executor/core/mod.rs",
+                include_str!("../sql/executor/core/mod.rs"),
+            ),
+            (
+                "sql/executor/core/guc_engine.rs",
+                include_str!("../sql/executor/core/guc_engine.rs"),
+            ),
+            (
+                "sql/executor/cron.rs",
+                include_str!("../sql/executor/cron.rs"),
+            ),
+            (
+                "sql/executor/dml_analyzed/mod.rs",
+                include_str!("../sql/executor/dml_analyzed/mod.rs"),
+            ),
+            (
+                "sql/executor/procedure/materialized_views.rs",
+                include_str!("../sql/executor/procedure/materialized_views.rs"),
+            ),
+            (
+                "sql/executor/table_utils/mod.rs",
+                include_str!("../sql/executor/table_utils/mod.rs"),
+            ),
+            ("session_context.rs", include_str!("../session_context.rs")),
+            ("main.rs", include_str!("../main.rs")),
+            (
+                "protocol/handler/dynamic/startup.rs",
+                include_str!("../protocol/handler/dynamic/startup.rs"),
+            ),
+            (
+                "protocol/handler/dynamic/query.rs",
+                include_str!("../protocol/handler/dynamic/query.rs"),
+            ),
+            (
+                "sql/session/transaction.rs",
+                include_str!("../sql/session/transaction.rs"),
+            ),
+            ("auth/rbac.rs", include_str!("../auth/rbac.rs")),
+            (
+                "extensions/fs/ws/auth.rs",
+                include_str!("../extensions/fs/ws/auth.rs"),
+            ),
+            (
+                "storage/tikv_store/mod.rs",
+                include_str!("../storage/tikv_store/mod.rs"),
+            ),
+            (
+                "storage/tikv_store/migrations.rs",
+                include_str!("../storage/tikv_store/migrations.rs"),
+            ),
+            (
+                "storage/tikv_store/sequences.rs",
+                include_str!("../storage/tikv_store/sequences.rs"),
+            ),
+        ];
+
+        // ── SHORT-LIVED ALLOWLIST ──────────────────────────────
+        //
+        // Functions listed here are verified safe WITHOUT track_worker_txn
+        // registration.  Each entry MUST have a comment explaining WHY.
+        //
+        // When you add a new store.begin() call, either:
+        //   (a) Add track_worker_txn() if the txn is long-lived, OR
+        //   (b) Add the function here with a justification.
+        //
+        // Categories:
+        //   [tick]      — single metadata read + immediate commit/rollback
+        //   [claim]     — pessimistic claim attempt, bounded by 1 key write
+        //   [enqueue]   — write ≤ handful of queue/registry entries + commit
+        //   [reconcile] — bounded metadata scan (registry list, not data)
+        //   [finalize]  — single record update + commit
+        //   [lookup]    — point read or tiny scan + immediate rollback/commit
+        //   [bootstrap] — one-time startup initialization (few key writes)
+        //   [migration] — one-time schema migration at startup
+        //   [session]   — session-scoped txn (registered via connection GC)
+        //   [DDL]       — session-scoped DDL txn (registered via connection GC or session rebind)
+        //   [autocommit]— optimistic CAS loop with immediate commit per attempt
+
+        let allowlist: &[&str] = &[
+            // ── worker/engine.rs ──
+
+            // [tick] Scans due queue entries (bounded by limit=1000) + immediate commit.
+            "tick",
+            // [reconcile] Reads registry list (small metadata) + immediate commit.
+            "reconcile_cron_jobs",
+            // [reconcile] Reads system queue + tenant cron state; bounded metadata operations.
+            "reconcile_cron_for_db",
+            // [reconcile] Reads registry list (small metadata) + immediate commit.
+            "reconcile_incomplete_cic_indexes",
+            // [reconcile] Scans table schemas for a single DB; bounded by schema count + commit.
+            "reconcile_incomplete_cic_indexes_for_db",
+            // [claim] Pessimistic claim attempt: 1 key check + commit.
+            "claim_and_execute_core",
+            // [lookup] Reads cron state + records run; bounded by single job lookup + commit.
+            "claim_and_record_cron_run",
+            // [lookup] Point read: checks cron enabled + loads single job; commit.
+            "load_next_cron_queue_entry",
+            // [finalize] Updates single cron run record + commit.
+            "finalize_cron_run",
+            // [lookup] Single point read to resolve database name; immediate commit.
+            "execute_task",
+            // [lookup] Reads schema for one table; immediate commit.
+            "execute_bg_ddl_backfill",
+            // [reconcile] Reads registry list (small metadata) + immediate commit.
+            "reconcile_storage_scans",
+            // [reconcile] Reads registry list (small metadata) + immediate commit.
+            "reconcile_hnsw_merges",
+            // [enqueue] Single put to system store queue + commit.
+            "enqueue_storage_scan",
+            // [reconcile] Reads registry + iterates DBs to warm cache; read-only + rollback.
+            "warm_load_storage_stats",
+            // [finalize] Single stats key write after scan completes; immediate commit.
+            // (The long-lived scan txn in execute_storage_size_scan IS tracked; this is
+            // just the final persist_txn that writes the result.)
+            "execute_storage_size_scan",
+            // ── worker/gc.rs ──
+
+            // [lookup] Neutralize GC instance state: single key write + commit.
+            "clear_gc_instance_state",
+            // [lookup] Publish GC instance state: single key write + commit.
+            "publish_gc_instance_state",
+            // [lookup] Read all GC instance states (small registry) + rollback.
+            "advance_gc_safepoint",
+            // [reconcile] Read registry list + immediate commit.
+            "sweep_hnsw_delta_backlogs",
+            // [reconcile] Read registry list + immediate commit.
+            "cleanup_cron_runs",
+            // [claim] Scans claim batch (bounded by batch_size) + commit/rollback.
+            "cleanup_orphan_claims_batch",
+            // [lookup] Read GC instance states (small registry) + rollback.
+            "reap_stale_gc_instance_states",
+            // [lookup] Delete stale GC instance rows (bounded) + commit.
+            "reap_stale_gc_instance_states_from_scan",
+            // ── cron/worker.rs ──
+            // (gc_database IS long-lived and MUST have track_worker_txn — not in allowlist)
+
+            // ── sql/ddl/create_index.rs ──
+
+            // [enqueue] Write queue entry + registry update for CIC backfill; immediate commit.
+            "execute_create_index",
+            // [DDL] Single schema read + state update + commit; bounded by one table.
+            "update_index_state",
+            // (backfill_index_by_name IS long-lived and has track_active_worker_txn — not in allowlist)
+            // (reconcile_index_pass IS long-lived and has track_active_worker_txn — not in allowlist)
+
+            // ── sql/ddl/mod.rs ──
+
+            // (maybe_rotate_backfill_txn calls begin_replacement_session_owned_txn
+            //  which re-registers via session context — not in allowlist; see separate test)
+
+            // ── sql/executor/bg_sql.rs ──
+
+            // [enqueue] Writes queue entry + registry update; immediate commit.
+            "execute_bg_sql",
+            // [enqueue] Launches background task; single put + commit.
+            "execute_bg_launch",
+            // [lookup] Point read for bg_result + scan for pending; immediate commit.
+            "execute_bg_result",
+            // ── sql/executor/core/mod.rs ──
+
+            // [enqueue] Writes trigger queue entries; immediate commit.
+            "flush_trigger_activations",
+            // [enqueue] Writes HNSW merge queue entries; immediate commit.
+            "flush_pending_hnsw_merges",
+            // ── sql/executor/core/guc_engine.rs ──
+
+            // [lookup] Reads user/role for auth error message; immediate rollback.
+            "session_auth_different_user_error",
+            // ── sql/executor/cron.rs ──
+
+            // [enqueue] Reschedule/dequeue cron entries in system store; immediate commit.
+            "enqueue_cron_to_worker",
+            // [enqueue] Delete queue entries for dequeued cron job; immediate commit.
+            "dequeue_cron_from_worker",
+            // ── sql/executor/dml_analyzed/mod.rs ──
+
+            // [enqueue] Check-and-enqueue auto-analyze task; immediate commit.
+            "maybe_enqueue_auto_analyze",
+            // ── sql/executor/procedure/materialized_views.rs ──
+
+            // [enqueue] Enqueue background refresh task; immediate commit.
+            "execute_refresh_materialized_view",
+            // [DDL] Refresh matview: single schema read + task enqueue + commit.
+            "execute_refresh_materialized_view_cmd",
+            // ── sql/executor/table_utils/mod.rs ──
+
+            // [lookup] Reads trigger queue entries for stats view; bounded scan.
+            "execute_async_trigger_stats_query",
+            // ── session_context.rs ──
+
+            // [session] Opens replacement session-owned txn; immediately re-registers
+            // via refresh_current_session_txn_registration.
+            "begin_replacement_session_owned_txn",
+            // ── main.rs ──
+
+            // [bootstrap] One-time auth bootstrap at startup; single write + commit.
+            "main",
+            "async_main",
+            // ── protocol/handler/dynamic/startup.rs ──
+
+            // [bootstrap] Per-connection auth bootstrap (idempotent); single write + commit.
+            "do_startup",
+            // [lookup] Auth check; single read + immediate commit/rollback.
+            "authenticate_user",
+            // ── protocol/handler/dynamic/query.rs ──
+
+            // [lookup] Temporary read-only txn for prepared statement analysis; immediate rollback.
+            "do_describe",
+            // [session] COPY FROM uses session txn (registered via connection GC).
+            "handle_copy_from_simple_query",
+            // [session] Parse step creates temp txn for analysis; immediate rollback.
+            "on_parse",
+            // ── sql/session/transaction.rs ──
+
+            // [session] Opens session-scoped transaction; registered via connection
+            // active_txn_registry (register_connection call immediately follows).
+            "begin",
+            // ── auth/rbac.rs ──
+
+            // [lookup] Check for superuser existence; immediate rollback.
+            "is_initialized",
+            // ── extensions/fs/ws/auth.rs ──
+
+            // [bootstrap] WebSocket auth bootstrap + auth check; immediate commit/rollback.
+            "authenticate_ws",
+            // [lookup] WebSocket auth handler; single read + immediate commit/rollback.
+            "handle_auth",
+            // ── storage/tikv_store/mod.rs ──
+
+            // [autocommit] Optimistic CAS loop; immediate commit per attempt.
+            "autocommit_update_key",
+            // [bootstrap] One-time format version check/init at startup; immediate commit.
+            "check_format_version",
+            // [bootstrap] One-time default database creation; immediate commit.
+            "bootstrap_default_database",
+            // ── storage/tikv_store/migrations.rs ──
+
+            // [migration] One-time schema migration at startup.
+            "ensure_view_relation_bindings_migration",
+            // [migration] One-time schema migration at startup.
+            "ensure_no_pk_fk_cascade_migration",
+            // ── storage/tikv_store/sequences.rs ──
+
+            // [autocommit] Optimistic CAS loop for sequence OID assignment; immediate commit.
+            "ensure_sequence_oid",
+            // [autocommit] Backfill sequence OID; immediate commit per attempt.
+            "autocommit_backfill_sequence_oid",
+            // [lookup] Read current sequence allocator value; immediate rollback.
+            "migrate_identity_sequence_if_needed",
+            // [migration] One-time implicit→standalone sequence migration; immediate commit.
+            "maybe_migrate_implicit_sequence_to_standalone",
+        ];
+
+        // ── Scan and verify ────────────────────────────────────
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for (file_label, source) in sources {
+            // Strip test modules — only scan production code.
+            let prod_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+            let fns = extract_fns_with_begin(prod_source);
+
+            for (sig, body) in &fns {
+                let name = fn_name_from_sig(sig);
+
+                // Skip if on the allowlist.
+                if allowlist.contains(&name) {
+                    continue;
+                }
+
+                // Must contain track_worker_txn (either direct or via helper).
+                let has_track =
+                    body.contains("track_worker_txn") || body.contains("track_active_worker_txn");
+
+                if !has_track {
+                    violations.push(format!(
+                        "  {file_label} :: {name}\n    \
+                         This function contains store.begin() but does NOT call \
+                         track_worker_txn() and is NOT in the short-lived allowlist.\n    \
+                         Fix: either add track_worker_txn() if the txn is long-lived,\n    \
+                         or add \"{name}\" to the allowlist in this test with a comment \
+                         explaining why it's safe."
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "\n\nGC SAFEPOINT REGRESSION: {} function(s) have unprotected \
+             store.begin() calls.\n\nEvery long-lived TiKV transaction must \
+             register with ActiveTxnRegistry via track_worker_txn() so the \
+             GC safepoint does not advance past live snapshots.\n\n\
+             Violations:\n{}\n",
+            violations.len(),
+            violations.join("\n\n")
+        );
+    }
+
     #[test]
     fn recovery_unfreeze_then_skip_check_returns_false() {
         use crate::sql::hnsw::storage::HnswMeta;
