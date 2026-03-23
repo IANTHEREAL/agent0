@@ -24,11 +24,18 @@ pub fn global_registry() -> Option<&'static Arc<ActiveTxnRegistry>> {
     GLOBAL_REGISTRY.get()
 }
 
-/// How long a quarantined registration stays alive after commit/rollback
-/// failure. Must exceed the longest possible TiKV lock TTL so the
-/// server-side transaction is fully cleaned up before we stop protecting
-/// its `start_ts`. TiKV's default pessimistic lock TTL is ~3 s and max
-/// TTL scales with txn size; 60 s provides generous headroom.
+/// *Minimum* time a quarantined registration stays alive after
+/// commit/rollback failure.  Must exceed the longest possible TiKV lock
+/// TTL so the server-side transaction is fully cleaned up before we stop
+/// protecting its `start_ts`.  TiKV's default pessimistic lock TTL is
+/// ~3 s and max TTL scales with txn size; 60 s provides generous headroom.
+///
+/// **Note:** The *practical* upper bound on hold time is
+/// `max(QUARANTINE_TTL, gc_safepoint_interval)` because
+/// [`reap_quarantined`](ActiveTxnRegistry::reap_quarantined) runs once
+/// per GC-publisher tick (default 300 s).  This is acceptable — even the
+/// worst-case hold is a small fraction of `gc_life_time` (default 24 h)
+/// and far exceeds the lock-TTL window needed for TiKV cleanup.
 const QUARANTINE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,9 +63,10 @@ impl ActiveTxnGuard {
     /// Move this guard's registration into a time-bounded quarantine.
     ///
     /// The entry stays in the registry (protecting the `start_ts` from GC)
-    /// for [`QUARANTINE_TTL`] after this call, then is automatically reaped
-    /// by [`ActiveTxnRegistry::reap_quarantined`].  The guard's `Drop` will
-    /// no longer unregister — the quarantine takes ownership of cleanup.
+    /// for at least [`QUARANTINE_TTL`] after this call, then is
+    /// automatically reaped by [`ActiveTxnRegistry::reap_quarantined`] on
+    /// the next GC-publisher tick.  The guard's `Drop` will no longer
+    /// unregister — the quarantine takes ownership of cleanup.
     ///
     /// Call this when the transaction's commit or rollback failed and the
     /// underlying TiKV transaction may still be live.

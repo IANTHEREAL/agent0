@@ -186,8 +186,8 @@ async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> 
         .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?;
 
     // Reap quarantined worker entries whose TTL has expired before reading
-    // min_start_ts, so a transient finalize failure doesn't pin the safepoint
-    // indefinitely (the quarantine covers the TiKV lock-TTL window).
+    // min_start_ts.  Practical hold time is max(QUARANTINE_TTL, this tick
+    // interval) — acceptable since both are far shorter than gc_life_time.
     if let Some(registry) = crate::worker::active_txn_registry::global_registry() {
         registry.reap_quarantined();
     }
