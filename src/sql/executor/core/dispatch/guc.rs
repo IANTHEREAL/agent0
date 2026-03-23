@@ -307,7 +307,7 @@ mod tests {
     fn make_session() -> Session {
         let store = crate::storage::TikvStore::new_stub();
         let obs = crate::observability::registry().tenant("dispatch_guc_tests");
-        Session::new_with_database(store, obs, 1, 1, "postgres".to_string(), 0, 0)
+        Session::new_with_database(store, obs, 1, 1, "postgres".to_string(), 0, 0).unwrap()
     }
 
     fn parse_set(sql: &str) -> (bool, ObjectName, Vec<Expr>) {
@@ -563,6 +563,7 @@ mod tests {
             0,
             0,
         )
+        .unwrap()
     }
 
     fn parse_set_value(sql: &str) -> Vec<Expr> {

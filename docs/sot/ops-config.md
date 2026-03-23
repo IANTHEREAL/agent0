@@ -121,7 +121,7 @@
 | `DB9_AUTO_ANALYZE_ENABLED` | `true` | `src/worker/config.rs` | Enables worker-driven auto-analyze. |
 | `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | `src/worker/config.rs` | Base threshold used by current auto-analyze policy. |
 | `DB9_WORKER_GC_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`. |
-| `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Independent cadence for HNSW delta sweep/enqueue. |
+| `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Independent cadence for HNSW delta sweep/enqueue. Also runs S3 GC when `HNSW_S3_BUCKET` is set. |
 | `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | `src/worker/config.rs` | Keyspace holding background task metadata. |
 | `DB9_GC_SAFEPOINT_ENABLED` | `true` | `src/worker/config.rs`, `src/worker/gc.rs` | Enables PD safepoint advancement. |
 | `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`; must remain below `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node because GC registry heartbeats are unconditional. |
@@ -133,6 +133,18 @@
 | `DB9_CRON_GC_INTERVAL_SEC` | `3600` | `src/cron/config.rs` | Cron run-history GC cadence. |
 | `DB9_CRON_RUN_RETENTION_DAYS` | `7` | `src/cron/config.rs` | Retention for cron run history. |
 | `DB9_CRON_ORPHAN_TIMEOUT_SEC` | `300` | `src/cron/config.rs` | Cron orphan timeout. |
+
+### HNSW S3 Offload
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `HNSW_S3_BUCKET` | unset | `src/sql/hnsw/s3.rs` | S3 bucket for HNSW graph offload. When set, graph blobs are stored in S3 instead of TiKV. When unset, behavior is unchanged (TiKV-only with 8 MB frozen guard). |
+| `HNSW_S3_REGION` | unset | `src/sql/hnsw/s3.rs` | S3 region. Falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`. |
+| `HNSW_S3_ENDPOINT` | unset | `src/sql/hnsw/s3.rs` | S3-compatible endpoint URL (e.g. MinIO). |
+| `HNSW_S3_PREFIX` | `hnsw` | `src/sql/hnsw/s3.rs` | S3 key prefix for graph objects. |
+| `HNSW_S3_FORCE_PATH_STYLE` | `false` | `src/sql/hnsw/s3.rs` | Use path-style URLs (required for MinIO). |
+| `HNSW_CACHE_MAX_ENTRIES` | `64` | `src/sql/hnsw/s3.rs` | Max cached HNSW graph files (LRU). Increase for deployments with many hot vector indexes. |
+| `HNSW_CACHE_DIR` | `/tmp/db9_hnsw_cache` | `src/sql/hnsw/s3.rs` | Directory for cached graph files. Use a dedicated volume for high-QPS workloads. |
 
 ### Observability, Extensions, and fs9
 

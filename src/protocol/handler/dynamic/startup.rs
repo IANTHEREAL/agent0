@@ -137,6 +137,23 @@ impl DynamicPgHandler {
             stats_cache,
         ));
 
+        if crate::sql::hnsw::s3::hnsw_s3_client().is_none() {
+            let requires_s3 = crate::sql::hnsw::storage::keyspace_requires_hnsw_s3(store.as_ref())
+                .await
+                .map_err(|e| {
+                    fatal_internal(format!(
+                        "Failed to validate HNSW S3 requirements for keyspace '{}': {}",
+                        effective_keyspace, e
+                    ))
+                })?;
+            if requires_s3 {
+                return Err(fatal_internal(format!(
+                    "Keyspace '{}' contains live S3-backed HNSW indexes, but HNSW_S3_BUCKET is not configured on this node.",
+                    effective_keyspace
+                )));
+            }
+        }
+
         let database_name = database.trim();
         let database_name = if database_name.is_empty() {
             "postgres"
@@ -189,7 +206,8 @@ impl DynamicPgHandler {
                 database_name,
                 default_stmt_timeout,
                 default_idle_txn_timeout,
-            ),
+            )
+            .map_err(|e| PgWireError::ApiError(e.into()))?,
             None => Session::new_with_database(
                 store,
                 tenant_obs,
@@ -198,7 +216,8 @@ impl DynamicPgHandler {
                 database_name,
                 default_stmt_timeout,
                 default_idle_txn_timeout,
-            ),
+            )
+            .map_err(|e| PgWireError::ApiError(e.into()))?,
         };
         session.set_server_config(self.server_config.clone());
         // Wire GC active transaction registry — unconditional for all interactive sessions.
@@ -751,7 +770,8 @@ mod tests {
             "testdb".to_string(),
             0,   // no statement timeout
             500, // 500ms idle-in-transaction timeout
-        );
+        )
+        .unwrap();
 
         // Simulate: BEGIN; SELECT 1; (then go idle)
         session.force_test_transaction_state(true, false);
@@ -798,7 +818,8 @@ mod tests {
             "testdb".to_string(),
             0,
             1000, // 1s timeout (should never fire)
-        );
+        )
+        .unwrap();
 
         let session_lock = Arc::new(tokio::sync::Mutex::new(session));
         let cancel = CancellationToken::new();

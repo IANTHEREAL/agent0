@@ -300,7 +300,7 @@ impl TikvStore {
         keyspace: &str,
         db_id: u64,
         task_id: i64,
-        fire_time_min: i64,
+        fire_time_ms: i64,
         claim: &WorkerClaim,
     ) -> Result<bool> {
         let key = self.key(&encode_worker_claim_key(
@@ -308,7 +308,7 @@ impl TikvStore {
             keyspace,
             db_id,
             task_id,
-            fire_time_min,
+            fire_time_ms,
         ));
         if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Ok(false);
@@ -328,7 +328,7 @@ impl TikvStore {
         keyspace: &str,
         db_id: u64,
         task_id: i64,
-        fire_time_min: i64,
+        fire_time_ms: i64,
         task_type: TaskType,
     ) -> Result<()> {
         let key = self.key(&encode_worker_claim_key(
@@ -336,7 +336,7 @@ impl TikvStore {
             keyspace,
             db_id,
             task_id,
-            fire_time_min,
+            fire_time_ms,
         ));
         txn_delete(txn, key).await?;
         Ok(())

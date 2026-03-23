@@ -349,6 +349,10 @@ mod test {
             todo!()
         }
 
+        async fn get_gc_safepoint(self: Arc<Self>) -> Result<u64> {
+            todo!()
+        }
+
         async fn update_safepoint(self: Arc<Self>, _safepoint: u64) -> Result<bool> {
             todo!()
         }

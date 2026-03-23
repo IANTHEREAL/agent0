@@ -122,7 +122,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
         session.set_current_role("other".to_string(), false, false);
         let out = executor
             .execute_set_role(&mut session, &None)
@@ -151,7 +152,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
         session.set_current_role("other".to_string(), false, false);
         let role_ident = sqlparser::ast::Ident::new("default");
         let out = executor
@@ -171,7 +173,7 @@ mod tests {
         let store = crate::storage::TikvStore::new_stub();
         let obs = crate::observability::registry().tenant("dispatch_roles_tests_missing");
         let mut session =
-            Session::new_with_database(store, obs, 1, 1, "postgres".to_string(), 0, 0);
+            Session::new_with_database(store, obs, 1, 1, "postgres".to_string(), 0, 0).unwrap();
 
         let err = executor
             .execute_set_role(&mut session, &Some(sqlparser::ast::Ident::new("role_x")))

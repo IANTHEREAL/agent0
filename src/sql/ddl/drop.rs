@@ -8,14 +8,16 @@ use tikv_client::Transaction;
 
 use crate::model::{DataType, Row, TableSchema};
 use crate::sql::gin::extract_gin_token_hashes_from_row;
-use crate::sql::hnsw::storage::{delete_all_deltas, hnsw_graph_key, hnsw_meta_key};
+use crate::sql::hnsw::storage::{
+    delete_all_deltas, hnsw_graph_key, hnsw_meta_key, hnsw_s3_prefix_gc_key, HnswS3PrefixGc,
+};
 use crate::sql::index_helpers;
 use crate::sql::names;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::sequences::SequenceSession;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::txn::txn_delete;
+use crate::txn::{txn_delete, txn_put};
 
 use super::{
     drop_dependent_views, drop_owned_sequences_for_table, KvScanBatches, DDL_SCAN_BATCH_SIZE,
@@ -222,11 +224,48 @@ pub async fn execute_drop_index(
         store.update_schema(txn, db_id, schema.clone()).await?;
 
         if index.is_hnsw() {
+            // Delete the TiKV graph blob (safe even if graph is in S3).
             txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
-            txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+            // Tombstone the meta instead of deleting it, so S3 GC can
+            // discover dropped indexes and clean up their graph objects.
+            {
+                let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
+                let prefix_gc_key = hnsw_s3_prefix_gc_key(db_id, schema.table_id, index.id);
+                let meta_bytes_opt = txn.get(meta_key.clone()).await?;
+                if let Some(meta_bytes) = meta_bytes_opt {
+                    if let Ok(mut meta) =
+                        serde_json::from_slice::<crate::sql::hnsw::HnswMeta>(&meta_bytes)
+                    {
+                        let prefix_gc_exists = txn.get(prefix_gc_key.clone()).await?.is_some();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        meta.dropped_at = Some(now);
+                        if let Ok(tombstoned) = serde_json::to_vec(&meta) {
+                            txn_put(txn, meta_key, tombstoned).await?;
+                        }
+                        if meta.graph_version > 0 || prefix_gc_exists {
+                            let marker = HnswS3PrefixGc {
+                                delete_after_safepoint: None,
+                                reason: Some("drop".to_string()),
+                            };
+                            txn_put(txn, prefix_gc_key, serde_json::to_vec(&marker)?).await?;
+                        }
+                    }
+                }
+            }
             // Clean up all delta keys (paginated) to prevent orphan keys
             // that could be misread by a future index with a recycled index_id.
             delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
+
+            // Evict the graph from the process-level cache. Without this,
+            // DROP + CREATE INDEX can reuse the same index_id, and the new
+            // index starts at graph_version=1 — colliding with the cached
+            // entry from the old index (same key + same version = stale hit).
+            let cache = crate::sql::hnsw::s3::hnsw_graph_cache();
+            let ks = store.keyspace().unwrap_or("default");
+            cache.evict(ks, db_id, schema.table_id, index.id);
         }
 
         // Release the reservation key for the dropped index name.

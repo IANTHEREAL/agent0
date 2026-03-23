@@ -69,7 +69,7 @@ pub(crate) mod wildcard;
 pub use executor::*;
 pub use parser::*;
 pub use result::*;
-mod session;
+pub(crate) mod session;
 pub use session::*;
 mod aggregate;
 pub use aggregate::*;

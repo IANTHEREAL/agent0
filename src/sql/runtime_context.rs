@@ -343,7 +343,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .expect("test session creation should succeed");
         session.set_active_txn_registry(Arc::new(
             crate::worker::active_txn_registry::ActiveTxnRegistry::new(),
         ));

@@ -248,6 +248,9 @@ tests/fs9_ws_mode_on_create_1902.py
 # #1969 – HNSW graph freeze on oversize (raft-entry-max-size)
 # design lessons: docs/design/30_tikv_value_size_design_lessons.md
 tests/hnsw_frozen_oversize_1969.py
+# #1971 – HNSW S3 graph offload (storage_version=2, graph_version, dropped_at)
+# design: docs/design/31_hnsw_s3_graph_offload.md
+tests/hnsw_s3_offload_meta_compat_1971.py
 [orm]
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts

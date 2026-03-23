@@ -1411,6 +1411,7 @@ mod prepared_policy_tests {
             0,
             0,
         )
+        .unwrap()
     }
 
     fn analyzed_query_exec() -> PreparedExec {

@@ -488,7 +488,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
         (executor, session)
     }
 

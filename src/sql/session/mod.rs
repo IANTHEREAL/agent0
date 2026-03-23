@@ -3,6 +3,7 @@
 //! Contains the `Session` struct (per-connection state), `TransactionState`,
 //! and `SessionSettings` (GUC parameters).
 
+pub mod db_connections;
 pub(crate) mod settings;
 mod transaction;
 
@@ -100,6 +101,10 @@ pub struct Session {
     bypass_rls: bool,
     current_database_id: u64,
     current_database_name: Arc<str>,
+    /// RAII guard that decrements the per-database connection count on drop.
+    /// Enables DROP DATABASE to refuse when other sessions are connected
+    /// (PostgreSQL SQLSTATE 55006).
+    _db_connection_guard: db_connections::DbConnectionGuard,
     /// Internal 64-bit connection identity.
     /// `pg_backend_pid()` remains int4 by truncating this value at function boundary.
     connection_id: i64,
@@ -178,7 +183,7 @@ impl Session {
         database_name: String,
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let settings = SessionSettings::new_with_defaults(
             default_statement_timeout_ms,
             default_idle_in_txn_timeout_ms,
@@ -187,7 +192,15 @@ impl Session {
             settings.prepared_plan_cache_size(),
             settings.prepared_plan_cache_min_exec(),
         );
-        Self {
+        let db_guard = db_connections::db_connection_registry()
+            .try_connect(store.keyspace().unwrap_or("default"), database_id)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "FATAL: database \"{}\" is being dropped by another session",
+                    database_name
+                )
+            })?;
+        Ok(Self {
             store,
             observability,
             state: TransactionState::Idle,
@@ -209,6 +222,7 @@ impl Session {
             bypass_rls: false,
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
+            _db_connection_guard: db_guard,
             connection_id,
             transaction_timestamp_ms: None,
             last_command_complete_at: None,
@@ -229,7 +243,7 @@ impl Session {
             local_session_auth_save: None,
             session_auth_savepoints: Vec::new(),
             active_txn_registry: None,
-        }
+        })
     }
 
     /// Create a session for the given user and database.
@@ -244,7 +258,7 @@ impl Session {
         database_name: String,
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let settings = SessionSettings::new_with_defaults(
             default_statement_timeout_ms,
             default_idle_in_txn_timeout_ms,
@@ -253,7 +267,15 @@ impl Session {
             settings.prepared_plan_cache_size(),
             settings.prepared_plan_cache_min_exec(),
         );
-        Self {
+        let db_guard = db_connections::db_connection_registry()
+            .try_connect(store.keyspace().unwrap_or("default"), database_id)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "FATAL: database \"{}\" is being dropped by another session",
+                    database_name
+                )
+            })?;
+        Ok(Self {
             store,
             observability,
             state: TransactionState::Idle,
@@ -275,6 +297,7 @@ impl Session {
             bypass_rls,
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
+            _db_connection_guard: db_guard,
             connection_id,
             transaction_timestamp_ms: None,
             last_command_complete_at: None,
@@ -295,7 +318,7 @@ impl Session {
             local_session_auth_save: None,
             session_auth_savepoints: Vec::new(),
             active_txn_registry: None,
-        }
+        })
     }
 
     /// Set the GC active transaction registry. Called once after construction

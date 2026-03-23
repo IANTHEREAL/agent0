@@ -1,7 +1,9 @@
 use super::*;
 use crate::sql::error::SqlError;
 use crate::sql::hnsw::storage::{
-    delete_all_deltas, delete_all_rowid_mappings, hnsw_graph_key, hnsw_meta_key,
+    create_empty_hnsw_index, delete_all_deltas, delete_all_rowid_mappings, hnsw_graph_key,
+    hnsw_meta_key, hnsw_s3_prefix_gc_key, hnsw_s3_retired_version_key, serialize_hnsw_snapshot,
+    HnswS3PrefixGc, HnswS3RetiredVersionGc,
 };
 use crate::storage::backpressure::tikv_op;
 
@@ -311,8 +313,46 @@ impl TikvStore {
                     if index.is_hnsw() {
                         has_hnsw = true;
                         txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
-                        txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+                        // Tombstone the meta instead of deleting it, so S3 GC can
+                        // discover dropped indexes and clean up their graph objects.
+                        {
+                            let meta_key_bytes = hnsw_meta_key(db_id, schema.table_id, index.id);
+                            let prefix_gc_key =
+                                hnsw_s3_prefix_gc_key(db_id, schema.table_id, index.id);
+                            let meta_bytes_opt = txn.get(meta_key_bytes.clone()).await?;
+                            if let Some(meta_bytes) = meta_bytes_opt {
+                                if let Ok(mut meta) = serde_json::from_slice::<
+                                    crate::sql::hnsw::HnswMeta,
+                                >(&meta_bytes)
+                                {
+                                    let prefix_gc_exists =
+                                        txn.get(prefix_gc_key.clone()).await?.is_some();
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    meta.dropped_at = Some(now);
+                                    if let Ok(tombstoned) = serde_json::to_vec(&meta) {
+                                        txn_put(txn, meta_key_bytes, tombstoned).await?;
+                                    }
+                                    if meta.graph_version > 0 || prefix_gc_exists {
+                                        let marker = HnswS3PrefixGc {
+                                            delete_after_safepoint: None,
+                                            reason: Some("drop".to_string()),
+                                        };
+                                        txn_put(txn, prefix_gc_key, serde_json::to_vec(&marker)?)
+                                            .await?;
+                                    }
+                                }
+                            }
+                        }
                         delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
+
+                        // Evict from process cache to prevent stale hit on
+                        // index_id reuse after DROP + CREATE.
+                        let cache = crate::sql::hnsw::s3::hnsw_graph_cache();
+                        let ks = self.keyspace().unwrap_or("default");
+                        cache.evict(ks, db_id, schema.table_id, index.id);
                     }
                 }
                 // Clean up table-level rowid mappings (pk2rid + rid2pk + seq).
@@ -839,13 +879,128 @@ impl TikvStore {
 
             // Keep TRUNCATE semantics consistent across index methods: HNSW
             // graph/meta/deltas are stored outside the generic index keyspace.
+            // For TRUNCATE, reset the meta to empty (preserving index params)
+            // rather than tombstoning, so the index remains usable after TRUNCATE.
             {
                 let mut has_hnsw = false;
                 for index in &schema.indexes {
                     if index.is_hnsw() {
                         has_hnsw = true;
                         txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
-                        txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+                        // Reset meta to empty while preserving index parameters.
+                        {
+                            let meta_key_bytes = hnsw_meta_key(db_id, schema.table_id, index.id);
+                            let prefix_gc_key =
+                                hnsw_s3_prefix_gc_key(db_id, schema.table_id, index.id);
+                            let meta_bytes_opt = txn.get(meta_key_bytes.clone()).await?;
+                            if let Some(meta_bytes) = meta_bytes_opt {
+                                if let Ok(old_meta) = serde_json::from_slice::<
+                                    crate::sql::hnsw::HnswMeta,
+                                >(&meta_bytes)
+                                {
+                                    let prefix_gc_exists =
+                                        txn.get(prefix_gc_key.clone()).await?.is_some();
+                                    if old_meta.graph_version > 0 {
+                                        let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client()
+                                        else {
+                                            return Err(anyhow!(
+                                                "HNSW index d_{}_hnsw_{}_{} requires S3 storage \
+                                                 during TRUNCATE (graph_version={}) but S3 is \
+                                                 not configured. Set HNSW_S3_BUCKET to enable \
+                                                 S3 offload.",
+                                                db_id,
+                                                schema.table_id,
+                                                index.id,
+                                                old_meta.graph_version
+                                            ));
+                                        };
+                                        let keyspace = self.keyspace().unwrap_or("default");
+                                        let (empty_index, _) = create_empty_hnsw_index(
+                                            old_meta.dimensions,
+                                            &old_meta.distance_metric,
+                                            old_meta.m,
+                                            old_meta.ef_construction,
+                                        )?;
+                                        let new_version = old_meta.graph_version + 1;
+                                        let fresh_meta = crate::sql::hnsw::HnswMeta {
+                                            count: 0,
+                                            capacity: empty_index.capacity() as u64,
+                                            dimensions: old_meta.dimensions,
+                                            distance_metric: old_meta.distance_metric.clone(),
+                                            m: old_meta.m,
+                                            ef_construction: old_meta.ef_construction,
+                                            storage_version: old_meta.storage_version.max(2),
+                                            label_mode: old_meta.label_mode,
+                                            frozen: false,
+                                            graph_version: new_version,
+                                            dropped_at: None,
+                                        };
+                                        let (graph_bytes, fresh_bytes) = serialize_hnsw_snapshot(
+                                            db_id,
+                                            schema.table_id,
+                                            index.id,
+                                            &empty_index,
+                                            &fresh_meta,
+                                        )?;
+                                        s3.put_graph(
+                                            keyspace,
+                                            db_id,
+                                            schema.table_id,
+                                            index.id,
+                                            new_version,
+                                            bytes::Bytes::from(graph_bytes),
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            anyhow!(
+                                                "HNSW S3 put_graph failed during TRUNCATE: {}",
+                                                e
+                                            )
+                                        })?;
+                                        txn_put(txn, meta_key_bytes, fresh_bytes).await?;
+                                        let marker = HnswS3RetiredVersionGc {
+                                            delete_after_safepoint: None,
+                                        };
+                                        txn_put(
+                                            txn,
+                                            hnsw_s3_retired_version_key(
+                                                db_id,
+                                                schema.table_id,
+                                                index.id,
+                                                old_meta.graph_version,
+                                            ),
+                                            serde_json::to_vec(&marker)?,
+                                        )
+                                        .await?;
+                                    } else {
+                                        let fresh_meta = crate::sql::hnsw::HnswMeta {
+                                            count: 0,
+                                            capacity: 0,
+                                            dimensions: old_meta.dimensions,
+                                            distance_metric: old_meta.distance_metric.clone(),
+                                            m: old_meta.m,
+                                            ef_construction: old_meta.ef_construction,
+                                            storage_version: old_meta.storage_version,
+                                            label_mode: old_meta.label_mode,
+                                            frozen: false,
+                                            graph_version: 0,
+                                            dropped_at: None,
+                                        };
+                                        if let Ok(fresh_bytes) = serde_json::to_vec(&fresh_meta) {
+                                            txn_put(txn, meta_key_bytes, fresh_bytes).await?;
+                                        }
+                                    }
+                                    if old_meta.graph_version == 0 && prefix_gc_exists {
+                                        let marker = HnswS3PrefixGc {
+                                            delete_after_safepoint: None,
+                                            reason: Some("truncate".to_string()),
+                                        };
+                                        txn_put(txn, prefix_gc_key, serde_json::to_vec(&marker)?)
+                                            .await?;
+                                    }
+                                }
+                            }
+                        }
                         delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
                     }
                 }
@@ -989,5 +1144,27 @@ impl TikvStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn truncate_hnsw_does_not_inline_delete_s3_prefix() {
+        let source = include_str!("tables.rs");
+        let truncate_section = source
+            .split("\n    pub async fn truncate_table(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// Update table schema").next())
+            .expect("tables.rs must contain truncate_table followed by rename_table_schema");
+
+        assert!(
+            truncate_section.contains("let new_version = old_meta.graph_version + 1;"),
+            "truncate_table must preserve monotonic HNSW S3 graph versions across TRUNCATE"
+        );
+        assert!(
+            !truncate_section.contains("delete_prefix("),
+            "truncate_table must not inline-delete HNSW S3 prefixes; GC owns MVCC-safe cleanup"
+        );
     }
 }

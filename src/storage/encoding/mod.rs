@@ -30,8 +30,9 @@ pub use data_keys::{
     encode_index_range_end_v2, encode_index_range_start_v2, encode_pk_values, encode_schema_prefix,
     encode_table_data_range_v2, encode_table_index_range_v2,
 };
+pub use metadata_keys::decode_worker_queue_fire_time;
 #[cfg(test)]
-pub use metadata_keys::{decode_worker_queue_fire_time, decode_worker_queue_task_type};
+pub use metadata_keys::decode_worker_queue_task_type;
 pub use metadata_keys::{
     encode_collation_key_v2, encode_collation_prefix_v2, encode_cron_claim_key_v2,
     encode_cron_claim_prefix_v2, encode_cron_enabled_key_v2, encode_cron_job_key_v2,

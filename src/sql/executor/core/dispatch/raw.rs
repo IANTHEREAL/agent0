@@ -504,7 +504,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
         if with_server_config {
             session.set_server_config(ServerConfig::default().shared());
         }

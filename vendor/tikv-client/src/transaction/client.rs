@@ -216,6 +216,11 @@ impl Client {
         self.pd.clone().get_timestamp().await
     }
 
+    /// Retrieve PD's current global GC safepoint.
+    pub async fn get_gc_safepoint(&self) -> Result<u64> {
+        self.pd.clone().get_gc_safepoint().await
+    }
+
     /// Retrieve the current [`Timestamp`] with a caller-provided timeout.
     ///
     /// This is primarily useful for long-lived background tasks that need a

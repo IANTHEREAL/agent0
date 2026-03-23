@@ -163,9 +163,15 @@ impl PhysicalOperator for HnswScanOperator {
         // Load base graph + apply pending deltas so read-your-writes holds:
         // delta keys written by prior INSERT/UPDATE in the same txn are
         // visible via txn.scan's buffer merge.
-        let Some((hnsw_index, meta, delta_count)) =
-            load_hnsw_graph_with_deltas(ctx.txn, ctx.db_id, self.schema.table_id, self.index_id)
-                .await?
+        let keyspace = ctx.store.keyspace().unwrap_or("default");
+        let Some((hnsw_index, meta, delta_count)) = load_hnsw_graph_with_deltas(
+            ctx.txn,
+            ctx.db_id,
+            self.schema.table_id,
+            self.index_id,
+            keyspace,
+        )
+        .await?
         else {
             return Ok(());
         };

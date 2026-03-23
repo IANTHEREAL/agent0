@@ -481,7 +481,23 @@ impl Executor {
         }
 
         session.begin().await?;
-        let result: Result<(Option<u64>, Vec<ExecuteResult>)> = async {
+
+        // Collect HNSW S3 cleanup info BEFORE commit (schemas are still readable).
+        // After commit + unsafe_destroy_range, all TiKV keys (including HNSW meta/
+        // markers) are gone, so GC can never discover these S3 objects.
+        let mut hnsw_s3_db_id: Option<u64> = None;
+        if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
+            // Peek at the db_id for this database name. If it exists and has
+            // HNSW indexes, we'll clean up S3 after commit.
+            let (txn, _, _) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+            if let Some(db_id) = self.store().get_database_id(txn, &cmd.name).await? {
+                hnsw_s3_db_id = Some(db_id);
+            }
+        }
+
+        let result: Result<_> = async {
             let current_db_id = session.current_database_id();
             let (txn, _sequence_values, _search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
@@ -510,14 +526,72 @@ impl Executor {
             session.rollback().await?;
         }
 
-        let (dropped_db_id, mut results) = result?;
-        if let Some(db_id) = dropped_db_id {
+        let (dropped_result, mut results) = result?;
+        if let Some((db_id, mut dropping_guard)) = dropped_result {
+            // Step 1: Delete all HNSW text-format keys for this database.
+            // HNSW keys use text format (d_{db_id}_hnsw_...) which falls
+            // OUTSIDE the binary range that unsafe_destroy_range deletes.
+            // Without this, they persist as permanent orphans.
+            //
+            // This also closes the concurrent-merge race: any in-flight
+            // merge worker's get_for_update(hnsw_meta_key) will return
+            // None after this scan-delete, causing the worker to abort
+            // BEFORE uploading to S3. This prevents new S3 orphans from
+            // being created between cleanup and destroy_range.
+            {
+                let prefix_start = crate::sql::hnsw::storage::hnsw_db_prefix(db_id);
+                let prefix_end = crate::sql::hnsw::storage::hnsw_db_prefix_end(db_id);
+                let mut cursor = prefix_start.clone();
+                loop {
+                    let mut txn = self.store().begin().await?;
+                    let range: tikv_client::BoundRange =
+                        (cursor.clone()..prefix_end.clone()).into();
+                    let keys: Vec<tikv_client::Key> = txn.scan_keys(range, 1_000).await?.collect();
+                    if keys.is_empty() {
+                        txn.rollback().await.ok();
+                        break;
+                    }
+                    // Advance cursor past the last key for the next batch.
+                    let last: Vec<u8> = keys.last().unwrap().clone().into();
+                    let mut next = last;
+                    next.push(0x00);
+                    cursor = next;
+                    for key in &keys {
+                        txn.delete(key.clone()).await?;
+                    }
+                    txn.commit().await?;
+                }
+            }
+
+            // Step 2: Clean up HNSW S3 objects.
+            // Now that all meta keys are deleted, no new S3 uploads can
+            // start for this database. Await (not spawn) because
+            // unsafe_destroy_range would remove any remaining markers.
+            if let Some(s3_db_id) = hnsw_s3_db_id {
+                if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+                    let keyspace = self.store().keyspace().unwrap_or("default").to_string();
+                    if let Err(e) = s3.delete_db_prefix(&keyspace, s3_db_id).await {
+                        warn!(
+                            db_id = s3_db_id,
+                            error = %e,
+                            "DROP DATABASE: S3 HNSW cleanup failed; objects may be leaked"
+                        );
+                    }
+                }
+            }
+
+            // Step 3: Destroy the binary-format key range.
             if let Err(e) = self.store().unsafe_destroy_database_data(db_id).await {
                 warn!(
                     "DROP DATABASE '{}': failed to destroy data range for db_id={}: {}",
                     cmd.name, db_id, e
                 );
             }
+
+            // Step 4: Finalize the dropping guard — remove the registry entry.
+            // This allows the (keyspace, db_id) to be reused if the same
+            // database name is re-created.
+            dropping_guard.commit();
         }
 
         results.push(ExecuteResult::CommandComplete {

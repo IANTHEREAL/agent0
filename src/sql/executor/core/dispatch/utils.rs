@@ -258,6 +258,7 @@ mod tests {
             0,
             0,
         )
+        .unwrap()
     }
 
     #[test]

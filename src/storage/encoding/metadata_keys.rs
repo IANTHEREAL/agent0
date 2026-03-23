@@ -470,7 +470,9 @@ pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Result<V
 }
 
 /// Decode fire_time_ms from a worker queue key.
-#[cfg(test)]
+///
+/// Used by worker claim logic so a claim is bound to the exact queue entry
+/// being executed, not to the worker's current wall-clock minute.
 pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
     use memcomparable::Deserializer;
     if key.len() < WORKER_QUEUE_PREFIX.len() + 1 + 8 {
@@ -491,13 +493,13 @@ pub fn decode_worker_queue_task_type(key: &[u8]) -> Option<u8> {
 
 /// Encode a worker claim key (global).
 ///
-/// Format: `_worker_claim_{task_type:u8}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}_{fire_time_min:be8}`
+/// Format: `_worker_claim_{task_type:u8}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}_{fire_time_ms:be8}`
 pub fn encode_worker_claim_key(
     task_type: u8,
     keyspace: &str,
     db_id: u64,
     task_id: i64,
-    fire_time_min: i64,
+    fire_time_ms: i64,
 ) -> Vec<u8> {
     let mut key =
         Vec::with_capacity(WORKER_CLAIM_PREFIX.len() + 1 + 2 + keyspace.len() + 1 + 8 + 1 + 8 + 8);
@@ -510,7 +512,7 @@ pub fn encode_worker_claim_key(
     key.push(b'_');
     key.extend_from_slice(&task_id.to_be_bytes());
     key.push(b'_');
-    key.extend_from_slice(&fire_time_min.to_be_bytes());
+    key.extend_from_slice(&fire_time_ms.to_be_bytes());
     key
 }
 

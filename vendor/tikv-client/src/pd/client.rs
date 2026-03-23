@@ -66,6 +66,8 @@ pub trait PdClient: Send + Sync + 'static {
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp>;
 
+    async fn get_gc_safepoint(self: Arc<Self>) -> Result<u64>;
+
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool>;
 
     /// Register or refresh a per-service GC safe point with TTL lease.
@@ -270,6 +272,10 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
         self.pd.clone().get_timestamp().await
+    }
+
+    async fn get_gc_safepoint(self: Arc<Self>) -> Result<u64> {
+        self.pd.clone().get_gc_safepoint().await
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {

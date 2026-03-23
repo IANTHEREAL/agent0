@@ -364,6 +364,7 @@ mod tests {
         let store = TikvStore::new_stub();
         let observability = crate::observability::registry().tenant("settings_tableless_tests");
         Session::new_with_database(store, observability, 1, 1, "postgres".to_string(), 0, 0)
+            .unwrap()
     }
 
     #[test]

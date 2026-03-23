@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tikv_client::{BoundRange, Transaction};
@@ -89,10 +90,45 @@ pub struct HnswMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub frozen: bool,
+    /// S3 graph version. Monotonically increasing, incremented on each merge.
+    /// 0 means no S3 graph has been written (TiKV-only or pre-migration).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub graph_version: u64,
+    /// Unix timestamp (seconds) when the index was dropped via DDL.
+    /// Used as tombstone for MVCC-safe S3 cleanup.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HnswS3RetiredVersionGc {
+    /// Conservative TiKV TSO frontier. The S3 object must not be deleted until
+    /// PD's GC safepoint has advanced to or beyond this value.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_after_safepoint: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HnswS3PrefixGc {
+    /// Conservative TiKV TSO frontier for deleting the entire S3 prefix.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_after_safepoint: Option<u64>,
+    /// Optional reason for observability (`drop` / `truncate`).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 fn is_direct_mode(mode: &HnswLabelMode) -> bool {
     matches!(mode, HnswLabelMode::Direct)
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 pub struct HnswIndexHandle(Box<dyn Deref<Target = Index>>);
@@ -123,6 +159,121 @@ pub fn hnsw_graph_key(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
 
 pub fn hnsw_meta_key(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_{table_id}_{index_id}_meta").into_bytes()
+}
+
+pub fn hnsw_db_prefix(db_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_").into_bytes()
+}
+
+pub fn hnsw_db_prefix_end(db_id: u64) -> Vec<u8> {
+    let mut end = hnsw_db_prefix(db_id);
+    end.push(0xFF);
+    end
+}
+
+pub fn hnsw_s3_retired_version_key(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    version: u64,
+) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_{table_id}_{index_id}_s3_retired_{version:020}").into_bytes()
+}
+
+pub fn hnsw_s3_retired_version_prefix(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_{table_id}_{index_id}_s3_retired_").into_bytes()
+}
+
+pub fn hnsw_s3_retired_version_prefix_end(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
+    let mut end = hnsw_s3_retired_version_prefix(db_id, table_id, index_id);
+    end.push(0xFF);
+    end
+}
+
+pub fn hnsw_s3_prefix_gc_key(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_{table_id}_{index_id}_s3_prefix_gc").into_bytes()
+}
+
+fn parse_hnsw_index_key_parts(key: &[u8]) -> Option<(u64, u64, u64, &str)> {
+    let s = std::str::from_utf8(key).ok()?;
+    let rest = s.strip_prefix("d_")?;
+    let (db_str, rest) = rest.split_once("_hnsw_")?;
+    let db_id = db_str.parse().ok()?;
+    let (table_str, rest) = rest.split_once('_')?;
+    let table_id = table_str.parse().ok()?;
+    let (index_str, suffix) = rest.split_once('_')?;
+    let index_id = index_str.parse().ok()?;
+    Some((db_id, table_id, index_id, suffix))
+}
+
+#[allow(dead_code)] // Used in tests; may be useful for future key introspection
+pub fn parse_hnsw_meta_key(key: &[u8]) -> Option<(u64, u64, u64)> {
+    let (db_id, table_id, index_id, suffix) = parse_hnsw_index_key_parts(key)?;
+    (suffix == "meta").then_some((db_id, table_id, index_id))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_hnsw_s3_retired_version_key(key: &[u8]) -> Option<(u64, u64, u64, u64)> {
+    let (db_id, table_id, index_id, suffix) = parse_hnsw_index_key_parts(key)?;
+    let version = suffix.strip_prefix("s3_retired_")?.parse().ok()?;
+    Some((db_id, table_id, index_id, version))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_hnsw_s3_prefix_gc_key(key: &[u8]) -> Option<(u64, u64, u64)> {
+    let (db_id, table_id, index_id, suffix) = parse_hnsw_index_key_parts(key)?;
+    (suffix == "s3_prefix_gc").then_some((db_id, table_id, index_id))
+}
+
+/// Return whether the current keyspace contains any *live* HNSW index whose
+/// readable graph is S3-backed.
+///
+/// This is used for startup / connection-time fail-fast on nodes that are
+/// missing `HNSW_S3_BUCKET`. We intentionally scope this to live schema state:
+/// dropped-index tombstones and GC markers do not make query serving depend on
+/// S3, while live `graph_version > 0` indexes do.
+pub async fn keyspace_requires_hnsw_s3(store: &TikvStore) -> anyhow::Result<bool> {
+    let mut txn = store.begin().await?;
+    let result = async {
+        for db in store.list_databases(&mut txn).await? {
+            let table_names = store.list_tables(&mut txn, db.id).await?;
+            let schemas = store
+                .list_table_schemas(&mut txn, db.id, &table_names)
+                .await?;
+            for schema in schemas {
+                for index in &schema.indexes {
+                    if !index.is_hnsw() {
+                        continue;
+                    }
+                    let Some(meta_bytes) = txn
+                        .get(hnsw_meta_key(db.id, schema.table_id, index.id))
+                        .await?
+                    else {
+                        continue;
+                    };
+                    let meta: HnswMeta = serde_json::from_slice(&meta_bytes).context(
+                        "Failed to deserialize HNSW meta while checking live S3 requirement",
+                    )?;
+                    if meta.dropped_at.is_none() && meta.graph_version > 0 {
+                        return Ok::<bool, anyhow::Error>(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+    .await;
+
+    match result {
+        Ok(required) => {
+            txn.rollback().await.ok();
+            Ok(required)
+        }
+        Err(e) => {
+            txn.rollback().await.ok();
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +401,8 @@ pub fn create_empty_hnsw_index(
         storage_version: 1,
         label_mode: HnswLabelMode::Direct,
         frozen: false,
+        graph_version: 0,
+        dropped_at: None,
     };
     Ok((HnswIndexHandle::new(index), meta))
 }
@@ -408,25 +561,112 @@ pub async fn delete_all_deltas(
 // Base graph loader (without re-reading meta)
 // ===========================================================================
 
-/// Load ONLY the base graph blob from TiKV (caller provides meta).
-/// Returns None if no graph_key exists (e.g., empty index before first merge).
+/// Load ONLY the base graph blob from TiKV or S3 (caller provides meta).
+/// Returns None if no graph_key exists (e.g., empty index before first merge),
+/// or if the index has been tombstoned (`dropped_at` is set).
+///
+/// When S3 is configured and `graph_version > 0`:
+///   1. Check the process-level file cache for a matching version.
+///   2. On cache hit: load the index from the cached file path.
+///   3. On cache miss: S3 GET, insert into cache, load from cached file.
+///   4. The cached file is persistent (NOT deleted after load).
+///
+/// When loading from TiKV (`graph_version == 0`):
+///   Uses a temp file, loads, and deletes (no cache integration for TiKV blobs).
 pub async fn load_base_graph(
     txn: &mut Transaction,
     db_id: u64,
     table_id: u64,
     index_id: u64,
     meta: &HnswMeta,
+    keyspace: &str,
 ) -> Result<Option<(HnswIndexHandle, HnswMeta)>, SqlError> {
-    let graph_key = hnsw_graph_key(db_id, table_id, index_id);
-    let Some(graph_bytes) = txn
-        .get(graph_key)
-        .await
-        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
-    else {
+    // Tombstoned indexes should not be loaded.
+    if meta.dropped_at.is_some() {
         return Ok(None);
+    }
+
+    // Determine the file path to load the index from.
+    // For S3 graphs: try cache first, then S3 GET + cache insert.
+    // For TiKV graphs: read bytes, write to temp file.
+    let (load_path, is_temp_file) = if meta.graph_version > 0 {
+        // S3 path: graph_version > 0 means the graph was written to S3.
+        let Some(s3) = super::s3::hnsw_s3_client() else {
+            return Err(SqlError::Internal(anyhow::anyhow!(
+                "HNSW index d_{}_hnsw_{}_{} requires S3 storage (graph_version={}) \
+                 but S3 is not configured. Set HNSW_S3_BUCKET to enable S3 offload.",
+                db_id,
+                table_id,
+                index_id,
+                meta.graph_version
+            )));
+        };
+
+        let cache = super::s3::hnsw_graph_cache();
+
+        // Step 1: cache lookup.
+        if let Some(cached_path) =
+            cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version)
+        {
+            (cached_path, false)
+        } else {
+            // Step 2: cache miss — S3 GET.
+            let graph_bytes = match s3
+                .get_graph(keyspace, db_id, table_id, index_id, meta.graph_version)
+                .await
+            {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    return Err(SqlError::Internal(anyhow::anyhow!(
+                        "HNSW S3 graph not found for d_{}_hnsw_{}_{} version {}",
+                        db_id,
+                        table_id,
+                        index_id,
+                        meta.graph_version
+                    )));
+                }
+                Err(e) => {
+                    return Err(SqlError::Internal(anyhow::anyhow!(
+                        "HNSW S3 graph load failed for d_{}_hnsw_{}_{}: {}",
+                        db_id,
+                        table_id,
+                        index_id,
+                        e
+                    )));
+                }
+            };
+
+            // Step 3: insert into cache.
+            let cached_path = cache
+                .insert(
+                    keyspace,
+                    db_id,
+                    table_id,
+                    index_id,
+                    meta.graph_version,
+                    &graph_bytes,
+                )
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+
+            (cached_path, false)
+        }
+    } else {
+        // TiKV path: graph_version == 0, read from TiKV as before.
+        let graph_key = hnsw_graph_key(db_id, table_id, index_id);
+        let Some(bytes) = txn
+            .get(graph_key)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+        else {
+            return Ok(None);
+        };
+
+        // Write to temp file for TiKV path (no cache).
+        let temp_path = temp_file_path(db_id, table_id, index_id, "load");
+        fs::write(&temp_path, &bytes).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        (temp_path, true)
     };
-    let temp_path = temp_file_path(db_id, table_id, index_id, "load");
-    fs::write(&temp_path, &graph_bytes).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+
     let metric = metric_from_string(&meta.distance_metric)?;
     let options = IndexOptions {
         dimensions: meta.dimensions,
@@ -436,17 +676,94 @@ pub async fn load_base_graph(
         expansion_add: meta.ef_construction,
         expansion_search: super::HNSW_DEFAULT_EF_SEARCH,
     };
-    let index = new_index(&options).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
-    let temp_path_str = temp_path.to_string_lossy().to_string();
-    let load_result = index
-        .load(&temp_path_str)
-        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)));
-    let _ = fs::remove_file(&temp_path);
-    load_result?;
-    let mut live_meta = meta.clone();
-    live_meta.count = index.size() as u64;
-    live_meta.capacity = index.capacity() as u64;
-    Ok(Some((HnswIndexHandle::new(index), live_meta)))
+    // Try loading the graph from the resolved path. If it fails on a
+    // cached file (not temp), retry from S3 — the file may have been
+    // deleted by concurrent LRU eviction or version-mismatch cleanup
+    // (TOCTOU race between cache.lookup() and index.load()).
+    // Try loading the index from the resolved path. If the file was
+    // deleted by concurrent LRU eviction or version-mismatch cleanup
+    // (TOCTOU race), we detect it here and retry from S3.
+    //
+    // We must ensure the non-Send UniquePtr<Index> does NOT live across
+    // an .await point. So we first attempt the load synchronously, and
+    // only if it fails do we drop everything, do the async S3 fetch,
+    // then create a new index.
+    let need_retry = {
+        let idx = new_index(&options).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        let path_str = load_path.to_string_lossy().to_string();
+        match idx.load(&path_str) {
+            Ok(()) => {
+                if is_temp_file {
+                    let _ = fs::remove_file(&load_path);
+                }
+                // Success — return early with this index.
+                let mut live_meta = meta.clone();
+                live_meta.count = idx.size() as u64;
+                live_meta.capacity = idx.capacity() as u64;
+                return Ok(Some((HnswIndexHandle::new(idx), live_meta)));
+            }
+            Err(_e) if !is_temp_file && meta.graph_version > 0 => {
+                // Cache file likely deleted — need S3 retry.
+                true
+            }
+            Err(e) => {
+                if is_temp_file {
+                    let _ = fs::remove_file(&load_path);
+                }
+                return Err(SqlError::Internal(anyhow::anyhow!(e)));
+            }
+        }
+        // idx (UniquePtr<Index>) is dropped here before any .await
+    };
+
+    // Retry path: re-fetch from S3 into a temp file.
+    if need_retry {
+        let s3 = super::s3::hnsw_s3_client().ok_or_else(|| {
+            SqlError::Internal(anyhow::anyhow!("S3 client unavailable for retry"))
+        })?;
+        let bytes = s3
+            .get_graph(keyspace, db_id, table_id, index_id, meta.graph_version)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!("S3 retry failed: {}", e)))?
+            .ok_or_else(|| {
+                SqlError::Internal(anyhow::anyhow!(
+                    "HNSW S3 graph not found on retry (version {})",
+                    meta.graph_version
+                ))
+            })?;
+        // Re-insert into cache so future queries don't repeat the
+        // retry. Without this, the stale cache entry (pointing at the
+        // deleted file) would cause every subsequent query to fail-then-
+        // retry from S3, degrading to uncached performance permanently.
+        let cache = super::s3::hnsw_graph_cache();
+        let cached_path = cache
+            .insert(
+                keyspace,
+                db_id,
+                table_id,
+                index_id,
+                meta.graph_version,
+                &bytes,
+            )
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+
+        let index = new_index(&options).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        let cached_str = cached_path.to_string_lossy().to_string();
+        let load_result = index
+            .load(&cached_str)
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)));
+        load_result?;
+
+        let mut live_meta = meta.clone();
+        live_meta.count = index.size() as u64;
+        live_meta.capacity = index.capacity() as u64;
+        return Ok(Some((HnswIndexHandle::new(index), live_meta)));
+    }
+
+    // Unreachable: the success branch returns at line ~569,
+    // the retry branch returns at line ~613, and the error
+    // branches return Err. This satisfies the compiler.
+    unreachable!("load_base_graph: all code paths return above")
 }
 
 // ===========================================================================
@@ -467,6 +784,7 @@ pub async fn load_hnsw_graph_with_deltas(
     db_id: u64,
     table_id: u64,
     index_id: u64,
+    keyspace: &str,
 ) -> Result<Option<(HnswIndexHandle, HnswMeta, usize)>, SqlError> {
     // 1. Read meta
     let meta_key = hnsw_meta_key(db_id, table_id, index_id);
@@ -480,11 +798,16 @@ pub async fn load_hnsw_graph_with_deltas(
     let meta: HnswMeta =
         serde_json::from_slice(&meta_bytes).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
 
-    // 2. Only v1 (delta-log) is supported; reject anything else.
-    if meta.storage_version != 1 {
+    // Tombstoned indexes should not be loaded.
+    if meta.dropped_at.is_some() {
+        return Ok(None);
+    }
+
+    // 2. Only v1 (delta-log) and v2 (S3) are supported; reject anything else.
+    if meta.storage_version != 1 && meta.storage_version != 2 {
         return Err(SqlError::Internal(anyhow::anyhow!(
             "HNSW index d_{}_hnsw_{}_{} has unsupported storage_version={}; \
-             only v1 (delta-log) is supported. Please rebuild the index.",
+             only v1 (delta-log) and v2 (S3) are supported. Please rebuild the index.",
             db_id,
             table_id,
             index_id,
@@ -494,7 +817,7 @@ pub async fn load_hnsw_graph_with_deltas(
 
     // 3. Delta-log path: load base graph (may not exist yet)
     let (index, mut live_meta) =
-        match load_base_graph(txn, db_id, table_id, index_id, &meta).await? {
+        match load_base_graph(txn, db_id, table_id, index_id, &meta, keyspace).await? {
             Some(pair) => pair,
             None => create_empty_hnsw_index(
                 meta.dimensions,
@@ -960,6 +1283,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Mapped,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"label_mode\":\"Mapped\""));
@@ -979,6 +1304,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -1044,6 +1371,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: true,
+            graph_version: 0,
+            dropped_at: None,
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
         let deserialized: HnswMeta = serde_json::from_slice(&bytes).unwrap();
@@ -1062,6 +1391,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("frozen"));
@@ -1106,6 +1437,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         let (graph_bytes, _) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
         // This graph should exceed the threshold.
@@ -1140,6 +1473,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: true,
+            graph_version: 0,
+            dropped_at: None,
         };
         // The merge dispatch checks meta.frozen and skips.
         assert!(meta.frozen, "frozen index should be skipped by dispatch");
@@ -1163,6 +1498,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: true,
+            graph_version: 0,
+            dropped_at: None,
         };
         let normal_meta = HnswMeta {
             count: 100,
@@ -1174,6 +1511,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         // Sweep logic: skip frozen, enqueue normal.
         let indexes = [("frozen_idx", &frozen_meta), ("normal_idx", &normal_meta)];
@@ -1222,6 +1561,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: true,
+            graph_version: 0,
+            dropped_at: None,
         };
         // Re-freeze is a no-op on the bool.
         meta.frozen = true;
@@ -1255,6 +1596,8 @@ mod tests {
             storage_version: 1,
             label_mode: HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         let (graph_bytes, _meta_bytes) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
 
@@ -1271,6 +1614,24 @@ mod tests {
         assert!(
             would_reject,
             "CREATE INDEX guard must reject oversized graph before write"
+        );
+    }
+
+    #[test]
+    fn parse_hnsw_meta_and_gc_marker_keys() {
+        let meta_key = hnsw_meta_key(7, 11, 13);
+        assert_eq!(parse_hnsw_meta_key(&meta_key), Some((7, 11, 13)));
+
+        let retired_key = hnsw_s3_retired_version_key(7, 11, 13, 17);
+        assert_eq!(
+            parse_hnsw_s3_retired_version_key(&retired_key),
+            Some((7, 11, 13, 17))
+        );
+
+        let prefix_gc_key = hnsw_s3_prefix_gc_key(7, 11, 13);
+        assert_eq!(
+            parse_hnsw_s3_prefix_gc_key(&prefix_gc_key),
+            Some((7, 11, 13))
         );
     }
 }

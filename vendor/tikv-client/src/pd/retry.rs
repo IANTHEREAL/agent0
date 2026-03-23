@@ -46,6 +46,8 @@ pub trait RetryClientTrait {
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp>;
 
+    async fn get_gc_safepoint(self: Arc<Self>) -> Result<u64>;
+
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool>;
 
     /// Register or refresh a per-service GC safe point with TTL lease.
@@ -251,6 +253,15 @@ impl RetryClientTrait for RetryClient<Cluster> {
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
         retry!(self, "get_timestamp", |cluster| cluster.get_timestamp())
+    }
+
+    async fn get_gc_safepoint(self: Arc<Self>) -> Result<u64> {
+        retry_mut!(self, "get_gc_safepoint", |cluster| async {
+            cluster
+                .get_gc_safepoint(self.timeout)
+                .await
+                .map(|resp| resp.safe_point)
+        })
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {

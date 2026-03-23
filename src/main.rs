@@ -205,6 +205,17 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let server_config = ServerConfig::from_env().shared();
     let initial_server_config = server_config.read().unwrap().clone();
     config::init_embedding_config();
+
+    // Initialize HNSW S3 offload client.
+    // When HNSW_S3_BUCKET is explicitly set, S3 init failure is fatal —
+    // the operator intends S3 storage and silent fallback to TiKV would
+    // defeat that intent and risk mixed-backend inconsistency.
+    // When HNSW_S3_BUCKET is not set, init succeeds with S3 disabled.
+    if let Err(e) = crate::sql::hnsw::s3::init_hnsw_s3() {
+        eprintln!("FATAL: HNSW S3 initialization failed: {}", e);
+        return Err(e);
+    }
+
     info!(
         "Statement timeout default: {}ms, idle-in-transaction timeout default: {}ms, pgwire TCP keepalive idle: {}ms",
         initial_server_config.statement_timeout_ms,
@@ -352,6 +363,13 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             )
         })?;
     info!("GC registry startup publish completed");
+
+    // Note: we do NOT scan keyspaces at startup to detect S3-backed indexes
+    // when HNSW_S3_BUCKET is unset. That check used get_client() which
+    // bootstraps inactive tenants (format marker + postgres database) as a
+    // side effect. Instead, we rely on the runtime check in load_base_graph()
+    // at storage.rs:457-465 which returns a clear, actionable error:
+    // "HNSW index requires S3 storage. Set HNSW_S3_BUCKET to enable."
 
     // GC registry publisher — UNCONDITIONAL. Runs on every SQL-serving node.
     // Publishes this instance's min_start_ts to _sys_worker every interval.

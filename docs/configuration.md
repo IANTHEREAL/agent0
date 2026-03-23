@@ -28,6 +28,13 @@ This document is a convenience overview. The authoritative list of config keys +
 | `DB9_DEV` | `false` | Dev-only escape hatch (legacy insecure bootstrap) |
 | `DB9_INSECURE` | `false` | Explicit insecure posture escape hatch |
 | `DB9_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
+| `HNSW_S3_BUCKET` | (unset) | S3 bucket for HNSW graph offload. When set, HNSW graphs are stored in S3 instead of TiKV, removing the 8 MB size limit. When unset, behavior is unchanged (TiKV-only). |
+| `HNSW_S3_REGION` | (unset) | S3 region. Falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`. |
+| `HNSW_S3_ENDPOINT` | (unset) | S3-compatible endpoint URL (e.g. `http://minio:9000`). |
+| `HNSW_S3_PREFIX` | `hnsw` | S3 key prefix for graph objects. |
+| `HNSW_S3_FORCE_PATH_STYLE` | `false` | Use path-style URLs (required for MinIO). |
+| `HNSW_CACHE_MAX_ENTRIES` | `64` | Max number of cached HNSW graph files (LRU). Set higher for deployments with many hot indexes. |
+| `HNSW_CACHE_DIR` | `/tmp/db9_hnsw_cache` | Directory for cached HNSW graph files. Use a dedicated volume for high-QPS workloads. |
 
 ## Examples
 
@@ -68,6 +75,35 @@ PG_TLS_KEY=/path/to/server.key \
 PG_REQUIRE_TLS=1 \
 ./target/release/db9-server
 ```
+
+### HNSW S3 Offload (Optional)
+
+Stores HNSW vector index graphs in S3, removing the 8 MB TiKV value size limit.
+Without this, indexes freeze at ~1,300 rows for VECTOR(1536) embeddings.
+
+```bash
+# AWS S3
+HNSW_S3_BUCKET=my-hnsw-graphs \
+HNSW_S3_REGION=us-east-1 \
+DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> \
+./target/release/db9-server
+```
+
+```bash
+# MinIO / S3-compatible
+HNSW_S3_BUCKET=hnsw \
+HNSW_S3_ENDPOINT=http://minio:9000 \
+HNSW_S3_FORCE_PATH_STYLE=true \
+DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> \
+./target/release/db9-server
+```
+
+S3 credentials use the standard AWS chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,
+EC2 Instance Profile, or ECS Task Role). Required IAM permissions:
+`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:ListBucket`.
+
+When `HNSW_S3_BUCKET` is not set, HNSW behavior is unchanged (TiKV-only with
+8 MB frozen guard). Existing indexes migrate automatically on next merge cycle.
 
 ## TiKV Configuration
 

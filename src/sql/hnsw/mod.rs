@@ -10,7 +10,14 @@
 //! concurrent reader to repopulate with stale data that persisted permanently.
 //! When a proper MVCC-aware cache is needed, it should validate freshness
 //! against TiKV timestamps rather than relying on eager invalidation.
+//!
+//! ## S3 offload (optional)
+//!
+//! When the `HNSW_S3_BUCKET` env var is set, serialized graph blobs can be
+//! cached in S3 as a warm tier between TiKV page storage and the process-level
+//! in-memory cache. See [`s3`] for the client implementation.
 
+pub(crate) mod s3;
 pub mod storage;
 
 use anyhow::anyhow;

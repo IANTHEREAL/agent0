@@ -7,6 +7,7 @@ use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 use crate::worker::now_epoch_ms;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +93,12 @@ impl WorkerGc {
             if let Err(e) = self.sweep_hnsw_delta_backlogs().await {
                 warn!("HNSW sweep error: {}", e);
             }
+            // S3 orphan sweep: only run if S3 offload is configured.
+            if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
+                if let Err(e) = self.sweep_hnsw_s3_orphans().await {
+                    warn!("HNSW S3 sweep error: {}", e);
+                }
+            }
         }
     }
 }
@@ -158,8 +165,13 @@ pub async fn publish_gc_instance_state_once(
 ) -> Result<()> {
     let current_version = publish_gc_instance_state(store, config).await?;
     if !config.gc_safepoint_enabled {
-        reap_stale_gc_instance_states(store, current_version, config.gc_life_time_sec, "publisher")
-            .await?;
+        reap_stale_gc_instance_states(
+            store,
+            current_version,
+            heartbeat_timeout_sec(config),
+            "publisher",
+        )
+        .await?;
     }
     Ok(())
 }
@@ -296,8 +308,14 @@ async fn advance_gc_safepoint(
         states
     };
 
-    let effective_life_time_sec =
-        effective_cluster_gc_life_time_sec(current_version, config.gc_life_time_sec, &all_states);
+    let hb_timeout = heartbeat_timeout_sec(config);
+
+    let effective_life_time_sec = effective_cluster_gc_life_time_sec(
+        current_version,
+        config.gc_life_time_sec,
+        hb_timeout,
+        &all_states,
+    );
     if effective_life_time_sec > config.gc_life_time_sec {
         info!(
             local_life_time = config.gc_life_time_sec,
@@ -306,11 +324,15 @@ async fn advance_gc_safepoint(
         );
     }
 
-    let safepoint_version =
-        compute_cluster_gc_safepoint(current_version, config.gc_life_time_sec, &all_states);
+    let safepoint_version = compute_cluster_gc_safepoint(
+        current_version,
+        config.gc_life_time_sec,
+        hb_timeout,
+        &all_states,
+    );
 
     for state in &all_states {
-        if !is_live_gc_instance_state(current_version, config.gc_life_time_sec, state) {
+        if !is_live_gc_instance_state(current_version, hb_timeout, state) {
             debug!(
                 instance_id = state.instance_id,
                 updated_at = state.updated_at_version,
@@ -335,7 +357,7 @@ async fn advance_gc_safepoint(
     if let Err(e) = reap_stale_gc_instance_states_from_scan(
         store,
         current_version,
-        config.gc_life_time_sec,
+        hb_timeout,
         &all_states,
         "advancer",
     )
@@ -453,6 +475,656 @@ impl WorkerGc {
                 total_enqueued, total_enqueue_errors, "HNSW periodic sweep complete"
             );
         }
+        Ok(())
+    }
+
+    /// Sweep orphaned HNSW S3 graph objects.
+    ///
+    /// Sweep orphaned or retired HNSW S3 graph objects.
+    ///
+    /// Correctness rule:
+    /// - Anything that was ever referenced by committed TiKV metadata must be
+    ///   reclaimed using a safepoint-aware marker, never wall-clock age.
+    /// - Objects without committed TiKV lifecycle state are treated as
+    ///   speculative uploads and left leak-safe for now. Writers upload to S3
+    ///   before committing TiKV metadata, so GC must not guess whether a
+    ///   no-meta object will later become live.
+    async fn sweep_hnsw_s3_orphans(&self) -> Result<()> {
+        let s3 = crate::sql::hnsw::s3::hnsw_s3_client()
+            .ok_or_else(|| anyhow::anyhow!("HNSW S3 client not available"))?;
+
+        let client = self
+            .system_store
+            .transaction_client()
+            .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
+        let gc_safepoint = client.get_gc_safepoint().await?;
+        let seal_safepoint = client
+            .current_timestamp_with_timeout(Duration::from_secs(TSO_TIMEOUT_SEC))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get current timestamp from PD: {}", e))?
+            .version();
+        let mut txn = self.system_store.begin().await?;
+        let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        let mut total_deleted = 0u64;
+
+        for entry in &all_entries {
+            // List all S3 objects for this (keyspace, db_id).
+            let all_objects = match s3.list_objects(&entry.keyspace, entry.db_id).await {
+                Ok(objs) => objs,
+                Err(e) => {
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        error = %e,
+                        "HNSW S3 sweep: failed to list objects"
+                    );
+                    continue;
+                }
+            };
+
+            if all_objects.is_empty() {
+                continue;
+            }
+
+            let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        error = %e,
+                        "HNSW S3 sweep: failed to acquire tenant store"
+                    );
+                    continue;
+                }
+            };
+            let store = handle.store();
+
+            // Group objects by (table_id, index_id).
+            let mut index_objects: HashMap<(u64, u64), Vec<&crate::sql::hnsw::s3::S3ObjectInfo>> =
+                HashMap::new();
+            for obj in &all_objects {
+                if let Some((table_id, index_id, _version)) =
+                    crate::sql::hnsw::s3::parse_s3_key(&obj.key)
+                {
+                    index_objects
+                        .entry((table_id, index_id))
+                        .or_default()
+                        .push(obj);
+                }
+            }
+
+            // Read all HNSW metas for this database.
+            let metas = match self.read_all_hnsw_metas(store.as_ref(), entry.db_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        error = %e,
+                        "HNSW S3 sweep: failed to read HNSW metas"
+                    );
+                    continue;
+                }
+            };
+
+            // Process each index's objects.
+            for ((table_id, index_id), objects) in &index_objects {
+                let meta_ref = metas.get(&(*table_id, *index_id));
+                let prefix_gc = match self
+                    .read_hnsw_s3_prefix_gc_marker(
+                        store.as_ref(),
+                        entry.db_id,
+                        *table_id,
+                        *index_id,
+                    )
+                    .await
+                {
+                    Ok(marker) => marker,
+                    Err(e) => {
+                        warn!(
+                            keyspace = %entry.keyspace,
+                            db_id = entry.db_id,
+                            table_id,
+                            index_id,
+                            error = %e,
+                            "HNSW S3 sweep: failed to read prefix GC marker"
+                        );
+                        continue;
+                    }
+                };
+
+                if let Some(mut marker) = prefix_gc {
+                    let can_delete_whole_prefix = meta_ref
+                        .map(|meta| meta.dropped_at.is_some() || meta.graph_version == 0)
+                        .unwrap_or(true);
+
+                    if !can_delete_whole_prefix {
+                        warn!(
+                            keyspace = %entry.keyspace,
+                            db_id = entry.db_id,
+                            table_id,
+                            index_id,
+                            current_version = meta_ref.map(|m| m.graph_version).unwrap_or(0),
+                            "HNSW S3 sweep: deleting stale prefix GC marker on live index"
+                        );
+                        self.delete_hnsw_s3_prefix_gc_marker(
+                            store.as_ref(),
+                            entry.db_id,
+                            *table_id,
+                            *index_id,
+                        )
+                        .await?;
+                    } else if marker.delete_after_safepoint.is_none() {
+                        marker.delete_after_safepoint = Some(seal_safepoint);
+                        self.write_hnsw_s3_prefix_gc_marker(
+                            store.as_ref(),
+                            entry.db_id,
+                            *table_id,
+                            *index_id,
+                            &marker,
+                        )
+                        .await?;
+                    } else if gc_safepoint >= marker.delete_after_safepoint.unwrap() {
+                        match s3
+                            .delete_prefix(&entry.keyspace, entry.db_id, *table_id, *index_id)
+                            .await
+                        {
+                            Ok(count) => {
+                                total_deleted += count;
+                                self.delete_hnsw_s3_prefix_gc_marker(
+                                    store.as_ref(),
+                                    entry.db_id,
+                                    *table_id,
+                                    *index_id,
+                                )
+                                .await?;
+                                self.delete_hnsw_s3_retired_version_markers_for_index(
+                                    store.as_ref(),
+                                    entry.db_id,
+                                    *table_id,
+                                    *index_id,
+                                )
+                                .await?;
+                                if meta_ref.is_some_and(|m| m.dropped_at.is_some()) {
+                                    self.delete_hnsw_meta(
+                                        store.as_ref(),
+                                        entry.db_id,
+                                        *table_id,
+                                        *index_id,
+                                    )
+                                    .await?;
+                                }
+                                debug!(
+                                    keyspace = %entry.keyspace,
+                                    db_id = entry.db_id,
+                                    table_id,
+                                    index_id,
+                                    gc_safepoint,
+                                    delete_after = marker.delete_after_safepoint,
+                                    "HNSW S3 sweep: cleaned whole prefix after safepoint advanced"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    keyspace = %entry.keyspace,
+                                    db_id = entry.db_id,
+                                    table_id,
+                                    index_id,
+                                    error = %e,
+                                    "HNSW S3 sweep: failed to delete prefix"
+                                );
+                            }
+                        }
+                    }
+                    if can_delete_whole_prefix {
+                        continue;
+                    }
+                }
+
+                match meta_ref {
+                    None => {
+                        // No committed meta. This could be:
+                        // (a) a writer-owned upload not yet committed (in-flight
+                        //     CREATE INDEX inside an explicit transaction)
+                        // (b) a rollback orphan (BEGIN; CREATE INDEX; ROLLBACK;)
+                        // (c) a crash orphan (S3 PUT succeeded, TiKV commit crashed)
+                        //
+                        // We CANNOT safely use wall-clock age to distinguish these:
+                        // an explicit transaction can hold an uncommitted S3 upload
+                        // for longer than gc_life_time_sec. Deleting based on age
+                        // would destroy a graph that the user is about to COMMIT.
+                        //
+                        // Correctness > cleanup: leave these objects alone. The S3
+                        // storage cost of orphans is negligible. Rollback/crash
+                        // orphans are bounded (one per failed CREATE INDEX) and
+                        // will be overwritten if the same index is re-created.
+                        debug!(
+                            keyspace = %entry.keyspace,
+                            db_id = entry.db_id,
+                            table_id,
+                            index_id,
+                            object_count = objects.len(),
+                            "HNSW S3 sweep: leaving no-meta objects untouched \
+                             (may be uncommitted explicit transaction)"
+                        );
+                    }
+                    Some(meta) if meta.dropped_at.is_some() => {
+                        let marker = crate::sql::hnsw::storage::HnswS3PrefixGc {
+                            delete_after_safepoint: Some(seal_safepoint),
+                            reason: Some("drop".to_string()),
+                        };
+                        self.write_hnsw_s3_prefix_gc_marker(
+                            store.as_ref(),
+                            entry.db_id,
+                            *table_id,
+                            *index_id,
+                            &marker,
+                        )
+                        .await?;
+                    }
+                    Some(meta) => {
+                        let current_version = meta.graph_version;
+                        if current_version == 0 {
+                            let marker = crate::sql::hnsw::storage::HnswS3PrefixGc {
+                                delete_after_safepoint: Some(seal_safepoint),
+                                reason: Some("truncate".to_string()),
+                            };
+                            self.write_hnsw_s3_prefix_gc_marker(
+                                store.as_ref(),
+                                entry.db_id,
+                                *table_id,
+                                *index_id,
+                                &marker,
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        for obj in objects {
+                            let version = match crate::sql::hnsw::s3::parse_s3_key(&obj.key) {
+                                Some((_, _, v)) => v,
+                                None => continue,
+                            };
+                            let retired_marker = self
+                                .read_hnsw_s3_retired_version_marker(
+                                    store.as_ref(),
+                                    entry.db_id,
+                                    *table_id,
+                                    *index_id,
+                                    version,
+                                )
+                                .await?;
+                            match classify_live_hnsw_s3_version(
+                                current_version,
+                                version,
+                                retired_marker.is_some(),
+                            ) {
+                                LiveHnswS3VersionDisposition::Current {
+                                    clear_stale_retired_marker,
+                                } => {
+                                    if clear_stale_retired_marker {
+                                        self.delete_hnsw_s3_retired_version_marker(
+                                            store.as_ref(),
+                                            entry.db_id,
+                                            *table_id,
+                                            *index_id,
+                                            version,
+                                        )
+                                        .await?;
+                                        warn!(
+                                            keyspace = %entry.keyspace,
+                                            db_id = entry.db_id,
+                                            table_id,
+                                            index_id,
+                                            version,
+                                            "HNSW S3 sweep: removed stale retired marker from current live version"
+                                        );
+                                    }
+                                }
+                                LiveHnswS3VersionDisposition::FutureSpeculative {
+                                    clear_stale_retired_marker,
+                                } => {
+                                    // Writers upload S3 graphs before committing the TiKV
+                                    // metadata flip to the new graph_version. Therefore a
+                                    // version greater than current_version may still be the
+                                    // next live graph in-flight; GC must never infer
+                                    // retirement from object listing alone for this case.
+                                    //
+                                    // Future/speculative versions are left alone. They
+                                    // could be an in-flight merge upload or an uncommitted
+                                    // explicit transaction. A crashed merge will overwrite
+                                    // on retry; a rolled-back txn leaves a small orphan.
+                                    // Correctness > cleanup.
+                                    if clear_stale_retired_marker {
+                                        self.delete_hnsw_s3_retired_version_marker(
+                                            store.as_ref(),
+                                            entry.db_id,
+                                            *table_id,
+                                            *index_id,
+                                            version,
+                                        )
+                                        .await?;
+                                        warn!(
+                                            keyspace = %entry.keyspace,
+                                            db_id = entry.db_id,
+                                            table_id,
+                                            index_id,
+                                            current_version,
+                                            version,
+                                            "HNSW S3 sweep: removed stale retired marker from speculative future version"
+                                        );
+                                    }
+                                }
+                                LiveHnswS3VersionDisposition::HistoricalRetired => {
+                                    match retired_marker {
+                                        None => {
+                                            let marker =
+                                                crate::sql::hnsw::storage::HnswS3RetiredVersionGc {
+                                                    delete_after_safepoint: Some(seal_safepoint),
+                                                };
+                                            self.write_hnsw_s3_retired_version_marker(
+                                                store.as_ref(),
+                                                entry.db_id,
+                                                *table_id,
+                                                *index_id,
+                                                version,
+                                                &marker,
+                                            )
+                                            .await?;
+                                        }
+                                        Some(mut marker)
+                                            if marker.delete_after_safepoint.is_none() =>
+                                        {
+                                            marker.delete_after_safepoint = Some(seal_safepoint);
+                                            self.write_hnsw_s3_retired_version_marker(
+                                                store.as_ref(),
+                                                entry.db_id,
+                                                *table_id,
+                                                *index_id,
+                                                version,
+                                                &marker,
+                                            )
+                                            .await?;
+                                        }
+                                        Some(marker)
+                                            if gc_safepoint
+                                                >= marker
+                                                    .delete_after_safepoint
+                                                    .unwrap_or(u64::MAX) =>
+                                        {
+                                            // Delete S3 object, then marker. On S3
+                                            // failure, keep the marker (retry next
+                                            // sweep) but do NOT abort the entire
+                                            // sweep — other indexes must still be
+                                            // processed.
+                                            match s3
+                                                .delete_graph(
+                                                    &entry.keyspace,
+                                                    entry.db_id,
+                                                    *table_id,
+                                                    *index_id,
+                                                    version,
+                                                )
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    self.delete_hnsw_s3_retired_version_marker(
+                                                        store.as_ref(),
+                                                        entry.db_id,
+                                                        *table_id,
+                                                        *index_id,
+                                                        version,
+                                                    )
+                                                    .await?;
+                                                    total_deleted += 1;
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        table_id,
+                                                        index_id,
+                                                        version,
+                                                        error = %e,
+                                                        "HNSW S3 sweep: retired version delete failed, marker retained for retry"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Some(_) => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if total_deleted > 0 {
+            info!(total_deleted, "HNSW S3 sweep complete");
+        }
+
+        Ok(())
+    }
+
+    /// Read all HNSW metas for a database by enumerating schemas.
+    ///
+    /// Discovers HNSW indexes from table schemas (O(tables × indexes)),
+    /// then point-gets each meta key (~200 bytes). Does NOT scan the
+    /// d_{db}_hnsw_* prefix — that prefix contains millions of rowid
+    /// mapping and delta keys on large tables.
+    async fn read_all_hnsw_metas(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+    ) -> Result<HashMap<(u64, u64), crate::sql::hnsw::storage::HnswMeta>> {
+        let mut txn = store.begin().await?;
+        let result = async {
+            let table_names = store.list_tables(&mut txn, db_id).await?;
+            let schemas = store
+                .list_table_schemas(&mut txn, db_id, &table_names)
+                .await?;
+
+            let mut result = HashMap::new();
+            for schema in &schemas {
+                for index in &schema.indexes {
+                    if !index.is_hnsw() {
+                        continue;
+                    }
+                    let meta_key =
+                        crate::sql::hnsw::storage::hnsw_meta_key(db_id, schema.table_id, index.id);
+                    if let Some(value) = txn.get(meta_key).await? {
+                        if let Ok(meta) =
+                            serde_json::from_slice::<crate::sql::hnsw::storage::HnswMeta>(&value)
+                        {
+                            result.insert((schema.table_id, index.id), meta);
+                        }
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(result)
+        }
+        .await;
+
+        match result {
+            Ok(result) => {
+                txn.rollback().await.ok();
+                Ok(result)
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
+    async fn read_hnsw_s3_prefix_gc_marker(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+    ) -> Result<Option<crate::sql::hnsw::storage::HnswS3PrefixGc>> {
+        let mut txn = store.begin().await?;
+        let result = async {
+            let key = crate::sql::hnsw::storage::hnsw_s3_prefix_gc_key(db_id, table_id, index_id);
+            let Some(bytes) = txn.get(key).await? else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            Ok(Some(serde_json::from_slice::<
+                crate::sql::hnsw::storage::HnswS3PrefixGc,
+            >(&bytes)?))
+        }
+        .await;
+        txn.rollback().await.ok();
+        result
+    }
+
+    async fn write_hnsw_s3_prefix_gc_marker(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        marker: &crate::sql::hnsw::storage::HnswS3PrefixGc,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let key = crate::sql::hnsw::storage::hnsw_s3_prefix_gc_key(db_id, table_id, index_id);
+        crate::txn::txn_put(&mut txn, key, serde_json::to_vec(marker)?).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_hnsw_s3_prefix_gc_marker(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let key = crate::sql::hnsw::storage::hnsw_s3_prefix_gc_key(db_id, table_id, index_id);
+        crate::txn::txn_delete(&mut txn, key).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn read_hnsw_s3_retired_version_marker(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        version: u64,
+    ) -> Result<Option<crate::sql::hnsw::storage::HnswS3RetiredVersionGc>> {
+        let mut txn = store.begin().await?;
+        let result = async {
+            let key = crate::sql::hnsw::storage::hnsw_s3_retired_version_key(
+                db_id, table_id, index_id, version,
+            );
+            let Some(bytes) = txn.get(key).await? else {
+                return Ok::<_, anyhow::Error>(None);
+            };
+            Ok(Some(serde_json::from_slice::<
+                crate::sql::hnsw::storage::HnswS3RetiredVersionGc,
+            >(&bytes)?))
+        }
+        .await;
+        txn.rollback().await.ok();
+        result
+    }
+
+    async fn write_hnsw_s3_retired_version_marker(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        version: u64,
+        marker: &crate::sql::hnsw::storage::HnswS3RetiredVersionGc,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let key = crate::sql::hnsw::storage::hnsw_s3_retired_version_key(
+            db_id, table_id, index_id, version,
+        );
+        crate::txn::txn_put(&mut txn, key, serde_json::to_vec(marker)?).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_hnsw_s3_retired_version_marker(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        version: u64,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let key = crate::sql::hnsw::storage::hnsw_s3_retired_version_key(
+            db_id, table_id, index_id, version,
+        );
+        crate::txn::txn_delete(&mut txn, key).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_hnsw_s3_retired_version_markers_for_index(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let result = async {
+            let range: tikv_client::BoundRange =
+                (crate::sql::hnsw::storage::hnsw_s3_retired_version_prefix(
+                    db_id, table_id, index_id,
+                )
+                    ..crate::sql::hnsw::storage::hnsw_s3_retired_version_prefix_end(
+                        db_id, table_id, index_id,
+                    ))
+                    .into();
+            let pairs = txn.scan(range, u32::MAX).await?;
+            let keys: Vec<Vec<u8>> = pairs
+                .map(|pair| {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    key.to_vec()
+                })
+                .collect();
+            for key in keys {
+                crate::txn::txn_delete(&mut txn, key).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
+    async fn delete_hnsw_meta(
+        &self,
+        store: &TikvStore,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let meta_key = crate::sql::hnsw::storage::hnsw_meta_key(db_id, table_id, index_id);
+        crate::txn::txn_delete(&mut txn, meta_key).await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -607,24 +1279,45 @@ pub(crate) fn compute_safepoint_version(current_version: u64, life_time_sec: u64
     current_version.saturating_sub(life_time_ms << 18)
 }
 
+/// Multiplier applied to gc_safepoint_interval_sec to derive the instance
+/// heartbeat timeout.  At 3x, an instance survives 2 consecutive missed
+/// heartbeats before being declared dead.
+///
+/// The heartbeat timeout MUST be:
+///   publish_interval < heartbeat_timeout < gc_life_time
+/// This is guaranteed by `WorkerConfig::validate_gc_config()` which enforces
+/// gc_life_time >= 3 * gc_safepoint_interval.
+const HEARTBEAT_TIMEOUT_MULTIPLIER: u64 = 3;
+
+/// Compute the heartbeat timeout from the publish interval.
+/// This is intentionally much shorter than gc_life_time_sec (24h) — using
+/// gc_life_time_sec would keep a crashed instance's min_start_ts in the
+/// safepoint calculation for up to 24 hours, stalling TiKV GC cluster-wide.
+pub(crate) fn heartbeat_timeout_sec(config: &WorkerConfig) -> u64 {
+    config
+        .gc_safepoint_interval_sec
+        .saturating_mul(HEARTBEAT_TIMEOUT_MULTIPLIER)
+}
+
 pub(crate) fn is_live_gc_instance_state(
     current_version: u64,
-    life_time_sec: u64,
+    heartbeat_timeout_sec: u64,
     state: &GcInstanceState,
 ) -> bool {
-    state.updated_at_version >= compute_safepoint_version(current_version, life_time_sec)
+    state.updated_at_version >= compute_safepoint_version(current_version, heartbeat_timeout_sec)
 }
 
 pub(crate) fn effective_cluster_gc_life_time_sec(
     current_version: u64,
     life_time_sec: u64,
+    heartbeat_timeout: u64,
     states: &[GcInstanceState],
 ) -> u64 {
     // Mixed-version rollout compatibility: legacy rows may still carry the
     // timeout-derived floor that old nodes rely on for untracked worker txns.
     let mut effective_life_time_sec = life_time_sec;
     for state in states {
-        if !is_live_gc_instance_state(current_version, life_time_sec, state) {
+        if !is_live_gc_instance_state(current_version, heartbeat_timeout, state) {
             continue;
         }
         if let Some(legacy_timeout_sec) = state.legacy_max_untracked_timeout_sec {
@@ -636,12 +1329,12 @@ pub(crate) fn effective_cluster_gc_life_time_sec(
 
 fn stale_gc_instance_ids(
     current_version: u64,
-    life_time_sec: u64,
+    heartbeat_timeout: u64,
     states: &[GcInstanceState],
 ) -> Vec<String> {
     states
         .iter()
-        .filter(|state| !is_live_gc_instance_state(current_version, life_time_sec, state))
+        .filter(|state| !is_live_gc_instance_state(current_version, heartbeat_timeout, state))
         .map(|state| state.instance_id.clone())
         .collect()
 }
@@ -649,13 +1342,18 @@ fn stale_gc_instance_ids(
 pub(crate) fn compute_cluster_gc_safepoint(
     current_version: u64,
     life_time_sec: u64,
+    heartbeat_timeout: u64,
     states: &[GcInstanceState],
 ) -> u64 {
-    let effective_life_time_sec =
-        effective_cluster_gc_life_time_sec(current_version, life_time_sec, states);
+    let effective_life_time_sec = effective_cluster_gc_life_time_sec(
+        current_version,
+        life_time_sec,
+        heartbeat_timeout,
+        states,
+    );
     let mut safepoint = compute_safepoint_version(current_version, effective_life_time_sec);
     for state in states {
-        if !is_live_gc_instance_state(current_version, life_time_sec, state) {
+        if !is_live_gc_instance_state(current_version, heartbeat_timeout, state) {
             continue;
         }
         if let Some(ts) = state.min_start_ts {
@@ -668,7 +1366,7 @@ pub(crate) fn compute_cluster_gc_safepoint(
 async fn reap_stale_gc_instance_states(
     store: &TikvStore,
     current_version: u64,
-    life_time_sec: u64,
+    heartbeat_timeout: u64,
     trigger: &'static str,
 ) -> Result<usize> {
     let all_states = {
@@ -680,7 +1378,7 @@ async fn reap_stale_gc_instance_states(
     reap_stale_gc_instance_states_from_scan(
         store,
         current_version,
-        life_time_sec,
+        heartbeat_timeout,
         &all_states,
         trigger,
     )
@@ -690,11 +1388,11 @@ async fn reap_stale_gc_instance_states(
 async fn reap_stale_gc_instance_states_from_scan(
     store: &TikvStore,
     current_version: u64,
-    life_time_sec: u64,
+    heartbeat_timeout: u64,
     states: &[GcInstanceState],
     trigger: &'static str,
 ) -> Result<usize> {
-    let stale_ids = stale_gc_instance_ids(current_version, life_time_sec, states);
+    let stale_ids = stale_gc_instance_ids(current_version, heartbeat_timeout, states);
     if stale_ids.is_empty() {
         return Ok(0);
     }
@@ -708,7 +1406,7 @@ async fn reap_stale_gc_instance_states_from_scan(
         else {
             continue;
         };
-        if is_live_gc_instance_state(current_version, life_time_sec, &current_state) {
+        if is_live_gc_instance_state(current_version, heartbeat_timeout, &current_state) {
             continue;
         }
         store
@@ -745,6 +1443,31 @@ fn effective_cron_orphan_timeout_sec(
 ) -> u64 {
     let worker_timeout_sec = worker_config.cron_job_timeout_ms.saturating_add(999) / 1000;
     cron_config.orphan_timeout_sec.max(worker_timeout_sec)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveHnswS3VersionDisposition {
+    Current { clear_stale_retired_marker: bool },
+    HistoricalRetired,
+    FutureSpeculative { clear_stale_retired_marker: bool },
+}
+
+fn classify_live_hnsw_s3_version(
+    current_version: u64,
+    object_version: u64,
+    retired_marker_present: bool,
+) -> LiveHnswS3VersionDisposition {
+    use std::cmp::Ordering;
+
+    match object_version.cmp(&current_version) {
+        Ordering::Equal => LiveHnswS3VersionDisposition::Current {
+            clear_stale_retired_marker: retired_marker_present,
+        },
+        Ordering::Less => LiveHnswS3VersionDisposition::HistoricalRetired,
+        Ordering::Greater => LiveHnswS3VersionDisposition::FutureSpeculative {
+            clear_stale_retired_marker: retired_marker_present,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -814,7 +1537,7 @@ mod tests {
         }];
 
         assert_eq!(
-            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            compute_cluster_gc_safepoint(current_version, life_time_sec, life_time_sec, &states),
             time_based
         );
     }
@@ -823,6 +1546,7 @@ mod tests {
     fn cluster_safepoint_clamps_to_oldest_live_transaction() {
         let current_version = 10_000_000u64 << 18;
         let life_time_sec = 600;
+        let hb_timeout = life_time_sec; // use same value as heartbeat timeout for this test
         let live_updated_at = current_version;
 
         let states = vec![
@@ -841,7 +1565,7 @@ mod tests {
         ];
 
         assert_eq!(
-            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            compute_cluster_gc_safepoint(current_version, life_time_sec, hb_timeout, &states),
             ((9_300_000u64 << 18) + 9).saturating_sub(1)
         );
     }
@@ -850,9 +1574,10 @@ mod tests {
     fn stale_gc_instance_ids_only_returns_stale_rows() {
         let current_version = 10_000_000u64 << 18;
         let life_time_sec = 600;
+        let hb_timeout = life_time_sec;
         let live_updated_at = current_version;
         let stale_updated_at =
-            compute_safepoint_version(current_version, life_time_sec).saturating_sub(1);
+            compute_safepoint_version(current_version, hb_timeout).saturating_sub(1);
 
         let states = vec![
             GcInstanceState {
@@ -870,7 +1595,7 @@ mod tests {
         ];
 
         assert_eq!(
-            stale_gc_instance_ids(current_version, life_time_sec, &states),
+            stale_gc_instance_ids(current_version, hb_timeout, &states),
             vec!["stale".to_string()]
         );
     }
@@ -879,6 +1604,7 @@ mod tests {
     fn cluster_gc_life_time_honors_live_legacy_timeout_floor() {
         let current_version = 10_000_000u64 << 18;
         let life_time_sec = 600;
+        let hb_timeout = life_time_sec;
         let states = vec![GcInstanceState {
             instance_id: "legacy".to_string(),
             min_start_ts: None,
@@ -887,11 +1613,11 @@ mod tests {
         }];
 
         assert_eq!(
-            effective_cluster_gc_life_time_sec(current_version, life_time_sec, &states),
+            effective_cluster_gc_life_time_sec(current_version, life_time_sec, hb_timeout, &states),
             3_600
         );
         assert_eq!(
-            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            compute_cluster_gc_safepoint(current_version, life_time_sec, hb_timeout, &states),
             compute_safepoint_version(current_version, 3_600)
         );
     }
@@ -900,8 +1626,9 @@ mod tests {
     fn cluster_gc_life_time_ignores_stale_legacy_timeout_floor() {
         let current_version = 10_000_000u64 << 18;
         let life_time_sec = 600;
+        let hb_timeout = life_time_sec;
         let stale_updated_at =
-            compute_safepoint_version(current_version, life_time_sec).saturating_sub(1);
+            compute_safepoint_version(current_version, hb_timeout).saturating_sub(1);
         let states = vec![GcInstanceState {
             instance_id: "stale-legacy".to_string(),
             min_start_ts: None,
@@ -910,11 +1637,11 @@ mod tests {
         }];
 
         assert_eq!(
-            effective_cluster_gc_life_time_sec(current_version, life_time_sec, &states),
+            effective_cluster_gc_life_time_sec(current_version, life_time_sec, hb_timeout, &states),
             life_time_sec
         );
         assert_eq!(
-            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            compute_cluster_gc_safepoint(current_version, life_time_sec, hb_timeout, &states),
             compute_safepoint_version(current_version, life_time_sec)
         );
     }
@@ -992,6 +1719,56 @@ mod tests {
         assert_eq!(
             effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),
             7_200
+        );
+    }
+
+    #[test]
+    fn live_hnsw_s3_classification_treats_current_as_live_and_clears_stale_marker() {
+        assert_eq!(
+            classify_live_hnsw_s3_version(6, 6, false),
+            LiveHnswS3VersionDisposition::Current {
+                clear_stale_retired_marker: false
+            }
+        );
+        assert_eq!(
+            classify_live_hnsw_s3_version(6, 6, true),
+            LiveHnswS3VersionDisposition::Current {
+                clear_stale_retired_marker: true
+            }
+        );
+    }
+
+    #[test]
+    fn live_hnsw_s3_classification_treats_older_versions_as_retired_only_when_behind_current() {
+        assert_eq!(
+            classify_live_hnsw_s3_version(6, 5, false),
+            LiveHnswS3VersionDisposition::HistoricalRetired
+        );
+        assert_eq!(
+            classify_live_hnsw_s3_version(6, 5, true),
+            LiveHnswS3VersionDisposition::HistoricalRetired
+        );
+    }
+
+    #[test]
+    fn live_hnsw_s3_classification_never_retires_future_versions() {
+        assert_eq!(
+            classify_live_hnsw_s3_version(5, 6, false),
+            LiveHnswS3VersionDisposition::FutureSpeculative {
+                clear_stale_retired_marker: false
+            }
+        );
+        assert_eq!(
+            classify_live_hnsw_s3_version(5, 6, true),
+            LiveHnswS3VersionDisposition::FutureSpeculative {
+                clear_stale_retired_marker: true
+            }
+        );
+        assert_eq!(
+            classify_live_hnsw_s3_version(0, 1, false),
+            LiveHnswS3VersionDisposition::FutureSpeculative {
+                clear_stale_retired_marker: false
+            }
         );
     }
 
@@ -1320,7 +2097,7 @@ mod tests {
 
         // Simulate publisher: publish min_start_ts to cluster.
         let state = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[state]);
+        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state]);
 
         // Registry clamps safepoint below the worker txn.
         assert_eq!(safepoint, worker_start_ts - 1);
@@ -1331,7 +2108,8 @@ mod tests {
 
         // Next publish: no txns → safepoint advances past old start_ts.
         let state_after = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint_after = compute_cluster_gc_safepoint(now, life_time_sec, &[state_after]);
+        let safepoint_after =
+            compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state_after]);
         assert!(
             safepoint_after > worker_start_ts,
             "safepoint {safepoint_after} should advance past old worker start_ts {worker_start_ts}"
@@ -1352,7 +2130,7 @@ mod tests {
         assert_eq!(registry.min_start_ts(), Some(session_start_ts));
 
         let state = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[state]);
+        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state]);
         assert_eq!(safepoint, session_start_ts - 1);
 
         // Session commits — clean unregister.
@@ -1360,7 +2138,8 @@ mod tests {
         assert_eq!(registry.min_start_ts(), None);
 
         let state_after = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint_after = compute_cluster_gc_safepoint(now, life_time_sec, &[state_after]);
+        let safepoint_after =
+            compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state_after]);
         assert!(safepoint_after > session_start_ts);
     }
 
@@ -1385,7 +2164,7 @@ mod tests {
 
         // Safepoint still clamped by quarantined entry.
         let state = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[state]);
+        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state]);
         assert_eq!(safepoint, worker_start_ts - 1);
 
         // After QUARANTINE_TTL, the publisher reaps the entry.
@@ -1395,7 +2174,8 @@ mod tests {
 
         // Safepoint now advances.
         let state_after = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint_after = compute_cluster_gc_safepoint(now, life_time_sec, &[state_after]);
+        let safepoint_after =
+            compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state_after]);
         assert!(safepoint_after > worker_start_ts);
     }
 
@@ -1418,7 +2198,7 @@ mod tests {
         assert_eq!(registry.quarantined_len(), 1);
 
         let state = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[state]);
+        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state]);
         assert_eq!(safepoint, session_start_ts - 1);
 
         // After TTL, publisher reaps.
@@ -1461,7 +2241,12 @@ mod tests {
         // Instance C: no active txns.
         let inst_c = live_state("inst-c", None, 10_000_000);
 
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[inst_a, inst_b, inst_c]);
+        let safepoint = compute_cluster_gc_safepoint(
+            now,
+            life_time_sec,
+            life_time_sec,
+            &[inst_a, inst_b, inst_c],
+        );
 
         // Must clamp to instance A's old txn (the global minimum).
         assert_eq!(safepoint, tso(9_000_000) - 1);
@@ -1484,7 +2269,8 @@ mod tests {
             legacy_max_untracked_timeout_sec: None,
         };
 
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[inst_a, inst_b]);
+        let safepoint =
+            compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[inst_a, inst_b]);
 
         // Stale instance B must be ignored — safepoint is purely time-based.
         let time_based_safepoint = compute_safepoint_version(now, life_time_sec);
@@ -1500,12 +2286,14 @@ mod tests {
 
         // Before shutdown: instance has an active old txn.
         let before = live_state("inst-1", Some(tso(9_000_000)), 10_000_000);
-        let safepoint_before = compute_cluster_gc_safepoint(now, life_time_sec, &[before]);
+        let safepoint_before =
+            compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[before]);
         assert_eq!(safepoint_before, tso(9_000_000) - 1);
 
         // Shutdown publishes min_start_ts=None (neutralize).
         let neutralized = live_state("inst-1", None, 10_000_000);
-        let safepoint_after = compute_cluster_gc_safepoint(now, life_time_sec, &[neutralized]);
+        let safepoint_after =
+            compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[neutralized]);
 
         // Neutralized row doesn't clamp — safepoint is purely time-based.
         let time_based = compute_safepoint_version(now, life_time_sec);
@@ -1537,7 +2325,7 @@ mod tests {
         assert_eq!(registry.min_start_ts(), Some(tso(9_000_000)));
 
         let state = live_state("inst-1", registry.min_start_ts(), 10_000_000);
-        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, &[state]);
+        let safepoint = compute_cluster_gc_safepoint(now, life_time_sec, life_time_sec, &[state]);
         assert_eq!(safepoint, tso(9_000_000) - 1);
     }
 
@@ -1567,8 +2355,13 @@ mod tests {
     #[test]
     fn e2e_missed_heartbeat_exposes_live_txn_to_gc() {
         let life_time_sec = 600;
+        // Heartbeat timeout = 3 * publish_interval.
+        // With default gc_safepoint_interval_sec=300, timeout=900s.
+        // For this test we use a smaller value to keep the scenario compact.
+        let hb_timeout_sec: u64 = 900; // 3 * 300
+        let heartbeat_timeout_ms = hb_timeout_sec * 1000;
         let publish_time_ms: u64 = 10_000_000;
-        let txn_start_ts = tso(9_000_000); // 1000s old, outside gc_life_time
+        let txn_start_ts = tso(9_000_000);
 
         let state = GcInstanceState {
             instance_id: "inst-stuck".to_string(),
@@ -1577,38 +2370,53 @@ mod tests {
             legacy_max_untracked_timeout_sec: None,
         };
 
-        // Phase 1: t=599s — just inside life_time window, txn IS protected.
-        let now_inside = tso(publish_time_ms + 599_000);
-        assert!(is_live_gc_instance_state(now_inside, life_time_sec, &state));
-        let sp_inside =
-            compute_cluster_gc_safepoint(now_inside, life_time_sec, std::slice::from_ref(&state));
+        // Phase 1: t=(timeout - 1s) — just inside heartbeat timeout, txn IS protected.
+        let now_inside = tso(publish_time_ms + heartbeat_timeout_ms - 1000);
+        assert!(is_live_gc_instance_state(
+            now_inside,
+            hb_timeout_sec,
+            &state
+        ));
+        let sp_inside = compute_cluster_gc_safepoint(
+            now_inside,
+            life_time_sec,
+            hb_timeout_sec,
+            std::slice::from_ref(&state),
+        );
         assert_eq!(
             sp_inside,
             txn_start_ts - 1,
             "txn must be protected while live"
         );
 
-        // Phase 2: t=601s — just outside life_time (missed heartbeat).
-        let now_outside = tso(publish_time_ms + 601_000);
+        // Phase 2: t=(timeout + 1s) — just outside heartbeat timeout (missed heartbeat).
+        let now_outside = tso(publish_time_ms + heartbeat_timeout_ms + 1000);
         assert!(!is_live_gc_instance_state(
             now_outside,
-            life_time_sec,
+            hb_timeout_sec,
             &state
         ));
-        let sp_outside =
-            compute_cluster_gc_safepoint(now_outside, life_time_sec, std::slice::from_ref(&state));
+        let sp_outside = compute_cluster_gc_safepoint(
+            now_outside,
+            life_time_sec,
+            hb_timeout_sec,
+            std::slice::from_ref(&state),
+        );
         assert!(
             sp_outside > txn_start_ts,
             "VULNERABILITY: safepoint {sp_outside} exceeds live txn {txn_start_ts} \
-             — a single missed heartbeat exposed the txn to GC"
+             — missed heartbeat exposed the txn to GC"
         );
     }
 
-    // ── Scenario 12: Exact life_time boundary (>= edge) ────────
+    // ── Scenario 12: Exact heartbeat timeout boundary (>= edge) ─
 
     #[test]
     fn e2e_missed_heartbeat_boundary_exact_life_time_edge() {
         let life_time_sec = 600;
+        // Heartbeat timeout derived from 3 * gc_safepoint_interval_sec.
+        let hb_timeout_sec: u64 = 900;
+        let heartbeat_timeout_ms = hb_timeout_sec * 1000;
         let publish_time_ms: u64 = 10_000_000;
         let txn_start_ts = tso(9_000_000);
 
@@ -1619,17 +2427,22 @@ mod tests {
             legacy_max_untracked_timeout_sec: None,
         };
 
-        // Exact boundary: updated_at + life_time — still live (>= check).
-        let now_exact = tso(publish_time_ms + life_time_sec * 1000);
-        assert!(is_live_gc_instance_state(now_exact, life_time_sec, &state));
-        let sp_exact =
-            compute_cluster_gc_safepoint(now_exact, life_time_sec, std::slice::from_ref(&state));
+        // Exact boundary: updated_at + heartbeat_timeout — still live (>= check).
+        let now_exact = tso(publish_time_ms + heartbeat_timeout_ms);
+        assert!(is_live_gc_instance_state(now_exact, hb_timeout_sec, &state));
+        let sp_exact = compute_cluster_gc_safepoint(
+            now_exact,
+            life_time_sec,
+            hb_timeout_sec,
+            std::slice::from_ref(&state),
+        );
         assert_eq!(sp_exact, txn_start_ts - 1, "protected at exact boundary");
 
         // One ms past boundary — stale.
-        let now_past = tso(publish_time_ms + life_time_sec * 1000 + 1);
-        assert!(!is_live_gc_instance_state(now_past, life_time_sec, &state));
-        let sp_past = compute_cluster_gc_safepoint(now_past, life_time_sec, &[state]);
+        let now_past = tso(publish_time_ms + heartbeat_timeout_ms + 1);
+        assert!(!is_live_gc_instance_state(now_past, hb_timeout_sec, &state));
+        let sp_past =
+            compute_cluster_gc_safepoint(now_past, life_time_sec, hb_timeout_sec, &[state]);
         assert!(sp_past > txn_start_ts, "1ms past boundary: txn exposed");
     }
 
@@ -1638,11 +2451,12 @@ mod tests {
     #[test]
     fn e2e_missed_heartbeat_multi_instance_one_stale_exposes_its_txn() {
         let life_time_sec = 600;
+        let hb_timeout_sec: u64 = life_time_sec; // use life_time as timeout for this test
         let now = tso(10_601_000); // 601s after inst-a's last heartbeat
         let txn_a = tso(9_000_000);
         let txn_b = tso(9_500_000);
 
-        // inst-a: stale (last heartbeat 601s ago)
+        // inst-a: stale (last heartbeat 601s ago, > hb_timeout_sec)
         let inst_a = GcInstanceState {
             instance_id: "inst-a".to_string(),
             min_start_ts: Some(txn_a),
@@ -1652,10 +2466,11 @@ mod tests {
         // inst-b: live (just heartbeated)
         let inst_b = live_state("inst-b", Some(txn_b), 10_601_000);
 
-        assert!(!is_live_gc_instance_state(now, life_time_sec, &inst_a));
-        assert!(is_live_gc_instance_state(now, life_time_sec, &inst_b));
+        assert!(!is_live_gc_instance_state(now, hb_timeout_sec, &inst_a));
+        assert!(is_live_gc_instance_state(now, hb_timeout_sec, &inst_b));
 
-        let sp = compute_cluster_gc_safepoint(now, life_time_sec, &[inst_a, inst_b]);
+        let sp =
+            compute_cluster_gc_safepoint(now, life_time_sec, hb_timeout_sec, &[inst_a, inst_b]);
         assert_eq!(sp, txn_b - 1, "clamped to live inst-b only");
         assert!(sp > txn_a, "inst-a's txn exposed: its row went stale");
         assert!(sp < txn_b, "inst-b's txn still protected");
@@ -1686,6 +2501,46 @@ mod tests {
         assert!(
             publisher_fn.contains("tokio::time::sleep(backoff)"),
             "publisher retry must use sleep-based backoff between attempts"
+        );
+    }
+
+    // ── heartbeat_timeout_sec adapts to config ──────────────────
+
+    #[test]
+    fn heartbeat_timeout_is_3x_publish_interval() {
+        let mut config = WorkerConfig::default();
+        assert_eq!(config.gc_safepoint_interval_sec, 300);
+        assert_eq!(heartbeat_timeout_sec(&config), 900);
+
+        config.gc_safepoint_interval_sec = 60;
+        assert_eq!(heartbeat_timeout_sec(&config), 180);
+
+        config.gc_safepoint_interval_sec = 30; // minimum allowed
+        assert_eq!(heartbeat_timeout_sec(&config), 90);
+    }
+
+    #[test]
+    fn heartbeat_timeout_always_less_than_default_gc_life_time() {
+        // The config validator enforces gc_life_time >= 3 * interval,
+        // so heartbeat_timeout (= 3 * interval) <= gc_life_time.
+        let config = WorkerConfig::default();
+        assert!(
+            heartbeat_timeout_sec(&config) <= config.gc_life_time_sec,
+            "heartbeat_timeout {} must not exceed gc_life_time {}",
+            heartbeat_timeout_sec(&config),
+            config.gc_life_time_sec,
+        );
+    }
+
+    #[test]
+    fn heartbeat_timeout_exceeds_publish_interval() {
+        // Core invariant: timeout > interval, otherwise healthy instances look dead.
+        let config = WorkerConfig::default();
+        assert!(
+            heartbeat_timeout_sec(&config) > config.gc_safepoint_interval_sec,
+            "heartbeat_timeout {} must exceed publish interval {}",
+            heartbeat_timeout_sec(&config),
+            config.gc_safepoint_interval_sec,
         );
     }
 }

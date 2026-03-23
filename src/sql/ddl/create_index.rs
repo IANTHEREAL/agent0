@@ -526,7 +526,7 @@ pub async fn execute_create_index(
                 }
             }
 
-            let (graph_bytes, meta_bytes) = {
+            let (graph_bytes, meta_bytes, initial_graph_version) = {
                 let options = IndexOptions {
                     dimensions: vector_dimensions,
                     metric,
@@ -550,6 +550,7 @@ pub async fn execute_create_index(
                         .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
                 }
 
+                let s3_enabled = crate::sql::hnsw::s3::hnsw_s3_client().is_some();
                 let meta = HnswMeta {
                     count,
                     capacity: index.capacity() as u64,
@@ -557,12 +558,28 @@ pub async fn execute_create_index(
                     distance_metric,
                     m,
                     ef_construction,
-                    storage_version: 1, // New indexes use delta-log from the start
+                    storage_version: if s3_enabled { 2 } else { 1 },
                     label_mode,
                     frozen: false,
+                    // Use PD TSO version as initial graph_version (not wall clock).
+                    // TSO is cluster-monotonic, so:
+                    // 1. DROP + CREATE with index_id reuse always produces a
+                    //    higher version, preventing cross-node stale cache hits.
+                    // 2. GC's version-ordering classification (current / historical
+                    //    / future) remains correct — no clock-skew inversion.
+                    graph_version: if s3_enabled {
+                        use tikv_client::TimestampExt;
+                        txn.start_timestamp().version()
+                    } else {
+                        0
+                    },
+                    dropped_at: None,
                 };
-                serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
-                    .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?
+                let gv = meta.graph_version;
+                let (gb, mb) =
+                    serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
+                        .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?;
+                (gb, mb, gv)
             };
 
             // Register this (keyspace, db_id) in the worker registry so the periodic
@@ -588,30 +605,49 @@ pub async fn execute_create_index(
                 sys_txn.commit().await?;
             }
 
-            // Guard: reject CREATE INDEX if the initial graph would exceed
-            // the raft-entry-safe limit. This prevents the same oversized
-            // monolithic write that the merge-path freeze guards against.
-            if graph_bytes.len() > crate::worker::engine::HNSW_GRAPH_MAX_BYTES {
-                return Err(anyhow!(
-                    "HNSW index too large for initial build ({} bytes, limit {} bytes). \
-                     Reduce table size or vector dimensions before creating the index.",
-                    graph_bytes.len(),
-                    crate::worker::engine::HNSW_GRAPH_MAX_BYTES
-                ));
-            }
+            if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+                // S3 path: upload graph to S3, skip TiKV graph write and size guard.
+                s3.put_graph(
+                    keyspace,
+                    db_id,
+                    schema.table_id,
+                    index_id,
+                    initial_graph_version, // timestamp-based, set above
+                    bytes::Bytes::from(graph_bytes),
+                )
+                .await
+                .map_err(|e| anyhow!("HNSW S3 put_graph failed during CREATE INDEX: {}", e))?;
+                // Only write meta to TiKV (graph is in S3).
+                txn_put(
+                    txn,
+                    hnsw_meta_key(db_id, schema.table_id, index_id),
+                    meta_bytes,
+                )
+                .await?;
+            } else {
+                // TiKV path: guard against oversized graph, then write both.
+                if graph_bytes.len() > crate::worker::engine::HNSW_GRAPH_MAX_BYTES {
+                    return Err(anyhow!(
+                        "HNSW index too large for initial build ({} bytes, limit {} bytes). \
+                         Reduce table size or vector dimensions before creating the index.",
+                        graph_bytes.len(),
+                        crate::worker::engine::HNSW_GRAPH_MAX_BYTES
+                    ));
+                }
 
-            txn_put(
-                txn,
-                hnsw_graph_key(db_id, schema.table_id, index_id),
-                graph_bytes,
-            )
-            .await?;
-            txn_put(
-                txn,
-                hnsw_meta_key(db_id, schema.table_id, index_id),
-                meta_bytes,
-            )
-            .await?;
+                txn_put(
+                    txn,
+                    hnsw_graph_key(db_id, schema.table_id, index_id),
+                    graph_bytes,
+                )
+                .await?;
+                txn_put(
+                    txn,
+                    hnsw_meta_key(db_id, schema.table_id, index_id),
+                    meta_bytes,
+                )
+                .await?;
+            }
         } else if index_helpers::is_index_materializable(&new_index) {
             if !rows.is_empty() {
                 if schema.pk_indices.is_empty() {

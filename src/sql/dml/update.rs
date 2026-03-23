@@ -420,7 +420,7 @@ pub async fn batch_maintain_hnsw_indexes(
             Some(meta_bytes) => {
                 let meta: crate::sql::hnsw::HnswMeta =
                     serde_json::from_slice(meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
-                if meta.storage_version != 1 {
+                if meta.storage_version != 1 && meta.storage_version != 2 {
                     return Err(anyhow::anyhow!(
                         "HNSW index '{}' has unsupported storage_version={}; please rebuild",
                         index.name,
@@ -563,7 +563,7 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
             Some(meta_bytes) => {
                 let meta: crate::sql::hnsw::HnswMeta =
                     serde_json::from_slice(meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
-                if meta.storage_version != 1 {
+                if meta.storage_version != 1 && meta.storage_version != 2 {
                     return Err(anyhow::anyhow!(
                         "HNSW index '{}' has unsupported storage_version={}; please rebuild",
                         index.name,
@@ -926,7 +926,7 @@ async fn maintain_hnsw_indexes_inner_for_index_ids(
             Some(meta_bytes) => {
                 let meta: crate::sql::hnsw::HnswMeta =
                     serde_json::from_slice(meta_bytes).map_err(|e| anyhow::anyhow!(e))?;
-                if meta.storage_version != 1 {
+                if meta.storage_version != 1 && meta.storage_version != 2 {
                     return Err(anyhow::anyhow!(
                         "HNSW index '{}' has unsupported storage_version={}; please rebuild",
                         index.name,

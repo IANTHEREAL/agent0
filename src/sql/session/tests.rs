@@ -1133,7 +1133,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             session
@@ -1204,7 +1205,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         session
             .set_known_setting("embedding.api_key", "sk-secret-1234".to_string())
@@ -1290,7 +1292,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         let manager = global_lock_manager();
         assert!(manager.try_acquire(
@@ -1337,7 +1340,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         assert_eq!(session.plan_cache().capacity(), 128);
         assert_eq!(session.plan_cache().min_exec(), 5);
@@ -1365,7 +1369,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         session
             .set_local_setting("db9.prepared_plan_cache_size", "8".to_string())
@@ -1396,7 +1401,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         // Simulate entering a transaction.
         session.force_test_transaction_state(true, false);
@@ -1433,7 +1439,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         session.force_test_transaction_state(true, false);
 
@@ -1478,7 +1485,8 @@ mod tests {
             "postgres".to_string(),
             0,
             0,
-        );
+        )
+        .unwrap();
 
         session.force_test_transaction_state(true, false);
 

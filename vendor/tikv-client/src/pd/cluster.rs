@@ -102,6 +102,14 @@ impl Cluster {
         req.send(&mut self.client, timeout).await
     }
 
+    pub async fn get_gc_safepoint(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<pdpb::GetGcSafePointResponse> {
+        let req = pd_request!(self.id, pdpb::GetGcSafePointRequest);
+        req.send(&mut self.client, timeout).await
+    }
+
     /// Register or refresh a per-service GC safe point in PD.
     ///
     /// Unlike `update_safepoint` (global GC safe point), this pins a per-service
@@ -438,6 +446,16 @@ impl PdMessage for pdpb::UpdateGcSafePointRequest {
 }
 
 #[async_trait]
+impl PdMessage for pdpb::GetGcSafePointRequest {
+    type Client = pdpb::pd_client::PdClient<Channel>;
+    type Response = pdpb::GetGcSafePointResponse;
+
+    async fn rpc(req: Request<Self>, client: &mut Self::Client) -> GrpcResult<Self::Response> {
+        Ok(client.get_gc_safe_point(req).await?.into_inner())
+    }
+}
+
+#[async_trait]
 impl PdMessage for pdpb::UpdateServiceGcSafePointRequest {
     type Client = pdpb::pd_client::PdClient<Channel>;
     type Response = pdpb::UpdateServiceGcSafePointResponse;
@@ -480,6 +498,12 @@ impl PdResponse for pdpb::GetAllStoresResponse {
 }
 
 impl PdResponse for pdpb::UpdateGcSafePointResponse {
+    fn header(&self) -> &pdpb::ResponseHeader {
+        self.header.as_ref().unwrap()
+    }
+}
+
+impl PdResponse for pdpb::GetGcSafePointResponse {
     fn header(&self) -> &pdpb::ResponseHeader {
         self.header.as_ref().unwrap()
     }

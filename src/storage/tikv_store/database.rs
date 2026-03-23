@@ -122,7 +122,7 @@ impl TikvStore {
         db_name: &str,
         if_exists: bool,
         current_database_id: u64,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(u64, crate::sql::session::db_connections::DroppingGuard)>> {
         if db_name.eq_ignore_ascii_case("postgres")
             || db_name.eq_ignore_ascii_case("template0")
             || db_name.eq_ignore_ascii_case("template1")
@@ -154,12 +154,24 @@ impl TikvStore {
             return Err(anyhow!("cannot drop the currently open database"));
         }
 
+        // PostgreSQL 55006: atomically check no other sessions are connected
+        // AND mark the database as "dropping" to block new connections.
+        // The Mutex in the registry ensures no window between check and mark.
+        let dropping_guard = crate::sql::session::db_connections::db_connection_registry()
+            .try_mark_dropping(self.keyspace().unwrap_or("default"), db_id)
+            .map_err(|count| crate::sql::error::SqlError::ObjectInUse {
+                message: format!(
+                    "database \"{}\" is being accessed by {} other user(s)",
+                    db_name, count
+                ),
+            })?;
+
         txn_delete(txn, name_key).await?;
 
         let id_key = self.key(&encode_database_id_key(db_id));
         txn_delete(txn, id_key).await?;
 
-        Ok(Some(db_id))
+        Ok(Some((db_id, dropping_guard)))
     }
 
     /// Rename a database (storage format v2).

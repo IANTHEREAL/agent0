@@ -473,7 +473,9 @@ impl WorkerEngine {
         F: FnOnce(Arc<TikvStore>, u64, CronRun, CronRunStatus, Option<String>, i64, i64) -> Fut,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let fire_time_min = chrono::Utc::now().timestamp() / 60;
+        let queue_fire_time_ms = crate::storage::decode_worker_queue_fire_time(&queue_key)
+            .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
+        let scheduled_minute = queue_fire_time_ms.div_euclid(60_000);
         let claim = WorkerClaim::new(config.worker_id.clone(), entry.task_type);
 
         let mut txn = system_store.begin().await?;
@@ -483,7 +485,7 @@ impl WorkerEngine {
                 &entry.keyspace,
                 entry.db_id,
                 entry.task_id,
-                fire_time_min,
+                queue_fire_time_ms,
                 &claim,
             )
             .await?;
@@ -497,7 +499,7 @@ impl WorkerEngine {
         txn.commit().await?;
 
         let (cron_run, keep_queue_entry) = if entry.task_type == TaskType::Cron {
-            Self::claim_and_record_cron_run(pool, &entry, fire_time_min).await?
+            Self::claim_and_record_cron_run(pool, &entry, scheduled_minute).await?
         } else {
             (None, false)
         };
@@ -583,7 +585,7 @@ impl WorkerEngine {
                 &entry.keyspace,
                 entry.db_id,
                 entry.task_id,
-                fire_time_min,
+                queue_fire_time_ms,
                 entry.task_type,
             )
             .await?;
@@ -592,17 +594,25 @@ impl WorkerEngine {
                 // HnswMerge uses deterministic fire_time=0 → concurrent DML can
                 // overwrite the same queue key with a new nonce. Read-compare-delete
                 // ensures we only remove the entry we actually processed.
-                if let Some(current_bytes) = txn.get(queue_key.clone()).await? {
-                    let current =
-                        TaskQueueEntry::deserialize_compat(&current_bytes).map_err(|e| {
-                            anyhow::anyhow!("Failed to deserialize worker queue entry: {e}")
-                        })?;
-                    if current.nonce == entry.nonce {
-                        system_store
-                            .delete_worker_queue_entry(&mut txn, &queue_key)
-                            .await?;
+                //
+                // Only delete the queue entry on SUCCESS. On failure (e.g., S3 not
+                // configured on this node), keep the entry so a capable worker can
+                // pick it up on the next poll cycle. This prevents a non-S3 worker
+                // from repeatedly claiming and failing merges, blocking progress
+                // until the 600s periodic sweep re-enqueues.
+                if exec_result.is_ok() {
+                    if let Some(current_bytes) = txn.get(queue_key.clone()).await? {
+                        let current =
+                            TaskQueueEntry::deserialize_compat(&current_bytes).map_err(|e| {
+                                anyhow::anyhow!("Failed to deserialize worker queue entry: {e}")
+                            })?;
+                        if current.nonce == entry.nonce {
+                            system_store
+                                .delete_worker_queue_entry(&mut txn, &queue_key)
+                                .await?;
+                        }
+                        // nonce mismatch → DML overwrote → skip delete, next tick handles it
                     }
-                    // nonce mismatch → DML overwrote → skip delete, next tick handles it
                 }
             } else {
                 // Non-HnswMerge: these tasks never share deterministic keys with DML,
@@ -1387,7 +1397,13 @@ pub(crate) const HNSW_GRAPH_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Returns `true` if the merge should be skipped because the index is frozen.
 /// Used at the top of `execute_hnsw_merge` and testable independently.
+///
+/// When S3 offload is enabled, frozen indexes can be merged again because
+/// the graph blob goes to S3 (no TiKV raft-entry-max-size concern).
 pub(crate) fn should_skip_frozen_merge(meta: &crate::sql::hnsw::storage::HnswMeta) -> bool {
+    if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
+        return false;
+    }
     meta.frozen
 }
 
@@ -1421,8 +1437,8 @@ async fn execute_hnsw_merge(
 ) -> Result<()> {
     use crate::sql::hnsw::storage::{
         create_empty_hnsw_index, delete_delta_keys, hnsw_delta_prefix, hnsw_delta_prefix_end,
-        hnsw_graph_key, hnsw_meta_key, load_base_graph, serialize_hnsw_snapshot, HnswDelta,
-        HnswMeta,
+        hnsw_graph_key, hnsw_meta_key, hnsw_s3_retired_version_key, load_base_graph,
+        serialize_hnsw_snapshot, HnswDelta, HnswMeta, HnswS3RetiredVersionGc,
     };
     use crate::txn::txn_put;
     use tikv_client::BoundRange;
@@ -1430,14 +1446,42 @@ async fn execute_hnsw_merge(
     let merge_start = std::time::Instant::now();
     let mut total_deltas_merged: usize = 0;
 
+    // Capability pre-check: if this index requires S3 but this worker
+    // doesn't have S3 configured, fail early before acquiring any locks.
+    // This prevents a non-S3 worker from holding a pessimistic lock on
+    // the meta key while it discovers it can't serve the merge.
+    if crate::sql::hnsw::s3::hnsw_s3_client().is_none() {
+        let mut pre_txn = store.begin().await?;
+        let pre_key = hnsw_meta_key(db_id, table_id, index_id);
+        if let Some(pre_bytes) = pre_txn.get(pre_key).await? {
+            if let Ok(pre_meta) = serde_json::from_slice::<HnswMeta>(&pre_bytes) {
+                if pre_meta.storage_version >= 2 || pre_meta.graph_version > 0 {
+                    pre_txn.rollback().await.ok();
+                    tracing::debug!(
+                        table_id,
+                        index_id,
+                        graph_version = pre_meta.graph_version,
+                        "Skipping HNSW merge: index requires S3 but this worker has no S3 client"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        pre_txn.rollback().await.ok();
+    }
+
     loop {
         let mut txn = store.begin().await?;
         let mut txn_guard = crate::worker::active_txn_registry::global_registry()
             .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
-        // 1. Read meta
+        // 1. Read meta with pessimistic lock.
+        // get_for_update is the last line of defense against duplicate merge
+        // execution. Worker claims are now bound to the exact queue entry, but
+        // manual requeue / operator mistakes must still not let two merges
+        // compute the same next graph_version from a stale snapshot.
         let meta_key = hnsw_meta_key(db_id, table_id, index_id);
-        let Some(meta_bytes) = txn.get(meta_key.clone()).await? else {
+        let Some(meta_bytes) = txn.get_for_update(meta_key.clone()).await? else {
             // Index metadata missing — index was dropped. Abort silently.
             if txn.rollback().await.is_err() {
                 if let Some(g) = txn_guard.as_mut() {
@@ -1456,14 +1500,14 @@ async fn execute_hnsw_merge(
             info!(table_id, index_id, "HNSW merge skipped: index is frozen");
             return Ok(());
         }
-        if meta.storage_version != 1 {
+        if meta.storage_version != 1 && meta.storage_version != 2 {
             if txn.rollback().await.is_err() {
                 if let Some(g) = txn_guard.as_mut() {
                     g.quarantine();
                 }
             }
             return Err(anyhow!(
-                "HNSW index has unsupported storage_version={}; only v1 supported",
+                "HNSW index has unsupported storage_version={}; only v1/v2 supported",
                 meta.storage_version
             ));
         }
@@ -1517,8 +1561,9 @@ async fn execute_hnsw_merge(
         let batch_count = batch_deltas.len();
 
         // 3. Load base graph (or create empty if none exists yet).
+        let keyspace = store.keyspace().unwrap_or("default");
         let (index, _): (crate::sql::hnsw::HnswIndexHandle, _) =
-            match load_base_graph(&mut txn, db_id, table_id, index_id, &meta).await? {
+            match load_base_graph(&mut txn, db_id, table_id, index_id, &meta, keyspace).await? {
                 Some(pair) => pair,
                 None => create_empty_hnsw_index(
                     meta.dimensions,
@@ -1546,40 +1591,82 @@ async fn execute_hnsw_merge(
         let mut updated_meta = meta.clone();
         updated_meta.count = index.size() as u64;
         updated_meta.capacity = index.capacity() as u64;
-        let (graph_bytes, meta_bytes_new) =
+        let (graph_bytes, _meta_bytes_tikv) =
             serialize_hnsw_snapshot(db_id, table_id, index_id, index.deref(), &updated_meta)?;
 
-        // 5a. If the serialized graph exceeds the raft-entry-safe limit,
-        //     freeze this index: persist frozen=true in meta, skip writing
-        //     the oversized graph, and stop merging.
-        if let Some(frozen_meta_bytes) =
-            check_graph_oversize_freeze(graph_bytes.len(), &updated_meta)
-        {
-            warn!(
+        // 5a. S3 vs TiKV write path for the graph blob.
+        if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+            // S3 path: upload graph to S3, increment graph_version.
+            let previous_version = updated_meta.graph_version;
+            let new_version = updated_meta.graph_version + 1;
+            s3.put_graph(
+                keyspace,
+                db_id,
                 table_id,
                 index_id,
-                graph_bytes = graph_bytes.len(),
-                limit = HNSW_GRAPH_MAX_BYTES,
-                "HNSW graph exceeds size limit — freezing index"
-            );
-            txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
-            if let Err(e) = txn.commit().await {
-                if let Some(g) = txn_guard.as_mut() {
-                    g.quarantine();
-                }
-                return Err(e.into());
+                new_version,
+                bytes::Bytes::from(graph_bytes),
+            )
+            .await
+            .map_err(|e| anyhow!("HNSW S3 put_graph failed: {}", e))?;
+            updated_meta.graph_version = new_version;
+            // First S3 write: upgrade storage_version to 2.
+            if updated_meta.storage_version == 1 {
+                updated_meta.storage_version = 2;
             }
-            return Ok(());
-        }
+            // Unfreeze if previously frozen (S3 has no size limit concern).
+            updated_meta.frozen = false;
+            // Re-serialize meta with updated graph_version/storage_version.
+            let meta_bytes_s3 = serde_json::to_vec(&updated_meta)?;
+            txn_put(&mut txn, meta_key, meta_bytes_s3).await?;
+            if previous_version > 0 {
+                let marker = HnswS3RetiredVersionGc {
+                    delete_after_safepoint: None,
+                };
+                txn_put(
+                    &mut txn,
+                    hnsw_s3_retired_version_key(db_id, table_id, index_id, previous_version),
+                    serde_json::to_vec(&marker)?,
+                )
+                .await?;
+            }
+            // On first migration (old graph was in TiKV), delete the stale
+            // TiKV graph blob. Safe: concurrent queries at older snapshots
+            // still see it via MVCC; no future query will read it since
+            // graph_version > 0 routes to S3.
+            if new_version == 1 {
+                let graph_key =
+                    crate::sql::hnsw::storage::hnsw_graph_key(db_id, table_id, index_id);
+                crate::txn::txn_delete(&mut txn, graph_key).await?;
+            }
+            // Skip TiKV graph write and oversize check — graph is in S3.
+        } else {
+            // TiKV path: check oversize freeze, then write graph to TiKV.
+            if let Some(frozen_meta_bytes) =
+                check_graph_oversize_freeze(graph_bytes.len(), &updated_meta)
+            {
+                warn!(
+                    table_id,
+                    index_id,
+                    graph_bytes = graph_bytes.len(),
+                    limit = HNSW_GRAPH_MAX_BYTES,
+                    "HNSW graph exceeds size limit — freezing index"
+                );
+                txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
+                txn.commit().await?;
+                return Ok(());
+            }
 
-        // 6. Atomic write: new base graph + delete consumed deltas + update meta.
-        txn_put(
-            &mut txn,
-            hnsw_graph_key(db_id, table_id, index_id),
-            graph_bytes,
-        )
-        .await?;
-        txn_put(&mut txn, meta_key, meta_bytes_new).await?;
+            // 6. Atomic write: new base graph + update meta.
+            txn_put(
+                &mut txn,
+                hnsw_graph_key(db_id, table_id, index_id),
+                graph_bytes,
+            )
+            .await?;
+            let meta_bytes_new = serde_json::to_vec(&updated_meta)?;
+            txn_put(&mut txn, meta_key, meta_bytes_new).await?;
+        }
         delete_delta_keys(&mut txn, &batch_keys).await?;
 
         // 7. Commit.
@@ -2396,8 +2483,13 @@ mod tests {
             storage_version: 1,
             label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
             frozen: true,
+            graph_version: 0,
+            dropped_at: None,
         };
         // This is the exact function called in execute_hnsw_merge dispatch.
+        // When S3 is not configured, frozen indexes should be skipped.
+        // Note: should_skip_frozen_merge now returns false when S3 is enabled,
+        // but in unit tests S3 is not initialized, so it returns true.
         assert!(super::should_skip_frozen_merge(&meta));
     }
 
@@ -2414,6 +2506,8 @@ mod tests {
             storage_version: 1,
             label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         assert!(!super::should_skip_frozen_merge(&meta));
     }
@@ -2431,6 +2525,8 @@ mod tests {
             storage_version: 1,
             label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         // Small graph: no freeze.
         let result = super::check_graph_oversize_freeze(1024, &meta);
@@ -2450,6 +2546,8 @@ mod tests {
             storage_version: 1,
             label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         // Oversized graph: should return frozen meta bytes.
         let result = super::check_graph_oversize_freeze(super::HNSW_GRAPH_MAX_BYTES + 1, &meta);
@@ -2474,6 +2572,8 @@ mod tests {
             storage_version: 1,
             label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
             frozen: false,
+            graph_version: 0,
+            dropped_at: None,
         };
         // Exactly at boundary: not oversize (uses >).
         let result = super::check_graph_oversize_freeze(super::HNSW_GRAPH_MAX_BYTES, &meta);
@@ -2497,6 +2597,8 @@ mod tests {
                     storage_version: 1,
                     label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
                     frozen: true,
+                    graph_version: 0,
+                    dropped_at: None,
                 },
             ),
             (
@@ -2511,6 +2613,8 @@ mod tests {
                     storage_version: 1,
                     label_mode: crate::sql::hnsw::storage::HnswLabelMode::Direct,
                     frozen: false,
+                    graph_version: 0,
+                    dropped_at: None,
                 },
             ),
         ];
@@ -2844,6 +2948,26 @@ mod tests {
             "reap_stale_gc_instance_states",
             // [lookup] Delete stale GC instance rows (bounded) + commit.
             "reap_stale_gc_instance_states_from_scan",
+            // [lookup] Read all HNSW metas for S3 GC sweep; bounded scan + rollback.
+            "read_all_hnsw_metas",
+            // [lookup] Scan S3 orphan prefixes + delete; bounded + commit.
+            "sweep_hnsw_s3_orphans",
+            // [lookup] Point read of S3 prefix GC marker; immediate commit/rollback.
+            "read_hnsw_s3_prefix_gc_marker",
+            // [finalize] Single key write for S3 prefix GC marker; immediate commit.
+            "write_hnsw_s3_prefix_gc_marker",
+            // [finalize] Single key delete for S3 prefix GC marker; immediate commit.
+            "delete_hnsw_s3_prefix_gc_marker",
+            // [lookup] Point read of S3 retired version marker; immediate commit/rollback.
+            "read_hnsw_s3_retired_version_marker",
+            // [finalize] Single key write for S3 retired version marker; immediate commit.
+            "write_hnsw_s3_retired_version_marker",
+            // [finalize] Single key delete for S3 retired version marker; immediate commit.
+            "delete_hnsw_s3_retired_version_marker",
+            // [reconcile] Scan + delete all retired version markers for an index; bounded + commit.
+            "delete_hnsw_s3_retired_version_markers_for_index",
+            // [finalize] Single key delete for HNSW meta; immediate commit.
+            "delete_hnsw_meta",
             // ── cron/worker.rs ──
             // (gc_database IS long-lived and MUST have track_worker_txn — not in allowlist)
 

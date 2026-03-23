@@ -530,6 +530,16 @@ fn test_worker_claim_key_same_identity_different_task_type() {
 }
 
 #[test]
+fn test_worker_claim_key_different_fire_times_within_same_minute() {
+    let key_a = encode_worker_claim_key(0x10, "myapp", 42, 100, 60_000);
+    let key_b = encode_worker_claim_key(0x10, "myapp", 42, 100, 60_999);
+    assert_ne!(
+        key_a, key_b,
+        "claim identity must bind to exact queue fire_time_ms, not minute buckets"
+    );
+}
+
+#[test]
 fn test_worker_registry_key_roundtrip_prefix() {
     let key = encode_worker_registry_key("tenant_x", 7);
     assert!(key.starts_with(b"_worker_registry_"));
