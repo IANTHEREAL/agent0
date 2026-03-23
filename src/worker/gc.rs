@@ -11,6 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tikv_client::{Timestamp, TimestampExt};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 /// Timeout for PD TSO requests in GC loops. We route this through the
@@ -27,6 +28,11 @@ pub struct WorkerGc {
     pool: Arc<TikvClientPool>,
     config: WorkerConfig,
     metrics: Arc<WorkerMetrics>,
+}
+
+pub struct WorkerGcHandles {
+    pub gc_loop_handle: JoinHandle<()>,
+    pub hnsw_sweep_handle: JoinHandle<()>,
 }
 
 struct ClaimGcBatch {
@@ -52,10 +58,14 @@ impl WorkerGc {
 
     /// Spawn worker-only GC loops (orphan claims + cron cleanup + HNSW sweep).
     /// Publisher and advancer are spawned separately at the top level of main.rs.
-    pub fn spawn_worker_gc_only(self: Arc<Self>) {
+    pub fn spawn_worker_gc_only(self: Arc<Self>) -> WorkerGcHandles {
         let gc_self = self.clone();
-        tokio::spawn(async move { gc_self.run_gc_loop().await });
-        tokio::spawn(async move { self.run_hnsw_sweep_loop().await });
+        let gc_loop_handle = tokio::spawn(async move { gc_self.run_gc_loop().await });
+        let hnsw_sweep_handle = tokio::spawn(async move { self.run_hnsw_sweep_loop().await });
+        WorkerGcHandles {
+            gc_loop_handle,
+            hnsw_sweep_handle,
+        }
     }
 
     async fn run_gc_loop(&self) {

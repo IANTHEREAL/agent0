@@ -13,6 +13,7 @@ use crate::worker::metrics::WorkerMetrics;
 use crate::worker::now_epoch_ms;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
+use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
@@ -36,6 +37,7 @@ pub struct WorkerEngine {
     semaphore: Arc<Semaphore>,
     metrics: Arc<WorkerMetrics>,
     notify: Arc<Notify>,
+    shutdown: CancellationToken,
 }
 
 struct ActiveJobGuard {
@@ -63,6 +65,7 @@ impl WorkerEngine {
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let notify = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
         crate::worker::set_worker_notify(notify.clone());
         Self {
             config,
@@ -72,11 +75,16 @@ impl WorkerEngine {
             semaphore,
             metrics: Arc::new(WorkerMetrics::new()),
             notify,
+            shutdown,
         }
     }
 
     pub fn metrics(&self) -> &Arc<WorkerMetrics> {
         &self.metrics
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     pub async fn run(&self) {
@@ -121,6 +129,10 @@ impl WorkerEngine {
 
         loop {
             tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    info!("WorkerEngine shutdown requested");
+                    break;
+                }
                 _ = interval.tick() => {}
                 _ = self.notify.notified() => {}
             }
@@ -169,6 +181,7 @@ impl WorkerEngine {
             let engine_config = self.config.clone();
             let active_jobs = self.active_jobs.clone();
             let engine_metrics = self.metrics.clone();
+            let engine_shutdown = self.shutdown.clone();
 
             join_set.spawn(async move {
                 let _permit = permit;
@@ -180,6 +193,7 @@ impl WorkerEngine {
                     &engine_metrics,
                     key,
                     entry,
+                    engine_shutdown,
                 )
                 .await;
 
@@ -428,6 +442,7 @@ impl WorkerEngine {
         metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
         entry: TaskQueueEntry,
+        shutdown_signal: CancellationToken,
     ) -> Result<()> {
         Self::claim_and_execute_core(
             system_store,
@@ -436,6 +451,7 @@ impl WorkerEngine {
             metrics,
             queue_key,
             entry,
+            shutdown_signal,
             Self::finalize_cron_run,
         )
         .await
@@ -450,6 +466,7 @@ impl WorkerEngine {
         metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
         entry: TaskQueueEntry,
+        shutdown_signal: CancellationToken,
         finalize_fn: F,
     ) -> Result<()>
     where
@@ -506,7 +523,13 @@ impl WorkerEngine {
                 None
             };
 
-            let task_fut = Self::execute_task(pool, config, &entry, Some(cancel_signal));
+            let task_fut = Self::execute_task(
+                pool,
+                config,
+                &entry,
+                Some(cancel_signal),
+                Some(shutdown_signal.clone()),
+            );
             let result = match timeout_dur {
                 Some(dur) => match tokio::time::timeout(dur, task_fut).await {
                     Ok(r) => r,
@@ -518,7 +541,7 @@ impl WorkerEngine {
             get_process_list().deregister(run.run_id);
             result
         } else {
-            Self::execute_task(pool, config, &entry, None).await
+            Self::execute_task(pool, config, &entry, None, Some(shutdown_signal)).await
         };
 
         // Capture finalize result instead of propagating with `?` — cleanup
@@ -822,6 +845,7 @@ impl WorkerEngine {
         config: &WorkerConfig,
         entry: &TaskQueueEntry,
         cancel_signal: Option<Arc<Notify>>,
+        shutdown_signal: Option<CancellationToken>,
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
@@ -945,7 +969,13 @@ impl WorkerEngine {
             Ok(statements.len())
         };
 
-        let result = run_with_guards(task_fut, task_timeout, cancel_signal.as_ref()).await;
+        let result = run_with_guards(
+            task_fut,
+            task_timeout,
+            cancel_signal.as_ref(),
+            shutdown_signal.as_ref(),
+        )
+        .await;
 
         match result {
             Ok(completed_commands) => Ok(completed_commands),
@@ -1237,6 +1267,7 @@ async fn run_with_guards<F, T>(
     fut: F,
     timeout: Option<Duration>,
     cancel: Option<&Arc<Notify>>,
+    shutdown: Option<&CancellationToken>,
 ) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -1250,12 +1281,21 @@ where
         }
     };
 
-    match cancel {
-        Some(cancel) => tokio::select! {
+    match (cancel, shutdown) {
+        (Some(cancel), Some(shutdown)) => tokio::select! {
+            res = timed_fut => res,
+            _ = cancel.notified() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+            _ = shutdown.cancelled() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+        },
+        (Some(cancel), None) => tokio::select! {
             res = timed_fut => res,
             _ = cancel.notified() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
         },
-        None => timed_fut.await,
+        (None, Some(shutdown)) => tokio::select! {
+            res = timed_fut => res,
+            _ = shutdown.cancelled() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+        },
+        (None, None) => timed_fut.await,
     }
 }
 
@@ -1939,7 +1979,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = run_with_guards(fut, Some(Duration::from_millis(5)), Some(&cancel))
+        let err = run_with_guards(fut, Some(Duration::from_millis(5)), Some(&cancel), None)
             .await
             .expect_err("expected timeout");
         assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
@@ -1952,7 +1992,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = run_with_guards(fut, Some(Duration::from_millis(5)), None)
+        let err = run_with_guards(fut, Some(Duration::from_millis(5)), None, None)
             .await
             .expect_err("expected timeout");
         assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
@@ -1967,7 +2007,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = run_with_guards(fut, None, Some(&cancel))
+        let err = run_with_guards(fut, None, Some(&cancel), None)
             .await
             .expect_err("expected cancel");
         assert_eq!(err.to_string(), CANCELLED_BY_ADMIN_ERROR);
@@ -1977,10 +2017,25 @@ mod tests {
     async fn run_with_guards_without_timeout_or_cancel_returns_inner_result() {
         let fut = async { Ok::<usize, anyhow::Error>(7) };
 
-        let result = run_with_guards(fut, None, None)
+        let result = run_with_guards(fut, None, None, None)
             .await
             .expect("expected success");
         assert_eq!(result, 7);
+    }
+
+    #[tokio::test]
+    async fn run_with_guards_shutdown_token_returns_cancel_error() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = run_with_guards(fut, None, None, Some(&shutdown))
+            .await
+            .expect_err("expected shutdown cancellation");
+        assert_eq!(err.to_string(), CANCELLED_BY_ADMIN_ERROR);
     }
 
     #[test]
@@ -2008,13 +2063,39 @@ mod tests {
             "individual statements must execute without per-statement timeout wrapping"
         );
         assert!(
-            execute_task_source
-                .contains("run_with_guards(task_fut, task_timeout, cancel_signal.as_ref())"),
+            execute_task_source.contains("run_with_guards(")
+                && execute_task_source.contains("task_timeout,")
+                && execute_task_source.contains("cancel_signal.as_ref(),")
+                && execute_task_source.contains("shutdown_signal.as_ref(),"),
             "execute_task must wrap the whole task future in run_with_guards"
         );
         assert!(
             !execute_task_source.contains("run_with_guards(fut, stmt_timeout"),
             "execute_task must not apply timeout per statement"
+        );
+    }
+
+    #[test]
+    fn worker_engine_shutdown_is_wired_into_run_loop_and_task_guards() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let run_fn = prod_source
+            .split("pub async fn run(&self)")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn tick(&self)").next())
+            .expect("engine.rs must define WorkerEngine::run before tick");
+
+        assert!(
+            run_fn.contains("_ = self.shutdown.cancelled()"),
+            "WorkerEngine::run must stop polling when shutdown is requested"
+        );
+        assert!(
+            prod_source.contains("Some(shutdown_signal.clone())")
+                && prod_source.contains("Some(shutdown_signal)).await"),
+            "worker task execution must propagate shutdown cancellation to running tasks"
         );
     }
 
@@ -2193,6 +2274,7 @@ mod tests {
             &metrics,
             queue_key,
             entry.clone(),
+            CancellationToken::new(),
             |_store, _db_id, _run, _status, _msg, _start, _end| async {
                 Err(anyhow!("injected: TiKV write error in finalize_cron_run"))
             },
