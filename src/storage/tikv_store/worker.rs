@@ -3,12 +3,16 @@ use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim};
 
 const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
+const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
 
 /// Published GC instance state read back from `_sys_worker`.
 pub struct GcInstanceState {
     pub instance_id: String,
     pub min_start_ts: Option<u64>,
     pub updated_at_version: u64,
+    /// Legacy 25-byte row compatibility during mixed-version rollout.
+    /// New-format rows do not publish this timeout tail.
+    pub legacy_max_untracked_timeout_sec: Option<u64>,
 }
 
 fn encode_gc_instance_state_value(min_start_ts: Option<u64>, updated_at_version: u64) -> Vec<u8> {
@@ -27,7 +31,7 @@ fn encode_gc_instance_state_value(min_start_ts: Option<u64>, updated_at_version:
     data
 }
 
-fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64)> {
+fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64, Option<u64>)> {
     if val.len() < GC_INSTANCE_STATE_VALUE_LEN {
         return None;
     }
@@ -38,7 +42,12 @@ fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64)> {
         None
     };
     let updated_at = u64::from_be_bytes(val[9..17].try_into().unwrap_or([0; 8]));
-    Some((min_ts, updated_at))
+    let legacy_max_untracked_timeout_sec = if val.len() >= LEGACY_GC_INSTANCE_STATE_VALUE_LEN {
+        Some(u64::from_be_bytes(val[17..25].try_into().unwrap_or([0; 8])))
+    } else {
+        None
+    };
+    Some((min_ts, updated_at, legacy_max_untracked_timeout_sec))
 }
 
 fn gc_instance_state_scan_end(prefix: &[u8]) -> Vec<u8> {
@@ -493,15 +502,16 @@ impl TikvStore {
         let Some(data) = tikv_op!(txn.get_for_update(key).await)? else {
             return Ok(None);
         };
-        Ok(
-            decode_gc_instance_state_value(&data).map(|(min_start_ts, updated_at_version)| {
+        Ok(decode_gc_instance_state_value(&data).map(
+            |(min_start_ts, updated_at_version, legacy_max_untracked_timeout_sec)| {
                 GcInstanceState {
                     instance_id: instance_id.to_string(),
                     min_start_ts,
                     updated_at_version,
+                    legacy_max_untracked_timeout_sec,
                 }
-            }),
-        )
+            },
+        ))
     }
 
     /// Scan all GC instance states from the shared registry.
@@ -525,11 +535,14 @@ impl TikvStore {
 
             // Accept both the current 17-byte format and the older 25-byte
             // format that appended max_untracked_timeout_sec.
-            if let Some((min_ts, updated_at)) = decode_gc_instance_state_value(pair.value()) {
+            if let Some((min_ts, updated_at, legacy_max_untracked_timeout_sec)) =
+                decode_gc_instance_state_value(pair.value())
+            {
                 results.push(GcInstanceState {
                     instance_id,
                     min_start_ts: min_ts,
                     updated_at_version: updated_at,
+                    legacy_max_untracked_timeout_sec,
                 });
             }
         }
@@ -551,7 +564,7 @@ mod tests {
         assert_eq!(encoded.len(), GC_INSTANCE_STATE_VALUE_LEN);
         assert_eq!(
             decode_gc_instance_state_value(&encoded),
-            Some((Some(123), 456))
+            Some((Some(123), 456, None))
         );
     }
 
@@ -561,7 +574,7 @@ mod tests {
         encoded.extend_from_slice(&789u64.to_be_bytes());
         assert_eq!(
             decode_gc_instance_state_value(&encoded),
-            Some((Some(123), 456))
+            Some((Some(123), 456, Some(789)))
         );
     }
 

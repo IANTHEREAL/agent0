@@ -1564,6 +1564,10 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
         std::collections::HashMap::new();
 
     let mut txn = store.begin_optimistic().await?;
+    // This snapshot spans the full paginated scan (including rate-limit sleeps),
+    // so it must participate in GC safepoint protection like other worker txns.
+    let _txn_guard = crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
     let mut cursor = range_start;
 
     loop {
@@ -2011,6 +2015,32 @@ mod tests {
         assert!(
             !execute_task_source.contains("run_with_guards(fut, stmt_timeout"),
             "execute_task must not apply timeout per statement"
+        );
+    }
+
+    #[test]
+    fn storage_size_scan_tracks_its_long_lived_read_transaction() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let scan_start = prod_source
+            .find("async fn execute_storage_size_scan(")
+            .expect("execute_storage_size_scan must exist");
+        let scan_end = prod_source[scan_start..]
+            .find("/// Enqueue a storage size scan task")
+            .map(|offset| scan_start + offset)
+            .expect("execute_storage_size_scan must appear before enqueue helper");
+        let scan_source = &prod_source[scan_start..scan_end];
+
+        assert!(
+            scan_source.contains("let mut txn = store.begin_optimistic().await?;"),
+            "storage size scan must keep its paginated snapshot in a single optimistic transaction"
+        );
+        assert!(
+            scan_source.contains("track_worker_txn(txn.start_timestamp().version())"),
+            "storage size scan must publish its long-lived scan transaction in the active txn registry"
         );
     }
 

@@ -217,6 +217,16 @@ async fn advance_gc_safepoint(
         states
     };
 
+    let effective_life_time_sec =
+        effective_cluster_gc_life_time_sec(current_version, config.gc_life_time_sec, &all_states);
+    if effective_life_time_sec > config.gc_life_time_sec {
+        info!(
+            local_life_time = config.gc_life_time_sec,
+            cluster_legacy_timeout_floor = effective_life_time_sec,
+            "GC life_time raised to cover legacy mixed-version worker timeout floor"
+        );
+    }
+
     let safepoint_version =
         compute_cluster_gc_safepoint(current_version, config.gc_life_time_sec, &all_states);
 
@@ -526,6 +536,25 @@ pub(crate) fn is_live_gc_instance_state(
     state.updated_at_version >= compute_safepoint_version(current_version, life_time_sec)
 }
 
+pub(crate) fn effective_cluster_gc_life_time_sec(
+    current_version: u64,
+    life_time_sec: u64,
+    states: &[GcInstanceState],
+) -> u64 {
+    // Mixed-version rollout compatibility: legacy rows may still carry the
+    // timeout-derived floor that old nodes rely on for untracked worker txns.
+    let mut effective_life_time_sec = life_time_sec;
+    for state in states {
+        if !is_live_gc_instance_state(current_version, life_time_sec, state) {
+            continue;
+        }
+        if let Some(legacy_timeout_sec) = state.legacy_max_untracked_timeout_sec {
+            effective_life_time_sec = effective_life_time_sec.max(legacy_timeout_sec);
+        }
+    }
+    effective_life_time_sec
+}
+
 fn stale_gc_instance_ids(
     current_version: u64,
     life_time_sec: u64,
@@ -543,7 +572,9 @@ pub(crate) fn compute_cluster_gc_safepoint(
     life_time_sec: u64,
     states: &[GcInstanceState],
 ) -> u64 {
-    let mut safepoint = compute_safepoint_version(current_version, life_time_sec);
+    let effective_life_time_sec =
+        effective_cluster_gc_life_time_sec(current_version, life_time_sec, states);
+    let mut safepoint = compute_safepoint_version(current_version, effective_life_time_sec);
     for state in states {
         if !is_live_gc_instance_state(current_version, life_time_sec, state) {
             continue;
@@ -700,6 +731,7 @@ mod tests {
             instance_id: "stale".to_string(),
             min_start_ts: Some(time_based.saturating_sub(10_000)),
             updated_at_version: stale_version,
+            legacy_max_untracked_timeout_sec: None,
         }];
 
         assert_eq!(
@@ -719,11 +751,13 @@ mod tests {
                 instance_id: "a".to_string(),
                 min_start_ts: Some((9_500_000u64 << 18) + 7),
                 updated_at_version: live_updated_at,
+                legacy_max_untracked_timeout_sec: None,
             },
             GcInstanceState {
                 instance_id: "b".to_string(),
                 min_start_ts: Some((9_300_000u64 << 18) + 9),
                 updated_at_version: live_updated_at,
+                legacy_max_untracked_timeout_sec: None,
             },
         ];
 
@@ -746,17 +780,63 @@ mod tests {
                 instance_id: "live".to_string(),
                 min_start_ts: None,
                 updated_at_version: live_updated_at,
+                legacy_max_untracked_timeout_sec: None,
             },
             GcInstanceState {
                 instance_id: "stale".to_string(),
                 min_start_ts: Some((9_300_000u64 << 18) + 9),
                 updated_at_version: stale_updated_at,
+                legacy_max_untracked_timeout_sec: None,
             },
         ];
 
         assert_eq!(
             stale_gc_instance_ids(current_version, life_time_sec, &states),
             vec!["stale".to_string()]
+        );
+    }
+
+    #[test]
+    fn cluster_gc_life_time_honors_live_legacy_timeout_floor() {
+        let current_version = 10_000_000u64 << 18;
+        let life_time_sec = 600;
+        let states = vec![GcInstanceState {
+            instance_id: "legacy".to_string(),
+            min_start_ts: None,
+            updated_at_version: current_version,
+            legacy_max_untracked_timeout_sec: Some(3_600),
+        }];
+
+        assert_eq!(
+            effective_cluster_gc_life_time_sec(current_version, life_time_sec, &states),
+            3_600
+        );
+        assert_eq!(
+            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            compute_safepoint_version(current_version, 3_600)
+        );
+    }
+
+    #[test]
+    fn cluster_gc_life_time_ignores_stale_legacy_timeout_floor() {
+        let current_version = 10_000_000u64 << 18;
+        let life_time_sec = 600;
+        let stale_updated_at =
+            compute_safepoint_version(current_version, life_time_sec).saturating_sub(1);
+        let states = vec![GcInstanceState {
+            instance_id: "stale-legacy".to_string(),
+            min_start_ts: None,
+            updated_at_version: stale_updated_at,
+            legacy_max_untracked_timeout_sec: Some(3_600),
+        }];
+
+        assert_eq!(
+            effective_cluster_gc_life_time_sec(current_version, life_time_sec, &states),
+            life_time_sec
+        );
+        assert_eq!(
+            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            compute_safepoint_version(current_version, life_time_sec)
         );
     }
 
