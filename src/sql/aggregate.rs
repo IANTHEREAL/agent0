@@ -140,14 +140,14 @@ impl Aggregator {
                             if let Some(sf) = sum_float.as_mut() {
                                 *sf += *i as f64;
                             } else {
-                                *sum += Decimal::from(*i);
+                                *sum = crate::sql::expr::numeric::checked_decimal_add(*sum, Decimal::from(*i))?;
                             }
                         }
                         Value::Int64(i) => {
                             if let Some(sf) = sum_float.as_mut() {
                                 *sf += *i as f64;
                             } else {
-                                *sum += Decimal::from(*i);
+                                *sum = crate::sql::expr::numeric::checked_decimal_add(*sum, Decimal::from(*i))?;
                             }
                         }
                         Value::Float64(f) => {
@@ -168,7 +168,7 @@ impl Aggregator {
                                 })?;
                                 *sf += df;
                             } else {
-                                *sum += *d;
+                                *sum = crate::sql::expr::numeric::checked_decimal_add(*sum, *d)?;
                             }
                         }
                         Value::Vector(v) => {
@@ -226,8 +226,8 @@ impl Aggregator {
         Ok(())
     }
 
-    pub fn result(&self) -> Value {
-        match self {
+    pub fn result(&self) -> Result<Value> {
+        Ok(match self {
             Aggregator::Count(c) => Value::Int64(*c),
             Aggregator::Sum { value, .. } => value.clone(),
             Aggregator::Max(v) => v.clone(),
@@ -246,7 +246,7 @@ impl Aggregator {
                     Value::Float64(*sf / *count as f64)
                 } else {
                     let denom = Decimal::from(*count);
-                    Value::Numeric(pg_numeric_div(*sum, denom))
+                    Value::Numeric(pg_numeric_div(*sum, denom)?)
                 }
             }
             Aggregator::StringAgg { values, delimiter } => {
@@ -285,7 +285,7 @@ impl Aggregator {
                     Value::Jsonb(format!("[{}]", items.join(",")))
                 }
             }
-        }
+        })
     }
 }
 
@@ -359,10 +359,22 @@ fn value_to_json_str_canonical(v: &Value) -> String {
 
 fn add_values(left: &Value, right: &Value) -> Result<Value> {
     match (left, right) {
-        (Value::Int32(l), Value::Int32(r)) => Ok(Value::Int32(l + r)),
-        (Value::Int64(l), Value::Int64(r)) => Ok(Value::Int64(l + r)),
-        (Value::Int32(l), Value::Int64(r)) => Ok(Value::Int64(*l as i64 + r)),
-        (Value::Int64(l), Value::Int32(r)) => Ok(Value::Int64(l + *r as i64)),
+        (Value::Int32(l), Value::Int32(r)) => l
+            .checked_add(*r)
+            .map(Value::Int32)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
+        (Value::Int64(l), Value::Int64(r)) => l
+            .checked_add(*r)
+            .map(Value::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (Value::Int32(l), Value::Int64(r)) => (*l as i64)
+            .checked_add(*r)
+            .map(Value::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (Value::Int64(l), Value::Int32(r)) => l
+            .checked_add(*r as i64)
+            .map(Value::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l + r)),
         (Value::Int32(l), Value::Float64(r)) => Ok(Value::Float64(*l as f64 + r)),
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l + *r as f64)),
@@ -372,7 +384,8 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         (Value::Text(l), Value::Text(r)) => {
             // Try parsing as int first, then float
             match (l.parse::<i64>(), r.parse::<i64>()) {
-                (Ok(li), Ok(ri)) => Ok(Value::Int64(li + ri)),
+                (Ok(li), Ok(ri)) => li.checked_add(ri).map(Value::Int64)
+                    .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
                 _ => match (l.parse::<f64>(), r.parse::<f64>()) {
                     (Ok(lf), Ok(rf)) => Ok(Value::Float64(lf + rf)),
                     _ => Err(anyhow!("Cannot add non-numeric text values")),
@@ -381,7 +394,8 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         }
         (Value::Text(t), Value::Int32(i)) | (Value::Int32(i), Value::Text(t)) => {
             if let Ok(ti) = t.parse::<i32>() {
-                Ok(Value::Int32(ti + i))
+                ti.checked_add(*i).map(Value::Int32)
+                    .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into())
             } else if let Ok(tf) = t.parse::<f64>() {
                 Ok(Value::Float64(tf + *i as f64))
             } else {
@@ -390,7 +404,8 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         }
         (Value::Text(t), Value::Int64(i)) | (Value::Int64(i), Value::Text(t)) => {
             if let Ok(ti) = t.parse::<i64>() {
-                Ok(Value::Int64(ti + i))
+                ti.checked_add(*i).map(Value::Int64)
+                    .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into())
             } else if let Ok(tf) = t.parse::<f64>() {
                 Ok(Value::Float64(tf + *i as f64))
             } else {
@@ -404,13 +419,15 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
                 Err(anyhow!("Cannot add non-numeric text to number"))
             }
         }
-        (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(l + r)),
-        (Value::Numeric(d), Value::Int32(i)) | (Value::Int32(i), Value::Numeric(d)) => {
-            Ok(Value::Numeric(d + Decimal::from(*i)))
-        }
-        (Value::Numeric(d), Value::Int64(i)) | (Value::Int64(i), Value::Numeric(d)) => {
-            Ok(Value::Numeric(d + Decimal::from(*i)))
-        }
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(
+            crate::sql::expr::numeric::checked_decimal_add(*l, *r)?,
+        )),
+        (Value::Numeric(d), Value::Int32(i)) | (Value::Int32(i), Value::Numeric(d)) => Ok(
+            Value::Numeric(crate::sql::expr::numeric::checked_decimal_add(*d, Decimal::from(*i))?),
+        ),
+        (Value::Numeric(d), Value::Int64(i)) | (Value::Int64(i), Value::Numeric(d)) => Ok(
+            Value::Numeric(crate::sql::expr::numeric::checked_decimal_add(*d, Decimal::from(*i))?),
+        ),
         (Value::Numeric(d), Value::Float64(f)) | (Value::Float64(f), Value::Numeric(d)) => {
             let df = d
                 .to_f64()
@@ -582,13 +599,13 @@ mod tests {
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
-        assert_eq!(agg.result(), Value::Int64(3));
+        assert_eq!(agg.result().unwrap(), Value::Int64(3));
     }
 
     #[test]
     fn test_count_empty() {
         let agg = Aggregator::new("COUNT", None).unwrap();
-        assert_eq!(agg.result(), Value::Int64(0));
+        assert_eq!(agg.result().unwrap(), Value::Int64(0));
     }
 
     #[test]
@@ -598,7 +615,7 @@ mod tests {
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
         agg.update(&Value::Int32(30)).unwrap();
-        assert_eq!(agg.result(), Value::Numeric(Decimal::from(60)));
+        assert_eq!(agg.result().unwrap(), Value::Numeric(Decimal::from(60)));
     }
 
     #[test]
@@ -607,13 +624,13 @@ mod tests {
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
-        assert_eq!(agg.result(), Value::Numeric(Decimal::from(30)));
+        assert_eq!(agg.result().unwrap(), Value::Numeric(Decimal::from(30)));
     }
 
     #[test]
     fn test_sum_empty() {
         let agg = Aggregator::new("SUM", None).unwrap();
-        assert_eq!(agg.result(), Value::Null);
+        assert_eq!(agg.result().unwrap(), Value::Null);
     }
 
     #[test]
@@ -622,7 +639,7 @@ mod tests {
         agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
         agg.update(&Value::Vector(vec![4.0, 5.0, 6.0])).unwrap();
         agg.update(&Value::Vector(vec![7.0, 8.0, 9.0])).unwrap();
-        assert_eq!(agg.result(), Value::Vector(vec![12.0, 15.0, 18.0]));
+        assert_eq!(agg.result().unwrap(), Value::Vector(vec![12.0, 15.0, 18.0]));
     }
 
     #[test]
@@ -631,7 +648,7 @@ mod tests {
         agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Vector(vec![4.0, 5.0, 6.0])).unwrap();
-        assert_eq!(agg.result(), Value::Vector(vec![5.0, 7.0, 9.0]));
+        assert_eq!(agg.result().unwrap(), Value::Vector(vec![5.0, 7.0, 9.0]));
     }
 
     #[test]
@@ -640,7 +657,7 @@ mod tests {
         agg.update(&Value::Int32(5)).unwrap();
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
-        assert_eq!(agg.result(), Value::Int32(10));
+        assert_eq!(agg.result().unwrap(), Value::Int32(10));
     }
 
     #[test]
@@ -649,7 +666,7 @@ mod tests {
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(5)).unwrap();
         agg.update(&Value::Null).unwrap();
-        assert_eq!(agg.result(), Value::Int32(5));
+        assert_eq!(agg.result().unwrap(), Value::Int32(5));
     }
 
     #[test]
@@ -658,7 +675,7 @@ mod tests {
         agg.update(&Value::Int32(5)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Int32(8)).unwrap();
-        assert_eq!(agg.result(), Value::Int32(2));
+        assert_eq!(agg.result().unwrap(), Value::Int32(2));
     }
 
     #[test]
@@ -667,7 +684,7 @@ mod tests {
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
         agg.update(&Value::Int32(30)).unwrap();
-        let result = agg.result();
+        let result = agg.result().unwrap();
         assert_eq!(result, Value::Numeric(Decimal::from(20)));
     }
 
@@ -677,14 +694,14 @@ mod tests {
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
-        let result = agg.result();
+        let result = agg.result().unwrap();
         assert_eq!(result, Value::Numeric(Decimal::from(15)));
     }
 
     #[test]
     fn test_avg_empty() {
         let agg = Aggregator::new("AVG", None).unwrap();
-        assert_eq!(agg.result(), Value::Null);
+        assert_eq!(agg.result().unwrap(), Value::Null);
     }
 
     #[test]
@@ -693,7 +710,7 @@ mod tests {
         agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
         agg.update(&Value::Vector(vec![4.0, 5.0, 6.0])).unwrap();
         agg.update(&Value::Vector(vec![7.0, 8.0, 9.0])).unwrap();
-        assert_eq!(agg.result(), Value::Vector(vec![4.0, 5.0, 6.0]));
+        assert_eq!(agg.result().unwrap(), Value::Vector(vec![4.0, 5.0, 6.0]));
     }
 
     #[test]
@@ -702,13 +719,13 @@ mod tests {
         agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Vector(vec![7.0, 8.0, 9.0])).unwrap();
-        assert_eq!(agg.result(), Value::Vector(vec![4.0, 5.0, 6.0]));
+        assert_eq!(agg.result().unwrap(), Value::Vector(vec![4.0, 5.0, 6.0]));
     }
 
     #[test]
     fn test_avg_vector_empty() {
         let agg = Aggregator::new("AVG", None).unwrap();
-        assert_eq!(agg.result(), Value::Null);
+        assert_eq!(agg.result().unwrap(), Value::Null);
     }
 
     #[test]
@@ -716,7 +733,7 @@ mod tests {
         let mut agg = Aggregator::new("AVG", None).unwrap();
         agg.update(&Value::Float64(1.5)).unwrap();
         agg.update(&Value::Float64(2.5)).unwrap();
-        let result = agg.result();
+        let result = agg.result().unwrap();
         assert_eq!(result, Value::Float64(2.0));
     }
 
@@ -726,7 +743,7 @@ mod tests {
         agg.update(&Value::Int32(300)).unwrap();
         agg.update(&Value::Int32(200)).unwrap();
         agg.update(&Value::Int32(300)).unwrap();
-        let result = agg.result();
+        let result = agg.result().unwrap();
         assert_eq!(
             result,
             Value::Numeric(Decimal::from_str_exact("266.6666666666666667").unwrap())
@@ -744,7 +761,7 @@ mod tests {
         agg.update(&Value::Text("apple".to_string())).unwrap();
         agg.update(&Value::Text("banana".to_string())).unwrap();
         agg.update(&Value::Text("cherry".to_string())).unwrap();
-        assert_eq!(agg.result(), Value::Text("cherry".to_string()));
+        assert_eq!(agg.result().unwrap(), Value::Text("cherry".to_string()));
     }
 
     #[test]
@@ -753,7 +770,7 @@ mod tests {
         agg.update(&Value::Text("banana".to_string())).unwrap();
         agg.update(&Value::Text("apple".to_string())).unwrap();
         agg.update(&Value::Text("cherry".to_string())).unwrap();
-        assert_eq!(agg.result(), Value::Text("apple".to_string()));
+        assert_eq!(agg.result().unwrap(), Value::Text("apple".to_string()));
     }
 
     #[test]
@@ -763,7 +780,7 @@ mod tests {
         agg.update(&Value::Text("banana".to_string())).unwrap();
         agg.update(&Value::Text("cherry".to_string())).unwrap();
         assert_eq!(
-            agg.result(),
+            agg.result().unwrap(),
             Value::Text("apple, banana, cherry".to_string())
         );
     }
@@ -774,13 +791,13 @@ mod tests {
         agg.update(&Value::Text("a".to_string())).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Text("b".to_string())).unwrap();
-        assert_eq!(agg.result(), Value::Text("a,b".to_string()));
+        assert_eq!(agg.result().unwrap(), Value::Text("a,b".to_string()));
     }
 
     #[test]
     fn test_string_agg_empty() {
         let agg = Aggregator::new_string_agg(",".to_string());
-        assert_eq!(agg.result(), Value::Null);
+        assert_eq!(agg.result().unwrap(), Value::Null);
     }
 
     #[test]
@@ -790,7 +807,7 @@ mod tests {
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
         assert_eq!(
-            agg.result(),
+            agg.result().unwrap(),
             Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
         );
     }
@@ -802,7 +819,7 @@ mod tests {
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         assert_eq!(
-            agg.result(),
+            agg.result().unwrap(),
             Value::Array(vec![Value::Int32(1), Value::Null, Value::Int32(2)])
         );
     }
@@ -810,7 +827,7 @@ mod tests {
     #[test]
     fn test_array_agg_empty() {
         let agg = Aggregator::new("ARRAY_AGG", None).unwrap();
-        assert_eq!(agg.result(), Value::Null);
+        assert_eq!(agg.result().unwrap(), Value::Null);
     }
 
     #[test]
@@ -819,7 +836,7 @@ mod tests {
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
-        match agg.result() {
+        match agg.result().unwrap() {
             Value::Jsonb(s) => assert_eq!(s, "[1,2,3]"),
             other => panic!("expected Value::Jsonb, got {:?}", other),
         }
@@ -830,7 +847,7 @@ mod tests {
         let mut agg = Aggregator::new("JSONB_AGG", None).unwrap();
         agg.update(&Value::Jsonb(r#"{"a":1}"#.to_string())).unwrap();
         agg.update(&Value::Jsonb(r#"{"b":2}"#.to_string())).unwrap();
-        match agg.result() {
+        match agg.result().unwrap() {
             Value::Jsonb(s) => assert_eq!(s, r#"[{"a":1},{"b":2}]"#),
             other => panic!("expected Value::Jsonb, got {:?}", other),
         }
@@ -839,7 +856,7 @@ mod tests {
     #[test]
     fn test_jsonb_agg_empty() {
         let agg = Aggregator::new("JSONB_AGG", None).unwrap();
-        assert_eq!(agg.result(), Value::Null);
+        assert_eq!(agg.result().unwrap(), Value::Null);
     }
 
     #[test]
@@ -847,7 +864,7 @@ mod tests {
         let mut agg = Aggregator::new("JSON_AGG", None).unwrap();
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
-        match agg.result() {
+        match agg.result().unwrap() {
             Value::Json(s) => assert_eq!(s, "[1,2]"),
             other => panic!("expected Value::Json, got {:?}", other),
         }
@@ -862,7 +879,7 @@ mod tests {
         let mut agg = Aggregator::new("JSON_AGG", None).unwrap();
         agg.update(&Value::Jsonb(r#"{"color":"w","size":"M"}"#.to_string()))
             .unwrap();
-        match agg.result() {
+        match agg.result().unwrap() {
             Value::Json(s) => assert_eq!(s, r#"[{"size": "M", "color": "w"}]"#),
             other => panic!("expected Value::Json, got {:?}", other),
         }
@@ -878,7 +895,7 @@ mod tests {
             r#"{"color":"w","size":"M"}"#.to_string(),
         )]))
         .unwrap();
-        match agg.result() {
+        match agg.result().unwrap() {
             Value::Json(s) => assert_eq!(s, r#"[[{"size": "M", "color": "w"}]]"#),
             other => panic!("expected Value::Json, got {:?}", other),
         }
@@ -968,7 +985,7 @@ mod tests {
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
         agg.update(&Value::Int32(30)).unwrap();
-        assert_eq!(agg.result(), Value::Int64(60));
+        assert_eq!(agg.result().unwrap(), Value::Int64(60));
     }
 
     #[test]
@@ -983,6 +1000,6 @@ mod tests {
         .unwrap();
         agg.update(&Value::Int64(100)).unwrap();
         agg.update(&Value::Int64(200)).unwrap();
-        assert_eq!(agg.result(), Value::Numeric(Decimal::from(300)));
+        assert_eq!(agg.result().unwrap(), Value::Numeric(Decimal::from(300)));
     }
 }

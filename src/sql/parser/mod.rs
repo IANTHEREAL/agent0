@@ -13,7 +13,7 @@ mod tokenizer;
 mod tests;
 
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{SelectItem, Statement, WildcardAdditionalOptions};
+use sqlparser::ast::{DataType, Expr, SelectItem, Statement, WildcardAdditionalOptions};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
@@ -25,19 +25,70 @@ use preprocess::{
 };
 use tokenizer::{skip_ws_comments_forward, tokenize_sql_for_rewrite, TokenKind};
 
-/// Parse a SQL string into AST statements
+/// Parse a SQL string into AST statements.
+///
+/// Custom typed-string literals (`mood 'happy'`) are parsed by our sqlparser
+/// fork as `Expr::TypedString { Custom(mood), "happy" }`. We normalize these
+/// to `Expr::Cast { 'happy', Custom(mood) }` so that ALL downstream code
+/// uses the existing Cast infrastructure — no per-consumer TypedString handling
+/// needed.
+///
+/// Builtin TypedStrings (DATE, TIMESTAMP, etc.) are left as-is because the
+/// analyzer already handles them natively.
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let dialect = PostgreSqlDialect {};
     let preprocessed = preprocess_sql(sql).map_err(SqlError::Syntax)?;
     match parse_sql_with_pg_named_arg_compat(&dialect, &preprocessed) {
-        Ok(stmts) => Ok(stmts),
+        Ok(mut stmts) => {
+            for stmt in &mut stmts {
+                normalize_custom_typed_strings(stmt);
+            }
+            Ok(stmts)
+        }
         Err(e) => {
-            if let Some(stmts) = parse_insert_returning_wildcard_fallback(&dialect, &preprocessed) {
+            if let Some(mut stmts) =
+                parse_insert_returning_wildcard_fallback(&dialect, &preprocessed)
+            {
+                for stmt in &mut stmts {
+                    normalize_custom_typed_strings(stmt);
+                }
                 return Ok(stmts);
             }
             Err(anyhow!("SQL parse error: {}", e))
         }
     }
+}
+
+/// Normalize `Expr::TypedString { Custom(type), value }` → `Expr::Cast`
+/// so downstream code only needs to handle Cast for custom types.
+/// Builtin TypedStrings (DATE, TIMESTAMP, etc.) are left as-is.
+fn normalize_custom_typed_strings(stmt: &mut Statement) {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::visit_expressions_mut;
+
+    let _ = visit_expressions_mut(stmt, |expr| {
+        if matches!(
+            expr,
+            Expr::TypedString {
+                data_type: DataType::Custom(..),
+                ..
+            }
+        ) {
+            let Expr::TypedString { data_type, value } =
+                std::mem::replace(expr, Expr::Value(sqlparser::ast::Value::Null))
+            else {
+                unreachable!()
+            };
+            *expr = Expr::Cast {
+                expr: Box::new(Expr::Value(sqlparser::ast::Value::SingleQuotedString(
+                    value,
+                ))),
+                data_type,
+                format: None,
+            };
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 fn parse_sql_with_pg_named_arg_compat(

@@ -1,0 +1,5 @@
+direct_select|happy
+nested_select|happy
+default_direct|happy
+default_nested|happy
+qualified_select|sad

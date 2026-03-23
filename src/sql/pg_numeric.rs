@@ -102,16 +102,17 @@ pub(crate) fn pg_select_div_scale(numer: &Decimal, denom: &Decimal) -> u32 {
     scale.max(0) as u32
 }
 
-pub(crate) fn pg_numeric_div(numer: Decimal, denom: Decimal) -> Decimal {
+pub(crate) fn pg_numeric_div(numer: Decimal, denom: Decimal) -> anyhow::Result<Decimal> {
+    use crate::sql::expr::numeric::checked_decimal_div;
     let scale = pg_select_div_scale(&numer, &denom);
-    let mut result = numer / denom;
+    let mut result = checked_decimal_div(numer, denom)?;
     if result.scale() > scale {
         result = result.round_dp_with_strategy(scale, RoundingStrategy::MidpointAwayFromZero);
     }
     if result.scale() < scale {
         result.rescale(scale);
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -120,14 +121,14 @@ mod tests {
 
     #[test]
     fn test_pg_numeric_div_pads_scale_for_exact_result() {
-        let result = pg_numeric_div(Decimal::from(675), Decimal::from(4));
+        let result = pg_numeric_div(Decimal::from(675), Decimal::from(4)).unwrap();
         assert_eq!(result.scale(), 16);
         assert_eq!(result.to_string(), "168.7500000000000000");
     }
 
     #[test]
     fn test_pg_numeric_div_rounds_to_pg_scale_for_repeating_result() {
-        let result = pg_numeric_div(Decimal::from(1000), Decimal::from(7));
+        let result = pg_numeric_div(Decimal::from(1000), Decimal::from(7)).unwrap();
         assert_eq!(result.scale(), 16);
         assert_eq!(result.to_string(), "142.8571428571428571");
     }

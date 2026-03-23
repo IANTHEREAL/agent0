@@ -256,7 +256,11 @@ pub fn exp(args: Vec<Value>) -> Result<Value> {
         Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).exp())),
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).exp())),
         Some(Value::Numeric(d)) => {
-            let result = d.exp();
+            let result = d.checked_exp().ok_or_else(|| {
+                crate::sql::error::SqlError::NumericValueOutOfRange {
+                    message: "value overflows numeric format".into(),
+                }
+            })?;
             Ok(Value::Numeric(round_to_significant_digits(result, 16)))
         }
         _ => Ok(Value::Null),
@@ -270,7 +274,24 @@ pub fn ln(args: Vec<Value>) -> Result<Value> {
         Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).ln())),
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).ln())),
         Some(Value::Numeric(d)) => {
-            let result = d.ln();
+            if d.is_zero() {
+                return Err(crate::sql::error::SqlError::InvalidArgumentForLogarithm {
+                    message: "cannot take logarithm of zero".into(),
+                }
+                .into());
+            }
+            if d.is_sign_negative() {
+                return Err(crate::sql::error::SqlError::InvalidArgumentForLogarithm {
+                    message: "cannot take logarithm of a negative number".into(),
+                }
+                .into());
+            }
+            let result = d.checked_ln().ok_or_else(|| {
+                crate::sql::error::SqlError::NumericValueOutOfRange {
+                    message: "value overflows numeric format"
+                        .into(),
+                }
+            })?;
             Ok(Value::Numeric(round_to_significant_digits(result, 16)))
         }
         _ => Ok(Value::Null),
@@ -286,12 +307,27 @@ pub fn log10(args: Vec<Value>) -> Result<Value> {
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).log10())),
         Some(Value::Numeric(d)) => {
             // log10(x) = ln(x) / ln(10)
-            let ln_val = d.ln();
-            let ln_10 = Decimal::TEN.ln();
-            Ok(Value::Numeric(round_to_significant_digits(
-                ln_val / ln_10,
-                16,
-            )))
+            if d.is_zero() {
+                return Err(crate::sql::error::SqlError::InvalidArgumentForLogarithm {
+                    message: "cannot take logarithm of zero".into(),
+                }
+                .into());
+            }
+            if d.is_sign_negative() {
+                return Err(crate::sql::error::SqlError::InvalidArgumentForLogarithm {
+                    message: "cannot take logarithm of a negative number".into(),
+                }
+                .into());
+            }
+            let ln_val = d.checked_ln().ok_or_else(|| {
+                crate::sql::error::SqlError::NumericValueOutOfRange {
+                    message: "value overflows numeric format"
+                        .into(),
+                }
+            })?;
+            let ln_10 = Decimal::TEN.ln(); // constant, always safe
+            let result = crate::sql::expr::numeric::checked_decimal_div(ln_val, ln_10)?;
+            Ok(Value::Numeric(round_to_significant_digits(result, 16)))
         }
         _ => Ok(Value::Null),
     }
@@ -330,8 +366,12 @@ pub fn modulo(args: Vec<Value>) -> Result<Value> {
     let a = iter.next();
     let b = iter.next();
     match (a, b) {
-        (Some(Value::Int32(a)), Some(Value::Int32(b))) if b != 0 => Ok(Value::Int32(a % b)),
-        (Some(Value::Int64(a)), Some(Value::Int64(b))) if b != 0 => Ok(Value::Int64(a % b)),
+        (Some(Value::Int32(a)), Some(Value::Int32(b))) if b != 0 => {
+            Ok(Value::Int32(a.checked_rem(b).unwrap_or(0)))
+        }
+        (Some(Value::Int64(a)), Some(Value::Int64(b))) if b != 0 => {
+            Ok(Value::Int64(a.checked_rem(b).unwrap_or(0)))
+        }
         (Some(Value::Float64(a)), Some(Value::Float64(b))) => Ok(Value::Float64(a % b)),
         _ => Ok(Value::Null),
     }

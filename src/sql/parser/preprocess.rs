@@ -1070,6 +1070,8 @@ pub(super) fn preprocess_sql(sql: &str) -> Result<String, String> {
     if let Some(rewritten) = preprocess_type_array(&result) {
         result = rewritten;
     }
+    // Custom typed-string literals (mood 'happy') are handled natively by
+    // our sqlparser fork (crates/sqlparser), not by preprocessing.
     if let Some(rewritten) = preprocess_not_valid(&result) {
         result = rewritten;
     }
@@ -1152,6 +1154,9 @@ mod tests {
     fn preprocess_type_array_ignores_bracket_form() {
         assert!(preprocess_type_array(r#"ADD "tags" varchar[]"#).is_none());
     }
+
+    // Typed-string literal tests (mood 'happy') are in src/sql/parser/tests.rs
+    // because they now test through parse_sql() → sqlparser fork, not preprocessing.
 
     #[test]
     fn preprocess_not_valid_strips() {
