@@ -790,6 +790,7 @@ pub async fn execute_create_index(
             // remove committed entries so CREATE INDEX does not leave orphaned index KV data.
             // Also release the reservation key to prevent permanent false 42P07.
             let _ = txn.rollback().await;
+            crate::session_context::clear_current_session_txn_registration();
             let (start, end) = index_prefix_range(db_id, schema.table_id, index_id);
             let idx_full_name = format!("{}.{}", owning_schema, idx_name_str);
             let cleanup_result: Result<()> = async {
@@ -803,7 +804,7 @@ pub async fn execute_create_index(
             }
             .await;
 
-            *txn = store.begin().await?;
+            crate::session_context::begin_replacement_session_owned_txn(store, txn).await?;
 
             if let Err(cleanup_err) = cleanup_result {
                 return Err(err.context(format!(
@@ -1640,6 +1641,41 @@ mod tests {
             err.to_string()
                 .contains("unrecognized parameter \"not_a_real_option\""),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cleanup_reopen_clears_stale_session_registration_before_cleanup() {
+        let source = include_str!("create_index.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("create_index.rs must contain test module marker");
+        let cleanup_path = prod_source
+            .split("if let Err(err) = create_result")
+            .nth(1)
+            .expect("create_index.rs must handle create_result errors");
+
+        let rollback_pos = cleanup_path
+            .find("let _ = txn.rollback().await;")
+            .expect("cleanup path must roll back the stale transaction");
+        let clear_pos = cleanup_path
+            .find("crate::session_context::clear_current_session_txn_registration();")
+            .expect("cleanup path must clear the stale session registration after rollback");
+        let cleanup_pos = cleanup_path
+            .find("let cleanup_result: Result<()> = async {")
+            .expect("cleanup path must run cleanup work after rollback");
+        let begin_pos = cleanup_path
+            .find("crate::session_context::begin_replacement_session_owned_txn(store, txn).await?;")
+            .expect("cleanup path must reopen the session-owned transaction via the shared helper");
+
+        assert!(
+            rollback_pos < clear_pos && clear_pos < cleanup_pos && cleanup_pos < begin_pos,
+            "cleanup path must clear the stale session registration before cleanup and refresh it only after reopening the replacement transaction"
+        );
+        assert!(
+            !cleanup_path.contains("*txn = store.begin().await?;"),
+            "cleanup path must not bypass the shared session-owned txn replacement helper"
         );
     }
 }

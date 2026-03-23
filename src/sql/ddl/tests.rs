@@ -304,18 +304,23 @@ fn maybe_rotate_backfill_txn_clears_then_refreshes_session_registration() {
         .find("txn.commit().await?")
         .expect("rotation helper must commit the old transaction");
     let clear_pos = rotate_fn
-        .find("clear_active_session_txn_registration();")
+        .find("crate::session_context::clear_current_session_txn_registration();")
         .expect("rotation helper must clear the old session registration");
     let begin_pos = rotate_fn
-        .find("*txn = store.begin().await?;")
-        .expect("rotation helper must start a fresh transaction");
-    let refresh_pos = rotate_fn
-        .find("refresh_active_session_txn_registration(txn);")
-        .expect("rotation helper must refresh the session registration for the new transaction");
+        .find("crate::session_context::begin_replacement_session_owned_txn(store, txn).await?;")
+        .expect("rotation helper must start a fresh transaction via the shared helper");
+    let worker_guard_pos = rotate_fn
+        .find("*txn_guard = track_active_worker_txn(txn);")
+        .expect("rotation helper must refresh the worker txn guard for the new transaction");
 
     assert!(
-        commit_pos < clear_pos && clear_pos < begin_pos && begin_pos < refresh_pos,
-        "rotation helper must clear the old session registration after commit and refresh it after the new begin"
+        commit_pos < clear_pos && clear_pos < begin_pos && begin_pos < worker_guard_pos,
+        "rotation helper must clear the old session registration after commit, reopen the session-owned txn via the shared helper, then track the new worker txn"
+    );
+    assert!(
+        !rotate_fn.contains("refresh_active_session_txn_registration(txn);")
+            && !rotate_fn.contains("*txn = store.begin().await?;"),
+        "rotation helper must not inline session GC re-registration logic outside the shared helper"
     );
 }
 
