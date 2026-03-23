@@ -57,7 +57,7 @@ impl Executor {
         table_name: &str,
         rows: Vec<Vec<(String, Value)>>,
         mut accumulated_fk_keys: Option<&mut HashMap<String, HashSet<String>>>,
-        mut deferred_fk_checks: Option<&mut Vec<(dml::ConstraintId, String, String)>>,
+        mut deferred_fk_checks: Option<&mut Vec<(dml::ConstraintId, String, String, String)>>,
     ) -> std::result::Result<(), CopyInsertBatchError> {
         if rows.is_empty() {
             return Ok(());
@@ -475,7 +475,7 @@ impl Executor {
         &self,
         session: &mut Session,
         table_name: &str,
-        deferred_refs: &[(dml::ConstraintId, String, String)],
+        deferred_refs: &[(dml::ConstraintId, String, String, String)],
         pending_pk_keys: &HashMap<String, HashSet<String>>,
     ) -> Result<()> {
         let db_id = session.current_database_id();
@@ -499,6 +499,7 @@ impl Executor {
         session: &mut Session,
         table_name: &str,
         url: &str,
+        started_txn: bool,
     ) -> Result<usize> {
         use crate::sql::dml;
 
@@ -728,8 +729,10 @@ impl Executor {
                 row_count += 1;
                 batch_writes += 1;
 
-                // Transaction rotation every commit_size rows
-                if batch_writes >= commit_size {
+                // Transaction rotation every commit_size rows.
+                // Only rotate in autocommit mode — explicit transactions must
+                // not be silently committed mid-COPY.
+                if started_txn && batch_writes >= commit_size {
                     txn.commit().await?;
                     crate::session_context::clear_current_session_txn_registration();
                     crate::session_context::begin_replacement_session_owned_txn(&self.store, txn)

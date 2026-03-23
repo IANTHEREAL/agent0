@@ -616,6 +616,7 @@ impl DynamicPgHandler {
             reached_end_marker: false,
             copy_options,
             header_skipped: false,
+            batch_rows_since_commit: 0,
             pending_self_fk_keys: std::collections::HashMap::new(),
             deferred_self_fk_checks: Vec::new(),
         });

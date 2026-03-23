@@ -518,7 +518,8 @@ pub(crate) async fn validate_foreign_keys_non_self_ref(
 }
 
 /// Collect unresolved self-referencing FK checks for deferred CopyDone validation.
-/// Returns `(constraint_id, hash_key, display_values)`:
+/// Returns `(constraint_id, fk_name, hash_key, display_values)`:
+///   - `fk_name`: FK constraint name for constraint-scoped pruning
 ///   - `hash_key`: collision-resistant key for set membership (from [`pk_to_hash_key`])
 ///   - `display_values`: PG-like `(col)=(val)` string for error DETAIL
 ///
@@ -529,7 +530,7 @@ pub(crate) async fn collect_deferred_self_fk_checks(
     db_id: u64,
     schema: &TableSchema,
     row: &Row,
-) -> Result<Vec<(ConstraintId, String, String)>> {
+) -> Result<Vec<(ConstraintId, String, String, String)>> {
     let mut checks = Vec::new();
     for (constraint_id, fk) in schema.foreign_keys.iter().enumerate() {
         if fk.ref_table != schema.name {
@@ -590,22 +591,22 @@ pub(crate) async fn collect_deferred_self_fk_checks(
         if !parent_exists {
             let hash_key = pk_to_hash_key(&fk_values);
             let display = format_fk_detail_values(&fk.columns, &fk_values);
-            checks.push((constraint_id, hash_key, display));
+            checks.push((constraint_id, fk.name.clone(), hash_key, display));
         }
     }
     Ok(checks)
 }
 
 /// Validate deferred self-referencing FK constraints at CopyDone.
-/// Each deferred check stores `(constraint_id, hash_key, display_values)`:
+/// Each deferred check stores `(constraint_id, fk_name, hash_key, display_values)`:
 ///   - `hash_key` is checked against `pending_pk_keys` for set membership
 ///   - `display_values` is used in the user-facing DETAIL message
 pub(crate) fn validate_deferred_self_fk_refs(
     schema: &TableSchema,
-    deferred_refs: &[(ConstraintId, String, String)],
+    deferred_refs: &[(ConstraintId, String, String, String)],
     pending_pk_keys: &HashMap<String, HashSet<String>>,
 ) -> Result<()> {
-    for (constraint_id, hash_key, display_values) in deferred_refs {
+    for (constraint_id, _fk_name, hash_key, display_values) in deferred_refs {
         let fk = schema
             .foreign_keys
             .get(*constraint_id)

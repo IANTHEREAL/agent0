@@ -14,6 +14,15 @@ pub(in crate::protocol::handler) fn copy_from_stdin_line_too_long_error() -> PgW
     )))
 }
 
+/// Transaction rotation threshold for COPY FROM STDIN (rows per commit).
+/// Matches the Parquet COPY and DDL backfill paths (5000).
+pub const COPY_STDIN_COMMIT_SIZE: usize = 5000;
+
+/// Hard ceiling: if rotation is blocked (e.g. by self-FK forward references)
+/// and the transaction exceeds this many rows, COPY aborts with a clear error
+/// instead of silently growing until TiKV rejects the transaction.
+pub const COPY_STDIN_MAX_UNROTATED_ROWS: usize = 50_000;
+
 pub struct CopyContext {
     pub table_name: String,
     pub columns: Vec<String>,
@@ -28,12 +37,15 @@ pub struct CopyContext {
     pub reached_end_marker: bool,
     /// Set to true after the header row has been consumed.
     pub header_skipped: bool,
+    /// Rows inserted since the last transaction commit (for rotation tracking).
+    pub batch_rows_since_commit: usize,
     /// Accumulated self-referencing FK ref-column keys (PK side) across all
     /// CopyData chunks.  Keyed by FK constraint name.
     pub pending_self_fk_keys: HashMap<String, HashSet<String>>,
     /// Accumulated unresolved self-referencing FK checks that need deferred
-    /// validation at CopyDone. Each entry is `(constraint_id, hash_key, display_values)`.
-    pub deferred_self_fk_checks: Vec<(usize, String, String)>,
+    /// validation at CopyDone.
+    /// Each entry is `(constraint_id, fk_name, hash_key, display_values)`.
+    pub deferred_self_fk_checks: Vec<(usize, String, String, String)>,
 }
 
 /// A safety cap to prevent unbounded buffering if the client sends a single row without newlines.

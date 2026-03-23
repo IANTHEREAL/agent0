@@ -384,7 +384,7 @@ impl DynamicPgHandler {
             let line_numbers: Vec<usize> = (1..=row_count).collect();
 
             let mut pending_self_fk_keys: HashMap<String, HashSet<String>> = HashMap::new();
-            let mut deferred_self_fk_checks: Vec<(usize, String, String)> = Vec::new();
+            let mut deferred_self_fk_checks: Vec<(usize, String, String, String)> = Vec::new();
 
             let insert_result: PgWireResult<()> =
                 crate::sql::query_context::with_scoped_query_context(
@@ -653,7 +653,7 @@ impl DynamicPgHandler {
                 &qctx,
                 crate::sql::runtime_context::wrap_with_statement_runtime_context(&runtime, async {
                     executor
-                        .execute_copy_from_parquet(&mut session, &table_name, &url)
+                        .execute_copy_from_parquet(&mut session, &table_name, &url, started_txn)
                         .await
                 }),
             )

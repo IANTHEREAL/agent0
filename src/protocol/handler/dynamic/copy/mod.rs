@@ -199,81 +199,177 @@ impl CopyHandler for DynamicPgHandler {
             .map(|(_, col_values)| col_values)
             .collect();
 
-        let insert_res: PgWireResult<()> = with_copy_statement_context(&qctx, &runtime, async {
-            let mut session = self.auth().session.lock().await;
+        // Transaction rotation for autocommit COPY FROM STDIN.
+        // Dynamically computes chunk sizes based on current deferred FK state
+        // after each batch, so rotation resumes immediately when forward
+        // self-FK references are resolved.
+        use crate::protocol::handler::copy::COPY_STDIN_COMMIT_SIZE;
 
-            if self.cancel_token.is_cancelled() {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "FATAL".to_string(),
-                    "25P03".to_string(),
-                    "terminating connection due to idle-in-transaction timeout".to_string(),
-                ))));
+        let rotation_enabled = started_txn;
+
+        let prev_batch_rows = {
+            let ctx_guard = self.copy_context.lock().await;
+            ctx_guard
+                .as_ref()
+                .map_or(0, |ctx| ctx.batch_rows_since_commit)
+        };
+        let mut batch_rows_since_commit = prev_batch_rows;
+
+        let total_rows = inserted_count;
+        let mut offset: usize = 0;
+
+        while offset < rows_to_insert.len() {
+            // Compute next chunk size dynamically based on remaining capacity.
+            let remaining_capacity = if rotation_enabled {
+                COPY_STDIN_COMMIT_SIZE
+                    .saturating_sub(batch_rows_since_commit)
+                    .max(1) // at least 1 row per chunk to make progress
+            } else {
+                rows_to_insert.len() - offset // all remaining in one chunk
+            };
+            let end = (offset + remaining_capacity).min(rows_to_insert.len());
+            let chunk_line_numbers = &line_numbers[offset..end];
+            let chunk_rows = rows_to_insert[offset..end].to_vec();
+            let chunk_len = chunk_rows.len();
+
+            let insert_res: PgWireResult<()> =
+                with_copy_statement_context(&qctx, &runtime, async {
+                    let mut session = self.auth().session.lock().await;
+
+                    if self.cancel_token.is_cancelled() {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "25P03".to_string(),
+                            "terminating connection due to idle-in-transaction timeout".to_string(),
+                        ))));
+                    }
+
+                    if let Err(e) = session.check_idle_in_transaction_timeout() {
+                        let _ = session.rollback().await;
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_string(),
+                            e.sqlstate().to_string(),
+                            e.to_string(),
+                        ))));
+                    }
+
+                    if session.is_transaction_failed() {
+                        return Err(in_failed_sql_transaction_pgwire_error());
+                    }
+
+                    let savepoints = session.savepoints();
+                    crate::txn::with_savepoints(savepoints, async {
+                        executor
+                            .execute_copy_insert_batch(
+                                &mut session,
+                                &table_name,
+                                chunk_rows,
+                                Some(&mut accumulated_fk_keys),
+                                Some(&mut accumulated_deferred_fk),
+                            )
+                            .await
+                            .map_err(|batch_err| {
+                                let line_no = batch_err
+                                    .failed_row_offset()
+                                    .and_then(|o| chunk_line_numbers.get(o).copied());
+                                let err = batch_err.source_error();
+                                error!("COPY insert error: {}", err);
+                                let table = copy_display_table_name(&table_name);
+                                let message = if should_add_copy_insert_context(err) {
+                                    if let Some(line_no) = line_no {
+                                        format!(
+                                            "{}\nCONTEXT:  COPY {}, line {}",
+                                            err, table, line_no
+                                        )
+                                    } else {
+                                        err.to_string()
+                                    }
+                                } else {
+                                    err.to_string()
+                                };
+                                user_error(sqlstate_for_executor_error(err), message)
+                            })?;
+
+                        // After each batch: prune resolved deferred self-FK checks,
+                        // then decide whether to commit + rotate.
+                        batch_rows_since_commit += chunk_len;
+                        if !accumulated_deferred_fk.is_empty() {
+                            accumulated_deferred_fk.retain(|(_, fk_name, hash_key, _)| {
+                                !accumulated_fk_keys
+                                    .get(fk_name)
+                                    .is_some_and(|keys| keys.contains(hash_key))
+                            });
+                        }
+                        // Hard ceiling: fail fast if rotation is blocked and the
+                        // transaction has grown too large. This prevents the silent
+                        // growth to TiKV's 100MB limit that #1988 was filed for.
+                        if rotation_enabled
+                            && !accumulated_deferred_fk.is_empty()
+                            && batch_rows_since_commit
+                                >= crate::protocol::handler::copy::COPY_STDIN_MAX_UNROTATED_ROWS
+                        {
+                            return Err(user_error(
+                                "54000",
+                                format!(
+                                    "COPY exceeds transaction size limit ({} rows). \
+                                     Table \"{}\" has self-referencing foreign keys with \
+                                     forward references (child rows before parent rows) \
+                                     that prevent transaction rotation. Reorder rows so \
+                                     parent rows appear before child rows, or split the \
+                                     import into smaller batches.",
+                                    batch_rows_since_commit,
+                                    copy_display_table_name(&table_name),
+                                ),
+                            ));
+                        }
+                        if rotation_enabled
+                            && accumulated_deferred_fk.is_empty()
+                            && batch_rows_since_commit >= COPY_STDIN_COMMIT_SIZE
+                        {
+                            session.commit().await.map_err(|e| {
+                                user_error(
+                                    "XX000",
+                                    format!("COPY transaction rotation commit failed: {}", e),
+                                )
+                            })?;
+                            session.begin().await.map_err(|e| {
+                                user_error(
+                                    "XX000",
+                                    format!("COPY transaction rotation begin failed: {}", e),
+                                )
+                            })?;
+                            batch_rows_since_commit = 0;
+                            tracing::info!(
+                                "COPY FROM STDIN: {} rows committed (rotation)",
+                                offset + chunk_len,
+                            );
+                        }
+
+                        Ok::<(), PgWireError>(())
+                    })
+                    .await?;
+
+                    Ok(())
+                })
+                .await;
+
+            if let Err(e) = insert_res {
+                let mut session = self.auth().session.lock().await;
+                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                drop(session);
+
+                let mut ctx_guard = self.copy_context.lock().await;
+                *ctx_guard = None;
+                return Err(e);
             }
 
-            if let Err(e) = session.check_idle_in_transaction_timeout() {
-                let _ = session.rollback().await;
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "FATAL".to_string(),
-                    e.sqlstate().to_string(),
-                    e.to_string(),
-                ))));
-            }
-
-            if session.is_transaction_failed() {
-                return Err(in_failed_sql_transaction_pgwire_error());
-            }
-
-            let savepoints = session.savepoints();
-            crate::txn::with_savepoints(savepoints, async {
-                executor
-                    .execute_copy_insert_batch(
-                        &mut session,
-                        &table_name,
-                        rows_to_insert,
-                        Some(&mut accumulated_fk_keys),
-                        Some(&mut accumulated_deferred_fk),
-                    )
-                    .await
-                    .map_err(|batch_err| {
-                        let line_no = batch_err
-                            .failed_row_offset()
-                            .and_then(|offset| line_numbers.get(offset).copied());
-                        let err = batch_err.source_error();
-                        error!("COPY insert error: {}", err);
-                        let table = copy_display_table_name(&table_name);
-                        let message = if should_add_copy_insert_context(err) {
-                            if let Some(line_no) = line_no {
-                                format!("{}\nCONTEXT:  COPY {}, line {}", err, table, line_no)
-                            } else {
-                                err.to_string()
-                            }
-                        } else {
-                            err.to_string()
-                        };
-                        user_error(sqlstate_for_executor_error(err), message)
-                    })?;
-
-                Ok::<(), PgWireError>(())
-            })
-            .await?;
-
-            Ok(())
-        })
-        .await;
-
-        if let Err(e) = insert_res {
-            let mut session = self.auth().session.lock().await;
-            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-            drop(session);
-
-            let mut ctx_guard = self.copy_context.lock().await;
-            *ctx_guard = None;
-            return Err(e);
+            offset = end;
         }
 
         let mut ctx_guard = self.copy_context.lock().await;
         if let Some(ctx) = ctx_guard.as_mut() {
-            ctx.row_count = ctx.row_count.saturating_add(inserted_count);
+            ctx.row_count = ctx.row_count.saturating_add(total_rows);
+            ctx.batch_rows_since_commit = batch_rows_since_commit;
             ctx.pending_self_fk_keys = accumulated_fk_keys;
             ctx.deferred_self_fk_checks = accumulated_deferred_fk;
         }
