@@ -974,7 +974,7 @@ impl Drop for Session {
         // from the GC registry even if commit/rollback was never called
         // (e.g., connection dropped, panic).
         if let Some(ref registry) = self.active_txn_registry {
-            registry.unregister(self.connection_id);
+            registry.unregister_connection(self.connection_id);
         }
     }
 }

@@ -33,7 +33,7 @@ use crate::sql::types::cast::CastContext;
 use crate::sql::types::coercion::is_assignment_compatible;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{DataType as SqlDataType, Expr, ObjectName};
-use tikv_client::Transaction;
+use tikv_client::{TimestampExt, Transaction};
 
 use super::names;
 use super::names::normalize_ident;
@@ -920,6 +920,7 @@ pub(super) async fn delete_range(
 pub(super) async fn maybe_rotate_backfill_txn(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    txn_guard: &mut Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
     current_batch_writes: &mut usize,
     has_committed_batches: &mut bool,
 ) -> Result<()> {
@@ -928,10 +929,19 @@ pub(super) async fn maybe_rotate_backfill_txn(
     }
 
     txn.commit().await?;
+    *txn_guard = None;
     *txn = store.begin().await?;
+    *txn_guard = track_active_worker_txn(txn);
     *current_batch_writes = 0;
     *has_committed_batches = true;
     Ok(())
+}
+
+pub(super) fn track_active_worker_txn(
+    txn: &Transaction,
+) -> Option<crate::worker::active_txn_registry::ActiveTxnGuard> {
+    crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()))
 }
 
 pub(super) fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Value> {

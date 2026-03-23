@@ -107,7 +107,7 @@ impl Drop for DynamicPgHandler {
         // This is the primary cleanup point for connection disconnect — Session::Drop
         // is the safety net (may be delayed if the watchdog task holds an Arc).
         if let Some(registry) = crate::worker::active_txn_registry::global_registry() {
-            registry.unregister(self.connection_id);
+            registry.unregister_connection(self.connection_id);
         }
     }
 }

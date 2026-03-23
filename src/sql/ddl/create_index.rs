@@ -31,7 +31,7 @@ use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DD
 use super::create_table::{check_relation_name_available, RelationKind};
 use super::{
     analyze_row_level_expr, delete_range, index_prefix_range, maybe_rotate_backfill_txn,
-    KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    track_active_worker_txn, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +392,7 @@ pub async fn execute_create_index(
 
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
+    let mut txn_guard = None;
 
     let create_result: Result<()> = async {
         if new_index.is_hnsw() {
@@ -657,6 +658,7 @@ pub async fn execute_create_index(
                             maybe_rotate_backfill_txn(
                                 store,
                                 txn,
+                                &mut txn_guard,
                                 &mut current_batch_writes,
                                 &mut has_committed_batches,
                             )
@@ -687,6 +689,7 @@ pub async fn execute_create_index(
                         maybe_rotate_backfill_txn(
                             store,
                             txn,
+                            &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
                         )
@@ -736,6 +739,7 @@ pub async fn execute_create_index(
                         maybe_rotate_backfill_txn(
                             store,
                             txn,
+                            &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
                         )
@@ -763,6 +767,7 @@ pub async fn execute_create_index(
                     maybe_rotate_backfill_txn(
                         store,
                         txn,
+                        &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
                     )
@@ -981,6 +986,7 @@ pub async fn backfill_index_by_name(
     set_state_on_commit: Option<IndexState>,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
+    let mut txn_guard = track_active_worker_txn(&txn);
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
 
@@ -1064,6 +1070,7 @@ pub async fn backfill_index_by_name(
                     maybe_rotate_backfill_txn(
                         store,
                         &mut txn,
+                        &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
                     )
@@ -1111,6 +1118,7 @@ pub async fn backfill_index_by_name(
                     maybe_rotate_backfill_txn(
                         store,
                         &mut txn,
+                        &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
                     )
@@ -1215,6 +1223,7 @@ async fn reconcile_index_pass(
     set_state_on_commit: Option<IndexState>,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
+    let mut txn_guard = track_active_worker_txn(&txn);
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
 
@@ -1329,6 +1338,7 @@ async fn reconcile_index_pass(
                         maybe_rotate_backfill_txn(
                             store,
                             &mut txn,
+                            &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
                         )

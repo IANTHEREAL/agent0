@@ -1,6 +1,7 @@
 use crate::cron::config::CronConfig;
 use crate::cron::worker::gc_database;
 use crate::pool::TikvClientPool;
+use crate::storage::worker::GcInstanceState;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
@@ -147,24 +148,13 @@ async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> 
     let local_min =
         crate::worker::active_txn_registry::global_registry().and_then(|r| r.min_start_ts());
 
-    // Publish this instance's max untracked transaction timeout so advancers
-    // on other nodes can use it as a gc_life_time floor.
-    let max_untracked_timeout_sec = if config.enabled {
-        let cron_sec = config.cron_job_timeout_ms.saturating_add(999) / 1000;
-        let stmt_sec = config.statement_timeout_ms.saturating_add(999) / 1000;
-        cron_sec.max(stmt_sec)
-    } else {
-        0 // Non-worker nodes have no untracked transactions
-    };
-
     let mut txn = store.begin().await?;
     store
         .put_gc_instance_state(
             &mut txn,
-            &config.worker_id,
+            &config.gc_instance_id,
             local_min,
             current_ts.version(),
-            max_untracked_timeout_sec,
         )
         .await?;
     txn.commit().await?;
@@ -188,9 +178,7 @@ async fn advance_gc_safepoint(
     let current_version = current_ts.version();
 
     // Read ALL instances' states from shared registry.
-    let mut global_max_timeout_sec = 0u64;
-    let stale_threshold_version =
-        compute_safepoint_version(current_version, config.gc_life_time_sec);
+    let time_based_safepoint = compute_safepoint_version(current_version, config.gc_life_time_sec);
 
     let all_states = {
         let mut txn = store.begin().await?;
@@ -199,30 +187,11 @@ async fn advance_gc_safepoint(
         states
     };
 
-    // First pass: compute effective gc_life_time from cluster-wide max timeout.
+    let safepoint_version =
+        compute_cluster_gc_safepoint(current_version, config.gc_life_time_sec, &all_states);
+
     for state in &all_states {
-        if state.updated_at_version >= stale_threshold_version {
-            global_max_timeout_sec = global_max_timeout_sec.max(state.max_untracked_timeout_sec);
-        }
-    }
-
-    // Effective gc_life_time: at least cover the longest untracked transaction
-    // timeout across ALL live instances in the cluster.
-    let effective_life_time_sec = config.gc_life_time_sec.max(global_max_timeout_sec);
-    let mut safepoint_version = compute_safepoint_version(current_version, effective_life_time_sec);
-
-    if effective_life_time_sec > config.gc_life_time_sec {
-        info!(
-            local_life_time = config.gc_life_time_sec,
-            cluster_max_timeout = global_max_timeout_sec,
-            effective_life_time = effective_life_time_sec,
-            "GC life_time raised to cover cluster-wide untracked transaction timeout"
-        );
-    }
-
-    // Second pass: clamp safepoint to protect active tracked transactions.
-    for state in &all_states {
-        if state.updated_at_version < stale_threshold_version {
+        if !is_live_gc_instance_state(current_version, config.gc_life_time_sec, state) {
             debug!(
                 instance_id = state.instance_id,
                 updated_at = state.updated_at_version,
@@ -232,15 +201,14 @@ async fn advance_gc_safepoint(
         }
         if let Some(ts) = state.min_start_ts {
             let txn_floor = ts.saturating_sub(1);
-            if txn_floor < safepoint_version {
+            if txn_floor == safepoint_version && txn_floor < time_based_safepoint {
                 info!(
                     instance_id = state.instance_id,
                     min_active_start_ts = ts,
-                    time_based = safepoint_version,
+                    time_based = time_based_safepoint,
                     clamped_to = txn_floor,
                     "GC safepoint clamped by active transaction on instance"
                 );
-                safepoint_version = txn_floor;
             }
         }
     }
@@ -499,6 +467,31 @@ pub(crate) fn compute_safepoint_version(current_version: u64, life_time_sec: u64
     current_version.saturating_sub(life_time_ms << 18)
 }
 
+pub(crate) fn is_live_gc_instance_state(
+    current_version: u64,
+    life_time_sec: u64,
+    state: &GcInstanceState,
+) -> bool {
+    state.updated_at_version >= compute_safepoint_version(current_version, life_time_sec)
+}
+
+pub(crate) fn compute_cluster_gc_safepoint(
+    current_version: u64,
+    life_time_sec: u64,
+    states: &[GcInstanceState],
+) -> u64 {
+    let mut safepoint = compute_safepoint_version(current_version, life_time_sec);
+    for state in states {
+        if !is_live_gc_instance_state(current_version, life_time_sec, state) {
+            continue;
+        }
+        if let Some(ts) = state.min_start_ts {
+            safepoint = safepoint.min(ts.saturating_sub(1));
+        }
+    }
+    safepoint
+}
+
 /// Generate random jitter in seconds (0..max_secs) using time-based seed.
 fn rand_jitter_secs(max_secs: u64) -> u64 {
     use std::time::SystemTime;
@@ -567,6 +560,50 @@ mod tests {
         // The subtraction is on the whole version, so logical bits are preserved
         let expected = current_version - ((life_time_sec * 1000) << 18);
         assert_eq!(sp, expected);
+    }
+
+    #[test]
+    fn cluster_safepoint_ignores_stale_instances() {
+        let current_version = 10_000_000u64 << 18;
+        let life_time_sec = 600;
+        let time_based = compute_safepoint_version(current_version, life_time_sec);
+        let stale_version = time_based.saturating_sub(1);
+
+        let states = vec![GcInstanceState {
+            instance_id: "stale".to_string(),
+            min_start_ts: Some(time_based.saturating_sub(10_000)),
+            updated_at_version: stale_version,
+        }];
+
+        assert_eq!(
+            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            time_based
+        );
+    }
+
+    #[test]
+    fn cluster_safepoint_clamps_to_oldest_live_transaction() {
+        let current_version = 10_000_000u64 << 18;
+        let life_time_sec = 600;
+        let live_updated_at = current_version;
+
+        let states = vec![
+            GcInstanceState {
+                instance_id: "a".to_string(),
+                min_start_ts: Some((9_500_000u64 << 18) + 7),
+                updated_at_version: live_updated_at,
+            },
+            GcInstanceState {
+                instance_id: "b".to_string(),
+                min_start_ts: Some((9_300_000u64 << 18) + 9),
+                updated_at_version: live_updated_at,
+            },
+        ];
+
+        assert_eq!(
+            compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
+            ((9_300_000u64 << 18) + 9).saturating_sub(1)
+        );
     }
 
     #[test]

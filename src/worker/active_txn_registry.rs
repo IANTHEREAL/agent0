@@ -8,6 +8,7 @@
 //! coordination is handled by `GcRegistryPublisher` + `GcSafepointAdvancer`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static GLOBAL_REGISTRY: OnceLock<Arc<ActiveTxnRegistry>> = OnceLock::new();
@@ -22,39 +23,79 @@ pub fn global_registry() -> Option<&'static Arc<ActiveTxnRegistry>> {
     GLOBAL_REGISTRY.get()
 }
 
-/// Tracks active transaction `start_ts` values by connection ID.
-///
-/// Registered in `Session::begin()`, unregistered on successful
-/// `commit()`/`rollback()`. `DynamicPgHandler::Drop` provides a safety-net
-/// unregister for disconnected sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ActiveTxnKey {
+    Connection(i64),
+    Worker(u64),
+}
+
+/// RAII guard for a worker/background TiKV transaction published in the
+/// process-local GC registry.
+pub struct ActiveTxnGuard {
+    registry: Arc<ActiveTxnRegistry>,
+    handle_id: u64,
+}
+
+impl Drop for ActiveTxnGuard {
+    fn drop(&mut self) {
+        self.registry.unregister_worker(self.handle_id);
+    }
+}
+
+/// Tracks active transaction `start_ts` values across interactive SQL sessions
+/// and worker/background TiKV transactions.
 pub struct ActiveTxnRegistry {
-    /// connection_id → start_ts (TiKV TSO version)
-    inner: Mutex<HashMap<i64, u64>>,
+    /// tracker key -> start_ts (TiKV TSO version)
+    inner: Mutex<HashMap<ActiveTxnKey, u64>>,
+    next_worker_handle: AtomicU64,
 }
 
 impl ActiveTxnRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            next_worker_handle: AtomicU64::new(1),
         }
     }
 
-    /// Register an active transaction's start_ts.
+    /// Register an interactive session transaction's start_ts.
     #[inline]
-    pub fn register(&self, connection_id: i64, start_ts_version: u64) {
+    pub fn register_connection(&self, connection_id: i64, start_ts_version: u64) {
         self.inner
             .lock()
             .expect("ActiveTxnRegistry poisoned")
-            .insert(connection_id, start_ts_version);
+            .insert(ActiveTxnKey::Connection(connection_id), start_ts_version);
     }
 
-    /// Unregister a connection's active transaction. Idempotent.
+    /// Unregister an interactive session transaction. Idempotent.
     #[inline]
-    pub fn unregister(&self, connection_id: i64) {
+    pub fn unregister_connection(&self, connection_id: i64) {
         self.inner
             .lock()
             .expect("ActiveTxnRegistry poisoned")
-            .remove(&connection_id);
+            .remove(&ActiveTxnKey::Connection(connection_id));
+    }
+
+    /// Register a worker/background transaction and return a guard that
+    /// unregisters it when dropped.
+    pub fn track_worker_txn(self: &Arc<Self>, start_ts_version: u64) -> ActiveTxnGuard {
+        let handle_id = self.next_worker_handle.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .lock()
+            .expect("ActiveTxnRegistry poisoned")
+            .insert(ActiveTxnKey::Worker(handle_id), start_ts_version);
+        ActiveTxnGuard {
+            registry: Arc::clone(self),
+            handle_id,
+        }
+    }
+
+    #[inline]
+    fn unregister_worker(&self, handle_id: u64) {
+        self.inner
+            .lock()
+            .expect("ActiveTxnRegistry poisoned")
+            .remove(&ActiveTxnKey::Worker(handle_id));
     }
 
     /// Minimum start_ts across all active transactions, or None if empty.
@@ -88,9 +129,9 @@ mod tests {
     #[test]
     fn register_and_min() {
         let r = ActiveTxnRegistry::new();
-        r.register(1, 100);
-        r.register(2, 50);
-        r.register(3, 200);
+        r.register_connection(1, 100);
+        r.register_connection(2, 50);
+        r.register_connection(3, 200);
         assert_eq!(r.min_start_ts(), Some(50));
         assert_eq!(r.len(), 3);
     }
@@ -98,25 +139,25 @@ mod tests {
     #[test]
     fn unregister_updates_min() {
         let r = ActiveTxnRegistry::new();
-        r.register(1, 100);
-        r.register(2, 50);
-        r.unregister(2);
+        r.register_connection(1, 100);
+        r.register_connection(2, 50);
+        r.unregister_connection(2);
         assert_eq!(r.min_start_ts(), Some(100));
     }
 
     #[test]
     fn unregister_all_returns_none() {
         let r = ActiveTxnRegistry::new();
-        r.register(1, 100);
-        r.unregister(1);
+        r.register_connection(1, 100);
+        r.unregister_connection(1);
         assert_eq!(r.min_start_ts(), None);
     }
 
     #[test]
     fn duplicate_register_overwrites() {
         let r = ActiveTxnRegistry::new();
-        r.register(1, 100);
-        r.register(1, 200);
+        r.register_connection(1, 100);
+        r.register_connection(1, 200);
         assert_eq!(r.min_start_ts(), Some(200));
         assert_eq!(r.len(), 1);
     }
@@ -124,7 +165,28 @@ mod tests {
     #[test]
     fn unregister_nonexistent_is_noop() {
         let r = ActiveTxnRegistry::new();
-        r.unregister(999);
+        r.unregister_connection(999);
         assert_eq!(r.min_start_ts(), None);
+    }
+
+    #[test]
+    fn worker_guard_unregisters_on_drop() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        {
+            let _guard = r.track_worker_txn(123);
+            assert_eq!(r.min_start_ts(), Some(123));
+            assert_eq!(r.len(), 1);
+        }
+        assert_eq!(r.min_start_ts(), None);
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn connection_and_worker_transactions_share_same_min() {
+        let r = Arc::new(ActiveTxnRegistry::new());
+        r.register_connection(1, 200);
+        let _guard = r.track_worker_txn(150);
+        assert_eq!(r.min_start_ts(), Some(150));
+        assert_eq!(r.len(), 2);
     }
 }

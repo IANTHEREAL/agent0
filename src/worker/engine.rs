@@ -19,6 +19,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tikv_client::TimestampExt;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -871,7 +872,7 @@ impl WorkerEngine {
         }
 
         let is_cron = entry.task_type == TaskType::Cron;
-        let stmt_timeout = if !is_cron && config.statement_timeout_ms > 0 {
+        let task_timeout = if !is_cron && config.statement_timeout_ms > 0 {
             Some(std::time::Duration::from_millis(
                 config.statement_timeout_ms,
             ))
@@ -897,8 +898,10 @@ impl WorkerEngine {
         let tikv_client = store.transaction_client();
 
         let mut txn = store.begin().await?;
+        let _txn_guard = crate::worker::active_txn_registry::global_registry()
+            .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
         let mut sequence_values = crate::sql::sequences::SequenceSession::new();
-        let result = async {
+        let task_fut = async {
             let statements = parse_sql(&entry.command)?;
             for stmt in &statements {
                 let stmt_ts = now_epoch_ms();
@@ -936,14 +939,13 @@ impl WorkerEngine {
                         ),
                     ),
                 );
-
-                let res = run_with_guards(fut, stmt_timeout, cancel_signal.as_ref()).await;
-                let _ = res?;
+                let _ = fut.await?;
             }
             txn.commit().await?;
             Ok(statements.len())
-        }
-        .await;
+        };
+
+        let result = run_with_guards(task_fut, task_timeout, cancel_signal.as_ref()).await;
 
         match result {
             Ok(completed_commands) => Ok(completed_commands),
@@ -1374,6 +1376,8 @@ async fn execute_hnsw_merge(
 
     loop {
         let mut txn = store.begin().await?;
+        let _txn_guard = crate::worker::active_txn_registry::global_registry()
+            .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
         // 1. Read meta
         let meta_key = hnsw_meta_key(db_id, table_id, index_id);
@@ -1973,6 +1977,41 @@ mod tests {
             .await
             .expect("expected success");
         assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn execute_task_applies_timeout_to_whole_worker_transaction() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let execute_task_start = prod_source
+            .find("async fn execute_task(")
+            .expect("execute_task must exist");
+        let execute_bg_ddl_start = prod_source[execute_task_start..]
+            .find("async fn execute_bg_ddl_backfill(")
+            .map(|offset| execute_task_start + offset)
+            .expect("execute_bg_ddl_backfill must exist after execute_task");
+        let execute_task_source = &prod_source[execute_task_start..execute_bg_ddl_start];
+
+        assert!(
+            execute_task_source.contains("let task_timeout ="),
+            "execute_task must compute a task-scoped timeout"
+        );
+        assert!(
+            execute_task_source.contains("let _ = fut.await?;"),
+            "individual statements must execute without per-statement timeout wrapping"
+        );
+        assert!(
+            execute_task_source
+                .contains("run_with_guards(task_fut, task_timeout, cancel_signal.as_ref())"),
+            "execute_task must wrap the whole task future in run_with_guards"
+        );
+        assert!(
+            !execute_task_source.contains("run_with_guards(fut, stmt_timeout"),
+            "execute_task must not apply timeout per statement"
+        );
     }
 
     #[test]

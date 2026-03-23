@@ -265,8 +265,9 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     }
 
     // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
-    // the safepoint, another node in the cluster might. This node's worker
-    // timeouts (cron, statement) must be covered by gc_life_time.
+    // the safepoint, another node in the cluster might. This only checks
+    // structural GC invariants (for example interval < life_time); foreground
+    // and worker transactions are protected by direct registry tracking.
     worker_config.validate_gc_config();
 
     // ================================================================

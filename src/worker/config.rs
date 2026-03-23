@@ -22,11 +22,9 @@ const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 const DEFAULT_GC_SAFEPOINT_ENABLED: bool = true;
 const DEFAULT_GC_SAFEPOINT_INTERVAL_SEC: u64 = 300; // 5 minutes
 const MIN_GC_SAFEPOINT_INTERVAL_SEC: u64 = 30;
-// 24 hours — conservative default. Interactive SQL transactions are tracked
-// via ActiveTxnRegistry and protected regardless of this value. This window
-// covers untracked worker transactions (cron, BgSql) whose max duration is
-// bounded by cron_job_timeout (default 30 min) and statement_timeout (default
-// 5 min). Can be tightened to match max(cron_timeout, statement_timeout).
+// 24 hours — conservative default retention window for historical MVCC
+// versions. Active foreground and worker transactions are protected directly
+// via ActiveTxnRegistry; gc_life_time is not a timeout surrogate.
 const DEFAULT_GC_LIFE_TIME_SEC: u64 = 86400;
 const MIN_GC_LIFE_TIME_SEC: u64 = 600; // TiDB enforces minimum 10 minutes
 
@@ -36,6 +34,7 @@ pub struct WorkerConfig {
     pub poll_ms: u64,
     pub max_concurrent_jobs: usize,
     pub worker_id: String,
+    pub gc_instance_id: String,
     pub statement_timeout_ms: u64,
     pub cron_job_timeout_ms: u64,
     pub orphan_timeout_sec: u64,
@@ -58,12 +57,14 @@ impl Default for WorkerConfig {
         let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
         let pid = std::process::id();
         let worker_id = format!("{}:{}", hostname, pid);
+        let gc_instance_id = uuid::Uuid::new_v4().to_string();
 
         Self {
             enabled: true,
             poll_ms: DEFAULT_POLL_MS,
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
             worker_id,
+            gc_instance_id,
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
             cron_job_timeout_ms: DEFAULT_CRON_JOB_TIMEOUT_MS,
             orphan_timeout_sec: DEFAULT_ORPHAN_TIMEOUT_SEC,
@@ -130,18 +131,28 @@ impl WorkerConfig {
             cfg.worker_id = v;
         }
         if let Ok(v) = env::var("DB9_WORKER_STATEMENT_TIMEOUT_MS") {
-            cfg.statement_timeout_ms = v
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .unwrap_or(cfg.statement_timeout_ms);
+            match v.parse::<u64>() {
+                Ok(parsed) => cfg.statement_timeout_ms = parsed,
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_STATEMENT_TIMEOUT_MS='{}' is not a valid integer; using default {}ms",
+                        v,
+                        cfg.statement_timeout_ms
+                    );
+                }
+            }
         }
         if let Ok(v) = env::var("DB9_CRON_JOB_TIMEOUT_MS") {
-            cfg.cron_job_timeout_ms = v
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .unwrap_or(cfg.cron_job_timeout_ms);
+            match v.parse::<u64>() {
+                Ok(parsed) => cfg.cron_job_timeout_ms = parsed,
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_CRON_JOB_TIMEOUT_MS='{}' is not a valid integer; using default {}ms",
+                        v,
+                        cfg.cron_job_timeout_ms
+                    );
+                }
+            }
         }
         if let Ok(v) = env::var("DB9_WORKER_ORPHAN_TIMEOUT_SEC") {
             cfg.orphan_timeout_sec = v
@@ -291,62 +302,7 @@ impl WorkerConfig {
     }
 
     /// Validate GC configuration invariants.
-    ///
-    /// **Key insight**: BgDdl and HnswMerge bypass statement_timeout but do NOT
-    /// hold long-lived TiKV transactions. BgDdl rotates transactions every
-    /// `DDL_BACKFILL_COMMIT_SIZE` (5000) writes. HnswMerge begins a new
-    /// transaction per merge batch. Each sub-transaction lasts seconds, not hours.
-    /// Therefore gc_life_time only needs to cover the longest **single transaction**,
-    /// not the total task duration. cron_job_timeout (default 30 min) remains the
-    /// binding constraint.
     pub fn validate_gc_config(&self) {
-        // Worker timeout checks: only when this node runs worker tasks.
-        if self.enabled {
-            if self.cron_job_timeout_ms == 0 {
-                // Cron transactions are NOT tracked in the active txn registry
-                // (they use store.begin() directly, not Session). Without a finite
-                // timeout, gc_life_time cannot cover them, and an advancer (on this
-                // or any other node) may push safepoint past a running cron job.
-                panic!(
-                    "UNSAFE CONFIG: DB9_CRON_JOB_TIMEOUT_MS=0 (no timeout) while worker \
-                     is enabled. Cron job transactions are not tracked in the GC registry \
-                     and require a finite timeout for GC safety. \
-                     Set DB9_CRON_JOB_TIMEOUT_MS > 0.",
-                );
-            } else {
-                let cron_timeout_sec = self.cron_job_timeout_ms.saturating_add(999) / 1000;
-                if self.gc_life_time_sec < cron_timeout_sec {
-                    panic!(
-                        "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < cron_job_timeout ({}s). \
-                         GC could reclaim data needed by running cron jobs. \
-                         Either increase DB9_GC_LIFE_TIME_SEC or decrease DB9_CRON_JOB_TIMEOUT_MS.",
-                        self.gc_life_time_sec, cron_timeout_sec,
-                    );
-                }
-            }
-
-            if self.statement_timeout_ms == 0 {
-                panic!(
-                    "UNSAFE CONFIG: DB9_WORKER_STATEMENT_TIMEOUT_MS=0 (no timeout) while \
-                     worker is enabled. Worker task transactions (BgSql, AutoAnalyze) are \
-                     not tracked in the GC registry and require a finite timeout for GC safety. \
-                     Set DB9_WORKER_STATEMENT_TIMEOUT_MS > 0.",
-                );
-            } else {
-                let stmt_timeout_sec = self.statement_timeout_ms.saturating_add(999) / 1000;
-                if self.gc_life_time_sec < stmt_timeout_sec {
-                    panic!(
-                        "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < statement_timeout ({}s). \
-                         Worker tasks (BgSql, AutoAnalyze) use statement_timeout and open \
-                         TiKV transactions directly without session registry tracking. \
-                         Either increase DB9_GC_LIFE_TIME_SEC or decrease DB9_WORKER_STATEMENT_TIMEOUT_MS.",
-                        self.gc_life_time_sec, stmt_timeout_sec,
-                    );
-                }
-            }
-        }
-
-        // Advancer interval check.
         if self.gc_safepoint_enabled && self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
             panic!(
                 "UNSAFE CONFIG: DB9_GC_SAFEPOINT_INTERVAL_SEC ({}) >= DB9_GC_LIFE_TIME_SEC ({}). \
@@ -530,6 +486,7 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.poll_ms, 60_000);
         assert_eq!(cfg.max_concurrent_jobs, 32);
+        assert!(uuid::Uuid::parse_str(&cfg.gc_instance_id).is_ok());
         assert_eq!(cfg.statement_timeout_ms, 300_000);
         assert_eq!(cfg.cron_job_timeout_ms, 1_800_000);
         assert_eq!(cfg.orphan_timeout_sec, 300);
@@ -673,6 +630,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_env_preserves_zero_worker_timeouts() {
+        let _guard = test_lock().lock().unwrap();
+
+        let stmt_key = "DB9_WORKER_STATEMENT_TIMEOUT_MS";
+        let cron_key = "DB9_CRON_JOB_TIMEOUT_MS";
+        let stmt_saved = env::var(stmt_key).ok();
+        let cron_saved = env::var(cron_key).ok();
+
+        unsafe {
+            env::set_var(stmt_key, "0");
+            env::set_var(cron_key, "0");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.statement_timeout_ms, 0);
+        assert_eq!(cfg.cron_job_timeout_ms, 0);
+
+        match stmt_saved {
+            Some(v) => unsafe { env::set_var(stmt_key, v) },
+            None => unsafe { env::remove_var(stmt_key) },
+        }
+        match cron_saved {
+            Some(v) => unsafe { env::set_var(cron_key, v) },
+            None => unsafe { env::remove_var(cron_key) },
+        }
+    }
+
     // --- GC safepoint config validation tests ---
 
     #[test]
@@ -682,33 +667,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "UNSAFE CONFIG")]
-    fn gc_config_rejects_life_time_below_cron_timeout() {
-        let cfg = WorkerConfig {
-            gc_safepoint_enabled: true,
-            gc_life_time_sec: 600,          // 10 min
-            cron_job_timeout_ms: 1_800_000, // 30 min — exceeds gc_life_time
-            ..Default::default()
-        };
-        cfg.validate_gc_config();
-    }
-
-    #[test]
-    #[should_panic(expected = "UNSAFE CONFIG")]
-    fn gc_config_rejects_cron_timeout_zero() {
+    fn gc_config_allows_zero_worker_timeouts_when_transactions_are_tracked() {
         let cfg = WorkerConfig {
             enabled: true,
             cron_job_timeout_ms: 0,
-            ..Default::default()
-        };
-        cfg.validate_gc_config();
-    }
-
-    #[test]
-    #[should_panic(expected = "UNSAFE CONFIG")]
-    fn gc_config_rejects_statement_timeout_zero() {
-        let cfg = WorkerConfig {
-            enabled: true,
             statement_timeout_ms: 0,
             ..Default::default()
         };
@@ -729,9 +691,6 @@ mod tests {
 
     #[test]
     fn gc_config_advancer_only_node_passes_with_short_life_time() {
-        // Advancer-only nodes (no worker) don't need 24h minimum.
-        // BgDdl/HnswMerge rotate transactions per batch — each sub-txn
-        // is seconds, not hours. gc_life_time only covers single-txn duration.
         let cfg = WorkerConfig {
             enabled: false,
             gc_safepoint_enabled: true,
