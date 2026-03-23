@@ -103,12 +103,12 @@ impl Drop for DynamicPgHandler {
         self.cancel_token.cancel(); // stop idle-in-transaction watchdog
         crate::sql::advisory_locks::global_lock_manager()
             .release_all_for_connection(self.connection_id);
-        // Unregister from GC active transaction registry before Session drops.
-        // This is the primary cleanup point for connection disconnect — Session::Drop
-        // is the safety net (may be delayed if the watchdog task holds an Arc).
-        if let Some(registry) = crate::worker::active_txn_registry::global_registry() {
-            registry.unregister_connection(self.connection_id);
-        }
+        // Do NOT unregister the GC active transaction registry here.
+        // The Session (which owns the TiKV Transaction) is held behind an Arc
+        // and may outlive the handler briefly via the watchdog task. Early
+        // unregister would remove GC protection before the transaction itself
+        // is dropped or rolled back. commit/rollback and Session::Drop are the
+        // authoritative cleanup points.
     }
 }
 
@@ -165,5 +165,27 @@ impl PgWireServerHandlers for DynamicHandlerFactory {
 
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {
         Arc::new(NoopErrorHandler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dynamic_handler_drop_does_not_unregister_gc_registry_early() {
+        let source = include_str!("mod.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dynamic/mod.rs must contain #[cfg(test)]");
+        let drop_impl = prod_source
+            .split("impl Drop for DynamicPgHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct DynamicHandlerFactory").next())
+            .expect("dynamic/mod.rs must define DynamicPgHandler::drop");
+
+        assert!(
+            !drop_impl.contains("unregister_connection(self.connection_id)"),
+            "DynamicPgHandler::drop must not unregister the GC registry before Session drops"
+        );
     }
 }

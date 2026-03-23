@@ -978,3 +978,24 @@ impl Drop for Session {
         }
     }
 }
+
+#[cfg(test)]
+mod drop_contract_tests {
+    #[test]
+    fn session_drop_remains_gc_registry_cleanup_point() {
+        let source = include_str!("mod.rs");
+        let prod_source = source
+            .split("#[cfg(test)] mod drop_contract_tests")
+            .next()
+            .expect("session/mod.rs must contain drop_contract_tests");
+        let drop_impl = prod_source
+            .split("impl Drop for Session")
+            .nth(1)
+            .expect("session/mod.rs must define Session::drop");
+
+        assert!(
+            drop_impl.contains("unregister_connection(self.connection_id)"),
+            "Session::drop must unregister the GC registry as the final connection cleanup point"
+        );
+    }
+}
