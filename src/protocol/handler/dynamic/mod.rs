@@ -32,7 +32,9 @@ use pgwire::tokio::CancellationToken;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, OnceCell};
+use tokio::task::JoinHandle;
 
 use crate::observability;
 use crate::pool::TenantHandle;
@@ -58,6 +60,7 @@ pub struct DynamicPgHandler {
     pub(super) connection_id: i64,
     pub(super) server_config: SharedServerConfig,
     pub(super) cancel_token: CancellationToken,
+    pub(super) idle_watchdog_handle: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl DynamicPgHandler {
@@ -80,6 +83,7 @@ impl DynamicPgHandler {
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             server_config,
             cancel_token,
+            idle_watchdog_handle: StdMutex::new(None),
         }
     }
 
@@ -101,14 +105,22 @@ impl DynamicPgHandler {
 impl Drop for DynamicPgHandler {
     fn drop(&mut self) {
         self.cancel_token.cancel(); // stop idle-in-transaction watchdog
+        if let Some(watchdog) = self
+            .idle_watchdog_handle
+            .lock()
+            .expect("idle_watchdog_handle poisoned")
+            .take()
+        {
+            watchdog.abort();
+        }
         crate::sql::advisory_locks::global_lock_manager()
             .release_all_for_connection(self.connection_id);
-        // Unregister from GC active transaction registry before Session drops.
-        // This is the primary cleanup point for connection disconnect — Session::Drop
-        // is the safety net (may be delayed if the watchdog task holds an Arc).
-        if let Some(registry) = crate::worker::active_txn_registry::global_registry() {
-            registry.unregister(self.connection_id);
-        }
+        // Do NOT unregister the GC active transaction registry here.
+        // The Session (which owns the TiKV Transaction) is held behind an Arc
+        // and may outlive the handler briefly via the watchdog task. Early
+        // unregister would remove GC protection before the transaction itself
+        // is dropped or rolled back. commit/rollback and Session::Drop are the
+        // authoritative cleanup points.
     }
 }
 
@@ -165,5 +177,50 @@ impl PgWireServerHandlers for DynamicHandlerFactory {
 
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {
         Arc::new(NoopErrorHandler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dynamic_handler_drop_does_not_unregister_gc_registry_early() {
+        let source = include_str!("mod.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dynamic/mod.rs must contain #[cfg(test)]");
+        let drop_impl = prod_source
+            .split("impl Drop for DynamicPgHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct DynamicHandlerFactory").next())
+            .expect("dynamic/mod.rs must define DynamicPgHandler::drop");
+
+        assert!(
+            !drop_impl.contains("unregister_connection(self.connection_id)"),
+            "DynamicPgHandler::drop must not unregister the GC registry before Session drops"
+        );
+    }
+
+    #[test]
+    fn dynamic_handler_drop_aborts_idle_watchdog() {
+        let source = include_str!("mod.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dynamic/mod.rs must contain #[cfg(test)]");
+        let drop_impl = prod_source
+            .split("impl Drop for DynamicPgHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct DynamicHandlerFactory").next())
+            .expect("dynamic/mod.rs must define DynamicPgHandler::drop");
+
+        assert!(
+            drop_impl.contains("idle_watchdog_handle"),
+            "DynamicPgHandler::drop must own the idle watchdog handle"
+        );
+        assert!(
+            drop_impl.contains("watchdog.abort()"),
+            "DynamicPgHandler::drop must abort the idle watchdog so Session cleanup cannot outlive the connection task"
+        );
     }
 }

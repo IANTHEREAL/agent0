@@ -54,11 +54,13 @@ PD_ENDPOINTS=127.0.0.1:2379 cargo run
 psql -h 127.0.0.1 -p 5433 -U admin
 ```
 
-To disable the worker on a specific instance (SQL-only mode):
+To disable background task execution on a specific instance:
 
 ```bash
 DB9_WORKER_ENABLED=false PD_ENDPOINTS=127.0.0.1:2379 cargo run
 ```
+
+This disables cron / async-trigger / background-task execution on that node, but a SQL-serving db9 process still participates in GC safepoint coordination by publishing transaction liveness to the shared GC registry.
 
 ---
 
@@ -232,16 +234,20 @@ All settings are controlled via environment variables. Every setting has a sensi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB9_WORKER_ENABLED` | `true` | Enable the worker engine. Set to `false` for SQL-only instances. |
-| `DB9_WORKER_POLL_MS` | `60000` | Queue poll interval in milliseconds (minimum 60000). |
+| `DB9_WORKER_ENABLED` | `true` | Enable background task execution on this instance. `false` does not disable GC registry participation for a SQL-serving node. |
+| `DB9_WORKER_POLL_MS` | `60000` | Queue poll interval in milliseconds (minimum 100). |
 | `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max tasks executing concurrently per instance. |
-| `DB9_WORKER_ID` | `{hostname}:{pid}` | Unique identifier for this worker instance. Auto-generated if not set. |
-| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Per-task execution timeout (5 minutes). |
+| `DB9_WORKER_ID` | `{hostname}:{pid}` | Worker claim/logging identifier. Auto-generated if not set. It is not the GC registry identity. |
+| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Whole-task timeout for non-cron worker SQL (5 minutes). `0` disables the timeout. |
+| `DB9_CRON_JOB_TIMEOUT_MS` | `1800000` | Whole-job timeout for cron execution (30 minutes). `0` disables the timeout. |
 | `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Seconds before an uncompleted claim is considered orphaned (5 minutes). |
 | `DB9_WORKER_GC_BATCH_SIZE` | `100` | Number of keyspaces processed per GC cycle. |
 | `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | TiKV keyspace for global worker state (rarely needs changing). |
 | `DB9_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE on modified tables. |
 | `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | Base threshold for auto-ANALYZE (formula: threshold + 0.1 × row_count). |
+| `DB9_GC_SAFEPOINT_ENABLED` | `true` | Enable PD GC safepoint advancement. |
+| `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | GC safepoint publish/advance interval (5 minutes). Must stay below `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node, even if local safepoint advancement is disabled. |
+| `DB9_GC_LIFE_TIME_SEC` | `86400` | Time-based MVCC retention window (24 hours). Active transactions are protected by direct registry tracking; GC registry heartbeats older than this window are treated as stale and reaped. |
 
 ### Deployment Scenarios
 
@@ -261,7 +267,7 @@ PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 DB9_WORKER_ID=worker-1 cargo run
 # Instance 2: SQL + Worker
 PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 DB9_WORKER_ID=worker-2 cargo run
 
-# Instance 3: SQL only (no background task execution)
+# Instance 3: no background task execution on this node
 PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 DB9_WORKER_ENABLED=false cargo run
 ```
 
@@ -318,6 +324,19 @@ The worker GC runs automatically on every instance with the worker enabled:
 - **Interval**: Every 10 minutes (with random jitter to avoid thundering herd)
 - **Orphan cleanup**: Deletes claims older than `orphan_timeout_sec`. This handles worker crashes — if a worker claims a task but crashes before completing, the claim is cleaned up and the task will be picked up on its next fire time.
 - **No manual intervention needed**
+
+## GC Safepoint Coordination
+
+Every SQL-serving db9 process publishes a heartbeat plus the minimum start timestamp of its currently active transactions to the shared worker system keyspace. The safepoint advancer then computes:
+
+`min(time_based_gc_life_time, oldest_live_transaction_start_ts - 1)`
+
+This means GC safety is based on real transaction liveness, not on worker timeout guesses. `DB9_WORKER_STATEMENT_TIMEOUT_MS` and `DB9_CRON_JOB_TIMEOUT_MS` still limit task runtime, but they are no longer inputs to safepoint calculation.
+
+Startup publishes the local GC registry row before the pgwire listener accepts traffic, so the process is visible to cluster GC coordination from its first served transaction. On graceful shutdown, db9 stops the local GC loops and removes its own row; if a process crashes instead, stale-row reaping handles cleanup.
+
+Heartbeat rows whose `updated_at_version` ages past `DB9_GC_LIFE_TIME_SEC` are treated as stale, ignored for safepoint calculation, and automatically reaped from `_sys_worker`.
+Because the publisher is unconditional, `DB9_GC_SAFEPOINT_INTERVAL_SEC` must remain smaller than `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node, not only on nodes that advance the safepoint.
 
 ---
 
@@ -379,7 +398,7 @@ Common causes:
 - SQL syntax error in the job command
 - Table or object doesn't exist
 - Permission denied
-- Statement timeout exceeded (`DB9_WORKER_STATEMENT_TIMEOUT_MS`)
+- Whole-task timeout exceeded (`DB9_WORKER_STATEMENT_TIMEOUT_MS`)
 
 ### Index stuck in "Building" state
 
@@ -404,7 +423,7 @@ CREATE INDEX CONCURRENTLY idx_name ON your_table (column);
 
 ### pg_background_launch returns error
 
-- `"worker engine not available"`: The worker is disabled on this instance (`DB9_WORKER_ENABLED=false`). Connect to an instance with the worker enabled, or enable it.
+- `"worker engine not available"`: Background task execution is disabled on this instance (`DB9_WORKER_ENABLED=false`). Connect to an instance with the worker enabled, or enable it.
 
 ---
 

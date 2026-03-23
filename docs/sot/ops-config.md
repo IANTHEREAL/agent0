@@ -110,12 +110,12 @@
 
 | Key | Default | Evidence | Notes |
 |---|---|---|---|
-| `DB9_WORKER_ENABLED` | `true` | `src/worker/config.rs` | Master switch for background worker engine. |
+| `DB9_WORKER_ENABLED` | `true` | `src/worker/config.rs` | Master switch for background task execution on this node; SQL-serving processes still publish GC registry state. |
 | `DB9_WORKER_POLL_MS` | `60000` | `src/worker/config.rs` | Minimum effective value is `100`. |
 | `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | `src/worker/config.rs` | Per-node worker concurrency cap. |
-| `DB9_WORKER_ID` | `<hostname>:<pid>` | `src/worker/config.rs` | Overrides the auto-derived worker ID. |
-| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | `src/worker/config.rs` | Statement timeout for worker-executed SQL. |
-| `DB9_CRON_JOB_TIMEOUT_MS` | `1800000` | `src/worker/config.rs` | Execution timeout for cron jobs. |
+| `DB9_WORKER_ID` | `<hostname>:<pid>` | `src/worker/config.rs` | Overrides the auto-derived worker claim/logging ID. This is not the GC registry identity. |
+| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | `src/worker/config.rs` | Whole-task timeout for non-cron worker SQL. `0` disables the timeout. |
+| `DB9_CRON_JOB_TIMEOUT_MS` | `1800000` | `src/worker/config.rs` | Whole-job timeout for cron execution. `0` disables the timeout. |
 | `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | `src/worker/config.rs` | Claim GC orphan timeout. |
 | `DB9_WORKER_GC_BATCH_SIZE` | `100` | `src/worker/config.rs` | Claim GC batch size. |
 | `DB9_AUTO_ANALYZE_ENABLED` | `true` | `src/worker/config.rs` | Enables worker-driven auto-analyze. |
@@ -123,6 +123,9 @@
 | `DB9_WORKER_GC_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`. |
 | `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Independent cadence for HNSW delta sweep/enqueue. |
 | `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | `src/worker/config.rs` | Keyspace holding background task metadata. |
+| `DB9_GC_SAFEPOINT_ENABLED` | `true` | `src/worker/config.rs`, `src/worker/gc.rs` | Enables PD safepoint advancement. |
+| `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`; must remain below `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node because GC registry heartbeats are unconditional. |
+| `DB9_GC_LIFE_TIME_SEC` | `86400` | `src/worker/config.rs`, `src/worker/gc.rs` | MVCC retention window for time-based safepoint calculation. Active transactions are protected by direct registry tracking, not by this timeout; GC registry heartbeats older than this window are ignored and reaped. |
 | `DB9_CRON_ENABLED` | `true` | `src/cron/config.rs` | Master switch for cron scheduling. |
 | `DB9_CRON_POLL_MS` | `60000` | `src/cron/config.rs` | Values below default are clamped up to `60000`. |
 | `DB9_CRON_MAX_RUNNING_JOBS` | `32` | `src/cron/config.rs` | Concurrent cron jobs per node. |
@@ -163,6 +166,9 @@
 
 ### Unsupported / Incidental Inputs
 - `HOSTNAME` is currently used only as a best-effort ingredient when auto-deriving the default worker ID. It is not treated as a supported configuration contract.
+
+### Notes
+- `DB9_WORKER_ENABLED=false` disables background task execution on that node, but SQL-serving processes still initialize the GC registry and publish transaction liveness for safepoint protection.
 
 ## Verification (Gates)
 Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).

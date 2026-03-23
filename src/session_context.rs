@@ -2,10 +2,41 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
+use anyhow::Result;
+use tikv_client::{TimestampExt, Transaction};
+
 use crate::sql::DEFAULT_MAX_SORT_BYTES;
+use crate::storage::TikvStore;
 
 /// Extension transaction delta snapshot: (created_set, dropped_set).
 pub type ExtensionTxnDelta = (HashSet<String>, HashSet<String>);
+
+#[derive(Clone)]
+pub struct SessionTxnTracker {
+    connection_id: i64,
+    registry: Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>,
+}
+
+impl SessionTxnTracker {
+    pub fn new(
+        connection_id: i64,
+        registry: Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>,
+    ) -> Self {
+        Self {
+            connection_id,
+            registry,
+        }
+    }
+
+    pub fn refresh(&self, start_ts_version: u64) {
+        self.registry
+            .register_connection(self.connection_id, start_ts_version);
+    }
+
+    pub fn clear(&self) {
+        self.registry.unregister_connection(self.connection_id);
+    }
+}
 
 tokio::task_local! {
     static TIMEZONE: Arc<str>;
@@ -48,6 +79,10 @@ tokio::task_local! {
 //   state (autocommit).
 tokio::task_local! {
     static EXTENSION_TXN_DELTA: Arc<ExtensionTxnDelta>;
+}
+
+tokio::task_local! {
+    static SESSION_TXN_TRACKER: Option<Arc<SessionTxnTracker>>;
 }
 
 fn utc_arc() -> Arc<str> {
@@ -207,6 +242,48 @@ where
     EXTENSION_TXN_DELTA.scope(delta, fut).await
 }
 
+pub async fn with_session_txn_tracker<R, Fut>(
+    tracker: Option<Arc<SessionTxnTracker>>,
+    fut: Fut,
+) -> R
+where
+    Fut: Future<Output = R>,
+{
+    SESSION_TXN_TRACKER.scope(tracker, fut).await
+}
+
+pub fn current_session_txn_tracker() -> Option<Arc<SessionTxnTracker>> {
+    SESSION_TXN_TRACKER
+        .try_with(|tracker| tracker.clone())
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn refresh_current_session_txn_registration(txn: &Transaction) {
+    if let Some(tracker) = current_session_txn_tracker() {
+        tracker.refresh(txn.start_timestamp().version());
+    }
+}
+
+pub(crate) fn clear_current_session_txn_registration() {
+    if let Some(tracker) = current_session_txn_tracker() {
+        tracker.clear();
+    }
+}
+
+/// Foreground COPY/DDL may replace the raw TiKV transaction inside a
+/// session-owned statement without going through `Session::begin()`. Once the
+/// old raw txn has been finalized and its session registration cleared, call
+/// this helper to bind the connection GC registration to the fresh start_ts.
+pub(crate) async fn begin_replacement_session_owned_txn(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+) -> Result<()> {
+    *txn = store.begin().await?;
+    refresh_current_session_txn_registration(txn);
+    Ok(())
+}
+
 /// Returns in-transaction extension status from DDL delta.
 /// - `Some(true)`: extension was created in current txn.
 /// - `Some(false)`: extension was dropped in current transaction scope.
@@ -288,5 +365,46 @@ mod tests {
         })
         .await;
         assert_eq!(got, Some(false));
+    }
+
+    #[tokio::test]
+    async fn session_txn_tracker_is_scoped() {
+        let tracker = Arc::new(super::SessionTxnTracker::new(
+            7,
+            Arc::new(crate::worker::active_txn_registry::ActiveTxnRegistry::new()),
+        ));
+        assert!(super::current_session_txn_tracker().is_none());
+        let seen = super::with_session_txn_tracker(Some(tracker.clone()), async {
+            super::current_session_txn_tracker()
+        })
+        .await;
+        assert!(seen.is_some());
+        assert!(Arc::ptr_eq(&seen.unwrap(), &tracker));
+        assert!(super::current_session_txn_tracker().is_none());
+    }
+
+    #[test]
+    fn begin_replacement_session_owned_txn_refreshes_new_start_ts() {
+        let source = include_str!("session_context.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("session_context.rs must contain test module marker");
+        let helper = prod_source
+            .split("pub(crate) async fn begin_replacement_session_owned_txn")
+            .nth(1)
+            .expect("session_context.rs must define begin_replacement_session_owned_txn");
+
+        let begin_pos = helper
+            .find("*txn = store.begin().await?;")
+            .expect("replacement helper must begin a fresh transaction");
+        let refresh_pos = helper
+            .find("refresh_current_session_txn_registration(txn);")
+            .expect("replacement helper must refresh the current session registration");
+
+        assert!(
+            begin_pos < refresh_pos,
+            "replacement helper must refresh the session registration after opening the fresh transaction"
+        );
     }
 }

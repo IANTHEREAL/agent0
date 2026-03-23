@@ -576,9 +576,16 @@ impl StartupHandler for DynamicPgHandler {
                             {
                                 let session_lock = Arc::clone(&self.auth().session);
                                 let cancel = self.cancel_token.clone();
-                                tokio::spawn(async move {
+                                let watchdog = tokio::spawn(async move {
                                     idle_in_transaction_watchdog(session_lock, cancel).await;
                                 });
+                                let mut guard = self
+                                    .idle_watchdog_handle
+                                    .lock()
+                                    .expect("idle_watchdog_handle poisoned");
+                                if let Some(previous) = guard.replace(watchdog) {
+                                    previous.abort();
+                                }
                             }
                         } else {
                             let message = failure_reason.unwrap_or_else(|| {

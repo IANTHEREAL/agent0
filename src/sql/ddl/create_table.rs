@@ -797,6 +797,7 @@ pub async fn create_table_from_stream(
     let mut row_count: usize = 0;
     let mut batch_writes: usize = 0;
     let mut has_committed_batches = false;
+    let mut txn_guard = None;
 
     while let Some(row_result) = row_stream.next().await {
         let row = row_result?;
@@ -807,8 +808,14 @@ pub async fn create_table_from_stream(
             .upsert(txn, db_id, table_name, Row::new(values))
             .await?;
         batch_writes += 1;
-        super::maybe_rotate_backfill_txn(store, txn, &mut batch_writes, &mut has_committed_batches)
-            .await?;
+        super::maybe_rotate_backfill_txn(
+            store,
+            txn,
+            &mut txn_guard,
+            &mut batch_writes,
+            &mut has_committed_batches,
+        )
+        .await?;
     }
 
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;

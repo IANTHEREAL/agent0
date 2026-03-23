@@ -25,7 +25,8 @@ pub(crate) fn checked_decimal_add(a: Decimal, b: Decimal) -> Result<Decimal> {
 pub(crate) fn checked_decimal_sub(a: Decimal, b: Decimal) -> Result<Decimal> {
     a.checked_sub(b).ok_or_else(|| {
         SqlError::NumericValueOutOfRange {
-            message: "numeric field overflow: result of subtraction exceeds numeric capacity".into(),
+            message: "numeric field overflow: result of subtraction exceeds numeric capacity"
+                .into(),
         }
         .into()
     })
@@ -185,16 +186,26 @@ impl NumericValue {
 pub fn numeric_add(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
-            .checked_add(b)
-            .map(NumericValue::Int32)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
-            .checked_add(b)
-            .map(NumericValue::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
+            a.checked_add(b).map(NumericValue::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            })
+        }
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
+            a.checked_add(b).map(NumericValue::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
+        }
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a + b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_add(a, b)?)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+            Ok(NumericValue::Decimal(checked_decimal_add(a, b)?))
+        }
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -202,16 +213,26 @@ pub fn numeric_add(left: NumericValue, right: NumericValue) -> Result<NumericVal
 pub fn numeric_sub(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
-            .checked_sub(b)
-            .map(NumericValue::Int32)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
-            .checked_sub(b)
-            .map(NumericValue::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
+            a.checked_sub(b).map(NumericValue::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            })
+        }
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
+            a.checked_sub(b).map(NumericValue::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
+        }
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a - b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_sub(a, b)?)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+            Ok(NumericValue::Decimal(checked_decimal_sub(a, b)?))
+        }
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -219,16 +240,26 @@ pub fn numeric_sub(left: NumericValue, right: NumericValue) -> Result<NumericVal
 pub fn numeric_mul(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
-            .checked_mul(b)
-            .map(NumericValue::Int32)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
-            .checked_mul(b)
-            .map(NumericValue::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
+            a.checked_mul(b).map(NumericValue::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            })
+        }
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
+            a.checked_mul(b).map(NumericValue::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
+        }
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a * b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_mul(a, b)?)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+            Ok(NumericValue::Decimal(checked_decimal_mul(a, b)?))
+        }
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -240,14 +271,22 @@ pub fn numeric_div(left: NumericValue, right: NumericValue) -> Result<NumericVal
 
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
-            .checked_div(b)
-            .map(NumericValue::Int32)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
-            .checked_div(b)
-            .map(NumericValue::Int64)
-            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
+            a.checked_div(b).map(NumericValue::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            })
+        }
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
+            a.checked_div(b).map(NumericValue::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
+        }
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a / b)),
         (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
             Ok(NumericValue::Decimal(pg_numeric_div(a, b)?))
@@ -271,7 +310,9 @@ pub fn numeric_mod(left: NumericValue, right: NumericValue) -> Result<NumericVal
             Ok(NumericValue::Int64(a.checked_rem(b).unwrap_or(0)))
         }
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a % b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_rem(a, b)?)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+            Ok(NumericValue::Decimal(checked_decimal_rem(a, b)?))
+        }
         _ => Err(anyhow!("type promotion failed")),
     }
 }

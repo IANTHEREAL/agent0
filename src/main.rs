@@ -27,16 +27,18 @@ mod worker;
 
 use crate::config::ServerConfig;
 use anyhow::Result;
-use pgwire::tokio::process_socket;
+use pgwire::tokio::{process_socket, CancellationToken};
 use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;
 use socket2::{SockRef, TcpKeepalive};
+use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::task::{Id as TaskId, JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -45,6 +47,88 @@ const DEFAULT_PG_PORT: u16 = 5433;
 const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
 const DEFAULT_TOKIO_STACK_MB: usize = 8;
+const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+struct WorkerRuntimeHandles {
+    engine_handle: JoinHandle<()>,
+    engine_shutdown: CancellationToken,
+    gc_loop_handle: JoinHandle<()>,
+    hnsw_sweep_handle: JoinHandle<()>,
+}
+
+struct ConnectionTaskRegistry {
+    tasks: JoinSet<()>,
+    cancel_tokens: HashMap<TaskId, CancellationToken>,
+}
+
+impl ConnectionTaskRegistry {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            cancel_tokens: HashMap::new(),
+        }
+    }
+
+    fn spawn<F>(&mut self, cancel_token: CancellationToken, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let task_id = self.tasks.spawn(fut).id();
+        self.cancel_tokens.insert(task_id, cancel_token);
+    }
+
+    fn reap_finished(&mut self) {
+        while let Some(result) = self.tasks.try_join_next_with_id() {
+            self.finish_task(result);
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        self.reap_finished();
+        if self.cancel_tokens.is_empty() {
+            return;
+        }
+
+        for token in self.cancel_tokens.values() {
+            token.cancel();
+        }
+
+        let graceful = async {
+            while let Some(result) = self.tasks.join_next_with_id().await {
+                self.finish_task(result);
+            }
+        };
+
+        if tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, graceful)
+            .await
+            .is_err()
+        {
+            warn!(
+                "Timed out waiting for {} connection task(s) to exit; aborting remaining tasks",
+                self.cancel_tokens.len()
+            );
+            self.tasks.abort_all();
+            while let Some(result) = self.tasks.join_next_with_id().await {
+                self.finish_task(result);
+            }
+        }
+    }
+
+    fn finish_task(&mut self, result: std::result::Result<(TaskId, ()), tokio::task::JoinError>) {
+        match result {
+            Ok((task_id, ())) => {
+                self.cancel_tokens.remove(&task_id);
+            }
+            Err(e) => {
+                self.cancel_tokens.remove(&e.id());
+                if !e.is_cancelled() {
+                    warn!("Connection task join failed during shutdown: {}", e);
+                }
+            }
+        }
+    }
+}
 
 fn main() -> Result<()> {
     // Record process start time before anything else.
@@ -252,33 +336,46 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         })?;
     worker::set_gc_registry_store(gc_store.clone());
 
+    // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
+    // the safepoint, another node in the cluster might. This only checks
+    // structural GC invariants (for example interval < life_time); foreground
+    // and worker transactions are protected by direct registry tracking.
+    worker_config.validate_gc_config();
+
+    worker::gc::publish_gc_instance_state_once(&gc_store, &worker_config)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to publish GC registry state during startup: {}. \
+                 A SQL-serving db9 process must publish GC liveness before it accepts traffic.",
+                e
+            )
+        })?;
+    info!("GC registry startup publish completed");
+
     // GC registry publisher — UNCONDITIONAL. Runs on every SQL-serving node.
     // Publishes this instance's min_start_ts to _sys_worker every interval.
     // This is NOT inside any if-block — it always runs.
-    {
+    let publisher_handle = {
         let publisher_store = gc_store.clone();
         let publisher_config = worker_config.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config).await;
         });
         info!("GC registry publisher started (unconditional)");
-    }
-
-    // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
-    // the safepoint, another node in the cluster might. This node's worker
-    // timeouts (cron, statement) must be covered by gc_life_time.
-    worker_config.validate_gc_config();
+        handle
+    };
 
     // ================================================================
     // GC safepoint advancer: OPTIONAL — reads all instances' states
     // from shared registry, computes global min, advances PD safepoint.
     // ================================================================
-    if worker_config.gc_safepoint_enabled {
+    let advancer_handle = if worker_config.gc_safepoint_enabled {
         let advancer_store = gc_store.clone();
         let advancer_config = worker_config.clone();
         let advancer_metrics = Arc::new(worker::metrics::WorkerMetrics::new());
         let advancer_metrics_clone = advancer_metrics.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             worker::gc::run_gc_advancer_loop(
                 &advancer_store,
                 &advancer_config,
@@ -287,52 +384,60 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             .await;
         });
         info!("GC safepoint advancer started");
-    }
+        Some(handle)
+    } else {
+        None
+    };
 
     // ================================================================
     // Worker engine: OPTIONAL — cron, triggers, HNSW, DDL, BgSql.
     // ================================================================
-    {
-        if worker_config.enabled {
-            let system_store = match worker::init_system_store(pd_addrs.clone(), &worker_config)
-                .await
-            {
-                Ok(Some(system_store)) => system_store,
-                Ok(None) => unreachable!("worker init returned None while worker is enabled"),
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                            "Failed to initialize system store: {}. \
-                             Worker is enabled (DB9_WORKER_ENABLED=true) but cannot start. \
-                             Either fix the system store connection or set DB9_WORKER_ENABLED=false.",
-                            e
-                        ));
-                }
-            };
+    let worker_runtime = if worker_config.enabled {
+        let system_store = match worker::init_system_store(pd_addrs.clone(), &worker_config).await {
+            Ok(Some(system_store)) => system_store,
+            Ok(None) => unreachable!("worker init returned None while worker is enabled"),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to initialize system store: {}. \
+                         Worker is enabled (DB9_WORKER_ENABLED=true) but cannot start. \
+                         Either fix the system store connection or set DB9_WORKER_ENABLED=false.",
+                    e
+                ));
+            }
+        };
 
-            worker::set_system_store(system_store.clone());
+        worker::set_system_store(system_store.clone());
 
-            let engine = worker::engine::WorkerEngine::new(
-                worker_config.clone(),
-                system_store.clone(),
-                client_pool.clone(),
-            );
-            let metrics = engine.metrics().clone();
-            worker::set_worker_metrics(metrics.clone());
-            tokio::spawn(async move { engine.run().await });
+        let engine = worker::engine::WorkerEngine::new(
+            worker_config.clone(),
+            system_store.clone(),
+            client_pool.clone(),
+        );
+        let metrics = engine.metrics().clone();
+        let engine_shutdown = engine.shutdown_token();
+        worker::set_worker_metrics(metrics.clone());
+        let engine_handle = tokio::spawn(async move { engine.run().await });
 
-            // WorkerGc: orphan claims + cron cleanup + HNSW sweep ONLY.
-            // Publisher and advancer are spawned above, not here.
-            let gc = Arc::new(worker::gc::WorkerGc::new(
-                system_store,
-                client_pool.clone(),
-                worker_config,
-                metrics,
-            ));
-            gc.spawn_worker_gc_only();
+        // WorkerGc: orphan claims + cron cleanup + HNSW sweep ONLY.
+        // Publisher and advancer are spawned above, not here.
+        let gc = Arc::new(worker::gc::WorkerGc::new(
+            system_store,
+            client_pool.clone(),
+            worker_config.clone(),
+            metrics,
+        ));
+        let gc_handles = gc.spawn_worker_gc_only();
 
-            info!("WorkerEngine started (cron/triggers/HNSW/DDL)");
-        }
-    }
+        info!("WorkerEngine started (cron/triggers/HNSW/DDL)");
+        Some(WorkerRuntimeHandles {
+            engine_handle,
+            engine_shutdown,
+            gc_loop_handle: gc_handles.gc_loop_handle,
+            hnsw_sweep_handle: gc_handles.hnsw_sweep_handle,
+        })
+    } else {
+        None
+    };
 
     // Export snapshot janitor (Backup v2 prerequisite).
     // Runs unconditionally — lightweight no-op when no export snapshots exist.
@@ -450,10 +555,29 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
     let max_connections = server_config.read().unwrap().max_connections;
     let conn_semaphore = Arc::new(Semaphore::new(max_connections as usize));
+    let mut connection_tasks = ConnectionTaskRegistry::new();
     info!("Max connections: {}", max_connections);
 
-    loop {
-        let (socket, peer_addr) = listener.accept().await?;
+    let mut shutdown = std::pin::pin!(shutdown_signal());
+    let serve_result: Result<()> = loop {
+        connection_tasks.reap_finished();
+        let (socket, peer_addr) = tokio::select! {
+            shutdown_reason = &mut shutdown => {
+                match shutdown_reason {
+                    Ok(reason) => {
+                        info!("Shutdown signal received: {}", reason);
+                        break Ok(());
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok(connection) => connection,
+                    Err(e) => break Err(e.into()),
+                }
+            }
+        };
         let accept_config = server_config.read().unwrap().clone();
 
         if let Err(e) = configure_pgwire_socket_keepalive(&socket, &accept_config) {
@@ -489,14 +613,25 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         );
         let cancel_token = factory.cancel_token();
 
-        tokio::spawn(async move {
+        connection_tasks.spawn(cancel_token.clone(), async move {
             let _permit = permit; // held for connection lifetime
             if let Err(e) = process_socket(socket, tls_acceptor, factory, Some(cancel_token)).await
             {
                 tracing::error!("Connection error: {}", e);
             }
         });
-    }
+    };
+
+    shutdown_server_runtime(
+        &gc_store,
+        &worker_config,
+        &mut connection_tasks,
+        worker_runtime,
+        publisher_handle,
+        advancer_handle,
+    )
+    .await;
+    serve_result
 }
 
 fn configure_pgwire_socket_keepalive(
@@ -555,6 +690,95 @@ async fn reject_over_limit(mut socket: tokio::net::TcpStream) {
 
     let _ = socket.write_all(&msg).await;
     let _ = socket.shutdown().await;
+}
+
+async fn shutdown_server_runtime(
+    gc_store: &storage::TikvStore,
+    worker_config: &worker::config::WorkerConfig,
+    connection_tasks: &mut ConnectionTaskRegistry,
+    worker_runtime: Option<WorkerRuntimeHandles>,
+    publisher_handle: JoinHandle<()>,
+    advancer_handle: Option<JoinHandle<()>>,
+) {
+    connection_tasks.shutdown().await;
+    shutdown_worker_runtime(worker_runtime).await;
+    shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle).await;
+}
+
+async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
+    let Some(worker_runtime) = worker_runtime else {
+        return;
+    };
+    let WorkerRuntimeHandles {
+        engine_handle,
+        engine_shutdown,
+        gc_loop_handle,
+        hnsw_sweep_handle,
+    } = worker_runtime;
+
+    engine_shutdown.cancel();
+    worker::wake_worker();
+
+    let mut engine_handle = engine_handle;
+    match tokio::time::timeout(WORKER_SHUTDOWN_GRACE, &mut engine_handle).await {
+        Ok(Ok(())) => info!("WorkerEngine stopped"),
+        Ok(Err(e)) if e.is_cancelled() => info!("WorkerEngine stopped"),
+        Ok(Err(e)) => warn!("WorkerEngine join failed during shutdown: {}", e),
+        Err(_) => {
+            warn!("Timed out waiting for WorkerEngine to stop; aborting");
+            abort_task("WorkerEngine", engine_handle).await;
+        }
+    }
+
+    abort_task("Worker GC loop", gc_loop_handle).await;
+    abort_task("HNSW sweep loop", hnsw_sweep_handle).await;
+}
+
+async fn shutdown_gc_runtime(
+    gc_store: &storage::TikvStore,
+    worker_config: &worker::config::WorkerConfig,
+    publisher_handle: JoinHandle<()>,
+    advancer_handle: Option<JoinHandle<()>>,
+) {
+    abort_task("GC registry publisher", publisher_handle).await;
+    if let Some(handle) = advancer_handle {
+        abort_task("GC safepoint advancer", handle).await;
+    }
+
+    match worker::gc::clear_gc_instance_state(gc_store, worker_config).await {
+        Ok(()) => info!("Cleared local GC registry state during shutdown"),
+        Err(e) => warn!(
+            "Failed to clear local GC registry state during shutdown: {}",
+            e
+        ),
+    }
+}
+
+async fn abort_task(task_name: &str, handle: JoinHandle<()>) {
+    handle.abort();
+    match handle.await {
+        Ok(()) => info!("{} stopped", task_name),
+        Err(e) if e.is_cancelled() => info!("{} stopped", task_name),
+        Err(e) => warn!("{} join failed during shutdown: {}", task_name, e),
+    }
+}
+
+async fn shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Ok("SIGINT"),
+            _ = terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("ctrl_c")
+    }
 }
 
 #[cfg(test)]
@@ -691,5 +915,113 @@ mod tests {
         cfg.tcp_keepalive_idle_ms = 0;
         configure_pgwire_socket_keepalive(&server, &cfg).unwrap();
         assert!(!socket_ref.keepalive().unwrap());
+    }
+
+    #[test]
+    fn gc_startup_publish_happens_before_listener_accepts_connections() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let startup_publish = prod_source
+            .find("publish_gc_instance_state_once(&gc_store, &worker_config)")
+            .expect("main.rs must publish GC registry state during startup");
+        let listener_bind = prod_source
+            .find("let listener = TcpListener::bind")
+            .expect("main.rs must bind the pgwire listener");
+
+        assert!(
+            startup_publish < listener_bind,
+            "GC registry startup publish must complete before the server starts accepting SQL traffic"
+        );
+    }
+
+    #[test]
+    fn gc_shutdown_clears_local_state_after_stopping_gc_tasks() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let shutdown_fn = prod_source
+            .split("async fn shutdown_gc_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn abort_task").next())
+            .expect("main.rs must define shutdown_gc_runtime");
+
+        let publisher_abort = shutdown_fn
+            .find("abort_task(\"GC registry publisher\", publisher_handle)")
+            .expect("shutdown must stop the publisher loop");
+        let clear_state = shutdown_fn
+            .find("clear_gc_instance_state(gc_store, worker_config)")
+            .expect("shutdown must clear the local GC registry row");
+
+        assert!(
+            publisher_abort < clear_state,
+            "shutdown must stop GC loops before clearing the local GC registry row"
+        );
+    }
+
+    #[test]
+    fn server_shutdown_quiesces_connections_and_workers_before_gc_clear() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let shutdown_fn = prod_source
+            .split("async fn shutdown_server_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn shutdown_worker_runtime").next())
+            .expect("main.rs must define shutdown_server_runtime");
+
+        let shutdown_connections = shutdown_fn
+            .find("connection_tasks.shutdown().await")
+            .expect("server shutdown must wait for connection tasks");
+        let shutdown_workers = shutdown_fn
+            .find("shutdown_worker_runtime(worker_runtime).await")
+            .expect("server shutdown must wait for worker runtime");
+        let shutdown_gc = shutdown_fn
+            .find("shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle)")
+            .expect("server shutdown must stop GC runtime last");
+
+        assert!(
+            shutdown_connections < shutdown_gc,
+            "server shutdown must quiesce connection tasks before clearing the local GC registry row"
+        );
+        assert!(
+            shutdown_workers < shutdown_gc,
+            "server shutdown must quiesce worker runtime before clearing the local GC registry row"
+        );
+    }
+
+    #[test]
+    fn worker_shutdown_signals_engine_before_abort_fallback() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let shutdown_fn = prod_source
+            .split("async fn shutdown_worker_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn shutdown_gc_runtime").next())
+            .expect("main.rs must define shutdown_worker_runtime");
+
+        let cancel_engine = shutdown_fn
+            .find("engine_shutdown.cancel();")
+            .expect("worker shutdown must signal engine cancellation");
+        let wake_worker = shutdown_fn
+            .find("worker::wake_worker();")
+            .expect("worker shutdown must wake the engine loop");
+        let abort_engine = shutdown_fn
+            .find("abort_task(\"WorkerEngine\", engine_handle).await")
+            .expect("worker shutdown must retain an abort fallback");
+
+        assert!(
+            cancel_engine < abort_engine && wake_worker < abort_engine,
+            "worker shutdown must try graceful cancellation before aborting the engine task"
+        );
     }
 }

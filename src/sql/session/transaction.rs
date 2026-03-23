@@ -163,7 +163,8 @@ impl Session {
                 // setting state to Active. This ensures the GC safepoint
                 // advancer sees this transaction before it can be affected.
                 if let Some(ref registry) = self.active_txn_registry {
-                    registry.register(self.connection_id, txn.start_timestamp().version());
+                    registry
+                        .register_connection(self.connection_id, txn.start_timestamp().version());
                 }
                 self.state = TransactionState::Active(txn);
                 self.extension_delta = super::ExtensionDelta::default();
@@ -204,7 +205,7 @@ impl Session {
                         self.observability.record_commit();
                         // Unregister only after definitive commit success.
                         if let Some(ref registry) = self.active_txn_registry {
-                            registry.unregister(self.connection_id);
+                            registry.unregister_connection(self.connection_id);
                         }
                         Ok(())
                     }
@@ -228,7 +229,7 @@ impl Session {
                         self.last_sequence_values.discard_pending_drops();
                         // Unregister only after definitive rollback success.
                         if let Some(ref registry) = self.active_txn_registry {
-                            registry.unregister(self.connection_id);
+                            registry.unregister_connection(self.connection_id);
                         }
                         Ok(())
                     }
@@ -265,7 +266,7 @@ impl Session {
                         // itself was reverted — stale entries must not survive.
                         self.clear_plan_cache();
                         if let Some(ref registry) = self.active_txn_registry {
-                            registry.unregister(self.connection_id);
+                            registry.unregister_connection(self.connection_id);
                         }
                         Ok(())
                     }
@@ -288,7 +289,7 @@ impl Session {
                         self.last_sequence_values.discard_pending_drops();
                         self.clear_plan_cache();
                         if let Some(ref registry) = self.active_txn_registry {
-                            registry.unregister(self.connection_id);
+                            registry.unregister_connection(self.connection_id);
                         }
                         Ok(())
                     }

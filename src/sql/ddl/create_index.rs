@@ -31,7 +31,7 @@ use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DD
 use super::create_table::{check_relation_name_available, RelationKind};
 use super::{
     analyze_row_level_expr, delete_range, index_prefix_range, maybe_rotate_backfill_txn,
-    KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    track_active_worker_txn, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +392,7 @@ pub async fn execute_create_index(
 
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
+    let mut txn_guard = None;
 
     let create_result: Result<()> = async {
         if new_index.is_hnsw() {
@@ -657,6 +658,7 @@ pub async fn execute_create_index(
                             maybe_rotate_backfill_txn(
                                 store,
                                 txn,
+                                &mut txn_guard,
                                 &mut current_batch_writes,
                                 &mut has_committed_batches,
                             )
@@ -687,6 +689,7 @@ pub async fn execute_create_index(
                         maybe_rotate_backfill_txn(
                             store,
                             txn,
+                            &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
                         )
@@ -736,6 +739,7 @@ pub async fn execute_create_index(
                         maybe_rotate_backfill_txn(
                             store,
                             txn,
+                            &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
                         )
@@ -763,6 +767,7 @@ pub async fn execute_create_index(
                     maybe_rotate_backfill_txn(
                         store,
                         txn,
+                        &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
                     )
@@ -784,7 +789,17 @@ pub async fn execute_create_index(
             // Backfill commits can succeed before schema update. On failure after that point,
             // remove committed entries so CREATE INDEX does not leave orphaned index KV data.
             // Also release the reservation key to prevent permanent false 42P07.
-            let _ = txn.rollback().await;
+            if let Err(rollback_err) = txn.rollback().await {
+                // Rollback failed — the old txn may still be live in TiKV.
+                // Do NOT clear the session GC registration or open a replacement
+                // txn; the safepoint must not advance past this live txn.
+                return Err(err.context(format!(
+                    "cleanup of partially backfilled index '{}' aborted: \
+                     rollback of stale transaction failed: {}",
+                    idx_name_str, rollback_err
+                )));
+            }
+            crate::session_context::clear_current_session_txn_registration();
             let (start, end) = index_prefix_range(db_id, schema.table_id, index_id);
             let idx_full_name = format!("{}.{}", owning_schema, idx_name_str);
             let cleanup_result: Result<()> = async {
@@ -798,7 +813,7 @@ pub async fn execute_create_index(
             }
             .await;
 
-            *txn = store.begin().await?;
+            crate::session_context::begin_replacement_session_owned_txn(store, txn).await?;
 
             if let Err(cleanup_err) = cleanup_result {
                 return Err(err.context(format!(
@@ -981,6 +996,7 @@ pub async fn backfill_index_by_name(
     set_state_on_commit: Option<IndexState>,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
+    let mut txn_guard = track_active_worker_txn(&txn);
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
 
@@ -1064,6 +1080,7 @@ pub async fn backfill_index_by_name(
                     maybe_rotate_backfill_txn(
                         store,
                         &mut txn,
+                        &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
                     )
@@ -1111,6 +1128,7 @@ pub async fn backfill_index_by_name(
                     maybe_rotate_backfill_txn(
                         store,
                         &mut txn,
+                        &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
                     )
@@ -1141,7 +1159,13 @@ pub async fn backfill_index_by_name(
     .await;
 
     if let Err(e) = result {
-        let _ = txn.rollback().await;
+        if txn.rollback().await.is_err() {
+            // Rollback failed — keep the GC registration so the safepoint
+            // does not advance past this potentially live transaction.
+            if let Some(g) = txn_guard.as_mut() {
+                g.quarantine();
+            }
+        }
         return Err(e);
     }
 
@@ -1215,6 +1239,7 @@ async fn reconcile_index_pass(
     set_state_on_commit: Option<IndexState>,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
+    let mut txn_guard = track_active_worker_txn(&txn);
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
 
@@ -1329,6 +1354,7 @@ async fn reconcile_index_pass(
                         maybe_rotate_backfill_txn(
                             store,
                             &mut txn,
+                            &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
                         )
@@ -1360,7 +1386,13 @@ async fn reconcile_index_pass(
     .await;
 
     if let Err(e) = result {
-        let _ = txn.rollback().await;
+        if txn.rollback().await.is_err() {
+            // Rollback failed — keep the GC registration so the safepoint
+            // does not advance past this potentially live transaction.
+            if let Some(g) = txn_guard.as_mut() {
+                g.quarantine();
+            }
+        }
         return Err(e);
     }
 
@@ -1631,5 +1663,85 @@ mod tests {
                 .contains("unrecognized parameter \"not_a_real_option\""),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn cleanup_reopen_validates_rollback_before_clearing_gc_state() {
+        let source = include_str!("create_index.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("create_index.rs must contain test module marker");
+        // Narrow scope: only the has_committed_batches cleanup block inside
+        // create_index_inner, not unrelated functions below it.
+        let after_create_result = prod_source
+            .split("if let Err(err) = create_result")
+            .nth(1)
+            .expect("create_index.rs must handle create_result errors");
+        let cleanup_path = after_create_result
+            .split("return Err(err);")
+            .next()
+            .expect("cleanup block must end with return Err(err)");
+
+        // The cleanup path must NOT silently discard the rollback result.
+        assert!(
+            !cleanup_path.contains("let _ = txn.rollback().await;"),
+            "cleanup path must not ignore rollback errors — GC state must only \
+             be cleared after a confirmed rollback"
+        );
+
+        // Rollback must be checked and must precede session GC manipulation.
+        let rollback_pos = cleanup_path
+            .find("if let Err(rollback_err) = txn.rollback().await")
+            .expect("cleanup path must check the rollback result");
+        let clear_pos = cleanup_path
+            .find("crate::session_context::clear_current_session_txn_registration();")
+            .expect("cleanup path must clear the stale session registration after rollback");
+        let cleanup_pos = cleanup_path
+            .find("let cleanup_result: Result<()> = async {")
+            .expect("cleanup path must run cleanup work after rollback");
+        let begin_pos = cleanup_path
+            .find("crate::session_context::begin_replacement_session_owned_txn(store, txn).await?;")
+            .expect("cleanup path must reopen the session-owned transaction via the shared helper");
+
+        assert!(
+            rollback_pos < clear_pos && clear_pos < cleanup_pos && cleanup_pos < begin_pos,
+            "cleanup path must validate rollback, clear the stale session registration, \
+             run cleanup, and refresh — in that order"
+        );
+        assert!(
+            !cleanup_path.contains("*txn = store.begin().await?;"),
+            "cleanup path must not bypass the shared session-owned txn replacement helper"
+        );
+    }
+
+    /// Worker-path rollback errors must quarantine the GC guard so the
+    /// safepoint does not advance past a potentially live transaction.
+    #[test]
+    fn backfill_and_reconcile_quarantine_guard_on_rollback_failure() {
+        let source = include_str!("create_index.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("create_index.rs must contain test module marker");
+
+        for fn_name in &["backfill_index_by_name", "reconcile_index_pass"] {
+            let fn_body = prod_source
+                .split(&format!("async fn {fn_name}"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{fn_name} must exist in create_index.rs"));
+
+            // The error path must NOT silently discard the rollback result.
+            assert!(
+                !fn_body.contains("let _ = txn.rollback().await;"),
+                "{fn_name}: must not ignore rollback errors"
+            );
+
+            // It must quarantine the guard when rollback fails.
+            assert!(
+                fn_body.contains("g.quarantine()"),
+                "{fn_name}: must quarantine the GC guard when rollback fails"
+            );
+        }
     }
 }

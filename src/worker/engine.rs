@@ -13,12 +13,14 @@ use crate::worker::metrics::WorkerMetrics;
 use crate::worker::now_epoch_ms;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
+use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tikv_client::TimestampExt;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -35,6 +37,7 @@ pub struct WorkerEngine {
     semaphore: Arc<Semaphore>,
     metrics: Arc<WorkerMetrics>,
     notify: Arc<Notify>,
+    shutdown: CancellationToken,
 }
 
 struct ActiveJobGuard {
@@ -62,6 +65,7 @@ impl WorkerEngine {
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let notify = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
         crate::worker::set_worker_notify(notify.clone());
         Self {
             config,
@@ -71,11 +75,16 @@ impl WorkerEngine {
             semaphore,
             metrics: Arc::new(WorkerMetrics::new()),
             notify,
+            shutdown,
         }
     }
 
     pub fn metrics(&self) -> &Arc<WorkerMetrics> {
         &self.metrics
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     pub async fn run(&self) {
@@ -120,6 +129,10 @@ impl WorkerEngine {
 
         loop {
             tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    info!("WorkerEngine shutdown requested");
+                    break;
+                }
                 _ = interval.tick() => {}
                 _ = self.notify.notified() => {}
             }
@@ -168,6 +181,7 @@ impl WorkerEngine {
             let engine_config = self.config.clone();
             let active_jobs = self.active_jobs.clone();
             let engine_metrics = self.metrics.clone();
+            let engine_shutdown = self.shutdown.clone();
 
             join_set.spawn(async move {
                 let _permit = permit;
@@ -179,6 +193,7 @@ impl WorkerEngine {
                     &engine_metrics,
                     key,
                     entry,
+                    engine_shutdown,
                 )
                 .await;
 
@@ -427,6 +442,7 @@ impl WorkerEngine {
         metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
         entry: TaskQueueEntry,
+        shutdown_signal: CancellationToken,
     ) -> Result<()> {
         Self::claim_and_execute_core(
             system_store,
@@ -435,6 +451,7 @@ impl WorkerEngine {
             metrics,
             queue_key,
             entry,
+            shutdown_signal,
             Self::finalize_cron_run,
         )
         .await
@@ -449,6 +466,7 @@ impl WorkerEngine {
         metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
         entry: TaskQueueEntry,
+        shutdown_signal: CancellationToken,
         finalize_fn: F,
     ) -> Result<()>
     where
@@ -505,7 +523,13 @@ impl WorkerEngine {
                 None
             };
 
-            let task_fut = Self::execute_task(pool, config, &entry, Some(cancel_signal));
+            let task_fut = Self::execute_task(
+                pool,
+                config,
+                &entry,
+                Some(cancel_signal),
+                Some(shutdown_signal.clone()),
+            );
             let result = match timeout_dur {
                 Some(dur) => match tokio::time::timeout(dur, task_fut).await {
                     Ok(r) => r,
@@ -517,7 +541,7 @@ impl WorkerEngine {
             get_process_list().deregister(run.run_id);
             result
         } else {
-            Self::execute_task(pool, config, &entry, None).await
+            Self::execute_task(pool, config, &entry, None, Some(shutdown_signal)).await
         };
 
         // Capture finalize result instead of propagating with `?` — cleanup
@@ -821,6 +845,7 @@ impl WorkerEngine {
         config: &WorkerConfig,
         entry: &TaskQueueEntry,
         cancel_signal: Option<Arc<Notify>>,
+        shutdown_signal: Option<CancellationToken>,
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
@@ -871,7 +896,7 @@ impl WorkerEngine {
         }
 
         let is_cron = entry.task_type == TaskType::Cron;
-        let stmt_timeout = if !is_cron && config.statement_timeout_ms > 0 {
+        let task_timeout = if !is_cron && config.statement_timeout_ms > 0 {
             Some(std::time::Duration::from_millis(
                 config.statement_timeout_ms,
             ))
@@ -897,8 +922,10 @@ impl WorkerEngine {
         let tikv_client = store.transaction_client();
 
         let mut txn = store.begin().await?;
+        let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+            .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
         let mut sequence_values = crate::sql::sequences::SequenceSession::new();
-        let result = async {
+        let task_fut = async {
             let statements = parse_sql(&entry.command)?;
             for stmt in &statements {
                 let stmt_ts = now_epoch_ms();
@@ -936,19 +963,31 @@ impl WorkerEngine {
                         ),
                     ),
                 );
-
-                let res = run_with_guards(fut, stmt_timeout, cancel_signal.as_ref()).await;
-                let _ = res?;
+                let _ = fut.await?;
             }
             txn.commit().await?;
             Ok(statements.len())
-        }
+        };
+
+        let result = run_with_guards(
+            task_fut,
+            task_timeout,
+            cancel_signal.as_ref(),
+            shutdown_signal.as_ref(),
+        )
         .await;
 
         match result {
             Ok(completed_commands) => Ok(completed_commands),
             Err(e) => {
-                let _ = txn.rollback().await;
+                if txn.rollback().await.is_err() {
+                    // Rollback failed — the txn may still be live in TiKV.
+                    // Keep the GC registration so the safepoint does not
+                    // advance past this potentially live transaction.
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
+                }
                 Err(e)
             }
         }
@@ -1141,6 +1180,11 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
     let handle = pool.acquire(Some(keyspace.to_string())).await?;
     let store = handle.store().clone();
     let mut txn = store.begin().await?;
+    // This read-only snapshot scans all tables, schemas, and per-index delta
+    // prefixes — proportional to tenant size.  Register with the GC safepoint
+    // so GC does not advance past this snapshot while the sweep runs.
+    let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
     let table_names = store.list_tables(&mut txn, db_id).await?;
     let mut observed = 0u32;
@@ -1223,7 +1267,11 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
         }
     }
 
-    txn.rollback().await.ok(); // read-only tenant txn
+    if txn.rollback().await.is_err() {
+        if let Some(g) = txn_guard.as_mut() {
+            g.quarantine();
+        }
+    }
     Ok(HnswSweepResult {
         observed,
         enqueued,
@@ -1235,6 +1283,7 @@ async fn run_with_guards<F, T>(
     fut: F,
     timeout: Option<Duration>,
     cancel: Option<&Arc<Notify>>,
+    shutdown: Option<&CancellationToken>,
 ) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -1248,12 +1297,21 @@ where
         }
     };
 
-    match cancel {
-        Some(cancel) => tokio::select! {
+    match (cancel, shutdown) {
+        (Some(cancel), Some(shutdown)) => tokio::select! {
+            res = timed_fut => res,
+            _ = cancel.notified() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+            _ = shutdown.cancelled() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+        },
+        (Some(cancel), None) => tokio::select! {
             res = timed_fut => res,
             _ = cancel.notified() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
         },
-        None => timed_fut.await,
+        (None, Some(shutdown)) => tokio::select! {
+            res = timed_fut => res,
+            _ = shutdown.cancelled() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+        },
+        (None, None) => timed_fut.await,
     }
 }
 
@@ -1374,22 +1432,36 @@ async fn execute_hnsw_merge(
 
     loop {
         let mut txn = store.begin().await?;
+        let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+            .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
         // 1. Read meta
         let meta_key = hnsw_meta_key(db_id, table_id, index_id);
         let Some(meta_bytes) = txn.get(meta_key.clone()).await? else {
             // Index metadata missing — index was dropped. Abort silently.
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+            }
             break;
         };
         let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
         if should_skip_frozen_merge(&meta) {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+            }
             info!(table_id, index_id, "HNSW merge skipped: index is frozen");
             return Ok(());
         }
         if meta.storage_version != 1 {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+            }
             return Err(anyhow!(
                 "HNSW index has unsupported storage_version={}; only v1 supported",
                 meta.storage_version
@@ -1434,7 +1506,11 @@ async fn execute_hnsw_merge(
         }
 
         if batch_deltas.is_empty() {
-            txn.rollback().await.ok();
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+            }
             break; // No more deltas — merge complete.
         }
 
@@ -1487,7 +1563,12 @@ async fn execute_hnsw_merge(
                 "HNSW graph exceeds size limit — freezing index"
             );
             txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
-            txn.commit().await?;
+            if let Err(e) = txn.commit().await {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+                return Err(e.into());
+            }
             return Ok(());
         }
 
@@ -1502,7 +1583,12 @@ async fn execute_hnsw_merge(
         delete_delta_keys(&mut txn, &batch_keys).await?;
 
         // 7. Commit.
-        txn.commit().await?;
+        if let Err(e) = txn.commit().await {
+            if let Some(g) = txn_guard.as_mut() {
+                g.quarantine();
+            }
+            return Err(e.into());
+        }
         total_deltas_merged += batch_count;
 
         info!(
@@ -1560,6 +1646,10 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
         std::collections::HashMap::new();
 
     let mut txn = store.begin_optimistic().await?;
+    // This snapshot spans the full paginated scan (including rate-limit sleeps),
+    // so it must participate in GC safepoint protection like other worker txns.
+    let _txn_guard = crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
     let mut cursor = range_start;
 
     loop {
@@ -1931,7 +2021,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = run_with_guards(fut, Some(Duration::from_millis(5)), Some(&cancel))
+        let err = run_with_guards(fut, Some(Duration::from_millis(5)), Some(&cancel), None)
             .await
             .expect_err("expected timeout");
         assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
@@ -1944,7 +2034,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = run_with_guards(fut, Some(Duration::from_millis(5)), None)
+        let err = run_with_guards(fut, Some(Duration::from_millis(5)), None, None)
             .await
             .expect_err("expected timeout");
         assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
@@ -1959,7 +2049,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = run_with_guards(fut, None, Some(&cancel))
+        let err = run_with_guards(fut, None, Some(&cancel), None)
             .await
             .expect_err("expected cancel");
         assert_eq!(err.to_string(), CANCELLED_BY_ADMIN_ERROR);
@@ -1969,10 +2059,135 @@ mod tests {
     async fn run_with_guards_without_timeout_or_cancel_returns_inner_result() {
         let fut = async { Ok::<usize, anyhow::Error>(7) };
 
-        let result = run_with_guards(fut, None, None)
+        let result = run_with_guards(fut, None, None, None)
             .await
             .expect("expected success");
         assert_eq!(result, 7);
+    }
+
+    #[tokio::test]
+    async fn run_with_guards_shutdown_token_returns_cancel_error() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = run_with_guards(fut, None, None, Some(&shutdown))
+            .await
+            .expect_err("expected shutdown cancellation");
+        assert_eq!(err.to_string(), CANCELLED_BY_ADMIN_ERROR);
+    }
+
+    #[test]
+    fn execute_task_applies_timeout_to_whole_worker_transaction() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let execute_task_start = prod_source
+            .find("async fn execute_task(")
+            .expect("execute_task must exist");
+        let execute_bg_ddl_start = prod_source[execute_task_start..]
+            .find("async fn execute_bg_ddl_backfill(")
+            .map(|offset| execute_task_start + offset)
+            .expect("execute_bg_ddl_backfill must exist after execute_task");
+        let execute_task_source = &prod_source[execute_task_start..execute_bg_ddl_start];
+
+        assert!(
+            execute_task_source.contains("let task_timeout ="),
+            "execute_task must compute a task-scoped timeout"
+        );
+        assert!(
+            execute_task_source.contains("let _ = fut.await?;"),
+            "individual statements must execute without per-statement timeout wrapping"
+        );
+        assert!(
+            execute_task_source.contains("run_with_guards(")
+                && execute_task_source.contains("task_timeout,")
+                && execute_task_source.contains("cancel_signal.as_ref(),")
+                && execute_task_source.contains("shutdown_signal.as_ref(),"),
+            "execute_task must wrap the whole task future in run_with_guards"
+        );
+        assert!(
+            !execute_task_source.contains("run_with_guards(fut, stmt_timeout"),
+            "execute_task must not apply timeout per statement"
+        );
+    }
+
+    #[test]
+    fn worker_engine_shutdown_is_wired_into_run_loop_and_task_guards() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let run_fn = prod_source
+            .split("pub async fn run(&self)")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn tick(&self)").next())
+            .expect("engine.rs must define WorkerEngine::run before tick");
+
+        assert!(
+            run_fn.contains("_ = self.shutdown.cancelled()"),
+            "WorkerEngine::run must stop polling when shutdown is requested"
+        );
+        assert!(
+            prod_source.contains("Some(shutdown_signal.clone())")
+                && prod_source.contains("Some(shutdown_signal)).await"),
+            "worker task execution must propagate shutdown cancellation to running tasks"
+        );
+    }
+
+    #[test]
+    fn storage_size_scan_tracks_its_long_lived_read_transaction() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let scan_start = prod_source
+            .find("async fn execute_storage_size_scan(")
+            .expect("execute_storage_size_scan must exist");
+        let scan_end = prod_source[scan_start..]
+            .find("/// Enqueue a storage size scan task")
+            .map(|offset| scan_start + offset)
+            .expect("execute_storage_size_scan must appear before enqueue helper");
+        let scan_source = &prod_source[scan_start..scan_end];
+
+        assert!(
+            scan_source.contains("let mut txn = store.begin_optimistic().await?;"),
+            "storage size scan must keep its paginated snapshot in a single optimistic transaction"
+        );
+        assert!(
+            scan_source.contains("track_worker_txn(txn.start_timestamp().version())"),
+            "storage size scan must publish its long-lived scan transaction in the active txn registry"
+        );
+    }
+
+    #[test]
+    fn hnsw_startup_sweep_tracks_its_read_transaction() {
+        let source = include_str!("engine.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("engine.rs must contain #[cfg(test)]");
+        let fn_start = prod_source
+            .find("pub(crate) async fn enqueue_pending_hnsw_merges(")
+            .expect("enqueue_pending_hnsw_merges must exist");
+        let fn_end = prod_source[fn_start..]
+            .find("\npub")
+            .map(|offset| fn_start + offset)
+            .unwrap_or(prod_source.len());
+        let fn_source = &prod_source[fn_start..fn_end];
+
+        assert!(
+            fn_source.contains("track_worker_txn(txn.start_timestamp().version())"),
+            "HNSW startup sweep must publish its tenant snapshot in the active txn registry \
+             — the scan is proportional to tenant size and can outlive gc_life_time on large tenants"
+        );
     }
 
     #[test]
@@ -2124,6 +2339,7 @@ mod tests {
             &metrics,
             queue_key,
             entry.clone(),
+            CancellationToken::new(),
             |_store, _db_id, _run, _status, _msg, _start, _end| async {
                 Err(anyhow!("injected: TiKV write error in finalize_cron_run"))
             },

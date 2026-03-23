@@ -48,6 +48,7 @@ pub(crate) struct StatementRuntimeContext {
     pub tenant_keyspace: Arc<str>,
     pub database_id: u64,
     pub txn_snapshot_ts_version: Option<u64>,
+    pub session_txn_tracker: Option<Arc<crate::session_context::SessionTxnTracker>>,
     pub tikv_client: Option<Arc<TransactionClient>>,
     pub extension_txn_delta: Arc<crate::session_context::ExtensionTxnDelta>,
     pub extension_statement_state: Arc<crate::extensions::context::ExtensionStatementState>,
@@ -64,6 +65,7 @@ impl StatementRuntimeContext {
             tenant_keyspace: Arc::from(tenant_keyspace),
             database_id: session.current_database_id(),
             txn_snapshot_ts_version: session.active_txn_start_ts_version(),
+            session_txn_tracker: session.session_txn_tracker(),
             tikv_client,
             extension_txn_delta: session.extension_delta_snapshot(),
             extension_statement_state: Arc::new(
@@ -86,6 +88,7 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
     let tenant_keyspace = runtime.tenant_keyspace.clone();
     let database_id = runtime.database_id;
     let txn_snapshot_ts_version = runtime.txn_snapshot_ts_version;
+    let session_txn_tracker = runtime.session_txn_tracker.clone();
     let tikv_client = runtime.tikv_client.clone();
     let extension_txn_delta = runtime.extension_txn_delta.clone();
     let extension_statement_state = runtime.extension_statement_state.clone();
@@ -104,17 +107,20 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                             database_id,
                             crate::session_context::with_txn_snapshot_ts_version(
                                 txn_snapshot_ts_version,
-                                crate::session_context::with_extension_txn_delta(
-                                    extension_txn_delta,
-                                    crate::extensions::context::with_context_opts(
-                                        crate::extensions::context::ExtensionContextOpts::statement(
-                                            settings.is_superuser,
-                                            settings.bypass_rls,
-                                            tenant_keyspace.as_ref(),
-                                        )
-                                        .with_statement_state(extension_statement_state)
-                                        .with_tikv_client(tikv_client),
-                                        fut,
+                                crate::session_context::with_session_txn_tracker(
+                                    session_txn_tracker,
+                                    crate::session_context::with_extension_txn_delta(
+                                        extension_txn_delta,
+                                        crate::extensions::context::with_context_opts(
+                                            crate::extensions::context::ExtensionContextOpts::statement(
+                                                settings.is_superuser,
+                                                settings.bypass_rls,
+                                                tenant_keyspace.as_ref(),
+                                            )
+                                            .with_statement_state(extension_statement_state)
+                                            .with_tikv_client(tikv_client),
+                                            fut,
+                                        ),
                                     ),
                                 ),
                             ),
@@ -286,6 +292,7 @@ mod tests {
             tenant_keyspace: Arc::from("tenant_a"),
             database_id: 42,
             txn_snapshot_ts_version: Some(999),
+            session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
@@ -314,6 +321,34 @@ mod tests {
         assert_eq!(out.6, Some(999));
     }
 
+    #[test]
+    fn from_session_carries_gc_tracker_when_registry_is_enabled() {
+        let store = crate::storage::TikvStore::new_stub();
+        let keyspace = "runtime_ctx_tracker_tests".to_string();
+        let observability = crate::observability::registry().tenant(&keyspace);
+        let mut session = crate::sql::Session::new_with_user_and_database(
+            store,
+            observability,
+            "admin".to_string(),
+            true,
+            false,
+            77,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        session.set_active_txn_registry(Arc::new(
+            crate::worker::active_txn_registry::ActiveTxnRegistry::new(),
+        ));
+
+        let runtime = StatementRuntimeContext::from_session(&session, &keyspace, None);
+        assert!(
+            runtime.session_txn_tracker.is_some(),
+            "interactive statement runtime must carry the session GC tracker"
+        );
+    }
+
     #[tokio::test]
     async fn wrap_runtime_context_reuses_extension_statement_state_across_reentry() {
         let runtime = StatementRuntimeContext {
@@ -328,6 +363,7 @@ mod tests {
             tenant_keyspace: Arc::from("tenant_a"),
             database_id: 42,
             txn_snapshot_ts_version: Some(999),
+            session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
@@ -367,6 +403,7 @@ mod tests {
             tenant_keyspace: Arc::from("tenant_a"),
             database_id: 42,
             txn_snapshot_ts_version: Some(999),
+            session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(

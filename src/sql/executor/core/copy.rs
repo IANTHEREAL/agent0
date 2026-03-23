@@ -731,7 +731,9 @@ impl Executor {
                 // Transaction rotation every commit_size rows
                 if batch_writes >= commit_size {
                     txn.commit().await?;
-                    *txn = self.store.begin().await?;
+                    crate::session_context::clear_current_session_txn_registration();
+                    crate::session_context::begin_replacement_session_owned_txn(&self.store, txn)
+                        .await?;
                     batch_writes = 0;
                     tracing::info!(
                         "COPY FROM PARQUET: {} rows imported (committed) into {}",
@@ -797,5 +799,39 @@ mod tests {
     fn batch_error_non_row_has_no_offset() {
         let err = CopyInsertBatchError::non_row(anyhow::anyhow!("test"));
         assert_eq!(err.failed_row_offset(), None);
+    }
+
+    #[test]
+    fn parquet_rotation_rebinds_session_gc_registration_via_shared_helper() {
+        let source = include_str!("copy.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("copy.rs must contain test module marker");
+        let parquet_fn = prod_source
+            .split("pub async fn execute_copy_from_parquet")
+            .nth(1)
+            .expect("copy.rs must define execute_copy_from_parquet");
+
+        let commit_pos = parquet_fn
+            .find("txn.commit().await?;")
+            .expect("parquet rotation must commit the old transaction");
+        let clear_pos = parquet_fn
+            .find("crate::session_context::clear_current_session_txn_registration();")
+            .expect("parquet rotation must clear the old session registration");
+        let begin_pos = parquet_fn
+            .find("crate::session_context::begin_replacement_session_owned_txn(&self.store, txn)")
+            .expect(
+                "parquet rotation must begin the replacement transaction via the shared helper",
+            );
+
+        assert!(
+            commit_pos < clear_pos && clear_pos < begin_pos,
+            "parquet rotation must clear the stale session registration after commit and before opening the replacement transaction"
+        );
+        assert!(
+            !parquet_fn.contains("*txn = self.store.begin().await?;"),
+            "parquet rotation must not bypass the shared session-owned txn replacement helper"
+        );
     }
 }

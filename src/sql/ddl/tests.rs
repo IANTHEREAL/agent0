@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::worker::types::IndexState;
+use std::sync::Arc;
 
 fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
     use sqlparser::dialect::PostgreSqlDialect;
@@ -257,6 +258,70 @@ fn test_legacy_scan_excludes_owning_table() {
         "t1_pkey",
         Some("public.t1"),
     ));
+}
+
+#[tokio::test]
+async fn session_txn_tracker_refresh_overwrites_previous_start_ts() {
+    let registry = Arc::new(crate::worker::active_txn_registry::ActiveTxnRegistry::new());
+    let tracker = Arc::new(crate::session_context::SessionTxnTracker::new(
+        42,
+        registry.clone(),
+    ));
+
+    crate::session_context::with_session_txn_tracker(Some(tracker), async {
+        crate::session_context::current_session_txn_tracker()
+            .expect("tracker must be scoped")
+            .refresh(100);
+        assert_eq!(registry.min_start_ts(), Some(100));
+
+        crate::session_context::current_session_txn_tracker()
+            .expect("tracker must still be scoped")
+            .refresh(250);
+        assert_eq!(registry.min_start_ts(), Some(250));
+
+        crate::session_context::current_session_txn_tracker()
+            .expect("tracker must still be scoped")
+            .clear();
+        assert_eq!(registry.min_start_ts(), None);
+    })
+    .await;
+}
+
+#[test]
+fn maybe_rotate_backfill_txn_clears_then_refreshes_session_registration() {
+    let source = include_str!("mod.rs");
+    let prod_source = source
+        .split("// ── Parse foreign key action")
+        .next()
+        .expect("ddl/mod.rs must contain parse_referential_action marker");
+    let rotate_fn = prod_source
+        .split("pub(super) async fn maybe_rotate_backfill_txn")
+        .nth(1)
+        .and_then(|rest| rest.split("pub(super) fn track_active_worker_txn").next())
+        .expect("ddl/mod.rs must define maybe_rotate_backfill_txn before track_active_worker_txn");
+
+    let commit_pos = rotate_fn
+        .find("txn.commit().await?")
+        .expect("rotation helper must commit the old transaction");
+    let clear_pos = rotate_fn
+        .find("crate::session_context::clear_current_session_txn_registration();")
+        .expect("rotation helper must clear the old session registration");
+    let begin_pos = rotate_fn
+        .find("crate::session_context::begin_replacement_session_owned_txn(store, txn).await?;")
+        .expect("rotation helper must start a fresh transaction via the shared helper");
+    let worker_guard_pos = rotate_fn
+        .find("*txn_guard = track_active_worker_txn(txn);")
+        .expect("rotation helper must refresh the worker txn guard for the new transaction");
+
+    assert!(
+        commit_pos < clear_pos && clear_pos < begin_pos && begin_pos < worker_guard_pos,
+        "rotation helper must clear the old session registration after commit, reopen the session-owned txn via the shared helper, then track the new worker txn"
+    );
+    assert!(
+        !rotate_fn.contains("refresh_active_session_txn_registration(txn);")
+            && !rotate_fn.contains("*txn = store.begin().await?;"),
+        "rotation helper must not inline session GC re-registration logic outside the shared helper"
+    );
 }
 
 #[test]
