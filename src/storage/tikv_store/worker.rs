@@ -472,6 +472,17 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Delete a GC instance state record from the shared registry.
+    pub async fn delete_gc_instance_state(
+        &self,
+        txn: &mut Transaction,
+        instance_id: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_gc_instance_state_key(instance_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
     /// Scan all GC instance states from the shared registry.
     pub async fn scan_gc_instance_states(
         &self,

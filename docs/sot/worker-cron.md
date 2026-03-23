@@ -32,6 +32,7 @@
   - The GC registry publishes only `updated_at_version` and optional `min_start_ts`.
   - The safepoint advancer computes `min(time_based_gc_life_time, min_live_instance_min_start_ts - 1)`.
   - Worker SQL task timeouts are execution limits only; they are not safepoint inputs.
+  - GC registry rows whose heartbeat ages past `gc_life_time` MUST be ignored for safepoint calculation and reaped from the shared registry.
   - Evidence: `src/worker/active_txn_registry.rs`, `src/worker/gc.rs`, `src/worker/engine.rs`.
 
 - **[Stable] Shipped task types**

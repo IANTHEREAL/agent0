@@ -17,6 +17,10 @@ use tracing::{debug, info, warn};
 /// tikv-client timeout API so GC gets a bounded wait on a dedicated TSO stream
 /// without disturbing the shared timestamp stream used by foreground traffic.
 const TSO_TIMEOUT_SEC: u64 = 30;
+/// Total wall-clock bound for GC safepoint updates, including any internal
+/// PD-client retries. This keeps the advancer loop from getting wedged on a
+/// long retry storm even though individual PD requests already have timeouts.
+const SAFEPOINT_UPDATE_TIMEOUT_SEC: u64 = 30;
 
 pub struct WorkerGc {
     system_store: Arc<TikvStore>,
@@ -101,8 +105,22 @@ pub async fn run_gc_publisher_loop(store: &TikvStore, config: &WorkerConfig) {
     let mut interval = tokio::time::interval(Duration::from_secs(config.gc_safepoint_interval_sec));
     loop {
         interval.tick().await;
-        if let Err(e) = publish_gc_instance_state(store, config).await {
-            warn!("GC registry publish failed: {}", e);
+        match publish_gc_instance_state(store, config).await {
+            Ok(current_version) => {
+                if !config.gc_safepoint_enabled {
+                    if let Err(e) = reap_stale_gc_instance_states(
+                        store,
+                        current_version,
+                        config.gc_life_time_sec,
+                        "publisher",
+                    )
+                    .await
+                    {
+                        warn!("GC registry stale-state reap failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("GC registry publish failed: {}", e),
         }
     }
 }
@@ -135,7 +153,7 @@ pub async fn run_gc_advancer_loop(
     }
 }
 
-async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<()> {
+async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<u64> {
     let client = store
         .transaction_client()
         .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
@@ -158,7 +176,7 @@ async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> 
         )
         .await?;
     txn.commit().await?;
-    Ok(())
+    Ok(current_ts.version())
 }
 
 async fn advance_gc_safepoint(
@@ -213,6 +231,18 @@ async fn advance_gc_safepoint(
         }
     }
 
+    if let Err(e) = reap_stale_gc_instance_states_from_scan(
+        store,
+        current_version,
+        config.gc_life_time_sec,
+        &all_states,
+        "advancer",
+    )
+    .await
+    {
+        warn!("GC registry stale-state reap failed: {}", e);
+    }
+
     if safepoint_version == 0 {
         info!("GC safepoint would be 0; skipping (cluster just started?)");
         return Ok(());
@@ -225,8 +255,13 @@ async fn advance_gc_safepoint(
     // to call from multiple db9 instances concurrently.
     // update_safepoint returns true if PD accepted our exact proposal,
     // false if PD already had a higher value (another instance advanced it).
-    match client.update_safepoint(safepoint).await {
-        Ok(accepted) => {
+    match tokio::time::timeout(
+        Duration::from_secs(SAFEPOINT_UPDATE_TIMEOUT_SEC),
+        client.update_safepoint(safepoint),
+    )
+    .await
+    {
+        Ok(Ok(accepted)) => {
             if accepted {
                 metrics
                     .gc_safepoint_last_version
@@ -247,7 +282,11 @@ async fn advance_gc_safepoint(
             }
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!("update_safepoint failed: {}", e)),
+        Ok(Err(e)) => Err(anyhow::anyhow!("update_safepoint failed: {}", e)),
+        Err(_) => Err(anyhow::anyhow!(
+            "update_safepoint timed out after {}s",
+            SAFEPOINT_UPDATE_TIMEOUT_SEC
+        )),
     }
 }
 
@@ -475,6 +514,18 @@ pub(crate) fn is_live_gc_instance_state(
     state.updated_at_version >= compute_safepoint_version(current_version, life_time_sec)
 }
 
+fn stale_gc_instance_ids(
+    current_version: u64,
+    life_time_sec: u64,
+    states: &[GcInstanceState],
+) -> Vec<String> {
+    states
+        .iter()
+        .filter(|state| !is_live_gc_instance_state(current_version, life_time_sec, state))
+        .map(|state| state.instance_id.clone())
+        .collect()
+}
+
 pub(crate) fn compute_cluster_gc_safepoint(
     current_version: u64,
     life_time_sec: u64,
@@ -490,6 +541,56 @@ pub(crate) fn compute_cluster_gc_safepoint(
         }
     }
     safepoint
+}
+
+async fn reap_stale_gc_instance_states(
+    store: &TikvStore,
+    current_version: u64,
+    life_time_sec: u64,
+    trigger: &'static str,
+) -> Result<usize> {
+    let all_states = {
+        let mut txn = store.begin().await?;
+        let states = store.scan_gc_instance_states(&mut txn).await?;
+        txn.rollback().await.ok();
+        states
+    };
+    reap_stale_gc_instance_states_from_scan(
+        store,
+        current_version,
+        life_time_sec,
+        &all_states,
+        trigger,
+    )
+    .await
+}
+
+async fn reap_stale_gc_instance_states_from_scan(
+    store: &TikvStore,
+    current_version: u64,
+    life_time_sec: u64,
+    states: &[GcInstanceState],
+    trigger: &'static str,
+) -> Result<usize> {
+    let stale_ids = stale_gc_instance_ids(current_version, life_time_sec, states);
+    if stale_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut txn = store.begin().await?;
+    for instance_id in &stale_ids {
+        store
+            .delete_gc_instance_state(&mut txn, instance_id)
+            .await?;
+    }
+    txn.commit().await?;
+
+    info!(
+        trigger,
+        deleted = stale_ids.len(),
+        "GC registry reaped stale instance state rows"
+    );
+    Ok(stale_ids.len())
 }
 
 /// Generate random jitter in seconds (0..max_secs) using time-based seed.
@@ -603,6 +704,33 @@ mod tests {
         assert_eq!(
             compute_cluster_gc_safepoint(current_version, life_time_sec, &states),
             ((9_300_000u64 << 18) + 9).saturating_sub(1)
+        );
+    }
+
+    #[test]
+    fn stale_gc_instance_ids_only_returns_stale_rows() {
+        let current_version = 10_000_000u64 << 18;
+        let life_time_sec = 600;
+        let live_updated_at = current_version;
+        let stale_updated_at =
+            compute_safepoint_version(current_version, life_time_sec).saturating_sub(1);
+
+        let states = vec![
+            GcInstanceState {
+                instance_id: "live".to_string(),
+                min_start_ts: None,
+                updated_at_version: live_updated_at,
+            },
+            GcInstanceState {
+                instance_id: "stale".to_string(),
+                min_start_ts: Some((9_300_000u64 << 18) + 9),
+                updated_at_version: stale_updated_at,
+            },
+        ];
+
+        assert_eq!(
+            stale_gc_instance_ids(current_version, life_time_sec, &states),
+            vec!["stale".to_string()]
         );
     }
 
@@ -724,6 +852,24 @@ mod tests {
             !prod_source.contains("tokio::time::timeout(\n        Duration::from_secs(TSO_TIMEOUT_SEC),\n        client.current_timestamp(),"),
             "gc.rs must not wrap client.current_timestamp() directly; that bypasses \
              the dedicated timed TSO path"
+        );
+    }
+
+    #[test]
+    fn gc_update_safepoint_has_total_timeout_bound() {
+        let source = include_str!("gc.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs must contain #[cfg(test)]");
+        assert!(
+            prod_source.contains("SAFEPOINT_UPDATE_TIMEOUT_SEC"),
+            "gc.rs must define an explicit total timeout for update_safepoint"
+        );
+        assert!(
+            prod_source.contains("tokio::time::timeout(")
+                && prod_source.contains("client.update_safepoint(safepoint)"),
+            "gc.rs must bound update_safepoint with an outer timeout"
         );
     }
 
