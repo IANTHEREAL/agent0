@@ -578,19 +578,33 @@ async fn reap_stale_gc_instance_states_from_scan(
     }
 
     let mut txn = store.begin().await?;
+    let mut deleted = 0usize;
     for instance_id in &stale_ids {
+        let Some(current_state) = store
+            .get_gc_instance_state_for_update(&mut txn, instance_id)
+            .await?
+        else {
+            continue;
+        };
+        if is_live_gc_instance_state(current_version, life_time_sec, &current_state) {
+            continue;
+        }
         store
             .delete_gc_instance_state(&mut txn, instance_id)
             .await?;
+        deleted += 1;
     }
-    txn.commit().await?;
+    if deleted > 0 {
+        txn.commit().await?;
+    } else {
+        txn.rollback().await.ok();
+    }
 
     info!(
         trigger,
-        deleted = stale_ids.len(),
-        "GC registry reaped stale instance state rows"
+        deleted, "GC registry reaped stale instance state rows"
     );
-    Ok(stale_ids.len())
+    Ok(deleted)
 }
 
 /// Generate random jitter in seconds (0..max_secs) using time-based seed.
@@ -870,6 +884,19 @@ mod tests {
             prod_source.contains("tokio::time::timeout(")
                 && prod_source.contains("client.update_safepoint(safepoint)"),
             "gc.rs must bound update_safepoint with an outer timeout"
+        );
+    }
+
+    #[test]
+    fn gc_stale_reaper_rechecks_current_row_before_delete() {
+        let source = include_str!("gc.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs must contain #[cfg(test)]");
+        assert!(
+            prod_source.contains("get_gc_instance_state_for_update"),
+            "gc.rs stale-row reaping must re-read the current row under lock before delete"
         );
     }
 

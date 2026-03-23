@@ -124,7 +124,7 @@
 | `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Independent cadence for HNSW delta sweep/enqueue. |
 | `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | `src/worker/config.rs` | Keyspace holding background task metadata. |
 | `DB9_GC_SAFEPOINT_ENABLED` | `true` | `src/worker/config.rs`, `src/worker/gc.rs` | Enables PD safepoint advancement. |
-| `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`; must remain below `DB9_GC_LIFE_TIME_SEC` when enabled. |
+| `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`; must remain below `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node because GC registry heartbeats are unconditional. |
 | `DB9_GC_LIFE_TIME_SEC` | `86400` | `src/worker/config.rs`, `src/worker/gc.rs` | MVCC retention window for time-based safepoint calculation. Active transactions are protected by direct registry tracking, not by this timeout; GC registry heartbeats older than this window are ignored and reaped. |
 | `DB9_CRON_ENABLED` | `true` | `src/cron/config.rs` | Master switch for cron scheduling. |
 | `DB9_CRON_POLL_MS` | `60000` | `src/cron/config.rs` | Values below default are clamped up to `60000`. |

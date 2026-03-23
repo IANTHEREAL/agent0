@@ -303,10 +303,10 @@ impl WorkerConfig {
 
     /// Validate GC configuration invariants.
     pub fn validate_gc_config(&self) {
-        if self.gc_safepoint_enabled && self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
+        if self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
             panic!(
                 "UNSAFE CONFIG: DB9_GC_SAFEPOINT_INTERVAL_SEC ({}) >= DB9_GC_LIFE_TIME_SEC ({}). \
-                 The advancement interval must be shorter than the retention window.",
+                 The GC registry heartbeat interval must be shorter than the retention window.",
                 self.gc_safepoint_interval_sec, self.gc_life_time_sec,
             );
         }
@@ -702,14 +702,15 @@ mod tests {
     }
 
     #[test]
-    fn gc_config_interval_check_skipped_when_advancer_disabled() {
+    #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_interval_ge_life_time_when_advancer_disabled() {
         let cfg = WorkerConfig {
             gc_safepoint_enabled: false,
             gc_safepoint_interval_sec: 86400,
             gc_life_time_sec: 86400,
             ..Default::default()
         };
-        cfg.validate_gc_config(); // should not panic
+        cfg.validate_gc_config();
     }
 
     #[test]

@@ -483,6 +483,27 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Lock and read a GC instance state record by instance ID.
+    pub async fn get_gc_instance_state_for_update(
+        &self,
+        txn: &mut Transaction,
+        instance_id: &str,
+    ) -> Result<Option<GcInstanceState>> {
+        let key = self.key(&encode_gc_instance_state_key(instance_id));
+        let Some(data) = tikv_op!(txn.get_for_update(key).await)? else {
+            return Ok(None);
+        };
+        Ok(
+            decode_gc_instance_state_value(&data).map(|(min_start_ts, updated_at_version)| {
+                GcInstanceState {
+                    instance_id: instance_id.to_string(),
+                    min_start_ts,
+                    updated_at_version,
+                }
+            }),
+        )
+    }
+
     /// Scan all GC instance states from the shared registry.
     pub async fn scan_gc_instance_states(
         &self,

@@ -246,7 +246,7 @@ All settings are controlled via environment variables. Every setting has a sensi
 | `DB9_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE on modified tables. |
 | `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | Base threshold for auto-ANALYZE (formula: threshold + 0.1 × row_count). |
 | `DB9_GC_SAFEPOINT_ENABLED` | `true` | Enable PD GC safepoint advancement. |
-| `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | GC safepoint publish/advance interval (5 minutes). |
+| `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | GC safepoint publish/advance interval (5 minutes). Must stay below `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node, even if local safepoint advancement is disabled. |
 | `DB9_GC_LIFE_TIME_SEC` | `86400` | Time-based MVCC retention window (24 hours). Active transactions are protected by direct registry tracking; GC registry heartbeats older than this window are treated as stale and reaped. |
 
 ### Deployment Scenarios
@@ -334,6 +334,7 @@ Every SQL-serving db9 process publishes a heartbeat plus the minimum start times
 This means GC safety is based on real transaction liveness, not on worker timeout guesses. `DB9_WORKER_STATEMENT_TIMEOUT_MS` and `DB9_CRON_JOB_TIMEOUT_MS` still limit task runtime, but they are no longer inputs to safepoint calculation.
 
 Heartbeat rows whose `updated_at_version` ages past `DB9_GC_LIFE_TIME_SEC` are treated as stale, ignored for safepoint calculation, and automatically reaped from `_sys_worker`.
+Because the publisher is unconditional, `DB9_GC_SAFEPOINT_INTERVAL_SEC` must remain smaller than `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node, not only on nodes that advance the safepoint.
 
 ---
 
