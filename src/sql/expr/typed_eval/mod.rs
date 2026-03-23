@@ -102,16 +102,36 @@ pub(crate) fn eval_const_usize(expr: &TypedExpr, null_as_zero: bool) -> Result<u
     }
 }
 
-/// Like `eval_const_usize`, but returns `Ok(None)` for NULL
-/// (PG parity: NULL = ALL/no-bound for LIMIT/OFFSET).
+/// Runtime-evaluable LIMIT/OFFSET bound that supports parameter expressions.
 ///
-/// Recursively unwraps CAST chains so nested forms like `NULL::int8::int8`
-/// also return `None`.
-pub(crate) fn eval_const_limit_bound(expr: &TypedExpr) -> Result<Option<usize>> {
-    match &expr.kind {
-        TypedExprKind::Constant(Value::Null) => Ok(None),
-        TypedExprKind::Cast { expr: inner, .. } => eval_const_limit_bound(inner),
-        _ => eval_const_usize(expr, false).map(Some),
+/// Unlike the former `eval_const_usize` (which only handles constants), this
+/// evaluates the expression against the provided `QueryContext`, resolving
+/// bound parameters at execution time. Returns `Ok(None)` for NULL
+/// (PG parity: NULL = ALL/no-bound for LIMIT, NULL = 0 for OFFSET).
+pub(crate) fn eval_limit_bound(expr: &TypedExpr, qctx: &QueryContext) -> Result<Option<usize>> {
+    let value = eval_typed_expr(expr, &Row::new(vec![]), qctx)?;
+    match value {
+        Value::Int32(v) => {
+            if v < 0 {
+                Err(anyhow!("LIMIT/OFFSET must not be negative"))
+            } else {
+                Ok(Some(v as usize))
+            }
+        }
+        Value::Int64(v) => {
+            if v < 0 {
+                Err(anyhow!("LIMIT/OFFSET must not be negative"))
+            } else {
+                usize::try_from(v)
+                    .map(Some)
+                    .map_err(|_| anyhow!("LIMIT/OFFSET value is too large"))
+            }
+        }
+        Value::Null => Ok(None),
+        other => Err(anyhow!(
+            "LIMIT/OFFSET must evaluate to a non-negative integer, got: {:?}",
+            other
+        )),
     }
 }
 

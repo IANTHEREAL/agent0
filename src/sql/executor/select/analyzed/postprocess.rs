@@ -16,8 +16,9 @@ use crate::sql::analyzer::types::{
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::traverse::for_each_child;
-use crate::sql::expr::typed_eval::eval_const_limit_bound;
+use crate::sql::expr::typed_eval::eval_limit_bound;
 use crate::sql::optimizer::BuildContext;
+use crate::sql::query_context::QueryContext;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::CastContext;
 
@@ -50,6 +51,9 @@ impl Executor {
             return Ok((rows, false));
         }
         let deferred_bounds_present = deferred_limit.is_some();
+
+        // Obtain QueryContext for runtime parameter evaluation in LIMIT/OFFSET.
+        let qctx = QueryContext::from_task_locals();
 
         // Extract lock properties.
         let has_skip_locked = has_skip_locked_clause(locks);
@@ -85,13 +89,13 @@ impl Executor {
             let limit = deferred_limit
                 .as_ref()
                 .and_then(|(l, _)| l.as_ref())
-                .map(eval_const_limit_bound)
+                .map(|e| eval_limit_bound(e, &qctx))
                 .transpose()?
                 .flatten();
             let offset = deferred_limit
                 .as_ref()
                 .and_then(|(_, o)| o.as_ref())
-                .map(eval_const_limit_bound)
+                .map(|e| eval_limit_bound(e, &qctx))
                 .transpose()?
                 .flatten()
                 .unwrap_or(0);
@@ -114,12 +118,12 @@ impl Executor {
             if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
                 let limit = limit_expr
                     .as_ref()
-                    .map(eval_const_limit_bound)
+                    .map(|e| eval_limit_bound(e, &qctx))
                     .transpose()?
                     .flatten();
                 let offset = offset_expr
                     .as_ref()
-                    .map(eval_const_limit_bound)
+                    .map(|e| eval_limit_bound(e, &qctx))
                     .transpose()?
                     .flatten()
                     .unwrap_or(0);

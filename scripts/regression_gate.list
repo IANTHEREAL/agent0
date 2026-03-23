@@ -231,6 +231,8 @@ tests/1662_reset_quoted_all.sql
 tests/1810_rls_dml_enforcement.sql
 # P3-2 – RLS security barrier: user predicates cannot observe hidden rows
 tests/rls_security_barrier.sql
+# #605 – parameterized LIMIT/OFFSET in deferred-limit path (FOR UPDATE)
+tests/605_parameterized_limit_offset.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

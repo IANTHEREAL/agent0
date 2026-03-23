@@ -1,0 +1,15 @@
+# Test 1: Simple LIMIT $1 = 3
+(3 rows)
+
+# Test 2: LIMIT $1 OFFSET $2 = LIMIT 2 OFFSET 2
+(2 rows)
+
+# Test 3: LIMIT $1 FOR UPDATE = 2 rows
+# Test 4: LIMIT $1 OFFSET $2 FOR UPDATE = 2 rows
+# Test 5: LIMIT $1 FOR UPDATE SKIP LOCKED = 3 rows
+
+# Test 6: NULL param = all 5 rows
+(5 rows)
+
+# Test 7: Async projection (to_regtype) + LIMIT $1 OFFSET $2
+# Test 8: Async ORDER BY (to_regtype) + LIMIT $1 OFFSET $2
