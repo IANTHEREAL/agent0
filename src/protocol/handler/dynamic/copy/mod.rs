@@ -511,6 +511,7 @@ mod tests {
             tenant_keyspace: Arc::from("copy_tenant"),
             database_id: 88,
             txn_snapshot_ts_version: Some(1234),
+            session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((
                 HashSet::from(["embedding".to_string()]),
@@ -560,6 +561,7 @@ mod tests {
             tenant_keyspace: Arc::from("copy_tenant"),
             database_id: 88,
             txn_snapshot_ts_version: Some(1234),
+            session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(

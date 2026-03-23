@@ -455,6 +455,17 @@ impl Session {
         self.connection_id
     }
 
+    pub(crate) fn session_txn_tracker(
+        &self,
+    ) -> Option<Arc<crate::session_context::SessionTxnTracker>> {
+        self.active_txn_registry.as_ref().map(|registry| {
+            Arc::new(crate::session_context::SessionTxnTracker::new(
+                self.connection_id,
+                registry.clone(),
+            ))
+        })
+    }
+
     pub fn current_database_id(&self) -> u64 {
         self.current_database_id
     }

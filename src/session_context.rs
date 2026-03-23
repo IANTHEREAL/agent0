@@ -7,6 +7,33 @@ use crate::sql::DEFAULT_MAX_SORT_BYTES;
 /// Extension transaction delta snapshot: (created_set, dropped_set).
 pub type ExtensionTxnDelta = (HashSet<String>, HashSet<String>);
 
+#[derive(Clone)]
+pub struct SessionTxnTracker {
+    connection_id: i64,
+    registry: Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>,
+}
+
+impl SessionTxnTracker {
+    pub fn new(
+        connection_id: i64,
+        registry: Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>,
+    ) -> Self {
+        Self {
+            connection_id,
+            registry,
+        }
+    }
+
+    pub fn refresh(&self, start_ts_version: u64) {
+        self.registry
+            .register_connection(self.connection_id, start_ts_version);
+    }
+
+    pub fn clear(&self) {
+        self.registry.unregister_connection(self.connection_id);
+    }
+}
+
 tokio::task_local! {
     static TIMEZONE: Arc<str>;
 }
@@ -48,6 +75,10 @@ tokio::task_local! {
 //   state (autocommit).
 tokio::task_local! {
     static EXTENSION_TXN_DELTA: Arc<ExtensionTxnDelta>;
+}
+
+tokio::task_local! {
+    static SESSION_TXN_TRACKER: Option<Arc<SessionTxnTracker>>;
 }
 
 fn utc_arc() -> Arc<str> {
@@ -207,6 +238,23 @@ where
     EXTENSION_TXN_DELTA.scope(delta, fut).await
 }
 
+pub async fn with_session_txn_tracker<R, Fut>(
+    tracker: Option<Arc<SessionTxnTracker>>,
+    fut: Fut,
+) -> R
+where
+    Fut: Future<Output = R>,
+{
+    SESSION_TXN_TRACKER.scope(tracker, fut).await
+}
+
+pub fn current_session_txn_tracker() -> Option<Arc<SessionTxnTracker>> {
+    SESSION_TXN_TRACKER
+        .try_with(|tracker| tracker.clone())
+        .ok()
+        .flatten()
+}
+
 /// Returns in-transaction extension status from DDL delta.
 /// - `Some(true)`: extension was created in current txn.
 /// - `Some(false)`: extension was dropped in current transaction scope.
@@ -288,5 +336,21 @@ mod tests {
         })
         .await;
         assert_eq!(got, Some(false));
+    }
+
+    #[tokio::test]
+    async fn session_txn_tracker_is_scoped() {
+        let tracker = Arc::new(super::SessionTxnTracker::new(
+            7,
+            Arc::new(crate::worker::active_txn_registry::ActiveTxnRegistry::new()),
+        ));
+        assert!(super::current_session_txn_tracker().is_none());
+        let seen = super::with_session_txn_tracker(Some(tracker.clone()), async {
+            super::current_session_txn_tracker()
+        })
+        .await;
+        assert!(seen.is_some());
+        assert!(Arc::ptr_eq(&seen.unwrap(), &tracker));
+        assert!(super::current_session_txn_tracker().is_none());
     }
 }

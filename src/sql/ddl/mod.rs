@@ -929,8 +929,13 @@ pub(super) async fn maybe_rotate_backfill_txn(
     }
 
     txn.commit().await?;
+    // Foreground rotating DDL/CTAS uses the session-owned transaction slot:
+    // clear the old connection registration once the old txn is committed, then
+    // refresh it to the new start_ts after we open the replacement txn.
+    clear_active_session_txn_registration();
     *txn_guard = None;
     *txn = store.begin().await?;
+    refresh_active_session_txn_registration(txn);
     *txn_guard = track_active_worker_txn(txn);
     *current_batch_writes = 0;
     *has_committed_batches = true;
@@ -942,6 +947,18 @@ pub(super) fn track_active_worker_txn(
 ) -> Option<crate::worker::active_txn_registry::ActiveTxnGuard> {
     crate::worker::active_txn_registry::global_registry()
         .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()))
+}
+
+pub(super) fn refresh_active_session_txn_registration(txn: &Transaction) {
+    if let Some(tracker) = crate::session_context::current_session_txn_tracker() {
+        tracker.refresh(txn.start_timestamp().version());
+    }
+}
+
+pub(super) fn clear_active_session_txn_registration() {
+    if let Some(tracker) = crate::session_context::current_session_txn_tracker() {
+        tracker.clear();
+    }
 }
 
 pub(super) fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Value> {
