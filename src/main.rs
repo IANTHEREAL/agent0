@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -252,34 +253,46 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         })?;
     worker::set_gc_registry_store(gc_store.clone());
 
-    // GC registry publisher — UNCONDITIONAL. Runs on every SQL-serving node.
-    // Publishes this instance's min_start_ts to _sys_worker every interval.
-    // This is NOT inside any if-block — it always runs.
-    {
-        let publisher_store = gc_store.clone();
-        let publisher_config = worker_config.clone();
-        tokio::spawn(async move {
-            worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config).await;
-        });
-        info!("GC registry publisher started (unconditional)");
-    }
-
     // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
     // the safepoint, another node in the cluster might. This only checks
     // structural GC invariants (for example interval < life_time); foreground
     // and worker transactions are protected by direct registry tracking.
     worker_config.validate_gc_config();
 
+    worker::gc::publish_gc_instance_state_once(&gc_store, &worker_config)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to publish GC registry state during startup: {}. \
+                 A SQL-serving db9 process must publish GC liveness before it accepts traffic.",
+                e
+            )
+        })?;
+    info!("GC registry startup publish completed");
+
+    // GC registry publisher — UNCONDITIONAL. Runs on every SQL-serving node.
+    // Publishes this instance's min_start_ts to _sys_worker every interval.
+    // This is NOT inside any if-block — it always runs.
+    let publisher_handle = {
+        let publisher_store = gc_store.clone();
+        let publisher_config = worker_config.clone();
+        let handle = tokio::spawn(async move {
+            worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config).await;
+        });
+        info!("GC registry publisher started (unconditional)");
+        handle
+    };
+
     // ================================================================
     // GC safepoint advancer: OPTIONAL — reads all instances' states
     // from shared registry, computes global min, advances PD safepoint.
     // ================================================================
-    if worker_config.gc_safepoint_enabled {
+    let advancer_handle = if worker_config.gc_safepoint_enabled {
         let advancer_store = gc_store.clone();
         let advancer_config = worker_config.clone();
         let advancer_metrics = Arc::new(worker::metrics::WorkerMetrics::new());
         let advancer_metrics_clone = advancer_metrics.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             worker::gc::run_gc_advancer_loop(
                 &advancer_store,
                 &advancer_config,
@@ -288,7 +301,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             .await;
         });
         info!("GC safepoint advancer started");
-    }
+        Some(handle)
+    } else {
+        None
+    };
 
     // ================================================================
     // Worker engine: OPTIONAL — cron, triggers, HNSW, DDL, BgSql.
@@ -326,7 +342,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             let gc = Arc::new(worker::gc::WorkerGc::new(
                 system_store,
                 client_pool.clone(),
-                worker_config,
+                worker_config.clone(),
                 metrics,
             ));
             gc.spawn_worker_gc_only();
@@ -453,8 +469,25 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let conn_semaphore = Arc::new(Semaphore::new(max_connections as usize));
     info!("Max connections: {}", max_connections);
 
-    loop {
-        let (socket, peer_addr) = listener.accept().await?;
+    let mut shutdown = std::pin::pin!(shutdown_signal());
+    let serve_result: Result<()> = loop {
+        let (socket, peer_addr) = tokio::select! {
+            shutdown_reason = &mut shutdown => {
+                match shutdown_reason {
+                    Ok(reason) => {
+                        info!("Shutdown signal received: {}", reason);
+                        break Ok(());
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok(connection) => connection,
+                    Err(e) => break Err(e.into()),
+                }
+            }
+        };
         let accept_config = server_config.read().unwrap().clone();
 
         if let Err(e) = configure_pgwire_socket_keepalive(&socket, &accept_config) {
@@ -497,7 +530,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                 tracing::error!("Connection error: {}", e);
             }
         });
-    }
+    };
+
+    shutdown_gc_runtime(&gc_store, &worker_config, publisher_handle, advancer_handle).await;
+    serve_result
 }
 
 fn configure_pgwire_socket_keepalive(
@@ -556,6 +592,53 @@ async fn reject_over_limit(mut socket: tokio::net::TcpStream) {
 
     let _ = socket.write_all(&msg).await;
     let _ = socket.shutdown().await;
+}
+
+async fn shutdown_gc_runtime(
+    gc_store: &storage::TikvStore,
+    worker_config: &worker::config::WorkerConfig,
+    publisher_handle: JoinHandle<()>,
+    advancer_handle: Option<JoinHandle<()>>,
+) {
+    abort_task("GC registry publisher", publisher_handle).await;
+    if let Some(handle) = advancer_handle {
+        abort_task("GC safepoint advancer", handle).await;
+    }
+
+    match worker::gc::clear_gc_instance_state(gc_store, worker_config).await {
+        Ok(()) => info!("Cleared local GC registry state during shutdown"),
+        Err(e) => warn!(
+            "Failed to clear local GC registry state during shutdown: {}",
+            e
+        ),
+    }
+}
+
+async fn abort_task(task_name: &str, handle: JoinHandle<()>) {
+    handle.abort();
+    match handle.await {
+        Ok(()) => info!("{} stopped", task_name),
+        Err(e) if e.is_cancelled() => info!("{} stopped", task_name),
+        Err(e) => warn!("{} join failed during shutdown: {}", task_name, e),
+    }
+}
+
+async fn shutdown_signal() -> Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Ok("SIGINT"),
+            _ = terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("ctrl_c")
+    }
 }
 
 #[cfg(test)]
@@ -692,5 +775,51 @@ mod tests {
         cfg.tcp_keepalive_idle_ms = 0;
         configure_pgwire_socket_keepalive(&server, &cfg).unwrap();
         assert!(!socket_ref.keepalive().unwrap());
+    }
+
+    #[test]
+    fn gc_startup_publish_happens_before_listener_accepts_connections() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let startup_publish = prod_source
+            .find("publish_gc_instance_state_once(&gc_store, &worker_config)")
+            .expect("main.rs must publish GC registry state during startup");
+        let listener_bind = prod_source
+            .find("let listener = TcpListener::bind")
+            .expect("main.rs must bind the pgwire listener");
+
+        assert!(
+            startup_publish < listener_bind,
+            "GC registry startup publish must complete before the server starts accepting SQL traffic"
+        );
+    }
+
+    #[test]
+    fn gc_shutdown_clears_local_state_after_stopping_gc_tasks() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let shutdown_fn = prod_source
+            .split("async fn shutdown_gc_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn abort_task").next())
+            .expect("main.rs must define shutdown_gc_runtime");
+
+        let publisher_abort = shutdown_fn
+            .find("abort_task(\"GC registry publisher\", publisher_handle)")
+            .expect("shutdown must stop the publisher loop");
+        let clear_state = shutdown_fn
+            .find("clear_gc_instance_state(gc_store, worker_config)")
+            .expect("shutdown must clear the local GC registry row");
+
+        assert!(
+            publisher_abort < clear_state,
+            "shutdown must stop GC loops before clearing the local GC registry row"
+        );
     }
 }

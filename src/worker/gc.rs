@@ -94,35 +94,39 @@ impl WorkerGc {
 /// GC registry publisher loop — UNCONDITIONAL for every SQL-serving process.
 /// Publishes this instance's min_start_ts to `_sys_worker` every interval.
 pub async fn run_gc_publisher_loop(store: &TikvStore, config: &WorkerConfig) {
-    let jitter = rand_jitter_secs(60);
-    tokio::time::sleep(Duration::from_secs(jitter)).await;
-
     info!(
         interval_sec = config.gc_safepoint_interval_sec,
         "GC registry publisher started (unconditional)"
     );
 
     let mut interval = tokio::time::interval(Duration::from_secs(config.gc_safepoint_interval_sec));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Startup publishes synchronously before we accept SQL traffic, so the
+    // periodic loop should wait one full interval before republishing.
+    interval.tick().await;
     loop {
         interval.tick().await;
-        match publish_gc_instance_state(store, config).await {
-            Ok(current_version) => {
-                if !config.gc_safepoint_enabled {
-                    if let Err(e) = reap_stale_gc_instance_states(
-                        store,
-                        current_version,
-                        config.gc_life_time_sec,
-                        "publisher",
-                    )
-                    .await
-                    {
-                        warn!("GC registry stale-state reap failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => warn!("GC registry publish failed: {}", e),
+        if let Err(e) = publish_gc_instance_state_once(store, config).await {
+            warn!("GC registry publish failed: {}", e);
         }
     }
+}
+
+/// Publish this process's GC registry row once.
+///
+/// Startup uses this synchronously before the SQL listener begins accepting
+/// connections so the process participates in cluster GC coordination from the
+/// first served transaction.
+pub async fn publish_gc_instance_state_once(
+    store: &TikvStore,
+    config: &WorkerConfig,
+) -> Result<()> {
+    let current_version = publish_gc_instance_state(store, config).await?;
+    if !config.gc_safepoint_enabled {
+        reap_stale_gc_instance_states(store, current_version, config.gc_life_time_sec, "publisher")
+            .await?;
+    }
+    Ok(())
 }
 
 /// GC safepoint advancer loop — OPTIONAL, controlled by gc_safepoint_enabled.
@@ -132,9 +136,6 @@ pub async fn run_gc_advancer_loop(
     config: &WorkerConfig,
     metrics: &WorkerMetrics,
 ) {
-    let jitter = rand_jitter_secs(60);
-    tokio::time::sleep(Duration::from_secs(jitter)).await;
-
     info!(
         interval_sec = config.gc_safepoint_interval_sec,
         life_time_sec = config.gc_life_time_sec,
@@ -142,6 +143,7 @@ pub async fn run_gc_advancer_loop(
     );
 
     let mut interval = tokio::time::interval(Duration::from_secs(config.gc_safepoint_interval_sec));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         if let Err(e) = advance_gc_safepoint(store, config, metrics).await {
@@ -151,6 +153,16 @@ pub async fn run_gc_advancer_loop(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Remove this process's GC registry row during graceful shutdown.
+pub async fn clear_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<()> {
+    let mut txn = store.begin().await?;
+    store
+        .delete_gc_instance_state(&mut txn, &config.gc_instance_id)
+        .await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<u64> {
@@ -897,6 +909,72 @@ mod tests {
         assert!(
             prod_source.contains("get_gc_instance_state_for_update"),
             "gc.rs stale-row reaping must re-read the current row under lock before delete"
+        );
+    }
+
+    #[test]
+    fn gc_registry_loops_do_not_add_startup_jitter() {
+        let source = include_str!("gc.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs must contain #[cfg(test)]");
+        let publisher_fn = prod_source
+            .split("pub async fn run_gc_publisher_loop")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub async fn publish_gc_instance_state_once")
+                    .next()
+            })
+            .expect(
+                "gc.rs must define run_gc_publisher_loop before publish_gc_instance_state_once",
+            );
+        let advancer_fn = prod_source
+            .split("pub async fn run_gc_advancer_loop")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// Remove this process's GC registry row")
+                    .next()
+            })
+            .expect("gc.rs must define run_gc_advancer_loop");
+
+        assert!(
+            !publisher_fn.contains("rand_jitter_secs"),
+            "GC registry publisher must not sleep behind startup jitter; heartbeat cadence is part of the safepoint contract"
+        );
+        assert!(
+            !advancer_fn.contains("rand_jitter_secs"),
+            "GC safepoint advancer must not sleep behind startup jitter; initial cadence must stay deterministic"
+        );
+    }
+
+    #[test]
+    fn gc_publisher_loop_waits_full_interval_after_startup_publish() {
+        let source = include_str!("gc.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs must contain #[cfg(test)]");
+        let publisher_fn = prod_source
+            .split("pub async fn run_gc_publisher_loop")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub async fn publish_gc_instance_state_once")
+                    .next()
+            })
+            .expect(
+                "gc.rs must define run_gc_publisher_loop before publish_gc_instance_state_once",
+            );
+
+        assert!(
+            publisher_fn.contains(
+                "interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);"
+            ),
+            "GC publisher loop must delay missed ticks instead of bursting multiple heartbeats"
+        );
+        assert!(
+            publisher_fn.matches("interval.tick().await").count() >= 2,
+            "GC publisher loop must consume the immediate tick so startup publish is followed by a full interval"
         );
     }
 

@@ -333,6 +333,8 @@ Every SQL-serving db9 process publishes a heartbeat plus the minimum start times
 
 This means GC safety is based on real transaction liveness, not on worker timeout guesses. `DB9_WORKER_STATEMENT_TIMEOUT_MS` and `DB9_CRON_JOB_TIMEOUT_MS` still limit task runtime, but they are no longer inputs to safepoint calculation.
 
+Startup publishes the local GC registry row before the pgwire listener accepts traffic, so the process is visible to cluster GC coordination from its first served transaction. On graceful shutdown, db9 stops the local GC loops and removes its own row; if a process crashes instead, stale-row reaping handles cleanup.
+
 Heartbeat rows whose `updated_at_version` ages past `DB9_GC_LIFE_TIME_SEC` are treated as stale, ignored for safepoint calculation, and automatically reaped from `_sys_worker`.
 Because the publisher is unconditional, `DB9_GC_SAFEPOINT_INTERVAL_SEC` must remain smaller than `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node, not only on nodes that advance the safepoint.
 

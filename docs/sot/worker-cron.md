@@ -25,6 +25,7 @@
 
 - **[Stable] GC registry participation is unconditional for SQL-serving processes**
   - Every db9 process that accepts SQL connections MUST publish its GC registry heartbeat and local `min_start_ts`, even when `DB9_WORKER_ENABLED=false`.
+  - Startup MUST publish the local GC registry row before the pgwire listener accepts traffic; the periodic publisher then maintains that row on a fixed cadence.
   - `DB9_WORKER_ENABLED` gates background task execution only; it does not opt a SQL-serving node out of safepoint coordination.
   - Therefore the shared GC publish interval MUST remain below `gc_life_time` for every SQL-serving node, not just for safepoint advancers.
   - Evidence: `src/main.rs`, `src/worker/gc.rs`, `src/worker/mod.rs`.
@@ -33,6 +34,7 @@
   - The GC registry publishes only `updated_at_version` and optional `min_start_ts`.
   - The safepoint advancer computes `min(time_based_gc_life_time, min_live_instance_min_start_ts - 1)`.
   - Worker SQL task timeouts are execution limits only; they are not safepoint inputs.
+  - Graceful shutdown MUST stop the local GC loops and delete the process's own GC registry row; crash recovery relies on stale-row reaping.
   - GC registry rows whose heartbeat ages past `gc_life_time` MUST be ignored for safepoint calculation and reaped from the shared registry.
   - Evidence: `src/worker/active_txn_registry.rs`, `src/worker/gc.rs`, `src/worker/engine.rs`.
 

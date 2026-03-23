@@ -34,7 +34,7 @@
     - `_sys_dbid_<u64be>`,
     - `_sys_format_version`,
     - system-worker metadata in the configured worker system keyspace,
-    - `_gc_instance_<gc_instance_id>` records in the worker system keyspace, encoded as `has_min:u8 + min_start_ts:u64be + updated_at_version:u64be`; stale rows older than the GC liveness window are reaped.
+    - `_gc_instance_<gc_instance_id>` records in the worker system keyspace, encoded as `has_min:u8 + min_start_ts:u64be + updated_at_version:u64be`; graceful shutdown deletes the local row and crash leftovers are reaped once they age past the GC liveness window.
   - Database-local metadata and data:
     - schema/catalog metadata (`sys_schema_*`, `sys_view_*`, `sys_seqdef_*`, `sys_ext_*`, comments, routines, types, cron metadata, stats),
     - table rows `t_{table_id}_...`,
