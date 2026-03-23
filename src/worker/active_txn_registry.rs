@@ -194,7 +194,7 @@ impl ActiveTxnRegistry {
         self.reap_quarantined_with_ttl(QUARANTINE_TTL)
     }
 
-    fn reap_quarantined_with_ttl(&self, ttl: Duration) -> usize {
+    pub(crate) fn reap_quarantined_with_ttl(&self, ttl: Duration) -> usize {
         let mut quarantined = self.quarantined.lock().expect("ActiveTxnRegistry poisoned");
         if quarantined.is_empty() {
             return 0;

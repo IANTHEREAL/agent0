@@ -360,9 +360,12 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         let publisher_store = gc_store.clone();
         let publisher_config = worker_config.clone();
         let handle = tokio::spawn(async move {
-            worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config).await;
+            supervised_background_loop("GC publisher", || {
+                worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config)
+            })
+            .await;
         });
-        info!("GC registry publisher started (unconditional)");
+        info!("GC registry publisher started (unconditional, supervised)");
         handle
     };
 
@@ -376,14 +379,16 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         let advancer_metrics = Arc::new(worker::metrics::WorkerMetrics::new());
         let advancer_metrics_clone = advancer_metrics.clone();
         let handle = tokio::spawn(async move {
-            worker::gc::run_gc_advancer_loop(
-                &advancer_store,
-                &advancer_config,
-                &advancer_metrics_clone,
-            )
+            supervised_background_loop("GC advancer", || {
+                worker::gc::run_gc_advancer_loop(
+                    &advancer_store,
+                    &advancer_config,
+                    &advancer_metrics_clone,
+                )
+            })
             .await;
         });
-        info!("GC safepoint advancer started");
+        info!("GC safepoint advancer started (supervised)");
         Some(handle)
     } else {
         None
@@ -754,6 +759,42 @@ async fn shutdown_gc_runtime(
     }
 }
 
+/// Restart-on-panic supervisor for infinite background loops.
+///
+/// Runs `make_fut()` repeatedly.  If the future panics or exits
+/// unexpectedly, logs an error and retries after a 5 s cooldown.
+/// This ensures a single transient panic does not permanently kill a
+/// critical background task (e.g., the GC publisher or advancer).
+async fn supervised_background_loop<F, Fut>(name: &str, make_fut: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures_util::FutureExt;
+
+    loop {
+        let result = std::panic::AssertUnwindSafe(make_fut())
+            .catch_unwind()
+            .await;
+        match result {
+            Ok(()) => {
+                tracing::error!("{name} loop exited unexpectedly; restarting in 5 s");
+            }
+            Err(panic) => {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "(non-string panic)".to_string()
+                };
+                tracing::error!("{name} loop panicked: {msg}; restarting in 5 s");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 async fn abort_task(task_name: &str, handle: JoinHandle<()>) {
     handle.abort();
     match handle.await {
@@ -993,6 +1034,35 @@ mod tests {
         assert!(
             shutdown_workers < shutdown_gc,
             "server shutdown must quiesce worker runtime before clearing the local GC registry row"
+        );
+    }
+
+    #[test]
+    fn gc_loops_are_supervised_with_panic_restart() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+
+        // Both GC loops must be wrapped in the supervised_background_loop supervisor.
+        assert!(
+            prod_source.contains("supervised_background_loop(\"GC publisher\""),
+            "GC publisher must be wrapped in supervised_background_loop for panic restart"
+        );
+        assert!(
+            prod_source.contains("supervised_background_loop(\"GC advancer\""),
+            "GC advancer must be wrapped in supervised_background_loop for panic restart"
+        );
+
+        // The supervisor must use catch_unwind (via FutureExt) to catch panics.
+        let supervisor_fn = prod_source
+            .split("async fn supervised_background_loop")
+            .nth(1)
+            .expect("main.rs must define supervised_background_loop");
+        assert!(
+            supervisor_fn.contains("catch_unwind"),
+            "supervised_background_loop must use catch_unwind to restart on panic"
         );
     }
 

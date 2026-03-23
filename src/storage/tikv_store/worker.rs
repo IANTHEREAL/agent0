@@ -6,6 +6,7 @@ const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
 const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
 
 /// Published GC instance state read back from `_sys_worker`.
+#[derive(Clone)]
 pub struct GcInstanceState {
     pub instance_id: String,
     pub min_start_ts: Option<u64>,

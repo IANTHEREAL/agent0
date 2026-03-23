@@ -1354,6 +1354,7 @@ dependencies = [
  "csv",
  "dashmap",
  "futures",
+ "futures-util",
  "globset",
  "hex",
  "hmac",

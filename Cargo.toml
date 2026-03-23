@@ -90,6 +90,7 @@ arrow = { version = "57", optional = true, default-features = false }
 arrow-array = { version = "57", optional = true }
 arrow-schema = { version = "57", optional = true }
 arrow-cast = { version = "57", optional = true }
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 
 [features]
 default = ["parquet"]

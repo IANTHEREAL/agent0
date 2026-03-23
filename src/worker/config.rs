@@ -301,13 +301,27 @@ impl WorkerConfig {
         cfg
     }
 
+    /// Minimum ratio of `gc_life_time_sec` to `gc_safepoint_interval_sec`.
+    /// At N=3, the system survives 2 consecutive missed heartbeats before
+    /// a row is considered stale by the advancer.
+    const MIN_LIFE_TIME_TO_INTERVAL_RATIO: u64 = 3;
+
     /// Validate GC configuration invariants.
     pub fn validate_gc_config(&self) {
-        if self.gc_safepoint_interval_sec >= self.gc_life_time_sec {
+        let min_life_time = self
+            .gc_safepoint_interval_sec
+            .saturating_mul(Self::MIN_LIFE_TIME_TO_INTERVAL_RATIO);
+        if self.gc_life_time_sec < min_life_time {
             panic!(
-                "UNSAFE CONFIG: DB9_GC_SAFEPOINT_INTERVAL_SEC ({}) >= DB9_GC_LIFE_TIME_SEC ({}). \
-                 The GC registry heartbeat interval must be shorter than the retention window.",
-                self.gc_safepoint_interval_sec, self.gc_life_time_sec,
+                "UNSAFE CONFIG: DB9_GC_LIFE_TIME_SEC ({}) < DB9_GC_SAFEPOINT_INTERVAL_SEC ({}) * {} = {}. \
+                 The GC retention window must be at least {}x the heartbeat interval \
+                 so that {} consecutive missed heartbeats do not expose live transactions to GC.",
+                self.gc_life_time_sec,
+                self.gc_safepoint_interval_sec,
+                Self::MIN_LIFE_TIME_TO_INTERVAL_RATIO,
+                min_life_time,
+                Self::MIN_LIFE_TIME_TO_INTERVAL_RATIO,
+                Self::MIN_LIFE_TIME_TO_INTERVAL_RATIO - 1,
             );
         }
     }
@@ -719,5 +733,39 @@ mod tests {
         assert!(cfg.gc_safepoint_enabled);
         assert_eq!(cfg.gc_safepoint_interval_sec, 300);
         assert_eq!(cfg.gc_life_time_sec, 86400);
+    }
+
+    #[test]
+    #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_single_missed_heartbeat_fatal_edge() {
+        // interval=599, life_time=600: a single missed publish makes the
+        // row stale after just 1 extra second.
+        let cfg = WorkerConfig {
+            gc_safepoint_interval_sec: 599,
+            gc_life_time_sec: 600,
+            ..Default::default()
+        };
+        cfg.validate_gc_config();
+    }
+
+    #[test]
+    fn gc_config_accepts_exactly_3x_ratio() {
+        let cfg = WorkerConfig {
+            gc_safepoint_interval_sec: 200,
+            gc_life_time_sec: 600, // exactly 3x
+            ..Default::default()
+        };
+        cfg.validate_gc_config(); // should not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "UNSAFE CONFIG")]
+    fn gc_config_rejects_just_below_3x_ratio() {
+        let cfg = WorkerConfig {
+            gc_safepoint_interval_sec: 201,
+            gc_life_time_sec: 600, // 600 < 201*3 = 603
+            ..Default::default()
+        };
+        cfg.validate_gc_config();
     }
 }
