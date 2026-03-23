@@ -166,7 +166,44 @@ pub async fn run_gc_advancer_loop(
 }
 
 /// Remove this process's GC registry row during graceful shutdown.
+///
+/// First publishes `min_start_ts = None` so the row stops clamping the
+/// cluster safepoint even if the subsequent delete fails (transient TiKV
+/// error, timeout).  A leaked row with `None` is harmless — the advancer
+/// skips it during safepoint computation and the stale-row reaper will
+/// eventually delete it.
 pub async fn clear_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<()> {
+    // Phase 1: neutralize — publish None so the row cannot pin GC.
+    let neutralize_result: Result<()> = async {
+        let client = store
+            .transaction_client()
+            .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
+        let current_ts = client
+            .current_timestamp_with_timeout(Duration::from_secs(TSO_TIMEOUT_SEC))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get shutdown timestamp from PD: {}", e))?;
+        let mut txn = store.begin().await?;
+        store
+            .put_gc_instance_state(
+                &mut txn,
+                &config.gc_instance_id,
+                None, // no min_start_ts — row cannot clamp safepoint
+                current_ts.version(),
+            )
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = &neutralize_result {
+        warn!(
+            "Failed to neutralize GC registry row during shutdown (will still attempt delete): {}",
+            e
+        );
+    }
+
+    // Phase 2: delete — best-effort removal of the row.
     let mut txn = store.begin().await?;
     store
         .delete_gc_instance_state(&mut txn, &config.gc_instance_id)
@@ -1154,5 +1191,34 @@ mod tests {
         assert_eq!(batches, 2, "must continue after first full capped batch");
         assert_eq!(cleaned, 1);
         assert_eq!(call_count, 2);
+    }
+
+    #[test]
+    fn clear_gc_instance_state_neutralizes_before_delete() {
+        let source = include_str!("gc.rs");
+        let clear_fn = source
+            .split("pub async fn clear_gc_instance_state")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub ").next())
+            .expect("gc.rs must define clear_gc_instance_state");
+
+        // Phase 1: must publish min_start_ts=None to neutralize the row.
+        let neutralize_pos = clear_fn
+            .find("put_gc_instance_state")
+            .expect("clear_gc_instance_state must publish a neutralizing heartbeat");
+        assert!(
+            clear_fn.contains("None, // no min_start_ts"),
+            "neutralizing publish must pass min_start_ts = None"
+        );
+
+        // Phase 2: must delete the row after neutralizing.
+        let delete_pos = clear_fn
+            .find("delete_gc_instance_state")
+            .expect("clear_gc_instance_state must delete the row");
+
+        assert!(
+            neutralize_pos < delete_pos,
+            "must neutralize (publish None) before deleting the row"
+        );
     }
 }
