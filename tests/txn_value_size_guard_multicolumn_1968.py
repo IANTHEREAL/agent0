@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Regression coverage for the KV value size guard (#1968 / PR #1979).
+Regression coverage for the KV value size guard (#1968) — multi-column variant.
 
-Validates that an oversized row write is rejected pre-flight with the new,
-actionable db9 error instead of surfacing TiKV's cryptic RaftEntryTooLarge
-commit-time failure.
+Validates that the guard fires when no single column exceeds the 8 MiB limit
+but the total encoded row does.  Each of the three TEXT columns carries ~3 MB,
+so the combined row (~9 MB) exceeds the default 8 MiB threshold.
 
 PostgreSQL divergence: PG 17.x accepts this INSERT because TOAST transparently
-out-of-lines large values.  db9 intentionally rejects it because TiKV enforces
-a raft-entry-max-size limit (8-16 MiB) on single KV values, and db9 has no
-TOAST equivalent.
+out-of-lines large column values.  db9 intentionally rejects it because TiKV
+enforces a raft-entry-max-size limit (8-16 MiB) on single KV values, and db9
+has no TOAST equivalent.
 """
 
 import argparse
@@ -19,12 +19,13 @@ import subprocess
 import time
 
 
-OVERSIZED_CHARS = 8_500_000
+# Each column ~3 MB; 3 columns total ≈ 9 MB, exceeds the 8 MiB guard.
+PER_COLUMN_CHARS = 3_000_000
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Regression coverage for the KV value size guard"
+        description="Multi-column regression coverage for the KV value size guard"
     )
     parser.add_argument(
         "--dsn",
@@ -73,7 +74,7 @@ def random_suffix() -> str:
 def main() -> int:
     args = parse_args()
     dsn = args.dsn
-    table_name = f"txn_value_guard_{random_suffix()}"
+    table_name = f"txn_vguard_multi_{random_suffix()}"
 
     print(f"[INFO] table={table_name}")
 
@@ -81,18 +82,32 @@ def main() -> int:
         run_sql(dsn, f"DROP TABLE IF EXISTS {table_name};")
         run_sql(
             dsn,
-            f"CREATE TABLE {table_name} (id INT PRIMARY KEY, payload TEXT NOT NULL);",
+            f"CREATE TABLE {table_name} ("
+            f"  id INT PRIMARY KEY,"
+            f"  col_a TEXT NOT NULL,"
+            f"  col_b TEXT NOT NULL,"
+            f"  col_c TEXT NOT NULL"
+            f");",
         )
 
-        run_sql(dsn, f"INSERT INTO {table_name} VALUES (1, 'ok');")
+        # ── Sanity: a small row succeeds ────────────────────────────
+        run_sql(dsn, f"INSERT INTO {table_name} VALUES (1, 'a', 'b', 'c');")
         count = run_sql(dsn, f"SELECT COUNT(*) FROM {table_name};")
         assert count == "1", f"expected 1 seeded row, got {count!r}"
 
-        # Use VERBOSITY verbose so psql includes SQLSTATE in error output.
-        # Must use stdin (-f -) because psql -c does not support \set.
+        # ── Oversized multi-column INSERT ───────────────────────────
+        # Each column: 3 000 000 bytes  ×  3 columns = 9 000 000 bytes.
+        # This exceeds the 8 MiB (8 388 608 bytes) default guard limit
+        # even though no single column alone would trigger it.
+        # Use VERBOSITY verbose via stdin so psql shows SQLSTATE in output.
         oversized_insert = (
             f"\\set VERBOSITY verbose\n"
-            f"INSERT INTO {table_name} VALUES (2, repeat('x', {OVERSIZED_CHARS}));\n"
+            f"INSERT INTO {table_name} VALUES ("
+            f"  2,"
+            f"  repeat('x', {PER_COLUMN_CHARS}),"
+            f"  repeat('y', {PER_COLUMN_CHARS}),"
+            f"  repeat('z', {PER_COLUMN_CHARS})"
+            f");\n"
         )
         result = subprocess.run(
             ["psql", dsn, "--no-psqlrc", "-A", "-t", "-q",
@@ -101,29 +116,33 @@ def main() -> int:
             capture_output=True, text=True, timeout=180,
         )
         if result.returncode == 0:
-            raise AssertionError("oversized insert unexpectedly succeeded")
+            raise AssertionError("oversized multi-column insert unexpectedly succeeded")
 
         stderr = (result.stderr or "").lower()
-        assert "value too large" in stderr, f"expected guard error, got: {result.stderr!r}"
-        assert "table row" in stderr, f"expected subsystem hint, got: {result.stderr!r}"
-        assert (
-            "db9_txn_value_size_limit_bytes" in stderr
-        ), f"expected env-var hint, got: {result.stderr!r}"
+        assert "value too large" in stderr, (
+            f"expected guard error, got: {result.stderr!r}"
+        )
+        assert "table row" in stderr, (
+            f"expected subsystem hint, got: {result.stderr!r}"
+        )
+        assert "db9_txn_value_size_limit_bytes" in stderr, (
+            f"expected env-var hint, got: {result.stderr!r}"
+        )
         assert "raftentrytoolarge" not in stderr, (
             "expected pre-flight db9 guard, not TiKV commit-time raft error: "
             f"{result.stderr!r}"
         )
-        # SQLSTATE 54000 (program_limit_exceeded) must appear in verbose output.
         assert "54000" in stderr, (
             f"expected SQLSTATE 54000 in verbose error output, got: {result.stderr!r}"
         )
 
+        # ── Verify no row was committed ─────────────────────────────
         count_after = run_sql(dsn, f"SELECT COUNT(*) FROM {table_name};")
         assert count_after == "1", (
             f"failed oversized insert must not commit a row, got count={count_after!r}"
         )
 
-        print("PASS: oversized row insert rejected by txn value size guard (SQLSTATE 54000)")
+        print("PASS: oversized multi-column row insert rejected by txn value size guard")
         return 0
     except AssertionError as exc:
         print(f"FAIL: assertion failed: {exc}")

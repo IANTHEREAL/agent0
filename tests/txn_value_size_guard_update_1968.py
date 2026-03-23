@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Regression coverage for the KV value size guard (#1968 / PR #1979).
+Regression coverage for the KV value size guard on UPDATE (#1968 / PR #1979).
 
-Validates that an oversized row write is rejected pre-flight with the new,
+Validates that an oversized row UPDATE is rejected pre-flight with the new,
 actionable db9 error instead of surfacing TiKV's cryptic RaftEntryTooLarge
-commit-time failure.
+commit-time failure.  Complements txn_value_size_guard_1968.py which covers
+INSERT.
 
-PostgreSQL divergence: PG 17.x accepts this INSERT because TOAST transparently
+PostgreSQL divergence: PG 17.x accepts this UPDATE because TOAST transparently
 out-of-lines large values.  db9 intentionally rejects it because TiKV enforces
 a raft-entry-max-size limit (8-16 MiB) on single KV values, and db9 has no
 TOAST equivalent.
@@ -24,7 +25,7 @@ OVERSIZED_CHARS = 8_500_000
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Regression coverage for the KV value size guard"
+        description="Regression coverage for the KV value size guard (UPDATE path)"
     )
     parser.add_argument(
         "--dsn",
@@ -73,35 +74,37 @@ def random_suffix() -> str:
 def main() -> int:
     args = parse_args()
     dsn = args.dsn
-    table_name = f"txn_value_guard_{random_suffix()}"
+    table_name = f"txn_value_guard_upd_{random_suffix()}"
 
     print(f"[INFO] table={table_name}")
 
     try:
+        # ── Setup ──────────────────────────────────────────────────────
         run_sql(dsn, f"DROP TABLE IF EXISTS {table_name};")
         run_sql(
             dsn,
             f"CREATE TABLE {table_name} (id INT PRIMARY KEY, payload TEXT NOT NULL);",
         )
 
-        run_sql(dsn, f"INSERT INTO {table_name} VALUES (1, 'ok');")
+        # Seed a small row that we will attempt to UPDATE with an oversized value.
+        run_sql(dsn, f"INSERT INTO {table_name} VALUES (1, 'small');")
         count = run_sql(dsn, f"SELECT COUNT(*) FROM {table_name};")
         assert count == "1", f"expected 1 seeded row, got {count!r}"
 
-        # Use VERBOSITY verbose so psql includes SQLSTATE in error output.
-        # Must use stdin (-f -) because psql -c does not support \set.
-        oversized_insert = (
+        # ── Oversized UPDATE ───────────────────────────────────────────
+        # Use VERBOSITY verbose via stdin so psql shows SQLSTATE in output.
+        oversized_update = (
             f"\\set VERBOSITY verbose\n"
-            f"INSERT INTO {table_name} VALUES (2, repeat('x', {OVERSIZED_CHARS}));\n"
+            f"UPDATE {table_name} SET payload = repeat('x', {OVERSIZED_CHARS}) WHERE id = 1;\n"
         )
         result = subprocess.run(
             ["psql", dsn, "--no-psqlrc", "-A", "-t", "-q",
              "-v", "ON_ERROR_STOP=1", "-f", "-"],
-            input=oversized_insert,
+            input=oversized_update,
             capture_output=True, text=True, timeout=180,
         )
         if result.returncode == 0:
-            raise AssertionError("oversized insert unexpectedly succeeded")
+            raise AssertionError("oversized update unexpectedly succeeded")
 
         stderr = (result.stderr or "").lower()
         assert "value too large" in stderr, f"expected guard error, got: {result.stderr!r}"
@@ -113,17 +116,22 @@ def main() -> int:
             "expected pre-flight db9 guard, not TiKV commit-time raft error: "
             f"{result.stderr!r}"
         )
-        # SQLSTATE 54000 (program_limit_exceeded) must appear in verbose output.
         assert "54000" in stderr, (
             f"expected SQLSTATE 54000 in verbose error output, got: {result.stderr!r}"
         )
 
-        count_after = run_sql(dsn, f"SELECT COUNT(*) FROM {table_name};")
-        assert count_after == "1", (
-            f"failed oversized insert must not commit a row, got count={count_after!r}"
+        # ── Verify original row is unchanged ───────────────────────────
+        payload_after = run_sql(dsn, f"SELECT payload FROM {table_name} WHERE id = 1;")
+        assert payload_after == "small", (
+            f"failed oversized update must not alter the row, got payload={payload_after!r}"
         )
 
-        print("PASS: oversized row insert rejected by txn value size guard (SQLSTATE 54000)")
+        count_after = run_sql(dsn, f"SELECT COUNT(*) FROM {table_name};")
+        assert count_after == "1", (
+            f"row count must remain 1 after failed update, got count={count_after!r}"
+        )
+
+        print("PASS: oversized row update rejected by txn value size guard")
         return 0
     except AssertionError as exc:
         print(f"FAIL: assertion failed: {exc}")
