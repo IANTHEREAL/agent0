@@ -32,7 +32,7 @@ impl WindowOperator {
                 if let Some(expr) = &wf.arg_expr {
                     let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if let Some(n) = self.value_to_decimal(&val) {
-                        sum += n;
+                        sum = crate::sql::expr::numeric::checked_decimal_add(sum, n)?;
                         has_value = true;
                     }
                 }
@@ -103,13 +103,13 @@ impl WindowOperator {
                 if let Some(expr) = &wf.arg_expr {
                     let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if let Some(n) = self.value_to_decimal(&val) {
-                        sum += n;
+                        sum = crate::sql::expr::numeric::checked_decimal_add(sum, n)?;
                         count += 1;
                     }
                 }
             }
             results[row_idx][wf_idx] = if count > 0 {
-                Value::Numeric(pg_numeric_div(sum, rust_decimal::Decimal::from(count)))
+                Value::Numeric(pg_numeric_div(sum, rust_decimal::Decimal::from(count))?)
             } else {
                 Value::Null
             };

@@ -5,6 +5,63 @@ use rust_decimal::Decimal;
 
 use crate::sql::pg_numeric::pg_numeric_div;
 
+// ── Checked Decimal arithmetic ──────────────────────────────────────
+//
+// `rust_decimal` v1.40 panics on overflow for +, -, *, /, %.
+// These helpers use the checked_* methods and return SQLSTATE 22003
+// (numeric_value_out_of_range) instead of crashing the server.
+
+#[inline]
+pub(crate) fn checked_decimal_add(a: Decimal, b: Decimal) -> Result<Decimal> {
+    a.checked_add(b).ok_or_else(|| {
+        SqlError::NumericValueOutOfRange {
+            message: "numeric field overflow: result of addition exceeds numeric capacity".into(),
+        }
+        .into()
+    })
+}
+
+#[inline]
+pub(crate) fn checked_decimal_sub(a: Decimal, b: Decimal) -> Result<Decimal> {
+    a.checked_sub(b).ok_or_else(|| {
+        SqlError::NumericValueOutOfRange {
+            message: "numeric field overflow: result of subtraction exceeds numeric capacity".into(),
+        }
+        .into()
+    })
+}
+
+#[inline]
+pub(crate) fn checked_decimal_mul(a: Decimal, b: Decimal) -> Result<Decimal> {
+    a.checked_mul(b).ok_or_else(|| {
+        SqlError::NumericValueOutOfRange {
+            message: "numeric field overflow: result of multiplication exceeds numeric capacity"
+                .into(),
+        }
+        .into()
+    })
+}
+
+#[inline]
+pub(crate) fn checked_decimal_div(a: Decimal, b: Decimal) -> Result<Decimal> {
+    a.checked_div(b).ok_or_else(|| {
+        SqlError::NumericValueOutOfRange {
+            message: "numeric field overflow: result of division exceeds numeric capacity".into(),
+        }
+        .into()
+    })
+}
+
+#[inline]
+pub(crate) fn checked_decimal_rem(a: Decimal, b: Decimal) -> Result<Decimal> {
+    a.checked_rem(b).ok_or_else(|| {
+        SqlError::NumericValueOutOfRange {
+            message: "numeric field overflow: result of modulo exceeds numeric capacity".into(),
+        }
+        .into()
+    })
+}
+
 #[derive(Debug, Clone)]
 pub enum NumericValue {
     Int32(i32),
@@ -128,14 +185,16 @@ impl NumericValue {
 pub fn numeric_add(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
-            Ok(NumericValue::Int32(a.wrapping_add(b)))
-        }
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
-            Ok(NumericValue::Int64(a.wrapping_add(b)))
-        }
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
+            .checked_add(b)
+            .map(NumericValue::Int32)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
+            .checked_add(b)
+            .map(NumericValue::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a + b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(a + b)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_add(a, b)?)),
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -143,14 +202,16 @@ pub fn numeric_add(left: NumericValue, right: NumericValue) -> Result<NumericVal
 pub fn numeric_sub(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
-            Ok(NumericValue::Int32(a.wrapping_sub(b)))
-        }
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
-            Ok(NumericValue::Int64(a.wrapping_sub(b)))
-        }
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
+            .checked_sub(b)
+            .map(NumericValue::Int32)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
+            .checked_sub(b)
+            .map(NumericValue::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a - b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(a - b)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_sub(a, b)?)),
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -158,14 +219,16 @@ pub fn numeric_sub(left: NumericValue, right: NumericValue) -> Result<NumericVal
 pub fn numeric_mul(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
-            Ok(NumericValue::Int32(a.wrapping_mul(b)))
-        }
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
-            Ok(NumericValue::Int64(a.wrapping_mul(b)))
-        }
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
+            .checked_mul(b)
+            .map(NumericValue::Int32)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
+            .checked_mul(b)
+            .map(NumericValue::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a * b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(a * b)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_mul(a, b)?)),
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -177,11 +240,17 @@ pub fn numeric_div(left: NumericValue, right: NumericValue) -> Result<NumericVal
 
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => Ok(NumericValue::Int32(a / b)),
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => Ok(NumericValue::Int64(a / b)),
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => a
+            .checked_div(b)
+            .map(NumericValue::Int32)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "integer out of range".into() }.into()),
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => a
+            .checked_div(b)
+            .map(NumericValue::Int64)
+            .ok_or_else(|| SqlError::NumericValueOutOfRange { message: "bigint out of range".into() }.into()),
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a / b)),
         (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
-            Ok(NumericValue::Decimal(pg_numeric_div(a, b)))
+            Ok(NumericValue::Decimal(pg_numeric_div(a, b)?))
         }
         _ => Err(anyhow!("type promotion failed")),
     }
@@ -194,10 +263,15 @@ pub fn numeric_mod(left: NumericValue, right: NumericValue) -> Result<NumericVal
 
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        (NumericValue::Int32(a), NumericValue::Int32(b)) => Ok(NumericValue::Int32(a % b)),
-        (NumericValue::Int64(a), NumericValue::Int64(b)) => Ok(NumericValue::Int64(a % b)),
+        // checked_rem returns None for MIN % -1, but PG returns 0.
+        (NumericValue::Int32(a), NumericValue::Int32(b)) => {
+            Ok(NumericValue::Int32(a.checked_rem(b).unwrap_or(0)))
+        }
+        (NumericValue::Int64(a), NumericValue::Int64(b)) => {
+            Ok(NumericValue::Int64(a.checked_rem(b).unwrap_or(0)))
+        }
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a % b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(a % b)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(checked_decimal_rem(a, b)?)),
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -309,5 +383,79 @@ mod tests {
             NumericValue::Decimal(d) => assert_eq!(d.to_string(), "0.33333333333333333333"),
             _ => panic!("expected Decimal"),
         }
+    }
+
+    // ── Overflow tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_decimal_add_overflow_returns_error() {
+        let max = NumericValue::Decimal(Decimal::MAX);
+        let one = NumericValue::Decimal(Decimal::ONE);
+        let err = numeric_add(max, one).unwrap_err();
+        assert!(err.to_string().contains("numeric field overflow"));
+    }
+
+    #[test]
+    fn test_decimal_sub_overflow_returns_error() {
+        let min = NumericValue::Decimal(Decimal::MIN);
+        let one = NumericValue::Decimal(Decimal::ONE);
+        let err = numeric_sub(min, one).unwrap_err();
+        assert!(err.to_string().contains("numeric field overflow"));
+    }
+
+    #[test]
+    fn test_decimal_mul_overflow_returns_error() {
+        let big = NumericValue::Decimal(Decimal::MAX);
+        let two = NumericValue::Decimal(Decimal::TWO);
+        let err = numeric_mul(big, two).unwrap_err();
+        assert!(err.to_string().contains("numeric field overflow"));
+    }
+
+    #[test]
+    fn test_decimal_div_overflow_returns_error() {
+        let max = NumericValue::Decimal(Decimal::MAX);
+        let half = NumericValue::Decimal(Decimal::new(5, 1)); // 0.5
+        let err = numeric_div(max, half).unwrap_err();
+        assert!(err.to_string().contains("numeric field overflow"));
+    }
+
+    #[test]
+    fn test_int32_add_overflow_returns_error() {
+        let max = NumericValue::Int32(i32::MAX);
+        let one = NumericValue::Int32(1);
+        let err = numeric_add(max, one).unwrap_err();
+        assert!(err.to_string().contains("integer out of range"));
+    }
+
+    #[test]
+    fn test_int32_sub_overflow_returns_error() {
+        let min = NumericValue::Int32(i32::MIN);
+        let one = NumericValue::Int32(1);
+        let err = numeric_sub(min, one).unwrap_err();
+        assert!(err.to_string().contains("integer out of range"));
+    }
+
+    #[test]
+    fn test_int64_add_overflow_returns_error() {
+        let max = NumericValue::Int64(i64::MAX);
+        let one = NumericValue::Int64(1);
+        let err = numeric_add(max, one).unwrap_err();
+        assert!(err.to_string().contains("bigint out of range"));
+    }
+
+    #[test]
+    fn test_int64_mul_overflow_returns_error() {
+        let big = NumericValue::Int64(i64::MAX);
+        let two = NumericValue::Int64(2);
+        let err = numeric_mul(big, two).unwrap_err();
+        assert!(err.to_string().contains("bigint out of range"));
+    }
+
+    #[test]
+    fn test_checked_helpers_return_sqlstate_22003() {
+        use crate::sql::error::SqlError;
+        let err = checked_decimal_add(Decimal::MAX, Decimal::ONE).unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(sql_err.sqlstate(), "22003");
     }
 }

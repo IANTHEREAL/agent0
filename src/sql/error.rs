@@ -84,6 +84,9 @@ pub enum SqlError {
     #[error("{message}")]
     NumericValueOutOfRange { message: String },
 
+    #[error("{message}")]
+    InvalidArgumentForLogarithm { message: String },
+
     #[error("value too long for type character varying({max_length})")]
     StringDataRightTruncation { max_length: u64 },
 
@@ -274,6 +277,7 @@ impl SqlError {
             Self::NotNullViolation { .. } => "23502",
             Self::CheckViolation { .. } => "23514",
             Self::NumericValueOutOfRange { .. } => "22003",
+            Self::InvalidArgumentForLogarithm { .. } => "2201E",
             Self::StringDataRightTruncation { .. } => "22001",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",

@@ -256,7 +256,7 @@ impl PhysicalOperator for HashAggregateOperator {
             for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
                 let rt = &self.output_schema.columns[i].data_type;
                 let agg = Self::create_aggregator(agg_expr, rt)?;
-                values.push(agg.result());
+                values.push(agg.result()?);
             }
             let out_row = Row::new(values);
             try_grow_statement_memory_scope(
@@ -297,7 +297,7 @@ impl PhysicalOperator for HashAggregateOperator {
                             agg.update(&sorted_value)?;
                         }
                     }
-                    values.push(agg.result());
+                    values.push(agg.result()?);
                 }
                 let out_row = Row::new(values);
                 try_grow_statement_memory_scope(
@@ -596,7 +596,7 @@ mod tests {
 
         let aggregator =
             HashAggregateOperator::create_aggregator(&agg_expr, &DataType::Text).unwrap();
-        assert_eq!(aggregator.result(), Value::Null);
+        assert_eq!(aggregator.result().unwrap(), Value::Null);
     }
 
     #[test]
