@@ -174,6 +174,58 @@ fn test_parse_at_time_zone_placeholder() {
 }
 
 #[test]
+fn test_parse_custom_typed_string_select() {
+    let stmts = parse_sql("SELECT mood 'happy'").unwrap();
+    assert_eq!(stmts.len(), 1);
+
+    let Statement::Query(query) = &stmts[0] else {
+        panic!("expected query statement");
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected SELECT query body");
+    };
+    // The sqlparser fork produces TypedString for custom types, but parse_sql()
+    // normalizes Custom TypedStrings to Cast for downstream compatibility.
+    let Some(sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Cast {
+        expr,
+        data_type,
+        ..
+    })) = select.projection.first()
+    else {
+        panic!("expected Cast projection, got {:?}", select.projection);
+    };
+
+    assert!(matches!(
+        expr.as_ref(),
+        sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) if s == "happy"
+    ));
+    assert!(matches!(
+        data_type,
+        sqlparser::ast::DataType::Custom(name, _) if name.to_string() == "mood"
+    ));
+}
+
+#[test]
+fn test_parse_custom_typed_string_default_expression() {
+    let stmts =
+        parse_sql("CREATE TABLE t (c mood DEFAULT coalesce(mood 'happy', mood 'sad'))").unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0], Statement::CreateTable { .. }));
+}
+
+#[test]
+fn test_parse_custom_typed_string_dollar_quoted() {
+    let stmts = parse_sql("SELECT mood $$happy$$").unwrap();
+    assert_eq!(stmts.len(), 1);
+}
+
+#[test]
+fn test_parse_custom_typed_string_escape_prefix() {
+    let stmts = parse_sql("SELECT mood E'happy'").unwrap();
+    assert_eq!(stmts.len(), 1);
+}
+
+#[test]
 fn test_parse_reset_role_via_rewrite() {
     let stmts = parse_sql("RESET ROLE").unwrap();
     assert_eq!(stmts.len(), 1);

@@ -97,3 +97,4 @@ parquet = ["dep:parquet", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "d
 
 [patch.crates-io]
 pgwire = { path = "crates/pgwire" }
+sqlparser = { path = "crates/sqlparser" }
