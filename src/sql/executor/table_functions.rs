@@ -344,7 +344,13 @@ impl Executor {
                 qctx,
             )
             .await?;
-        let func_upper = function_name.to_ascii_uppercase();
+        // Strip optional schema prefix so schema-qualified calls like
+        // "extensions.fs9_events" dispatch the same as unqualified "fs9_events".
+        let func_part = match function_name.rsplit_once('.') {
+            Some((_, name)) => name,
+            None => function_name,
+        };
+        let func_upper = func_part.to_ascii_uppercase();
 
         let rows = if func_upper == "FS9_EVENTS" {
             // fs9_events(since_seq [, path_prefix [, limit]])

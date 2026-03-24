@@ -3062,8 +3062,7 @@ impl EmbeddedPageFs {
         if !use_pack_route {
             debug!(
                 files = files.len(),
-                s3_available,
-                "fs9: batch_write using sequential route"
+                s3_available, "fs9: batch_write using sequential route"
             );
             return self.batch_write_sequential(files).await;
         }
