@@ -142,6 +142,8 @@ impl TikvStore {
         }
     }
 
+    /// Create a single index entry.  Returns the number of bytes written
+    /// (key + value) so callers can track transaction byte budgets.
     pub async fn create_index_entry(
         &self,
         txn: &mut Transaction,
@@ -151,7 +153,7 @@ impl TikvStore {
         values: &[Value],
         pk_values: &[Value],
         unique: bool,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let enforce_unique_lookup = unique && !Self::index_key_has_null(values);
         if enforce_unique_lookup {
             let idx_key = self.key(&encode_index_key_v2(
@@ -161,11 +163,10 @@ impl TikvStore {
                 return Err(crate::storage::unique_index_duplicate_error());
             }
             let idx_val = encode_pk_values(pk_values);
+            let bytes_written = idx_key.len() + idx_val.len();
             txn_put(txn, idx_key, idx_val).await?;
+            Ok(bytes_written)
         } else {
-            // PostgreSQL unique indexes treat NULL values as distinct by default.
-            // For unique keys containing NULL, persist with PK-suffixed key shape
-            // (same as non-unique) so multiple NULL rows can coexist.
             let idx_key = self.key(&encode_index_key_v2(
                 db_id,
                 table_id,
@@ -173,9 +174,10 @@ impl TikvStore {
                 values,
                 Some(pk_values),
             ));
+            let bytes_written = idx_key.len() + INDEX_SENTINEL_VALUE.len();
             txn_put(txn, idx_key, INDEX_SENTINEL_VALUE.to_vec()).await?;
+            Ok(bytes_written)
         }
-        Ok(())
     }
 
     /// Batch-create index entries, using a single `batch_get` for the unique

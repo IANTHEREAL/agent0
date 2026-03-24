@@ -82,6 +82,74 @@ pub(super) const DDL_SCAN_BATCH_SIZE: u32 = 1024;
 pub(super) const DDL_BACKFILL_COMMIT_SIZE: usize = 5000;
 const LEGACY_RELNAME_CONFLICT_SCAN_SUNSET_DATE: &str = "2026-12-31";
 
+/// Default byte budget for ALTER TABLE single-transaction operations.
+///
+/// TiKV enforces a 100 MB `txn-total-size-limit`.  The default of 80 MB
+/// provides a 20% safety margin.  Override via `DB9_ALTER_TABLE_BYTE_LIMIT`
+/// (set to 0 to disable).
+pub(super) const DEFAULT_ALTER_TABLE_BYTE_LIMIT: usize = 80 * 1024 * 1024;
+
+pub(super) fn alter_table_byte_limit() -> usize {
+    std::env::var("DB9_ALTER_TABLE_BYTE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ALTER_TABLE_BYTE_LIMIT)
+}
+
+/// Inline byte-budget tracker for ALTER TABLE rewrite loops.
+///
+/// Instead of a pre-scan that predicts transaction size (which is always
+/// wrong for operations that add columns, rebuild indexes, or change types),
+/// this tracker counts ACTUAL bytes written during the rewrite.  Call
+/// `track_write()` after every `txn_put` / `txn_delete` / `create_index_entry`.
+/// It returns an error when the budget is exceeded — the transaction has not
+/// committed yet, so the caller can let it rollback safely.
+pub(super) struct AlterTableBudget {
+    total_bytes: usize,
+    limit: usize,
+    table_name: String,
+    operation: String,
+}
+
+impl AlterTableBudget {
+    pub(super) fn new(table_name: &str, operation: &str) -> Self {
+        Self {
+            total_bytes: 0,
+            limit: alter_table_byte_limit(),
+            table_name: table_name.to_string(),
+            operation: operation.to_string(),
+        }
+    }
+
+    /// Track bytes written.  Returns Err if budget exceeded.
+    pub(super) fn track_write(&mut self, key_len: usize, value_len: usize) -> Result<()> {
+        if self.limit == 0 {
+            return Ok(());
+        }
+        self.total_bytes += key_len + value_len;
+        if self.total_bytes > self.limit {
+            let mb = self.total_bytes / (1024 * 1024);
+            let limit_mb = self.limit / (1024 * 1024);
+            return Err(crate::sql::error::SqlError::StatementTooComplex {
+                message: format!(
+                    "ALTER TABLE \"{}\" {} exceeded the {} MB transaction byte budget \
+                     ({} MB written so far).  TiKV enforces a 100 MB txn-total-size-limit. \
+                     Workaround: create a new table with the desired schema, copy data \
+                     in batches, then swap.  Override: DB9_ALTER_TABLE_BYTE_LIMIT=0.",
+                    self.table_name, self.operation, limit_mb, mb
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Track a delete (key only, no value).
+    pub(super) fn track_delete(&mut self, key_len: usize) -> Result<()> {
+        self.track_write(key_len, 0)
+    }
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 pub(super) fn warn_legacy_relname_conflict_scan_once() {
@@ -943,6 +1011,25 @@ pub(super) fn track_active_worker_txn(
 ) -> Option<crate::worker::active_txn_registry::ActiveTxnGuard> {
     crate::worker::active_txn_registry::global_registry()
         .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()))
+}
+
+// Pre-scan guard removed: replaced by inline AlterTableBudget tracking
+// that counts actual bytes written during the rewrite (not predicted).
+
+/// Check if a view/matview depends on the specified table.
+///
+/// db9 does not track column-level view dependencies (only table-level via
+/// `ViewDef.deps`).  Fine-grained detection of which columns a view uses
+/// would require full semantic analysis (resolving wildcards, qualified names,
+/// table aliases).  Instead, we take the conservative PostgreSQL-compatible
+/// approach: if a view depends on the table at all, DROP COLUMN is blocked
+/// unless CASCADE is used (which db9 does not support yet).
+///
+/// This may produce false positives (blocking drops of columns the view
+/// doesn't actually use), but never false negatives (allowing drops that
+/// break views).  Column-level dependency tracking is tracked in #2045.
+pub(super) fn view_depends_on_table(view_deps: &[String], table_name: &str) -> bool {
+    view_deps.iter().any(|d| d == table_name)
 }
 
 pub(super) fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Value> {

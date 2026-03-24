@@ -660,3 +660,27 @@ fn coerce_uuid_to_text_for_type_change() {
     let out = coerce_value_for_type_change(Value::Uuid(bytes), &col).unwrap();
     assert_eq!(out, Value::Text(uuid::Uuid::nil().to_string()));
 }
+
+/// Single test to avoid env-var race conditions under parallel test execution.
+#[test]
+fn alter_table_byte_limit_respects_env_var() {
+    // Default when env unset
+    std::env::remove_var("DB9_ALTER_TABLE_BYTE_LIMIT");
+    assert_eq!(alter_table_byte_limit(), DEFAULT_ALTER_TABLE_BYTE_LIMIT);
+    assert_eq!(alter_table_byte_limit(), 80 * 1024 * 1024);
+
+    // Zero disables
+    std::env::set_var("DB9_ALTER_TABLE_BYTE_LIMIT", "0");
+    assert_eq!(alter_table_byte_limit(), 0);
+
+    // Custom value
+    std::env::set_var("DB9_ALTER_TABLE_BYTE_LIMIT", "50000000");
+    assert_eq!(alter_table_byte_limit(), 50_000_000);
+
+    // Invalid falls back to default
+    std::env::set_var("DB9_ALTER_TABLE_BYTE_LIMIT", "not_a_number");
+    assert_eq!(alter_table_byte_limit(), DEFAULT_ALTER_TABLE_BYTE_LIMIT);
+
+    // Cleanup
+    std::env::remove_var("DB9_ALTER_TABLE_BYTE_LIMIT");
+}

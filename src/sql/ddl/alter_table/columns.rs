@@ -20,9 +20,9 @@ use crate::txn::txn_put;
 
 use super::super::{
     analyze_row_level_expr_with_udts, check_expr_references_column, coerce_value_for_type_change,
-    delete_range, eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
+    eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
     resolve_column_data_type, validate_column_default_expr, validate_generated_column_expr,
-    KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    AlterTableBudget, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
@@ -252,6 +252,8 @@ pub(super) async fn alter_table_add_column(
         }
 
         let new_col_idx = schema.columns.len() - 1;
+        let mut budget =
+            AlterTableBudget::new(&schema.name, "ADD COLUMN (identity/serial backfill)");
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
         while let Some(batch) = scanner.next_batch(txn).await? {
@@ -263,7 +265,9 @@ pub(super) async fn alter_table_add_column(
                 row.values[new_col_idx] =
                     coerce_value_for_column(Value::Int64(seq_val), &schema.columns[new_col_idx])?;
                 let row_data = crate::storage::serialize_row(&row)?;
-                txn_put(txn, key.into(), row_data).await?;
+                let key_vec: Vec<u8> = key.into();
+                budget.track_write(key_vec.len(), row_data.len())?;
+                txn_put(txn, key_vec, row_data).await?;
             }
         }
     }
@@ -288,6 +292,8 @@ pub(super) async fn alter_table_add_column(
                 gen_expr_str
             )
         })?;
+        let mut budget =
+            AlterTableBudget::new(&schema.name, "ADD COLUMN (generated column backfill)");
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
         while let Some(batch) = scanner.next_batch(txn).await? {
@@ -313,7 +319,9 @@ pub(super) async fn alter_table_add_column(
                 )
                 .await?;
                 let row_data = crate::storage::serialize_row(&row)?;
-                txn_put(txn, key.into(), row_data).await?;
+                let key_vec: Vec<u8> = key.into();
+                budget.track_write(key_vec.len(), row_data.len())?;
+                txn_put(txn, key_vec, row_data).await?;
             }
         }
     }
@@ -379,6 +387,94 @@ pub(super) async fn alter_table_drop_column(
                 }
             }
 
+            // Extended dependency checks: index predicates/expressions,
+            // generated columns, RLS policies, and views/matviews.
+            for index in &schema.indexes {
+                if let Some(pred) = &index.predicate {
+                    if check_expr_references_column(pred, &col_name)? {
+                        return Err(anyhow!(
+                            "Cannot drop column '{}' referenced in index '{}' predicate",
+                            col_name,
+                            index.name
+                        ));
+                    }
+                }
+                for expr in &index.expressions {
+                    if check_expr_references_column(expr, &col_name)? {
+                        return Err(anyhow!(
+                            "Cannot drop column '{}' referenced in index '{}' expression",
+                            col_name,
+                            index.name
+                        ));
+                    }
+                }
+            }
+            for (i, col) in schema.columns.iter().enumerate() {
+                if i == idx {
+                    continue;
+                }
+                if let Some(gen_expr) = &col.generation_expr {
+                    if check_expr_references_column(gen_expr, &col_name)? {
+                        return Err(anyhow!(
+                            "Cannot drop column '{}' referenced by generated column '{}'",
+                            col_name,
+                            col.name
+                        ));
+                    }
+                }
+            }
+            let policies = store
+                .list_policies_for_table(txn, db_id, schema.table_id)
+                .await?;
+            for policy in &policies {
+                if let Some(using) = &policy.using_expr {
+                    if check_expr_references_column(using, &col_name)? {
+                        return Err(anyhow!(
+                            "Cannot drop column '{}' referenced by RLS policy '{}'",
+                            col_name,
+                            policy.name
+                        ));
+                    }
+                }
+                if let Some(with_check) = &policy.with_check_expr {
+                    if check_expr_references_column(with_check, &col_name)? {
+                        return Err(anyhow!(
+                            "Cannot drop column '{}' referenced by RLS policy '{}'",
+                            col_name,
+                            policy.name
+                        ));
+                    }
+                }
+            }
+            // Views and materialized views: conservative table-level check.
+            // db9 does not track column-level view dependencies, so we block
+            // DROP COLUMN if ANY view depends on this table.  This may produce
+            // false positives but never false negatives (a broken view after
+            // drop).  Column-level dependency tracking is tracked in #2045.
+            let views = store.list_views(txn, db_id).await?;
+            for view in &views {
+                if super::super::view_depends_on_table(&view.deps, &schema.name) {
+                    return Err(anyhow!(
+                        "cannot drop column \"{}\" because view \"{}\" depends on table \"{}\"",
+                        col_name,
+                        view.name,
+                        schema.name
+                    ));
+                }
+            }
+            let matviews = store.list_materialized_views(txn, db_id).await?;
+            for mv in &matviews {
+                if super::super::view_depends_on_table(&mv.deps, &schema.name) {
+                    return Err(anyhow!(
+                        "cannot drop column \"{}\" because materialized view \"{}\" depends on table \"{}\"",
+                        col_name,
+                        mv.name,
+                        schema.name
+                    ));
+                }
+            }
+
+            let mut budget = AlterTableBudget::new(&schema.name, "DROP COLUMN");
             let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
             let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
             while let Some(batch) = scanner.next_batch(txn).await? {
@@ -388,7 +484,9 @@ pub(super) async fn alter_table_drop_column(
                     fill_row_defaults(&mut row, schema)?;
                     row.values.remove(idx);
                     let row_data = crate::storage::serialize_row(&row)?;
-                    txn_put(txn, key.into(), row_data).await?;
+                    let key_vec: Vec<u8> = key.into();
+                    budget.track_write(key_vec.len(), row_data.len())?;
+                    txn_put(txn, key_vec, row_data).await?;
                 }
             }
             schema.columns.remove(idx);
@@ -457,11 +555,9 @@ pub(super) async fn alter_table_alter_column_set_data_type(
         .cloned()
         .collect();
 
-    for idx in &affected_indexes {
-        let (start, end) = index_prefix_range(db_id, schema.table_id, idx.id);
-        delete_range(txn, start, end).await?;
-    }
-
+    // Validate USING expression BEFORE the rewrite safety guard so that
+    // expression errors (bad column reference, type mismatch) are reported
+    // instead of the generic "table too large" rejection.
     let mut target_col = schema.columns[col_idx].clone();
     target_col.data_type = new_type.clone();
     let enum_validator =
@@ -483,6 +579,24 @@ pub(super) async fn alter_table_alter_column_set_data_type(
     } else {
         None
     };
+
+    let mut budget = AlterTableBudget::new(&schema.name, "ALTER COLUMN SET DATA TYPE");
+
+    // Delete old index entries (count toward budget).
+    for idx in &affected_indexes {
+        let (idx_start, idx_end) = index_prefix_range(db_id, schema.table_id, idx.id);
+        let mut idx_scanner = KvScanBatches::new(idx_start, idx_end, DDL_SCAN_BATCH_SIZE);
+        while let Some(idx_batch) = idx_scanner.next_batch(txn).await? {
+            for pair in &idx_batch {
+                let k: &[u8] = pair.key().as_ref().into();
+                budget.track_delete(k.len())?;
+            }
+            for pair in idx_batch {
+                crate::txn::txn_delete(txn, pair.into_key().into()).await?;
+            }
+        }
+    }
+
     let qctx = QueryContext::from_task_locals();
 
     let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
@@ -540,7 +654,7 @@ pub(super) async fn alter_table_alter_column_set_data_type(
             };
             for idx in &affected_indexes {
                 let idx_values = schema.get_index_values(idx, &row);
-                store
+                let idx_bytes = store
                     .create_index_entry(
                         txn,
                         db_id,
@@ -551,10 +665,13 @@ pub(super) async fn alter_table_alter_column_set_data_type(
                         idx.unique,
                     )
                     .await?;
+                budget.track_write(idx_bytes, 0)?;
             }
 
             let row_data = crate::storage::serialize_row(&row)?;
-            txn_put(txn, key.into(), row_data).await?;
+            let key_vec: Vec<u8> = key.into();
+            budget.track_write(key_vec.len(), row_data.len())?;
+            txn_put(txn, key_vec, row_data).await?;
         }
     }
 

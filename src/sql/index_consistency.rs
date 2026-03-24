@@ -84,7 +84,7 @@ pub(crate) async fn resolve_unique_index_conflict(
                 )
                 .await
             {
-                Ok(()) => return Ok(UniqueConflictResolution::StaleReplaced),
+                Ok(_) => return Ok(UniqueConflictResolution::StaleReplaced),
                 Err(e) if is_unique_duplicate_error(&e) => continue,
                 Err(e) => return Err(e),
             }
@@ -145,7 +145,7 @@ pub(crate) async fn resolve_unique_index_conflict(
             )
             .await
         {
-            Ok(()) => return Ok(UniqueConflictResolution::StaleReplaced),
+            Ok(_) => return Ok(UniqueConflictResolution::StaleReplaced),
             Err(e) if is_unique_duplicate_error(&e) => continue,
             Err(e) => return Err(e),
         }
