@@ -5,11 +5,12 @@
 //! - v1 (delta-log): DML writes small delta entries; a background merge worker
 //!   consolidates them into the base graph periodically.
 
+use std::collections::HashMap;
 use std::fs;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -911,11 +912,21 @@ pub fn estimate_graph_memory(count: u64, dimensions: usize, m: usize) -> usize {
     (count as usize) * per_node + 4096 // 4KB fixed overhead
 }
 
+/// Inflight loader coordination: prevents thundering herd on cache miss.
+///
+/// When multiple queries miss the cache for the same key simultaneously,
+/// only one performs the actual load. Others wait on the Notify and then
+/// read the result from the cache. This bounds peak memory to 1× graph
+/// size during cold start or version transitions, not N×.
+type InflightKey = (String, u64, u64, u64, u64); // same as IndexCacheKey
+static INFLIGHT_LOADS: LazyLock<Mutex<HashMap<InflightKey, Arc<tokio::sync::Notify>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Get a shared reference to the base graph, using the in-memory index cache.
 ///
 /// On cache hit: returns `Arc<SharedHnswIndex>` directly (zero-copy, 0ms).
-/// On cache miss: loads from disk/S3/TiKV via `load_base_graph`, inserts
-/// into the cache, and returns the shared reference.
+/// On cache miss: exactly one loader runs per key (singleflight). Other
+/// concurrent callers wait for the loader to finish, then read from cache.
 pub async fn get_shared_base_graph(
     txn: &mut Transaction,
     db_id: u64,
@@ -941,31 +952,75 @@ pub async fn get_shared_base_graph(
         )));
     }
 
-    // Cache lookup by exact version.
+    // Fast path: cache hit.
     if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version) {
         return Ok(Some(shared));
     }
 
-    // Cache miss: load the base graph via existing path.
-    let Some((handle, live_meta)) =
-        load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await?
-    else {
-        return Ok(None);
-    };
-
-    let estimated_bytes = estimate_graph_memory(live_meta.count, live_meta.dimensions, live_meta.m);
-
-    let shared = cache.insert(
-        keyspace,
-        db_id,
-        table_id,
-        index_id,
-        meta.graph_version,
-        handle,
-        estimated_bytes,
+    // Slow path: cache miss with singleflight coordination.
+    let inflight_key = (
+        keyspace.to_string(), db_id, table_id, index_id, meta.graph_version,
     );
 
-    Ok(Some(shared))
+    loop {
+        // Determine our role: loader or waiter.
+        // The mutex is acquired and released within this block — never held across await.
+        enum Role {
+            Loader(Arc<tokio::sync::Notify>),
+            Waiter(Arc<tokio::sync::Notify>),
+        }
+
+        let role = {
+            let mut inflight = INFLIGHT_LOADS.lock().unwrap();
+
+            // Re-check cache under inflight lock to avoid race.
+            if let Some(shared) =
+                cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version)
+            {
+                return Ok(Some(shared));
+            }
+
+            if let Some(existing) = inflight.get(&inflight_key) {
+                Role::Waiter(Arc::clone(existing))
+            } else {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                inflight.insert(inflight_key.clone(), Arc::clone(&notify));
+                Role::Loader(notify)
+            }
+        }; // mutex released here, before any await
+
+        match role {
+            Role::Waiter(notify) => {
+                notify.notified().await;
+                // Loop back: re-check cache. Loader either succeeded or failed.
+            }
+            Role::Loader(notify) => {
+                // We are the sole loader for this key.
+                let result =
+                    load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await;
+
+                // Always clean up inflight entry + notify waiters, even on error.
+                {
+                    let mut inflight = INFLIGHT_LOADS.lock().unwrap();
+                    inflight.remove(&inflight_key);
+                }
+                notify.notify_waiters();
+
+                // Process result.
+                let Some((handle, live_meta)) = result? else {
+                    return Ok(None);
+                };
+                let estimated_bytes = estimate_graph_memory(
+                    live_meta.count, live_meta.dimensions, live_meta.m,
+                );
+                let shared = cache.insert(
+                    keyspace, db_id, table_id, index_id,
+                    meta.graph_version, handle, estimated_bytes,
+                );
+                return Ok(Some(shared));
+            }
+        }
+    }
 }
 
 /// Maximum delta count for the two-level search path. Beyond this, the scan

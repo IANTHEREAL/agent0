@@ -272,6 +272,20 @@ impl PhysicalOperator for HnswScanOperator {
             // This loads a private copy of the base graph and streams deltas
             // onto it page-by-page, avoiding the O(backlog) Vec collection.
             drop(deltas); // free the partial collection immediately
+
+            // Apply the same HNSW_MAX_INDEX_MEMORY check as the shared path.
+            // Without this, the fallback would bypass the memory limit entirely.
+            let estimated_bytes = crate::sql::hnsw::storage::estimate_graph_memory(
+                meta.count, meta.dimensions, meta.m,
+            );
+            let max_index = crate::sql::hnsw::s3::hnsw_max_index_memory();
+            if max_index > 0 && estimated_bytes > max_index {
+                return Err(anyhow!(
+                    "HNSW index estimated at {} bytes exceeds HNSW_MAX_INDEX_MEMORY ({} bytes)",
+                    estimated_bytes, max_index
+                ));
+            }
+
             let Some((hnsw_index, fallback_meta, delta_count)) = load_hnsw_graph_with_deltas(
                 ctx.txn, ctx.db_id, self.schema.table_id, self.index_id, keyspace,
             ).await? else {
