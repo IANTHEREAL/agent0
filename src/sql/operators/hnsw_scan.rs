@@ -11,7 +11,8 @@ use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::hnsw::s3::SharedHnswIndex;
 use crate::sql::hnsw::storage::{
     batch_get_pk_for_rowids, build_delta_index, get_shared_base_graph, hnsw_meta_key,
-    merge_search_results, scan_visible_deltas, HnswMeta,
+    load_hnsw_graph_with_deltas, merge_search_results, scan_visible_deltas,
+    HnswMeta, DELTA_TWO_LEVEL_THRESHOLD,
 };
 use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle, HnswLabelMode};
 
@@ -258,16 +259,140 @@ impl PhysicalOperator for HnswScanOperator {
 
         let label_mode = meta.label_mode;
 
+        // Try two-level search: scan deltas up to threshold.
+        // If delta backlog exceeds threshold, fall back to streaming apply
+        // (old path) which never collects all deltas into memory.
+        let (deltas, delta_truncated) = scan_visible_deltas(
+            ctx.txn, ctx.db_id, self.schema.table_id, self.index_id,
+            DELTA_TWO_LEVEL_THRESHOLD,
+        ).await?;
+
+        if delta_truncated {
+            // Large delta backlog — fall back to streaming-apply path.
+            // This loads a private copy of the base graph and streams deltas
+            // onto it page-by-page, avoiding the O(backlog) Vec collection.
+            drop(deltas); // free the partial collection immediately
+            let Some((hnsw_index, fallback_meta, delta_count)) = load_hnsw_graph_with_deltas(
+                ctx.txn, ctx.db_id, self.schema.table_id, self.index_id, keyspace,
+            ).await? else {
+                return Ok(());
+            };
+            let label_mode_fb = fallback_meta.label_mode;
+            if delta_count > 0 {
+                if let Some(m) = crate::worker::get_worker_metrics() {
+                    m.hnsw_scan_deltas_applied
+                        .fetch_add(delta_count as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // Use the private index directly — wrap in Arc for search_delta.
+            let hnsw_arc = Arc::new(hnsw_index);
+            let graph_size = hnsw_arc.size();
+            let mut fetch_k = self.k.max(ef_search).max(self.k * 2).max(self.k + 100);
+            // Re-resolve label_mode and vector_col_idx for the fallback path.
+            let fb_label_mode = label_mode_fb;
+            let fb_vector_col_idx = self
+                .schema
+                .indexes
+                .iter()
+                .find(|idx| idx.id == self.index_id)
+                .and_then(|idx| idx.columns.first())
+                .and_then(|col_name| self.schema.column_index(col_name));
+            let mut rows;
+            let mut distance_by_label: HashMap<u64, f64>;
+            let mut pk_to_label: HashMap<String, u64> = HashMap::new();
+            loop {
+                let ranked_labels = Self::search_delta(
+                    &hnsw_arc, &query_f32, fetch_k, self.distance_metric,
+                ).await?;
+                if ranked_labels.is_empty() {
+                    self.row_buffer.clear();
+                    return Ok(());
+                }
+                let rank_by_label: HashMap<u64, usize> = ranked_labels
+                    .iter().enumerate().map(|(r, (l, _))| (*l, r)).collect();
+                distance_by_label = ranked_labels.iter().copied().collect();
+                pk_to_label.clear();
+                let batch_pks: Vec<Vec<Value>> = match fb_label_mode {
+                    HnswLabelMode::Direct => ranked_labels
+                        .iter()
+                        .map(|(label, _)| self.pk_value_from_label(*label).map(|pk| vec![pk]))
+                        .collect::<Result<Vec<_>>>()?,
+                    HnswLabelMode::Mapped => {
+                        let rowids: Vec<u64> = ranked_labels.iter().map(|(l, _)| *l).collect();
+                        let pk_types: Vec<DataType> = self.schema.pk_indices.iter()
+                            .map(|&i| self.schema.columns[i].data_type.clone()).collect();
+                        let pk_bytes_vec = batch_get_pk_for_rowids(
+                            ctx.txn, ctx.db_id, self.schema.table_id, &rowids,
+                        ).await?;
+                        let mut pks = Vec::with_capacity(rowids.len());
+                        for (i, opt_bytes) in pk_bytes_vec.into_iter().enumerate() {
+                            let Some(pk_bytes) = opt_bytes else { continue; };
+                            let pk_values = decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
+                            let pk_key = pk_values.iter().map(|v| v.to_string())
+                                .collect::<Vec<_>>().join(",");
+                            pk_to_label.insert(pk_key, rowids[i]);
+                            pks.push(pk_values);
+                        }
+                        pks
+                    }
+                };
+                let fetched_rows = ctx.store.batch_get_rows(
+                    ctx.txn, ctx.db_id, self.schema.table_id, batch_pks, &self.schema,
+                ).await?;
+                let mut valid = Vec::with_capacity(fetched_rows.len());
+                for mut r in fetched_rows {
+                    fill_row_defaults(&mut r, &self.schema)?;
+                    while r.values.len() < self.schema.columns.len() { r.values.push(Value::Null); }
+                    if let Some(vi) = fb_vector_col_idx {
+                        if matches!(r.values.get(vi), Some(Value::Null) | None) { continue; }
+                    }
+                    valid.push(r);
+                }
+                let pk_to_label_ref = &pk_to_label;
+                valid.sort_by_key(|row| {
+                    let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
+                    let label = match fb_label_mode {
+                        HnswLabelMode::Direct => row.values.get(pk_col_idx).and_then(Self::pk_as_u64),
+                        HnswLabelMode::Mapped => {
+                            let pk_key = row.values.get(pk_col_idx)
+                                .map(|v| v.to_string()).unwrap_or_default();
+                            pk_to_label_ref.get(&pk_key).copied()
+                        }
+                    };
+                    label.and_then(|l| rank_by_label.get(&l).copied()).unwrap_or(usize::MAX)
+                });
+                valid.truncate(self.k);
+                rows = valid;
+                if rows.len() >= self.k || fetch_k >= graph_size { break; }
+                fetch_k = (fetch_k.saturating_mul(2)).min(graph_size);
+            }
+            if self.distance_expr.is_some() {
+                let pk_to_label_ref = &pk_to_label;
+                for row in &mut rows {
+                    let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
+                    let label = match fb_label_mode {
+                        HnswLabelMode::Direct => row.values.get(pk_col_idx).and_then(Self::pk_as_u64),
+                        HnswLabelMode::Mapped => {
+                            let pk_key = row.values.get(pk_col_idx)
+                                .map(|v| v.to_string()).unwrap_or_default();
+                            pk_to_label_ref.get(&pk_key).copied()
+                        }
+                    };
+                    let distance = label.and_then(|l| distance_by_label.get(&l).copied())
+                        .unwrap_or(f64::NAN);
+                    row.values.push(Value::Float64(distance));
+                }
+            }
+            self.row_buffer = rows;
+            return Ok(());
+        }
+
+        let delta_count = deltas.len();
+
         // Get shared base graph (cache hit = 0ms, miss = load from disk/S3).
         let shared_base = get_shared_base_graph(
             ctx.txn, ctx.db_id, self.schema.table_id, self.index_id, &meta, keyspace,
         ).await?;
-
-        // Scan deltas visible to this transaction.
-        let deltas = scan_visible_deltas(
-            ctx.txn, ctx.db_id, self.schema.table_id, self.index_id,
-        ).await?;
-        let delta_count = deltas.len();
 
         // Nothing to search.
         if shared_base.is_none() && deltas.is_empty() {

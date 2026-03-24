@@ -779,7 +779,6 @@ pub async fn load_base_graph(
 /// Deltas are applied via paginated streaming: scan one page, apply to
 /// in-memory index, advance start_key, repeat. Never collects all deltas
 /// into a single Vec.
-#[allow(dead_code)] // retained for worker merge path compatibility
 pub async fn load_hnsw_graph_with_deltas(
     txn: &mut Transaction,
     db_id: u64,
@@ -969,14 +968,24 @@ pub async fn get_shared_base_graph(
     Ok(Some(shared))
 }
 
-/// Scan visible delta vectors for the current transaction snapshot.
-/// Returns the raw deltas without applying them to any index.
+/// Maximum delta count for the two-level search path. Beyond this, the scan
+/// operator falls back to the streaming-apply path (load_hnsw_graph_with_deltas)
+/// which applies deltas page-by-page without collecting them all into memory.
+///
+/// At VECTOR(1536), each delta is ~6KB in Vec + ~6.4KB in the usearch index.
+/// 1000 deltas ≈ 12.4MB — acceptable for a per-query allocation.
+/// 50,000 deltas ≈ 620MB — unacceptable, must use streaming.
+pub const DELTA_TWO_LEVEL_THRESHOLD: usize = 1000;
+
+/// Scan visible delta vectors up to `max_deltas`. Returns `(deltas, truncated)`.
+/// If `truncated` is true, the caller should fall back to streaming apply.
 pub async fn scan_visible_deltas(
     txn: &mut Transaction,
     db_id: u64,
     table_id: u64,
     index_id: u64,
-) -> Result<Vec<HnswDelta>, SqlError> {
+    max_deltas: usize,
+) -> Result<(Vec<HnswDelta>, bool), SqlError> {
     let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
     let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
     let mut start = prefix.clone();
@@ -1001,6 +1010,10 @@ pub async fn scan_visible_deltas(
             if !key.starts_with(&prefix) {
                 break;
             }
+            if deltas.len() >= max_deltas {
+                // Too many deltas — signal caller to use streaming fallback.
+                return Ok((deltas, true));
+            }
             let delta: HnswDelta = bincode::deserialize(pair.value())
                 .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
             deltas.push(delta);
@@ -1019,7 +1032,7 @@ pub async fn scan_visible_deltas(
         }
     }
 
-    Ok(deltas)
+    Ok((deltas, false))
 }
 
 /// Build a small per-query HNSW index from delta vectors.
