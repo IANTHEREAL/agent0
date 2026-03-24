@@ -1003,6 +1003,14 @@ impl TikvStore {
                             }
                         }
                         delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
+
+                        // Evict from both process caches so post-TRUNCATE queries
+                        // don't return stale pre-TRUNCATE neighbors.
+                        let ks = self.keyspace().unwrap_or("default");
+                        crate::sql::hnsw::s3::hnsw_graph_cache()
+                            .evict(ks, db_id, schema.table_id, index.id);
+                        crate::sql::hnsw::s3::hnsw_index_cache()
+                            .evict(ks, db_id, schema.table_id, index.id);
                     }
                 }
                 // Clean up table-level rowid mappings (pk2rid + rid2pk + seq).
