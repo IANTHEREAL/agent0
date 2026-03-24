@@ -62,29 +62,56 @@ impl TikvStore {
             let header: TableStatsHeader =
                 bincode::deserialize(&header_data).context("Failed to deserialize stats header")?;
 
-            // Scan all column stats keys.
+            // Scan column stats keys in pages to avoid gRPC message size limits.
+            // Each column stats KV is ~100-120 KB max (with WIDTH_THRESHOLD=1024),
+            // so 50 columns per page ≈ 5-6 MB, safely under gRPC limits.
+            const STATS_SCAN_PAGE_SIZE: u32 = 50;
+
             let col_prefix = self.key(&encode_stats_column_prefix(db_id, table_id));
             let col_prefix_end = {
                 let mut end = col_prefix.clone();
-                // Increment last byte to form an exclusive upper bound.
                 if let Some(last) = end.last_mut() {
                     *last = last.wrapping_add(1);
                 }
                 end
             };
-            let pairs = tikv_op!(txn.scan(col_prefix.clone()..col_prefix_end, u32::MAX).await)?;
 
             let mut columns = std::collections::HashMap::new();
-            for pair in pairs {
-                let key_bytes: Vec<u8> = pair.key().clone().into();
-                // Extract column name from key suffix after the prefix.
-                if key_bytes.len() > col_prefix.len() {
-                    let col_name_bytes = &key_bytes[col_prefix.len()..];
-                    if let Ok(col_name) = std::str::from_utf8(col_name_bytes) {
-                        let col_stats: ColumnStatistics = bincode::deserialize(pair.value())
-                            .context("Failed to deserialize column statistics")?;
-                        columns.insert(col_name.to_string(), col_stats);
+            let mut scan_start = col_prefix.clone();
+            loop {
+                let pairs: Vec<_> = tikv_op!(
+                    txn.scan(
+                        scan_start.clone()..col_prefix_end.clone(),
+                        STATS_SCAN_PAGE_SIZE
+                    )
+                    .await
+                )?
+                .collect();
+                if pairs.is_empty() {
+                    break;
+                }
+                let mut last_key: Option<Vec<u8>> = None;
+                for pair in &pairs {
+                    let key_bytes: Vec<u8> = pair.key().clone().into();
+                    if key_bytes.len() > col_prefix.len() {
+                        let col_name_bytes = &key_bytes[col_prefix.len()..];
+                        if let Ok(col_name) = std::str::from_utf8(col_name_bytes) {
+                            let col_stats: ColumnStatistics = bincode::deserialize(pair.value())
+                                .context("Failed to deserialize column statistics")?;
+                            columns.insert(col_name.to_string(), col_stats);
+                        }
                     }
+                    last_key = Some(key_bytes);
+                }
+                if (pairs.len() as u32) < STATS_SCAN_PAGE_SIZE {
+                    break; // Last page
+                }
+                // Next page starts after the last key.
+                if let Some(mut next) = last_key {
+                    next.push(0);
+                    scan_start = next;
+                } else {
+                    break;
                 }
             }
 
@@ -122,7 +149,9 @@ impl TikvStore {
         let header_key = self.key(&encode_stats_header_key(db_id, table_id));
         txn_delete(txn, header_key).await?;
 
-        // Delete all per-column stats keys via prefix scan.
+        // Delete all per-column stats keys via paginated prefix scan.
+        const STATS_DELETE_PAGE_SIZE: u32 = 100;
+
         let col_prefix = self.key(&encode_stats_column_prefix(db_id, table_id));
         let col_prefix_end = {
             let mut end = col_prefix.clone();
@@ -131,10 +160,34 @@ impl TikvStore {
             }
             end
         };
-        let pairs = tikv_op!(txn.scan(col_prefix..col_prefix_end, u32::MAX).await)?;
-        for pair in pairs {
-            let key: Vec<u8> = pair.key().clone().into();
-            txn_delete(txn, key).await?;
+        let mut scan_start = col_prefix;
+        loop {
+            let pairs: Vec<_> = tikv_op!(
+                txn.scan(
+                    scan_start.clone()..col_prefix_end.clone(),
+                    STATS_DELETE_PAGE_SIZE
+                )
+                .await
+            )?
+            .collect();
+            if pairs.is_empty() {
+                break;
+            }
+            let mut last_key: Option<Vec<u8>> = None;
+            for pair in &pairs {
+                let key: Vec<u8> = pair.key().clone().into();
+                last_key = Some(key.clone());
+                txn_delete(txn, key).await?;
+            }
+            if (pairs.len() as u32) < STATS_DELETE_PAGE_SIZE {
+                break;
+            }
+            if let Some(mut next) = last_key {
+                next.push(0);
+                scan_start = next;
+            } else {
+                break;
+            }
         }
 
         // Delete legacy single-blob key.
