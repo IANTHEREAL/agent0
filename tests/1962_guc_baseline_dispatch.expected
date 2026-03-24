@@ -1,27 +1,16 @@
- t
-
- t
-
- read committed
-
+t
+t
+read committed
 SET
- off
-
- guc_test
-
- guc_test
-
+off
+guc_test
+guc_test
 SET
 BEGIN
- local_val
-
- local_val
-
+local_val
+local_val
 COMMIT
- base
-
- postgres
-
- ISO, MDY
-
+base
+postgres
+ISO, MDY
 RESET

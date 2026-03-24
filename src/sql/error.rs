@@ -6,11 +6,31 @@
 
 use crate::model::DataType;
 use crate::sql::analyzer::AnalyzerError;
+use crate::sql::quoting::quote_ident;
 
 fn column_not_found_display(column: &str, hint: &Option<String>) -> String {
     match hint {
-        Some(h) => format!("column \"{}\" does not exist\n{}", column, h),
-        None => format!("column \"{}\" does not exist", column),
+        Some(h) => format!(
+            "column {} does not exist\n{}",
+            format_missing_column_name(column),
+            h
+        ),
+        None => format!(
+            "column {} does not exist",
+            format_missing_column_name(column)
+        ),
+    }
+}
+
+fn format_missing_column_name(column: &str) -> String {
+    if column.contains('.') && !column.contains('*') {
+        column
+            .split('.')
+            .map(quote_ident)
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        format!("\"{}\"", column)
     }
 }
 
@@ -687,6 +707,14 @@ mod tests {
             }
             .to_string(),
             "column \"age\" does not exist"
+        );
+        assert_eq!(
+            SqlError::ColumnNotFound {
+                column: "drop_test.age".into(),
+                hint: None,
+            }
+            .to_string(),
+            "column drop_test.age does not exist"
         );
         assert_eq!(
             SqlError::AmbiguousColumn("id".into()).to_string(),

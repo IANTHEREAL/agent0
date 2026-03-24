@@ -1,19 +1,24 @@
 id|name|email
 1|alice|alice@example.com
 2|bob|bob@example.com
+(2 rows)
 id|name|email
 1|alice|alice@example.com
 2|bob|bob@example.com
+(2 rows)
 id|name|email
 1|alice|alice@example.com
 2|bob|bob@example.com
 3|charlie|charlie@example.com
+(3 rows)
 id|email
 4|dave@example.com
-ERROR: column "age" does not exist
-ERROR: column "age" does not exist
+(1 row)
 attname|attisdropped
 id|f
 name|f
 ........pg.dropped.3........|t
 email|f
+(4 rows)
+ERROR:  column "age" does not exist
+ERROR:  column drop_test.age does not exist

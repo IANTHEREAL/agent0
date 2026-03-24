@@ -1391,9 +1391,7 @@ impl<'a> Analyzer<'a> {
             }
 
             // -- IS [NOT] DISTINCT FROM --
-            Expr::IsDistinctFrom(left, right) => {
-                self.analyze_is_distinct_from(left, right, false)
-            }
+            Expr::IsDistinctFrom(left, right) => self.analyze_is_distinct_from(left, right, false),
             Expr::IsNotDistinctFrom(left, right) => {
                 self.analyze_is_distinct_from(left, right, true)
             }
@@ -1438,19 +1436,13 @@ impl<'a> Analyzer<'a> {
             if let TypedExprKind::Parameter { index } = &l.kind {
                 if self.is_unresolved_param(&l) {
                     self.resolve_param_type(*index, &DataType::Text)?;
-                    l = TypedExpr::new(
-                        TypedExprKind::Parameter { index: *index },
-                        DataType::Text,
-                    );
+                    l = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
                 }
             }
             if let TypedExprKind::Parameter { index } = &r.kind {
                 if self.is_unresolved_param(&r) {
                     self.resolve_param_type(*index, &DataType::Text)?;
-                    r = TypedExpr::new(
-                        TypedExprKind::Parameter { index: *index },
-                        DataType::Text,
-                    );
+                    r = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
                 }
             }
         }
@@ -1465,37 +1457,29 @@ impl<'a> Analyzer<'a> {
         //
         // For text-like types, PG normalizes: varchar(n) → text, name → name.
         if let TypedExprKind::Parameter { index } = &l.kind {
-            if !r.is_null_constant()
-                && !self.is_unresolved_param(&r)
+            let rhs_blocks_param_inference = r.is_null_constant()
+                || self.is_unresolved_param(&r)
                 // PG has no `json = json` operator; don't infer param as Json.
-                && !(self.is_unresolved_param(&l) && r.data_type == DataType::Json)
-            {
+                || (self.is_unresolved_param(&l) && r.data_type == DataType::Json);
+            if !rhs_blocks_param_inference {
                 let was_unresolved = self.is_unresolved_param(&l);
-                let target =
-                    Self::param_inference_target(was_unresolved, &r.data_type);
+                let target = Self::param_inference_target(was_unresolved, &r.data_type);
                 self.resolve_param_type(*index, &target)?;
                 if was_unresolved {
-                    l = TypedExpr::new(
-                        TypedExprKind::Parameter { index: *index },
-                        target,
-                    );
+                    l = TypedExpr::new(TypedExprKind::Parameter { index: *index }, target);
                 }
             }
         }
         if let TypedExprKind::Parameter { index } = &r.kind {
-            if !l.is_null_constant()
-                && !self.is_unresolved_param(&l)
-                && !(self.is_unresolved_param(&r) && l.data_type == DataType::Json)
-            {
+            let lhs_blocks_param_inference = l.is_null_constant()
+                || self.is_unresolved_param(&l)
+                || (self.is_unresolved_param(&r) && l.data_type == DataType::Json);
+            if !lhs_blocks_param_inference {
                 let was_unresolved = self.is_unresolved_param(&r);
-                let target =
-                    Self::param_inference_target(was_unresolved, &l.data_type);
+                let target = Self::param_inference_target(was_unresolved, &l.data_type);
                 self.resolve_param_type(*index, &target)?;
                 if was_unresolved {
-                    r = TypedExpr::new(
-                        TypedExprKind::Parameter { index: *index },
-                        target,
-                    );
+                    r = TypedExpr::new(TypedExprKind::Parameter { index: *index }, target);
                 }
             }
         }
@@ -1533,10 +1517,8 @@ impl<'a> Analyzer<'a> {
             let l_text = Self::is_text_like_type(&l.data_type);
             let r_text = Self::is_text_like_type(&r.data_type);
             // "unknown value" = bare literal or unresolved param (NOT null — handled above).
-            let l_unknown_val =
-                Self::is_untyped_text_literal(&l) || self.is_unresolved_param(&l);
-            let r_unknown_val =
-                Self::is_untyped_text_literal(&r) || self.is_unresolved_param(&r);
+            let l_unknown_val = Self::is_untyped_text_literal(&l) || self.is_unresolved_param(&l);
+            let r_unknown_val = Self::is_untyped_text_literal(&r) || self.is_unresolved_param(&r);
 
             let target = if l_text && !r_text {
                 if l_unknown_val && !matches!(r.data_type, DataType::Json) {

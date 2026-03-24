@@ -6,9 +6,6 @@ use crate::extensions::fs::backend::{
 };
 use crate::extensions::fs::channel_reader::ChunkReceiverReader;
 use crate::extensions::fs::config::fs9_config;
-use crate::extensions::fs::notify::{
-    notify_metrics_for_keyspace, EventRing, FsEventBuilder, FsEventType,
-};
 use crate::extensions::fs::embedded::bundle::{
     build_bundle, delete_bundle_manifest, load_bundle_manifest, retire_bundle_entry,
     save_bundle_manifest, scan_bundle_manifests, BundleBuildInput, BundleJournal, BundleManifest,
@@ -17,6 +14,9 @@ use crate::extensions::fs::embedded::bundle::{
 use crate::extensions::fs::embedded::lifecycle::{self, FileLifecycle, UploadReservation};
 use crate::extensions::fs::embedded::types::*;
 use crate::extensions::fs::embedded::{blob, keys};
+use crate::extensions::fs::notify::{
+    notify_metrics_for_keyspace, EventRing, FsEventBuilder, FsEventType,
+};
 use crate::extensions::fs::s3::FsS3Client;
 use crate::extensions::fs::upload_token::{
     normalized_path_hash_hex, sign_upload_token, verify_upload_token, UploadTokenClaims,
@@ -637,8 +637,7 @@ impl EmbeddedPageFs {
         // Get-or-create the EventRing for this keyspace from the global registry.
         // This is the owner-side registration point; the TVF read path uses
         // get_event_ring() which only returns existing rings.
-        let notify_ring =
-            crate::extensions::fs::notify::get_or_create_event_ring(&keyspace);
+        let notify_ring = crate::extensions::fs::notify::get_or_create_event_ring(&keyspace);
 
         let runtime_state = Arc::new(runtime_state_from_superblock(&keyspace, superblock));
         let spool_root =
@@ -740,8 +739,7 @@ impl EmbeddedPageFs {
             metrics.record_coalesced(suppressed);
         }
         // Capture event types before push_batch consumes the builders.
-        let event_types: Vec<FsEventType> =
-            final_builders.iter().map(|b| b.event_type).collect();
+        let event_types: Vec<FsEventType> = final_builders.iter().map(|b| b.event_type).collect();
         match self.notify_ring.push_batch(final_builders) {
             Ok(_) => {
                 for et in &event_types {
@@ -8177,6 +8175,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
     async fn test_parent_directory_generation_changes_on_child_create_and_remove() {
         let fs = make_fs().await;
         let base = "/test_parent_dir_generation";
@@ -8204,6 +8203,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
     async fn test_parent_directory_generation_changes_on_cross_directory_rename() {
         let fs = make_fs().await;
         let base = "/test_parent_dir_generation_rename";

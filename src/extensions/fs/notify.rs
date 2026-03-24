@@ -1474,8 +1474,7 @@ mod tests {
         }
 
         // Push the coalesced batch.
-        let event_types: Vec<FsEventType> =
-            final_builders.iter().map(|b| b.event_type).collect();
+        let event_types: Vec<FsEventType> = final_builders.iter().map(|b| b.event_type).collect();
         ring.push_batch(final_builders).unwrap();
         for et in &event_types {
             metrics.record_emit(et);
@@ -1483,7 +1482,11 @@ mod tests {
 
         // Verify: ring has exactly 1 event (the last state).
         let result = ring.query(0, None, 100);
-        assert_eq!(result.events.len(), 1, "duplicate path must coalesce to 1 event");
+        assert_eq!(
+            result.events.len(),
+            1,
+            "duplicate path must coalesce to 1 event"
+        );
         assert_eq!(result.events[0].event_type, FsEventType::Write);
         assert_eq!(result.events[0].path, "/data/dup.txt");
         assert_eq!(result.events[0].size, 200);
