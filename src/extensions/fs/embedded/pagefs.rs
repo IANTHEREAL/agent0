@@ -6,6 +6,9 @@ use crate::extensions::fs::backend::{
 };
 use crate::extensions::fs::channel_reader::ChunkReceiverReader;
 use crate::extensions::fs::config::fs9_config;
+use crate::extensions::fs::notify::{
+    notify_metrics_for_keyspace, EventRing, FsEventBuilder, FsEventType,
+};
 use crate::extensions::fs::embedded::bundle::{
     build_bundle, delete_bundle_manifest, load_bundle_manifest, retire_bundle_entry,
     save_bundle_manifest, scan_bundle_manifests, BundleBuildInput, BundleJournal, BundleManifest,
@@ -69,6 +72,7 @@ pub(crate) struct EmbeddedPageFs {
     s3_client: Arc<OnceCell<Option<Arc<FsS3Client>>>>,
     inode_allocator: Arc<AsyncMutex<CachedIdRange>>,
     bundle_allocator: Arc<AsyncMutex<CachedIdRange>>,
+    notify_ring: Arc<EventRing>,
 }
 
 const STREAM_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -630,10 +634,11 @@ impl EmbeddedPageFs {
         keyspace: String,
         superblock: &Superblock,
     ) -> Self {
-        // Register the EventRing for this keyspace so fs9_events() TVF can
-        // find it. This is the owner-side registration point; the TVF read
-        // path uses get_event_ring() which only returns existing rings.
-        let _ring = crate::extensions::fs::notify::get_or_create_event_ring(&keyspace);
+        // Get-or-create the EventRing for this keyspace from the global registry.
+        // This is the owner-side registration point; the TVF read path uses
+        // get_event_ring() which only returns existing rings.
+        let notify_ring =
+            crate::extensions::fs::notify::get_or_create_event_ring(&keyspace);
 
         let runtime_state = Arc::new(runtime_state_from_superblock(&keyspace, superblock));
         let spool_root =
@@ -647,6 +652,7 @@ impl EmbeddedPageFs {
             s3_client: Arc::new(OnceCell::new()),
             inode_allocator: Arc::new(AsyncMutex::new(CachedIdRange::default())),
             bundle_allocator: Arc::new(AsyncMutex::new(CachedIdRange::default())),
+            notify_ring,
         }
     }
 
@@ -698,6 +704,57 @@ impl EmbeddedPageFs {
 
     pub(crate) fn ensure_background_maintenance(&self) {
         self.maybe_start_background_maintenance();
+    }
+
+    /// Returns a reference to the per-keyspace EventRing for fs9 notify.
+    pub(crate) fn notify_ring(&self) -> &Arc<EventRing> {
+        &self.notify_ring
+    }
+
+    /// Emit a single fs event after a successful TiKV commit.
+    /// Silently drops if the ring lock is poisoned (Hard Contract #4).
+    /// Records emit metrics for observability.
+    fn emit_event(&self, builder: FsEventBuilder) {
+        let metrics = notify_metrics_for_keyspace(&self.keyspace);
+        let event_type = builder.event_type;
+        match self.notify_ring.push(builder) {
+            Ok(_) => metrics.record_emit(&event_type),
+            Err(_) => metrics.record_emit_error(),
+        }
+    }
+
+    /// Emit multiple fs events atomically after a successful TiKV commit.
+    /// Used for batch_write to ensure all-or-none visibility (Hard Contract #5).
+    /// Silently drops if the ring lock is poisoned (Hard Contract #4).
+    /// Applies commit-scope coalescing: same path → keep only last event (Hard Contract #2).
+    fn emit_events(&self, builders: Vec<FsEventBuilder>) {
+        if builders.is_empty() {
+            return;
+        }
+        // Coalesce: same path within a commit → keep last state only (HC #2).
+        let input_count = builders.len();
+        let mut coalesced: std::collections::HashMap<String, FsEventBuilder> =
+            std::collections::HashMap::with_capacity(input_count);
+        for b in builders {
+            coalesced.insert(b.path.clone(), b);
+        }
+        let final_builders: Vec<FsEventBuilder> = coalesced.into_values().collect();
+        let metrics = notify_metrics_for_keyspace(&self.keyspace);
+        let suppressed = (input_count - final_builders.len()) as u64;
+        if suppressed > 0 {
+            metrics.record_coalesced(suppressed);
+        }
+        // Capture event types before push_batch consumes the builders.
+        let event_types: Vec<FsEventType> =
+            final_builders.iter().map(|b| b.event_type).collect();
+        match self.notify_ring.push_batch(final_builders) {
+            Ok(_) => {
+                for et in &event_types {
+                    metrics.record_emit(et);
+                }
+            }
+            Err(_) => metrics.record_emit_error(),
+        }
     }
 
     async fn alloc_inode_id(&self) -> Result<u64> {
@@ -1010,6 +1067,7 @@ impl EmbeddedPageFs {
         files: &[PreparedPackPublishFile],
     ) -> Result<()> {
         let mut txn = self.begin().await?;
+        let mut event_builders: Vec<FsEventBuilder> = Vec::with_capacity(files.len());
 
         for file in files {
             let (parent_inode, name) =
@@ -1036,6 +1094,7 @@ impl EmbeddedPageFs {
             }
 
             let mut publish_generation = staging_inode.generation.max(1);
+            let mut is_overwrite = false;
             if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
                 let existing_inode = load_inode(&mut txn, existing_inode_id)
                     .await?
@@ -1049,6 +1108,7 @@ impl EmbeddedPageFs {
                     )));
                 }
 
+                is_overwrite = true;
                 publish_generation = existing_inode.generation.checked_add(1).ok_or_else(|| {
                     anyhow!(EmbeddedFsError::internal("inode generation overflow"))
                 })?;
@@ -1082,10 +1142,28 @@ impl EmbeddedPageFs {
             save_inode(&mut txn, &staging_inode).await?;
             lifecycle::clear_lifecycle(&mut txn, file.staging_inode_id).await?;
             link(&mut txn, parent_inode, &name, file.staging_inode_id).await?;
+
+            event_builders.push(FsEventBuilder {
+                event_type: if is_overwrite {
+                    FsEventType::Write
+                } else {
+                    FsEventType::Create
+                },
+                path: normalize_path(&file.path),
+                old_path: None,
+                inode: file.staging_inode_id,
+                parent_inode,
+                generation: staging_inode.generation,
+                is_dir: false,
+                size: staging_inode.size,
+            });
         }
 
         save_bundle_manifest(&mut txn, manifest).await?;
         txn.commit().await?;
+
+        self.emit_events(event_builders);
+
         Ok(())
     }
 
@@ -2934,7 +3012,13 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = prepare_replace_file_txn(self, &mut txn, path, mode).await?;
+        let prepared = prepare_replace_file_txn(self, &mut txn, path, mode).await?;
+        let PreparedFile {
+            inode_id,
+            mut inode,
+            parent_inode,
+            is_new,
+        } = prepared;
 
         if data.is_empty() {
             inode.data = DataRef::None;
@@ -2950,6 +3034,24 @@ impl EmbeddedPageFs {
         save_inode(&mut txn, &inode).await?;
 
         txn.commit().await?;
+
+        // Emit fs9 notify event after successful commit.
+        let normalized = normalize_path(path);
+        self.emit_event(FsEventBuilder {
+            event_type: if is_new {
+                FsEventType::Create
+            } else {
+                FsEventType::Write
+            },
+            path: normalized,
+            old_path: None,
+            inode: inode_id,
+            parent_inode,
+            generation: inode.generation,
+            is_dir: false,
+            size: inode.size,
+        });
+
         Ok(data.len())
     }
 
@@ -3637,7 +3739,13 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = prepare_write_at_file_txn(self, &mut txn, path, None).await?;
+        let prepared = prepare_write_at_file_txn(self, &mut txn, path, None).await?;
+        let PreparedFile {
+            inode_id,
+            mut inode,
+            parent_inode,
+            is_new,
+        } = prepared;
         apply_inline_write_at(
             &mut txn,
             inode_id,
@@ -3650,6 +3758,23 @@ impl EmbeddedPageFs {
         )
         .await?;
         txn.commit().await?;
+
+        let normalized = normalize_path(path);
+        self.emit_event(FsEventBuilder {
+            event_type: if is_new {
+                FsEventType::Create
+            } else {
+                FsEventType::Write
+            },
+            path: normalized,
+            old_path: None,
+            inode: inode_id,
+            parent_inode,
+            generation: inode.generation,
+            is_dir: false,
+            size: inode.size,
+        });
+
         Ok(data.len())
     }
 
@@ -3659,7 +3784,13 @@ impl EmbeddedPageFs {
         }
 
         let mut txn = self.begin().await?;
-        let (inode_id, mut inode) = prepare_write_at_file_txn(self, &mut txn, path, None).await?;
+        let prepared = prepare_write_at_file_txn(self, &mut txn, path, None).await?;
+        let PreparedFile {
+            inode_id,
+            mut inode,
+            parent_inode,
+            is_new,
+        } = prepared;
         let offset = inode.size;
         apply_inline_write_at(
             &mut txn,
@@ -3673,6 +3804,23 @@ impl EmbeddedPageFs {
         )
         .await?;
         txn.commit().await?;
+
+        let normalized = normalize_path(path);
+        self.emit_event(FsEventBuilder {
+            event_type: if is_new {
+                FsEventType::Create
+            } else {
+                FsEventType::Write
+            },
+            path: normalized,
+            old_path: None,
+            inode: inode_id,
+            parent_inode,
+            generation: inode.generation,
+            is_dir: false,
+            size: inode.size,
+        });
+
         Ok(data.len())
     }
 
@@ -3718,7 +3866,21 @@ impl EmbeddedPageFs {
         bump_inode_generation(&mut inode)?;
         inode.touch_mtime();
         save_inode(&mut txn, &inode).await?;
+        let (parent_inode, _) = resolve_parent(&mut txn, path).await?;
         txn.commit().await?;
+
+        let normalized = normalize_path(path);
+        self.emit_event(FsEventBuilder {
+            event_type: FsEventType::Write,
+            path: normalized,
+            old_path: None,
+            inode: inode_id,
+            parent_inode,
+            generation: inode.generation,
+            is_dir: false,
+            size: inode.size,
+        });
+
         Ok(())
     }
 
@@ -3749,10 +3911,25 @@ impl EmbeddedPageFs {
         }
 
         let (parent_inode, name) = resolve_parent(&mut txn, &normalized).await?;
+        let is_dir = inode.is_directory();
+        let inode_size = inode.size;
+        let inode_generation = inode.generation;
         unlink(&mut txn, parent_inode, &name).await?;
         delete_inode(&mut txn, inode_id).await?;
 
         txn.commit().await?;
+
+        self.emit_event(FsEventBuilder {
+            event_type: FsEventType::Delete,
+            path: normalized,
+            old_path: None,
+            inode: inode_id,
+            parent_inode,
+            generation: inode_generation,
+            is_dir,
+            size: inode_size,
+        });
+
         Ok(())
     }
 
@@ -3767,6 +3944,9 @@ impl EmbeddedPageFs {
         let mut txn = self.begin().await?;
         let (inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
         let (parent_inode, name) = resolve_parent(&mut txn, &normalized).await?;
+        let is_dir = inode.is_directory();
+        let inode_size = inode.size;
+        let inode_generation = inode.generation;
 
         let removed = remove_inode_recursive(
             &mut txn,
@@ -3778,6 +3958,19 @@ impl EmbeddedPageFs {
         unlink(&mut txn, parent_inode, &name).await?;
 
         txn.commit().await?;
+
+        // Phase 1: emit single root DELETE (not per-child).
+        self.emit_event(FsEventBuilder {
+            event_type: FsEventType::Delete,
+            path: normalized,
+            old_path: None,
+            inode: inode_id,
+            parent_inode,
+            generation: inode_generation,
+            is_dir,
+            size: inode_size,
+        });
+
         Ok(removed)
     }
 
@@ -3787,9 +3980,18 @@ impl EmbeddedPageFs {
             return Ok(());
         }
 
+        // Collect created directories for event emission after commit.
+        struct CreatedDir {
+            path: String,
+            inode_id: u64,
+            parent_inode: u64,
+        }
+
         let attempts = fs9_config().tikv_commit_retry_attempts.max(1);
         for attempt in 0..attempts {
             let mut txn = self.begin().await?;
+            let mut created_dirs: Vec<CreatedDir> = Vec::new();
+
             let result: Result<()> = async {
                 if !recursive {
                     let (parent_inode, name) = resolve_parent(&mut txn, &normalized).await?;
@@ -3801,6 +4003,11 @@ impl EmbeddedPageFs {
                     let inode = Inode::new_directory(new_inode_id, mode.unwrap_or(0o755));
                     save_inode(&mut txn, &inode).await?;
                     link(&mut txn, parent_inode, &name, new_inode_id).await?;
+                    created_dirs.push(CreatedDir {
+                        path: normalized.clone(),
+                        inode_id: new_inode_id,
+                        parent_inode,
+                    });
                     txn.commit().await?;
                     return Ok(());
                 }
@@ -3830,6 +4037,12 @@ impl EmbeddedPageFs {
                         let inode = Inode::new_directory(new_inode_id, dir_mode);
                         save_inode(&mut txn, &inode).await?;
                         link(&mut txn, current_inode, part, new_inode_id).await?;
+                        let dir_path = format!("/{}", parts[..=i].join("/"));
+                        created_dirs.push(CreatedDir {
+                            path: dir_path,
+                            inode_id: new_inode_id,
+                            parent_inode: current_inode,
+                        });
                         current_inode = new_inode_id;
                     }
                 }
@@ -3840,7 +4053,24 @@ impl EmbeddedPageFs {
             .await;
 
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // Emit Mkdir events for all created directories.
+                    let builders: Vec<FsEventBuilder> = created_dirs
+                        .into_iter()
+                        .map(|d| FsEventBuilder {
+                            event_type: FsEventType::Mkdir,
+                            path: d.path,
+                            old_path: None,
+                            inode: d.inode_id,
+                            parent_inode: d.parent_inode,
+                            generation: 1,
+                            is_dir: true,
+                            size: 0,
+                        })
+                        .collect();
+                    self.emit_events(builders);
+                    return Ok(());
+                }
                 Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < attempts => {
                     fs9_commit_backoff(attempt).await;
                 }
@@ -3932,7 +4162,23 @@ impl EmbeddedPageFs {
         unlink(&mut txn, old_parent_inode, &old_name).await?;
         link(&mut txn, new_parent_inode, &new_name, old_inode_id).await?;
 
+        let is_dir = old_inode.is_directory();
+        let inode_generation = old_inode.generation;
+        let inode_size = old_inode.size;
+
         txn.commit().await?;
+
+        self.emit_event(FsEventBuilder {
+            event_type: FsEventType::Rename,
+            path: new_normalized,
+            old_path: Some(old_normalized),
+            inode: old_inode_id,
+            parent_inode: new_parent_inode,
+            generation: inode_generation,
+            is_dir,
+            size: inode_size,
+        });
+
         Ok(())
     }
 
@@ -4163,6 +4409,7 @@ impl EmbeddedPageFs {
         // Publish should advance the per-path generation counter so CAS can detect
         // intervening in-place mutations even when inode ids are stable.
         let mut publish_generation = staging_inode.generation.max(1);
+        let mut is_overwrite = false;
         let orphan_inode_id =
             if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
                 let mut existing_inode = load_inode(&mut txn, existing_inode_id)
@@ -4178,6 +4425,7 @@ impl EmbeddedPageFs {
                     )));
                 }
 
+                is_overwrite = true;
                 publish_generation = existing_inode.generation.checked_add(1).ok_or_else(|| {
                     anyhow!(EmbeddedFsError::internal("inode generation overflow"))
                 })?;
@@ -4228,10 +4476,28 @@ impl EmbeddedPageFs {
         link(&mut txn, parent_inode, &name, staging_inode_id).await?;
         lifecycle::clear_lifecycle(&mut txn, staging_inode_id).await?;
         clear_staging_write(&mut txn, staging_inode_id).await?;
+        let emit_size = staging_inode.size;
+        let emit_generation = staging_inode.generation;
         txn.commit().await?;
 
+        let normalized = normalize_path(path);
+        self.emit_event(FsEventBuilder {
+            event_type: if is_overwrite {
+                FsEventType::Write
+            } else {
+                FsEventType::Create
+            },
+            path: normalized,
+            old_path: None,
+            inode: staging_inode_id,
+            parent_inode,
+            generation: emit_generation,
+            is_dir: false,
+            size: emit_size,
+        });
+
         Ok((
-            usize::try_from(staging_inode.size)
+            usize::try_from(emit_size)
                 .map_err(|_| anyhow!(EmbeddedFsError::internal("staging size exceeds usize")))?,
             orphan_inode_id,
         ))
@@ -4511,6 +4777,8 @@ impl EmbeddedPageFs {
         for attempt in 0..attempts {
             let mut txn = self.begin().await?;
             let mut did_bump_version = false;
+            let mut symlink_inode_id = 0u64;
+            let mut symlink_parent_inode = 0u64;
             let result: Result<()> = async {
                 // Lazy format version bump: ensure this keyspace declares symlink support.
                 // One-time per keyspace; concurrent bumps are resolved by TiKV write conflict + retry.
@@ -4535,6 +4803,8 @@ impl EmbeddedPageFs {
                 txn.put(keys::blob_key(new_inode_id), target.as_bytes().to_vec())
                     .await?;
                 link(&mut txn, parent_inode, &name, new_inode_id).await?;
+                symlink_inode_id = new_inode_id;
+                symlink_parent_inode = parent_inode;
                 txn.commit().await?;
                 Ok(())
             }
@@ -4549,6 +4819,16 @@ impl EmbeddedPageFs {
                             FS9_FORMAT_VERSION_SYMLINK
                         );
                     }
+                    self.emit_event(FsEventBuilder {
+                        event_type: FsEventType::Create,
+                        path: normalized,
+                        old_path: None,
+                        inode: symlink_inode_id,
+                        parent_inode: symlink_parent_inode,
+                        generation: 1,
+                        is_dir: false,
+                        size: target.len() as u64,
+                    });
                     return Ok(());
                 }
                 Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < attempts => {
@@ -4568,10 +4848,21 @@ impl EmbeddedPageFs {
         let attempts = fs9_config().tikv_commit_retry_attempts.max(1);
         for attempt in 0..attempts {
             let mut txn = self.begin().await?;
+            let mut chmod_inode_id = 0u64;
+            let mut chmod_generation = 0u64;
+            let mut chmod_is_dir = false;
+            let mut chmod_size = 0u64;
+            let mut chmod_parent_inode = 0u64;
             let result: Result<()> = async {
-                let (_inode_id, mut inode) = resolve_path(&mut txn, &normalized).await?;
+                let (inode_id, mut inode) = resolve_path(&mut txn, &normalized).await?;
+                let (parent_inode, _) = resolve_parent(&mut txn, &normalized).await?;
                 inode.mode = mode;
                 inode.touch_mtime();
+                chmod_inode_id = inode_id;
+                chmod_generation = inode.generation;
+                chmod_is_dir = inode.is_directory();
+                chmod_size = inode.size;
+                chmod_parent_inode = parent_inode;
                 save_inode(&mut txn, &inode).await?;
                 txn.commit().await?;
                 Ok(())
@@ -4579,7 +4870,19 @@ impl EmbeddedPageFs {
             .await;
 
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.emit_event(FsEventBuilder {
+                        event_type: FsEventType::Write,
+                        path: normalized,
+                        old_path: None,
+                        inode: chmod_inode_id,
+                        parent_inode: chmod_parent_inode,
+                        generation: chmod_generation,
+                        is_dir: chmod_is_dir,
+                        size: chmod_size,
+                    });
+                    return Ok(());
+                }
                 Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < attempts => {
                     fs9_commit_backoff(attempt).await;
                 }
@@ -4610,12 +4913,21 @@ impl EmbeddedPageFs {
     }
 }
 
+/// Result of `prepare_replace_file_txn`, carrying parent inode for event emission.
+struct PreparedFile {
+    inode_id: u64,
+    inode: Inode,
+    parent_inode: u64,
+    /// True if the inode was freshly allocated in this txn (generation == 1 before bump).
+    is_new: bool,
+}
+
 async fn prepare_replace_file_txn(
     fs: &EmbeddedPageFs,
     txn: &mut Transaction,
     path: &str,
     mode: Option<u32>,
-) -> Result<(u64, Inode)> {
+) -> Result<PreparedFile> {
     let (parent_inode, name) = ensure_parents_and_resolve_parent(fs, txn, path).await?;
 
     if let Some(existing_inode_id) = lookup(txn, parent_inode, &name).await? {
@@ -4641,13 +4953,23 @@ async fn prepare_replace_file_txn(
         .await?;
         inode.data = DataRef::None;
         inode.size = 0;
-        Ok((existing_inode_id, inode))
+        Ok(PreparedFile {
+            inode_id: existing_inode_id,
+            inode,
+            parent_inode,
+            is_new: false,
+        })
     } else {
         let inode_id = fs.alloc_inode_id().await?;
         let mut inode = Inode::new_file(inode_id, mode.unwrap_or(0o644));
         inode.data = DataRef::None;
         link(txn, parent_inode, &name, inode_id).await?;
-        Ok((inode_id, inode))
+        Ok(PreparedFile {
+            inode_id,
+            inode,
+            parent_inode,
+            is_new: true,
+        })
     }
 }
 
@@ -4656,7 +4978,7 @@ async fn prepare_write_at_file_txn(
     txn: &mut Transaction,
     path: &str,
     mode: Option<u32>,
-) -> Result<(u64, Inode)> {
+) -> Result<PreparedFile> {
     let (parent_inode, name) = ensure_parents_and_resolve_parent(fs, txn, path).await?;
 
     if let Some(existing_inode_id) = lookup(txn, parent_inode, &name).await? {
@@ -4673,13 +4995,23 @@ async fn prepare_write_at_file_txn(
             )));
         }
 
-        Ok((existing_inode_id, inode))
+        Ok(PreparedFile {
+            inode_id: existing_inode_id,
+            inode,
+            parent_inode,
+            is_new: false,
+        })
     } else {
         let inode_id = fs.alloc_inode_id().await?;
         let inode = Inode::new_file(inode_id, mode.unwrap_or(0o644));
         save_inode(txn, &inode).await?;
         link(txn, parent_inode, &name, inode_id).await?;
-        Ok((inode_id, inode))
+        Ok(PreparedFile {
+            inode_id,
+            inode,
+            parent_inode,
+            is_new: true,
+        })
     }
 }
 

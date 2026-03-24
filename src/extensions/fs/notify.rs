@@ -468,6 +468,8 @@ pub struct NotifyMetrics {
     pub events_mkdir: AtomicU64,
     pub overflow_queries: AtomicU64,
     pub emit_errors: AtomicU64,
+    /// Events suppressed by commit-scope coalescing (same path in one commit).
+    pub events_coalesced: AtomicU64,
 }
 
 impl NotifyMetrics {
@@ -481,6 +483,7 @@ impl NotifyMetrics {
             events_mkdir: AtomicU64::new(0),
             overflow_queries: AtomicU64::new(0),
             emit_errors: AtomicU64::new(0),
+            events_coalesced: AtomicU64::new(0),
         }
     }
 
@@ -501,6 +504,10 @@ impl NotifyMetrics {
 
     pub fn record_emit_error(&self) {
         self.emit_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_coalesced(&self, count: u64) {
+        self.events_coalesced.fetch_add(count, Ordering::Relaxed);
     }
 }
 
@@ -1376,5 +1383,73 @@ mod tests {
         assert_eq!(metrics.events_write.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.overflow_queries.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.emit_errors.load(Ordering::Relaxed), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: commit-scope coalescing — duplicate path in same batch
+    // -----------------------------------------------------------------------
+
+    /// Reproduces the coalescing logic from `EmbeddedPageFs::emit_events()`:
+    /// same path appears twice in one batch → only the last state is emitted,
+    /// and the `events_coalesced` metric increments.
+    #[test]
+    fn test_batch_coalescing_duplicate_path() {
+        let ring = EventRing::with_epoch(100, 42);
+        let metrics = NotifyMetrics::new();
+
+        // Simulate two mutations to the same path within one commit:
+        // first a CREATE, then a WRITE (overwrite). Only WRITE should survive.
+        let builders = vec![
+            {
+                let mut b = make_builder(FsEventType::Create, "/data/dup.txt");
+                b.size = 50;
+                b
+            },
+            {
+                let mut b = make_builder(FsEventType::Write, "/data/dup.txt");
+                b.size = 200;
+                b
+            },
+        ];
+
+        // -- replicate the coalescing logic from pagefs emit_events() --
+        let input_count = builders.len();
+        let mut coalesced: std::collections::HashMap<String, FsEventBuilder> =
+            std::collections::HashMap::with_capacity(input_count);
+        for b in builders {
+            coalesced.insert(b.path.clone(), b);
+        }
+        let final_builders: Vec<FsEventBuilder> = coalesced.into_values().collect();
+        let suppressed = (input_count - final_builders.len()) as u64;
+        if suppressed > 0 {
+            metrics.record_coalesced(suppressed);
+        }
+
+        // Push the coalesced batch.
+        let event_types: Vec<FsEventType> =
+            final_builders.iter().map(|b| b.event_type).collect();
+        ring.push_batch(final_builders).unwrap();
+        for et in &event_types {
+            metrics.record_emit(et);
+        }
+
+        // Verify: ring has exactly 1 event (the last state).
+        let result = ring.query(0, None, 100);
+        assert_eq!(result.events.len(), 1, "duplicate path must coalesce to 1 event");
+        assert_eq!(result.events[0].event_type, FsEventType::Write);
+        assert_eq!(result.events[0].path, "/data/dup.txt");
+        assert_eq!(result.events[0].size, 200);
+
+        // Verify: coalesced counter incremented by 1.
+        assert_eq!(
+            metrics.events_coalesced.load(Ordering::Relaxed),
+            1,
+            "one event was suppressed by coalescing"
+        );
+
+        // Verify: only 1 emit recorded (the surviving event).
+        assert_eq!(metrics.events_emitted.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.events_write.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.events_create.load(Ordering::Relaxed), 0);
     }
 }
