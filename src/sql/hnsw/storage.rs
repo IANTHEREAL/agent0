@@ -9,7 +9,7 @@ use std::fs;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -779,6 +779,7 @@ pub async fn load_base_graph(
 /// Deltas are applied via paginated streaming: scan one page, apply to
 /// in-memory index, advance start_key, repeat. Never collects all deltas
 /// into a single Vec.
+#[allow(dead_code)] // retained for worker merge path compatibility
 pub async fn load_hnsw_graph_with_deltas(
     txn: &mut Transaction,
     db_id: u64,
@@ -896,6 +897,177 @@ pub async fn load_hnsw_graph_with_deltas(
     }
 
     Ok(Some((HnswIndexHandle::new(index), live_meta, delta_count)))
+}
+
+// ===========================================================================
+// Shared index cache integration (concurrent read-safe)
+// ===========================================================================
+
+use super::s3::{hnsw_index_cache, SharedHnswIndex};
+
+/// Estimate in-memory size for a loaded usearch index.
+/// Formula: count * (dimensions * 4 + 2 * m * 8 + 40) + fixed overhead.
+pub fn estimate_graph_memory(count: u64, dimensions: usize, m: usize) -> usize {
+    let per_node = dimensions * 4 + 2 * m * 8 + 40;
+    (count as usize) * per_node + 4096 // 4KB fixed overhead
+}
+
+/// Get a shared reference to the base graph, using the in-memory index cache.
+///
+/// On cache hit: returns `Arc<SharedHnswIndex>` directly (zero-copy, 0ms).
+/// On cache miss: loads from disk/S3/TiKV via `load_base_graph`, inserts
+/// into the cache, and returns the shared reference.
+pub async fn get_shared_base_graph(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    meta: &HnswMeta,
+    keyspace: &str,
+) -> Result<Option<Arc<SharedHnswIndex>>, SqlError> {
+    if meta.dropped_at.is_some() {
+        return Ok(None);
+    }
+
+    let cache = hnsw_index_cache();
+
+    // Cache lookup by exact version.
+    if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version) {
+        return Ok(Some(shared));
+    }
+
+    // Cache miss: load the base graph via existing path.
+    let Some((handle, live_meta)) =
+        load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await?
+    else {
+        return Ok(None);
+    };
+
+    let estimated_bytes = estimate_graph_memory(live_meta.count, live_meta.dimensions, live_meta.m);
+
+    let shared = cache.insert(
+        keyspace,
+        db_id,
+        table_id,
+        index_id,
+        meta.graph_version,
+        handle,
+        estimated_bytes,
+    );
+
+    Ok(Some(shared))
+}
+
+/// Scan visible delta vectors for the current transaction snapshot.
+/// Returns the raw deltas without applying them to any index.
+pub async fn scan_visible_deltas(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+) -> Result<Vec<HnswDelta>, SqlError> {
+    let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+    let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+    let mut start = prefix.clone();
+    let mut deltas = Vec::new();
+
+    loop {
+        let range: BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn
+            .scan(range, DELTA_SCAN_BATCH_SIZE)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+            .collect();
+        let page_count = pairs.len();
+        if page_count == 0 {
+            break;
+        }
+
+        let mut last_key: Option<Vec<u8>> = None;
+        for pair in pairs {
+            let k: &[u8] = pair.key().as_ref().into();
+            let key: Vec<u8> = k.to_vec();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let delta: HnswDelta = bincode::deserialize(pair.value())
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+            deltas.push(delta);
+            last_key = Some(key);
+        }
+
+        if (page_count as u32) < DELTA_SCAN_BATCH_SIZE {
+            break;
+        }
+        match last_key {
+            Some(mut lk) => {
+                lk.push(0x00);
+                start = lk;
+            }
+            None => break,
+        }
+    }
+
+    Ok(deltas)
+}
+
+/// Build a small per-query HNSW index from delta vectors.
+pub fn build_delta_index(
+    meta: &HnswMeta,
+    deltas: &[HnswDelta],
+) -> Result<HnswIndexHandle, SqlError> {
+    let metric = metric_from_string(&meta.distance_metric)?;
+    let options = IndexOptions {
+        dimensions: meta.dimensions,
+        metric,
+        quantization: ScalarKind::F32,
+        connectivity: meta.m,
+        expansion_add: meta.ef_construction,
+        expansion_search: super::HNSW_DEFAULT_EF_SEARCH,
+    };
+    let index = new_index(&options).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    index
+        .reserve(deltas.len())
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    for delta in deltas {
+        index
+            .add(delta.label, &delta.vector)
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    }
+    Ok(HnswIndexHandle::new(index))
+}
+
+/// Merge search results from base graph and delta index.
+///
+/// For labels appearing in both sets, the delta result takes precedence
+/// (it reflects the current vector value, not the stale base graph entry).
+/// Results are sorted by distance ascending and truncated to k.
+pub fn merge_search_results(
+    base_results: &[(u64, f64)],
+    delta_results: &[(u64, f64)],
+    k: usize,
+) -> Vec<(u64, f64)> {
+    use std::collections::HashSet;
+
+    let delta_labels: HashSet<u64> = delta_results.iter().map(|(l, _)| *l).collect();
+
+    // Base results: exclude labels that have delta overrides.
+    let mut merged: Vec<(u64, f64)> = base_results
+        .iter()
+        .filter(|(label, _)| !delta_labels.contains(label))
+        .copied()
+        .collect();
+
+    // Add all delta results.
+    merged.extend_from_slice(delta_results);
+
+    // Sort by distance, deduplicate by label (keep closest).
+    merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen = HashSet::with_capacity(k);
+    merged.retain(|(label, _)| seen.insert(*label));
+    merged.truncate(k);
+
+    merged
 }
 
 // ===========================================================================

@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::hnsw::storage::{batch_get_pk_for_rowids, load_hnsw_graph_with_deltas};
+use crate::sql::hnsw::storage::{
+    batch_get_pk_for_rowids, build_delta_index, get_shared_base_graph, hnsw_meta_key,
+    merge_search_results, scan_visible_deltas, HnswMeta,
+};
 use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle, HnswLabelMode};
 use crate::sql::projection::fill_row_defaults;
 use crate::storage::decode_pk_from_index_suffix;
@@ -160,22 +163,56 @@ impl PhysicalOperator for HnswScanOperator {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(40);
 
-        // Load base graph + apply pending deltas so read-your-writes holds:
-        // delta keys written by prior INSERT/UPDATE in the same txn are
-        // visible via txn.scan's buffer merge.
+        // Two-level search: shared base graph + per-query delta index.
+        //
+        // 1. Get shared base graph from the in-memory index cache (Arc, zero-copy).
+        // 2. Scan deltas visible to this transaction's MVCC snapshot.
+        // 3. Search base graph + search delta index + merge results.
+        //
+        // This eliminates the N× memory multiplier: N concurrent queries
+        // share one loaded base graph instead of each loading a private copy.
         let keyspace = ctx.store.keyspace().unwrap_or("default");
-        let Some((hnsw_index, meta, delta_count)) = load_hnsw_graph_with_deltas(
-            ctx.txn,
-            ctx.db_id,
-            self.schema.table_id,
-            self.index_id,
-            keyspace,
-        )
-        .await?
+
+        // Read meta.
+        let meta_key = hnsw_meta_key(ctx.db_id, self.schema.table_id, self.index_id);
+        let Some(meta_bytes) = ctx
+            .txn
+            .get(meta_key)
+            .await
+            .map_err(|e| anyhow!(e))?
         else {
             return Ok(());
         };
+        let meta: HnswMeta =
+            serde_json::from_slice(&meta_bytes).map_err(|e| anyhow!(e))?;
+        if meta.dropped_at.is_some() {
+            return Ok(());
+        }
+        if meta.storage_version != 1 && meta.storage_version != 2 {
+            return Err(anyhow!(
+                "HNSW index has unsupported storage_version={}; only v1/v2 supported",
+                meta.storage_version
+            ));
+        }
+
         let label_mode = meta.label_mode;
+
+        // Get shared base graph (cache hit = 0ms, miss = load from disk/S3).
+        let shared_base = get_shared_base_graph(
+            ctx.txn, ctx.db_id, self.schema.table_id, self.index_id, &meta, keyspace,
+        ).await?;
+
+        // Scan deltas visible to this transaction.
+        let deltas = scan_visible_deltas(
+            ctx.txn, ctx.db_id, self.schema.table_id, self.index_id,
+        ).await?;
+        let delta_count = deltas.len();
+
+        // Nothing to search.
+        if shared_base.is_none() && deltas.is_empty() {
+            return Ok(());
+        }
+
         if delta_count > 0 {
             if let Some(m) = crate::worker::get_worker_metrics() {
                 m.hnsw_scan_deltas_applied
@@ -203,15 +240,41 @@ impl PhysicalOperator for HnswScanOperator {
         // If the first pass yields < k valid rows (too many stale hits),
         // widen fetch_k and retry until we either have enough rows or
         // have exhausted the entire graph.
-        let graph_size = hnsw_index.size();
+        // Two-level search: base graph + delta index, merge results.
+        let base_graph_size = shared_base.as_ref().map(|s| s.index.size()).unwrap_or(0);
+        let delta_index = if !deltas.is_empty() {
+            Some(build_delta_index(&meta, &deltas)?)
+        } else {
+            None
+        };
+        let graph_size = base_graph_size + delta_index.as_ref().map(|d| d.size()).unwrap_or(0);
         let mut fetch_k = self.k.max(ef_search).max(self.k * 2).max(self.k + 100);
         let mut rows;
         let mut distance_by_label: HashMap<u64, f64>;
         let mut pk_to_label: HashMap<String, u64> = HashMap::new();
 
         loop {
-            let ranked_labels =
-                Self::search_ranked_labels(&hnsw_index, &query_f32, fetch_k, self.distance_metric)?;
+            // Search base graph (if it exists).
+            let base_results = if let Some(ref base) = shared_base {
+                Self::search_ranked_labels(
+                    &base.index, &query_f32, fetch_k, self.distance_metric,
+                )?
+            } else {
+                Vec::new()
+            };
+
+            // Search delta index (if it exists) and merge results.
+            let ranked_labels = if let Some(ref di) = delta_index {
+                let delta_k = fetch_k.min(di.size());
+                let delta_results = if delta_k > 0 {
+                    Self::search_ranked_labels(di, &query_f32, delta_k, self.distance_metric)?
+                } else {
+                    Vec::new()
+                };
+                merge_search_results(&base_results, &delta_results, fetch_k)
+            } else {
+                base_results
+            };
             if ranked_labels.is_empty() {
                 self.row_buffer.clear();
                 return Ok(());
