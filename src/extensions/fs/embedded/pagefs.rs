@@ -5441,11 +5441,30 @@ async fn link(
         child_inode.to_be_bytes().to_vec(),
     )
     .await?;
+    touch_directory_entry_parent(txn, parent_inode).await?;
     Ok(())
 }
 
 async fn unlink(txn: &mut Transaction, parent_inode: u64, name: &str) -> Result<()> {
     txn.delete(keys::dir_entry_key(parent_inode, name)).await?;
+    touch_directory_entry_parent(txn, parent_inode).await?;
+    Ok(())
+}
+
+async fn touch_directory_entry_parent(txn: &mut Transaction, parent_inode: u64) -> Result<()> {
+    let mut inode = load_inode(txn, parent_inode).await?.ok_or_else(|| {
+        anyhow!(EmbeddedFsError::internal(
+            "parent inode missing during directory update"
+        ))
+    })?;
+    if !inode.is_directory() {
+        return Err(anyhow!(EmbeddedFsError::internal(
+            "parent inode is not a directory during directory update",
+        )));
+    }
+    bump_inode_generation(&mut inode)?;
+    inode.touch_mtime();
+    save_inode(txn, &inode).await?;
     Ok(())
 }
 
@@ -7825,6 +7844,78 @@ mod tests {
         assert!(fs::metadata(&stale).await.is_err());
 
         remove_dir_all_if_exists(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_parent_directory_generation_changes_on_child_create_and_remove() {
+        let fs = make_fs().await;
+        let base = "/test_parent_dir_generation";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+
+        let before = fs.stat(base).await.unwrap();
+        let child = format!("{base}/child.txt");
+
+        fs.write_file(&child, b"hello", None).await.unwrap();
+        let after_create = fs.stat(base).await.unwrap();
+        assert!(
+            after_create.generation > before.generation,
+            "creating a child must bump parent directory generation"
+        );
+
+        fs.remove(&child).await.unwrap();
+        let after_remove = fs.stat(base).await.unwrap();
+        assert!(
+            after_remove.generation > after_create.generation,
+            "removing a child must bump parent directory generation"
+        );
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    async fn test_parent_directory_generation_changes_on_cross_directory_rename() {
+        let fs = make_fs().await;
+        let base = "/test_parent_dir_generation_rename";
+        cleanup(&fs, base).await;
+        let src_dir = format!("{base}/src");
+        let dst_dir = format!("{base}/dst");
+        ensure_dir(&fs, &src_dir).await;
+        ensure_dir(&fs, &dst_dir).await;
+
+        let src_before = fs.stat(&src_dir).await.unwrap();
+        let dst_before = fs.stat(&dst_dir).await.unwrap();
+
+        let old_path = format!("{src_dir}/child.txt");
+        let new_path = format!("{dst_dir}/child.txt");
+        fs.write_file(&old_path, b"hello", None).await.unwrap();
+
+        let src_after_create = fs.stat(&src_dir).await.unwrap();
+        let dst_after_create = fs.stat(&dst_dir).await.unwrap();
+
+        fs.rename(&old_path, &new_path).await.unwrap();
+
+        let src_after_rename = fs.stat(&src_dir).await.unwrap();
+        let dst_after_rename = fs.stat(&dst_dir).await.unwrap();
+
+        assert!(
+            src_after_create.generation > src_before.generation,
+            "creating a child must bump source parent directory generation"
+        );
+        assert_eq!(
+            dst_after_create.generation, dst_before.generation,
+            "destination parent generation must not change before rename"
+        );
+        assert!(
+            src_after_rename.generation > src_after_create.generation,
+            "rename must bump the old parent directory generation"
+        );
+        assert!(
+            dst_after_rename.generation > dst_after_create.generation,
+            "rename must bump the new parent directory generation"
+        );
+
+        cleanup(&fs, base).await;
     }
 
     #[test]

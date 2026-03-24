@@ -364,6 +364,7 @@ mod tests {
                 is_symlink: false,
                 size: data.len() as u64,
                 mode: 0o644,
+                generation: 1,
                 mtime: 0,
                 storage: Some(FsStorage::Inline),
                 sealed: Some(false),

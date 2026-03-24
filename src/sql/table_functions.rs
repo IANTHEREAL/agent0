@@ -283,6 +283,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             is_symlink: false,
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },
+            generation: 0,
             mtime,
             storage: None,
             sealed: None,

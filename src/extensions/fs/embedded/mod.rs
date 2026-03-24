@@ -263,6 +263,7 @@ fn inode_to_file_info(path: &str, inode: &Inode) -> Result<FsFileInfo> {
         is_symlink,
         size: inode.size,
         mode: inode.mode,
+        generation: inode.generation,
         mtime: inode.mtime as u64,
         storage,
         sealed,
@@ -365,6 +366,7 @@ mod tests {
         let info = inode_to_file_info("/data.bin", &inode).expect("object inode must map");
         assert_eq!(info.storage, Some(FsStorage::Object));
         assert_eq!(info.sealed, Some(true));
+        assert_eq!(info.generation, inode.generation);
     }
 
     #[test]
