@@ -22,7 +22,7 @@ use super::super::create_table::{check_relation_name_available, RelationKind};
 use super::super::{
     analyze_row_level_expr, constraint_name_exists, delete_range, eval_row_level_expr,
     extract_first_column_from_check_expr, find_check_constraint_index, index_prefix_range,
-    parse_referential_action, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    parse_referential_action, AlterTableBudget, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 
 /// ADD CONSTRAINT ... PRIMARY KEY: validate columns, set pk_indices, reserve
@@ -139,6 +139,7 @@ pub(super) async fn alter_table_add_unique_constraint(
         hnsw_distance_metric: None,
     };
 
+    let mut budget = AlterTableBudget::new(&schema.name, "ADD CONSTRAINT UNIQUE (index backfill)");
     let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
     let data_key_prefix = start.clone();
     let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
@@ -171,7 +172,7 @@ pub(super) async fn alter_table_add_unique_constraint(
             } else {
                 schema.get_pk_values(&row)
             };
-            store
+            let idx_bytes = store
                 .create_index_entry(
                     txn,
                     db_id,
@@ -182,6 +183,7 @@ pub(super) async fn alter_table_add_unique_constraint(
                     true,
                 )
                 .await?;
+            budget.track_write(idx_bytes, 0)?;
         }
     }
 
