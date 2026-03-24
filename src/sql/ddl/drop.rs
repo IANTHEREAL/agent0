@@ -263,9 +263,9 @@ pub async fn execute_drop_index(
             // DROP + CREATE INDEX can reuse the same index_id, and the new
             // index starts at graph_version=1 — colliding with the cached
             // entry from the old index (same key + same version = stale hit).
-            let cache = crate::sql::hnsw::s3::hnsw_graph_cache();
             let ks = store.keyspace().unwrap_or("default");
-            cache.evict(ks, db_id, schema.table_id, index.id);
+            crate::sql::hnsw::s3::hnsw_graph_cache().evict(ks, db_id, schema.table_id, index.id);
+            crate::sql::hnsw::s3::hnsw_index_cache().evict(ks, db_id, schema.table_id, index.id);
         }
 
         // Release the reservation key for the dropped index name.

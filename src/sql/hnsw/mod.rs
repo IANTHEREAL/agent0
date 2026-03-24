@@ -3,13 +3,13 @@
 //! This module provides integration with the `usearch` crate for efficient
 //! approximate nearest neighbor search on high-dimensional vectors.
 //!
-//! Design note: there is intentionally no process-level HNSW graph cache.
-//! Each scan/write operation loads the graph directly from TiKV, which
-//! guarantees it always sees committed state. A prior cache introduced a
-//! race condition where INSERT could invalidate before commit, allowing a
-//! concurrent reader to repopulate with stale data that persisted permanently.
-//! When a proper MVCC-aware cache is needed, it should validate freshness
-//! against TiKV timestamps rather than relying on eager invalidation.
+//! Design note: the process-level `HnswIndexCache` (in `s3`) caches loaded,
+//! read-only base graphs keyed by `(keyspace, db_id, table_id, index_id,
+//! graph_version)`. Version changes from merge are natural cache misses.
+//! Per-query deltas (MVCC-visible inserts since last merge) are searched
+//! in a small per-query delta index and merged with base graph results.
+//! usearch `search()` is thread-safe (internal per-thread context pool),
+//! so multiple concurrent queries share one `Arc<SharedHnswIndex>`.
 //!
 //! ## S3 offload (optional)
 //!

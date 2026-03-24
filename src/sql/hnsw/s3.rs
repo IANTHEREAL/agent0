@@ -13,8 +13,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context};
@@ -98,13 +98,11 @@ static CACHE_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Keyspace is required because IDs are per-keyspace in multi-tenant mode.
 type CacheKey = (String, u64, u64, u64);
 
-/// Process-level LRU cache for HNSW graph files.
+/// Process-level LRU cache for HNSW graph files on disk.
 ///
 /// Stores persistent files on disk, keyed by `(keyspace, db_id, table_id, index_id)`.
-/// Each query loads its own usearch `Index` from the cached file path
-/// (~5-15ms `index.load()` vs 200-400ms S3 GET).
-///
-/// The usearch `Index` is NOT stored in the cache because it is not thread-safe.
+/// This is the L2 cache (disk); the L1 cache is [`HnswIndexCache`] which stores
+/// loaded `Index` objects in memory, shared across concurrent queries.
 pub(crate) struct HnswGraphCache {
     entries: Mutex<HashMap<CacheKey, CacheEntry>>,
     cache_dir: PathBuf,
@@ -349,6 +347,276 @@ pub(crate) fn init_hnsw_cache() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Process-level in-memory index cache (shared read-only indexes)
+// ---------------------------------------------------------------------------
+
+use super::storage::HnswIndexHandle;
+
+/// A shared, read-only loaded HNSW index.
+///
+/// usearch `search()` is thread-safe: it uses an internal per-thread context pool
+/// (`available_threads_` with `hardware_concurrency()` slots). Multiple concurrent
+/// queries can safely call `search()` on the same `Index` without external locking.
+///
+/// The prior comment claiming "usearch Index is not thread-safe" was overly
+/// conservative — it applies to concurrent `add()` + `search()` on the same
+/// scratch buffers, but the punned_dense wrapper's `thread_lock_()` mechanism
+/// handles this internally.
+pub(crate) struct SharedHnswIndex {
+    pub index: HnswIndexHandle,
+    pub estimated_memory_bytes: usize,
+}
+
+/// Cache key: (keyspace, db_id, table_id, index_id, cache_version).
+///
+/// For S3 graphs (graph_version > 0): `cache_version = graph_version`.
+/// Version is monotonically increasing (TSO-based), so DDL cycles cannot collide.
+///
+/// For TiKV graphs (graph_version == 0): `cache_version = meta_fingerprint(count, capacity)`.
+/// This disambiguates across DROP+CREATE cycles (which reuse index_id with
+/// graph_version=0) and naturally invalidates after merge (count/capacity change).
+type IndexCacheKey = (String, u64, u64, u64, u64);
+
+struct IndexCacheEntry {
+    index: Arc<SharedHnswIndex>,
+    last_access: Instant,
+}
+
+/// Process-level cache for loaded, read-only HNSW indexes.
+///
+/// Each entry is an `Arc<SharedHnswIndex>` that can be cloned cheaply by
+/// concurrent queries. When a version changes (after merge), the old entry
+/// stays alive via `Arc` until the last query holding it finishes.
+pub(crate) struct HnswIndexCache {
+    entries: Mutex<HashMap<IndexCacheKey, IndexCacheEntry>>,
+    total_memory_bytes: AtomicUsize,
+    max_memory_bytes: usize,
+}
+
+/// Default memory budget: 2 GB.
+const DEFAULT_INDEX_CACHE_MEMORY: usize = 2 * 1024 * 1024 * 1024;
+
+impl HnswIndexCache {
+    fn new(max_memory_bytes: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            total_memory_bytes: AtomicUsize::new(0),
+            max_memory_bytes,
+        }
+    }
+
+    /// Look up a cached loaded index by exact version.
+    pub(crate) fn lookup(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        graph_version: u64,
+    ) -> Option<Arc<SharedHnswIndex>> {
+        let key = (
+            keyspace.to_string(),
+            db_id,
+            table_id,
+            index_id,
+            graph_version,
+        );
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.last_access = Instant::now();
+            debug!(
+                keyspace,
+                db_id, table_id, index_id, graph_version, "hnsw-index-cache: hit"
+            );
+            Some(Arc::clone(&entry.index))
+        } else {
+            None
+        }
+    }
+
+    /// Insert a loaded index into the cache.
+    /// Evicts LRU entries if memory budget is exceeded.
+    pub(crate) fn insert(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        graph_version: u64,
+        index: HnswIndexHandle,
+        estimated_memory_bytes: usize,
+    ) -> Arc<SharedHnswIndex> {
+        let shared = Arc::new(SharedHnswIndex {
+            index,
+            estimated_memory_bytes,
+        });
+
+        // Admission control: if a single index exceeds the entire cache budget,
+        // return it for the current query but don't cache it. This prevents a
+        // single oversized graph from evicting all other entries and exceeding
+        // the memory budget permanently.
+        if self.max_memory_bytes > 0 && estimated_memory_bytes > self.max_memory_bytes {
+            warn!(
+                keyspace,
+                db_id,
+                table_id,
+                index_id,
+                graph_version,
+                estimated_memory_bytes,
+                max_memory_bytes = self.max_memory_bytes,
+                "hnsw-index-cache: index too large to cache, serving without caching"
+            );
+            return shared;
+        }
+
+        let key = (
+            keyspace.to_string(),
+            db_id,
+            table_id,
+            index_id,
+            graph_version,
+        );
+
+        let mut entries = self.entries.lock().unwrap();
+
+        // Evict older versions of the same index (different graph_version).
+        let same_index_keys: Vec<IndexCacheKey> = entries
+            .keys()
+            .filter(|(ks, did, tid, iid, _)| {
+                ks == keyspace && *did == db_id && *tid == table_id && *iid == index_id
+            })
+            .cloned()
+            .collect();
+        for old_key in same_index_keys {
+            if old_key.4 != graph_version {
+                if let Some(evicted) = entries.remove(&old_key) {
+                    self.total_memory_bytes
+                        .fetch_sub(evicted.index.estimated_memory_bytes, Ordering::Relaxed);
+                    debug!(
+                        keyspace,
+                        db_id,
+                        table_id,
+                        index_id,
+                        old_version = old_key.4,
+                        new_version = graph_version,
+                        "hnsw-index-cache: evicted stale version"
+                    );
+                }
+            }
+        }
+
+        // Evict LRU entries while over memory budget.
+        let new_total = self.total_memory_bytes.load(Ordering::Relaxed) + estimated_memory_bytes;
+        if self.max_memory_bytes > 0 && new_total > self.max_memory_bytes {
+            let mut to_free = new_total - self.max_memory_bytes;
+            while to_free > 0 {
+                let lru_key = entries
+                    .iter()
+                    .filter(|(k, _)| *k != &key) // don't evict what we're about to insert
+                    .min_by_key(|(_, e)| e.last_access)
+                    .map(|(k, _)| k.clone());
+                match lru_key {
+                    Some(lru) => {
+                        if let Some(evicted) = entries.remove(&lru) {
+                            let freed = evicted.index.estimated_memory_bytes;
+                            self.total_memory_bytes.fetch_sub(freed, Ordering::Relaxed);
+                            to_free = to_free.saturating_sub(freed);
+                            debug!(
+                                keyspace = %lru.0, db_id = lru.1,
+                                table_id = lru.2, index_id = lru.3,
+                                version = lru.4, freed_bytes = freed,
+                                "hnsw-index-cache: evicted LRU entry for memory budget"
+                            );
+                        }
+                    }
+                    None => break, // no more entries to evict
+                }
+            }
+        }
+
+        // Insert the new entry. If a prior entry exists for the same key
+        // (concurrent cache miss race), subtract its memory before adding ours.
+        self.total_memory_bytes
+            .fetch_add(estimated_memory_bytes, Ordering::Relaxed);
+        if let Some(replaced) = entries.insert(
+            key,
+            IndexCacheEntry {
+                index: Arc::clone(&shared),
+                last_access: Instant::now(),
+            },
+        ) {
+            self.total_memory_bytes
+                .fetch_sub(replaced.index.estimated_memory_bytes, Ordering::Relaxed);
+        }
+
+        debug!(
+            keyspace,
+            db_id,
+            table_id,
+            index_id,
+            graph_version,
+            estimated_memory_bytes,
+            total_cached_bytes = self.total_memory_bytes.load(Ordering::Relaxed),
+            "hnsw-index-cache: inserted"
+        );
+
+        shared
+    }
+
+    /// Evict all entries for a specific index (e.g., on DROP INDEX).
+    #[allow(dead_code)] // wired by DROP INDEX path
+    pub(crate) fn evict(&self, keyspace: &str, db_id: u64, table_id: u64, index_id: u64) {
+        let mut entries = self.entries.lock().unwrap();
+        let keys_to_remove: Vec<IndexCacheKey> = entries
+            .keys()
+            .filter(|(ks, did, tid, iid, _)| {
+                ks == keyspace && *did == db_id && *tid == table_id && *iid == index_id
+            })
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            if let Some(evicted) = entries.remove(&key) {
+                self.total_memory_bytes
+                    .fetch_sub(evicted.index.estimated_memory_bytes, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+static HNSW_INDEX_CACHE: OnceLock<HnswIndexCache> = OnceLock::new();
+
+/// Maximum size of a single HNSW index that can be loaded into memory.
+/// Defaults to the cache memory budget. Set via HNSW_MAX_INDEX_MEMORY env var.
+/// 0 = unlimited (not recommended).
+pub(crate) fn hnsw_max_index_memory() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        config::env_string("HNSW_MAX_INDEX_MEMORY")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                // Default to cache budget — a single index shouldn't exceed the cache.
+                config::env_string("HNSW_INDEX_CACHE_MEMORY")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_INDEX_CACHE_MEMORY)
+            })
+    })
+}
+
+/// Returns a reference to the global in-memory index cache.
+pub(crate) fn hnsw_index_cache() -> &'static HnswIndexCache {
+    HNSW_INDEX_CACHE.get_or_init(|| {
+        let max_bytes: usize = config::env_string("HNSW_INDEX_CACHE_MEMORY")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_INDEX_CACHE_MEMORY);
+        info!(
+            max_memory_bytes = max_bytes,
+            "hnsw-index-cache: initializing"
+        );
+        HnswIndexCache::new(max_bytes)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -485,6 +753,21 @@ impl HnswS3Client {
 
         match result {
             Ok(output) => {
+                // Check Content-Length before downloading to prevent
+                // unbounded memory allocation from oversized S3 objects.
+                if let Some(content_length) = output.content_length() {
+                    let max_download = hnsw_max_index_memory();
+                    if max_download > 0 && (content_length as usize) > max_download {
+                        return Err(anyhow!(
+                            "hnsw-s3: graph s3://{}/{} is {} bytes, exceeds \
+                             HNSW_MAX_INDEX_MEMORY ({} bytes)",
+                            self.bucket,
+                            key,
+                            content_length,
+                            max_download
+                        ));
+                    }
+                }
                 let agg = output.body.collect().await.with_context(|| {
                     format!(
                         "hnsw-s3: failed to read GetObject body for s3://{}/{}",

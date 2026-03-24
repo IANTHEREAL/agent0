@@ -5,11 +5,12 @@
 //! - v1 (delta-log): DML writes small delta entries; a background merge worker
 //!   consolidates them into the base graph periodically.
 
+use std::collections::HashMap;
 use std::fs;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -100,6 +101,16 @@ pub struct HnswMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dropped_at: Option<u64>,
+    /// Random per-index nonce set on CREATE INDEX. Used as part of the
+    /// shared index cache key to prevent stale-cache hits after DROP+CREATE
+    /// cycles that reuse the same index_id. Without this, two indexes with
+    /// identical parameters (but on different columns) would produce the
+    /// same cache fingerprint. The nonce makes each index instance globally
+    /// unique regardless of parameter coincidence.
+    /// Backward-compatible: old meta without this field deserializes to 0.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_nonce: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -403,6 +414,7 @@ pub fn create_empty_hnsw_index(
         frozen: false,
         graph_version: 0,
         dropped_at: None,
+        cache_nonce: 0,
     };
     Ok((HnswIndexHandle::new(index), meta))
 }
@@ -779,6 +791,7 @@ pub async fn load_base_graph(
 /// Deltas are applied via paginated streaming: scan one page, apply to
 /// in-memory index, advance start_key, repeat. Never collects all deltas
 /// into a single Vec.
+#[allow(dead_code)] // retained for worker merge path; query path uses two-level search
 pub async fn load_hnsw_graph_with_deltas(
     txn: &mut Transaction,
     db_id: u64,
@@ -896,6 +909,342 @@ pub async fn load_hnsw_graph_with_deltas(
     }
 
     Ok(Some((HnswIndexHandle::new(index), live_meta, delta_count)))
+}
+
+// ===========================================================================
+// Shared index cache integration (concurrent read-safe)
+// ===========================================================================
+
+use super::s3::{hnsw_index_cache, hnsw_max_index_memory, SharedHnswIndex};
+
+/// Estimate in-memory size for a loaded usearch index.
+/// Formula: count * (dimensions * 4 + 2 * m * 8 + 40) + fixed overhead.
+pub fn estimate_graph_memory(count: u64, dimensions: usize, m: usize) -> usize {
+    let per_node = dimensions * 4 + 2 * m * 8 + 40;
+    (count as usize) * per_node + 4096 // 4KB fixed overhead
+}
+
+/// Inflight loader coordination: prevents thundering herd on cache miss.
+///
+/// When multiple queries miss the cache for the same key simultaneously,
+/// only one performs the actual load. Others wait via `watch::Receiver`
+/// and then read the result from the cache.
+///
+/// Uses `watch<bool>` (not `Notify`) because `watch::Receiver::changed()`
+/// checks the channel's version counter, not whether a listener was
+/// registered at send time. A receiver cloned inside the mutex sees
+/// version N; when the sender sets `true` (version N+1), `changed()`
+/// returns immediately — even if the send happened before the await.
+/// This eliminates the lost-wakeup race that `Notify` suffers from.
+type InflightKey = (String, u64, u64, u64, u64);
+static INFLIGHT_LOADS: LazyLock<Mutex<HashMap<InflightKey, tokio::sync::watch::Receiver<bool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Get a shared reference to the base graph, using the in-memory index cache.
+///
+/// On cache hit: returns `Arc<SharedHnswIndex>` directly (zero-copy, 0ms).
+/// On cache miss: exactly one loader runs per key (singleflight). Other
+/// concurrent callers wait for the loader to finish, then read from cache.
+pub async fn get_shared_base_graph(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    meta: &HnswMeta,
+    keyspace: &str,
+) -> Result<Option<Arc<SharedHnswIndex>>, SqlError> {
+    if meta.dropped_at.is_some() {
+        return Ok(None);
+    }
+
+    // Empty base graph (post-TRUNCATE or pre-first-merge).
+    if meta.count == 0 {
+        return Ok(None);
+    }
+
+    // Pre-load size check: reject before any allocation.
+    let estimated_bytes = estimate_graph_memory(meta.count, meta.dimensions, meta.m);
+    let max_index = hnsw_max_index_memory();
+    if max_index > 0 && estimated_bytes > max_index {
+        return Err(SqlError::Internal(anyhow::anyhow!(
+            "HNSW index d_{}_hnsw_{}_{} estimated at {} bytes ({} vectors × {} dims) \
+             exceeds HNSW_MAX_INDEX_MEMORY ({} bytes). Reduce index size or increase the limit.",
+            db_id,
+            table_id,
+            index_id,
+            estimated_bytes,
+            meta.count,
+            meta.dimensions,
+            max_index
+        )));
+    }
+
+    // Cache version: for S3 graphs, graph_version (TSO-based, collision-free).
+    // For TiKV graphs with a nonce, use nonce ^ count. Legacy TiKV indexes
+    // (cache_nonce=0, pre-upgrade) bypass the shared cache entirely to avoid
+    // stale hits — the nonce is the only reliable cross-DDL discriminator.
+    let cache_version = if meta.graph_version > 0 {
+        meta.graph_version
+    } else if meta.cache_nonce != 0 {
+        meta.cache_nonce ^ meta.count
+    } else {
+        // Legacy TiKV index without nonce: load directly, don't cache.
+        let result = load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await?;
+        return match result {
+            Some((handle, _)) => Ok(Some(Arc::new(SharedHnswIndex {
+                index: handle,
+                estimated_memory_bytes: estimated_bytes,
+            }))),
+            None => Ok(None),
+        };
+    };
+
+    let cache = hnsw_index_cache();
+
+    // Fast path: cache hit.
+    if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, cache_version) {
+        return Ok(Some(shared));
+    }
+
+    // Slow path: cache miss with singleflight coordination.
+    let inflight_key = (
+        keyspace.to_string(),
+        db_id,
+        table_id,
+        index_id,
+        cache_version,
+    );
+
+    loop {
+        enum Role {
+            Loader(tokio::sync::watch::Sender<bool>),
+            Waiter(tokio::sync::watch::Receiver<bool>),
+        }
+
+        let role = {
+            let mut inflight = INFLIGHT_LOADS.lock().unwrap();
+
+            // Re-check cache under inflight lock to close the race window.
+            if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, cache_version) {
+                return Ok(Some(shared));
+            }
+
+            if let Some(rx) = inflight.get(&inflight_key) {
+                Role::Waiter(rx.clone())
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                inflight.insert(inflight_key.clone(), rx);
+                Role::Loader(tx)
+            }
+        }; // mutex released before any await
+
+        match role {
+            Role::Waiter(mut rx) => {
+                // rx was cloned inside the mutex with version mark at "false".
+                // When the loader sends "true", changed() sees version advance
+                // and returns — even if send() happened before this await.
+                // If the loader failed and dropped tx, changed() returns Err,
+                // and we loop back to become the next loader.
+                let _ = rx.changed().await;
+            }
+            Role::Loader(tx) => {
+                let result = load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await;
+
+                // On success: insert into cache FIRST, then signal waiters.
+                // This ensures waiters always find the value in cache.
+                // On failure: clean up and drop tx (waiters get RecvError, retry).
+                match result {
+                    Ok(Some((handle, live_meta))) => {
+                        let estimated_bytes = estimate_graph_memory(
+                            live_meta.count,
+                            live_meta.dimensions,
+                            live_meta.m,
+                        );
+                        let shared = cache.insert(
+                            keyspace,
+                            db_id,
+                            table_id,
+                            index_id,
+                            cache_version,
+                            handle,
+                            estimated_bytes,
+                        );
+                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        let _ = tx.send(true);
+                        return Ok(Some(shared));
+                    }
+                    Ok(None) => {
+                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        drop(tx);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        drop(tx);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compute the maximum number of deltas that fit within the memory budget.
+///
+/// Budget = 10% of HNSW_MAX_INDEX_MEMORY, capped to never exceed the full
+/// limit. When HNSW_MAX_INDEX_MEMORY = 0 (unlimited), deltas are unlimited.
+///
+/// Each delta costs `(32 + dims*4)` bytes in Vec<HnswDelta> plus
+/// `(dims*4 + 2*m*8 + 40)` bytes in the usearch delta index — both live
+/// simultaneously during build_delta_index.
+///
+/// This adapts automatically to vector dimensions:
+///   dim=1536, m=16, 2GB limit → ~16K deltas (~200MB)
+///   dim=8192, m=16, 2GB limit → ~3K deltas (~200MB)
+///   dim=32,   m=16, 2GB limit → ~362K deltas (~200MB)
+///   dim=1536, m=16, 30MB limit → ~240 deltas (~3MB)
+///
+/// Limitation: when the backlog exceeds this budget, recent inserts beyond
+/// the limit are temporarily invisible to queries (logged as a warning).
+/// This includes same-transaction writes in very large bulk-insert
+/// transactions. The merge worker consolidates deltas into the base graph,
+/// restoring full visibility. This is an intentional tradeoff: bounded
+/// per-query memory vs perfect read-your-writes for arbitrarily large
+/// transactions.
+pub fn max_deltas_for_budget(dimensions: usize, m: usize) -> usize {
+    let max_index = hnsw_max_index_memory();
+    if max_index == 0 {
+        return usize::MAX; // unlimited
+    }
+    // 10% of the index memory limit, never exceeding the limit itself.
+    let budget = max_index / 10;
+
+    // Per-delta peak memory: Vec entry + usearch node (both live simultaneously).
+    let vec_per_delta = 32 + dimensions * 4; // label(8) + Vec header(24) + f32 data
+    let index_per_delta = dimensions * 4 + 2 * m * 8 + 40; // estimate_graph_memory per-node
+    let per_delta = vec_per_delta + index_per_delta;
+
+    if per_delta == 0 {
+        return usize::MAX;
+    }
+    budget / per_delta
+}
+
+/// Scan visible delta vectors up to `max_deltas`. Returns `(deltas, truncated)`.
+/// If `truncated` is true, the caller should fall back to streaming apply.
+pub async fn scan_visible_deltas(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    max_deltas: usize,
+) -> Result<(Vec<HnswDelta>, bool), SqlError> {
+    let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+    let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+    let mut start = prefix.clone();
+    let mut deltas = Vec::new();
+
+    loop {
+        let range: BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn
+            .scan(range, DELTA_SCAN_BATCH_SIZE)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+            .collect();
+        let page_count = pairs.len();
+        if page_count == 0 {
+            break;
+        }
+
+        let mut last_key: Option<Vec<u8>> = None;
+        for pair in pairs {
+            let k: &[u8] = pair.key().as_ref().into();
+            let key: Vec<u8> = k.to_vec();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if deltas.len() >= max_deltas {
+                // Too many deltas — signal caller to use streaming fallback.
+                return Ok((deltas, true));
+            }
+            let delta: HnswDelta = bincode::deserialize(pair.value())
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+            deltas.push(delta);
+            last_key = Some(key);
+        }
+
+        if (page_count as u32) < DELTA_SCAN_BATCH_SIZE {
+            break;
+        }
+        match last_key {
+            Some(mut lk) => {
+                lk.push(0x00);
+                start = lk;
+            }
+            None => break,
+        }
+    }
+
+    Ok((deltas, false))
+}
+
+/// Build a small per-query HNSW index from delta vectors.
+pub fn build_delta_index(
+    meta: &HnswMeta,
+    deltas: &[HnswDelta],
+) -> Result<HnswIndexHandle, SqlError> {
+    let metric = metric_from_string(&meta.distance_metric)?;
+    let options = IndexOptions {
+        dimensions: meta.dimensions,
+        metric,
+        quantization: ScalarKind::F32,
+        connectivity: meta.m,
+        expansion_add: meta.ef_construction,
+        expansion_search: super::HNSW_DEFAULT_EF_SEARCH,
+    };
+    let index = new_index(&options).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    index
+        .reserve(deltas.len())
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    for delta in deltas {
+        index
+            .add(delta.label, &delta.vector)
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    }
+    Ok(HnswIndexHandle::new(index))
+}
+
+/// Merge search results from base graph and delta index.
+///
+/// For labels appearing in both sets, the delta result takes precedence
+/// (it reflects the current vector value, not the stale base graph entry).
+/// Results are sorted by distance ascending and truncated to k.
+pub fn merge_search_results(
+    base_results: &[(u64, f64)],
+    delta_results: &[(u64, f64)],
+    k: usize,
+) -> Vec<(u64, f64)> {
+    use std::collections::HashSet;
+
+    let delta_labels: HashSet<u64> = delta_results.iter().map(|(l, _)| *l).collect();
+
+    // Base results: exclude labels that have delta overrides.
+    let mut merged: Vec<(u64, f64)> = base_results
+        .iter()
+        .filter(|(label, _)| !delta_labels.contains(label))
+        .copied()
+        .collect();
+
+    // Add all delta results.
+    merged.extend_from_slice(delta_results);
+
+    // Sort by distance, deduplicate by label (keep closest).
+    merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen = HashSet::with_capacity(k);
+    merged.retain(|(label, _)| seen.insert(*label));
+    merged.truncate(k);
+
+    merged
 }
 
 // ===========================================================================
@@ -1285,6 +1634,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"label_mode\":\"Mapped\""));
@@ -1306,6 +1656,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -1373,6 +1724,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
         let deserialized: HnswMeta = serde_json::from_slice(&bytes).unwrap();
@@ -1393,6 +1745,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("frozen"));
@@ -1439,6 +1792,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let (graph_bytes, _) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
         // This graph should exceed the threshold.
@@ -1475,6 +1829,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // The merge dispatch checks meta.frozen and skips.
         assert!(meta.frozen, "frozen index should be skipped by dispatch");
@@ -1500,6 +1855,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let normal_meta = HnswMeta {
             count: 100,
@@ -1513,6 +1869,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Sweep logic: skip frozen, enqueue normal.
         let indexes = [("frozen_idx", &frozen_meta), ("normal_idx", &normal_meta)];
@@ -1563,6 +1920,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Re-freeze is a no-op on the bool.
         meta.frozen = true;
@@ -1598,6 +1956,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let (graph_bytes, _meta_bytes) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
 

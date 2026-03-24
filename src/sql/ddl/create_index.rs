@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use rand::Rng;
 use sqlparser::ast::{Expr, Ident, OrderByExpr};
 use tikv_client::Transaction;
 use usearch::ffi::{IndexOptions, ScalarKind};
@@ -574,6 +575,7 @@ pub async fn execute_create_index(
                         0
                     },
                     dropped_at: None,
+                    cache_nonce: rand::thread_rng().gen::<u64>() | 1,
                 };
                 let gv = meta.graph_version;
                 let (gb, mb) =
