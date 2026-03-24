@@ -259,10 +259,10 @@ impl PhysicalOperator for HnswScanOperator {
         let label_mode = meta.label_mode;
 
         // Scan deltas up to a byte-based budget (adapts to dimensions).
-        // If truncated, search with partial deltas — HNSW is already approximate,
-        // and missing recent inserts is semantically the same as stale deletions
-        // still in the graph. The merge worker will consolidate them into the
-        // base graph, at which point they become visible to all queries.
+        // If truncated, we MUST error rather than return partial results.
+        // Silently dropping deltas causes read-your-writes violations: a row
+        // that exists (visible via seq scan) becomes invisible to HNSW search.
+        // This is not an approximation quality issue — it is a correctness bug.
         let delta_limit = max_deltas_for_budget(meta.dimensions, meta.m);
         let (deltas, delta_truncated) = scan_visible_deltas(
             ctx.txn,
@@ -274,14 +274,16 @@ impl PhysicalOperator for HnswScanOperator {
         .await?;
 
         if delta_truncated {
-            tracing::warn!(
-                table = %self.schema.name,
-                index = %self.index_name,
-                collected = deltas.len(),
-                limit = delta_limit,
-                "HNSW scan: delta backlog exceeds memory budget; \
-                 searching with partial deltas until merge catches up"
-            );
+            return Err(anyhow!(
+                "HNSW index \"{}\" on table \"{}\" has {} pending deltas exceeding \
+                 the memory budget (limit: {}). Recent writes may be invisible to \
+                 approximate nearest-neighbor search until the background merge \
+                 completes. Wait for merge or run ANALYZE to trigger it.",
+                self.index_name,
+                self.schema.name,
+                deltas.len(),
+                delta_limit,
+            ));
         }
 
         let delta_count = deltas.len();

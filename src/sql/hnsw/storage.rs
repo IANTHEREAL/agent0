@@ -1040,15 +1040,41 @@ pub async fn get_shared_base_graph(
 
         match role {
             Role::Waiter(mut rx) => {
-                // rx was cloned inside the mutex with version mark at "false".
-                // When the loader sends "true", changed() sees version advance
-                // and returns — even if send() happened before this await.
-                // If the loader failed and dropped tx, changed() returns Err,
-                // and we loop back to become the next loader.
-                let _ = rx.changed().await;
+                if rx.changed().await.is_err() {
+                    // Sender was dropped — the loader either failed normally
+                    // (and already called remove()) or was CANCELLED (client
+                    // disconnect, statement_timeout, task abort) without
+                    // cleanup.  Remove the potentially-stale map entry so
+                    // the next loop iteration can become the new Loader.
+                    // This is idempotent: remove() is a no-op if the key
+                    // was already cleaned up by the normal error path.
+                    INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                }
             }
             Role::Loader(tx) => {
+                // CANCELLATION SAFETY: if load_base_graph().await is
+                // cancelled (dropped), this guard ensures the map entry
+                // is removed so waiters don't spin on a closed channel.
+                struct InflightCleanup<'a> {
+                    key: &'a InflightKey,
+                    defused: bool,
+                }
+                impl<'a> Drop for InflightCleanup<'a> {
+                    fn drop(&mut self) {
+                        if !self.defused {
+                            INFLIGHT_LOADS.lock().unwrap().remove(self.key);
+                        }
+                    }
+                }
+                let mut cleanup = InflightCleanup {
+                    key: &inflight_key,
+                    defused: false,
+                };
+
                 let result = load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await;
+
+                // Defuse the guard — we'll handle cleanup explicitly below.
+                cleanup.defused = true;
 
                 // On success: insert into cache FIRST, then signal waiters.
                 // This ensures waiters always find the value in cache.
