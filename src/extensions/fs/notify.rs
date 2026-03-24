@@ -58,7 +58,8 @@ pub struct FsEvent {
     pub old_path: Option<String>,
     /// Inode id.
     pub inode: u64,
-    /// Parent directory inode id.
+    /// Parent directory inode id (reserved for future TVF columns).
+    #[allow(dead_code)]
     pub parent_inode: u64,
     /// Post-mutation generation.
     pub generation: u64,
@@ -142,6 +143,7 @@ pub struct EventRing {
     evicted: std::sync::atomic::AtomicU64,
 }
 
+#[allow(dead_code)] // Accessor methods are part of the public API surface, used in tests and future consumers.
 impl EventRing {
     /// Create a new EventRing with the given capacity and a fresh epoch.
     pub fn new(capacity: usize) -> Self {

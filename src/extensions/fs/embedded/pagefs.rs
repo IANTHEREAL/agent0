@@ -706,11 +706,6 @@ impl EmbeddedPageFs {
         self.maybe_start_background_maintenance();
     }
 
-    /// Returns a reference to the per-keyspace EventRing for fs9 notify.
-    pub(crate) fn notify_ring(&self) -> &Arc<EventRing> {
-        &self.notify_ring
-    }
-
     /// Emit a single fs event after a successful TiKV commit.
     /// Silently drops if the ring lock is poisoned (Hard Contract #4).
     /// Records emit metrics for observability.

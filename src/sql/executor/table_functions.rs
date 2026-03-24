@@ -388,7 +388,7 @@ impl Executor {
             };
             let keyspace = self.tenant_keyspace();
             crate::extensions::fs::notify::execute_fs9_events(
-                &keyspace,
+                keyspace,
                 since_seq,
                 path_prefix,
                 limit,
