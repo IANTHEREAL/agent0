@@ -946,6 +946,14 @@ pub async fn get_shared_base_graph(
         return Ok(None);
     }
 
+    // Empty base graph (post-TRUNCATE or pre-first-merge). Return None so
+    // the caller only searches the delta index. This is the authoritative
+    // guard against stale cache entries after TRUNCATE: meta.count is always
+    // consistent after commit, regardless of cache eviction timing.
+    if meta.count == 0 {
+        return Ok(None);
+    }
+
     let cache = hnsw_index_cache();
 
     // Pre-load size check: reject before any allocation.
