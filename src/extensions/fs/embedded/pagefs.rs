@@ -35,7 +35,7 @@ use tokio::fs;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell, Semaphore};
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FsRuntimeState {
@@ -3058,27 +3058,25 @@ impl EmbeddedPageFs {
             return Ok(Vec::new());
         }
 
-        let use_pack_route = fs9_config().s3.is_some()
-            && files.len() > 1
-            && files.iter().any(|file| !file.data.is_empty());
+        let s3_available = fs9_config().s3.is_some();
+        let use_pack_route =
+            s3_available && files.len() > 1 && files.iter().any(|file| !file.data.is_empty());
         if !use_pack_route {
+            debug!(
+                files = files.len(),
+                s3_available,
+                "fs9: batch_write using sequential route"
+            );
             return self.batch_write_sequential(files).await;
         }
+        debug!(files = files.len(), "fs9: batch_write using pack route");
 
-        let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
-        match self.batch_write_pack(files).await {
-            Ok(entries) => Ok(entries),
-            Err(err) => {
-                let message = err.to_string();
-                Ok(paths
-                    .into_iter()
-                    .map(|path| FsBatchWriteEntry {
-                        path,
-                        result: Err(anyhow!(message.clone())),
-                    })
-                    .collect())
-            }
-        }
+        // Do NOT fall back to sequential on pack failure: internal retries
+        // (5× TiKV write-conflict, 5× S3 HEAD verification) are already
+        // exhausted inside batch_write_pack, and unconditional fallback after
+        // a successful publish can corrupt data by overwriting pack-backed
+        // inodes with inline blobs (see #2085 discussion).
+        self.batch_write_pack(files).await
     }
 
     async fn batch_write_sequential(
