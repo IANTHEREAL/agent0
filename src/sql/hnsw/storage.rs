@@ -1039,28 +1039,35 @@ pub async fn get_shared_base_graph(
     }
 }
 
-/// Minimum delta memory budget (bytes). Used when HNSW_MAX_INDEX_MEMORY is 0
-/// (unlimited) or when the computed budget would be unreasonably small.
-const DELTA_BUDGET_FLOOR: usize = 50 * 1024 * 1024; // 50 MB
-
 /// Compute the maximum number of deltas that fit within the memory budget.
 ///
-/// The budget is 10% of HNSW_MAX_INDEX_MEMORY (default 2GB → 200MB), with a
-/// floor of 50MB. Each delta costs `(32 + dims*4)` bytes in Vec<HnswDelta>
-/// plus `(dims*4 + 2*m*8 + 40)` bytes in the usearch delta index — both live
+/// Budget = 10% of HNSW_MAX_INDEX_MEMORY, capped to never exceed the full
+/// limit. When HNSW_MAX_INDEX_MEMORY = 0 (unlimited), deltas are unlimited.
+///
+/// Each delta costs `(32 + dims*4)` bytes in Vec<HnswDelta> plus
+/// `(dims*4 + 2*m*8 + 40)` bytes in the usearch delta index — both live
 /// simultaneously during build_delta_index.
 ///
 /// This adapts automatically to vector dimensions:
-///   dim=1536, m=16 → ~16K deltas (~200MB)
-///   dim=8192, m=16 → ~3K deltas (~200MB)
-///   dim=32,   m=16 → ~90K deltas (~50MB floor)
+///   dim=1536, m=16, 2GB limit → ~16K deltas (~200MB)
+///   dim=8192, m=16, 2GB limit → ~3K deltas (~200MB)
+///   dim=32,   m=16, 2GB limit → ~362K deltas (~200MB)
+///   dim=1536, m=16, 30MB limit → ~240 deltas (~3MB)
+///
+/// Limitation: when the backlog exceeds this budget, recent inserts beyond
+/// the limit are temporarily invisible to queries (logged as a warning).
+/// This includes same-transaction writes in very large bulk-insert
+/// transactions. The merge worker consolidates deltas into the base graph,
+/// restoring full visibility. This is an intentional tradeoff: bounded
+/// per-query memory vs perfect read-your-writes for arbitrarily large
+/// transactions.
 pub fn max_deltas_for_budget(dimensions: usize, m: usize) -> usize {
     let max_index = hnsw_max_index_memory();
-    let budget = if max_index == 0 {
-        DELTA_BUDGET_FLOOR
-    } else {
-        (max_index / 10).max(DELTA_BUDGET_FLOOR)
-    };
+    if max_index == 0 {
+        return usize::MAX; // unlimited
+    }
+    // 10% of the index memory limit, never exceeding the limit itself.
+    let budget = max_index / 10;
 
     // Per-delta peak memory: Vec entry + usearch node (both live simultaneously).
     let vec_per_delta = 32 + dimensions * 4; // label(8) + Vec header(24) + f32 data
