@@ -1,0 +1,4 @@
+# Test 2: Negative LIMIT
+must not be negative
+# Test 3: Negative OFFSET
+must not be negative

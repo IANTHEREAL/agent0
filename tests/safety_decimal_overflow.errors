@@ -1,0 +1,20 @@
+# int32 MAX + 1
+out of range
+# int64 MAX + 1
+out of range
+# int64 MIN - 1
+out of range
+# Decimal::MAX + 1
+numeric field overflow
+# Decimal::MAX * 2
+numeric field overflow
+# -Decimal::MAX - 1
+numeric field overflow
+# Division by zero
+division by zero
+# SUM: MAX + 1
+numeric field overflow
+# AVG: two MAX values
+numeric field overflow
+# exp(1000)
+overflows numeric format

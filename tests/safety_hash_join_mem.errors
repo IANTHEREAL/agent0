@@ -1,0 +1,6 @@
+# Equi-join at 1KB limit
+hash join build side exceeded memory limit
+# Semi-join (EXISTS) at 1KB limit
+hash join build side exceeded memory limit
+# Anti-join (NOT EXISTS) at 1KB limit
+hash join build side exceeded memory limit

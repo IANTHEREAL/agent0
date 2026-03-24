@@ -1,0 +1,8 @@
+# ln(0)
+cannot take logarithm of zero
+# ln(-1)
+cannot take logarithm of a negative
+# log(0)
+cannot take logarithm of zero
+# log(-1)
+cannot take logarithm of a negative

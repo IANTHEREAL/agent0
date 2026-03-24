@@ -1,0 +1,25 @@
+# Test 1: string_agg with COLLATE
+eng|Alice,Bob,Charlie
+sales|Amy,Zara
+
+# Test 2: HAVING with COLLATE — only eng starts with 'A'
+# (eng → "Alice,Bob,Charlie" starts with A; sales → "Amy,Zara" starts with A)
+eng|Alice,Bob,Charlie
+sales|Amy,Zara
+
+# Test 3: IS DISTINCT FROM basic
+t
+f
+f
+t
+f
+
+# Test 4: IS DISTINCT FROM in WHERE (exclude val=20 → id=2 excluded)
+1|10
+3|30
+4|40
+5|50
+
+# Test 6: HAVING count(*) IS DISTINCT FROM 0
+eng|3
+sales|2
