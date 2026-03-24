@@ -1039,14 +1039,39 @@ pub async fn get_shared_base_graph(
     }
 }
 
-/// Maximum delta count for the two-level search path. Beyond this, the scan
-/// operator falls back to the streaming-apply path (load_hnsw_graph_with_deltas)
-/// which applies deltas page-by-page without collecting them all into memory.
+/// Minimum delta memory budget (bytes). Used when HNSW_MAX_INDEX_MEMORY is 0
+/// (unlimited) or when the computed budget would be unreasonably small.
+const DELTA_BUDGET_FLOOR: usize = 50 * 1024 * 1024; // 50 MB
+
+/// Compute the maximum number of deltas that fit within the memory budget.
 ///
-/// At VECTOR(1536), each delta is ~6KB in Vec + ~6.4KB in the usearch index.
-/// 1000 deltas ≈ 12.4MB — acceptable for a per-query allocation.
-/// 50,000 deltas ≈ 620MB — unacceptable, must use streaming.
-pub const DELTA_TWO_LEVEL_THRESHOLD: usize = 1000;
+/// The budget is 10% of HNSW_MAX_INDEX_MEMORY (default 2GB → 200MB), with a
+/// floor of 50MB. Each delta costs `(32 + dims*4)` bytes in Vec<HnswDelta>
+/// plus `(dims*4 + 2*m*8 + 40)` bytes in the usearch delta index — both live
+/// simultaneously during build_delta_index.
+///
+/// This adapts automatically to vector dimensions:
+///   dim=1536, m=16 → ~16K deltas (~200MB)
+///   dim=8192, m=16 → ~3K deltas (~200MB)
+///   dim=32,   m=16 → ~90K deltas (~50MB floor)
+pub fn max_deltas_for_budget(dimensions: usize, m: usize) -> usize {
+    let max_index = hnsw_max_index_memory();
+    let budget = if max_index == 0 {
+        DELTA_BUDGET_FLOOR
+    } else {
+        (max_index / 10).max(DELTA_BUDGET_FLOOR)
+    };
+
+    // Per-delta peak memory: Vec entry + usearch node (both live simultaneously).
+    let vec_per_delta = 32 + dimensions * 4; // label(8) + Vec header(24) + f32 data
+    let index_per_delta = dimensions * 4 + 2 * m * 8 + 40; // estimate_graph_memory per-node
+    let per_delta = vec_per_delta + index_per_delta;
+
+    if per_delta == 0 {
+        return usize::MAX;
+    }
+    budget / per_delta
+}
 
 /// Scan visible delta vectors up to `max_deltas`. Returns `(deltas, truncated)`.
 /// If `truncated` is true, the caller should fall back to streaming apply.

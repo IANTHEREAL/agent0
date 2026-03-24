@@ -11,7 +11,7 @@ use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::hnsw::s3::SharedHnswIndex;
 use crate::sql::hnsw::storage::{
     batch_get_pk_for_rowids, build_delta_index, get_shared_base_graph, hnsw_meta_key,
-    merge_search_results, scan_visible_deltas, HnswMeta, DELTA_TWO_LEVEL_THRESHOLD,
+    max_deltas_for_budget, merge_search_results, scan_visible_deltas, HnswMeta,
 };
 use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle, HnswLabelMode};
 
@@ -258,27 +258,26 @@ impl PhysicalOperator for HnswScanOperator {
 
         let label_mode = meta.label_mode;
 
-        // Try two-level search: scan deltas up to threshold.
-        // If delta backlog exceeds threshold, fall back to streaming apply
-        // (old path) which never collects all deltas into memory.
+        // Scan deltas up to a byte-based budget (adapts to dimensions).
+        // If truncated, search with partial deltas — HNSW is already approximate,
+        // and missing recent inserts is semantically the same as stale deletions
+        // still in the graph. The merge worker will consolidate them into the
+        // base graph, at which point they become visible to all queries.
+        let delta_limit = max_deltas_for_budget(meta.dimensions, meta.m);
         let (deltas, delta_truncated) = scan_visible_deltas(
             ctx.txn, ctx.db_id, self.schema.table_id, self.index_id,
-            DELTA_TWO_LEVEL_THRESHOLD,
+            delta_limit,
         ).await?;
 
         if delta_truncated {
-            // More than DELTA_TWO_LEVEL_THRESHOLD pending deltas — the merge
-            // worker is lagging. Rather than loading an unbounded private copy
-            // (which caused repeated OOM vulnerabilities), reject the query
-            // with a clear, actionable error. This is a transient condition
-            // that resolves when the merge worker catches up.
-            return Err(anyhow!(
-                "HNSW index on table {} has more than {} pending deltas; \
-                 the background merge worker has not yet consolidated them. \
-                 This is a transient condition — please retry shortly.",
-                self.schema.name,
-                DELTA_TWO_LEVEL_THRESHOLD,
-            ));
+            tracing::warn!(
+                table = %self.schema.name,
+                index = %self.index_name,
+                collected = deltas.len(),
+                limit = delta_limit,
+                "HNSW scan: delta backlog exceeds memory budget; \
+                 searching with partial deltas until merge catches up"
+            );
         }
 
         let delta_count = deltas.len();
