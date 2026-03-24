@@ -780,6 +780,7 @@ pub async fn load_base_graph(
 /// Deltas are applied via paginated streaming: scan one page, apply to
 /// in-memory index, advance start_key, repeat. Never collects all deltas
 /// into a single Vec.
+#[allow(dead_code)] // retained for worker merge path; query path uses two-level search
 pub async fn load_hnsw_graph_with_deltas(
     txn: &mut Transaction,
     db_id: u64,
@@ -915,11 +916,17 @@ pub fn estimate_graph_memory(count: u64, dimensions: usize, m: usize) -> usize {
 /// Inflight loader coordination: prevents thundering herd on cache miss.
 ///
 /// When multiple queries miss the cache for the same key simultaneously,
-/// only one performs the actual load. Others wait on the Notify and then
-/// read the result from the cache. This bounds peak memory to 1× graph
-/// size during cold start or version transitions, not N×.
-type InflightKey = (String, u64, u64, u64, u64); // same as IndexCacheKey
-static INFLIGHT_LOADS: LazyLock<Mutex<HashMap<InflightKey, Arc<tokio::sync::Notify>>>> =
+/// only one performs the actual load. Others wait via `watch::Receiver`
+/// and then read the result from the cache.
+///
+/// Uses `watch<bool>` (not `Notify`) because `watch::Receiver::changed()`
+/// checks the channel's version counter, not whether a listener was
+/// registered at send time. A receiver cloned inside the mutex sees
+/// version N; when the sender sets `true` (version N+1), `changed()`
+/// returns immediately — even if the send happened before the await.
+/// This eliminates the lost-wakeup race that `Notify` suffers from.
+type InflightKey = (String, u64, u64, u64, u64);
+static INFLIGHT_LOADS: LazyLock<Mutex<HashMap<InflightKey, tokio::sync::watch::Receiver<bool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get a shared reference to the base graph, using the in-memory index cache.
@@ -963,61 +970,70 @@ pub async fn get_shared_base_graph(
     );
 
     loop {
-        // Determine our role: loader or waiter.
-        // The mutex is acquired and released within this block — never held across await.
         enum Role {
-            Loader(Arc<tokio::sync::Notify>),
-            Waiter(Arc<tokio::sync::Notify>),
+            Loader(tokio::sync::watch::Sender<bool>),
+            Waiter(tokio::sync::watch::Receiver<bool>),
         }
 
         let role = {
             let mut inflight = INFLIGHT_LOADS.lock().unwrap();
 
-            // Re-check cache under inflight lock to avoid race.
+            // Re-check cache under inflight lock to close the race window.
             if let Some(shared) =
                 cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version)
             {
                 return Ok(Some(shared));
             }
 
-            if let Some(existing) = inflight.get(&inflight_key) {
-                Role::Waiter(Arc::clone(existing))
+            if let Some(rx) = inflight.get(&inflight_key) {
+                Role::Waiter(rx.clone())
             } else {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                inflight.insert(inflight_key.clone(), Arc::clone(&notify));
-                Role::Loader(notify)
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                inflight.insert(inflight_key.clone(), rx);
+                Role::Loader(tx)
             }
-        }; // mutex released here, before any await
+        }; // mutex released before any await
 
         match role {
-            Role::Waiter(notify) => {
-                notify.notified().await;
-                // Loop back: re-check cache. Loader either succeeded or failed.
+            Role::Waiter(mut rx) => {
+                // rx was cloned inside the mutex with version mark at "false".
+                // When the loader sends "true", changed() sees version advance
+                // and returns — even if send() happened before this await.
+                // If the loader failed and dropped tx, changed() returns Err,
+                // and we loop back to become the next loader.
+                let _ = rx.changed().await;
             }
-            Role::Loader(notify) => {
-                // We are the sole loader for this key.
+            Role::Loader(tx) => {
                 let result =
                     load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await;
 
-                // Always clean up inflight entry + notify waiters, even on error.
-                {
-                    let mut inflight = INFLIGHT_LOADS.lock().unwrap();
-                    inflight.remove(&inflight_key);
+                // On success: insert into cache FIRST, then signal waiters.
+                // This ensures waiters always find the value in cache.
+                // On failure: clean up and drop tx (waiters get RecvError, retry).
+                match result {
+                    Ok(Some((handle, live_meta))) => {
+                        let estimated_bytes = estimate_graph_memory(
+                            live_meta.count, live_meta.dimensions, live_meta.m,
+                        );
+                        let shared = cache.insert(
+                            keyspace, db_id, table_id, index_id,
+                            meta.graph_version, handle, estimated_bytes,
+                        );
+                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        let _ = tx.send(true);
+                        return Ok(Some(shared));
+                    }
+                    Ok(None) => {
+                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        drop(tx);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        drop(tx);
+                        return Err(e);
+                    }
                 }
-                notify.notify_waiters();
-
-                // Process result.
-                let Some((handle, live_meta)) = result? else {
-                    return Ok(None);
-                };
-                let estimated_bytes = estimate_graph_memory(
-                    live_meta.count, live_meta.dimensions, live_meta.m,
-                );
-                let shared = cache.insert(
-                    keyspace, db_id, table_id, index_id,
-                    meta.graph_version, handle, estimated_bytes,
-                );
-                return Ok(Some(shared));
             }
         }
     }
