@@ -630,6 +630,11 @@ impl EmbeddedPageFs {
         keyspace: String,
         superblock: &Superblock,
     ) -> Self {
+        // Register the EventRing for this keyspace so fs9_events() TVF can
+        // find it. This is the owner-side registration point; the TVF read
+        // path uses get_event_ring() which only returns existing rings.
+        let _ring = crate::extensions::fs::notify::get_or_create_event_ring(&keyspace);
+
         let runtime_state = Arc::new(runtime_state_from_superblock(&keyspace, superblock));
         let spool_root =
             pack_spool_root(&runtime_state.identity, &runtime_state.fs_instance_id_hex);

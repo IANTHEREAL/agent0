@@ -346,7 +346,55 @@ impl Executor {
             .await?;
         let func_upper = function_name.to_ascii_uppercase();
 
-        let rows = if func_upper == "UNNEST" {
+        let rows = if func_upper == "FS9_EVENTS" {
+            // fs9_events(since_seq [, path_prefix [, limit]])
+            let since_seq = match evaluated_args.first() {
+                Some(arg) => match &arg.value {
+                    Value::Int64(v) => *v,
+                    Value::Int32(v) => *v as i64,
+                    Value::Null => 0i64,
+                    _ => return Err(anyhow!("fs9_events: since_seq must be an integer")),
+                },
+                None => 0i64,
+            };
+            let path_prefix = match evaluated_args.get(1) {
+                Some(arg) => match &arg.value {
+                    Value::Text(s) => Some(s.as_str()),
+                    Value::Null => None,
+                    _ => return Err(anyhow!("fs9_events: path_prefix must be text")),
+                },
+                None => None,
+            };
+            let limit = match evaluated_args.get(2) {
+                Some(arg) => match &arg.value {
+                    Value::Int64(v) if *v > 0 => *v as usize,
+                    Value::Int32(v) if *v > 0 => *v as usize,
+                    Value::Int64(v) => {
+                        return Err(anyhow!(
+                            "fs9_events: limit must be a positive integer, got {}",
+                            v
+                        ))
+                    }
+                    Value::Int32(v) => {
+                        return Err(anyhow!(
+                            "fs9_events: limit must be a positive integer, got {}",
+                            v
+                        ))
+                    }
+                    Value::Null => 10_000usize,
+                    _ => return Err(anyhow!("fs9_events: limit must be an integer")),
+                },
+                None => 10_000usize,
+            };
+            let keyspace = self.tenant_keyspace();
+            crate::extensions::fs::notify::execute_fs9_events(
+                &keyspace,
+                since_seq,
+                path_prefix,
+                limit,
+            )
+            .map_err(|e| anyhow!("{}", e))?
+        } else if func_upper == "UNNEST" {
             let mut columns: Vec<Vec<Value>> = Vec::with_capacity(evaluated_args.len());
             for arg in &evaluated_args {
                 let arr = match &arg.value {

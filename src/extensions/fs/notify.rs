@@ -1,8 +1,11 @@
-use std::collections::VecDeque;
-use std::sync::RwLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
+
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 
 // ---------------------------------------------------------------------------
 // FsEventType
@@ -299,12 +302,7 @@ impl EventRing {
     /// 2. `since_seq > newest_seq` — stale cursor (likely post-restart)
     /// 3. Epoch mismatch is detected by the consumer comparing `result.epoch`
     ///    against their cached epoch.
-    pub fn query(
-        &self,
-        since_seq: u64,
-        path_prefix: Option<&str>,
-        limit: usize,
-    ) -> QueryResult {
+    pub fn query(&self, since_seq: u64, path_prefix: Option<&str>, limit: usize) -> QueryResult {
         let events = self.events.read().expect("lock poisoned");
 
         let oldest_seq = events.front().map(|e| e.seq).unwrap_or(0);
@@ -335,8 +333,7 @@ impl EventRing {
         let start_idx = if since_seq == 0 {
             0
         } else {
-            events
-                .partition_point(|e| e.seq <= since_seq)
+            events.partition_point(|e| e.seq <= since_seq)
         };
 
         let mut result_events = Vec::new();
@@ -384,12 +381,20 @@ impl EventRing {
 
     /// Oldest seq in the ring, or None if empty.
     pub fn oldest_seq(&self) -> Option<u64> {
-        self.events.read().expect("lock poisoned").front().map(|e| e.seq)
+        self.events
+            .read()
+            .expect("lock poisoned")
+            .front()
+            .map(|e| e.seq)
     }
 
     /// Newest seq in the ring, or None if empty.
     pub fn newest_seq(&self) -> Option<u64> {
-        self.events.read().expect("lock poisoned").back().map(|e| e.seq)
+        self.events
+            .read()
+            .expect("lock poisoned")
+            .back()
+            .map(|e| e.seq)
     }
 }
 
@@ -411,6 +416,246 @@ impl std::fmt::Display for PushError {
 }
 
 impl std::error::Error for PushError {}
+
+// ---------------------------------------------------------------------------
+// Global per-keyspace EventRing registry
+// ---------------------------------------------------------------------------
+
+type RingRegistry = Mutex<HashMap<String, Arc<EventRing>>>;
+
+fn ring_registry() -> &'static RingRegistry {
+    static REGISTRY: OnceLock<RingRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get or create the EventRing for a given keyspace.
+///
+/// Used by the mutation/emit path (e.g. `EmbeddedPageFs::new()`) to obtain or
+/// create the ring. Only the emit side should call this — creating a ring
+/// implicitly marks this process as the owner for this keyspace.
+///
+/// TODO(Phase 2): Implement real multi-instance owner detection. Phase 1
+/// assumes single process / single owner per keyspace.
+pub fn get_or_create_event_ring(keyspace: &str) -> Arc<EventRing> {
+    let mut registry = ring_registry().lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .entry(keyspace.to_string())
+        .or_insert_with(|| Arc::new(EventRing::from_env()))
+        .clone()
+}
+
+/// Get the EventRing for a keyspace only if it already exists (read-only).
+///
+/// Used by the TVF query path. Returns `None` if no ring has been registered
+/// for this keyspace, which means this process is not the owner (no mutation
+/// path has created one). Callers should return an explicit error on `None`.
+pub fn get_event_ring(keyspace: &str) -> Option<Arc<EventRing>> {
+    let registry = ring_registry().lock().unwrap_or_else(|e| e.into_inner());
+    registry.get(keyspace).cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Notify metrics
+// ---------------------------------------------------------------------------
+
+/// In-memory counters for fs9 notify observability.
+pub struct NotifyMetrics {
+    pub events_emitted: AtomicU64,
+    pub events_create: AtomicU64,
+    pub events_write: AtomicU64,
+    pub events_delete: AtomicU64,
+    pub events_rename: AtomicU64,
+    pub events_mkdir: AtomicU64,
+    pub overflow_queries: AtomicU64,
+    pub emit_errors: AtomicU64,
+}
+
+impl NotifyMetrics {
+    pub fn new() -> Self {
+        Self {
+            events_emitted: AtomicU64::new(0),
+            events_create: AtomicU64::new(0),
+            events_write: AtomicU64::new(0),
+            events_delete: AtomicU64::new(0),
+            events_rename: AtomicU64::new(0),
+            events_mkdir: AtomicU64::new(0),
+            overflow_queries: AtomicU64::new(0),
+            emit_errors: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_emit(&self, event_type: &FsEventType) {
+        self.events_emitted.fetch_add(1, Ordering::Relaxed);
+        match event_type {
+            FsEventType::Create => self.events_create.fetch_add(1, Ordering::Relaxed),
+            FsEventType::Write => self.events_write.fetch_add(1, Ordering::Relaxed),
+            FsEventType::Delete => self.events_delete.fetch_add(1, Ordering::Relaxed),
+            FsEventType::Rename => self.events_rename.fetch_add(1, Ordering::Relaxed),
+            FsEventType::Mkdir => self.events_mkdir.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    pub fn record_overflow(&self) {
+        self.overflow_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_emit_error(&self) {
+        self.emit_errors.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+type MetricsRegistry = Mutex<HashMap<String, Arc<NotifyMetrics>>>;
+
+fn metrics_registry() -> &'static MetricsRegistry {
+    static REGISTRY: OnceLock<MetricsRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get or create NotifyMetrics for a given keyspace.
+pub fn notify_metrics_for_keyspace(keyspace: &str) -> Arc<NotifyMetrics> {
+    let mut registry = metrics_registry().lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .entry(keyspace.to_string())
+        .or_insert_with(|| Arc::new(NotifyMetrics::new()))
+        .clone()
+}
+
+// ---------------------------------------------------------------------------
+// fs9_events() table function schema + execution
+// ---------------------------------------------------------------------------
+
+fn col(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type,
+        nullable,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
+        collation: None,
+        is_dropped: false,
+    }
+}
+
+/// Return the output schema for `fs9_events(...)`.
+pub fn fs9_events_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "fs9_events".to_string(),
+        columns: vec![
+            col("seq", DataType::Int64, false),
+            col("event_type", DataType::Text, false),
+            col("path", DataType::Text, false),
+            col("old_path", DataType::Text, true),
+            col("inode", DataType::Int64, false),
+            col("generation", DataType::Int64, false),
+            col("is_dir", DataType::Boolean, false),
+            col("size", DataType::Int64, false),
+            col("timestamp", DataType::TimestampTz, false),
+        ],
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        version: 1,
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        rls_enabled: false,
+        rls_force: false,
+        from_alias: None,
+    }
+}
+
+/// Execute `fs9_events(since_seq [, path_prefix [, limit]])` and return rows.
+///
+/// First row is always a META row with event_type='META' containing ring
+/// metadata (epoch, oldest_seq, newest_seq, overflow status).
+///
+/// **Overflow detection** (seq-based):
+/// 1. `since_seq < oldest_seq` — events evicted from ring
+/// 2. `since_seq > newest_seq` — stale cursor
+///
+/// **Epoch / restart detection** is the consumer's responsibility:
+/// compare the META row's `inode` field (ring epoch) against your cached
+/// epoch. If they differ, the process restarted and a full resync is needed.
+/// The META row always exposes the current epoch for this purpose.
+///
+/// Returns an error if this process does not own the ring for the given
+/// keyspace (i.e. no mutation path has registered a ring).
+pub fn execute_fs9_events(
+    keyspace: &str,
+    since_seq: i64,
+    path_prefix: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Row>, String> {
+    if since_seq < 0 {
+        return Err("fs9_events: since_seq must be non-negative".to_string());
+    }
+
+    let ring = get_event_ring(keyspace).ok_or_else(|| {
+        "fs9_events() is only available on the keyspace owner process".to_string()
+    })?;
+    let metrics = notify_metrics_for_keyspace(keyspace);
+
+    let since = since_seq as u64;
+    let result = ring.query(since, path_prefix, limit);
+
+    if result.overflow {
+        metrics.record_overflow();
+        tracing::warn!(
+            keyspace = keyspace,
+            since_seq = since,
+            oldest_seq = result.oldest_seq,
+            newest_seq = result.newest_seq,
+            epoch = result.epoch,
+            "fs9_events: overflow detected, consumer must resync"
+        );
+    }
+
+    let now_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64;
+
+    let mut rows = Vec::with_capacity(result.events.len() + 1);
+
+    // META row — always first, contains ring metadata.
+    // path='' per spec; structured metadata goes in typed columns.
+    rows.push(Row::new(vec![
+        Value::Int64(result.newest_seq as i64), // seq
+        Value::Text("META".to_string()),        // event_type
+        Value::Text(String::new()),             // path (empty per spec)
+        Value::Null,                            // old_path
+        Value::Int64(result.epoch as i64),      // inode (carries epoch)
+        Value::Int64(result.oldest_seq as i64), // generation (carries oldest_seq)
+        Value::Boolean(result.overflow),        // is_dir (carries overflow flag)
+        Value::Int64(result.capacity as i64),   // size (carries capacity)
+        Value::Timestamp(now_micros),           // timestamp (current time per spec)
+    ]));
+
+    // Event rows.
+    for event in &result.events {
+        rows.push(Row::new(vec![
+            Value::Int64(event.seq as i64),
+            Value::Text(event.event_type.as_str().to_string()),
+            Value::Text(event.path.clone()),
+            match &event.old_path {
+                Some(p) => Value::Text(p.clone()),
+                None => Value::Null,
+            },
+            Value::Int64(event.inode as i64),
+            Value::Int64(event.generation as i64),
+            Value::Boolean(event.is_dir),
+            Value::Int64(event.size as i64),
+            Value::Timestamp(event.timestamp * 1_000_000), // seconds → microseconds
+        ]));
+    }
+
+    Ok(rows)
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -456,9 +701,13 @@ mod tests {
         let ring = EventRing::with_epoch(100, 42);
 
         // New file → CREATE
-        let seq1 = ring.push(make_builder(FsEventType::Create, "/data/new.txt")).unwrap();
+        let seq1 = ring
+            .push(make_builder(FsEventType::Create, "/data/new.txt"))
+            .unwrap();
         // Existing file modified → WRITE
-        let seq2 = ring.push(make_builder(FsEventType::Write, "/data/new.txt")).unwrap();
+        let seq2 = ring
+            .push(make_builder(FsEventType::Write, "/data/new.txt"))
+            .unwrap();
 
         let result = ring.query(0, None, 100);
         assert_eq!(result.events.len(), 2);
@@ -499,7 +748,8 @@ mod tests {
     #[test]
     fn test_owner_process_can_query() {
         let ring = EventRing::with_epoch(100, 42);
-        ring.push(make_builder(FsEventType::Create, "/f.txt")).unwrap();
+        ring.push(make_builder(FsEventType::Create, "/f.txt"))
+            .unwrap();
         let result = ring.query(0, None, 100);
         assert_eq!(result.events.len(), 1);
         assert_eq!(result.epoch, 42);
@@ -571,7 +821,12 @@ mod tests {
             let seq = ring
                 .push(make_builder(FsEventType::Write, &format!("/f{}.txt", i)))
                 .unwrap();
-            assert!(seq > last_seq, "seq {} must be > previous {}", seq, last_seq);
+            assert!(
+                seq > last_seq,
+                "seq {} must be > previous {}",
+                seq,
+                last_seq
+            );
             last_seq = seq;
         }
 
@@ -586,13 +841,15 @@ mod tests {
     fn test_seq_monotonic_across_push_and_batch() {
         let ring = EventRing::with_epoch(1000, 42);
 
-        ring.push(make_builder(FsEventType::Create, "/a.txt")).unwrap(); // seq 1
+        ring.push(make_builder(FsEventType::Create, "/a.txt"))
+            .unwrap(); // seq 1
         ring.push_batch(vec![
             make_builder(FsEventType::Create, "/b.txt"),
             make_builder(FsEventType::Create, "/c.txt"),
         ])
         .unwrap(); // seq 2, 3
-        ring.push(make_builder(FsEventType::Write, "/a.txt")).unwrap(); // seq 4
+        ring.push(make_builder(FsEventType::Write, "/a.txt"))
+            .unwrap(); // seq 4
 
         let result = ring.query(0, None, 100);
         let seqs: Vec<u64> = result.events.iter().map(|e| e.seq).collect();
@@ -645,7 +902,8 @@ mod tests {
     fn test_overflow_since_seq_greater_than_newest() {
         let ring = EventRing::with_epoch(100, 42);
 
-        ring.push(make_builder(FsEventType::Write, "/f.txt")).unwrap();
+        ring.push(make_builder(FsEventType::Write, "/f.txt"))
+            .unwrap();
         // since_seq=999 > newest_seq=1 → overflow (stale cursor, post-restart).
         let result = ring.query(999, None, 100);
         assert!(result.overflow);
@@ -655,13 +913,17 @@ mod tests {
     #[test]
     fn test_overflow_epoch_change_detectable() {
         let ring1 = EventRing::with_epoch(100, 42);
-        ring1.push(make_builder(FsEventType::Write, "/f.txt")).unwrap();
+        ring1
+            .push(make_builder(FsEventType::Write, "/f.txt"))
+            .unwrap();
         let r1 = ring1.query(0, None, 100);
         assert_eq!(r1.epoch, 42);
 
         // Simulate restart: new ring with different epoch.
         let ring2 = EventRing::with_epoch(100, 99);
-        ring2.push(make_builder(FsEventType::Write, "/f.txt")).unwrap();
+        ring2
+            .push(make_builder(FsEventType::Write, "/f.txt"))
+            .unwrap();
         let r2 = ring2.query(0, None, 100);
         assert_eq!(r2.epoch, 99);
 
@@ -682,7 +944,8 @@ mod tests {
     #[test]
     fn test_no_overflow_since_eq_newest() {
         let ring = EventRing::with_epoch(100, 42);
-        ring.push(make_builder(FsEventType::Write, "/f.txt")).unwrap();
+        ring.push(make_builder(FsEventType::Write, "/f.txt"))
+            .unwrap();
         // since_seq == newest_seq → no overflow, no events.
         let result = ring.query(1, None, 100);
         assert!(!result.overflow);
@@ -697,10 +960,14 @@ mod tests {
     fn test_path_prefix_filter() {
         let ring = EventRing::with_epoch(100, 42);
 
-        ring.push(make_builder(FsEventType::Create, "/data/foo.txt")).unwrap();
-        ring.push(make_builder(FsEventType::Create, "/data/sub/bar.txt")).unwrap();
-        ring.push(make_builder(FsEventType::Create, "/data-backup/baz.txt")).unwrap();
-        ring.push(make_builder(FsEventType::Create, "/other/qux.txt")).unwrap();
+        ring.push(make_builder(FsEventType::Create, "/data/foo.txt"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Create, "/data/sub/bar.txt"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Create, "/data-backup/baz.txt"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Create, "/other/qux.txt"))
+            .unwrap();
 
         // Filter by /data/ — should match /data/foo.txt and /data/sub/bar.txt
         let result = ring.query(0, Some("/data/"), 100);
@@ -721,8 +988,10 @@ mod tests {
     fn test_path_filter_does_not_affect_metadata() {
         let ring = EventRing::with_epoch(100, 42);
 
-        ring.push(make_builder(FsEventType::Create, "/a/file.txt")).unwrap();
-        ring.push(make_builder(FsEventType::Create, "/b/file.txt")).unwrap();
+        ring.push(make_builder(FsEventType::Create, "/a/file.txt"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Create, "/b/file.txt"))
+            .unwrap();
 
         // Filter that matches nothing.
         let result = ring.query(0, Some("/nonexistent/"), 100);
@@ -779,7 +1048,8 @@ mod tests {
         let ring = EventRing::with_epoch(100, 42);
         let mut rx = ring.subscribe();
 
-        ring.push(make_builder(FsEventType::Create, "/f.txt")).unwrap();
+        ring.push(make_builder(FsEventType::Create, "/f.txt"))
+            .unwrap();
 
         let seq = rx.recv().await.unwrap();
         assert_eq!(seq, 1);
@@ -816,10 +1086,7 @@ mod tests {
         assert_eq!(result.events.len(), 1);
         assert_eq!(result.events[0].event_type, FsEventType::Rename);
         assert_eq!(result.events[0].path, "/new/name.txt");
-        assert_eq!(
-            result.events[0].old_path.as_deref(),
-            Some("/old/name.txt")
-        );
+        assert_eq!(result.events[0].old_path.as_deref(), Some("/old/name.txt"));
     }
 
     // -----------------------------------------------------------------------
@@ -887,5 +1154,227 @@ mod tests {
         // Without env var set, should use default.
         let ring = EventRing::from_env();
         assert_eq!(ring.capacity(), DEFAULT_RING_CAPACITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // fs9_events() TVF execution tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_fs9_events_empty_ring() {
+        let keyspace = "test_empty_ring_tvf";
+        // Ensure a fresh ring exists.
+        let ring = get_or_create_event_ring(keyspace);
+        assert!(ring.is_empty());
+
+        let rows = execute_fs9_events(keyspace, 0, None, 100).unwrap();
+        // Should have exactly 1 META row.
+        assert_eq!(rows.len(), 1);
+        let meta = &rows[0];
+        assert_eq!(meta.values[1], Value::Text("META".to_string()));
+        // overflow should be false for empty ring with since_seq=0.
+        assert_eq!(meta.values[6], Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_execute_fs9_events_with_events() {
+        let keyspace = "test_tvf_with_events";
+        let ring = get_or_create_event_ring(keyspace);
+
+        ring.push(make_builder(FsEventType::Create, "/data/file1.txt"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Write, "/data/file2.txt"))
+            .unwrap();
+
+        let rows = execute_fs9_events(keyspace, 0, None, 100).unwrap();
+        // 1 META + 2 event rows.
+        assert_eq!(rows.len(), 3);
+
+        // First row is META.
+        assert_eq!(rows[0].values[1], Value::Text("META".to_string()));
+
+        // Second row is CREATE event.
+        assert_eq!(rows[1].values[1], Value::Text("CREATE".to_string()));
+        assert_eq!(
+            rows[1].values[2],
+            Value::Text("/data/file1.txt".to_string())
+        );
+
+        // Third row is WRITE event.
+        assert_eq!(rows[2].values[1], Value::Text("WRITE".to_string()));
+        assert_eq!(
+            rows[2].values[2],
+            Value::Text("/data/file2.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_execute_fs9_events_with_path_prefix() {
+        let keyspace = "test_tvf_path_prefix";
+        let ring = get_or_create_event_ring(keyspace);
+
+        ring.push(make_builder(FsEventType::Create, "/data/file1.txt"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Create, "/logs/app.log"))
+            .unwrap();
+        ring.push(make_builder(FsEventType::Write, "/data/file2.txt"))
+            .unwrap();
+
+        let rows = execute_fs9_events(keyspace, 0, Some("/data/"), 100).unwrap();
+        // 1 META + 2 matching events (only /data/ prefix).
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[1].values[2],
+            Value::Text("/data/file1.txt".to_string())
+        );
+        assert_eq!(
+            rows[2].values[2],
+            Value::Text("/data/file2.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_execute_fs9_events_overflow_detection() {
+        let keyspace = "test_tvf_overflow";
+        // Create a ring with small capacity for overflow testing.
+        {
+            let mut registry = ring_registry().lock().unwrap();
+            registry.insert(
+                keyspace.to_string(),
+                Arc::new(EventRing::with_epoch(3, 999)),
+            );
+        }
+
+        let ring = get_or_create_event_ring(keyspace);
+        // Push 5 events into a ring of capacity 3 → 2 evicted.
+        for i in 0..5 {
+            ring.push(make_builder(FsEventType::Write, &format!("/f{i}.txt")))
+                .unwrap();
+        }
+
+        // Query with since_seq=1 — should be overflow since seq 1 was evicted.
+        let rows = execute_fs9_events(keyspace, 1, None, 100).unwrap();
+        let meta = &rows[0];
+        assert_eq!(meta.values[6], Value::Boolean(true)); // overflow = true
+    }
+
+    #[test]
+    fn test_execute_fs9_events_since_seq_filtering() {
+        let keyspace = "test_tvf_since_seq";
+        let ring = get_or_create_event_ring(keyspace);
+
+        let seq1 = ring
+            .push(make_builder(FsEventType::Create, "/a.txt"))
+            .unwrap();
+        let _seq2 = ring
+            .push(make_builder(FsEventType::Write, "/b.txt"))
+            .unwrap();
+        let _seq3 = ring
+            .push(make_builder(FsEventType::Delete, "/c.txt"))
+            .unwrap();
+
+        // Query since seq1 → should get events 2 and 3 only.
+        let rows = execute_fs9_events(keyspace, seq1 as i64, None, 100).unwrap();
+        // 1 META + 2 events.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].values[1], Value::Text("WRITE".to_string()));
+        assert_eq!(rows[2].values[1], Value::Text("DELETE".to_string()));
+    }
+
+    #[test]
+    fn test_execute_fs9_events_limit() {
+        let keyspace = "test_tvf_limit";
+        let ring = get_or_create_event_ring(keyspace);
+
+        for i in 0..10 {
+            ring.push(make_builder(FsEventType::Write, &format!("/f{i}.txt")))
+                .unwrap();
+        }
+
+        let rows = execute_fs9_events(keyspace, 0, None, 3).unwrap();
+        // 1 META + 3 events (limited).
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn test_fs9_events_schema_columns() {
+        let schema = fs9_events_schema();
+        assert_eq!(schema.name, "fs9_events");
+        assert_eq!(schema.columns.len(), 9);
+        assert_eq!(schema.columns[0].name, "seq");
+        assert_eq!(schema.columns[1].name, "event_type");
+        assert_eq!(schema.columns[2].name, "path");
+        assert_eq!(schema.columns[3].name, "old_path");
+        assert!(schema.columns[3].nullable);
+        assert_eq!(schema.columns[4].name, "inode");
+        assert_eq!(schema.columns[5].name, "generation");
+        assert_eq!(schema.columns[6].name, "is_dir");
+        assert_eq!(schema.columns[7].name, "size");
+        assert_eq!(schema.columns[8].name, "timestamp");
+    }
+
+    #[test]
+    fn test_execute_fs9_events_negative_since_seq() {
+        let keyspace = "test_tvf_neg_seq";
+        get_or_create_event_ring(keyspace); // register ring
+        let result = execute_fs9_events(keyspace, -1, None, 100);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("since_seq must be non-negative"));
+    }
+
+    #[test]
+    fn test_execute_fs9_events_non_owner() {
+        // Query a keyspace that has no ring registered → not owner.
+        let result = execute_fs9_events("unregistered_keyspace_xyz", 0, None, 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("owner process"));
+    }
+
+    #[test]
+    fn test_execute_fs9_events_meta_epoch_exposed() {
+        // Verify META row exposes epoch for consumer-side comparison.
+        let keyspace = "test_tvf_meta_epoch";
+        {
+            let mut registry = ring_registry().lock().unwrap();
+            registry.insert(
+                keyspace.to_string(),
+                Arc::new(EventRing::with_epoch(10, 42)),
+            );
+        }
+        let rows = execute_fs9_events(keyspace, 0, None, 100).unwrap();
+        let meta = &rows[0];
+        // epoch is carried in inode column (index 4).
+        assert_eq!(meta.values[4], Value::Int64(42));
+    }
+
+    #[test]
+    fn test_execute_fs9_events_meta_timestamp_nonzero() {
+        let keyspace = "test_tvf_meta_ts";
+        get_or_create_event_ring(keyspace);
+        let rows = execute_fs9_events(keyspace, 0, None, 100).unwrap();
+        let meta = &rows[0];
+        // META timestamp should be current time (non-zero).
+        match meta.values[8] {
+            Value::Timestamp(ts) => assert!(ts > 0, "META timestamp should be current time"),
+            _ => panic!("expected Timestamp value"),
+        }
+    }
+
+    #[test]
+    fn test_notify_metrics() {
+        let metrics = NotifyMetrics::new();
+        metrics.record_emit(&FsEventType::Create);
+        metrics.record_emit(&FsEventType::Write);
+        metrics.record_emit(&FsEventType::Write);
+        metrics.record_overflow();
+        metrics.record_emit_error();
+
+        assert_eq!(metrics.events_emitted.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.events_create.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.events_write.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.overflow_queries.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.emit_errors.load(Ordering::Relaxed), 1);
     }
 }
