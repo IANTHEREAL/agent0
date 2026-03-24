@@ -7,7 +7,7 @@ use sqlparser::ast::{self as ast, Expr};
 
 use crate::model::DataType;
 use crate::sql::types::cast::CastContext;
-use crate::sql::types::coercion::{common_type, unify_types};
+use crate::sql::types::coercion::{common_type, is_oid_alias_type, unify_types};
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;
@@ -48,7 +48,13 @@ impl<'a> Analyzer<'a> {
             // Keep the first inferred type stable. Widening here can
             // desynchronize already-built TypedExpr::Parameter node types
             // from finalize_param_types() output.
-            if existing != *data_type && common_type(&existing, data_type).is_none() {
+            let compatible = existing == *data_type
+                || common_type(&existing, data_type).is_some()
+                // OID alias types (regclass, regtype) are storage-compatible
+                // with Int64/Int32.  Phase 2 may infer Int64 (PG's oid base)
+                // while Phase 3 coercion targets the alias; both are valid.
+                || Self::oid_alias_compat(&existing, data_type);
+            if !compatible {
                 return Err(AnalyzerError::InconsistentParameterTypes {
                     index: index + 1,
                     first: existing,
@@ -59,6 +65,12 @@ impl<'a> Analyzer<'a> {
             *slot = Some(data_type.clone());
         }
         Ok(())
+    }
+
+    /// OID alias types (regclass, regtype) are storage-compatible with Int64/Int32.
+    fn oid_alias_compat(a: &DataType, b: &DataType) -> bool {
+        (is_oid_alias_type(a) && matches!(b, DataType::Int64 | DataType::Int32))
+            || (is_oid_alias_type(b) && matches!(a, DataType::Int64 | DataType::Int32))
     }
 
     // -- Helper: implicit cast insertion --
