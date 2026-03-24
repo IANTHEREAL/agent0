@@ -446,15 +446,6 @@ pub fn get_or_create_event_ring(keyspace: &str) -> Arc<EventRing> {
         .clone()
 }
 
-/// Get the EventRing for a keyspace only if it already exists (read-only).
-///
-/// Used by the TVF query path. Returns `None` if no ring has been registered
-/// for this keyspace, which means this process is not the owner (no mutation
-/// path has created one). Callers should return an explicit error on `None`.
-pub fn get_event_ring(keyspace: &str) -> Option<Arc<EventRing>> {
-    let registry = ring_registry().lock().unwrap_or_else(|e| e.into_inner());
-    registry.get(keyspace).cloned()
-}
 
 // ---------------------------------------------------------------------------
 // Notify metrics
@@ -604,9 +595,9 @@ pub fn execute_fs9_events(
         return Err("fs9_events: since_seq must be non-negative".to_string());
     }
 
-    let ring = get_event_ring(keyspace).ok_or_else(|| {
-        "fs9_events() is only available on the keyspace owner process".to_string()
-    })?;
+    // Auto-create the ring on first query so users don't need a prior fs9
+    // operation. The ring starts empty (META-only) until mutations happen.
+    let ring = get_or_create_event_ring(keyspace);
     let metrics = notify_metrics_for_keyspace(keyspace);
 
     let since = since_seq as u64;
@@ -624,10 +615,10 @@ pub fn execute_fs9_events(
         );
     }
 
-    let now_micros = std::time::SystemTime::now()
+    let now_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_micros() as i64;
+        .as_millis() as i64;
 
     let mut rows = Vec::with_capacity(result.events.len() + 1);
 
@@ -642,7 +633,7 @@ pub fn execute_fs9_events(
         Value::Int64(result.oldest_seq as i64), // generation (carries oldest_seq)
         Value::Boolean(result.overflow),        // is_dir (carries overflow flag)
         Value::Int64(result.capacity as i64),   // size (carries capacity)
-        Value::Timestamp(now_micros),           // timestamp (current time per spec)
+        Value::Timestamp(now_millis),           // timestamp (current time per spec)
     ]));
 
     // Event rows.
@@ -659,7 +650,7 @@ pub fn execute_fs9_events(
             Value::Int64(event.generation as i64),
             Value::Boolean(event.is_dir),
             Value::Int64(event.size as i64),
-            Value::Timestamp(event.timestamp * 1_000_000), // seconds → microseconds
+            Value::Timestamp(event.timestamp * 1_000), // seconds → milliseconds
         ]));
     }
 
@@ -1334,11 +1325,14 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_fs9_events_non_owner() {
-        // Query a keyspace that has no ring registered → not owner.
-        let result = execute_fs9_events("unregistered_keyspace_xyz", 0, None, 100);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("owner process"));
+    fn test_execute_fs9_events_auto_creates_ring() {
+        // Query a keyspace with no prior ring → auto-creates empty ring.
+        let result = execute_fs9_events("auto_create_keyspace_xyz", 0, None, 100);
+        assert!(result.is_ok());
+        let rows = result.unwrap();
+        // Should return META row only (empty ring).
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1], Value::Text("META".to_string()));
     }
 
     #[test]
@@ -1368,6 +1362,58 @@ mod tests {
         match meta.values[8] {
             Value::Timestamp(ts) => assert!(ts > 0, "META timestamp should be current time"),
             _ => panic!("expected Timestamp value"),
+        }
+    }
+
+    #[test]
+    fn test_timestamp_unit_is_millis() {
+        // Regression test: Value::Timestamp must contain Unix milliseconds.
+        // Previously we used microseconds (META row) and seconds*1_000_000
+        // (event rows), causing the pg wire encoder to show 2056 instead of 2026.
+        let keyspace = "test_timestamp_unit";
+        let ring = EventRing::with_epoch(100, 99);
+        // Use push_inner to set a known timestamp (123 seconds since epoch).
+        ring.push_inner(make_builder(FsEventType::Create, "/ts.txt"), 123)
+            .unwrap();
+        {
+            let mut registry = ring_registry().lock().unwrap();
+            registry.insert(keyspace.to_string(), Arc::new(ring));
+        }
+
+        let before_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let rows = execute_fs9_events(keyspace, 0, None, 100).unwrap();
+        let after_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // META row (index 0): timestamp should be Unix milliseconds in current range.
+        match rows[0].values[8] {
+            Value::Timestamp(ts) => {
+                assert!(
+                    ts >= before_ms && ts <= after_ms,
+                    "META timestamp {} not in Unix millis range [{}, {}]",
+                    ts,
+                    before_ms,
+                    after_ms
+                );
+            }
+            _ => panic!("expected Timestamp value for META row"),
+        }
+
+        // Event row (index 1): timestamp should be 123 seconds * 1_000 = 123_000 millis.
+        match rows[1].values[8] {
+            Value::Timestamp(ts) => {
+                assert_eq!(
+                    ts, 123_000,
+                    "event timestamp should be 123_000 ms, got {}",
+                    ts
+                );
+            }
+            _ => panic!("expected Timestamp value for event row"),
         }
     }
 
