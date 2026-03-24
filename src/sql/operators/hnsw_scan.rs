@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Semaphore;
 
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::hnsw::s3::SharedHnswIndex;
 use crate::sql::hnsw::storage::{
     batch_get_pk_for_rowids, build_delta_index, get_shared_base_graph, hnsw_meta_key,
     merge_search_results, scan_visible_deltas, HnswMeta,
@@ -107,7 +108,7 @@ impl HnswScanOperator {
         }
     }
 
-    fn search_ranked_labels_sync(
+    fn search_and_rank(
         index: &HnswIndexHandle,
         query_f32: &[f32],
         k: usize,
@@ -139,32 +140,45 @@ impl HnswScanOperator {
         Ok(ranked_labels)
     }
 
-    /// Search with semaphore guard + spawn_blocking to prevent:
-    /// 1. UB from exceeding usearch's internal thread pool capacity
-    /// 2. Blocking the tokio async runtime with CPU-bound graph traversal
-    async fn search_ranked_labels(
-        index: &HnswIndexHandle,
+    /// Search a shared base graph with semaphore + spawn_blocking.
+    ///
+    /// The Arc and semaphore permit are moved into the blocking closure,
+    /// so both outlive the search even under async cancellation.
+    async fn search_shared(
+        base: &Arc<SharedHnswIndex>,
         query_f32: &[f32],
         k: usize,
         distance_metric: HnswDistanceMetric,
     ) -> Result<Vec<(u64, f64)>> {
-        let _permit = hnsw_search_semaphore().acquire().await
+        let permit = hnsw_search_semaphore().acquire().await
             .map_err(|_| anyhow!("HNSW search semaphore closed"))?;
-
-        // SAFETY: HnswIndexHandle is Send+Sync. We hold a semaphore permit
-        // ensuring concurrent search() callers <= hardware_concurrency().
-        // The index pointer is stable (owned by Arc in the cache).
-        let index_ptr = index as *const HnswIndexHandle as usize;
+        let base = Arc::clone(base);
         let query = query_f32.to_vec();
-        let result = tokio::task::spawn_blocking(move || {
-            // SAFETY: The index lives in Arc<SharedHnswIndex> which outlives this task.
-            // The semaphore permit is held by the parent async fn until we return.
-            let index_ref = unsafe { &*(index_ptr as *const HnswIndexHandle) };
-            Self::search_ranked_labels_sync(index_ref, &query, k, distance_metric)
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit; // moved in — released when closure returns
+            Self::search_and_rank(&base.index, &query, k, distance_metric)
         }).await
-            .map_err(|e| anyhow!("HNSW search task failed: {}", e))??;
+            .map_err(|e| anyhow!("HNSW search task failed: {}", e))?
+    }
 
-        Ok(result)
+    /// Search a small per-query delta index with semaphore + spawn_blocking.
+    ///
+    /// The delta index is wrapped in Arc to transfer ownership safely.
+    async fn search_delta(
+        delta: &Arc<HnswIndexHandle>,
+        query_f32: &[f32],
+        k: usize,
+        distance_metric: HnswDistanceMetric,
+    ) -> Result<Vec<(u64, f64)>> {
+        let permit = hnsw_search_semaphore().acquire().await
+            .map_err(|_| anyhow!("HNSW search semaphore closed"))?;
+        let delta = Arc::clone(delta);
+        let query = query_f32.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Self::search_and_rank(&delta, &query, k, distance_metric)
+        }).await
+            .map_err(|e| anyhow!("HNSW search task failed: {}", e))?
     }
 }
 
@@ -289,8 +303,9 @@ impl PhysicalOperator for HnswScanOperator {
         // have exhausted the entire graph.
         // Two-level search: base graph + delta index, merge results.
         let base_graph_size = shared_base.as_ref().map(|s| s.index.size()).unwrap_or(0);
-        let delta_index = if !deltas.is_empty() {
-            Some(build_delta_index(&meta, &deltas)?)
+        // Wrap in Arc for safe transfer into spawn_blocking (cancellation-safe).
+        let delta_index: Option<Arc<HnswIndexHandle>> = if !deltas.is_empty() {
+            Some(Arc::new(build_delta_index(&meta, &deltas)?))
         } else {
             None
         };
@@ -303,9 +318,7 @@ impl PhysicalOperator for HnswScanOperator {
         loop {
             // Search base graph (if it exists).
             let base_results = if let Some(ref base) = shared_base {
-                Self::search_ranked_labels(
-                    &base.index, &query_f32, fetch_k, self.distance_metric,
-                ).await?
+                Self::search_shared(base, &query_f32, fetch_k, self.distance_metric).await?
             } else {
                 Vec::new()
             };
@@ -314,7 +327,7 @@ impl PhysicalOperator for HnswScanOperator {
             let ranked_labels = if let Some(ref di) = delta_index {
                 let delta_k = fetch_k.min(di.size());
                 let delta_results = if delta_k > 0 {
-                    Self::search_ranked_labels(di, &query_f32, delta_k, self.distance_metric).await?
+                    Self::search_delta(di, &query_f32, delta_k, self.distance_metric).await?
                 } else {
                     Vec::new()
                 };

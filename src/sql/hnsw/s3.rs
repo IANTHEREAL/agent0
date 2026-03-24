@@ -438,6 +438,20 @@ impl HnswIndexCache {
             index,
             estimated_memory_bytes,
         });
+
+        // Admission control: if a single index exceeds the entire cache budget,
+        // return it for the current query but don't cache it. This prevents a
+        // single oversized graph from evicting all other entries and exceeding
+        // the memory budget permanently.
+        if self.max_memory_bytes > 0 && estimated_memory_bytes > self.max_memory_bytes {
+            warn!(
+                keyspace, db_id, table_id, index_id, graph_version,
+                estimated_memory_bytes, max_memory_bytes = self.max_memory_bytes,
+                "hnsw-index-cache: index too large to cache, serving without caching"
+            );
+            return shared;
+        }
+
         let key = (keyspace.to_string(), db_id, table_id, index_id, graph_version);
 
         let mut entries = self.entries.lock().unwrap();
@@ -540,6 +554,23 @@ impl HnswIndexCache {
 }
 
 static HNSW_INDEX_CACHE: OnceLock<HnswIndexCache> = OnceLock::new();
+
+/// Maximum size of a single HNSW index that can be loaded into memory.
+/// Defaults to the cache memory budget. Set via HNSW_MAX_INDEX_MEMORY env var.
+/// 0 = unlimited (not recommended).
+pub(crate) fn hnsw_max_index_memory() -> usize {
+    static VAL: OnceLock<usize> = OnceLock::new();
+    *VAL.get_or_init(|| {
+        config::env_string("HNSW_MAX_INDEX_MEMORY")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                // Default to cache budget — a single index shouldn't exceed the cache.
+                config::env_string("HNSW_INDEX_CACHE_MEMORY")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_INDEX_CACHE_MEMORY)
+            })
+    })
+}
 
 /// Returns a reference to the global in-memory index cache.
 pub(crate) fn hnsw_index_cache() -> &'static HnswIndexCache {
@@ -689,6 +720,18 @@ impl HnswS3Client {
 
         match result {
             Ok(output) => {
+                // Check Content-Length before downloading to prevent
+                // unbounded memory allocation from oversized S3 objects.
+                if let Some(content_length) = output.content_length() {
+                    let max_download = hnsw_max_index_memory();
+                    if max_download > 0 && (content_length as usize) > max_download {
+                        return Err(anyhow!(
+                            "hnsw-s3: graph s3://{}/{} is {} bytes, exceeds \
+                             HNSW_MAX_INDEX_MEMORY ({} bytes)",
+                            self.bucket, key, content_length, max_download
+                        ));
+                    }
+                }
                 let agg = output.body.collect().await.with_context(|| {
                     format!(
                         "hnsw-s3: failed to read GetObject body for s3://{}/{}",

@@ -903,7 +903,7 @@ pub async fn load_hnsw_graph_with_deltas(
 // Shared index cache integration (concurrent read-safe)
 // ===========================================================================
 
-use super::s3::{hnsw_index_cache, SharedHnswIndex};
+use super::s3::{hnsw_index_cache, hnsw_max_index_memory, SharedHnswIndex};
 
 /// Estimate in-memory size for a loaded usearch index.
 /// Formula: count * (dimensions * 4 + 2 * m * 8 + 40) + fixed overhead.
@@ -930,6 +930,17 @@ pub async fn get_shared_base_graph(
     }
 
     let cache = hnsw_index_cache();
+
+    // Pre-load size check: reject before any allocation.
+    let estimated_bytes = estimate_graph_memory(meta.count, meta.dimensions, meta.m);
+    let max_index = hnsw_max_index_memory();
+    if max_index > 0 && estimated_bytes > max_index {
+        return Err(SqlError::Internal(anyhow::anyhow!(
+            "HNSW index d_{}_hnsw_{}_{} estimated at {} bytes ({} vectors × {} dims) \
+             exceeds HNSW_MAX_INDEX_MEMORY ({} bytes). Reduce index size or increase the limit.",
+            db_id, table_id, index_id, estimated_bytes, meta.count, meta.dimensions, max_index
+        )));
+    }
 
     // Cache lookup by exact version.
     if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version) {
