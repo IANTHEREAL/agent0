@@ -144,7 +144,7 @@
 | `HNSW_S3_PREFIX` | `hnsw` | `src/sql/hnsw/s3.rs` | S3 key prefix for graph objects. |
 | `HNSW_S3_FORCE_PATH_STYLE` | `false` | `src/sql/hnsw/s3.rs` | Use path-style URLs (required for MinIO). |
 | `HNSW_CACHE_MAX_ENTRIES` | `64` | `src/sql/hnsw/s3.rs` | Max cached HNSW graph files (LRU). Increase for deployments with many hot vector indexes. |
-| `HNSW_CACHE_DIR` | `/tmp/db9_hnsw_cache` | `src/sql/hnsw/s3.rs` | Directory for cached graph files. Use a dedicated volume for high-QPS workloads. |
+| `HNSW_CACHE_DIR` | `/tmp/db9_hnsw_cache` | `src/sql/hnsw/s3.rs` | Base directory for cached graph files. db9 uses a `db9_hnsw_cache/` subdirectory under this path. Use a dedicated volume for high-QPS workloads. |
 
 ### Observability, Extensions, and fs9
 
