@@ -15,6 +15,7 @@ pub(crate) mod s3;
 pub(crate) mod sql_client;
 pub(crate) mod streaming;
 pub(crate) mod upload_token;
+pub(crate) mod notify;
 pub(crate) mod ws;
 
 pub(crate) enum Fs9Mode {
