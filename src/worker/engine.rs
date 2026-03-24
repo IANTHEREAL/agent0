@@ -715,11 +715,18 @@ impl WorkerEngine {
                 return Ok((None, false));
             }
 
-            let database = store
+            let Some(db_def) = store
                 .get_database_by_id(&mut txn, entry.db_id)
                 .await?
-                .map(|db| db.name)
-                .unwrap_or_else(|| "postgres".to_string());
+            else {
+                tracing::warn!(
+                    db_id = entry.db_id,
+                    job_id = entry.task_id,
+                    "skipping cron job: database no longer exists (possibly dropped)"
+                );
+                return Ok((None, false));
+            };
+            let database = db_def.name;
 
             let max_runtime_ms = job.max_runtime_ms;
 
@@ -863,11 +870,19 @@ impl WorkerEngine {
             let mut db_txn = store.begin().await?;
             let resolved = store
                 .get_database_by_id(&mut db_txn, entry.db_id)
-                .await?
-                .map(|db| db.name)
-                .unwrap_or_else(|| "postgres".to_string());
+                .await?;
             db_txn.commit().await?;
-            Arc::from(resolved)
+            match resolved {
+                Some(db) => Arc::from(db.name),
+                None => {
+                    tracing::warn!(
+                        db_id = entry.db_id,
+                        task_type = ?entry.task_type,
+                        "skipping worker task: database no longer exists (possibly dropped)"
+                    );
+                    return Ok(0);
+                }
+            }
         };
         let current_user: Arc<str> = Arc::from(entry.username.clone());
         let timezone: Arc<str> = Arc::from("UTC");
