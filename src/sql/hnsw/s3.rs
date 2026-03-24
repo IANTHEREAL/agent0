@@ -494,16 +494,20 @@ impl HnswIndexCache {
             }
         }
 
-        // Insert the new entry.
+        // Insert the new entry. If a prior entry exists for the same key
+        // (concurrent cache miss race), subtract its memory before adding ours.
         self.total_memory_bytes
             .fetch_add(estimated_memory_bytes, Ordering::Relaxed);
-        entries.insert(
+        if let Some(replaced) = entries.insert(
             key,
             IndexCacheEntry {
                 index: Arc::clone(&shared),
                 last_access: Instant::now(),
             },
-        );
+        ) {
+            self.total_memory_bytes
+                .fetch_sub(replaced.index.estimated_memory_bytes, Ordering::Relaxed);
+        }
 
         debug!(
             keyspace, db_id, table_id, index_id, graph_version,

@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use tokio::sync::Semaphore;
 
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
@@ -10,6 +13,22 @@ use crate::sql::hnsw::storage::{
     merge_search_results, scan_visible_deltas, HnswMeta,
 };
 use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle, HnswLabelMode};
+
+/// Process-level semaphore bounding concurrent usearch search() calls.
+///
+/// usearch's internal thread context pool has `hardware_concurrency()` slots.
+/// Calling search() with more concurrent callers than slots causes undefined
+/// behavior (empty vector access in thread_lock_()). This semaphore prevents
+/// that by limiting concurrent HNSW searches to `available_parallelism()`.
+fn hnsw_search_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        Semaphore::new(permits)
+    })
+}
 use crate::sql::projection::fill_row_defaults;
 use crate::storage::decode_pk_from_index_suffix;
 
@@ -88,7 +107,7 @@ impl HnswScanOperator {
         }
     }
 
-    fn search_ranked_labels(
+    fn search_ranked_labels_sync(
         index: &HnswIndexHandle,
         query_f32: &[f32],
         k: usize,
@@ -118,6 +137,34 @@ impl HnswScanOperator {
         }
 
         Ok(ranked_labels)
+    }
+
+    /// Search with semaphore guard + spawn_blocking to prevent:
+    /// 1. UB from exceeding usearch's internal thread pool capacity
+    /// 2. Blocking the tokio async runtime with CPU-bound graph traversal
+    async fn search_ranked_labels(
+        index: &HnswIndexHandle,
+        query_f32: &[f32],
+        k: usize,
+        distance_metric: HnswDistanceMetric,
+    ) -> Result<Vec<(u64, f64)>> {
+        let _permit = hnsw_search_semaphore().acquire().await
+            .map_err(|_| anyhow!("HNSW search semaphore closed"))?;
+
+        // SAFETY: HnswIndexHandle is Send+Sync. We hold a semaphore permit
+        // ensuring concurrent search() callers <= hardware_concurrency().
+        // The index pointer is stable (owned by Arc in the cache).
+        let index_ptr = index as *const HnswIndexHandle as usize;
+        let query = query_f32.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            // SAFETY: The index lives in Arc<SharedHnswIndex> which outlives this task.
+            // The semaphore permit is held by the parent async fn until we return.
+            let index_ref = unsafe { &*(index_ptr as *const HnswIndexHandle) };
+            Self::search_ranked_labels_sync(index_ref, &query, k, distance_metric)
+        }).await
+            .map_err(|e| anyhow!("HNSW search task failed: {}", e))??;
+
+        Ok(result)
     }
 }
 
@@ -258,7 +305,7 @@ impl PhysicalOperator for HnswScanOperator {
             let base_results = if let Some(ref base) = shared_base {
                 Self::search_ranked_labels(
                     &base.index, &query_f32, fetch_k, self.distance_metric,
-                )?
+                ).await?
             } else {
                 Vec::new()
             };
@@ -267,7 +314,7 @@ impl PhysicalOperator for HnswScanOperator {
             let ranked_labels = if let Some(ref di) = delta_index {
                 let delta_k = fetch_k.min(di.size());
                 let delta_results = if delta_k > 0 {
-                    Self::search_ranked_labels(di, &query_f32, delta_k, self.distance_metric)?
+                    Self::search_ranked_labels(di, &query_f32, delta_k, self.distance_metric).await?
                 } else {
                     Vec::new()
                 };
