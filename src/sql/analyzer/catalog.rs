@@ -637,6 +637,7 @@ impl MockCatalogBuilder {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             })
             .collect();
 
@@ -672,6 +673,7 @@ impl MockCatalogBuilder {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             })
             .collect();
 
@@ -708,6 +710,7 @@ impl MockCatalogBuilder {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: coll.map(|s| s.to_string()),
+                is_dropped: false,
             })
             .collect();
 
@@ -824,6 +827,7 @@ mod tests {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             vec![],
         );

@@ -1,0 +1,19 @@
+id|name|email
+1|alice|alice@example.com
+2|bob|bob@example.com
+id|name|email
+1|alice|alice@example.com
+2|bob|bob@example.com
+id|name|email
+1|alice|alice@example.com
+2|bob|bob@example.com
+3|charlie|charlie@example.com
+id|email
+4|dave@example.com
+ERROR: column "age" does not exist
+ERROR: column "age" does not exist
+attname|attisdropped
+id|f
+name|f
+........pg.dropped.3........|t
+email|f

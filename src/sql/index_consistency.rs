@@ -185,6 +185,7 @@ mod tests {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             ..TableSchema::default()
         };
@@ -206,6 +207,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "b".to_string(),
@@ -218,6 +220,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             pk_indices: vec![1, 0],

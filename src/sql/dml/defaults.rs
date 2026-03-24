@@ -149,6 +149,12 @@ async fn eval_column_default_or_null_inner(
         .get(column_idx)
         .ok_or_else(|| anyhow!("Column index {} out of bounds", column_idx))?;
 
+    // Dropped columns always get NULL — their metadata flags (is_serial, etc.)
+    // may be stale; skip any default/sequence evaluation.
+    if column.is_dropped {
+        return Ok(Value::Null);
+    }
+
     if column.is_serial {
         match classify_serial_default(column.default_expr.as_deref()) {
             SerialDefaultBehavior::ImplicitSequence => {
@@ -371,6 +377,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "v".to_string(),
@@ -383,6 +390,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,

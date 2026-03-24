@@ -99,6 +99,11 @@ impl VirtualTable for Columns {
             let full_table_name = &schema.name;
             let (table_schema, table_name) = split_schema_and_name(full_table_name);
             for (i, col) in schema.columns.iter().enumerate() {
+                // Skip logically dropped columns — PostgreSQL hides them from
+                // information_schema.columns (only pg_attribute shows attisdropped).
+                if col.is_dropped {
+                    continue;
+                }
                 // PostgreSQL reports enum/UDT columns as data_type='USER-DEFINED'
                 // with udt_schema/udt_name pointing to the actual type.
                 // For enum[] (Array(UserDefined(...))), PostgreSQL reports

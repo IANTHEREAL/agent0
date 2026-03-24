@@ -368,6 +368,7 @@ fn build_returns_table_schema(declared_cols: &[(String, crate::model::DataType)]
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         })
         .collect();
 
@@ -408,6 +409,7 @@ fn build_output_schema(
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }
         })
         .collect();

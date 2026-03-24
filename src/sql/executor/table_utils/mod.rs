@@ -62,6 +62,7 @@ pub(crate) fn create_sequence_state_table_schema(
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "log_cnt".to_string(),
@@ -74,6 +75,7 @@ pub(crate) fn create_sequence_state_table_schema(
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "is_called".to_string(),
@@ -86,6 +88,7 @@ pub(crate) fn create_sequence_state_table_schema(
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 0,
@@ -501,6 +504,7 @@ impl Executor {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             pk_constraint_name: None,
             pk_indices: vec![],
@@ -585,6 +589,7 @@ impl Executor {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "applied_at".to_string(),
@@ -597,6 +602,7 @@ impl Executor {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "status".to_string(),
@@ -609,6 +615,7 @@ impl Executor {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             pk_constraint_name: None,

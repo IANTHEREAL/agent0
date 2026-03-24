@@ -227,6 +227,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "b".to_string(),
@@ -239,6 +240,7 @@ mod tests {
                     generation_expr: Some("a + 1".to_string()),
                     generation_expr_authorized_by: Some("admin".to_string()),
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,
@@ -270,6 +272,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "body_vec".to_string(),
@@ -282,6 +285,7 @@ mod tests {
                     generation_expr: Some(expr.to_string()),
                     generation_expr_authorized_by: Some("admin".to_string()),
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,

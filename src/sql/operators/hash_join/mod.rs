@@ -176,6 +176,7 @@ impl HashJoinOperator {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             });
         }
         for col in &right_child.schema().columns {
@@ -190,6 +191,7 @@ impl HashJoinOperator {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             });
         }
 

@@ -19,6 +19,7 @@ fn schema_left() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "l".to_string(),
@@ -31,6 +32,7 @@ fn schema_left() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 1,
@@ -62,6 +64,7 @@ fn schema_right() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "r".to_string(),
@@ -74,6 +77,7 @@ fn schema_right() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 1,

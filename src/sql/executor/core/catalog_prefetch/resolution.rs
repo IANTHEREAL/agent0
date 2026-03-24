@@ -250,6 +250,7 @@ async fn resolve_view_output_schema(
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         })
         .collect();
 
@@ -382,6 +383,7 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         });
     }
 

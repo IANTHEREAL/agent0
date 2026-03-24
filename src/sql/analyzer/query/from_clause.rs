@@ -543,8 +543,20 @@ impl<'a> Analyzer<'a> {
                 // Try catalog with proper schema qualification.
                 match self.catalog.resolve_table(&obj_name, schema_opt.as_deref()) {
                     Ok(Some((qualified_name, table_schema))) => {
-                        let columns_for_scope: Vec<(String, DataType, bool, Option<String>)> =
-                            table_schema
+                        let has_dropped = table_schema.columns.iter().any(|c| c.is_dropped);
+
+                        let col_start = self.scopes.current().column_count();
+                        if has_dropped {
+                            // All physical columns (including dropped) occupy scope
+                            // slots so join-row indexing stays correct. Dropped slots
+                            // are marked hidden and excluded from name resolution.
+                            let columns_for_scope: Vec<(
+                                String,
+                                DataType,
+                                bool,
+                                Option<String>,
+                                bool,
+                            )> = table_schema
                                 .columns
                                 .iter()
                                 .map(|c| {
@@ -553,14 +565,33 @@ impl<'a> Analyzer<'a> {
                                         c.data_type.clone(),
                                         c.nullable,
                                         c.collation.clone(),
+                                        c.is_dropped,
                                     )
                                 })
                                 .collect();
-
-                        let col_start = self.scopes.current().column_count();
-                        self.scopes
-                            .current_mut()
-                            .add_table(&alias_str, &columns_for_scope);
+                            self.scopes.current_mut().add_table_with_dropped_columns(
+                                &alias_str,
+                                &columns_for_scope,
+                                true,
+                            );
+                        } else {
+                            let columns_for_scope: Vec<(String, DataType, bool, Option<String>)> =
+                                table_schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| {
+                                        (
+                                            c.name.clone(),
+                                            c.data_type.clone(),
+                                            c.nullable,
+                                            c.collation.clone(),
+                                        )
+                                    })
+                                    .collect();
+                            self.scopes
+                                .current_mut()
+                                .add_table(&alias_str, &columns_for_scope);
+                        }
                         let col_end = self.scopes.current().column_count();
                         let relation_binding =
                             if qualified_name.eq_ignore_ascii_case("pg_namespace") {
@@ -589,6 +620,9 @@ impl<'a> Analyzer<'a> {
                             }
                         }
 
+                        // Include all physical columns in TableRefSchema so
+                        // wildcard offset computation aligns with scope slots.
+                        // Dropped columns are filtered in the wildcard plan consumer.
                         let columns_for_schema: Vec<(String, DataType, bool)> = table_schema
                             .columns
                             .iter()

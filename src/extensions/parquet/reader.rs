@@ -170,6 +170,7 @@ pub(crate) fn arrow_schema_to_table_schema(arrow_schema: &ArrowSchema) -> Result
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             })
         })
         .collect::<Result<Vec<_>>>()?;

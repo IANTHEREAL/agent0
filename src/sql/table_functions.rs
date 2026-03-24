@@ -34,6 +34,7 @@ fn basic_fs9_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "line".to_string(),
@@ -46,6 +47,7 @@ fn basic_fs9_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "_path".to_string(),
@@ -58,6 +60,7 @@ fn basic_fs9_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         pk_constraint_name: None,

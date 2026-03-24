@@ -27,9 +27,13 @@ pub struct ScopeColumn {
     /// Whether the column is nullable.
     #[allow(dead_code)] // framework: scope resolution field
     pub nullable: bool,
-    /// Whether this column is hidden from SELECT * expansion.
-    /// Used for USING join columns: the right-side duplicate is hidden.
+    /// Whether this column is hidden from SELECT * and unqualified resolution.
+    /// Used for USING join right-side duplicates and dropped columns.
     pub hidden: bool,
+    /// Whether this column is logically dropped (PostgreSQL `attisdropped`).
+    /// Dropped columns are invisible to ALL resolution (unqualified, qualified,
+    /// and wildcards), unlike USING-hidden columns which remain qualified-accessible.
+    pub is_dropped: bool,
     /// Collation name (if column has a declared collation).
     pub collation: Option<String>,
 }
@@ -228,22 +232,41 @@ impl Scope {
     /// Build a scope from a `TableSchema`, using the table name (or alias) as qualifier.
     ///
     /// Convenience for DML contexts where the target table is already known as a
-    /// `TableSchema`. Columns are added in schema order with their catalog types.
+    /// `TableSchema`. All physical columns are added (dropped ones as hidden
+    /// placeholders) so ColumnRef indices align with the executor's physical rows.
     pub fn from_table_schema(alias: &str, schema: &crate::model::TableSchema) -> Self {
         let mut scope = Self::new();
-        let cols: Vec<(String, DataType, bool, Option<String>)> = schema
-            .columns
-            .iter()
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    c.data_type.clone(),
-                    c.nullable,
-                    c.collation.clone(),
-                )
-            })
-            .collect();
-        scope.add_table(alias, &cols);
+        let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
+        if has_dropped {
+            let cols: Vec<(String, DataType, bool, Option<String>, bool)> = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.data_type.clone(),
+                        c.nullable,
+                        c.collation.clone(),
+                        c.is_dropped,
+                    )
+                })
+                .collect();
+            scope.add_table_with_dropped_columns(alias, &cols, false);
+        } else {
+            let cols: Vec<(String, DataType, bool, Option<String>)> = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.data_type.clone(),
+                        c.nullable,
+                        c.collation.clone(),
+                    )
+                })
+                .collect();
+            scope.add_table(alias, &cols);
+        }
         scope
     }
 
@@ -282,6 +305,7 @@ impl Scope {
             data_type,
             nullable: false,
             hidden: true,
+            is_dropped: false,
             collation: None,
         });
     }
@@ -302,6 +326,7 @@ impl Scope {
                 data_type: data_type.clone(),
                 nullable: *nullable,
                 hidden: false,
+                is_dropped: false,
                 collation: collation.clone(),
             };
 
@@ -324,6 +349,56 @@ impl Scope {
         }
     }
 
+    /// Add columns from a table where the physical row index may differ from
+    /// the scope position (e.g., tables with logically dropped columns).
+    /// Each entry is `(physical_row_index, name, data_type, nullable, collation)`.
+    /// Add columns from a table that has logically dropped columns.
+    ///
+    /// ALL physical columns (including dropped ones) occupy scope slots to
+    /// maintain the invariant that `ScopeColumn.column_index == Vec position`
+    /// for correct JOIN row indexing. Dropped columns are added as hidden
+    /// placeholders that are invisible to name resolution and wildcard expansion.
+    pub fn add_table_with_dropped_columns(
+        &mut self,
+        alias: &str,
+        all_columns: &[(String, DataType, bool, Option<String>, bool)], // (name, type, nullable, collation, is_dropped)
+        include_system_columns: bool,
+    ) {
+        let base_offset = self.columns.len();
+        for (idx, (name, data_type, nullable, collation, is_dropped)) in
+            all_columns.iter().enumerate()
+        {
+            let abs_index = base_offset + idx;
+            let col = ScopeColumn {
+                table_alias: Some(alias.to_string()),
+                column_name: name.clone(),
+                column_index: abs_index,
+                data_type: data_type.clone(),
+                nullable: *nullable,
+                hidden: *is_dropped,
+                is_dropped: *is_dropped,
+                collation: collation.clone(),
+            };
+
+            if !is_dropped {
+                // Only visible columns participate in name resolution.
+                self.column_index
+                    .entry(name.to_lowercase())
+                    .or_default()
+                    .push(abs_index);
+
+                self.qualified_index
+                    .insert((alias.to_lowercase(), name.to_lowercase()), abs_index);
+            }
+
+            self.columns.push(col);
+        }
+
+        if include_system_columns {
+            self.add_hidden_qualified_column(alias, "ctid", DataType::Int64);
+        }
+    }
+
     /// Add a single column to the scope (e.g. for subquery output columns).
     pub fn add_column(
         &mut self,
@@ -341,6 +416,7 @@ impl Scope {
             data_type,
             nullable,
             hidden: false,
+            is_dropped: false,
             collation,
         };
 
@@ -378,11 +454,12 @@ impl Scope {
         let positions: Vec<usize> = self
             .columns
             .iter()
+            .enumerate()
             // Hidden columns (right-side USING/NATURAL duplicates) are excluded
             // from unqualified resolution, matching PostgreSQL merged-column
             // semantics while preserving qualified access.
-            .filter(|c| !c.hidden && Self::ident_matches_name(&c.column_name, ident))
-            .map(|c| c.column_index)
+            .filter(|(_, c)| !c.hidden && Self::ident_matches_name(&c.column_name, ident))
+            .map(|(vec_pos, _)| vec_pos)
             .collect();
 
         match positions.as_slice() {
@@ -418,10 +495,11 @@ impl Scope {
     /// Resolve a qualified column with SQL identifier semantics.
     pub fn resolve_qualified_idents(&self, table: &Ident, column: &Ident) -> Option<&ScopeColumn> {
         self.columns.iter().find(|c| {
-            c.table_alias
-                .as_ref()
-                .map(|a| Self::ident_matches_name(a, table))
-                .unwrap_or(false)
+            !c.is_dropped
+                && c.table_alias
+                    .as_ref()
+                    .map(|a| Self::ident_matches_name(a, table))
+                    .unwrap_or(false)
                 && Self::ident_matches_name(&c.column_name, column)
         })
     }
@@ -468,10 +546,13 @@ impl Scope {
         self.columns
             .iter()
             .filter(|c| {
-                c.table_alias
-                    .as_ref()
-                    .map(|a| Self::ident_matches_name(a, table))
-                    .unwrap_or(false)
+                // Filter dropped columns (invisible to all SQL) but keep
+                // USING-hidden columns (accessible via qualified t.*).
+                !c.is_dropped
+                    && c.table_alias
+                        .as_ref()
+                        .map(|a| Self::ident_matches_name(a, table))
+                        .unwrap_or(false)
             })
             .collect()
     }

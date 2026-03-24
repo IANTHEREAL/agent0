@@ -26,6 +26,7 @@ fn test_table_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "name".to_string(),
@@ -38,6 +39,7 @@ fn test_table_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         vec![0],
@@ -351,6 +353,7 @@ fn test_nlj() {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "val".to_string(),
@@ -363,6 +366,7 @@ fn test_nlj() {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         vec![0],
@@ -854,6 +858,7 @@ fn test_hash_join_right_keys_are_local() {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "val".to_string(),
@@ -866,6 +871,7 @@ fn test_hash_join_right_keys_are_local() {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         vec![0],
@@ -970,6 +976,7 @@ fn test_duplicate_aggregate_produces_correct_output_width() {
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         }],
         vec![0],
     );

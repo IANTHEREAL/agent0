@@ -420,6 +420,11 @@ pub struct ColumnDef {
     pub generation_expr_authorized_by: Option<String>,
     #[serde(default)]
     pub collation: Option<String>,
+    /// Logical DROP COLUMN marker (PostgreSQL `attisdropped`).
+    /// When true, the column's physical slot is preserved in rows but
+    /// the column is invisible to SQL queries.
+    #[serde(default)]
+    pub is_dropped: bool,
 }
 
 /// Index definition
@@ -754,8 +759,31 @@ impl TableSchema {
 }
 
 impl TableSchema {
+    /// Iterate only SQL-visible columns (excluding logically dropped ones).
+    /// Returns `(physical_index, &ColumnDef)` so callers keep correct row positions.
+    ///
+    /// Use this for any SQL-facing surface: name resolution, DDL export,
+    /// information_schema, DML target lists, wildcard expansion.
+    /// Use `.columns` directly only when you need the physical row layout
+    /// (storage encoding, fill_row_defaults, scope-with-gaps, pg_attribute).
+    #[allow(dead_code)]
+    pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_dropped)
+    }
+
+    /// Count of SQL-visible columns (excluding dropped).
+    #[allow(dead_code)]
+    pub fn visible_column_count(&self) -> usize {
+        self.columns.iter().filter(|c| !c.is_dropped).count()
+    }
+
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name == name)
+        self.columns
+            .iter()
+            .position(|c| !c.is_dropped && c.name == name)
     }
 
     pub fn get_pk_values(&self, row: &Row) -> Vec<Value> {
