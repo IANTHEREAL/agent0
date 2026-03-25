@@ -1,0 +1,10 @@
+# Test 1: DROP COLUMN blocked by CHECK constraint
+Cannot drop column
+# Test 2: DROP COLUMN blocked by expression index
+Cannot drop column
+# Test 3: DROP COLUMN blocked by partial index predicate
+Cannot drop column
+# Test 4: DROP COLUMN blocked by generated column
+Cannot drop column
+# Test 5: DROP COLUMN blocked by view dependency
+cannot drop column

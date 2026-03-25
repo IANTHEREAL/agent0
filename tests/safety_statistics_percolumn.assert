@@ -1,0 +1,11 @@
+# Test 1: Basic ANALYZE shows real row counts
+rows=100
+
+# Test 2: Wide column ANALYZE succeeds and shows row counts
+rows=50
+
+# Test 3: Re-ANALYZE after schema change
+rows=200
+
+# Test 5: Multi-column mixed widths
+rows=80

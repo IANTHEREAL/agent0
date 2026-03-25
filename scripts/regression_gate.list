@@ -233,6 +233,28 @@ tests/1810_rls_dml_enforcement.sql
 tests/rls_security_barrier.sql
 # #605 – parameterized LIMIT/OFFSET in deferred-limit path (FOR UPDATE)
 tests/605_parameterized_limit_offset.sql
+# --- Safety regression tests (2026-03-24, pre-launch gate) ---
+# #2043 – hash join memory limit enforcement (semi-join, anti-join, GUC)
+tests/safety_hash_join_mem.sql
+# #2028 – Decimal checked arithmetic (overflow → error, not crash)
+tests/safety_decimal_overflow.sql
+# #2044 – ALTER TABLE DROP COLUMN dependency checks + byte budget
+tests/safety_alter_table.sql
+# #2040 – per-column statistics storage + WIDTH_THRESHOLD
+tests/safety_statistics_percolumn.sql
+# #2015 – reject unsupported index types (hash/brin/spgist/gist)
+tests/safety_unsupported_index_types.sql
+# #2053 – HNSW shared index cache + two-level search correctness
+tests/2053_hnsw_shared_cache.sql
+tests/2053_hnsw_twolevel_search.sql
+# #1967 – aggregate + COLLATE / IS DISTINCT FROM wildcard fix
+tests/safety_aggregate_collate_isdistinct.sql
+# #2028 – math domain errors (ln/log of zero/negative)
+tests/safety_math_domain_errors.sql
+# #2022 – parameterized LIMIT/OFFSET negative/zero boundary
+tests/safety_parameterized_limit_negative.sql
+# #2033 – COPY FORMAT binary rejection
+tests/safety_copy_binary_rejection.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
@@ -251,6 +273,33 @@ tests/hnsw_frozen_oversize_1969.py
 # #1971 – HNSW S3 graph offload (storage_version=2, graph_version, dropped_at)
 # design: docs/design/31_hnsw_s3_graph_offload.md
 tests/hnsw_s3_offload_meta_compat_1971.py
+# --- Safety regression tests (2026-03-24, pre-launch gate) ---
+# #1979/#2025 – KV value size guard (connection recovery, batch rejection, UPDATE)
+tests/safety_kv_value_size_guard.py
+# #2033/#2044 – COPY self-FK deferred validation + ALTER TABLE deps (RLS, matview)
+tests/safety_copy_selfref_fk.py
+#
+# --- E2E dev-only tests (NOT in regression gate) ---
+# Timing-sensitive (sleep/GC tick), large data, or special infra.
+# Run manually against dev environment:
+#
+# Basic e2e (std db9+TiKV, ~15-35s each):
+#   python3 tests/safety_gc_safepoint.py --dsn ...
+#   python3 tests/safety_hnsw_s3_offload.py --dsn ...
+#   python3 tests/safety_copy_rotation.py --dsn ...
+#   python3 tests/2053_hnsw_concurrent_search.py --dsn ...
+#
+# Stress/boundary (large data, concurrent, ~30-120s each):
+#   python3 tests/stress_boundary_test.py --dsn ...
+#   python3 tests/stress_boundary_test_2.py --dsn ...
+#
+# GC safepoint (requires DB9_GC_SAFEPOINT_INTERVAL_SEC=30, ~90-120s):
+#   python3 tests/stress_gc_critical.py --dsn ...
+#   python3 tests/stress_gc_and_kvsize.py --dsn ...
+#
+# S3 HNSW (requires HNSW_S3_BUCKET + S3/MinIO, ~60s):
+#   python3 tests/stress_hnsw_s3_live.py --dsn ...
+#   HNSW_S3_TEST=1 python3 tests/safety_hnsw_s3_offload.py --dsn ...
 [orm]
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
