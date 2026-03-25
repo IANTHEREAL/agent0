@@ -12,6 +12,7 @@ env:
   PG_PORT: 5433
   PG_USER: admin
   PG_PASSWORD: admin
+  REDIS_URL: redis://localhost:6379
 
 jobs:
   # -- Build (single release build, shared via artifact) --------------------
@@ -57,6 +58,16 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -96,6 +107,16 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -203,6 +224,16 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -269,6 +300,16 @@ jobs:
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 

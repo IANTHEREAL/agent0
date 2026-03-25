@@ -748,14 +748,14 @@ impl EmbeddedPageFs {
         }
     }
 
-    /// Enqueue a single event for async persistence (zero TiKV I/O on caller).
+    /// Enqueue a single event for async Redis persistence (zero I/O on caller).
     fn persist_event_async(&self, builder: FsEventBuilder) {
-        crate::extensions::fs::notify::enqueue_persist_event(builder);
+        crate::extensions::fs::notify::enqueue_persist_event(&self.keyspace, builder);
     }
 
-    /// Enqueue multiple events for async persistence (zero TiKV I/O on caller).
+    /// Enqueue multiple events for async Redis persistence (zero I/O on caller).
     fn persist_events_async(&self, builders: Vec<FsEventBuilder>) {
-        crate::extensions::fs::notify::enqueue_persist_events(builders);
+        crate::extensions::fs::notify::enqueue_persist_events(&self.keyspace, builders);
     }
 
     async fn alloc_inode_id(&self) -> Result<u64> {

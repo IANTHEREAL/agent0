@@ -353,15 +353,17 @@ impl Executor {
         let func_upper = func_part.to_ascii_uppercase();
 
         let rows = if func_upper == "FS9_EVENTS" {
-            // fs9_events(since_seq [, path_prefix [, limit]])
-            let since_seq = match evaluated_args.first() {
+            // fs9_events(since_id [, path_prefix [, limit]])
+            let since_id = match evaluated_args.first() {
                 Some(arg) => match &arg.value {
-                    Value::Int64(v) => *v,
-                    Value::Int32(v) => *v as i64,
-                    Value::Null => 0i64,
-                    _ => return Err(anyhow!("fs9_events: since_seq must be an integer")),
+                    Value::Text(s) => s.clone(),
+                    Value::Null => "0".to_string(),
+                    // Accept integers for backwards compatibility (convert to stream ID prefix).
+                    Value::Int64(v) => v.to_string(),
+                    Value::Int32(v) => v.to_string(),
+                    _ => return Err(anyhow!("fs9_events: since_id must be text")),
                 },
-                None => 0i64,
+                None => "0".to_string(),
             };
             let path_prefix = match evaluated_args.get(1) {
                 Some(arg) => match &arg.value {
@@ -392,9 +394,10 @@ impl Executor {
                 },
                 None => 10_000usize,
             };
-            crate::extensions::fs::notify::execute_fs9_events_from_tikv(
-                txn,
-                since_seq,
+            let keyspace = self.tenant_keyspace();
+            crate::extensions::fs::notify::execute_fs9_events_from_redis(
+                keyspace,
+                &since_id,
                 path_prefix,
                 limit,
             )

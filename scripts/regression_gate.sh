@@ -529,6 +529,7 @@ if [[ "$START_ENV" -eq 1 ]]; then
 	  DB9_BOOTSTRAP_ADMIN_USER="$PG_USER" \
 	  DB9_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
 	  DB9_INSECURE=1 \
+	  REDIS_URL="${REDIS_URL:-redis://localhost:6379}" \
 	  ./target/release/db9-server > /tmp/db9-regression.log 2>&1 &
 	  DB9_PID=$!
 	  popd >/dev/null
