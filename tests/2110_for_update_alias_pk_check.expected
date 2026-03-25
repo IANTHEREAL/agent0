@@ -1,0 +1,23 @@
+ id | val
+----+-----
+  1 | a
+  2 | b
+  3 | c
+(3 rows)
+
+ id | val
+----+-----
+  1 | a
+  2 | b
+  3 | c
+(3 rows)
+
+ id
+----
+  1
+  2
+  3
+(3 rows)
+
+ERROR:  FOR UPDATE/SHARE requires primary key
+ERROR:  FOR UPDATE/SHARE requires primary key

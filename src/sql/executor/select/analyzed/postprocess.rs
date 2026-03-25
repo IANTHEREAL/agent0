@@ -63,23 +63,30 @@ impl Executor {
                 .is_some_and(|nb| *nb == sqlparser::ast::NonBlock::Nowait)
         });
 
-        // Find the table name for locking. Use the first base table in FROM.
-        let table_name = match &analyzed.body {
+        // Find the table name + alias for locking. Use the first base table in FROM.
+        let table_ref_info = match &analyzed.body {
             AnalyzedQueryBody::Select(select) => {
                 select.from.first().and_then(|tr| match &tr.kind {
-                    AnalyzedTableRefKind::Table { name, .. } => Some(name.clone()),
+                    AnalyzedTableRefKind::Table { name, .. } => {
+                        Some((name.clone(), tr.alias.as_deref().map(String::from)))
+                    }
                     _ => None,
                 })
             }
             _ => None,
         };
 
-        let Some(table_name) = table_name else {
+        let Some((table_name, table_alias)) = table_ref_info else {
             return Ok((rows, false));
         };
 
+        // Use the same composite key that pipeline.rs uses to populate
+        // build_ctx.table_schemas (schema_map_key includes the alias).
+        let schema_key =
+            crate::sql::optimizer::schema_map_key(&table_name, table_alias.as_deref());
+
         // Check that the table has a primary key (required for locking).
-        if let Some(schema) = build_ctx.table_schemas.get(&table_name) {
+        if let Some(schema) = build_ctx.table_schemas.get(&schema_key) {
             if schema.pk_indices.is_empty() {
                 return Err(anyhow!("FOR UPDATE/SHARE requires primary key"));
             }

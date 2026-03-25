@@ -1,0 +1,2 @@
+SELECT * FROM no_pk_2110 AS t FOR UPDATE: FOR UPDATE/SHARE requires primary key
+SELECT * FROM no_pk_2110 FOR UPDATE: FOR UPDATE/SHARE requires primary key
