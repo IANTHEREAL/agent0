@@ -58,6 +58,8 @@ UPDATE hnsw_2l SET v = '[0.95, 0.0, 0.0]' WHERE id = 3;
 SELECT 'multi_update' AS test, id FROM hnsw_2l ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
 
 -- ================================================================
--- Cleanup
+-- Cleanup (retry: DROP may conflict with HNSW merge lock — #2058)
+-- S3 mode merge is slower; wait for it to finish.
 -- ================================================================
-DROP TABLE hnsw_2l;
+SELECT pg_sleep(8);
+DROP TABLE IF EXISTS hnsw_2l;

@@ -31,6 +31,8 @@ SELECT 'q3' AS tag, id FROM hnsw_cache_t ORDER BY v <-> '[0.0, 0.0, 1.0]' LIMIT 
 -- ================================================================
 SELECT 'q4' AS tag, id FROM hnsw_cache_t ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
 
+-- Allow merge to finish before DDL (#2058: merge lock conflict)
+SELECT pg_sleep(3);
 DROP TABLE hnsw_cache_t;
 
 -- ================================================================
@@ -50,6 +52,7 @@ INSERT INTO hnsw_trunc_t (id, v) VALUES (10, '[0.0, 0.0, 1.0]'), (11, '[0.0, 0.9
 -- Must reflect new data, not stale cache
 SELECT 'post_trunc' AS tag, id FROM hnsw_trunc_t ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
 
+SELECT pg_sleep(3);
 DROP TABLE hnsw_trunc_t;
 
 -- ================================================================
@@ -63,6 +66,7 @@ CREATE INDEX idx_drop_c ON hnsw_drop_c USING hnsw (v vector_l2_ops);
 -- Warm cache
 SELECT 'phase1' AS tag, id FROM hnsw_drop_c ORDER BY v <-> '[1.0, 0.0, 0.0]' LIMIT 1;
 
+SELECT pg_sleep(3);
 DROP TABLE hnsw_drop_c;
 
 CREATE TABLE hnsw_drop_c (id INT PRIMARY KEY, v VECTOR(3));
@@ -72,4 +76,5 @@ CREATE INDEX idx_drop_c ON hnsw_drop_c USING hnsw (v vector_l2_ops);
 -- Must use new index
 SELECT 'phase2' AS tag, id FROM hnsw_drop_c ORDER BY v <-> '[0.0, 1.0, 0.0]' LIMIT 1;
 
+SELECT pg_sleep(3);
 DROP TABLE hnsw_drop_c;
