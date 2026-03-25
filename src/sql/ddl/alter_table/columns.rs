@@ -705,9 +705,9 @@ pub(super) async fn alter_table_alter_column_set_data_type(
 ///   Bare `col` still matches conservatively (unknown table).
 fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &str) -> bool {
     use sqlparser::ast::{
-        Expr as AstExpr, FunctionArg, FunctionArgExpr, GroupByExpr, NamedWindowDefinition,
-        ObjectName, Offset, Query, Select, SelectItem, SetExpr, Statement as SqlStatement,
-        TableFactor, TableWithJoins, WindowType,
+        Expr as AstExpr, GroupByExpr, NamedWindowDefinition, ObjectName, Offset, Query, Select,
+        SelectItem, SetExpr, Statement as SqlStatement, TableFactor, TableWithJoins, Visit,
+        Visitor,
     };
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
@@ -799,66 +799,105 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
         names
     }
 
-    fn function_arg_depends_on_column(
-        arg: &FunctionArg,
+    /// Check whether any expression inside `v` references `col_lower`,
+    /// using `scope_names` for qualifying `table.column` identifiers.
+    /// Subquery boundaries are respected: when a `Query` node is reached
+    /// the visitor delegates to `query_depends_on_column` (which builds
+    /// a fresh scope from the inner FROM clause) and skips the subtree to
+    /// prevent outer scope names from leaking in.
+    fn visit_depends_on_column<V: Visit>(
+        v: &V,
         scope_names: &[String],
         target_full: &str,
         target_bare: &str,
         col_lower: &str,
     ) -> bool {
-        match arg {
-            FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
-                function_arg_expr_depends_on_column(
-                    arg,
-                    scope_names,
-                    target_full,
-                    target_bare,
-                    col_lower,
-                )
+        use std::ops::ControlFlow;
+
+        struct DepCheck<'a> {
+            scope_names: &'a [String],
+            target_full: &'a str,
+            target_bare: &'a str,
+            col_lower: &'a str,
+            /// Depth counter: > 0 means we are inside a subquery whose
+            /// expressions have already been (or will be) checked with a
+            /// fresh scope by `query_depends_on_column`.  While > 0 we
+            /// must ignore every `Expr` the visitor encounters so that
+            /// the outer `scope_names` is not applied to inner identifiers.
+            skip_depth: usize,
+        }
+
+        impl Visitor for DepCheck<'_> {
+            type Break = (); // `Break(())` ≡ "found a dependency"
+
+            fn pre_visit_expr(&mut self, e: &AstExpr) -> ControlFlow<()> {
+                if self.skip_depth > 0 {
+                    // Inside a subquery handled by query_depends_on_column;
+                    // do not check expressions with the outer scope.
+                    return ControlFlow::Continue(());
+                }
+                match e {
+                    // Bare column reference — conservatively matches any
+                    // same-name column regardless of qualifier.
+                    AstExpr::Identifier(ident) => {
+                        if crate::sql::names::normalize_ident(ident) == self.col_lower {
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    // Qualified column reference — only matches when the
+                    // qualifier resolves to our target table.
+                    AstExpr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                        let col = crate::sql::names::normalize_ident(parts.last().unwrap());
+                        if col == self.col_lower {
+                            let qualifier =
+                                crate::sql::names::normalize_ident(&parts[parts.len() - 2]);
+                            if self.scope_names.iter().any(|s| s == &qualifier) {
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                    // All other expressions: the visitor recurses automatically.
+                    // Subquery expressions (InSubquery, Exists, Subquery,
+                    // ArraySubquery) contain Query nodes that are handled by
+                    // pre_visit_query with scope-isolated recursion.
+                    _ => {}
+                }
+                ControlFlow::Continue(())
+            }
+
+            fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+                // Every Query node (Expr-level subqueries AND TableFactor::Derived)
+                // needs scope-isolated handling via query_depends_on_column.
+                // We handle it here and skip the visitor's own recursion.
+                if self.skip_depth == 0 {
+                    if query_depends_on_column(q, self.target_full, self.target_bare, self.col_lower)
+                    {
+                        return ControlFlow::Break(());
+                    }
+                }
+                // Skip all inner nodes — query_depends_on_column already
+                // recursed with proper scope.
+                self.skip_depth += 1;
+                ControlFlow::Continue(())
+            }
+
+            fn post_visit_query(&mut self, _q: &Query) -> ControlFlow<()> {
+                self.skip_depth -= 1;
+                ControlFlow::Continue(())
             }
         }
+
+        let mut checker = DepCheck {
+            scope_names,
+            target_full,
+            target_bare,
+            col_lower,
+            skip_depth: 0,
+        };
+        matches!(v.visit(&mut checker), ControlFlow::Break(()))
     }
 
-    fn function_arg_expr_depends_on_column(
-        arg: &FunctionArgExpr,
-        scope_names: &[String],
-        target_full: &str,
-        target_bare: &str,
-        col_lower: &str,
-    ) -> bool {
-        match arg {
-            FunctionArgExpr::Expr(expr) => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-            }
-            FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => false,
-        }
-    }
-
-    fn window_type_depends_on_column(
-        wt: &WindowType,
-        scope_names: &[String],
-        target_full: &str,
-        target_bare: &str,
-        col_lower: &str,
-    ) -> bool {
-        match wt {
-            WindowType::WindowSpec(spec) => {
-                spec.partition_by.iter().any(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                }) || spec.order_by.iter().any(|ob| {
-                    expr_depends_on_column(
-                        &ob.expr,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                })
-            }
-            WindowType::NamedWindow(_) => false,
-        }
-    }
-
+    /// Thin wrapper: check a single expression tree for column dependency.
     fn expr_depends_on_column(
         expr: &AstExpr,
         scope_names: &[String],
@@ -866,361 +905,7 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
         target_bare: &str,
         col_lower: &str,
     ) -> bool {
-        match expr {
-            AstExpr::Identifier(ident) => crate::sql::names::normalize_ident(ident) == col_lower,
-            AstExpr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-                let qualifier = crate::sql::names::normalize_ident(&parts[parts.len() - 2]);
-                let col =
-                    crate::sql::names::normalize_ident(parts.last().expect("parts.len() >= 2"));
-                col == col_lower && scope_names.contains(&qualifier)
-            }
-            AstExpr::CompoundIdentifier(_) => false,
-            AstExpr::JsonAccess { left, right, .. } => {
-                expr_depends_on_column(left, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        right,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            AstExpr::CompositeAccess { expr, .. }
-            | AstExpr::IsFalse(expr)
-            | AstExpr::IsNotFalse(expr)
-            | AstExpr::IsTrue(expr)
-            | AstExpr::IsNotTrue(expr)
-            | AstExpr::IsNull(expr)
-            | AstExpr::IsNotNull(expr)
-            | AstExpr::IsUnknown(expr)
-            | AstExpr::IsNotUnknown(expr)
-            | AstExpr::UnaryOp { expr, .. }
-            | AstExpr::Convert { expr, .. }
-            | AstExpr::Cast { expr, .. }
-            | AstExpr::TryCast { expr, .. }
-            | AstExpr::SafeCast { expr, .. }
-            | AstExpr::Extract { expr, .. }
-            | AstExpr::Ceil { expr, .. }
-            | AstExpr::Floor { expr, .. }
-            | AstExpr::Collate { expr, .. }
-            | AstExpr::Nested(expr)
-            | AstExpr::Named { expr, .. }
-            | AstExpr::AtTimeZone {
-                timestamp: expr, ..
-            } => expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower),
-            AstExpr::IsDistinctFrom(left, right)
-            | AstExpr::IsNotDistinctFrom(left, right)
-            | AstExpr::BinaryOp { left, right, .. }
-            | AstExpr::AnyOp { left, right, .. }
-            | AstExpr::AllOp { left, right, .. }
-            | AstExpr::Position {
-                expr: left,
-                r#in: right,
-            } => {
-                expr_depends_on_column(left, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        right,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            AstExpr::InList { expr, list, .. } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || list.iter().any(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::InSubquery { expr, subquery, .. } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || query_depends_on_column(subquery, target_full, target_bare, col_lower)
-            }
-            AstExpr::InUnnest {
-                expr, array_expr, ..
-            } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        array_expr,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            AstExpr::Between {
-                expr, low, high, ..
-            } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(low, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        high,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            AstExpr::Like { expr, pattern, .. }
-            | AstExpr::ILike { expr, pattern, .. }
-            | AstExpr::SimilarTo { expr, pattern, .. }
-            | AstExpr::RLike { expr, pattern, .. } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        pattern,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            AstExpr::Substring {
-                expr,
-                substring_from,
-                substring_for,
-                ..
-            } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || substring_from.as_ref().is_some_and(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-                    || substring_for.as_ref().is_some_and(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::Trim {
-                expr,
-                trim_what,
-                trim_characters,
-                ..
-            } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || trim_what.as_ref().is_some_and(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-                    || trim_characters.iter().flatten().any(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::Overlay {
-                expr,
-                overlay_what,
-                overlay_from,
-                overlay_for,
-            } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        overlay_what,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                    || expr_depends_on_column(
-                        overlay_from,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                    || overlay_for.as_ref().is_some_and(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::MapAccess { column, keys } => {
-                expr_depends_on_column(column, scope_names, target_full, target_bare, col_lower)
-                    || keys.iter().any(|item| {
-                        expr_depends_on_column(
-                            item,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::Function(func) => {
-                func.args.iter().any(|arg| {
-                    function_arg_depends_on_column(
-                        arg,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                }) || func.filter.as_ref().is_some_and(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                }) || func.over.as_ref().is_some_and(|wt| {
-                    window_type_depends_on_column(
-                        wt,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                }) || func.order_by.iter().any(|ob| {
-                    expr_depends_on_column(
-                        &ob.expr,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                })
-            }
-            AstExpr::AggregateExpressionWithFilter { expr, filter } => {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        filter,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            AstExpr::Case {
-                operand,
-                conditions,
-                results,
-                else_result,
-            } => {
-                operand.as_ref().is_some_and(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                }) || conditions.iter().any(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                }) || results.iter().any(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                }) || else_result.as_ref().is_some_and(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                })
-            }
-            AstExpr::Exists { subquery, .. }
-            | AstExpr::Subquery(subquery)
-            | AstExpr::ArraySubquery(subquery) => {
-                query_depends_on_column(subquery, target_full, target_bare, col_lower)
-            }
-            AstExpr::ListAgg(listagg) => {
-                expr_depends_on_column(
-                    &listagg.expr,
-                    scope_names,
-                    target_full,
-                    target_bare,
-                    col_lower,
-                ) || listagg.separator.as_ref().is_some_and(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                }) || listagg
-                    .on_overflow
-                    .as_ref()
-                    .is_some_and(|overflow| match overflow {
-                        sqlparser::ast::ListAggOnOverflow::Error => false,
-                        sqlparser::ast::ListAggOnOverflow::Truncate { filler, with_count } => {
-                            filler.as_ref().is_some_and(|expr| {
-                                expr_depends_on_column(
-                                    expr,
-                                    scope_names,
-                                    target_full,
-                                    target_bare,
-                                    col_lower,
-                                )
-                            }) || *with_count
-                        }
-                    })
-                    || listagg.within_group.iter().any(|ob| {
-                        expr_depends_on_column(
-                            &ob.expr,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::ArrayAgg(array_agg) => {
-                expr_depends_on_column(
-                    &array_agg.expr,
-                    scope_names,
-                    target_full,
-                    target_bare,
-                    col_lower,
-                ) || array_agg.order_by.iter().flatten().any(|ob| {
-                    expr_depends_on_column(
-                        &ob.expr,
-                        scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-                }) || array_agg.limit.as_ref().is_some_and(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                })
-            }
-            AstExpr::GroupingSets(items) | AstExpr::Cube(items) | AstExpr::Rollup(items) => {
-                items.iter().flatten().any(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                })
-            }
-            AstExpr::Tuple(items) | AstExpr::Struct { values: items, .. } => {
-                items.iter().any(|expr| {
-                    expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-                })
-            }
-            AstExpr::Array(array) => array.elem.iter().any(|expr| {
-                expr_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
-            }),
-            AstExpr::ArrayIndex { obj, indexes } => {
-                expr_depends_on_column(obj, scope_names, target_full, target_bare, col_lower)
-                    || indexes.iter().any(|expr| {
-                        expr_depends_on_column(
-                            expr,
-                            scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
-            }
-            AstExpr::Value(_)
-            | AstExpr::IntroducedString { .. }
-            | AstExpr::TypedString { .. }
-            | AstExpr::Interval(_)
-            | AstExpr::MatchAgainst { .. } => false,
-        }
+        visit_depends_on_column(expr, scope_names, target_full, target_bare, col_lower)
     }
 
     fn join_constraint_depends_on_column(
@@ -1260,82 +945,6 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
         }
     }
 
-    fn table_factor_depends_on_column(
-        factor: &TableFactor,
-        target_full: &str,
-        target_bare: &str,
-        col_lower: &str,
-    ) -> bool {
-        match factor {
-            TableFactor::Table {
-                args, with_hints, ..
-            } => {
-                args.iter().flatten().any(|arg| {
-                    function_arg_depends_on_column(arg, &[], target_full, target_bare, col_lower)
-                }) || with_hints.iter().any(|expr| {
-                    expr_depends_on_column(expr, &[], target_full, target_bare, col_lower)
-                })
-            }
-            TableFactor::Derived { subquery, .. } => {
-                query_depends_on_column(subquery, target_full, target_bare, col_lower)
-            }
-            TableFactor::TableFunction { expr, .. } => {
-                expr_depends_on_column(expr, &[], target_full, target_bare, col_lower)
-            }
-            TableFactor::Function { args, .. } => args.iter().any(|arg| {
-                function_arg_depends_on_column(arg, &[], target_full, target_bare, col_lower)
-            }),
-            TableFactor::UNNEST { array_exprs, .. } => array_exprs
-                .iter()
-                .any(|expr| expr_depends_on_column(expr, &[], target_full, target_bare, col_lower)),
-            TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => table_with_joins_depends_on_column(
-                table_with_joins,
-                target_full,
-                target_bare,
-                col_lower,
-            ),
-            TableFactor::Pivot {
-                table,
-                aggregate_function,
-                ..
-            } => {
-                table_factor_depends_on_column(table, target_full, target_bare, col_lower)
-                    || expr_depends_on_column(
-                        aggregate_function,
-                        &[],
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            }
-            TableFactor::Unpivot { table, .. } => {
-                table_factor_depends_on_column(table, target_full, target_bare, col_lower)
-            }
-        }
-    }
-
-    fn table_with_joins_depends_on_column(
-        twj: &TableWithJoins,
-        target_full: &str,
-        target_bare: &str,
-        col_lower: &str,
-    ) -> bool {
-        let scope_names = our_table_names(std::slice::from_ref(twj), target_full, target_bare);
-        table_factor_depends_on_column(&twj.relation, target_full, target_bare, col_lower)
-            || twj.joins.iter().any(|join| {
-                table_factor_depends_on_column(&join.relation, target_full, target_bare, col_lower)
-                    || join_constraint_depends_on_column(
-                        &join.join_operator,
-                        &scope_names,
-                        target_full,
-                        target_bare,
-                        col_lower,
-                    )
-            })
-    }
-
     fn select_depends_on_column(
         select: &Select,
         target_full: &str,
@@ -1362,10 +971,32 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
             }
         }
 
-        select
-            .from
-            .iter()
-            .any(|twj| table_with_joins_depends_on_column(twj, target_full, target_bare, col_lower))
+        // Check expressions inside FROM items (table function args,
+        // derived subqueries, UNNEST, etc.) with empty scope — identifiers
+        // in the FROM clause itself cannot reference sibling FROM aliases.
+        // Also check join constraints (USING, NATURAL, ON).
+        select.from.iter().any(|twj| {
+            let twj_scope = our_table_names(std::slice::from_ref(twj), target_full, target_bare);
+            // Visit all expressions in table factors (empty scope).
+            // The visitor automatically handles derived subqueries via
+            // pre_visit_query → query_depends_on_column.
+            visit_depends_on_column(&twj.relation, &[], target_full, target_bare, col_lower)
+                || twj.joins.iter().any(|join| {
+                    visit_depends_on_column(
+                        &join.relation,
+                        &[],
+                        target_full,
+                        target_bare,
+                        col_lower,
+                    ) || join_constraint_depends_on_column(
+                        &join.join_operator,
+                        &twj_scope,
+                        target_full,
+                        target_bare,
+                        col_lower,
+                    )
+                })
+        })
             || select.lateral_views.iter().any(|lv| {
                 expr_depends_on_column(
                     &lv.lateral_view,
@@ -1576,6 +1207,20 @@ mod tests {
     #[test]
     fn view_dep_check_blocks_natural_join_conservatively() {
         let sql = "SELECT 1 FROM public.users u NATURAL JOIN public.orders o";
+        assert!(view_sql_depends_on_column(sql, "public.users", "age"));
+    }
+
+    #[test]
+    fn view_dep_check_matches_derived_subquery_in_from() {
+        // Derived subquery (TableFactor::Derived) references the column.
+        let sql = "SELECT d.age FROM (SELECT age FROM public.users) d";
+        assert!(view_sql_depends_on_column(sql, "public.users", "age"));
+    }
+
+    #[test]
+    fn view_dep_check_matches_join_on_clause() {
+        // ON clause of a JOIN references the column.
+        let sql = "SELECT 1 FROM public.users u JOIN public.orders o ON u.age = o.val";
         assert!(view_sql_depends_on_column(sql, "public.users", "age"));
     }
 }
