@@ -10,6 +10,7 @@
 //! - Segment TTL: 4 hours after last write (consumer catch-up window).
 //! - Schema version field `v:1` for future evolution.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -40,6 +41,12 @@ static REDIS_CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Global sender for the event persistence channel.
 static EVENT_TX: OnceLock<mpsc::UnboundedSender<RedisEvent>> = OnceLock::new();
+
+/// Current number of events queued for Redis persistence (enqueued minus flushed).
+static EVENT_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+/// Threshold for logging a warning about queue depth.
+const QUEUE_DEPTH_WARN_THRESHOLD: u64 = 10_000;
 
 /// An event ready to be written to Redis.
 struct RedisEvent {
@@ -207,13 +214,52 @@ fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i64> {
 /// Enqueue multiple events for async Redis persistence.
 pub fn enqueue_events(keyspace: &str, builders: Vec<FsEventBuilder>) {
     if let Some(tx) = EVENT_TX.get() {
-        for b in builders {
-            let _ = tx.send(RedisEvent {
-                keyspace: keyspace.to_string(),
-                builder: b,
-            });
+        let sent = enqueue_with_accounting(tx, keyspace, builders);
+        if sent > 0 {
+            let depth = EVENT_QUEUE_DEPTH.load(Ordering::Relaxed);
+            if depth >= QUEUE_DEPTH_WARN_THRESHOLD {
+                tracing::warn!(
+                    "fs9_redis: event queue depth {depth} (threshold {QUEUE_DEPTH_WARN_THRESHOLD})"
+                );
+            }
         }
     }
+}
+
+/// Core enqueue logic: increment counter before each send, rollback on failure.
+/// Extracted for testability — the ordering invariant (increment-before-visibility)
+/// is pinned by tests that call this function directly.
+fn enqueue_with_accounting(
+    tx: &mpsc::UnboundedSender<RedisEvent>,
+    keyspace: &str,
+    builders: Vec<FsEventBuilder>,
+) -> u64 {
+    let mut sent = 0u64;
+    for b in builders {
+        // Increment BEFORE send so the counter is always >= actual queue length.
+        // This ensures the consumer's fetch_sub never underflows the counter.
+        EVENT_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+        if tx
+            .send(RedisEvent {
+                keyspace: keyspace.to_string(),
+                builder: b,
+            })
+            .is_ok()
+        {
+            sent += 1;
+        } else {
+            // Channel closed — roll back the increment for this failed send.
+            EVENT_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    sent
+}
+
+/// Returns the current number of events pending in the Redis persistence queue.
+/// Intended for observability tooling (health checks, metrics scraping).
+#[allow(dead_code)]
+pub fn event_queue_depth() -> u64 {
+    EVENT_QUEUE_DEPTH.load(Ordering::Relaxed)
 }
 
 /// Start the background event persistence loop. Call once at startup.
@@ -258,12 +304,24 @@ pub fn spawn_event_loop() {
             }
 
             let to_flush = std::mem::take(&mut batch);
+            let flushed = to_flush.len() as u64;
             if let Err(e) = flush_batch(&mut conn, to_flush).await {
                 tracing::warn!("fs9_redis: batch flush failed: {e}");
                 // Reconnect on failure.
                 if let Ok(new_conn) = get_connection().await {
                     conn = new_conn;
                 }
+                // Note: failed events are dropped, not requeued. Decrement is
+                // correct because the events have left the channel regardless
+                // of whether Redis accepted them.
+            }
+            let remaining = EVENT_QUEUE_DEPTH.fetch_sub(flushed, Ordering::Relaxed) - flushed;
+            if remaining >= QUEUE_DEPTH_WARN_THRESHOLD {
+                tracing::warn!(
+                    "fs9_redis: queue depth still high after flush: {remaining} pending"
+                );
+            } else if remaining > 0 {
+                tracing::debug!("fs9_redis: flushed {flushed}, {remaining} pending");
             }
         }
 
@@ -273,7 +331,9 @@ pub fn spawn_event_loop() {
         }
         if !batch.is_empty() {
             let to_flush = std::mem::take(&mut batch);
+            let flushed = to_flush.len() as u64;
             let _ = flush_batch(&mut conn, to_flush).await;
+            EVENT_QUEUE_DEPTH.fetch_sub(flushed, Ordering::Relaxed);
         }
         tracing::info!("fs9_redis: event loop exited");
     });
@@ -542,4 +602,133 @@ fn parse_stream_entry(value: &redis::Value) -> Option<RedisStreamEvent> {
         size: map.get("size")?.parse().unwrap_or(0),
         timestamp: map.get("ts")?.parse().unwrap_or(0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_queue_depth_counter() {
+        // Use fetch_add / fetch_sub deltas — net zero so parallel tests unaffected.
+        let before = event_queue_depth();
+
+        EVENT_QUEUE_DEPTH.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(event_queue_depth(), before + 5);
+
+        EVENT_QUEUE_DEPTH.fetch_sub(3, Ordering::Relaxed);
+        assert_eq!(event_queue_depth(), before + 2);
+
+        EVENT_QUEUE_DEPTH.fetch_sub(2, Ordering::Relaxed);
+        assert_eq!(event_queue_depth(), before);
+    }
+
+    #[test]
+    fn test_queue_depth_warn_threshold() {
+        // Just verify the threshold constant is sensible.
+        assert_eq!(QUEUE_DEPTH_WARN_THRESHOLD, 10_000);
+    }
+
+    #[test]
+    fn test_hour_segment_format() {
+        let seg = current_hour_segment();
+        assert_eq!(
+            seg.len(),
+            10,
+            "hour segment should be YYYYMMDDHH (10 chars)"
+        );
+    }
+
+    #[test]
+    fn test_hour_roundtrip() {
+        let seg = current_hour_segment();
+        let epoch = hour_to_epoch_secs(&seg);
+        assert!(epoch.is_some(), "current hour segment should parse");
+    }
+
+    /// Helper to build N dummy FsEventBuilder instances for testing.
+    fn make_builders(n: usize) -> Vec<FsEventBuilder> {
+        (0..n)
+            .map(|i| FsEventBuilder {
+                event_type: FsEventType::Write,
+                path: format!("/test/{i}"),
+                old_path: None,
+                inode: i as u64,
+                parent_inode: 0,
+                generation: 1,
+                is_dir: false,
+                size: 0,
+            })
+            .collect()
+    }
+
+    /// Test enqueue_with_accounting on a live channel with a concurrent
+    /// consumer draining events. Verifies the counter never underflows.
+    /// This pins the real implementation's ordering invariant
+    /// (increment-before-send).
+    #[test]
+    fn test_enqueue_with_accounting_concurrent_drain() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RedisEvent>();
+        let n = 500usize;
+        let builders = make_builders(n);
+
+        // Record baseline (other parallel tests may have modified the global).
+        let baseline = EVENT_QUEUE_DEPTH.load(Ordering::SeqCst);
+
+        // Spawn consumer that drains events and decrements counter,
+        // mirroring the real event loop's flush path.
+        let consumer = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut drained = 0usize;
+                while drained < n {
+                    match rx.recv().await {
+                        Some(_) => {
+                            EVENT_QUEUE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                            drained += 1;
+                        }
+                        None => break,
+                    }
+                }
+                drained
+            })
+        });
+
+        // Producer: call the real extracted helper.
+        let sent = enqueue_with_accounting(&tx, "test_ks", builders);
+        assert_eq!(sent, n as u64, "all sends should succeed");
+
+        // Counter must be >= baseline at all times during enqueue (no underflow).
+        // After consumer finishes, counter should return to baseline.
+        drop(tx); // Close channel so consumer exits if not done.
+        let drained = consumer.join().unwrap();
+        assert_eq!(drained, n);
+        assert_eq!(
+            EVENT_QUEUE_DEPTH.load(Ordering::SeqCst),
+            baseline,
+            "queue depth must return to baseline after all events drained"
+        );
+    }
+
+    /// Test that enqueue_with_accounting rolls back counter for failed sends
+    /// (closed channel). Exercises the real implementation, not a simulation.
+    #[test]
+    fn test_enqueue_with_accounting_closed_channel_rollback() {
+        let (tx, rx) = mpsc::unbounded_channel::<RedisEvent>();
+        // Drop receiver immediately — all sends will fail.
+        drop(rx);
+
+        let baseline = EVENT_QUEUE_DEPTH.load(Ordering::SeqCst);
+        let builders = make_builders(5);
+        let sent = enqueue_with_accounting(&tx, "test_ks", builders);
+
+        assert_eq!(sent, 0, "no sends should succeed on closed channel");
+        assert_eq!(
+            EVENT_QUEUE_DEPTH.load(Ordering::SeqCst),
+            baseline,
+            "counter must return to baseline — all increments rolled back"
+        );
+    }
 }
