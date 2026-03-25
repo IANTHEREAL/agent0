@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tikv_client::Transaction;
+use tikv_client::{CheckLevel, Transaction, TransactionClient, TransactionOptions};
 use tokio::sync::broadcast;
 
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -854,21 +854,104 @@ fn notify_config() -> &'static NotifyConfig {
     })
 }
 
-/// Persist fs9 notify events to TiKV within the given transaction.
-///
-/// Reads and increments the seq counter, writes event keys, all atomically
-/// within the caller's pessimistic transaction. Returns (first_seq, last_seq).
-///
-/// Applies commit-scope coalescing (same path → keep last) before writing.
-pub async fn persist_notify_events(
-    txn: &mut Transaction,
-    builders: Vec<FsEventBuilder>,
-) -> Result<(u64, u64)> {
+// ---------------------------------------------------------------------------
+// Async event persistence via background flush task
+// ---------------------------------------------------------------------------
+
+/// Global sender for the event persistence channel.
+static EVENT_PERSIST_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<FsEventBuilder>> =
+    OnceLock::new();
+
+/// Enqueue event builders for async persistence. Zero-cost on the mutation path:
+/// just an `mpsc::send()`, no TiKV I/O.
+pub fn enqueue_persist_events(builders: Vec<FsEventBuilder>) {
     if builders.is_empty() {
-        return Ok((0, 0));
+        return;
+    }
+    if let Some(tx) = EVENT_PERSIST_TX.get() {
+        for b in builders {
+            // If the channel is full/closed, drop silently — best-effort.
+            let _ = tx.send(b);
+        }
+    }
+}
+
+/// Enqueue a single event builder for async persistence.
+pub fn enqueue_persist_event(builder: FsEventBuilder) {
+    if let Some(tx) = EVENT_PERSIST_TX.get() {
+        let _ = tx.send(builder);
+    }
+}
+
+/// Maximum number of events to batch into a single TiKV transaction.
+const FLUSH_BATCH_SIZE: usize = 500;
+
+/// Maximum time to wait before flushing a partial batch.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Start the background event persistence loop. Call once at startup.
+///
+/// The loop drains the channel, batches events, and writes them to TiKV in
+/// a single optimistic transaction per batch. This eliminates per-event
+/// contention on the `_fs_ES` sequence counter.
+pub fn spawn_event_persist_loop(client: Arc<TransactionClient>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FsEventBuilder>();
+    EVENT_PERSIST_TX
+        .set(tx)
+        .unwrap_or_else(|_| tracing::warn!("fs9_notify: event persist loop already started"));
+
+    tokio::spawn(async move {
+        let mut batch: Vec<FsEventBuilder> = Vec::with_capacity(FLUSH_BATCH_SIZE);
+        loop {
+            // Wait for the first event (blocks until something arrives or channel closes).
+            match rx.recv().await {
+                Some(builder) => batch.push(builder),
+                None => break, // Channel closed — shutdown.
+            }
+
+            // Drain up to FLUSH_BATCH_SIZE or until FLUSH_INTERVAL expires.
+            let deadline = tokio::time::Instant::now() + FLUSH_INTERVAL;
+            while batch.len() < FLUSH_BATCH_SIZE {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(builder)) => batch.push(builder),
+                    Ok(None) => break, // Channel closed.
+                    Err(_) => break,   // Timeout — flush what we have.
+                }
+            }
+
+            if batch.is_empty() {
+                continue;
+            }
+
+            let to_flush: Vec<FsEventBuilder> = std::mem::take(&mut batch);
+            if let Err(e) = flush_events_batch(&client, to_flush).await {
+                tracing::warn!("fs9_notify: batch flush failed: {e}");
+            }
+        }
+        // Graceful shutdown: drain remaining events before exiting.
+        while let Ok(builder) = rx.try_recv() {
+            batch.push(builder);
+        }
+        if !batch.is_empty() {
+            let to_flush = std::mem::take(&mut batch);
+            if let Err(e) = flush_events_batch(&client, to_flush).await {
+                tracing::warn!("fs9_notify: final flush on shutdown failed: {e}");
+            }
+        }
+        tracing::info!("fs9_notify: event persist loop exited");
+    });
+}
+
+/// Flush a batch of events to TiKV in a single optimistic transaction.
+async fn flush_events_batch(
+    client: &TransactionClient,
+    builders: Vec<FsEventBuilder>,
+) -> Result<()> {
+    if builders.is_empty() {
+        return Ok(());
     }
 
-    // Commit-scope coalescing (Hard Contract #2).
+    // Coalesce: same path → keep last event.
     let mut coalesced: HashMap<String, FsEventBuilder> = HashMap::with_capacity(builders.len());
     for b in builders {
         coalesced.insert(b.path.clone(), b);
@@ -880,7 +963,13 @@ pub async fn persist_notify_events(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    // Read current max seq (pessimistic txn locks this key).
+    let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+    let mut txn = client
+        .begin_with_options(options)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Read current max seq — single lock acquisition per batch.
     let seq_key = notify_seq_key();
     let current_seq =
         match tikv_op!(txn.get(seq_key.clone()).await).map_err(|e| anyhow::anyhow!("{e}"))? {
@@ -888,9 +977,7 @@ pub async fn persist_notify_events(
             _ => 0,
         };
 
-    let first_seq = current_seq + 1;
-    let mut seq = first_seq;
-
+    let mut seq = current_seq + 1;
     for builder in final_builders {
         let event = builder.into_event(seq, now);
         let event_key = notify_event_key(seq);
@@ -900,17 +987,11 @@ pub async fn persist_notify_events(
     }
     let last_seq = seq - 1;
 
-    // Write back new max seq.
     tikv_op!(txn.put(seq_key, last_seq.to_be_bytes().to_vec()).await)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    Ok((first_seq, last_seq))
-}
-
-/// Persist a single fs9 notify event to TiKV within the given transaction.
-pub async fn persist_notify_event(txn: &mut Transaction, builder: FsEventBuilder) -> Result<u64> {
-    let (_, last_seq) = persist_notify_events(txn, vec![builder]).await?;
-    Ok(last_seq)
+    txn.commit().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }
 
 /// Execute `fs9_events()` by reading from TiKV.
