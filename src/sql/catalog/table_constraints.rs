@@ -21,10 +21,9 @@ impl VirtualTable for TableConstraints {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "table_constraints".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "table_constraints",
+            vec![
                 text_col("constraint_catalog"),
                 text_col("constraint_schema"),
                 text_col("constraint_name"),
@@ -36,17 +35,7 @@ impl VirtualTable for TableConstraints {
                 text_col("initially_deferred"),
                 text_col("enforced"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

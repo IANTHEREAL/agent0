@@ -19,10 +19,9 @@ impl VirtualTable for PgPolicy {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_policy".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_policy",
+            vec![
                 int_col("oid"),
                 text_col("polname"),
                 int_col("polrelid"),
@@ -32,17 +31,7 @@ impl VirtualTable for PgPolicy {
                 text_col("polqual"),
                 text_col("polwithcheck"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

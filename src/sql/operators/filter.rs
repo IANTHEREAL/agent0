@@ -125,48 +125,15 @@ mod tests {
     use crate::sql::analyzer::types::{BinaryOp, IsTestKind, TypedExprKind};
 
     fn test_schema() -> TableSchema {
-        TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "active".to_string(),
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "test".to_string(),
+            1,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("active", DataType::Boolean, false),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![0],
+        )
     }
 
     #[test]

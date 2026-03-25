@@ -26,10 +26,9 @@ impl VirtualTable for PgUser {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_user".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_user",
+            vec![
                 text_col("usename"),
                 int_col("usesysid"),
                 bool_col("usecreatedb"),
@@ -40,17 +39,7 @@ impl VirtualTable for PgUser {
                 timestamptz_col("valuntil"),
                 text_array_col("useconfig"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

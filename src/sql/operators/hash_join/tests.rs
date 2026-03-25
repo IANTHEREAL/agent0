@@ -4,93 +4,27 @@ use super::*;
 use crate::model::{ColumnDef, DataType};
 
 fn schema_left() -> TableSchema {
-    TableSchema {
-        name: "left".to_string(),
-        table_id: 1,
-        columns: vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "l".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    TableSchema::new(
+        "left".to_string(),
+        1,
+        vec![
+            ColumnDef::new("id", DataType::Int32, true),
+            ColumnDef::new("l", DataType::Text, true),
         ],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+        vec![],
+    )
 }
 
 fn schema_right() -> TableSchema {
-    TableSchema {
-        name: "right".to_string(),
-        table_id: 2,
-        columns: vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "r".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    TableSchema::new(
+        "right".to_string(),
+        2,
+        vec![
+            ColumnDef::new("id", DataType::Int32, true),
+            ColumnDef::new("r", DataType::Text, true),
         ],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+        vec![],
+    )
 }
 
 #[test]

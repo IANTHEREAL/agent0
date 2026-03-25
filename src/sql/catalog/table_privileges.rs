@@ -69,10 +69,9 @@ impl VirtualTable for TablePrivileges {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "table_privileges".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "table_privileges",
+            vec![
                 text_col("grantor"),
                 text_col("grantee"),
                 text_col("table_catalog"),
@@ -82,17 +81,7 @@ impl VirtualTable for TablePrivileges {
                 text_col("is_grantable"),
                 text_col("with_hierarchy"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

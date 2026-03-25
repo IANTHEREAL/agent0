@@ -357,28 +357,10 @@ fn build_returns_table_schema(declared_cols: &[(String, crate::model::DataType)]
 
     let cols: Vec<ColumnDef> = declared_cols
         .iter()
-        .map(|(name, dt)| ColumnDef {
-            name: name.clone(),
-            data_type: dt.clone(),
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        })
+        .map(|(name, dt)| ColumnDef::new(name.clone(), dt.clone(), true))
         .collect();
 
-    TableSchema {
-        table_id: 0,
-        name: String::new(),
-        columns: cols,
-        indexes: vec![],
-        ..Default::default()
-    }
+    TableSchema::virtual_table("", cols)
 }
 
 fn build_output_schema(
@@ -398,27 +380,9 @@ fn build_output_schema(
                 .cloned()
                 // INTENTIONAL: no RETURNS clause — default to Text (PG-compatible)
                 .unwrap_or(DataType::Text);
-            ColumnDef {
-                name: name.clone(),
-                data_type: dt,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }
+            ColumnDef::new(name.clone(), dt, true)
         })
         .collect();
 
-    TableSchema {
-        table_id: 0,
-        name: table_name.to_string(),
-        columns: cols,
-        indexes: vec![],
-        ..Default::default()
-    }
+    TableSchema::virtual_table(table_name, cols)
 }

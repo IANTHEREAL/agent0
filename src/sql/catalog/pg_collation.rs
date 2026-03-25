@@ -19,10 +19,9 @@ impl VirtualTable for PgCollation {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_collation".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_collation",
+            vec![
                 int_col("oid"),
                 text_col("collname"),
                 int_col("collnamespace"),
@@ -36,17 +35,7 @@ impl VirtualTable for PgCollation {
                 text_col("collicurules"),
                 text_col("collversion"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

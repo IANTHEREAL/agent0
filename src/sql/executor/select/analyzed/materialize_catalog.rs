@@ -2210,48 +2210,15 @@ mod tests {
 
     #[test]
     fn test_find_text_column_case_insensitive_and_none_cases() {
-        let schema = TableSchema {
-            name: "t".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "OID".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "typname".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        let schema = TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![
+                ColumnDef::new("OID", DataType::Int64, false),
+                ColumnDef::new("typname", DataType::Text, true),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+            vec![],
+        );
 
         let (_, idx) = find_text_column(Some(&schema), "TypName").expect("column should match");
         assert_eq!(idx, 1);
@@ -2261,48 +2228,15 @@ mod tests {
 
     #[test]
     fn test_find_text_column_returns_first_match_when_duplicate_names_exist() {
-        let schema = TableSchema {
-            name: "dup".to_string(),
-            table_id: 2,
-            columns: vec![
-                ColumnDef {
-                    name: "typname".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "TyPnAmE".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        let schema = TableSchema::new(
+            "dup".to_string(),
+            2,
+            vec![
+                ColumnDef::new("typname", DataType::Text, true),
+                ColumnDef::new("TyPnAmE", DataType::Text, true),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+            vec![],
+        );
 
         let (_, idx) = find_text_column(Some(&schema), "typname").expect("column should match");
         assert_eq!(idx, 0);

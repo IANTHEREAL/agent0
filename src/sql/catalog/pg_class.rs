@@ -102,10 +102,9 @@ impl VirtualTable for PgClass {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_class".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_class",
+            vec![
                 int_col("oid"),
                 text_col("relname"),
                 int_col("relnamespace"),
@@ -133,17 +132,7 @@ impl VirtualTable for PgClass {
                 int_col("reltablespace"),
                 text_array_col("reloptions"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
@@ -375,47 +364,38 @@ mod tests {
     use std::collections::HashMap;
 
     fn empty_schema(name: &str) -> TableSchema {
-        TableSchema {
-            name: name.to_string(),
-            ..Default::default()
-        }
+        TableSchema::virtual_table(name, vec![])
     }
 
     #[test]
     fn fk_trigger_tables_include_source_and_target_for_qualified_and_unqualified_refs() {
         let mut schemas = HashMap::new();
         schemas.insert("public.parent".to_string(), empty_schema("public.parent"));
-        schemas.insert(
-            "public.child".to_string(),
-            TableSchema {
-                name: "public.child".to_string(),
-                foreign_keys: vec![ForeignKeyConstraint {
-                    name: "child_parent_fkey".to_string(),
-                    columns: vec!["parent_id".to_string()],
-                    ref_table: "public.parent".to_string(),
-                    ref_columns: vec!["id".to_string()],
-                    on_delete: ForeignKeyAction::NoAction,
-                    on_update: ForeignKeyAction::NoAction,
-                }],
-                ..Default::default()
-            },
-        );
+        schemas.insert("public.child".to_string(), {
+            let mut s = TableSchema::virtual_table("public.child", vec![]);
+            s.foreign_keys = vec![ForeignKeyConstraint {
+                name: "child_parent_fkey".to_string(),
+                columns: vec!["parent_id".to_string()],
+                ref_table: "public.parent".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+            }];
+            s
+        });
         schemas.insert("tenant.p".to_string(), empty_schema("tenant.p"));
-        schemas.insert(
-            "tenant.c".to_string(),
-            TableSchema {
-                name: "tenant.c".to_string(),
-                foreign_keys: vec![ForeignKeyConstraint {
-                    name: "tenant_c_p_fkey".to_string(),
-                    columns: vec!["p_id".to_string()],
-                    ref_table: "p".to_string(),
-                    ref_columns: vec!["id".to_string()],
-                    on_delete: ForeignKeyAction::NoAction,
-                    on_update: ForeignKeyAction::NoAction,
-                }],
-                ..Default::default()
-            },
-        );
+        schemas.insert("tenant.c".to_string(), {
+            let mut s = TableSchema::virtual_table("tenant.c", vec![]);
+            s.foreign_keys = vec![ForeignKeyConstraint {
+                name: "tenant_c_p_fkey".to_string(),
+                columns: vec!["p_id".to_string()],
+                ref_table: "p".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+            }];
+            s
+        });
 
         let tables = tables_with_fk_internal_triggers(&schemas);
         assert!(tables.contains("public.parent"));

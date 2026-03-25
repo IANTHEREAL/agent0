@@ -362,48 +362,17 @@ mod tests {
     }
 
     fn test_schema(nullable_second: bool) -> TableSchema {
-        TableSchema {
-            name: "public.t".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: true,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "v".to_string(),
-                    data_type: DataType::Text,
-                    nullable: nullable_second,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "public.t".to_string(),
+            1,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false)
+                    .primary_key()
+                    .unique(),
+                ColumnDef::new("v", DataType::Text, nullable_second),
             ],
-            version: 1,
-            pk_constraint_name: Some("t_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![0],
+        )
     }
 
     #[test]

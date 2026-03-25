@@ -125,38 +125,12 @@ fn get_or_update_tenant_semaphore(tenant: &str, limit: usize) -> Arc<Semaphore> 
 }
 
 pub(crate) fn embedding_usage_table_schema() -> TableSchema {
-    TableSchema::new(
-        "embedding_usage".to_string(),
-        0,
+    TableSchema::virtual_table(
+        "embedding_usage",
         vec![
-            ColumnDef {
-                name: "tokens_used".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "resets_at".to_string(),
-                data_type: DataType::TimestampTz,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+            ColumnDef::new("tokens_used", DataType::Int64, false),
+            ColumnDef::new("resets_at", DataType::TimestampTz, false),
         ],
-        vec![],
     )
 }
 

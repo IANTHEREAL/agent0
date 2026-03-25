@@ -18,27 +18,16 @@ impl VirtualTable for PgAttrdef {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_attrdef".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_attrdef",
+            vec![
                 int_col("oid"),
                 int_col("adrelid"),
                 int_col("adnum"),
                 text_col("adbin"),
                 text_col("adsrc"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

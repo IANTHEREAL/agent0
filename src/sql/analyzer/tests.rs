@@ -107,48 +107,13 @@ fn generated_catalog() -> MockCatalog {
         .table_with_column_defs(
             "gen_users",
             vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "name_vec".to_string(),
-                    data_type: DataType::Vector(1024),
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: Some(
-                        "EMBED_TEXT('text-embedding-v4', name, '{\"dimensions\":1024}')"
-                            .to_string(),
-                    ),
-                    generation_expr_authorized_by: Some("admin".to_string()),
-                    collation: None,
-                    is_dropped: false,
-                },
+                ColumnDef::new("id", DataType::Int32, false),
+                ColumnDef::new("name", DataType::Text, true),
+                ColumnDef::new("name_vec", DataType::Vector(1024), true)
+                    .generation_expr(
+                        "EMBED_TEXT('text-embedding-v4', name, '{\"dimensions\":1024}')",
+                    )
+                    .generation_expr_authorized_by("admin"),
             ],
         )
         .build()

@@ -305,26 +305,14 @@ pub(crate) fn build_schema_from_columns(
         Option<crate::sql::collation::ResolvedCollation>,
     )],
 ) -> TableSchema {
-    TableSchema::new(
-        name.to_string(),
-        0,
+    TableSchema::virtual_table(
+        name,
         columns
             .iter()
-            .map(|(col_name, dt, _coll)| crate::model::ColumnDef {
-                name: col_name.clone(),
-                data_type: dt.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
+            .map(|(col_name, dt, _coll)| {
+                crate::model::ColumnDef::new(col_name.clone(), dt.clone(), true)
             })
             .collect(),
-        vec![],
     )
 }
 

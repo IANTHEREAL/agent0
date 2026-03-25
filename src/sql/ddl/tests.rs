@@ -359,19 +359,7 @@ fn set_data_type_stats_invalidation_matches_type_change() {
 
 #[test]
 fn coerce_jsonb_to_text_produces_canonical_output() {
-    let col = crate::model::ColumnDef {
-        name: "data".to_string(),
-        data_type: DataType::Text,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    };
+    let col = crate::model::ColumnDef::new("data", DataType::Text, true);
     let result =
         coerce_value_for_type_change(Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
     assert_eq!(result, Value::Text(r#"{"a": 2, "b": 1}"#.to_string()));
@@ -379,19 +367,7 @@ fn coerce_jsonb_to_text_produces_canonical_output() {
 
 #[test]
 fn coerce_json_to_text_preserves_raw_format() {
-    let col = crate::model::ColumnDef {
-        name: "data".to_string(),
-        data_type: DataType::Text,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    };
+    let col = crate::model::ColumnDef::new("data", DataType::Text, true);
     let result =
         coerce_value_for_type_change(Value::Json(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
     // JSON preserves the original string verbatim
@@ -497,15 +473,9 @@ fn extract_first_column_skips_keywords_types_and_literals() {
 
 #[test]
 fn check_constraint_effective_name_and_find_index_work_for_generated_names() {
-    let schema = TableSchema {
-        name: "public.t".to_string(),
-        table_id: 1,
-        columns: vec![],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![
+    let schema = {
+        let mut s = TableSchema::new("public.t".to_string(), 1, vec![], vec![]);
+        s.check_constraints = vec![
             CheckConstraint {
                 name: None,
                 expr: "age > 0".to_string(),
@@ -514,12 +484,8 @@ fn check_constraint_effective_name_and_find_index_work_for_generated_names() {
                 name: Some("explicit_ck".to_string()),
                 expr: "score > 0".to_string(),
             },
-        ],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        ];
+        s
     };
 
     assert_eq!(
@@ -539,14 +505,9 @@ fn check_constraint_effective_name_and_find_index_work_for_generated_names() {
 
 #[test]
 fn constraint_name_exists_checks_pk_fk_index_and_checks() {
-    let schema = TableSchema {
-        name: "public.t".to_string(),
-        table_id: 1,
-        columns: vec![],
-        version: 1,
-        pk_constraint_name: Some("t_pkey".to_string()),
-        pk_indices: vec![0],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new("public.t".to_string(), 1, vec![], vec![0]);
+        s.indexes = vec![IndexDef {
             name: "idx_t_a".to_string(),
             id: 1,
             columns: vec!["a".to_string()],
@@ -560,23 +521,20 @@ fn constraint_name_exists_checks_pk_fk_index_and_checks() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![CheckConstraint {
+        }];
+        s.check_constraints = vec![CheckConstraint {
             name: None,
             expr: "age > 0".to_string(),
-        }],
-        foreign_keys: vec![ForeignKeyConstraint {
+        }];
+        s.foreign_keys = vec![ForeignKeyConstraint {
             name: "fk_t_p".to_string(),
             columns: vec![],
             ref_table: "public.p".to_string(),
             ref_columns: vec![],
             on_delete: ForeignKeyAction::NoAction,
             on_update: ForeignKeyAction::NoAction,
-        }],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     assert!(constraint_name_exists(&schema, "t", "t_pkey"));
@@ -646,19 +604,7 @@ fn prefix_end_increments_last_non_ff_byte() {
 
 #[test]
 fn coerce_uuid_to_text_for_type_change() {
-    let col = crate::model::ColumnDef {
-        name: "id".to_string(),
-        data_type: DataType::Text,
-        nullable: false,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    };
+    let col = crate::model::ColumnDef::new("id", DataType::Text, false);
     let bytes = *uuid::Uuid::nil().as_bytes();
     let out = coerce_value_for_type_change(Value::Uuid(bytes), &col).unwrap();
     assert_eq!(out, Value::Text(uuid::Uuid::nil().to_string()));

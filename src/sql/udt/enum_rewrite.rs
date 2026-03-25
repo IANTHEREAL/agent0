@@ -320,35 +320,14 @@ fn synthetic_schema_from_output<C>(
 ) -> TableSchema {
     let columns = output_schema
         .into_iter()
-        .map(|(name, data_type, _)| ColumnDef {
-            name,
-            data_type,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        })
+        .map(|(name, data_type, _)| ColumnDef::new(name, data_type, true))
         .collect();
 
-    TableSchema {
-        name: relation_full_name.to_string(),
-        table_id: 0,
-        columns,
-        version: 0,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+    {
+        let mut s = TableSchema::virtual_table(relation_full_name, columns);
+        s.version = 0;
+        s.owner = "postgres".to_string();
+        s
     }
 }
 

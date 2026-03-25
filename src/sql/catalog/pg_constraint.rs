@@ -86,10 +86,9 @@ impl VirtualTable for PgConstraint {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_constraint".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_constraint",
+            vec![
                 int_col("oid"),
                 text_col("conname"),
                 int_col("connamespace"),
@@ -111,17 +110,7 @@ impl VirtualTable for PgConstraint {
                 int_col("coninhcount"),
                 bool_col("convalidated"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
@@ -429,60 +418,20 @@ mod tests {
 
     #[test]
     fn not_null_constraints_emit_contype_n_rows_with_psql18_flags() {
-        let schema = TableSchema {
-            table_id: 42,
-            name: "t".to_string(),
-            columns: vec![
-                crate::model::ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                crate::model::ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                crate::model::ColumnDef {
-                    name: "score".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "t".to_string(),
+                42,
+                vec![
+                    crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                    crate::model::ColumnDef::new("name", DataType::Text, false),
+                    crate::model::ColumnDef::new("score", DataType::Int32, true),
+                ],
+                vec![0],
+            );
+            s.pk_constraint_name = None;
+            s.owner = String::new();
+            s
         };
 
         let mut oid = 1;

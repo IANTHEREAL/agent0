@@ -239,36 +239,15 @@ async fn resolve_view_output_schema(
     let columns: Vec<ColumnDef> = analyzed
         .output_schema
         .iter()
-        .map(|(col_name, data_type, _coll)| ColumnDef {
-            name: col_name.clone(),
-            data_type: data_type.clone(),
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
+        .map(|(col_name, data_type, _coll)| {
+            ColumnDef::new(col_name.clone(), data_type.clone(), true)
         })
         .collect();
 
-    Ok(TableSchema {
-        name: view_full_name.to_string(),
-        table_id: 0, // synthetic -- views have no storage table_id
-        columns,
-        version: 0,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    })
+    let mut schema = TableSchema::virtual_table(view_full_name, columns);
+    schema.version = 0;
+    schema.owner = "postgres".to_string();
+    Ok(schema)
 }
 
 pub(super) async fn try_resolve_function_def(
@@ -372,32 +351,14 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
             }
             _ => DataType::Text,
         };
-        cols.push(ColumnDef {
-            name: col_name,
-            data_type: dt,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        });
+        cols.push(ColumnDef::new(col_name, dt, true));
     }
 
     if cols.is_empty() {
         return None;
     }
 
-    Some(TableSchema {
-        table_id: 0,
-        name: String::new(),
-        columns: cols,
-        indexes: vec![],
-        ..Default::default()
-    })
+    Some(TableSchema::virtual_table("", cols))
 }
 
 pub(super) async fn prefetch_scalar_functions(

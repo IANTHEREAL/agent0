@@ -21,19 +21,7 @@ fn test_schema(
     let mut schema = TableSchema::new(
         name.to_string(),
         table_id,
-        vec![ColumnDef {
-            name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
-            primary_key: true,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
+        vec![ColumnDef::new("id", DataType::Int32, false).primary_key()],
         vec![0],
     );
     schema.owner = owner.to_string();

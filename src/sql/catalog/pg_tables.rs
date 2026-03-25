@@ -49,10 +49,9 @@ impl VirtualTable for PgTables {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_tables".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_tables",
+            vec![
                 text_col("schemaname"),
                 text_col("tablename"),
                 text_col("tableowner"),
@@ -62,17 +61,7 @@ impl VirtualTable for PgTables {
                 bool_col("hastriggers"),
                 bool_col("rowsecurity"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

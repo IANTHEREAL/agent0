@@ -176,19 +176,10 @@ mod owned_sequence_lookup_tests {
         use crate::model::ColumnDef;
         use crate::sql::sequences::resolve_serial_display_default;
 
-        let col = ColumnDef {
-            name: "id".to_string(),
-            data_type: crate::model::DataType::Int32,
-            nullable: false,
-            primary_key: true,
-            unique: true,
-            is_serial: true,
-            default_expr: None, // ImplicitSequence behavior
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        };
+        let col = ColumnDef::new("id", crate::model::DataType::Int32, false)
+            .primary_key()
+            .unique()
+            .serial();
         let sequences = vec![
             make_sequence("public.s1", Some(("public.t", "id"))),
             make_sequence("public.s2", Some(("public.t", "id"))),

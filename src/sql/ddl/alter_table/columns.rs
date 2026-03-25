@@ -169,19 +169,12 @@ pub(super) async fn alter_table_add_column(
 
     if generation_expr_str.is_some() {
         let mut candidate_schema = schema.clone();
-        candidate_schema.columns.push(crate::model::ColumnDef {
-            name: col_name.clone(),
-            data_type: data_type.clone(),
-            nullable,
-            primary_key: false,
-            unique: false,
-            is_serial,
-            default_expr: default_expr.clone(),
-            generation_expr: generation_expr_str.clone(),
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        });
+        let mut candidate_col =
+            crate::model::ColumnDef::new(col_name.clone(), data_type.clone(), nullable);
+        candidate_col.is_serial = is_serial;
+        candidate_col.default_expr = default_expr.clone();
+        candidate_col.generation_expr = generation_expr_str.clone();
+        candidate_schema.columns.push(candidate_col);
         let new_col_idx = candidate_schema.columns.len() - 1;
         generation_expr_authorized_by =
             validate_generated_column_expr(store, txn, db_id, &candidate_schema, new_col_idx)
@@ -199,19 +192,11 @@ pub(super) async fn alter_table_add_column(
         }
     }
 
-    let new_col = crate::model::ColumnDef {
-        name: col_name,
-        data_type,
-        nullable,
-        primary_key: false,
-        unique: false,
-        is_serial,
-        default_expr,
-        generation_expr: generation_expr_str,
-        generation_expr_authorized_by,
-        collation: None,
-        is_dropped: false,
-    };
+    let mut new_col = crate::model::ColumnDef::new(col_name, data_type, nullable);
+    new_col.is_serial = is_serial;
+    new_col.default_expr = default_expr;
+    new_col.generation_expr = generation_expr_str;
+    new_col.generation_expr_authorized_by = generation_expr_authorized_by;
     if let Some(default_expr_ast) = default_expr_ast.as_ref() {
         validate_column_default_expr(store, txn, default_expr_ast, &new_col, db_id, search_path)
             .await?;

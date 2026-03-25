@@ -21,10 +21,9 @@ impl VirtualTable for Sequences {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "sequences".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "sequences",
+            vec![
                 text_col("sequence_catalog"),
                 text_col("sequence_schema"),
                 text_col("sequence_name"),
@@ -36,17 +35,7 @@ impl VirtualTable for Sequences {
                 text_col("cycle_option"),
                 text_col("sequence_owner"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

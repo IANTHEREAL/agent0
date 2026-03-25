@@ -27,42 +27,19 @@ impl VirtualTable for PgPolicies {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_policies".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_policies",
+            vec![
                 text_col("schemaname"),
                 text_col("tablename"),
                 text_col("policyname"),
                 text_col("permissive"),
-                ColumnDef {
-                    name: "roles".to_string(),
-                    data_type: DataType::Array(Box::new(DataType::Name)),
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+                ColumnDef::new("roles", DataType::Array(Box::new(DataType::Name)), true),
                 text_col("cmd"),
                 text_col("qual"),
                 text_col("with_check"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

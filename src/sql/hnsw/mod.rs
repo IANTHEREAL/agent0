@@ -26,9 +26,7 @@ use tikv_client::Transaction;
 use crate::model::Value;
 use crate::storage::{encode_pk_values, TikvStore};
 
-pub use storage::{
-    metric_from_string, vec_f64_to_f32, HnswIndexHandle, HnswLabelMode, HnswMeta,
-};
+pub use storage::{metric_from_string, vec_f64_to_f32, HnswIndexHandle, HnswLabelMode, HnswMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HnswDistanceMetric {

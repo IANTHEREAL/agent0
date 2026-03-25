@@ -106,52 +106,18 @@ impl WindowOperator {
             .schema()
             .columns
             .iter()
-            .map(|c| ColumnDef {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            })
+            .map(|c| ColumnDef::new(c.name.clone(), c.data_type.clone(), c.nullable))
             .collect();
 
         for wf in &window_functions {
-            columns.push(ColumnDef {
-                name: wf.output_name.clone(),
-                data_type: wf.output_type.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(
+                wf.output_name.clone(),
+                wf.output_type.clone(),
+                true,
+            ));
         }
 
-        let output_schema = TableSchema {
-            name: "window_result".to_string(),
-            table_id: 0,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let output_schema = TableSchema::virtual_table("window_result", columns);
 
         Self {
             child,

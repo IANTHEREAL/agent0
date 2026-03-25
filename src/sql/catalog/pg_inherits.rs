@@ -18,26 +18,15 @@ impl VirtualTable for PgInherits {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_inherits".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_inherits",
+            vec![
                 int_col("inhrelid"),
                 int_col("inhparent"),
                 int_col("inhseqno"),
                 bool_col("inhdetachpending"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, _ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

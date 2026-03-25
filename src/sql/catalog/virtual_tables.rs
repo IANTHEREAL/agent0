@@ -6,35 +6,11 @@
 use crate::model::{ColumnDef, DataType, TableSchema};
 
 fn col(name: &str, data_type: DataType) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable: false,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, data_type, false)
 }
 
 fn col_nullable(name: &str, data_type: DataType) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, data_type, true)
 }
 
 /// Return the schema for a _DB9_SYS_* virtual table, if `name` matches.
@@ -131,21 +107,7 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
         _ => return None,
     };
 
-    Some(TableSchema {
-        table_id: 0,
-        name: name.to_string(),
-        columns,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    })
+    Some(TableSchema::virtual_table(name, columns))
 }
 
 #[cfg(test)]

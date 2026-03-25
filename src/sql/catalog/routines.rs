@@ -21,10 +21,9 @@ impl VirtualTable for Routines {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "routines".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "routines",
+            vec![
                 text_col("routine_catalog"),
                 text_col("routine_schema"),
                 text_col("routine_name"),
@@ -32,17 +31,7 @@ impl VirtualTable for Routines {
                 text_col("data_type"),
                 text_col("routine_owner"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

@@ -19,10 +19,9 @@ impl VirtualTable for PgProc {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_proc".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_proc",
+            vec![
                 int_col("oid"),
                 text_col("proname"),
                 int_col("pronamespace"),
@@ -31,17 +30,7 @@ impl VirtualTable for PgProc {
                 text_col("prokind"),
                 bool_col("prosecdef"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

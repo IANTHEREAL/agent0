@@ -20,10 +20,9 @@ impl VirtualTable for PgExtension {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_extension".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_extension",
+            vec![
                 int_col("oid"),
                 text_col("extname"),
                 int_col("extowner"),
@@ -33,17 +32,7 @@ impl VirtualTable for PgExtension {
                 int_array_col("extconfig"),
                 text_array_col("extcondition"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

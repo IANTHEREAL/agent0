@@ -67,10 +67,9 @@ impl VirtualTable for PgIndex {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_index".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_index",
+            vec![
                 int_col("indexrelid"),
                 int_col("indrelid"),
                 int_col("indnatts"),
@@ -89,17 +88,7 @@ impl VirtualTable for PgIndex {
                 oidvector_col("indclass"),
                 int2vector_col("indoption"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

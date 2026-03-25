@@ -159,19 +159,11 @@ pub(crate) fn arrow_schema_to_table_schema(arrow_schema: &ArrowSchema) -> Result
         .fields()
         .iter()
         .map(|field| {
-            Ok(ColumnDef {
-                name: field.name().clone(),
-                data_type: arrow_type_to_pg_type(field.data_type())?,
-                nullable: field.is_nullable(),
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            })
+            Ok(ColumnDef::new(
+                field.name().clone(),
+                arrow_type_to_pg_type(field.data_type())?,
+                field.is_nullable(),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
 

@@ -469,47 +469,18 @@ mod tests {
 
     #[test]
     fn substitute_row_references_does_not_prefix_match() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "id2".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: Some("test_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                    ColumnDef::new("id2", DataType::Int32, false),
+                ],
+                vec![0],
+            );
+            s.owner = String::new();
+            s
         };
 
         let new_values = vec![Value::Int32(7), Value::Int32(3)];
@@ -528,60 +499,19 @@ mod tests {
 
     #[test]
     fn substitute_row_references_handles_schema_growth() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "id2".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "added".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: Some("test_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                    ColumnDef::new("id2", DataType::Int32, false),
+                    ColumnDef::new("added", DataType::Int32, true),
+                ],
+                vec![0],
+            );
+            s.owner = String::new();
+            s
         };
 
         // Simulate an async trigger event queued before `ALTER TABLE .. ADD COLUMN`.
@@ -601,47 +531,18 @@ mod tests {
 
     #[test]
     fn substitute_row_references_does_not_collide_a_aa() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "a".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "aa".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    ColumnDef::new("a", DataType::Int32, false),
+                    ColumnDef::new("aa", DataType::Int32, false),
+                ],
+                vec![],
+            );
+            s.owner = String::new();
+            s
         };
 
         let new_values = vec![Value::Int32(1), Value::Int32(9)];

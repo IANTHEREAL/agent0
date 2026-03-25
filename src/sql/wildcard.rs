@@ -211,37 +211,11 @@ mod tests {
     use crate::model::ColumnDef;
 
     fn test_column(name: &str, data_type: DataType) -> ColumnDef {
-        ColumnDef {
-            name: name.to_string(),
-            data_type,
-            nullable: false,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }
+        ColumnDef::new(name, data_type, false)
     }
 
     fn test_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
-        TableSchema {
-            name: name.to_string(),
-            table_id: 0,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        TableSchema::virtual_table(name, columns)
     }
 
     fn parse_select(sql: &str) -> sqlparser::ast::Select {

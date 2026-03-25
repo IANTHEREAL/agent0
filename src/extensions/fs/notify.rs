@@ -477,49 +477,22 @@ pub fn notify_metrics_for_keyspace(keyspace: &str) -> Arc<NotifyMetrics> {
 // fs9_events() table function schema + execution (Redis Streams backend)
 // ---------------------------------------------------------------------------
 
-fn col(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
-}
-
 /// Return the output schema for `fs9_events(...)`.
 pub fn fs9_events_schema() -> TableSchema {
-    TableSchema {
-        table_id: 0,
-        name: "fs9_events".to_string(),
-        columns: vec![
-            col("stream_id", DataType::Text, false),
-            col("event_type", DataType::Text, false),
-            col("path", DataType::Text, false),
-            col("old_path", DataType::Text, true),
-            col("inode", DataType::Int64, false),
-            col("generation", DataType::Int64, false),
-            col("is_dir", DataType::Boolean, false),
-            col("size", DataType::Int64, false),
-            col("timestamp", DataType::TimestampTz, false),
+    TableSchema::virtual_table(
+        "fs9_events",
+        vec![
+            ColumnDef::new("stream_id", DataType::Text, false),
+            ColumnDef::new("event_type", DataType::Text, false),
+            ColumnDef::new("path", DataType::Text, false),
+            ColumnDef::new("old_path", DataType::Text, true),
+            ColumnDef::new("inode", DataType::Int64, false),
+            ColumnDef::new("generation", DataType::Int64, false),
+            ColumnDef::new("is_dir", DataType::Boolean, false),
+            ColumnDef::new("size", DataType::Int64, false),
+            ColumnDef::new("timestamp", DataType::TimestampTz, false),
         ],
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+    )
 }
 
 /// Execute `fs9_events(since_id [, path_prefix [, limit]])` by reading from Redis Streams.

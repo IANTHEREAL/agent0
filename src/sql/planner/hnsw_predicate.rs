@@ -182,19 +182,7 @@ mod tests {
     use crate::sql::analyzer::types::{FunctionKind, ResolvedFunction};
 
     fn vector_column(name: &str, dim: u32) -> ColumnDef {
-        ColumnDef {
-            name: name.to_string(),
-            data_type: DataType::Vector(dim),
-            nullable: false,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }
+        ColumnDef::new(name, DataType::Vector(dim), false)
     }
 
     fn hnsw_index(column: &str, metric: &str) -> IndexDef {

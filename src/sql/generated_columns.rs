@@ -212,93 +212,31 @@ mod tests {
     use crate::sql::error::SqlError;
 
     fn generated_schema() -> TableSchema {
-        TableSchema {
-            name: "public.generated_test".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "a".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "b".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: Some("a + 1".to_string()),
-                    generation_expr_authorized_by: Some("admin".to_string()),
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "public.generated_test".to_string(),
+            1,
+            vec![
+                ColumnDef::new("a", DataType::Int32, false),
+                ColumnDef::new("b", DataType::Int32, false)
+                    .generation_expr("a + 1")
+                    .generation_expr_authorized_by("admin"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![],
+        )
     }
 
     fn embedding_generated_schema(expr: &str, data_type: DataType) -> TableSchema {
-        TableSchema {
-            name: "public.generated_embedding_test".to_string(),
-            table_id: 2,
-            columns: vec![
-                ColumnDef {
-                    name: "body".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "body_vec".to_string(),
-                    data_type,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: Some(expr.to_string()),
-                    generation_expr_authorized_by: Some("admin".to_string()),
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "public.generated_embedding_test".to_string(),
+            2,
+            vec![
+                ColumnDef::new("body", DataType::Text, false),
+                ColumnDef::new("body_vec", data_type, false)
+                    .generation_expr(expr)
+                    .generation_expr_authorized_by("admin"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![],
+        )
     }
 
     #[test]

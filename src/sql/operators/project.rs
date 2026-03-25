@@ -303,37 +303,14 @@ impl ProjectOperator {
         output_names: Vec<String>,
         output_types: Vec<DataType>,
     ) -> Self {
-        let output_schema = TableSchema {
-            name: "projection".to_string(),
-            table_id: 0,
-            columns: output_names
+        let output_schema = TableSchema::virtual_table(
+            "projection",
+            output_names
                 .iter()
                 .zip(output_types.iter())
-                .map(|(name, dt)| ColumnDef {
-                    name: name.clone(),
-                    data_type: dt.clone(),
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                })
+                .map(|(name, dt)| ColumnDef::new(name.clone(), dt.clone(), true))
                 .collect(),
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        );
 
         let srf_indices: Vec<(usize, SrfKind)> = expressions
             .iter()
@@ -529,61 +506,16 @@ mod tests {
     use crate::sql::query_context::QueryContext;
 
     fn test_schema() -> TableSchema {
-        TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "age".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "test".to_string(),
+            1,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("name", DataType::Text, true),
+                ColumnDef::new("age", DataType::Int32, true),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![0],
+        )
     }
 
     /// Helper to create a ColumnRef TypedExpr.

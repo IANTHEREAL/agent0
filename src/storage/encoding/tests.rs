@@ -150,53 +150,45 @@ fn test_serialize_deserialize_numeric() {
 
 #[test]
 fn test_serialize_deserialize_schema() {
-    let schema = TableSchema {
-        name: "test_table".to_string(),
-        table_id: 42,
-        columns: vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: true,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "name".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    let mut schema = TableSchema::new(
+        "test_table".to_string(),
+        42,
+        vec![
+            ColumnDef::new("id", DataType::Int32, false).primary_key(),
+            ColumnDef::new("name", DataType::Text, true),
+            ColumnDef::new("name_lower", DataType::Text, false)
+                .generation_expr("lower(name)")
+                .generation_expr_authorized_by("admin"),
         ],
-        version: 1,
-        pk_constraint_name: Some("test_table_pkey".to_string()),
-        pk_indices: vec![0],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    };
+        vec![0],
+    );
+    schema.owner = "postgres".to_string();
     let serialized = serialize_schema(&schema).unwrap();
     let deserialized = deserialize_schema(&serialized).unwrap();
     assert_eq!(deserialized.name, schema.name);
     assert_eq!(deserialized.table_id, schema.table_id);
-    assert_eq!(deserialized.columns.len(), 2);
+    assert_eq!(deserialized.columns.len(), 3);
+    assert_eq!(deserialized.pk_indices, schema.pk_indices);
+    assert_eq!(deserialized.owner, schema.owner);
+    assert_eq!(deserialized.rls_enabled, schema.rls_enabled);
+    assert_eq!(deserialized.rls_force, schema.rls_force);
+    // Verify ColumnDef fields survive round-trip
+    for (got, want) in deserialized.columns.iter().zip(schema.columns.iter()) {
+        assert_eq!(got.name, want.name);
+        assert_eq!(got.data_type, want.data_type);
+        assert_eq!(got.nullable, want.nullable);
+        assert_eq!(got.primary_key, want.primary_key);
+        assert_eq!(got.unique, want.unique);
+        assert_eq!(got.is_serial, want.is_serial);
+        assert_eq!(got.default_expr, want.default_expr);
+        assert_eq!(got.generation_expr, want.generation_expr);
+        assert_eq!(got.collation, want.collation);
+        assert_eq!(got.is_dropped, want.is_dropped);
+        assert_eq!(
+            got.generation_expr_authorized_by,
+            want.generation_expr_authorized_by
+        );
+    }
 }
 
 #[test]

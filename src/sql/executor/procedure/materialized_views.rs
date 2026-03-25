@@ -179,38 +179,18 @@ impl Executor {
         let view_name = resolved.full;
 
         let table_id = self.store().next_table_id(txn, db_id).await?;
-        let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
-            name: "_mv_rowid".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            primary_key: true,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_serial: true,
-            unique: true,
-            is_dropped: false,
-        }];
+        let mut col_defs: Vec<ColumnDef> =
+            vec![ColumnDef::new("_mv_rowid", DataType::Int64, false)
+                .primary_key()
+                .serial()
+                .unique()];
         col_defs.extend(columns.iter().enumerate().map(|(i, col_name)| {
             let data_type = if rows.is_empty() {
                 DataType::Text
             } else {
                 infer_data_type(&rows[0].values[i])
             };
-            ColumnDef {
-                name: col_name.clone(),
-                data_type,
-                nullable: true,
-                primary_key: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_serial: false,
-                unique: false,
-                is_dropped: false,
-            }
+            ColumnDef::new(col_name.clone(), data_type, true)
         }));
 
         let rows_with_rowid: Vec<Row> = rows
@@ -223,24 +203,7 @@ impl Executor {
             })
             .collect();
 
-        let schema = TableSchema {
-            table_id,
-            name: view_name.clone(),
-            columns: col_defs,
-            version: 1,
-            pk_constraint_name: Some(format!(
-                "{}_pkey",
-                view_name.rsplit('.').next().unwrap_or(&view_name)
-            )),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema = TableSchema::new(view_name.clone(), table_id, col_defs, vec![0]);
 
         ddl::execute_create_materialized_view(
             &self.store(),

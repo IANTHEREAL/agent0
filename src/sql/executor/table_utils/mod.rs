@@ -47,61 +47,17 @@ pub(crate) fn create_sequence_state_table_schema(
     full_name: &str,
     def: &SequenceDef,
 ) -> TableSchema {
-    TableSchema {
-        name: full_name.to_string(),
-        table_id: 0,
-        columns: vec![
-            ColumnDef {
-                name: "last_value".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "log_cnt".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "is_called".to_string(),
-                data_type: DataType::Boolean,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    let mut schema = TableSchema::virtual_table(
+        full_name,
+        vec![
+            ColumnDef::new("last_value", DataType::Int64, false),
+            ColumnDef::new("log_cnt", DataType::Int64, false),
+            ColumnDef::new("is_called", DataType::Boolean, false),
         ],
-        version: 0,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: def.owner.clone(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+    );
+    schema.version = 0;
+    schema.owner = def.owner.clone();
+    schema
 }
 
 impl Executor {
@@ -490,33 +446,10 @@ impl Executor {
             "generate_series".to_string()
         };
 
-        let schema = TableSchema {
-            table_id: 0,
-            name: "generate_series".to_string(),
-            columns: vec![ColumnDef {
-                name: col_name,
-                data_type,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            version: 1,
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema = TableSchema::virtual_table(
+            "generate_series",
+            vec![ColumnDef::new(col_name, data_type, false)],
+        );
 
         let rows: Vec<Row> = values.into_iter().map(|v| Row::new(vec![v])).collect();
         Ok((schema, rows))
@@ -574,61 +507,14 @@ impl Executor {
         };
         self.store().record_migration(txn, record).await?;
 
-        let schema = TableSchema {
-            table_id: 0,
-            name: "_db9_sys_record_migration".to_string(),
-            columns: vec![
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "applied_at".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "status".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        let schema = TableSchema::virtual_table(
+            "_db9_sys_record_migration",
+            vec![
+                ColumnDef::new("name", DataType::Text, false),
+                ColumnDef::new("applied_at", DataType::Text, false),
+                ColumnDef::new("status", DataType::Text, false),
             ],
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            version: 1,
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        );
 
         let rows = vec![Row::new(vec![
             Value::Text(name),

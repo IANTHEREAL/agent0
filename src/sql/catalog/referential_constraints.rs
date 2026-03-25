@@ -21,10 +21,9 @@ impl VirtualTable for ReferentialConstraints {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "referential_constraints".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "referential_constraints",
+            vec![
                 text_col("constraint_catalog"),
                 text_col("constraint_schema"),
                 text_col("constraint_name"),
@@ -35,17 +34,7 @@ impl VirtualTable for ReferentialConstraints {
                 text_col("update_rule"),
                 text_col("delete_rule"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

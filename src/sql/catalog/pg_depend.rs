@@ -19,10 +19,9 @@ impl VirtualTable for PgDepend {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_depend".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_depend",
+            vec![
                 int_col("classid"),
                 int_col("objid"),
                 int_col("objsubid"),
@@ -31,17 +30,7 @@ impl VirtualTable for PgDepend {
                 int_col("refobjsubid"),
                 text_col("deptype"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

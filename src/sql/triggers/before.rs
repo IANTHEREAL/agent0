@@ -254,47 +254,23 @@ mod tests {
 
     #[test]
     fn test_substitute_row_references() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                crate::model::ColumnDef {
-                    name: "id".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                crate::model::ColumnDef {
-                    name: "updated_at".to_string(),
-                    data_type: crate::model::DataType::Timestamp,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: Some("test_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    crate::model::ColumnDef::new("id", crate::model::DataType::Int32, false)
+                        .primary_key(),
+                    crate::model::ColumnDef::new(
+                        "updated_at",
+                        crate::model::DataType::Timestamp,
+                        true,
+                    ),
+                ],
+                vec![0],
+            );
+            s.owner = String::new();
+            s
         };
 
         let new_values = vec![Value::Int32(1), Value::Null];
@@ -308,47 +284,19 @@ mod tests {
 
     #[test]
     fn test_substitute_row_references_does_not_prefix_match() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                crate::model::ColumnDef {
-                    name: "id".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                crate::model::ColumnDef {
-                    name: "id2".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: Some("test_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    crate::model::ColumnDef::new("id", crate::model::DataType::Int32, false)
+                        .primary_key(),
+                    crate::model::ColumnDef::new("id2", crate::model::DataType::Int32, false),
+                ],
+                vec![0],
+            );
+            s.owner = String::new();
+            s
         };
 
         let new_values = vec![Value::Int32(7), Value::Int32(3)];
@@ -367,47 +315,18 @@ mod tests {
 
     #[test]
     fn test_substitute_row_references_does_not_collide_a_aa() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                crate::model::ColumnDef {
-                    name: "a".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                crate::model::ColumnDef {
-                    name: "aa".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    crate::model::ColumnDef::new("a", crate::model::DataType::Int32, false),
+                    crate::model::ColumnDef::new("aa", crate::model::DataType::Int32, false),
+                ],
+                vec![],
+            );
+            s.owner = String::new();
+            s
         };
 
         let new_values = vec![Value::Int32(1), Value::Int32(9)];
@@ -417,47 +336,18 @@ mod tests {
 
     #[test]
     fn test_substitute_row_references_ignores_strings_and_comments() {
-        let schema = TableSchema {
-            name: "test".to_string(),
-            table_id: 1,
-            columns: vec![
-                crate::model::ColumnDef {
-                    name: "a".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                crate::model::ColumnDef {
-                    name: "aa".to_string(),
-                    data_type: crate::model::DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+        let schema = {
+            let mut s = TableSchema::new(
+                "test".to_string(),
+                1,
+                vec![
+                    crate::model::ColumnDef::new("a", crate::model::DataType::Int32, false),
+                    crate::model::ColumnDef::new("aa", crate::model::DataType::Int32, false),
+                ],
+                vec![],
+            );
+            s.owner = String::new();
+            s
         };
 
         let new_values = vec![Value::Int32(1), Value::Int32(9)];

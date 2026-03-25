@@ -21,10 +21,9 @@ impl VirtualTable for ConstraintColumnUsage {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "constraint_column_usage".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "constraint_column_usage",
+            vec![
                 text_col("table_catalog"),
                 text_col("table_schema"),
                 text_col("table_name"),
@@ -33,17 +32,7 @@ impl VirtualTable for ConstraintColumnUsage {
                 text_col("constraint_schema"),
                 text_col("constraint_name"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

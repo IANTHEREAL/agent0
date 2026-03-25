@@ -775,48 +775,24 @@ mod tests {
     use crate::model::{ColumnDef, DataType, ForeignKeyAction, IndexDef};
 
     fn self_ref_schema() -> TableSchema {
-        TableSchema {
-            name: "public.items".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "parent_id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        let mut s = TableSchema::new(
+            "public.items".to_string(),
+            1,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("parent_id", DataType::Int32, true),
             ],
-            pk_indices: vec![0],
-            foreign_keys: vec![ForeignKeyConstraint {
-                name: "items_parent_id_fkey".to_string(),
-                columns: vec!["parent_id".to_string()],
-                ref_table: "public.items".to_string(),
-                ref_columns: vec!["id".to_string()],
-                on_delete: ForeignKeyAction::NoAction,
-                on_update: ForeignKeyAction::NoAction,
-            }],
-            ..TableSchema::default()
-        }
+            vec![0],
+        );
+        s.foreign_keys = vec![ForeignKeyConstraint {
+            name: "items_parent_id_fkey".to_string(),
+            columns: vec!["parent_id".to_string()],
+            ref_table: "public.items".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete: ForeignKeyAction::NoAction,
+            on_update: ForeignKeyAction::NoAction,
+        }];
+        s
     }
 
     #[test]
@@ -934,67 +910,19 @@ mod tests {
     // ── find_fk_covering_index unit tests ──
 
     fn make_child_schema_with_indexes(indexes: Vec<IndexDef>) -> TableSchema {
-        TableSchema {
-            name: "public.child".to_string(),
-            table_id: 2,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "parent_id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "unrelated".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        let mut s = TableSchema::new(
+            "public.child".to_string(),
+            2,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("parent_id", DataType::Int32, true),
+                ColumnDef::new("name", DataType::Text, true),
+                ColumnDef::new("unrelated", DataType::Int32, true),
             ],
-            pk_indices: vec![0],
-            indexes,
-            ..TableSchema::default()
-        }
+            vec![0],
+        );
+        s.indexes = indexes;
+        s
     }
 
     fn btree_index(

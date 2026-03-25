@@ -15,19 +15,7 @@ use helpers::{expr_has_unqualified_type_cast, query_has_unqualified_type_cast};
 use rename::{parse_stored_query, rewrite_expr_type_casts};
 
 fn col(name: &str, data_type: DataType) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, data_type, true)
 }
 
 fn test_schema() -> TableSchema {

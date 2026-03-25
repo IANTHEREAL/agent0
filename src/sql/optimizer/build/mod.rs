@@ -133,18 +133,8 @@ impl PhysicalPlan {
                     self.schema
                         .columns
                         .iter()
-                        .map(|(name, dt)| crate::model::ColumnDef {
-                            name: name.clone(),
-                            data_type: dt.clone(),
-                            nullable: true,
-                            primary_key: false,
-                            unique: false,
-                            is_serial: false,
-                            default_expr: None,
-                            generation_expr: None,
-                            generation_expr_authorized_by: None,
-                            collation: None,
-                            is_dropped: false,
+                        .map(|(name, dt)| {
+                            crate::model::ColumnDef::new(name.clone(), dt.clone(), true)
                         })
                         .collect(),
                     vec![],

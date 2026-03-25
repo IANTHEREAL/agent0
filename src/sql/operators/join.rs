@@ -88,52 +88,22 @@ impl NestedLoopJoinOperator {
         let mut columns = Vec::new();
 
         for col in &left.schema().columns {
-            columns.push(ColumnDef {
-                name: col.name.clone(),
-                data_type: col.data_type.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(
+                col.name.clone(),
+                col.data_type.clone(),
+                true,
+            ));
         }
 
         for col in &right.schema().columns {
-            columns.push(ColumnDef {
-                name: col.name.clone(),
-                data_type: col.data_type.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(
+                col.name.clone(),
+                col.data_type.clone(),
+                true,
+            ));
         }
 
-        let output_schema = TableSchema {
-            name: "join".to_string(),
-            table_id: 0,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let output_schema = TableSchema::virtual_table("join", columns);
 
         Self {
             left,
@@ -408,93 +378,27 @@ mod tests {
     use crate::sql::operators::scan::TableScanOperator;
 
     fn users_schema() -> TableSchema {
-        TableSchema {
-            name: "users".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("name", DataType::Text, true),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![0],
+        )
     }
 
     fn orders_schema() -> TableSchema {
-        TableSchema {
-            name: "orders".to_string(),
-            table_id: 2,
-            columns: vec![
-                ColumnDef {
-                    name: "order_id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "user_id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "orders".to_string(),
+            2,
+            vec![
+                ColumnDef::new("order_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("user_id", DataType::Int32, false),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![0],
+        )
     }
 
     /// Build the TypedExpr equivalent of `id = user_id` for the joined schema

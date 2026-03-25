@@ -427,6 +427,92 @@ pub struct ColumnDef {
     pub is_dropped: bool,
 }
 
+impl ColumnDef {
+    /// Create a column with the three semantically-required fields; all other
+    /// flags default to `false` / `None`.
+    ///
+    /// `nullable` is an explicit parameter because its correct value depends on
+    /// context: catalog views typically use `true`, virtual-table system columns
+    /// use `false`, and DDL paths take the value from the parsed AST.
+    ///
+    /// Use the chainable modifiers ([`primary_key`](Self::primary_key),
+    /// [`serial`](Self::serial), etc.) to set non-default fields.
+    pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            nullable,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+            generation_expr: None,
+            generation_expr_authorized_by: None,
+            collation: None,
+            is_dropped: false,
+        }
+    }
+
+    /// Mark the column as a primary-key member.
+    ///
+    /// Implies `NOT NULL` (overrides the `nullable` parameter passed to
+    /// [`new`](Self::new)), matching PostgreSQL semantics.
+    pub fn primary_key(mut self) -> Self {
+        self.primary_key = true;
+        self.nullable = false;
+        self
+    }
+
+    /// Mark the column as `UNIQUE`.
+    ///
+    /// Does **not** imply `NOT NULL` — PostgreSQL UNIQUE columns accept
+    /// multiple NULL values.
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
+    /// Mark the column as `SERIAL` (auto-increment).
+    ///
+    /// Implies `NOT NULL` and clears any previously-set `default_expr`,
+    /// matching PostgreSQL semantics where SERIAL overrides an explicit
+    /// DEFAULT.
+    pub fn serial(mut self) -> Self {
+        self.is_serial = true;
+        self.nullable = false;
+        self.default_expr = None;
+        self
+    }
+
+    /// Set a column-level `DEFAULT` expression.
+    #[allow(dead_code)]
+    pub fn default_expr(mut self, expr: impl Into<String>) -> Self {
+        self.default_expr = Some(expr.into());
+        self
+    }
+
+    /// Set the column collation (e.g. `"en_US"`).
+    pub fn collation(mut self, collation: impl Into<String>) -> Self {
+        self.collation = Some(collation.into());
+        self
+    }
+
+    /// Set a `GENERATED ALWAYS AS (…) STORED` expression.
+    #[allow(dead_code)]
+    pub fn generation_expr(mut self, expr: impl Into<String>) -> Self {
+        self.generation_expr = Some(expr.into());
+        self
+    }
+
+    #[allow(dead_code)]
+    /// Set the role that authorised a generated-column expression
+    /// (used by the auto-embedding feature).
+    pub fn generation_expr_authorized_by(mut self, author: impl Into<String>) -> Self {
+        self.generation_expr_authorized_by = Some(author.into());
+        self
+    }
+}
+
 /// Index definition
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexDef {
@@ -751,6 +837,34 @@ impl TableSchema {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             owner: default_owner(),
+            rls_enabled: false,
+            rls_force: false,
+            from_alias: None,
+        }
+    }
+
+    /// Create a virtual / catalog table schema (`table_id = 0`).
+    ///
+    /// Intended for pg_catalog views, information_schema views, extension
+    /// output schemas, operator output schemas, and any other context where
+    /// the schema describes ephemeral or system-defined rows with no indexes,
+    /// constraints, or owner.
+    ///
+    /// Uses `owner: ""` (empty), matching all 50+ existing catalog view
+    /// definitions.  Do **not** use this for user-owned persistent tables —
+    /// use [`TableSchema::new`] instead.
+    pub fn virtual_table(name: impl Into<String>, columns: Vec<ColumnDef>) -> Self {
+        Self {
+            name: name.into(),
+            table_id: 0,
+            columns,
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: Vec::new(),
+            indexes: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            owner: String::new(),
             rls_enabled: false,
             rls_force: false,
             from_alias: None,
@@ -1098,6 +1212,184 @@ mod tests {
             DataType::Array(Box::new(DataType::Varchar(3))).pg_display_name(),
             "character varying[]"
         );
+    }
+
+    // ── ColumnDef::new() + modifiers ──────────────────────────────────
+
+    #[test]
+    fn columndef_new_defaults() {
+        let c = ColumnDef::new("id", DataType::Int64, true);
+        assert_eq!(c.name, "id");
+        assert_eq!(c.data_type, DataType::Int64);
+        assert!(c.nullable);
+        assert!(!c.primary_key);
+        assert!(!c.unique);
+        assert!(!c.is_serial);
+        assert!(c.default_expr.is_none());
+        assert!(c.generation_expr.is_none());
+        assert!(c.generation_expr_authorized_by.is_none());
+        assert!(c.collation.is_none());
+        assert!(!c.is_dropped);
+    }
+
+    #[test]
+    fn columndef_new_not_null() {
+        let c = ColumnDef::new("x", DataType::Int32, false);
+        assert!(!c.nullable);
+    }
+
+    #[test]
+    fn columndef_primary_key_implies_not_null() {
+        let c = ColumnDef::new("id", DataType::Int64, true).primary_key();
+        assert!(c.primary_key);
+        assert!(!c.nullable); // PK overrides nullable
+    }
+
+    #[test]
+    fn columndef_serial_implies_not_null_and_clears_default() {
+        let c = ColumnDef::new("id", DataType::Int64, true)
+            .default_expr("42")
+            .serial();
+        assert!(c.is_serial);
+        assert!(!c.nullable);
+        assert!(c.default_expr.is_none()); // serial clears default
+    }
+
+    #[test]
+    fn columndef_unique_does_not_change_nullable() {
+        let c = ColumnDef::new("email", DataType::Text, true).unique();
+        assert!(c.unique);
+        assert!(c.nullable); // UNIQUE allows NULLs in PG
+    }
+
+    #[test]
+    fn columndef_flag_modifiers_are_order_independent() {
+        let a = ColumnDef::new("id", DataType::Int64, true)
+            .serial()
+            .primary_key()
+            .unique();
+        let b = ColumnDef::new("id", DataType::Int64, true)
+            .unique()
+            .primary_key()
+            .serial();
+        assert_eq!(a.primary_key, b.primary_key);
+        assert_eq!(a.is_serial, b.is_serial);
+        assert_eq!(a.unique, b.unique);
+        assert_eq!(a.nullable, b.nullable);
+        assert_eq!(a.default_expr, b.default_expr);
+    }
+
+    #[test]
+    fn columndef_serial_clears_default_expr() {
+        // .serial() clears default_expr — order matters when combining
+        // with .default_expr(). Always call .serial() BEFORE .default_expr()
+        // if both are needed.
+        let cleared = ColumnDef::new("id", DataType::Int64, true)
+            .default_expr("42")
+            .serial();
+        assert!(cleared.default_expr.is_none(), "serial() must clear prior default_expr");
+
+        let preserved = ColumnDef::new("id", DataType::Int64, true)
+            .serial()
+            .default_expr("42");
+        assert_eq!(preserved.default_expr.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn columndef_optional_setters() {
+        let c = ColumnDef::new("bio", DataType::Text, true)
+            .default_expr("''")
+            .collation("en_US")
+            .generation_expr("lower(name)")
+            .generation_expr_authorized_by("admin");
+        assert_eq!(c.default_expr.as_deref(), Some("''"));
+        assert_eq!(c.collation.as_deref(), Some("en_US"));
+        assert_eq!(c.generation_expr.as_deref(), Some("lower(name)"));
+        assert_eq!(c.generation_expr_authorized_by.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn columndef_equivalence_with_struct_literal() {
+        let via_new = ColumnDef::new("_rowid", DataType::Int64, false)
+            .primary_key()
+            .unique()
+            .serial();
+        let via_literal = ColumnDef {
+            name: "_rowid".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            primary_key: true,
+            unique: true,
+            is_serial: true,
+            default_expr: None,
+            generation_expr: None,
+            generation_expr_authorized_by: None,
+            collation: None,
+            is_dropped: false,
+        };
+        assert_eq!(via_new.name, via_literal.name);
+        assert_eq!(via_new.data_type, via_literal.data_type);
+        assert_eq!(via_new.nullable, via_literal.nullable);
+        assert_eq!(via_new.primary_key, via_literal.primary_key);
+        assert_eq!(via_new.unique, via_literal.unique);
+        assert_eq!(via_new.is_serial, via_literal.is_serial);
+        assert_eq!(via_new.default_expr, via_literal.default_expr);
+        assert_eq!(via_new.generation_expr, via_literal.generation_expr);
+        assert_eq!(
+            via_new.generation_expr_authorized_by,
+            via_literal.generation_expr_authorized_by
+        );
+        assert_eq!(via_new.collation, via_literal.collation);
+        assert_eq!(via_new.is_dropped, via_literal.is_dropped);
+    }
+
+    // ── TableSchema::virtual_table() ─────────────────────────────────
+
+    #[test]
+    fn virtual_table_defaults() {
+        let s = TableSchema::virtual_table(
+            "pg_class",
+            vec![ColumnDef::new("relname", DataType::Text, true)],
+        );
+        assert_eq!(s.name, "pg_class");
+        assert_eq!(s.table_id, 0);
+        assert_eq!(s.version, 1);
+        assert_eq!(s.columns.len(), 1);
+        assert!(s.pk_constraint_name.is_none());
+        assert!(s.pk_indices.is_empty());
+        assert!(s.indexes.is_empty());
+        assert!(s.check_constraints.is_empty());
+        assert!(s.foreign_keys.is_empty());
+        assert_eq!(s.owner, ""); // virtual tables use empty owner
+        assert!(!s.rls_enabled);
+        assert!(!s.rls_force);
+        assert!(s.from_alias.is_none());
+    }
+
+    #[test]
+    fn virtual_table_equivalence_with_struct_literal() {
+        let cols = vec![ColumnDef::new("oid", DataType::Int64, false)];
+        let via_factory = TableSchema::virtual_table("pg_type", cols.clone());
+        let via_literal = TableSchema {
+            table_id: 0,
+            name: "pg_type".to_string(),
+            columns: cols,
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            rls_enabled: false,
+            rls_force: false,
+            from_alias: None,
+        };
+        assert_eq!(via_factory.name, via_literal.name);
+        assert_eq!(via_factory.table_id, via_literal.table_id);
+        assert_eq!(via_factory.version, via_literal.version);
+        assert_eq!(via_factory.owner, via_literal.owner);
+        assert_eq!(via_factory.columns.len(), via_literal.columns.len());
     }
 }
 

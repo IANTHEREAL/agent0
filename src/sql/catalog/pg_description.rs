@@ -23,26 +23,15 @@ impl VirtualTable for PgDescription {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_description".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_description",
+            vec![
                 int_col("objoid"),
                 int_col("classoid"),
                 int_col("objsubid"),
                 text_col("description"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

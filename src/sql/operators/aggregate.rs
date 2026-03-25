@@ -50,52 +50,14 @@ impl HashAggregateOperator {
         let mut columns = Vec::new();
 
         for (name, dt) in group_by_names.iter().zip(group_by_types.iter()) {
-            columns.push(ColumnDef {
-                name: name.clone(),
-                data_type: dt.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(name.clone(), dt.clone(), true));
         }
 
         for (name, dt) in aggregate_names.iter().zip(aggregate_types.iter()) {
-            columns.push(ColumnDef {
-                name: name.clone(),
-                data_type: dt.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(name.clone(), dt.clone(), true));
         }
 
-        let output_schema = TableSchema {
-            name: "aggregate".to_string(),
-            table_id: 0,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let output_schema = TableSchema::virtual_table("aggregate", columns);
 
         Self {
             child,
@@ -384,48 +346,15 @@ mod tests {
     use crate::sql::operators::scan::TableScanOperator;
 
     fn test_schema() -> TableSchema {
-        TableSchema {
-            name: "sales".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "category".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "amount".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        TableSchema::new(
+            "sales".to_string(),
+            1,
+            vec![
+                ColumnDef::new("category", DataType::Text, false),
+                ColumnDef::new("amount", DataType::Int32, false),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![],
+        )
     }
 
     fn category_ref() -> TypedExpr {

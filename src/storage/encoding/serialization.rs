@@ -321,62 +321,35 @@ mod tests {
     use crate::worker::types::IndexState;
 
     fn sample_schema() -> TableSchema {
-        TableSchema {
-            name: "public.users".into(),
-            table_id: 42,
-            columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    primary_key: true,
-                    unique: true,
-                    is_serial: true,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "name".into(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: Some("en_US".into()),
-                    is_dropped: false,
-                },
+        let mut schema = TableSchema::new(
+            "public.users".into(),
+            42,
+            vec![
+                ColumnDef::new("id", DataType::Int64, false)
+                    .primary_key()
+                    .unique()
+                    .serial(),
+                ColumnDef::new("name", DataType::Text, true).collation("en_US"),
             ],
-            version: 1,
-            pk_constraint_name: Some("users_pkey".into()),
-            pk_indices: vec![0],
-            indexes: vec![IndexDef {
-                name: "users_name_idx".into(),
-                id: 1,
-                columns: vec!["name".into()],
-                unique: false,
-                is_constraint: false,
-                method: Some("btree".into()),
-                predicate: None,
-                expressions: vec![],
-                state: IndexState::Ready,
-                cached_predicate_conjuncts: None,
-                hnsw_m: None,
-                hnsw_ef_construction: None,
-                hnsw_distance_metric: None,
-            }],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "admin".into(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![0],
+        );
+        schema.indexes = vec![IndexDef {
+            name: "users_name_idx".into(),
+            id: 1,
+            columns: vec!["name".into()],
+            unique: false,
+            is_constraint: false,
+            method: Some("btree".into()),
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }];
+        schema.owner = "admin".into();
+        schema
     }
 
     #[test]
@@ -588,41 +561,17 @@ mod tests {
 
     #[test]
     fn v2_missing_index_constraint_bit_uses_legacy_backward_compat_default() {
-        let schema = TableSchema {
-            name: "public.legacy".into(),
-            table_id: 11,
-            columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "email".into(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![
+        let schema = {
+            let mut s = TableSchema::new(
+                "public.legacy".into(),
+                11,
+                vec![
+                    ColumnDef::new("id", DataType::Int64, false),
+                    ColumnDef::new("email", DataType::Text, false),
+                ],
+                vec![],
+            );
+            s.indexes = vec![
                 IndexDef {
                     name: "legacy_id_uix".into(),
                     id: 1,
@@ -668,13 +617,8 @@ mod tests {
                     hnsw_ef_construction: None,
                     hnsw_distance_metric: None,
                 },
-            ],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".into(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+            ];
+            s
         };
 
         let mut json = serde_json::to_value(&schema).unwrap();

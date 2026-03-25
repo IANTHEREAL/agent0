@@ -18,25 +18,14 @@ impl VirtualTable for PgDbRoleSetting {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_db_role_setting".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_db_role_setting",
+            vec![
                 int_col("setdatabase"),
                 int_col("setrole"),
                 text_array_col("setconfig"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

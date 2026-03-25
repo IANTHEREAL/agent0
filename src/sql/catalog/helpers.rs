@@ -24,180 +24,48 @@ pub const RELREPLIDENT_DEFAULT: &str = "d";
 pub const AM_BTREE_OID: i64 = 403;
 
 pub fn text_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Text,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Text, true)
 }
 
 pub fn name_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Name,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Name, true)
 }
 
 pub fn int_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Int64,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Int64, true)
 }
 
 pub fn float_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Float64,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Float64, true)
 }
 
 /// PostgreSQL `"char"` — single-byte internal character type.
 pub fn char_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::UserDefined("char".to_string()),
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::UserDefined("char".to_string()), true)
 }
 
 pub fn bool_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Boolean,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Boolean, true)
 }
 
 pub fn int2vector_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::UserDefined("int2vector".to_string()),
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::UserDefined("int2vector".to_string()), true)
 }
 
 pub fn oidvector_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::UserDefined("oidvector".to_string()),
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::UserDefined("oidvector".to_string()), true)
 }
 
 pub fn int_array_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Array(Box::new(DataType::Int64)),
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Array(Box::new(DataType::Int64)), true)
 }
 
 pub fn timestamptz_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::TimestampTz,
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::TimestampTz, true)
 }
 
 pub fn text_array_col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type: DataType::Array(Box::new(DataType::Text)),
-        nullable: true,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
+    ColumnDef::new(name, DataType::Array(Box::new(DataType::Text)), true)
 }
 
 pub fn text_val(s: &str) -> Value {

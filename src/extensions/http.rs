@@ -126,74 +126,15 @@ fn limiters() -> &'static TenantLimiters {
 }
 
 fn http_response_schema(name: &str) -> TableSchema {
-    TableSchema {
-        table_id: 0,
-        name: name.to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "status".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "content_type".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "headers".to_string(),
-                data_type: DataType::Jsonb,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "content".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    TableSchema::virtual_table(
+        name,
+        vec![
+            ColumnDef::new("status", DataType::Int32, false),
+            ColumnDef::new("content_type", DataType::Text, true),
+            ColumnDef::new("headers", DataType::Jsonb, false),
+            ColumnDef::new("content", DataType::Text, false),
         ],
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+    )
 }
 
 pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {

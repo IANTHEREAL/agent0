@@ -626,19 +626,7 @@ impl MockCatalogBuilder {
     pub fn table(mut self, name: &str, columns: Vec<(&str, DataType, bool)>) -> Self {
         let col_defs: Vec<ColumnDef> = columns
             .iter()
-            .map(|(n, dt, nullable)| ColumnDef {
-                name: n.to_string(),
-                data_type: dt.clone(),
-                nullable: *nullable,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            })
+            .map(|(n, dt, nullable)| ColumnDef::new(*n, dt.clone(), *nullable))
             .collect();
 
         let schema = TableSchema::new(
@@ -662,19 +650,7 @@ impl MockCatalogBuilder {
     ) -> Self {
         let col_defs: Vec<ColumnDef> = columns
             .iter()
-            .map(|(n, dt, nullable)| ColumnDef {
-                name: n.to_string(),
-                data_type: dt.clone(),
-                nullable: *nullable,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            })
+            .map(|(n, dt, nullable)| ColumnDef::new(*n, dt.clone(), *nullable))
             .collect();
 
         let qualified_name = format!("{}.{}", schema_name, name);
@@ -699,18 +675,12 @@ impl MockCatalogBuilder {
     ) -> Self {
         let col_defs: Vec<ColumnDef> = columns
             .iter()
-            .map(|(n, dt, nullable, coll)| ColumnDef {
-                name: n.to_string(),
-                data_type: dt.clone(),
-                nullable: *nullable,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: coll.map(|s| s.to_string()),
-                is_dropped: false,
+            .map(|(n, dt, nullable, coll)| {
+                let mut col = ColumnDef::new(*n, dt.clone(), *nullable);
+                if let Some(c) = coll {
+                    col = col.collation(*c);
+                }
+                col
             })
             .collect();
 
@@ -816,19 +786,7 @@ mod tests {
         let schema = TableSchema::new(
             "public.test".to_string(),
             1,
-            vec![ColumnDef {
-                name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
+            vec![ColumnDef::new("x", DataType::Int32, false)],
             vec![],
         );
 

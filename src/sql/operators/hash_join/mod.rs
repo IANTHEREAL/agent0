@@ -165,51 +165,21 @@ impl HashJoinOperator {
     ) -> Self {
         let mut columns: Vec<ColumnDef> = Vec::new();
         for col in &left_child.schema().columns {
-            columns.push(ColumnDef {
-                name: col.name.clone(),
-                data_type: col.data_type.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(
+                col.name.clone(),
+                col.data_type.clone(),
+                true,
+            ));
         }
         for col in &right_child.schema().columns {
-            columns.push(ColumnDef {
-                name: col.name.clone(),
-                data_type: col.data_type.clone(),
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            });
+            columns.push(ColumnDef::new(
+                col.name.clone(),
+                col.data_type.clone(),
+                true,
+            ));
         }
 
-        let output_schema = TableSchema {
-            name: "hash_join".to_string(),
-            table_id: 0,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let output_schema = TableSchema::virtual_table("hash_join", columns);
 
         let (build_child, probe_child, build_key_indices, probe_key_indices) = if left_is_build {
             (left_child, right_child, left_key_indices, right_key_indices)

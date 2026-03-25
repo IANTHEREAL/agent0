@@ -24,10 +24,9 @@ impl VirtualTable for KeyColumnUsage {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "key_column_usage".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "key_column_usage",
+            vec![
                 text_col("constraint_catalog"),
                 text_col("constraint_schema"),
                 text_col("constraint_name"),
@@ -38,17 +37,7 @@ impl VirtualTable for KeyColumnUsage {
                 int_col("ordinal_position"),
                 int_col("position_in_unique_constraint"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

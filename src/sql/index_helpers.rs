@@ -144,37 +144,13 @@ mod tests {
     use super::*;
 
     fn test_col(name: &str) -> crate::model::ColumnDef {
-        crate::model::ColumnDef {
-            name: name.to_string(),
-            data_type: crate::model::DataType::Text,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }
+        crate::model::ColumnDef::new(name, crate::model::DataType::Text, true)
     }
 
     fn test_schema(columns: Vec<crate::model::ColumnDef>) -> TableSchema {
-        TableSchema {
-            name: "public.t".to_string(),
-            table_id: 1,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        let mut schema = TableSchema::new("public.t".to_string(), 1, columns, vec![]);
+        schema.owner = "postgres".to_string();
+        schema
     }
 
     #[test]
@@ -393,19 +369,7 @@ mod tests {
     }
 
     fn test_col_typed(name: &str, data_type: crate::model::DataType) -> crate::model::ColumnDef {
-        crate::model::ColumnDef {
-            name: name.to_string(),
-            data_type,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }
+        crate::model::ColumnDef::new(name, data_type, true)
     }
 
     #[test]

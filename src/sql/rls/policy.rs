@@ -454,32 +454,17 @@ mod tests {
         use std::sync::Arc;
 
         // Schema with a text column for the policy expression to reference.
-        let schema = TableSchema {
-            name: "public.posts".to_string(),
-            table_id: 1,
-            columns: vec![ColumnDef {
-                name: "owner".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "admin".to_string(),
-            from_alias: None,
-            rls_enabled: true,
-            rls_force: false,
+        let schema = {
+            let mut s = TableSchema::new(
+                "public.posts".to_string(),
+                1,
+                vec![ColumnDef::new("owner", DataType::Text, false)],
+                vec![0],
+            );
+            s.pk_constraint_name = None;
+            s.owner = "admin".to_string();
+            s.rls_enabled = true;
+            s
         };
 
         let cache = RlsPolicyCache::new();

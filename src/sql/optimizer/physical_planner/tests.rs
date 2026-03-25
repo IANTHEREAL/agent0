@@ -1363,32 +1363,10 @@ fn make_schema_with_index() -> TableSchema {
         "t".to_string(),
         1,
         vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: true,
-                unique: true,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "name".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+            ColumnDef::new("id", DataType::Int64, false)
+                .primary_key()
+                .unique(),
+            ColumnDef::new("name", DataType::Text, true),
         ],
         vec![0],
     );

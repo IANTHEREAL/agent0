@@ -88,36 +88,18 @@ mod tests {
     use std::sync::Arc;
 
     fn check_schema() -> TableSchema {
-        TableSchema {
-            name: "public.t_check".to_string(),
-            table_id: 2,
-            columns: vec![ColumnDef {
-                name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![CheckConstraint {
-                name: Some("x_positive".to_string()),
-                expr: "x > 0".to_string(),
-            }],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        let mut s = TableSchema::new(
+            "public.t_check".to_string(),
+            2,
+            vec![ColumnDef::new("x", DataType::Int32, false)],
+            vec![],
+        );
+        s.check_constraints = vec![CheckConstraint {
+            name: Some("x_positive".to_string()),
+            expr: "x > 0".to_string(),
+        }];
+        s.owner = String::new();
+        s
     }
 
     #[test]

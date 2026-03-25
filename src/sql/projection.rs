@@ -165,33 +165,10 @@ mod tests {
 
     #[test]
     fn test_infer_expr_type_compound_identifier_prefers_full_name() {
-        let schema = TableSchema {
-            name: "joined".to_string(),
-            table_id: 0,
-            columns: vec![ColumnDef {
-                name: "total".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema = TableSchema::virtual_table(
+            "joined",
+            vec![ColumnDef::new("total", DataType::Float64, true)],
+        );
 
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, "SELECT o.total").unwrap();
@@ -213,33 +190,10 @@ mod tests {
 
     #[test]
     fn test_infer_expr_type_coalesce_sum_float() {
-        let schema = TableSchema {
-            name: "joined".to_string(),
-            table_id: 0,
-            columns: vec![ColumnDef {
-                name: "total".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema = TableSchema::virtual_table(
+            "joined",
+            vec![ColumnDef::new("total", DataType::Float64, true)],
+        );
 
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, "SELECT COALESCE(SUM(o.total), 0)").unwrap();
@@ -261,33 +215,8 @@ mod tests {
 
     #[test]
     fn test_infer_expr_type_sum_int32_returns_int64() {
-        let schema = TableSchema {
-            name: "t".to_string(),
-            table_id: 0,
-            columns: vec![ColumnDef {
-                name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema =
+            TableSchema::virtual_table("t", vec![ColumnDef::new("x", DataType::Int32, true)]);
 
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, "SELECT SUM(x)").unwrap();
@@ -309,33 +238,8 @@ mod tests {
 
     #[test]
     fn test_infer_expr_type_sum_int64_returns_numeric() {
-        let schema = TableSchema {
-            name: "t".to_string(),
-            table_id: 0,
-            columns: vec![ColumnDef {
-                name: "x".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema =
+            TableSchema::virtual_table("t", vec![ColumnDef::new("x", DataType::Int64, true)]);
 
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, "SELECT SUM(x)").unwrap();
@@ -363,33 +267,8 @@ mod tests {
 
     #[test]
     fn test_infer_expr_type_grouping_returns_int32() {
-        let schema = TableSchema {
-            name: "t".to_string(),
-            table_id: 0,
-            columns: vec![ColumnDef {
-                name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema =
+            TableSchema::virtual_table("t", vec![ColumnDef::new("x", DataType::Int32, true)]);
 
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, "SELECT GROUPING(x)").unwrap();
@@ -504,48 +383,21 @@ mod tests {
     /// for the caller-supplied backfill value.
     #[test]
     fn fill_row_defaults_skips_serial_nextval() {
-        let schema = TableSchema {
-            name: "public.t".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: true,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "seq_col".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: true,
-                    default_expr: Some("nextval('public.t_seq_col_seq')".to_string()),
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
+        let mut schema = TableSchema::new(
+            "public.t".to_string(),
+            1,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false)
+                    .primary_key()
+                    .unique(),
+                // serial() clears default_expr, so set it afterwards
+                ColumnDef::new("seq_col", DataType::Int32, false)
+                    .serial()
+                    .default_expr("nextval('public.t_seq_col_seq')"),
             ],
-            version: 1,
-            pk_constraint_name: Some("t_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+            vec![0],
+        );
+        schema.owner = "postgres".to_string();
 
         // Row has only the first column — fill_row_defaults must pad the serial
         // column with Null instead of erroring on nextval evaluation.

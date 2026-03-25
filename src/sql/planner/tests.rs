@@ -47,135 +47,58 @@ fn typed_binop(left: TypedExpr, op: TypedBinaryOp, right: TypedExpr, dt: DataTyp
 
 fn orders_columns_with_region() -> Vec<crate::model::ColumnDef> {
     vec![
-        crate::model::ColumnDef {
-            name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            primary_key: true,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        },
-        crate::model::ColumnDef {
-            name: "status".to_string(),
-            data_type: DataType::Text,
-            nullable: false,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        },
-        crate::model::ColumnDef {
-            name: "region".to_string(),
-            data_type: DataType::Text,
-            nullable: false,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        },
+        crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+        crate::model::ColumnDef::new("status", DataType::Text, false),
+        crate::model::ColumnDef::new("region", DataType::Text, false),
     ]
 }
 
 fn gin_schema() -> TableSchema {
-    TableSchema {
-        name: "docs".to_string(),
-        table_id: 1,
-        columns: vec![
-            crate::model::ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: true,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            crate::model::ColumnDef {
-                name: "body".to_string(),
-                data_type: DataType::Tsvector,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            crate::model::ColumnDef {
-                name: "data".to_string(),
-                data_type: DataType::Jsonb,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    let mut s = TableSchema::new(
+        "docs".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+            crate::model::ColumnDef::new("body", DataType::Tsvector, true),
+            crate::model::ColumnDef::new("data", DataType::Jsonb, true),
         ],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![0],
-        indexes: vec![
-            IndexDef {
-                id: 1,
-                name: "idx_body_gin".to_string(),
-                columns: vec!["body".to_string()],
-                unique: false,
-                is_constraint: false,
-                method: Some("gin".to_string()),
-                predicate: None,
-                expressions: Vec::new(),
-                state: crate::worker::types::IndexState::Ready,
-                cached_predicate_conjuncts: None,
-                hnsw_m: None,
-                hnsw_ef_construction: None,
-                hnsw_distance_metric: None,
-            },
-            IndexDef {
-                id: 2,
-                name: "idx_data_gin".to_string(),
-                columns: vec!["data".to_string()],
-                unique: false,
-                is_constraint: false,
-                method: Some("gin".to_string()),
-                predicate: None,
-                expressions: Vec::new(),
-                state: crate::worker::types::IndexState::Ready,
-                cached_predicate_conjuncts: None,
-                hnsw_m: None,
-                hnsw_ef_construction: None,
-                hnsw_distance_metric: None,
-            },
-        ],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+        vec![0],
+    );
+    s.pk_constraint_name = None;
+    s.owner = String::new();
+    s.indexes = vec![
+        IndexDef {
+            id: 1,
+            name: "idx_body_gin".to_string(),
+            columns: vec!["body".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: Some("gin".to_string()),
+            predicate: None,
+            expressions: Vec::new(),
+            state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        },
+        IndexDef {
+            id: 2,
+            name: "idx_data_gin".to_string(),
+            columns: vec!["data".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: Some("gin".to_string()),
+            predicate: None,
+            expressions: Vec::new(),
+            state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        },
+    ];
+    s
 }
 
 #[test]
@@ -263,33 +186,16 @@ fn test_gin_typed_json_contains_merges_multiple_conjuncts() {
 #[test]
 fn test_gin_typed_no_gin_index_falls_back() {
     // Schema without GIN index
-    let schema = TableSchema {
-        name: "plain".to_string(),
-        table_id: 1,
-        columns: vec![crate::model::ColumnDef {
-            name: "body".to_string(),
-            data_type: DataType::Tsvector,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    };
+    let schema = TableSchema::new(
+        "plain".to_string(),
+        1,
+        vec![crate::model::ColumnDef::new(
+            "body",
+            DataType::Tsvector,
+            true,
+        )],
+        vec![],
+    );
 
     let filter = typed_binop(
         typed_column("body", DataType::Tsvector),
@@ -305,26 +211,15 @@ fn test_gin_typed_no_gin_index_falls_back() {
 #[test]
 fn test_expression_index_typed_lower() {
     // Schema with expression index on lower(name)
-    let schema = TableSchema {
-        name: "users".to_string(),
-        table_id: 1,
-        columns: vec![crate::model::ColumnDef {
-            name: "name".to_string(),
-            data_type: DataType::Text,
-            nullable: false,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![crate::model::ColumnDef::new("name", DataType::Text, false)],
+            vec![],
+        );
+        s.owner = String::new();
+        s.indexes = vec![IndexDef {
             id: 1,
             name: "idx_lower_name".to_string(),
             columns: vec![],
@@ -338,13 +233,8 @@ fn test_expression_index_typed_lower() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     // WHERE lower(name) = 'alice'
@@ -383,41 +273,19 @@ fn test_expression_index_typed_lower() {
 #[test]
 fn test_partial_index_typed_exact_predicate() {
     // Schema with partial index: WHERE status = 'active'
-    let schema = TableSchema {
-        name: "orders".to_string(),
-        table_id: 1,
-        columns: vec![
-            crate::model::ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: true,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            crate::model::ColumnDef {
-                name: "status".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-        ],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![0],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new(
+            "orders".to_string(),
+            1,
+            vec![
+                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("status", DataType::Text, false),
+            ],
+            vec![0],
+        );
+        s.pk_constraint_name = None;
+        s.owner = String::new();
+        s.indexes = vec![IndexDef {
             id: 1,
             name: "idx_active_orders".to_string(),
             columns: vec!["id".to_string()],
@@ -431,13 +299,8 @@ fn test_partial_index_typed_exact_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     // WHERE status = 'active' AND id = 42
@@ -473,41 +336,19 @@ fn test_partial_index_typed_exact_predicate() {
 #[test]
 fn test_partial_index_typed_missing_predicate() {
     // Same schema as above, but query doesn't include the partial predicate
-    let schema = TableSchema {
-        name: "orders".to_string(),
-        table_id: 1,
-        columns: vec![
-            crate::model::ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: true,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            crate::model::ColumnDef {
-                name: "status".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-        ],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![0],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new(
+            "orders".to_string(),
+            1,
+            vec![
+                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("status", DataType::Text, false),
+            ],
+            vec![0],
+        );
+        s.pk_constraint_name = None;
+        s.owner = String::new();
+        s.indexes = vec![IndexDef {
             id: 1,
             name: "idx_active_orders".to_string(),
             columns: vec!["id".to_string()],
@@ -521,13 +362,8 @@ fn test_partial_index_typed_missing_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     // WHERE id = 42 (missing status = 'active')
@@ -549,14 +385,16 @@ fn test_partial_index_typed_missing_predicate() {
 
 #[test]
 fn test_partial_index_typed_valid_cached_predicate() {
-    let schema = TableSchema {
-        name: "orders".to_string(),
-        table_id: 1,
-        columns: orders_columns_with_region(),
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![0],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new(
+            "orders".to_string(),
+            1,
+            orders_columns_with_region(),
+            vec![0],
+        );
+        s.pk_constraint_name = None;
+        s.owner = String::new();
+        s.indexes = vec![IndexDef {
             id: 1,
             name: "idx_active_orders".to_string(),
             columns: vec!["id".to_string()],
@@ -573,13 +411,8 @@ fn test_partial_index_typed_valid_cached_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     let filter = typed_binop(
@@ -609,14 +442,16 @@ fn test_partial_index_typed_valid_cached_predicate() {
 
 #[test]
 fn test_partial_index_typed_malformed_predicate() {
-    let schema = TableSchema {
-        name: "orders".to_string(),
-        table_id: 1,
-        columns: orders_columns_with_region(),
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![0],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new(
+            "orders".to_string(),
+            1,
+            orders_columns_with_region(),
+            vec![0],
+        );
+        s.pk_constraint_name = None;
+        s.owner = String::new();
+        s.indexes = vec![IndexDef {
             id: 1,
             name: "idx_bad_partial".to_string(),
             columns: vec!["id".to_string()],
@@ -630,13 +465,8 @@ fn test_partial_index_typed_malformed_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     let filter = typed_binop(
@@ -667,14 +497,16 @@ fn test_partial_index_typed_malformed_predicate() {
 #[test]
 fn test_partial_index_typed_multi_conjunct_predicate() {
     let predicate = "status = 'active' AND region = 'us'";
-    let schema = TableSchema {
-        name: "orders".to_string(),
-        table_id: 1,
-        columns: orders_columns_with_region(),
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![0],
-        indexes: vec![IndexDef {
+    let schema = {
+        let mut s = TableSchema::new(
+            "orders".to_string(),
+            1,
+            orders_columns_with_region(),
+            vec![0],
+        );
+        s.pk_constraint_name = None;
+        s.owner = String::new();
+        s.indexes = vec![IndexDef {
             id: 1,
             name: "idx_active_us_orders".to_string(),
             columns: vec!["id".to_string()],
@@ -688,13 +520,8 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
-        }],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+        }];
+        s
     };
 
     let status_and_region = typed_binop(
@@ -803,32 +630,15 @@ fn build_single_column_schema(unique: bool) -> (TableSchema, IndexDef) {
         cached_predicate_conjuncts: None,
     };
 
-    let schema = TableSchema {
-        name: "orders".to_string(),
-        table_id: 1,
-        columns: vec![ColumnDef {
-            name: "status".to_string(),
-            data_type: DataType::Text,
-            nullable: true,
-            primary_key: false,
-            unique,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![index.clone()],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+    let mut col = ColumnDef::new("status", DataType::Text, true);
+    if unique {
+        col = col.unique();
+    }
+    let schema = {
+        let mut s = TableSchema::new("orders".to_string(), 1, vec![col], vec![]);
+        s.owner = String::new();
+        s.indexes = vec![index.clone()];
+        s
     };
 
     (schema, index)
@@ -949,32 +759,16 @@ fn test_inlist_mixed_null_and_duplicates_matches_normalized_scan_keys_and_cost()
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
     };
-    let schema = TableSchema {
-        name: "items".to_string(),
-        table_id: 1,
-        columns: vec![ColumnDef {
-            name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![index],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+    let schema = {
+        let mut s = TableSchema::new(
+            "items".to_string(),
+            1,
+            vec![ColumnDef::new("id", DataType::Int32, true)],
+            vec![],
+        );
+        s.owner = String::new();
+        s.indexes = vec![index];
+        s
     };
     let stats = build_table_stats("id", 1000.0, 0.0);
 
@@ -1058,32 +852,16 @@ fn test_inlist_mixed_sign_nan_deduplicates_to_one_effective_nan() {
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
     };
-    let schema = TableSchema {
-        name: "items".to_string(),
-        table_id: 1,
-        columns: vec![ColumnDef {
-            name: "score".to_string(),
-            data_type: DataType::Float64,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![index],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+    let schema = {
+        let mut s = TableSchema::new(
+            "items".to_string(),
+            1,
+            vec![ColumnDef::new("score", DataType::Float64, true)],
+            vec![],
+        );
+        s.owner = String::new();
+        s.indexes = vec![index];
+        s
     };
     let stats = build_table_stats("score", 10.0, 0.0);
 
@@ -1322,47 +1100,19 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
     };
-    let schema = TableSchema {
-        name: "events".to_string(),
-        table_id: 1,
-        columns: vec![
-            ColumnDef {
-                name: "tenant_id".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "status".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-        ],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![index],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
+    let schema = {
+        let mut s = TableSchema::new(
+            "events".to_string(),
+            1,
+            vec![
+                ColumnDef::new("tenant_id", DataType::Int64, false),
+                ColumnDef::new("status", DataType::Text, false),
+            ],
+            vec![],
+        );
+        s.owner = String::new();
+        s.indexes = vec![index];
+        s
     };
 
     // Stats: tenant_id has 100 distinct values, status has 5

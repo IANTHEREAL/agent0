@@ -54,36 +54,10 @@ impl HashSemiJoinOperator {
             .schema()
             .columns
             .iter()
-            .map(|col| ColumnDef {
-                name: col.name.clone(),
-                data_type: col.data_type.clone(),
-                nullable: col.nullable,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            })
+            .map(|col| ColumnDef::new(col.name.clone(), col.data_type.clone(), col.nullable))
             .collect();
 
-        let output_schema = TableSchema {
-            name: "hash_semi_join".to_string(),
-            table_id: 0,
-            columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let output_schema = TableSchema::virtual_table("hash_semi_join", columns);
 
         Self {
             left_child,
@@ -252,36 +226,14 @@ mod tests {
     }
 
     fn make_schema(name: &str, cols: &[(&str, DataType, bool)]) -> TableSchema {
-        TableSchema {
-            name: name.to_string(),
-            table_id: 1,
-            columns: cols
-                .iter()
-                .map(|(n, dt, nullable)| ColumnDef {
-                    name: (*n).to_string(),
-                    data_type: dt.clone(),
-                    nullable: *nullable,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                })
+        TableSchema::new(
+            name.to_string(),
+            1,
+            cols.iter()
+                .map(|(n, dt, nullable)| ColumnDef::new(*n, dt.clone(), *nullable))
                 .collect(),
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+            vec![],
+        )
     }
 
     #[test]

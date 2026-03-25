@@ -24,10 +24,9 @@ impl VirtualTable for PgStatUserTables {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_stat_user_tables".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_stat_user_tables",
+            vec![
                 int_col("relid"),
                 text_col("schemaname"),
                 text_col("relname"),
@@ -41,17 +40,7 @@ impl VirtualTable for PgStatUserTables {
                 int_col("n_live_tup"),
                 int_col("n_dead_tup"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

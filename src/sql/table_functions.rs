@@ -19,61 +19,14 @@ use tokio::io::AsyncBufRead;
 #[cfg(test)]
 fn basic_fs9_schema() -> TableSchema {
     use crate::model::{ColumnDef, DataType};
-    TableSchema {
-        table_id: 0,
-        name: "fs9".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "_line_number".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "line".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
-            ColumnDef {
-                name: "_path".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            },
+    TableSchema::virtual_table(
+        "fs9",
+        vec![
+            ColumnDef::new("_line_number", DataType::Int64, false),
+            ColumnDef::new("line", DataType::Text, false),
+            ColumnDef::new("_path", DataType::Text, false),
         ],
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+    )
 }
 
 /// Build a stable signature key for a table-valued function call in FROM.

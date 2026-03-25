@@ -467,19 +467,7 @@ mod tests {
     use sqlparser::ast::BinaryOperator;
 
     fn test_col(name: &str, data_type: DataType) -> ColumnDef {
-        ColumnDef {
-            name: name.to_string(),
-            data_type,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }
+        ColumnDef::new(name, data_type, true)
     }
 
     #[test]

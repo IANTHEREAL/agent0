@@ -393,36 +393,13 @@ pub(crate) fn build_cte_table_schema(
     cte_name: &str,
     columns: Vec<(String, DataType)>,
 ) -> TableSchema {
-    TableSchema {
-        table_id: 0,
-        name: cte_name.to_string(),
-        columns: columns
+    TableSchema::virtual_table(
+        cte_name,
+        columns
             .into_iter()
-            .map(|(name, data_type)| ColumnDef {
-                name,
-                data_type,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            })
+            .map(|(name, data_type)| ColumnDef::new(name, data_type, true))
             .collect(),
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+    )
 }
 
 /// Check if a CTE is recursive (references itself in the UNION)

@@ -538,19 +538,11 @@ mod tests {
         let schema = TableSchema::new(
             "public.docs".to_string(),
             1,
-            vec![crate::model::ColumnDef {
-                name: "payload".to_string(),
-                data_type: DataType::Jsonb,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
+            vec![crate::model::ColumnDef::new(
+                "payload",
+                DataType::Jsonb,
+                true,
+            )],
             vec![],
         );
         let index = IndexDef {

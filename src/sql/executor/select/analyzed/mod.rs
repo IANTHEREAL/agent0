@@ -233,41 +233,19 @@ impl Executor {
                         } else {
                             crate::model::infer_column_types_from_rows(&rows, col_names.len())
                         };
-                        let schema = TableSchema {
-                            table_id: 0,
-                            name: cte.name.clone(),
-                            columns: col_names
+                        let schema = TableSchema::virtual_table(
+                            cte.name.clone(),
+                            col_names
                                 .iter()
                                 .enumerate()
-                                .map(|(idx, n)| crate::model::ColumnDef {
-                                    name: n.clone(),
+                                .map(|(idx, n)| {
                                     // Index guard: unreachable when types and columns are aligned.
-                                    data_type: inferred_types
-                                        .get(idx)
-                                        .cloned()
-                                        .unwrap_or(DataType::Text),
-                                    nullable: true,
-                                    primary_key: false,
-                                    unique: false,
-                                    is_serial: false,
-                                    default_expr: None,
-                                    generation_expr: None,
-                                    generation_expr_authorized_by: None,
-                                    collation: None,
-                                    is_dropped: false,
+                                    let dt =
+                                        inferred_types.get(idx).cloned().unwrap_or(DataType::Text);
+                                    crate::model::ColumnDef::new(n.clone(), dt, true)
                                 })
                                 .collect(),
-                            pk_constraint_name: None,
-                            pk_indices: vec![],
-                            indexes: vec![],
-                            version: 1,
-                            check_constraints: vec![],
-                            foreign_keys: vec![],
-                            owner: String::new(),
-                            rls_enabled: false,
-                            rls_force: false,
-                            from_alias: None,
-                        };
+                        );
                         ctes.insert(cte.name.to_lowercase(), (schema, rows));
                     }
                     _ => return Err(anyhow!("CTE must be a SELECT query")),

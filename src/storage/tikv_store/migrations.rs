@@ -1125,12 +1125,10 @@ mod tests {
         pk_indices: Vec<usize>,
         foreign_keys: Vec<ForeignKeyConstraint>,
     ) -> TableSchema {
-        TableSchema {
-            name: table_name.to_string(),
-            pk_indices,
-            foreign_keys,
-            ..TableSchema::default()
-        }
+        let mut s = TableSchema::virtual_table(table_name, vec![]);
+        s.pk_indices = pk_indices;
+        s.foreign_keys = foreign_keys;
+        s
     }
 
     fn no_pk_target(table_name: &str, fk_name: &str) -> NoPkFkDowngradeTarget {

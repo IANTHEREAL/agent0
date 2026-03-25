@@ -38,12 +38,12 @@ pub(crate) fn detect_format(path: &str, explicit_format: Option<&str>) -> &'stat
 }
 
 pub(crate) fn decode_raw_text(data: &[u8], path: &str, max_rows: usize) -> DecodedRows {
-    let schema = make_schema(
+    let schema = TableSchema::virtual_table(
         "fs9",
         vec![
-            make_column("_line_number", DataType::Int64, false),
-            make_column("line", DataType::Text, false),
-            make_column("_path", DataType::Text, false),
+            ColumnDef::new("_line_number", DataType::Int64, false),
+            ColumnDef::new("line", DataType::Text, false),
+            ColumnDef::new("_path", DataType::Text, false),
         ],
     );
 
@@ -65,14 +65,14 @@ pub(crate) fn decode_raw_text(data: &[u8], path: &str, max_rows: usize) -> Decod
 }
 
 pub(crate) fn decode_directory(entries: Vec<FsFileInfo>) -> DecodedRows {
-    let schema = make_schema(
+    let schema = TableSchema::virtual_table(
         "fs9",
         vec![
-            make_column("path", DataType::Text, false),
-            make_column("type", DataType::Text, false),
-            make_column("size", DataType::Int64, false),
-            make_column("mode", DataType::Int64, false),
-            make_column("mtime", DataType::Text, false),
+            ColumnDef::new("path", DataType::Text, false),
+            ColumnDef::new("type", DataType::Text, false),
+            ColumnDef::new("size", DataType::Int64, false),
+            ColumnDef::new("mode", DataType::Int64, false),
+            ColumnDef::new("mtime", DataType::Text, false),
         ],
     );
 
@@ -131,12 +131,12 @@ pub(crate) fn decode_csv(
         let headers = reader.headers()?.clone();
         let col_count = headers.len();
 
-        let mut columns = vec![make_column("_line_number", DataType::Int64, false)];
+        let mut columns = vec![ColumnDef::new("_line_number", DataType::Int64, false)];
         for name in headers.iter() {
-            columns.push(make_column(name, DataType::Text, true));
+            columns.push(ColumnDef::new(name, DataType::Text, true));
         }
-        columns.push(make_column("_path", DataType::Text, false));
-        let schema = make_schema("fs9", columns);
+        columns.push(ColumnDef::new("_path", DataType::Text, false));
+        let schema = TableSchema::virtual_table("fs9", columns);
 
         let mut rows = Vec::new();
         for (idx, record) in reader.records().enumerate() {
@@ -161,11 +161,11 @@ pub(crate) fn decode_csv(
 
     let mut records = reader.records();
     let Some(first) = records.next() else {
-        let schema = make_schema(
+        let schema = TableSchema::virtual_table(
             "fs9",
             vec![
-                make_column("_line_number", DataType::Int64, false),
-                make_column("_path", DataType::Text, false),
+                ColumnDef::new("_line_number", DataType::Int64, false),
+                ColumnDef::new("_path", DataType::Text, false),
             ],
         );
         return Ok(DecodedRows {
@@ -176,12 +176,12 @@ pub(crate) fn decode_csv(
 
     let first = first?;
     let col_count = first.len();
-    let mut columns = vec![make_column("_line_number", DataType::Int64, false)];
+    let mut columns = vec![ColumnDef::new("_line_number", DataType::Int64, false)];
     for idx in 0..col_count {
-        columns.push(make_column(&format!("col_{idx}"), DataType::Text, true));
+        columns.push(ColumnDef::new(format!("col_{idx}"), DataType::Text, true));
     }
-    columns.push(make_column("_path", DataType::Text, false));
-    let schema = make_schema("fs9", columns);
+    columns.push(ColumnDef::new("_path", DataType::Text, false));
+    let schema = TableSchema::virtual_table("fs9", columns);
 
     let mut rows = Vec::new();
     if max_rows > 0 {
@@ -218,12 +218,12 @@ pub(crate) fn decode_csv(
 }
 
 pub(crate) fn decode_jsonl(data: &[u8], path: &str, max_rows: usize) -> DecodedRows {
-    let schema = make_schema(
+    let schema = TableSchema::virtual_table(
         "fs9",
         vec![
-            make_column("_line_number", DataType::Int64, false),
-            make_column("line", DataType::Jsonb, false),
-            make_column("_path", DataType::Text, false),
+            ColumnDef::new("_line_number", DataType::Int64, false),
+            ColumnDef::new("line", DataType::Jsonb, false),
+            ColumnDef::new("_path", DataType::Text, false),
         ],
     );
 
@@ -281,40 +281,6 @@ pub(crate) fn decode_csv_header_only(
     header: Option<bool>,
 ) -> Result<TableSchema> {
     decode_csv(data, path, delimiter, header, 0).map(|d| d.schema)
-}
-
-fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
-    ColumnDef {
-        name: name.to_string(),
-        data_type,
-        nullable,
-        primary_key: false,
-        unique: false,
-        is_serial: false,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }
-}
-
-fn make_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
-    TableSchema {
-        table_id: 0,
-        name: name.to_string(),
-        columns,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
 }
 
 #[cfg(test)]

@@ -292,19 +292,13 @@ pub async fn execute_create_table(
             nullable = false;
         }
 
-        let column_def = ColumnDef {
-            name: col_name,
-            data_type,
-            nullable,
-            primary_key: is_pk,
-            unique,
-            is_serial,
-            default_expr,
-            generation_expr: generation_expr_str,
-            generation_expr_authorized_by: None,
-            collation,
-            is_dropped: false,
-        };
+        let mut column_def = ColumnDef::new(col_name, data_type, nullable);
+        column_def.primary_key = is_pk;
+        column_def.unique = unique;
+        column_def.is_serial = is_serial;
+        column_def.default_expr = default_expr;
+        column_def.generation_expr = generation_expr_str;
+        column_def.collation = collation;
         if let Some(default_expr_ast) = default_expr_ast.as_ref() {
             validate_column_default_expr(
                 store,
@@ -522,21 +516,11 @@ pub async fn execute_create_table(
         }
     }
 
-    let mut schema = TableSchema {
-        name: table_full_name.clone(),
-        table_id,
-        columns: col_defs,
-        version: 1,
-        pk_constraint_name,
-        pk_indices,
-        indexes,
-        check_constraints,
-        foreign_keys,
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    };
+    let mut schema = TableSchema::new(table_full_name.clone(), table_id, col_defs, pk_indices);
+    schema.pk_constraint_name = pk_constraint_name;
+    schema.indexes = indexes;
+    schema.check_constraints = check_constraints;
+    schema.foreign_keys = foreign_keys;
 
     for column_idx in 0..schema.columns.len() {
         let authorizer =
@@ -626,19 +610,10 @@ pub async fn create_table_from_query_result(
     }
 
     // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
-    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
-        name: "_rowid".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
-        primary_key: true,
-        unique: true,
-        is_serial: true,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }];
+    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef::new("_rowid", DataType::Int64, false)
+        .primary_key()
+        .unique()
+        .serial()];
 
     if explicit_columns.is_empty() {
         col_defs.extend(result_cols.iter().enumerate().map(|(i, col_name)| {
@@ -647,19 +622,7 @@ pub async fn create_table_from_query_result(
             } else {
                 DataType::Text
             };
-            ColumnDef {
-                name: col_name.clone(),
-                data_type,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }
+            ColumnDef::new(col_name.clone(), data_type, true)
         }));
     } else {
         col_defs.extend(
@@ -667,19 +630,7 @@ pub async fn create_table_from_query_result(
                 .iter()
                 .map(|col| {
                     let data_type = sql_datatype_to_internal_strict(&col.data_type)?;
-                    Ok(ColumnDef {
-                        name: normalize_ident(&col.name),
-                        data_type,
-                        nullable: true,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                        generation_expr: None,
-                        generation_expr_authorized_by: None,
-                        collation: None,
-                        is_dropped: false,
-                    })
+                    Ok(ColumnDef::new(normalize_ident(&col.name), data_type, true))
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
@@ -690,22 +641,8 @@ pub async fn create_table_from_query_result(
     // does not expose/reserve a user-visible "<table>_pkey" constraint name.
     // Use empty-name sentinel (not None) so legacy fallback checks do not
     // synthesize "<table>_pkey" from pk_indices.
-    let pk_constraint_name = Some(String::new());
-    let mut schema = TableSchema {
-        name: table_name.to_string(),
-        table_id,
-        columns: col_defs,
-        version: 1,
-        pk_constraint_name,
-        pk_indices: vec![0],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    };
+    let mut schema = TableSchema::new(table_name.to_string(), table_id, col_defs, vec![0]);
+    schema.pk_constraint_name = Some(String::new());
     store.create_table(txn, db_id, schema.clone()).await?;
     let excl = schema.name.clone();
     create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
@@ -743,57 +680,22 @@ pub async fn create_table_from_stream(
     }
 
     // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
-    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
-        name: "_rowid".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
-        primary_key: true,
-        unique: true,
-        is_serial: true,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }];
+    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef::new("_rowid", DataType::Int64, false)
+        .primary_key()
+        .unique()
+        .serial()];
 
     for (i, col_name) in result_cols.iter().enumerate() {
         // INTENTIONAL: Text is the safe fallback for column types in streaming CTAS
         let data_type = column_types.get(i).cloned().unwrap_or(DataType::Text);
-        col_defs.push(ColumnDef {
-            name: col_name.clone(),
-            data_type,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        });
+        col_defs.push(ColumnDef::new(col_name.clone(), data_type, true));
     }
 
     let table_id = store.next_table_id(txn, db_id).await?;
     // Streaming CTAS uses an internal synthetic row-id PK for storage only;
     // same convention as batch CTAS — empty-name sentinel.
-    let pk_constraint_name = Some(String::new());
-    let mut schema = TableSchema {
-        name: table_name.to_string(),
-        table_id,
-        columns: col_defs,
-        version: 1,
-        pk_constraint_name,
-        pk_indices: vec![0],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    };
+    let mut schema = TableSchema::new(table_name.to_string(), table_id, col_defs, vec![0]);
+    schema.pk_constraint_name = Some(String::new());
     store.create_table(txn, db_id, schema.clone()).await?;
     let excl = schema.name.clone();
     create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
@@ -844,19 +746,10 @@ pub async fn create_table_from_select_into(
     }
 
     // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
-    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
-        name: "_rowid".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
-        primary_key: true,
-        unique: true,
-        is_serial: true,
-        default_expr: None,
-        generation_expr: None,
-        generation_expr_authorized_by: None,
-        collation: None,
-        is_dropped: false,
-    }];
+    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef::new("_rowid", DataType::Int64, false)
+        .primary_key()
+        .unique()
+        .serial()];
 
     col_defs.extend(result_cols.iter().enumerate().map(|(i, col_name)| {
         let data_type = if !result_rows.is_empty() {
@@ -864,19 +757,7 @@ pub async fn create_table_from_select_into(
         } else {
             DataType::Text
         };
-        ColumnDef {
-            name: col_name.clone(),
-            data_type,
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }
+        ColumnDef::new(col_name.clone(), data_type, true)
     }));
 
     let table_id = store.next_table_id(txn, db_id).await?;
@@ -884,22 +765,8 @@ pub async fn create_table_from_select_into(
     // must not reserve a user-visible "<table>_pkey" relation name.
     // Use empty-name sentinel (not None) so legacy fallback checks do not
     // synthesize "<table>_pkey" from pk_indices.
-    let pk_constraint_name = Some(String::new());
-    let mut schema = TableSchema {
-        name: table_name.to_string(),
-        table_id,
-        columns: col_defs,
-        version: 1,
-        pk_constraint_name,
-        pk_indices: vec![0],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: "postgres".to_string(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    };
+    let mut schema = TableSchema::new(table_name.to_string(), table_id, col_defs, vec![0]);
+    schema.pk_constraint_name = Some(String::new());
     store.create_table(txn, db_id, schema.clone()).await?;
     let excl = schema.name.clone();
     create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;

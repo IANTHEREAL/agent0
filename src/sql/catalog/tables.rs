@@ -21,10 +21,9 @@ impl VirtualTable for Tables {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "tables".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "tables",
+            vec![
                 text_col("table_catalog"),
                 text_col("table_schema"),
                 text_col("table_name"),
@@ -39,17 +38,7 @@ impl VirtualTable for Tables {
                 text_col("commit_action"),
                 text_col("table_owner"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

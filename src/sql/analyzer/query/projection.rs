@@ -58,102 +58,39 @@ impl<'a> Analyzer<'a> {
 
     fn leaf_wildcard_source_schema(table_ref: &AnalyzedTableRef) -> TableSchema {
         match &table_ref.kind {
-            AnalyzedTableRefKind::Table { name, schema } => TableSchema {
-                name: name.clone(),
-                table_id: 0,
-                columns: schema
+            AnalyzedTableRefKind::Table { name, schema } => TableSchema::virtual_table(
+                name.clone(),
+                schema
                     .columns
                     .iter()
-                    .map(|(col_name, data_type, nullable)| ColumnDef {
-                        name: col_name.clone(),
-                        data_type: data_type.clone(),
-                        nullable: *nullable,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                        generation_expr: None,
-                        generation_expr_authorized_by: None,
-                        collation: None,
-                        is_dropped: false,
+                    .map(|(col_name, data_type, nullable)| {
+                        ColumnDef::new(col_name.clone(), data_type.clone(), *nullable)
                     })
                     .collect(),
-                version: 1,
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                rls_enabled: false,
-                rls_force: false,
-                from_alias: None,
-            },
-            AnalyzedTableRefKind::Subquery(query) => TableSchema {
-                name: "subquery".to_string(),
-                table_id: 0,
-                columns: query
+            ),
+            AnalyzedTableRefKind::Subquery(query) => TableSchema::virtual_table(
+                "subquery",
+                query
                     .output_schema
                     .iter()
-                    .map(|(col_name, data_type, _coll)| ColumnDef {
-                        name: col_name.clone(),
-                        data_type: data_type.clone(),
-                        nullable: true,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                        generation_expr: None,
-                        generation_expr_authorized_by: None,
-                        collation: None,
-                        is_dropped: false,
+                    .map(|(col_name, data_type, _coll)| {
+                        ColumnDef::new(col_name.clone(), data_type.clone(), true)
                     })
                     .collect(),
-                version: 1,
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                rls_enabled: false,
-                rls_force: false,
-                from_alias: None,
-            },
+            ),
             AnalyzedTableRefKind::Function {
                 func,
                 output_columns,
                 ..
-            } => TableSchema {
-                name: func.name.clone(),
-                table_id: 0,
-                columns: output_columns
+            } => TableSchema::virtual_table(
+                func.name.clone(),
+                output_columns
                     .iter()
-                    .map(|(col_name, data_type)| ColumnDef {
-                        name: col_name.clone(),
-                        data_type: data_type.clone(),
-                        nullable: true,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                        generation_expr: None,
-                        generation_expr_authorized_by: None,
-                        collation: None,
-                        is_dropped: false,
+                    .map(|(col_name, data_type)| {
+                        ColumnDef::new(col_name.clone(), data_type.clone(), true)
                     })
                     .collect(),
-                version: 1,
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                rls_enabled: false,
-                rls_force: false,
-                from_alias: None,
-            },
+            ),
             AnalyzedTableRefKind::Join { .. } => unreachable!(),
         }
     }

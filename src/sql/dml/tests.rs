@@ -5,33 +5,16 @@ use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use std::collections::HashMap;
 
 fn enum_schema() -> TableSchema {
-    TableSchema {
-        name: "t".to_string(),
-        table_id: 1,
-        columns: vec![ColumnDef {
-            name: "r".to_string(),
-            data_type: DataType::UserDefined("public.role".to_string()),
-            nullable: true,
-            primary_key: false,
-            unique: false,
-            is_serial: false,
-            default_expr: None,
-            generation_expr: None,
-            generation_expr_authorized_by: None,
-            collation: None,
-            is_dropped: false,
-        }],
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        rls_enabled: false,
-        rls_force: false,
-        from_alias: None,
-    }
+    TableSchema::new(
+        "t".to_string(),
+        1,
+        vec![ColumnDef::new(
+            "r",
+            DataType::UserDefined("public.role".to_string()),
+            true,
+        )],
+        vec![],
+    )
 }
 
 fn enum_cache() -> EnumLabelCache {

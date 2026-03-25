@@ -173,58 +173,23 @@ mod tests {
 
     #[test]
     fn pk_types_for_schema_defaults_to_uuid_without_pk() {
-        let schema = TableSchema {
-            columns: vec![ColumnDef {
-                name: "c".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            ..TableSchema::default()
-        };
+        let schema =
+            TableSchema::virtual_table("", vec![ColumnDef::new("c", DataType::Int32, true)]);
         assert_eq!(pk_types_for_schema(&schema), vec![DataType::Uuid]);
     }
 
     #[test]
     fn pk_types_for_schema_uses_pk_indices_order() {
-        let schema = TableSchema {
-            columns: vec![
-                ColumnDef {
-                    name: "a".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "b".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            pk_indices: vec![1, 0],
-            ..TableSchema::default()
+        let schema = {
+            let mut s = TableSchema::virtual_table(
+                "",
+                vec![
+                    ColumnDef::new("a", DataType::Int32, false),
+                    ColumnDef::new("b", DataType::Text, false),
+                ],
+            );
+            s.pk_indices = vec![1, 0];
+            s
         };
         assert_eq!(
             pk_types_for_schema(&schema),

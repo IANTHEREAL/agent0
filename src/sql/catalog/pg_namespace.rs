@@ -19,27 +19,16 @@ impl VirtualTable for PgNamespace {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "pg_namespace".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "pg_namespace",
+            vec![
                 int_col("oid"),
                 text_col("nspname"),
                 int_col("nspowner"),
                 // nspacl — access privileges; NULL = no explicit ACL (PG default).
                 text_array_col("nspacl"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

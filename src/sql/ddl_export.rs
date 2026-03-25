@@ -507,57 +507,33 @@ mod tests {
 
     #[test]
     fn table_to_ddl_includes_constraints() {
-        let schema = TableSchema {
-            name: "public.users".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: true,
-                    default_expr: None,
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-                ColumnDef {
-                    name: "email".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: true,
-                    is_serial: false,
-                    default_expr: Some("'x@example.com'".to_string()),
-                    generation_expr: None,
-                    generation_expr_authorized_by: None,
-                    collation: None,
-                    is_dropped: false,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: Some("users_pkey".to_string()),
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![CheckConstraint {
+        let schema = {
+            let mut s = TableSchema::new(
+                "public.users".to_string(),
+                1,
+                vec![
+                    ColumnDef::new("id", DataType::Int32, false)
+                        .primary_key()
+                        .serial(),
+                    ColumnDef::new("email", DataType::Text, false)
+                        .unique()
+                        .default_expr("'x@example.com'"),
+                ],
+                vec![0],
+            );
+            s.check_constraints = vec![CheckConstraint {
                 name: Some("users_email_chk".to_string()),
                 expr: "email <> ''".to_string(),
-            }],
-            foreign_keys: vec![ForeignKeyConstraint {
+            }];
+            s.foreign_keys = vec![ForeignKeyConstraint {
                 name: "users_org_fk".to_string(),
                 columns: vec!["id".to_string()],
                 ref_table: "public.orgs".to_string(),
                 ref_columns: vec!["id".to_string()],
                 on_delete: ForeignKeyAction::Cascade,
                 on_update: ForeignKeyAction::NoAction,
-            }],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
+            }];
+            s
         };
 
         let mut serial_sequences = HashMap::new();
@@ -577,33 +553,14 @@ mod tests {
 
     #[test]
     fn table_to_ddl_serial_uses_explicit_default_expression() {
-        let schema = TableSchema {
-            name: "public.users".to_string(),
-            table_id: 1,
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: true,
-                default_expr: Some("42".to_string()),
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema = TableSchema::new(
+            "public.users".to_string(),
+            1,
+            vec![ColumnDef::new("id", DataType::Int32, false)
+                .serial()
+                .default_expr("42")],
+            vec![],
+        );
 
         let mut serial_sequences = HashMap::new();
         serial_sequences.insert("id".to_string(), "public.users_id_seq".to_string());
@@ -614,33 +571,14 @@ mod tests {
 
     #[test]
     fn table_to_ddl_serial_drop_default_omits_default_clause() {
-        let schema = TableSchema {
-            name: "public.users".to_string(),
-            table_id: 1,
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: true,
-                default_expr: Some(crate::sql::sequences::serial_default_dropped_marker().into()),
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let schema = TableSchema::new(
+            "public.users".to_string(),
+            1,
+            vec![ColumnDef::new("id", DataType::Int32, false)
+                .serial()
+                .default_expr(crate::sql::sequences::serial_default_dropped_marker())],
+            vec![],
+        );
 
         let mut serial_sequences = HashMap::new();
         serial_sequences.insert("id".to_string(), "public.users_id_seq".to_string());
@@ -774,43 +712,25 @@ mod tests {
     }
 
     fn make_schema(name: &str, fk_refs: &[&str]) -> TableSchema {
-        TableSchema {
-            name: name.to_string(),
-            table_id: 1,
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: true,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: fk_refs
-                .iter()
-                .map(|rt| ForeignKeyConstraint {
-                    name: format!("fk_{}", rt),
-                    columns: vec!["id".to_string()],
-                    ref_table: rt.to_string(),
-                    ref_columns: vec!["id".to_string()],
-                    on_delete: ForeignKeyAction::NoAction,
-                    on_update: ForeignKeyAction::NoAction,
-                })
-                .collect(),
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        let mut s = TableSchema::new(
+            name.to_string(),
+            1,
+            vec![ColumnDef::new("id", DataType::Int32, false).primary_key()],
+            vec![0],
+        );
+        s.pk_constraint_name = None;
+        s.foreign_keys = fk_refs
+            .iter()
+            .map(|rt| ForeignKeyConstraint {
+                name: format!("fk_{}", rt),
+                columns: vec!["id".to_string()],
+                ref_table: rt.to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+            })
+            .collect();
+        s
     }
 
     #[test]

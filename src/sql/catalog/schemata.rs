@@ -21,10 +21,9 @@ impl VirtualTable for Schemata {
     }
 
     fn schema(&self) -> TableSchema {
-        TableSchema {
-            table_id: 0,
-            name: "schemata".to_string(),
-            columns: vec![
+        TableSchema::virtual_table(
+            "schemata",
+            vec![
                 text_col("catalog_name"),
                 text_col("schema_name"),
                 text_col("schema_owner"),
@@ -33,17 +32,7 @@ impl VirtualTable for Schemata {
                 text_col("default_character_set_name"),
                 text_col("sql_path"),
             ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        }
+        )
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {

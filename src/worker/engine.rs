@@ -2029,38 +2029,19 @@ mod tests {
 
     #[test]
     fn repair_incomplete_cic_states_repairs_building_and_writeonly() {
-        let mut schema = TableSchema {
-            name: "public.t".to_string(),
-            table_id: 1,
-            columns: vec![crate::model::ColumnDef {
-                name: "c1".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                generation_expr: None,
-                generation_expr_authorized_by: None,
-                collation: None,
-                is_dropped: false,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![
-                idx("i_ready", IndexState::Ready),
-                idx("i_building", IndexState::Building),
-                idx("i_invalid", IndexState::Invalid),
-                idx("i_write_only", IndexState::WriteOnly),
-            ],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            rls_enabled: false,
-            rls_force: false,
-            from_alias: None,
-        };
+        let mut schema = TableSchema::new(
+            "public.t".to_string(),
+            1,
+            vec![crate::model::ColumnDef::new("c1", DataType::Int32, true)],
+            vec![],
+        );
+        schema.indexes = vec![
+            idx("i_ready", IndexState::Ready),
+            idx("i_building", IndexState::Building),
+            idx("i_invalid", IndexState::Invalid),
+            idx("i_write_only", IndexState::WriteOnly),
+        ];
+        schema.owner = "postgres".to_string();
 
         let repaired = repair_incomplete_cic_states(&mut schema);
         assert_eq!(repaired, 2);
@@ -2072,13 +2053,11 @@ mod tests {
 
     #[test]
     fn repair_incomplete_cic_states_noop_when_no_transient_state() {
-        let mut schema = TableSchema {
-            indexes: vec![
-                idx("i_ready", IndexState::Ready),
-                idx("i_invalid", IndexState::Invalid),
-            ],
-            ..TableSchema::default()
-        };
+        let mut schema = TableSchema::virtual_table("", vec![]);
+        schema.indexes = vec![
+            idx("i_ready", IndexState::Ready),
+            idx("i_invalid", IndexState::Invalid),
+        ];
 
         let repaired = repair_incomplete_cic_states(&mut schema);
         assert_eq!(repaired, 0);
