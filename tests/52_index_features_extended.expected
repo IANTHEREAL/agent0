@@ -53,6 +53,7 @@ CREATE_COMPLEX:success
 (1 row)
 ERROR:  index "idx_ext_tags_gin" does not exist
 ERROR:  index "idx_ext_data_gist" does not exist
+ERROR:  index "idx_ext_name_hash" does not exist
 ?column?
 DROP_ALL:success
 (1 row)

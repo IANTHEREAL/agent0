@@ -1,0 +1,65 @@
+-- schedule returns job IDs
+schedule
+1
+schedule
+2
+schedule
+3
+
+-- alter_job disables job 2
+alter_job
+NULL
+
+-- all columns from cron.job
+jobid|schedule|command|nodename|nodeport|database|username|active|jobname
+59 23 31 12 *|SELECT 1|localhost|5433|
+vtab_every_min
+vtab_hourly
+vtab_daily
+(3 rows)
+
+-- active jobs
+jobname
+vtab_daily
+vtab_every_min
+(2 rows)
+
+-- inactive jobs
+jobname
+vtab_hourly
+(1 row)
+
+-- filter by schedule
+vtab_every_min|59 23 31 12 *
+
+-- filter by command
+vtab_daily
+
+-- count all jobs
+count
+3
+
+-- count active
+count
+2
+
+-- job_run_details empty
+(0 rows)
+
+-- count on empty
+count
+0
+
+-- filter by jobid
+vtab_every_min
+
+-- filter by jobname
+0 0 * * *|VACUUM
+
+-- cleanup
+unschedule
+t
+unschedule
+t
+unschedule
+t

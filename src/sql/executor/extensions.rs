@@ -405,6 +405,13 @@ impl Executor {
             if !installed.enabled {
                 return Err(anyhow!("extension \"http\" is disabled"));
             }
+            if !crate::extensions::context::is_superuser() {
+                return Err(crate::sql::error::SqlError::PermissionDenied {
+                    object_type: "extension".into(),
+                    object_name: "\"http\"".into(),
+                }
+                .into());
+            }
 
             let (mut schema, rows) =
                 http::execute_table_function(self.tenant_keyspace(), call).await?;

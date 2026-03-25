@@ -57,6 +57,6 @@ HELLO WORLD
 PostgreSQL
 db9-server
 has_version
-postgres
+current_database
 public
 has_pid

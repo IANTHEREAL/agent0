@@ -1287,7 +1287,10 @@ mod tests {
         let cleared = ColumnDef::new("id", DataType::Int64, true)
             .default_expr("42")
             .serial();
-        assert!(cleared.default_expr.is_none(), "serial() must clear prior default_expr");
+        assert!(
+            cleared.default_expr.is_none(),
+            "serial() must clear prior default_expr"
+        );
 
         let preserved = ColumnDef::new("id", DataType::Int64, true)
             .serial()

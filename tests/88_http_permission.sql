@@ -6,6 +6,6 @@ DROP ROLE IF EXISTS bob;
 CREATE ROLE bob LOGIN PASSWORD 'bob';
 
 \setenv PGPASSWORD bob
-\connect postgres bob
+\connect - bob
 
 SELECT status FROM extensions.http_get('https://example.com');

@@ -13,9 +13,9 @@ use tokio::fs;
 use tracing::warn;
 
 use crate::extensions::fs::embedded::keys;
-use crate::txn::txn_put;
 #[cfg(test)]
 use crate::extensions::fs::embedded::types::FS9_SPOOL_LAYOUT_VERSION;
+use crate::txn::txn_put;
 
 const BUNDLE_TRAILER_MAGIC: &[u8; 8] = b"FS9PACK1";
 

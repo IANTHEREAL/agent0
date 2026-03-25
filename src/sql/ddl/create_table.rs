@@ -107,6 +107,8 @@ pub async fn execute_create_table(
     let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
     let mut fk_name_is_user_specified: Vec<bool> = Vec::new();
     let mut col_defs = Vec::new();
+    let mut unique_constraint_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for col in columns {
         let col_name = normalize_ident(&col.name);
         let (data_type, mut is_serial) =
@@ -115,6 +117,7 @@ pub async fn execute_create_table(
         let mut is_pk = pk_columns.contains(&col_name);
         let mut nullable = true;
         let mut unique = false;
+        let mut unique_constraint_name: Option<String> = None;
         let mut default_expr = None;
         let mut default_expr_ast = None;
         let collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
@@ -131,6 +134,9 @@ pub async fn execute_create_table(
                         }
                     } else {
                         unique = true;
+                        if unique_constraint_name.is_none() {
+                            unique_constraint_name = opt.name.as_ref().map(normalize_ident);
+                        }
                     }
                 }
                 ColumnOption::NotNull => nullable = false,
@@ -291,6 +297,9 @@ pub async fn execute_create_table(
         if is_pk {
             nullable = false;
         }
+        if let Some(ucn) = unique_constraint_name {
+            unique_constraint_names.insert(col_name.clone(), ucn);
+        }
 
         let mut column_def = ColumnDef::new(col_name, data_type, nullable);
         column_def.primary_key = is_pk;
@@ -341,8 +350,12 @@ pub async fn execute_create_table(
 
     for col in col_defs.iter() {
         if col.unique && !col.primary_key {
+            let idx_name = unique_constraint_names
+                .get(&col.name)
+                .cloned()
+                .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col.name));
             indexes.push(IndexDef {
-                name: format!("{}_{}_key", table_object_name, col.name),
+                name: idx_name,
                 id: next_index_id,
                 columns: vec![col.name.clone()],
                 unique: true,
@@ -552,6 +565,30 @@ pub async fn execute_create_table(
         }
 
         resolve_fk_ref_lookup(&fk.ref_columns, &schema)?;
+    }
+
+    // Check for collisions between explicit constraint/index names and
+    // implicit SERIAL sequence names (PostgreSQL 42P07 parity).
+    {
+        let mut constraint_names: HashSet<String> = HashSet::new();
+        if let Some(pk) = &schema.pk_constraint_name {
+            constraint_names.insert(pk.clone());
+        }
+        for idx in &schema.indexes {
+            constraint_names.insert(idx.name.clone());
+        }
+        for fk in &schema.foreign_keys {
+            constraint_names.insert(fk.name.clone());
+        }
+        for col in &schema.columns {
+            if col.is_serial {
+                let seq_name =
+                    crate::sql::sequences::implicit_sequence_name(&table_object_name, &col.name);
+                if constraint_names.contains(&seq_name) {
+                    return Err(SqlError::DuplicateRelation(seq_name).into());
+                }
+            }
+        }
     }
 
     store.create_table(txn, db_id, schema.clone()).await?;

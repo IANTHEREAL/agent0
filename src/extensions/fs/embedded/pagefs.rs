@@ -14,7 +14,6 @@ use crate::extensions::fs::embedded::bundle::{
 use crate::extensions::fs::embedded::lifecycle::{self, FileLifecycle, UploadReservation};
 use crate::extensions::fs::embedded::types::*;
 use crate::extensions::fs::embedded::{blob, keys};
-use crate::txn::txn_put;
 use crate::extensions::fs::notify::{
     notify_metrics_for_keyspace, EventRing, FsEventBuilder, FsEventType,
 };
@@ -22,6 +21,7 @@ use crate::extensions::fs::s3::FsS3Client;
 use crate::extensions::fs::upload_token::{
     normalized_path_hash_hex, sign_upload_token, verify_upload_token, UploadTokenClaims,
 };
+use crate::txn::txn_put;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -3567,8 +3567,7 @@ async fn clear_staging_write(txn: &mut Transaction, inode_id: u64) -> Result<()>
 }
 
 async fn mark_orphan_inode(txn: &mut Transaction, inode_id: u64) -> Result<()> {
-    txn_put(txn, keys::orphan_inode_key(inode_id), Vec::new())
-        .await?;
+    txn_put(txn, keys::orphan_inode_key(inode_id), Vec::new()).await?;
     Ok(())
 }
 
@@ -3657,8 +3656,7 @@ async fn write_staging_page(
     if page_data.len() < PAGE_SIZE {
         page_data.resize(PAGE_SIZE, 0);
     }
-    txn_put(txn, keys::page_key(inode_id, page_num), page_data)
-        .await?;
+    txn_put(txn, keys::page_key(inode_id, page_num), page_data).await?;
     Ok(())
 }
 

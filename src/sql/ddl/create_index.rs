@@ -94,7 +94,7 @@ fn resolve_create_index_method(using: Option<&Ident>) -> Result<ResolvedIndexMet
         },
         "hash" | "gist" | "spgist" | "brin" => {
             return Err(anyhow!(
-                "access method \"{}\" is not supported\nHINT: Only btree, gin, and hnsw indexes are currently supported.",
+                "access method \"{}\" is not supported\nHINT:  Only btree, gin, and hnsw indexes are currently supported.",
                 method_raw
             ));
         }

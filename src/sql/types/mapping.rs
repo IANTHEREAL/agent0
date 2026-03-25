@@ -436,7 +436,7 @@ fn convert_custom_builtin(type_name: &str, modifiers: &[String]) -> Option<DataT
         "real" | "float4" | "double" | "double precision" | "float8" | "float" => {
             Some(DataType::Float64)
         }
-        "text" | "char" | "character" => Some(DataType::Text),
+        "text" | "char" | "character" | "bpchar" | "void" => Some(DataType::Text),
         "varchar" | "character varying" => Some(
             modifiers
                 .first()

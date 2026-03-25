@@ -425,8 +425,7 @@ pub(crate) async fn record_embedding_tokens(
         let new_total = current
             .checked_add(tokens)
             .ok_or_else(|| anyhow!("embedding: usage counter overflow"))?;
-        txn_put(&mut txn, key.clone(), new_total.to_be_bytes().to_vec())
-            .await?;
+        txn_put(&mut txn, key.clone(), new_total.to_be_bytes().to_vec()).await?;
         match txn.commit().await {
             Ok(_) => return Ok(new_total),
             Err(_) => {

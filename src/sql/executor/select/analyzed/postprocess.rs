@@ -82,8 +82,7 @@ impl Executor {
 
         // Use the same composite key that pipeline.rs uses to populate
         // build_ctx.table_schemas (schema_map_key includes the alias).
-        let schema_key =
-            crate::sql::optimizer::schema_map_key(&table_name, table_alias.as_deref());
+        let schema_key = crate::sql::optimizer::schema_map_key(&table_name, table_alias.as_deref());
 
         // Check that the table has a primary key (required for locking).
         if let Some(schema) = build_ctx.table_schemas.get(&schema_key) {
