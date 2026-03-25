@@ -3245,3 +3245,92 @@ async fn grouped_write_contract_single_subgroup() {
         assert!(entry.result.is_ok(), "entry {} must succeed", entry.path);
     }
 }
+
+/// Regression test for #2121: single-file `write_file` must produce an event
+/// visible through the Redis-backed `fs9_events()` TVF — the shipped surface
+/// that `db9 fs watch` polls.
+///
+/// Before #2121, `emit_event()` only pushed to the in-memory EventRing but did
+/// NOT call `persist_events_async()`, so `db9 fs watch` never saw single-file
+/// mutation events.
+///
+/// This test drives the real shipped path end-to-end:
+///   `write_file()` → `emit_event()` → `persist_events_async()` →
+///   Redis Streams XADD → `execute_fs9_events_from_redis()` → event visible
+///
+/// Requires both TiKV (for write_file) and Redis (for event persistence).
+#[tokio::test]
+#[ignore = "requires TiKV + Redis (REDIS_URL env var)"]
+async fn test_write_file_event_visible_through_fs9_events() {
+    use crate::extensions::fs::notify::execute_fs9_events_from_redis;
+
+    // Ensure Redis client and event loop are initialized.
+    // OnceLock-guarded — safe to call multiple times, only first succeeds.
+    let _ = crate::extensions::fs::redis_events::init_redis_client().await;
+    crate::extensions::fs::redis_events::spawn_event_loop();
+
+    let fs = make_fs().await;
+    let base = "/test_write_file_fs9_events_regression";
+    cleanup(&fs, base).await;
+    ensure_dir(&fs, base).await;
+
+    // Snapshot: query fs9_events before our write to get a cursor.
+    let before_rows = execute_fs9_events_from_redis(&fs.keyspace, "0", Some(base), 10_000)
+        .await
+        .unwrap_or_default();
+    let since_id = before_rows
+        .last()
+        .and_then(|r| match &r.values[0] {
+            crate::model::Value::Text(id) => Some(id.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "0".to_string());
+
+    // Perform a single-file write — the exact path broken before #2121.
+    let path = format!("{base}/watch_regression.txt");
+    fs.write_file(&path, b"hello from regression test", None)
+        .await
+        .expect("write_file must succeed");
+
+    // Poll fs9_events() until the event appears (background flush is async,
+    // FLUSH_INTERVAL = 50ms, so we retry for up to 2s).
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let rows = execute_fs9_events_from_redis(&fs.keyspace, &since_id, Some(base), 100)
+            .await
+            .unwrap_or_default();
+        let matching = rows.iter().any(|r| {
+            matches!(&r.values[2], crate::model::Value::Text(p) if p == &path)
+        });
+        if matching {
+            // Verify event type is CREATE or WRITE.
+            let event_row = rows
+                .iter()
+                .filter(|r| matches!(&r.values[2], crate::model::Value::Text(p) if p == &path))
+                .last()
+                .unwrap();
+            let event_type = match &event_row.values[1] {
+                crate::model::Value::Text(t) => t.as_str(),
+                _ => "",
+            };
+            assert!(
+                event_type == "CREATE" || event_type == "WRITE",
+                "expected CREATE or WRITE event, got '{}'",
+                event_type
+            );
+            found = true;
+            break;
+        }
+    }
+
+    assert!(
+        found,
+        "write_file event for '{}' not found in fs9_events() after 2s — \
+         this is the exact regression that #2121 fixed: single-file mutations \
+         were not persisted to Redis Streams",
+        path
+    );
+
+    cleanup(&fs, base).await;
+}
