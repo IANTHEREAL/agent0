@@ -101,13 +101,17 @@ pub(super) fn validate_intervalstyle(value: &str) -> Result<String> {
 }
 
 pub(super) fn validate_session_replication_role(value: &str) -> Result<String> {
-    let _ = value;
-    Err(SqlError::Unsupported(
-        "session_replication_role is not supported; \
-         triggers always fire as in \"origin\" mode"
-            .to_string(),
-    )
-    .into())
+    let v = value.trim().to_lowercase();
+    if v == "origin" {
+        Ok("origin".to_string())
+    } else {
+        Err(SqlError::Unsupported(
+            "session_replication_role is not supported; \
+             triggers always fire as in \"origin\" mode"
+                .to_string(),
+        )
+        .into())
+    }
 }
 
 pub(super) fn validate_default_transaction_deferrable(value: &str) -> Result<String> {

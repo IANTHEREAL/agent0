@@ -424,6 +424,15 @@ pub(crate) const GUC_TABLE: &[GucDef] = &[
         validate_fn: None,
     },
     GucDef {
+        name: "session_replication_role",
+        guc_type: GucType::String,
+        context: GucContext::Userset,
+        description: "session_replication_role is not supported; triggers always fire as in \"origin\" mode",
+        boot_default: "origin",
+        flags: 0,
+        validate_fn: Some(validate_session_replication_role),
+    },
+    GucDef {
         name: "standard_conforming_strings",
         guc_type: GucType::Bool,
         context: GucContext::Userset,

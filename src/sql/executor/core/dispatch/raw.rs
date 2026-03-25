@@ -434,15 +434,10 @@ impl Executor {
                     &rn.name,
                     &rn.original,
                 )?;
-                let allow_unknown_reset =
-                    crate::sql::session::settings::SessionSettings::resettable_unknown_guc(
-                        &rn.name,
-                    );
                 // PostgreSQL errors on unknown parameters (SQLSTATE 42704).
                 // Dotted names (custom GUC namespaces like `db9.foo`) are exempt —
                 // PG silently accepts `RESET ns.key` even when the key is unknown.
-                if !allow_unknown_reset
-                    && !rn.name.contains('.')
+                if !rn.name.contains('.')
                     && session.show_setting_value(&rn.name).is_none()
                 {
                     // Use original token text (case-preserved) for the error
@@ -757,7 +752,12 @@ mod tests {
             "RESET session_replication_role should succeed"
         );
         assert_command_tag(result.unwrap(), "RESET");
-        assert_eq!(session.show_setting_value("session_replication_role"), None);
+        assert_eq!(
+            session
+                .show_setting_value("session_replication_role")
+                .as_deref(),
+            Some("origin")
+        );
     }
 
     #[test]

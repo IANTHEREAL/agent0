@@ -10,60 +10,22 @@ impl SessionSettings {
         let canonical = Self::canonical_setting_name(name);
         match canonical {
             "search_path" => Self::format_search_path_show(&Self::default_search_path()),
+            "db9.dml_table_scan_max_rows" => DEFAULT_DML_TABLE_SCAN_MAX_ROWS.to_string(),
+            "db9.hash_join_work_mem" => DEFAULT_HASH_JOIN_WORK_MEM.to_string(),
+            "db9.max_sort_bytes" => DEFAULT_MAX_SORT_BYTES.to_string(),
+            "default_text_search_config" => {
+                crate::sql::fts_tokenizers::default_text_search_config().to_string()
+            }
             "statement_timeout"
             | "lock_timeout"
             | "idle_in_transaction_session_timeout"
             | "db9.retry_timeout" => Self::format_timeout_show(0),
-            "db9.dml_table_scan_max_rows" => DEFAULT_DML_TABLE_SCAN_MAX_ROWS.to_string(),
-            "db9.hash_join_work_mem" => DEFAULT_HASH_JOIN_WORK_MEM.to_string(),
-            "db9.max_sort_bytes" => DEFAULT_MAX_SORT_BYTES.to_string(),
-            "db9.prepared_plan_cache_size" => "128".to_string(),
-            "db9.prepared_plan_cache_min_exec" => "5".to_string(),
-            "hnsw.ef_search" => "40".to_string(),
-            "db9.retry_max_attempts" => "64".to_string(),
-            "db9.use_optimizer" => "on".to_string(),
-            "timezone" => "UTC".to_string(),
-            "application_name" => String::new(),
-            "client_encoding" => "UTF8".to_string(),
-            "standard_conforming_strings" => "on".to_string(),
-            "check_function_bodies" => "on".to_string(),
-            "xmloption" => "content".to_string(),
-            "client_min_messages" => "notice".to_string(),
-            "row_security" => "on".to_string(),
-            "default_tablespace" => String::new(),
-            "default_table_access_method" => "heap".to_string(),
-            "transaction_deferrable" | "default_transaction_deferrable" => "off".to_string(),
-            "transaction_isolation" => "repeatable read".to_string(),
-            "default_transaction_read_only" => "off".to_string(),
-            // Immutable / computed GUCs.
-            "server_version" => "16.0".to_string(),
-            "server_version_num" => "160000".to_string(),
-            "server_encoding" => "UTF8".to_string(),
-            "datestyle" => "ISO, MDY".to_string(),
-            "integer_datetimes" => "on".to_string(),
-            "intervalstyle" => "postgres".to_string(),
-            _ => {
-                // Fall back to boot_default from GUC_TABLE registry.
-                GUC_TABLE
-                    .iter()
-                    .find(|g| g.name == canonical)
-                    .map(|g| {
-                        if g.boot_default.is_empty() {
-                            String::new()
-                        } else {
-                            g.boot_default.to_string()
-                        }
-                    })
-                    .unwrap_or_default()
-            }
+            _ => GUC_TABLE
+                .iter()
+                .find(|g| g.name == canonical)
+                .map(|g| g.boot_default.to_string())
+                .unwrap_or_default(),
         }
-    }
-
-    pub(crate) fn resettable_unknown_guc(name: &str) -> bool {
-        matches!(
-            Self::canonical_setting_name(name),
-            "session_replication_role"
-        )
     }
 
     /// Return the effective post-reset display value for a GUC.
@@ -447,68 +409,6 @@ impl SessionSettings {
         self.prepared_plan_cache_min_exec
     }
 
-    /// All keys that `show_value()` and `default_value()` handle explicitly.
-    ///
-    /// Kept adjacent to `show_value()` so that adding a new built-in GUC
-    /// to `show_value()` without adding it here is an obvious oversight.
-    const KNOWN_SETTING_KEYS: &'static [&'static str] = &[
-        // show_value() match arms
-        "server_version",
-        "server_version_num",
-        "server_encoding",
-        "search_path",
-        "datestyle",
-        "integer_datetimes",
-        "intervalstyle",
-        "statement_timeout",
-        "lock_timeout",
-        "idle_in_transaction_session_timeout",
-        "db9.dml_table_scan_max_rows",
-        "db9.hash_join_work_mem",
-        "db9.max_sort_bytes",
-        "db9.prepared_plan_cache_size",
-        "db9.prepared_plan_cache_min_exec",
-        "db9.retry_max_attempts",
-        "db9.retry_timeout",
-        "db9.use_optimizer",
-        "embedding.model",
-        "embedding.dimensions",
-        "embedding.max_calls",
-        "embedding.concurrency",
-        "embedding.provider",
-        "embedding.endpoint",
-        "embedding.api_key",
-        "timezone",
-        "application_name",
-        "client_encoding",
-        "standard_conforming_strings",
-        "check_function_bodies",
-        "xmloption",
-        "client_min_messages",
-        "row_security",
-        "default_tablespace",
-        "default_table_access_method",
-        "transaction_deferrable",
-        "transaction_isolation",
-        "default_transaction_deferrable",
-        "default_transaction_isolation",
-        "default_transaction_read_only",
-        "hnsw.ef_search",
-        // default_value() fallthrough keys
-        "extra_float_digits",
-        "bytea_output",
-        "lc_messages",
-        "lc_monetary",
-        "lc_numeric",
-        "lc_time",
-        "max_identifier_length",
-        "max_index_keys",
-        "work_mem",
-        "default_text_search_config",
-        "in_hot_standby",
-        "password_encryption",
-    ];
-
     /// Collect all current settings into a flat map.
     ///
     /// Resolves every key through `show_value()` so precedence
@@ -517,9 +417,9 @@ impl SessionSettings {
     pub(crate) fn all_values(&self) -> HashMap<String, String> {
         use std::collections::HashSet;
 
-        let all_keys: HashSet<&str> = Self::KNOWN_SETTING_KEYS
+        let all_keys: HashSet<&str> = GUC_TABLE
             .iter()
-            .copied()
+            .map(|g| g.name)
             .chain(self.server_reserved_settings.keys().map(String::as_str))
             .chain(self.extra_settings.keys().map(String::as_str))
             .chain(self.local_overrides.keys().map(String::as_str))

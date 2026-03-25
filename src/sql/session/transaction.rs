@@ -57,6 +57,8 @@ impl Session {
         }
         self.settings
             .push_settings_savepoint(name_for_settings.clone());
+        self.settings
+            .push_guc_savepoint(name_for_settings.clone());
         self.push_extension_delta_savepoint(name_for_settings.clone());
         self.push_session_auth_savepoint(name_for_settings);
         self.last_sequence_values.push_savepoint(name_for_seq);
@@ -79,6 +81,7 @@ impl Session {
             tracker.release(name)?;
         }
         self.settings.release_settings_savepoint(name);
+        self.settings.release_guc_savepoint(name);
         self.release_extension_delta_savepoint(name);
         self.release_session_auth_savepoint(name);
         self.last_sequence_values.release_savepoint(name);
@@ -139,9 +142,8 @@ impl Session {
             let _ = self.rollback().await;
             return Err(e);
         }
-        // TODO(#601-followup): Regular SET (non-LOCAL) is not restored on savepoint rollback.
-        // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
         self.settings.rollback_settings_to_savepoint(name);
+        self.settings.rollback_guc_to_savepoint(name);
         self.rollback_extension_delta_to_savepoint(name);
         self.rollback_session_auth_to_savepoint(name);
         self.last_sequence_values.rollback_to_savepoint(name);
@@ -172,6 +174,7 @@ impl Session {
                         .register_connection(self.connection_id, txn.start_timestamp().version());
                 }
                 self.state = TransactionState::Active(txn);
+                self.settings.begin_transaction_settings();
                 self.extension_delta = super::ExtensionDelta::default();
                 self.extension_delta_savepoints.clear();
                 self.session_auth_savepoints.clear();
@@ -204,6 +207,7 @@ impl Session {
                 self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.commit().await {
                     Ok(_) => {
+                        self.settings.commit_transaction_settings();
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.apply_pending_drops();
@@ -229,6 +233,7 @@ impl Session {
                 self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.rollback().await {
                     Ok(_) => {
+                        self.settings.rollback_transaction_settings();
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.discard_pending_drops();
@@ -263,6 +268,7 @@ impl Session {
                 self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.rollback().await {
                     Ok(_) => {
+                        self.settings.rollback_transaction_settings();
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.discard_pending_drops();
@@ -289,6 +295,7 @@ impl Session {
                 self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.rollback().await {
                     Ok(_) => {
+                        self.settings.rollback_transaction_settings();
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
                         self.last_sequence_values.discard_pending_drops();

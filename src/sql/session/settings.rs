@@ -14,7 +14,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use super::{DEFAULT_DML_TABLE_SCAN_MAX_ROWS, DEFAULT_HASH_JOIN_WORK_MEM, DEFAULT_MAX_SORT_BYTES};
-use validate::validate_session_replication_role;
 const DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND: usize = i64::MAX as usize;
 
 pub(crate) use defs::{find_guc_def, GUC_TABLE};
@@ -88,6 +87,22 @@ struct SettingsSavepoint {
     search_path: Option<Vec<String>>,
 }
 
+/// A single savepoint frame for GUC transaction rollback (regular SET only).
+/// Records the prior value of each GUC before it was modified within this frame.
+#[derive(Debug, Default)]
+struct GucXactFrame {
+    name: String,
+    prior_values: HashMap<String, Option<String>>,
+}
+
+/// Transaction-level mutation log for regular SET rollback.
+/// SET LOCAL does NOT write here (it uses the separate local_overrides/SettingsSavepoint path).
+#[derive(Debug, Default)]
+struct GucSaveStack {
+    prior_values: HashMap<String, Option<String>>,
+    savepoints: Vec<GucXactFrame>,
+}
+
 /// A small, per-connection container for session-level settings (GUCs).
 ///
 /// This is intentionally compact and avoids heap allocations unless a setting is
@@ -157,6 +172,10 @@ pub(crate) struct SessionSettings {
     local_search_path: Option<Vec<String>>,
     /// Savepoint snapshots for transaction-local overrides.
     settings_savepoint_stack: Vec<SettingsSavepoint>,
+
+    /// Transaction mutation log for regular SET rollback.
+    /// Only active during an explicit transaction (BEGIN..COMMIT/ROLLBACK).
+    guc_save_stack: Option<GucSaveStack>,
 }
 
 pub(crate) fn public_setting_value(canonical: &str, value: String) -> String {
@@ -254,6 +273,18 @@ impl SessionSettings {
     }
 
     pub(crate) fn set_search_path(&mut self, search_path: Vec<String>) {
+        // Record prior value for transaction rollback.
+        if self.guc_save_stack.is_some() {
+            let prior = Some(Self::format_search_path_show(&self.search_path));
+            if let Some(ref mut stack) = self.guc_save_stack {
+                let frame = stack
+                    .savepoints
+                    .last_mut()
+                    .map(|sp| &mut sp.prior_values)
+                    .unwrap_or(&mut stack.prior_values);
+                frame.entry("search_path".to_string()).or_insert(prior);
+            }
+        }
         self.search_path = search_path;
     }
 
@@ -388,13 +419,6 @@ impl SessionSettings {
     pub(crate) fn validate_and_normalize_value(name: &str, value: &str) -> Result<String> {
         let canonical = Self::canonical_setting_name(name);
 
-        // session_replication_role is not in GUC_TABLE (not a known GUC) but
-        // must be explicitly rejected rather than accepted through the generic
-        // unknown-GUC path (#1535).
-        if canonical == "session_replication_role" {
-            return validate_session_replication_role(value);
-        }
-
         // Look up the GUC definition.
         if let Some(def) = find_guc_def(canonical) {
             // 0. Context check — Internal GUCs cannot be SET.
@@ -491,7 +515,34 @@ impl SessionSettings {
         }
         let normalized = Self::validate_and_normalize_value(canonical, &value)?;
 
+        // Record prior value for transaction rollback (regular SET only).
+        if self.guc_save_stack.is_some() {
+            let prior = self.show_value(canonical);
+            if let Some(ref mut stack) = self.guc_save_stack {
+                let frame = stack
+                    .savepoints
+                    .last_mut()
+                    .map(|sp| &mut sp.prior_values)
+                    .unwrap_or(&mut stack.prior_values);
+                frame.entry(canonical.to_string()).or_insert(prior);
+            }
+        }
+
         match canonical {
+            "search_path" => {
+                self.search_path = normalized
+                    .split(',')
+                    .map(|s| {
+                        let t = s.trim();
+                        if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+                            t[1..t.len() - 1].replace("\"\"", "\"")
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "statement_timeout" => {
                 self.statement_timeout_ms = Self::parse_timeout_millis(&normalized)?;
             }
@@ -675,6 +726,20 @@ impl SessionSettings {
     /// Reset a single session setting to its default value.
     pub(crate) fn reset_setting(&mut self, name: &str) {
         let canonical = Self::canonical_setting_name(name);
+
+        // Record prior value for transaction rollback.
+        if self.guc_save_stack.is_some() {
+            let prior = self.show_value(canonical);
+            if let Some(ref mut stack) = self.guc_save_stack {
+                let frame = stack
+                    .savepoints
+                    .last_mut()
+                    .map(|sp| &mut sp.prior_values)
+                    .unwrap_or(&mut stack.prior_values);
+                frame.entry(canonical.to_string()).or_insert(prior);
+            }
+        }
+
         if crate::sql::executor::is_server_reserved_guc(canonical) {
             self.remove_local_override(canonical);
             return;
@@ -723,18 +788,125 @@ impl SessionSettings {
     /// across RESET ALL so that a client cannot indirectly clear auth-pipeline
     /// values set after JWT verification.
     pub(crate) fn reset_all_settings(&mut self) {
+        // Record prior values for transaction rollback before wiping.
+        if self.guc_save_stack.is_some() {
+            let snapshot = self.all_values();
+            if let Some(ref mut stack) = self.guc_save_stack {
+                let frame = stack
+                    .savepoints
+                    .last_mut()
+                    .map(|sp| &mut sp.prior_values)
+                    .unwrap_or(&mut stack.prior_values);
+                for (key, value) in snapshot {
+                    frame.entry(key).or_insert(Some(value));
+                }
+            }
+        }
+
         let reserved = self.server_reserved_settings.clone();
 
         let savepoint_stack = std::mem::take(&mut self.settings_savepoint_stack);
+        let guc_stack = self.guc_save_stack.take();
         *self = Self::new_with_defaults(
             self.default_statement_timeout_ms,
             self.default_idle_in_transaction_session_timeout_ms,
         );
         self.settings_savepoint_stack = savepoint_stack;
+        self.guc_save_stack = guc_stack;
 
         // Restore server-reserved entries.
         if !reserved.is_empty() {
             self.server_reserved_settings.extend(reserved);
+        }
+    }
+
+    // ── GUC Transaction Rollback ─────────────────────────────────────────
+
+    pub(crate) fn begin_transaction_settings(&mut self) {
+        self.guc_save_stack = Some(GucSaveStack::default());
+    }
+
+    pub(crate) fn commit_transaction_settings(&mut self) {
+        self.guc_save_stack = None;
+    }
+
+    pub(crate) fn rollback_transaction_settings(&mut self) {
+        let Some(stack) = self.guc_save_stack.take() else {
+            return;
+        };
+        for frame in stack.savepoints.into_iter().rev() {
+            for (name, prior) in frame.prior_values {
+                self.restore_guc_value(&name, prior);
+            }
+        }
+        for (name, prior) in stack.prior_values {
+            self.restore_guc_value(&name, prior);
+        }
+    }
+
+    pub(crate) fn push_guc_savepoint(&mut self, name: String) {
+        if let Some(ref mut stack) = self.guc_save_stack {
+            stack.savepoints.push(GucXactFrame {
+                name,
+                prior_values: HashMap::new(),
+            });
+        }
+    }
+
+    pub(crate) fn release_guc_savepoint(&mut self, name: &str) {
+        let Some(ref mut stack) = self.guc_save_stack else {
+            return;
+        };
+        let Some(idx) = stack.savepoints.iter().rposition(|sp| sp.name == name) else {
+            return;
+        };
+        // Drain target + all frames after it (matching other release paths).
+        let released: Vec<GucXactFrame> = stack.savepoints.drain(idx..).collect();
+        let parent = stack
+            .savepoints
+            .last_mut()
+            .map(|sp| &mut sp.prior_values)
+            .unwrap_or(&mut stack.prior_values);
+        for frame in released {
+            for (k, v) in frame.prior_values {
+                parent.entry(k).or_insert(v);
+            }
+        }
+    }
+
+    pub(crate) fn rollback_guc_to_savepoint(&mut self, name: &str) {
+        // Take the stack so restore_guc_value -> set_known_setting won't
+        // re-record restores as new mutations (guc_save_stack is None).
+        let Some(mut stack) = self.guc_save_stack.take() else {
+            return;
+        };
+        let Some(target_idx) = stack.savepoints.iter().rposition(|sp| sp.name == name) else {
+            self.guc_save_stack = Some(stack);
+            return;
+        };
+        // Drain and replay frames from target onwards (innermost first via rev).
+        let frames: Vec<GucXactFrame> = stack.savepoints.drain(target_idx..).collect();
+        for frame in frames.iter().rev() {
+            for (k, v) in &frame.prior_values {
+                self.restore_guc_value(k, v.clone());
+            }
+        }
+        // Re-push empty target frame (PG: savepoint remains active after ROLLBACK TO).
+        stack.savepoints.push(GucXactFrame {
+            name: name.to_string(),
+            prior_values: HashMap::new(),
+        });
+        self.guc_save_stack = Some(stack);
+    }
+
+    fn restore_guc_value(&mut self, name: &str, value: Option<String>) {
+        match value {
+            Some(v) => {
+                let _ = self.set_known_setting(name, v);
+            }
+            None => {
+                self.reset_setting(name);
+            }
         }
     }
 }

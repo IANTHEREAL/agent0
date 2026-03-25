@@ -279,9 +279,16 @@ impl Executor {
                                 )]);
                             }
 
-                            let value = session.show_setting_value(&var_name).ok_or_else(|| {
-                                anyhow!("unrecognized configuration parameter \"{}\"", var_name)
-                            })?;
+                            let value = match session.show_setting_value(&var_name) {
+                                Some(v) => v,
+                                None if var_name.contains('.') => String::new(),
+                                None => {
+                                    return Err(anyhow!(
+                                        "unrecognized configuration parameter \"{}\"",
+                                        var_name
+                                    ))
+                                }
+                            };
 
                             Ok(vec![ExecuteResult::Select {
                                 columns: vec![var_name],

@@ -1,0 +1,11 @@
+during_txn|Asia/Shanghai
+after_rollback|UTC
+after_commit|US/Eastern
+inside_savepoint|Europe/London
+after_rollback_to|UTC
+after_release|Asia/Tokyo
+after_outer_rollback|UTC
+after_reset|UTC
+after_reset_rollback|Asia/Shanghai
+after_sp_rollback_to|US/Eastern
+after_full_rollback|US/Eastern
