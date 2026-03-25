@@ -109,50 +109,74 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         return Ok(Value::Null);
     }
 
-    match (val, target) {
-        // ===== To Varchar(n) =====
-        (v, DataType::Varchar(max_len)) => {
-            let s = v.to_string();
-            if *max_len == 0 {
-                // PostgreSQL bare VARCHAR has no typmod limit. We preserve the
-                // type identity as Varchar(0) in metadata, but runtime coercion
-                // must behave like unbounded character varying.
-                return Ok(Value::Text(s));
-            }
-            match context {
-                CastContext::Explicit => {
-                    let truncated: String = s.chars().take(*max_len as usize).collect();
-                    Ok(Value::Text(truncated))
+    match target {
+        DataType::Varchar(n) => cast_to_varchar(&val, *n, context),
+        DataType::Text | DataType::Name => cast_to_text(val),
+        DataType::Boolean => cast_to_boolean(val, context),
+        DataType::Int32 => cast_to_int32(val, context),
+        DataType::Int64 => cast_to_int64(val, context),
+        DataType::Float64 => cast_to_float64(val, context),
+        DataType::Bytes => cast_to_bytea(val),
+        DataType::Date | DataType::Time | DataType::Timestamp | DataType::TimestampTz
+        | DataType::Interval => cast_to_temporal(val, target),
+        DataType::Uuid => cast_to_uuid(val),
+        DataType::Json | DataType::Jsonb => cast_to_json(val, target, context),
+        DataType::Tsquery => cast_to_tsquery(val),
+        DataType::Numeric { .. } => cast_to_numeric(val, target),
+        DataType::Array(_) => cast_to_array(val, target, context),
+        DataType::Vector(_) => cast_to_vector(val, target),
+        DataType::UserDefined(u) if is_regclass_udt(u) => cast_to_regclass(val),
+        DataType::UserDefined(u) if is_regtype_udt(u) => cast_to_regtype(val),
+        _ => cast_catchall(val, target, context),
+    }
+}
+
+fn cast_to_varchar(val: &Value, max_len: u64, context: CastContext) -> Result<Value> {
+    let s = val.to_string();
+    if max_len == 0 {
+        // PostgreSQL bare VARCHAR has no typmod limit. We preserve the
+        // type identity as Varchar(0) in metadata, but runtime coercion
+        // must behave like unbounded character varying.
+        return Ok(Value::Text(s));
+    }
+    match context {
+        CastContext::Explicit => {
+            let truncated: String = s.chars().take(max_len as usize).collect();
+            Ok(Value::Text(truncated))
+        }
+        CastContext::Assignment => {
+            // Postgres: error if value exceeds length (unless excess is all spaces)
+            let trimmed = s.trim_end();
+            if trimmed.chars().count() > max_len as usize {
+                Err(SqlError::StringDataRightTruncation {
+                    max_length: max_len,
                 }
-                CastContext::Assignment => {
-                    // Postgres: error if value exceeds length (unless excess is all spaces)
-                    let trimmed = s.trim_end();
-                    if trimmed.chars().count() > *max_len as usize {
-                        Err(SqlError::StringDataRightTruncation {
-                            max_length: *max_len,
-                        }
-                        .into())
-                    } else {
-                        Ok(Value::Text(s.chars().take(*max_len as usize).collect()))
-                    }
-                }
-                CastContext::Implicit => Ok(Value::Text(s)),
+                .into())
+            } else {
+                Ok(Value::Text(s.chars().take(max_len as usize).collect()))
             }
         }
+        CastContext::Implicit => Ok(Value::Text(s)),
+    }
+}
 
-        // ===== To Text / Name =====
-        (Value::Timestamp(ts), DataType::Text | DataType::Name) => {
+fn cast_to_text(val: Value) -> Result<Value> {
+    match val {
+        Value::Timestamp(ts) => {
             let formatted = crate::model::timestamp::format_timestamp_millis(ts, false)
                 .unwrap_or_else(|_| ts.to_string());
             Ok(Value::Text(formatted))
         }
-        (Value::Jsonb(s), DataType::Text | DataType::Name) => {
+        Value::Jsonb(s) => {
             Ok(Value::Text(crate::sql::jsonb::format_jsonb_pg_str(&s)))
         }
-        (v, DataType::Text | DataType::Name) => Ok(Value::Text(v.to_string())),
+        v => Ok(Value::Text(v.to_string())),
+    }
+}
 
-        // ===== To Boolean =====
-        (Value::Text(s), DataType::Boolean) => match s.trim().to_lowercase().as_str() {
+fn cast_to_boolean(val: Value, context: CastContext) -> Result<Value> {
+    match val {
+        Value::Text(s) => match s.trim().to_lowercase().as_str() {
             "true" | "t" | "yes" | "y" | "on" | "1" => Ok(Value::Boolean(true)),
             "false" | "f" | "no" | "n" | "off" | "0" => Ok(Value::Boolean(false)),
             _ => Err(SqlError::InvalidInputSyntax {
@@ -162,21 +186,25 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             .into()),
         },
         // Int/Float/Numeric → Bool: Explicit only
-        (Value::Int32(n), DataType::Boolean) if context == CastContext::Explicit => {
+        Value::Int32(n) if context == CastContext::Explicit => {
             Ok(Value::Boolean(n != 0))
         }
-        (Value::Int64(n), DataType::Boolean) if context == CastContext::Explicit => {
+        Value::Int64(n) if context == CastContext::Explicit => {
             Ok(Value::Boolean(n != 0))
         }
-        (Value::Float64(n), DataType::Boolean) if context == CastContext::Explicit => {
+        Value::Float64(n) if context == CastContext::Explicit => {
             Ok(Value::Boolean(n != 0.0))
         }
-        (Value::Numeric(d), DataType::Boolean) if context == CastContext::Explicit => {
+        Value::Numeric(d) if context == CastContext::Explicit => {
             Ok(Value::Boolean(!d.is_zero()))
         }
+        v => cast_catchall(v, &DataType::Boolean, context),
+    }
+}
 
-        // ===== To Int32 =====
-        (Value::Text(s), DataType::Int32) => {
+fn cast_to_int32(val: Value, context: CastContext) -> Result<Value> {
+    match val {
+        Value::Text(s) => {
             s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
                 SqlError::InvalidInputSyntax {
                     type_name: "integer".into(),
@@ -185,13 +213,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 .into()
             })
         }
-        (Value::Int64(n), DataType::Int32) => i32::try_from(n).map(Value::Int32).map_err(|_| {
+        Value::Int64(n) => i32::try_from(n).map(Value::Int32).map_err(|_| {
             SqlError::NumericValueOutOfRange {
                 message: "integer out of range".into(),
             }
             .into()
         }),
-        (Value::Float64(f), DataType::Int32) => match context {
+        Value::Float64(f) => match context {
             CastContext::Explicit => {
                 let rounded = round_half_away_from_zero(f);
                 if f.is_nan() || rounded < (i32::MIN as f64) || rounded > (i32::MAX as f64) {
@@ -219,7 +247,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 })
             }
         },
-        (Value::Numeric(d), DataType::Int32) => {
+        Value::Numeric(d) => {
             use rust_decimal::prelude::ToPrimitive;
             match context {
                 CastContext::Explicit => {
@@ -245,12 +273,16 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
         }
         // Bool → Int32: Explicit only
-        (Value::Boolean(b), DataType::Int32) if context == CastContext::Explicit => {
+        Value::Boolean(b) if context == CastContext::Explicit => {
             Ok(Value::Int32(if b { 1 } else { 0 }))
         }
+        v => cast_catchall(v, &DataType::Int32, context),
+    }
+}
 
-        // ===== To Int64 =====
-        (Value::Text(s), DataType::Int64) => {
+fn cast_to_int64(val: Value, context: CastContext) -> Result<Value> {
+    match val {
+        Value::Text(s) => {
             s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
                 SqlError::InvalidInputSyntax {
                     type_name: "bigint".into(),
@@ -259,9 +291,9 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 .into()
             })
         }
-        (Value::Int32(n), DataType::Int64) => Ok(Value::Int64(n as i64)),
+        Value::Int32(n) => Ok(Value::Int64(n as i64)),
         // Float64 → Int64: Explicit only
-        (Value::Float64(n), DataType::Int64) if context == CastContext::Explicit => {
+        Value::Float64(n) if context == CastContext::Explicit => {
             let rounded = round_half_away_from_zero(n);
             if n.is_nan() || rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
                 return Err(SqlError::NumericValueOutOfRange {
@@ -271,7 +303,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
             Ok(Value::Int64(rounded as i64))
         }
-        (Value::Numeric(d), DataType::Int64) => {
+        Value::Numeric(d) => {
             use rust_decimal::prelude::ToPrimitive;
             match context {
                 CastContext::Explicit => {
@@ -296,9 +328,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 }
             }
         }
+        v => cast_catchall(v, &DataType::Int64, context),
+    }
+}
 
-        // ===== To Float64 =====
-        (Value::Text(s), DataType::Float64) => {
+fn cast_to_float64(val: Value, context: CastContext) -> Result<Value> {
+    match val {
+        Value::Text(s) => {
             s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
                 SqlError::InvalidInputSyntax {
                     type_name: "double precision".into(),
@@ -307,9 +343,9 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 .into()
             })
         }
-        (Value::Int32(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
-        (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
-        (Value::Numeric(d), DataType::Float64) => {
+        Value::Int32(n) => Ok(Value::Float64(n as f64)),
+        Value::Int64(n) => Ok(Value::Float64(n as f64)),
+        Value::Numeric(d) => {
             use rust_decimal::prelude::ToPrimitive;
             match context {
                 CastContext::Explicit => d.to_f64().map(Value::Float64).ok_or_else(|| {
@@ -328,11 +364,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 }
             }
         }
+        v => cast_catchall(v, &DataType::Float64, context),
+    }
+}
 
-        // ===== To Bytes =====
-        (v, DataType::Bytes) => cast_to_bytea(v),
-
-        // ===== Temporal =====
+fn cast_to_temporal(val: Value, target: &DataType) -> Result<Value> {
+    match (val, target) {
         (Value::Text(s), DataType::Interval) => crate::sql::expr::parse_interval_string(&s)
             .map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
@@ -377,9 +414,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 })
         }
         (Value::Time(micros), DataType::Time) => Ok(Value::Time(micros)),
+        (v, _) => cast_catchall(v, target, CastContext::Explicit),
+    }
+}
 
-        // ===== UUID =====
-        (Value::Text(s), DataType::Uuid) => uuid::Uuid::parse_str(s.trim())
+fn cast_to_uuid(val: Value) -> Result<Value> {
+    match val {
+        Value::Text(s) => uuid::Uuid::parse_str(s.trim())
             .map(|u| Value::Uuid(*u.as_bytes()))
             .map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
@@ -387,9 +428,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     value: s,
                 })
             }),
-        (Value::Uuid(bytes), DataType::Uuid) => Ok(Value::Uuid(bytes)),
+        Value::Uuid(bytes) => Ok(Value::Uuid(bytes)),
+        v => cast_catchall(v, &DataType::Uuid, CastContext::Explicit),
+    }
+}
 
-        // ===== JSON =====
+fn cast_to_json(val: Value, target: &DataType, context: CastContext) -> Result<Value> {
+    match (val, target) {
         (Value::Text(s), DataType::Json) => {
             serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
                 SqlError::InvalidInputSyntax {
@@ -436,59 +481,79 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             })?;
             Ok(Value::Json(s))
         }
+        (v, _) => cast_catchall(v, target, context),
+    }
+}
 
-        // ===== Full-text search =====
-        (Value::Text(s), DataType::Tsquery) => {
+fn cast_to_tsquery(val: Value) -> Result<Value> {
+    match val {
+        Value::Text(s) => {
             crate::sql::fts::validate_tsquery_syntax(&s)?;
             Ok(Value::Tsquery(s))
         }
-        (Value::Tsquery(s), DataType::Tsquery) => Ok(Value::Tsquery(s)),
+        Value::Tsquery(s) => Ok(Value::Tsquery(s)),
+        v => cast_catchall(v, &DataType::Tsquery, CastContext::Explicit),
+    }
+}
 
-        // ===== Numeric =====
-        (Value::Text(s), DataType::Numeric { scale, .. }) => {
+fn cast_to_numeric(val: Value, target: &DataType) -> Result<Value> {
+    let scale = match target {
+        DataType::Numeric { scale, .. } => *scale,
+        _ => None,
+    };
+    match val {
+        Value::Text(s) => {
             let mut d = Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
                 type_name: "numeric".into(),
                 value: s,
             })?;
             if let Some(s) = scale {
-                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
+                d.rescale(s.min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
-        (Value::Int32(n), DataType::Numeric { scale, .. }) => {
+        Value::Int32(n) => {
             let mut d = Decimal::from(n);
             if let Some(s) = scale {
-                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
+                d.rescale(s.min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
-        (Value::Int64(n), DataType::Numeric { scale, .. }) => {
+        Value::Int64(n) => {
             let mut d = Decimal::from(n);
             if let Some(s) = scale {
-                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
+                d.rescale(s.min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
-        (Value::Float64(f), DataType::Numeric { scale, .. }) => {
+        Value::Float64(f) => {
             let mut d = Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
                 type_name: "numeric".into(),
                 value: f.to_string(),
             })?;
             if let Some(s) = scale {
-                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
+                d.rescale(s.min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
-        (Value::Numeric(d), DataType::Numeric { scale, .. }) => {
+        Value::Numeric(d) => {
             let mut d = d;
             if let Some(s) = scale {
-                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
+                d.rescale(s.min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
+        v => cast_catchall(v, target, CastContext::Explicit),
+    }
+}
 
-        // ===== Array =====
-        (Value::Text(s), DataType::Array(elem_type)) => {
+fn cast_to_array(val: Value, target: &DataType, context: CastContext) -> Result<Value> {
+    let elem_type = match target {
+        DataType::Array(elem_type) => elem_type,
+        _ => unreachable!(),
+    };
+    match val {
+        Value::Text(s) => {
             let arr = crate::sql::value_coercion::parse_pg_array(&s).map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
                     type_name: "array".into(),
@@ -505,7 +570,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
             Ok(Value::Array(out))
         }
-        (Value::Array(elems), DataType::Array(elem_type)) => {
+        Value::Array(elems) => {
             let mut out = Vec::with_capacity(elems.len());
             for v in elems {
                 if v == Value::Null {
@@ -516,9 +581,17 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
             Ok(Value::Array(out))
         }
+        v => cast_catchall(v, target, context),
+    }
+}
 
-        // ===== Vector =====
-        (Value::Text(s), DataType::Vector(dim)) => {
+fn cast_to_vector(val: Value, target: &DataType) -> Result<Value> {
+    let dim = match target {
+        DataType::Vector(dim) => *dim,
+        _ => unreachable!(),
+    };
+    match val {
+        Value::Text(s) => {
             const MAX_VECTOR_DIMENSIONS: usize = 16384;
             let trimmed = s.trim();
             if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
@@ -529,7 +602,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 .into());
             }
             // Reject modifier > MAX before parsing elements.
-            if *dim as usize > MAX_VECTOR_DIMENSIONS {
+            if dim as usize > MAX_VECTOR_DIMENSIONS {
                 return Err(anyhow!(
                     "vector cannot have more than {} dimensions",
                     MAX_VECTOR_DIMENSIONS
@@ -558,26 +631,30 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     })
                 })?;
             // dim == 0 means "any dimension" (bare `vector` without modifier).
-            if *dim > 0 && vec.len() != *dim as usize {
+            if dim > 0 && vec.len() != dim as usize {
                 return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));
             }
             Ok(Value::Vector(vec))
         }
-        (Value::Vector(vec), DataType::Vector(dim)) => {
+        Value::Vector(vec) => {
             if vec.is_empty() {
                 return Err(anyhow!("vector must have at least 1 dimension"));
             }
-            if *dim > 0 && vec.len() != *dim as usize {
+            if dim > 0 && vec.len() != dim as usize {
                 return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));
             }
             Ok(Value::Vector(vec))
         }
+        v => cast_catchall(v, target, CastContext::Explicit),
+    }
+}
 
-        // ===== regclass pseudo-type =====
+fn cast_to_regclass(val: Value) -> Result<Value> {
+    match val {
         // db9 stores catalog OIDs as Int64. For psql/JDBC compatibility queries
         // (e.g. d.classoid = 'pg_class'::regclass), accept numeric text,
         // well-known catalog table names, and integer values; normalize to Int64.
-        (Value::Text(s), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
+        Value::Text(s) => {
             let trimmed = s.trim();
             // Try numeric OID first.
             if let Ok(n) = trimmed.parse::<i64>() {
@@ -598,35 +675,41 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             }
             .into())
         }
-        (Value::Int32(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
+        Value::Int32(n) => {
             Ok(Value::Int64(n as i64))
         }
-        (Value::Int64(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
+        Value::Int64(n) => {
             Ok(Value::Int64(n))
         }
+        v => cast_catchall(v, &DataType::UserDefined("regclass".to_string()), CastContext::Explicit),
+    }
+}
 
-        // ===== regtype pseudo-type =====
+fn cast_to_regtype(val: Value) -> Result<Value> {
+    match val {
         // Implements minimal ::regtype::text — strip schema qualification and
         // map short PostgreSQL aliases to their canonical display names.
-        (Value::Text(s), DataType::UserDefined(ref udt)) if is_regtype_udt(udt) => {
+        Value::Text(s) => {
             Ok(Value::Text(normalize_regtype(&s)))
         }
+        v => cast_catchall(v, &DataType::UserDefined("regtype".to_string()), CastContext::Explicit),
+    }
+}
 
-        // ===== Catch-all =====
-        (v, _) => match context {
-            CastContext::Explicit => Ok(v),
-            CastContext::Assignment | CastContext::Implicit => {
-                if value_is_compatible_with_column_type(&v, target) {
-                    Ok(v)
-                } else {
-                    Err(SqlError::InvalidCast {
-                        from: v.type_display_name(),
-                        to: target.clone(),
-                    }
-                    .into())
+fn cast_catchall(val: Value, target: &DataType, context: CastContext) -> Result<Value> {
+    match context {
+        CastContext::Explicit => Ok(val),
+        CastContext::Assignment | CastContext::Implicit => {
+            if value_is_compatible_with_column_type(&val, target) {
+                Ok(val)
+            } else {
+                Err(SqlError::InvalidCast {
+                    from: val.type_display_name(),
+                    to: target.clone(),
                 }
+                .into())
             }
-        },
+        }
     }
 }
 
