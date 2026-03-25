@@ -710,10 +710,13 @@ impl EmbeddedPageFs {
         self.maybe_start_background_maintenance();
     }
 
-    /// Emit a single fs event to the in-memory ring after a successful TiKV commit.
+    /// Emit a single fs event to the in-memory ring AND enqueue for Redis
+    /// persistence after a successful TiKV commit.
     /// Silently drops if the ring lock is poisoned (Hard Contract #4).
     /// Records emit metrics for observability.
     fn emit_event(&self, builder: FsEventBuilder) {
+        // Persist to Redis Streams so fs9_events() TVF / `fs watch` can see it.
+        self.persist_events_async(vec![builder.clone()]);
         let metrics = notify_metrics_for_keyspace(&self.keyspace);
         let event_type = builder.event_type;
         match self.notify_ring.push(builder) {
@@ -722,7 +725,8 @@ impl EmbeddedPageFs {
         }
     }
 
-    /// Emit multiple fs events atomically to the in-memory ring after commit.
+    /// Emit multiple fs events atomically to the in-memory ring AND enqueue
+    /// for Redis persistence after commit.
     /// Applies commit-scope coalescing: same path → keep only last event (Hard Contract #2).
     fn emit_events(&self, builders: Vec<FsEventBuilder>) {
         if builders.is_empty() {
@@ -736,6 +740,8 @@ impl EmbeddedPageFs {
             coalesced.insert(b.path.clone(), b);
         }
         let final_builders: Vec<FsEventBuilder> = coalesced.into_values().collect();
+        // Persist to Redis Streams so fs9_events() TVF / `fs watch` can see them.
+        self.persist_events_async(final_builders.clone());
         let metrics = notify_metrics_for_keyspace(&self.keyspace);
         let suppressed = (input_count - final_builders.len()) as u64;
         if suppressed > 0 {
@@ -1163,7 +1169,6 @@ impl EmbeddedPageFs {
         save_bundle_manifest(&mut txn, manifest).await?;
         txn.commit().await?;
 
-        self.persist_events_async(event_builders.clone());
         self.emit_events(event_builders);
 
         Ok(())

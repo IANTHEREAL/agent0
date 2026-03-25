@@ -117,7 +117,10 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         DataType::Int64 => cast_to_int64(val, context),
         DataType::Float64 => cast_to_float64(val, context),
         DataType::Bytes => cast_to_bytea(val),
-        DataType::Date | DataType::Time | DataType::Timestamp | DataType::TimestampTz
+        DataType::Date
+        | DataType::Time
+        | DataType::Timestamp
+        | DataType::TimestampTz
         | DataType::Interval => cast_to_temporal(val, target),
         DataType::Uuid => cast_to_uuid(val),
         DataType::Json | DataType::Jsonb => cast_to_json(val, target, context),
@@ -167,9 +170,7 @@ fn cast_to_text(val: Value) -> Result<Value> {
                 .unwrap_or_else(|_| ts.to_string());
             Ok(Value::Text(formatted))
         }
-        Value::Jsonb(s) => {
-            Ok(Value::Text(crate::sql::jsonb::format_jsonb_pg_str(&s)))
-        }
+        Value::Jsonb(s) => Ok(Value::Text(crate::sql::jsonb::format_jsonb_pg_str(&s))),
         v => Ok(Value::Text(v.to_string())),
     }
 }
@@ -186,33 +187,23 @@ fn cast_to_boolean(val: Value, context: CastContext) -> Result<Value> {
             .into()),
         },
         // Int/Float/Numeric → Bool: Explicit only
-        Value::Int32(n) if context == CastContext::Explicit => {
-            Ok(Value::Boolean(n != 0))
-        }
-        Value::Int64(n) if context == CastContext::Explicit => {
-            Ok(Value::Boolean(n != 0))
-        }
-        Value::Float64(n) if context == CastContext::Explicit => {
-            Ok(Value::Boolean(n != 0.0))
-        }
-        Value::Numeric(d) if context == CastContext::Explicit => {
-            Ok(Value::Boolean(!d.is_zero()))
-        }
+        Value::Int32(n) if context == CastContext::Explicit => Ok(Value::Boolean(n != 0)),
+        Value::Int64(n) if context == CastContext::Explicit => Ok(Value::Boolean(n != 0)),
+        Value::Float64(n) if context == CastContext::Explicit => Ok(Value::Boolean(n != 0.0)),
+        Value::Numeric(d) if context == CastContext::Explicit => Ok(Value::Boolean(!d.is_zero())),
         v => cast_catchall(v, &DataType::Boolean, context),
     }
 }
 
 fn cast_to_int32(val: Value, context: CastContext) -> Result<Value> {
     match val {
-        Value::Text(s) => {
-            s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "integer".into(),
-                    value: s,
-                }
-                .into()
-            })
-        }
+        Value::Text(s) => s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
+            SqlError::InvalidInputSyntax {
+                type_name: "integer".into(),
+                value: s,
+            }
+            .into()
+        }),
         Value::Int64(n) => i32::try_from(n).map(Value::Int32).map_err(|_| {
             SqlError::NumericValueOutOfRange {
                 message: "integer out of range".into(),
@@ -282,15 +273,13 @@ fn cast_to_int32(val: Value, context: CastContext) -> Result<Value> {
 
 fn cast_to_int64(val: Value, context: CastContext) -> Result<Value> {
     match val {
-        Value::Text(s) => {
-            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "bigint".into(),
-                    value: s,
-                }
-                .into()
-            })
-        }
+        Value::Text(s) => s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
+            SqlError::InvalidInputSyntax {
+                type_name: "bigint".into(),
+                value: s,
+            }
+            .into()
+        }),
         Value::Int32(n) => Ok(Value::Int64(n as i64)),
         // Float64 → Int64: Explicit only
         Value::Float64(n) if context == CastContext::Explicit => {
@@ -334,15 +323,13 @@ fn cast_to_int64(val: Value, context: CastContext) -> Result<Value> {
 
 fn cast_to_float64(val: Value, context: CastContext) -> Result<Value> {
     match val {
-        Value::Text(s) => {
-            s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "double precision".into(),
-                    value: s,
-                }
-                .into()
-            })
-        }
+        Value::Text(s) => s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
+            SqlError::InvalidInputSyntax {
+                type_name: "double precision".into(),
+                value: s,
+            }
+            .into()
+        }),
         Value::Int32(n) => Ok(Value::Float64(n as f64)),
         Value::Int64(n) => Ok(Value::Float64(n as f64)),
         Value::Numeric(d) => {
@@ -675,13 +662,13 @@ fn cast_to_regclass(val: Value) -> Result<Value> {
             }
             .into())
         }
-        Value::Int32(n) => {
-            Ok(Value::Int64(n as i64))
-        }
-        Value::Int64(n) => {
-            Ok(Value::Int64(n))
-        }
-        v => cast_catchall(v, &DataType::UserDefined("regclass".to_string()), CastContext::Explicit),
+        Value::Int32(n) => Ok(Value::Int64(n as i64)),
+        Value::Int64(n) => Ok(Value::Int64(n)),
+        v => cast_catchall(
+            v,
+            &DataType::UserDefined("regclass".to_string()),
+            CastContext::Explicit,
+        ),
     }
 }
 
@@ -689,10 +676,12 @@ fn cast_to_regtype(val: Value) -> Result<Value> {
     match val {
         // Implements minimal ::regtype::text — strip schema qualification and
         // map short PostgreSQL aliases to their canonical display names.
-        Value::Text(s) => {
-            Ok(Value::Text(normalize_regtype(&s)))
-        }
-        v => cast_catchall(v, &DataType::UserDefined("regtype".to_string()), CastContext::Explicit),
+        Value::Text(s) => Ok(Value::Text(normalize_regtype(&s))),
+        v => cast_catchall(
+            v,
+            &DataType::UserDefined("regtype".to_string()),
+            CastContext::Explicit,
+        ),
     }
 }
 

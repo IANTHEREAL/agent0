@@ -1116,9 +1116,9 @@ impl<'a> Analyzer<'a> {
                     _ => unreachable!(),
                 };
                 let dt = match json_op {
-                    JsonAccessOp::Arrow
-                    | JsonAccessOp::HashArrow
-                    | JsonAccessOp::HashMinus => DataType::Jsonb,
+                    JsonAccessOp::Arrow | JsonAccessOp::HashArrow | JsonAccessOp::HashMinus => {
+                        DataType::Jsonb
+                    }
                     JsonAccessOp::LongArrow | JsonAccessOp::HashLongArrow => DataType::Text,
                 };
                 Ok(TypedExpr::new(
@@ -1217,8 +1217,7 @@ impl<'a> Analyzer<'a> {
                     DataType::Array(inner) => inner.as_ref().clone(),
                     _ => left_expr.data_type.clone(),
                 };
-                let allow_text_recovery =
-                    !Self::has_explicit_text_like_array_cast(&right_expr);
+                let allow_text_recovery = !Self::has_explicit_text_like_array_cast(&right_expr);
                 let common = self
                     .comparison_target_type_for_any_literal_array(
                         &left_expr,
@@ -1284,8 +1283,7 @@ impl<'a> Analyzer<'a> {
                     DataType::Array(inner) => inner.as_ref().clone(),
                     _ => left_expr.data_type.clone(),
                 };
-                let allow_text_recovery =
-                    !Self::has_explicit_text_like_array_cast(&right_expr);
+                let allow_text_recovery = !Self::has_explicit_text_like_array_cast(&right_expr);
                 let common = self
                     .comparison_target_type_for_any_literal_array(
                         &left_expr,
@@ -1348,14 +1346,10 @@ impl<'a> Analyzer<'a> {
                 if self.is_unresolved_param(&right_expr) {
                     let array_type = DataType::Array(Box::new(left_expr.data_type.clone()));
                     self.resolve_param_type(*index, &array_type)?;
-                    let right_fixed = TypedExpr::new(
-                        TypedExprKind::Parameter { index: *index },
-                        array_type,
-                    );
-                    let array_pos = self.make_function_call(
-                        "ARRAY_POSITION",
-                        vec![right_fixed, left_expr],
-                    )?;
+                    let right_fixed =
+                        TypedExpr::new(TypedExprKind::Parameter { index: *index }, array_type);
+                    let array_pos =
+                        self.make_function_call("ARRAY_POSITION", vec![right_fixed, left_expr])?;
                     return Ok(TypedExpr::new(
                         TypedExprKind::IsTest {
                             expr: Box::new(array_pos),

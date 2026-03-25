@@ -3,19 +3,19 @@
 pub mod date;
 pub mod timestamp;
 
-mod data_type;
-mod value;
-mod schema;
-mod metadata;
 mod catalog;
+mod data_type;
+mod metadata;
+mod schema;
+mod value;
 
 // Re-export all public types for backward compatibility.
 // `use crate::model::DataType` etc. continues to work.
-pub use data_type::*;
-pub use value::*;
-pub use schema::*;
-pub use metadata::*;
 pub use catalog::*;
+pub use data_type::*;
+pub use metadata::*;
+pub use schema::*;
+pub use value::*;
 
 #[allow(clippy::items_after_test_module)]
 pub(crate) fn default_owner() -> String {

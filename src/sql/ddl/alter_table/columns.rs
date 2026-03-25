@@ -869,11 +869,15 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
                 // Every Query node (Expr-level subqueries AND TableFactor::Derived)
                 // needs scope-isolated handling via query_depends_on_column.
                 // We handle it here and skip the visitor's own recursion.
-                if self.skip_depth == 0 {
-                    if query_depends_on_column(q, self.target_full, self.target_bare, self.col_lower)
-                    {
-                        return ControlFlow::Break(());
-                    }
+                if self.skip_depth == 0
+                    && query_depends_on_column(
+                        q,
+                        self.target_full,
+                        self.target_bare,
+                        self.col_lower,
+                    )
+                {
+                    return ControlFlow::Break(());
                 }
                 // Skip all inner nodes — query_depends_on_column already
                 // recursed with proper scope.
@@ -996,62 +1000,47 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
                         col_lower,
                     )
                 })
-        })
-            || select.lateral_views.iter().any(|lv| {
-                expr_depends_on_column(
-                    &lv.lateral_view,
-                    &scope_names,
-                    target_full,
-                    target_bare,
-                    col_lower,
-                )
-            })
-            || select.selection.as_ref().is_some_and(|expr| {
+        }) || select.lateral_views.iter().any(|lv| {
+            expr_depends_on_column(
+                &lv.lateral_view,
+                &scope_names,
+                target_full,
+                target_bare,
+                col_lower,
+            )
+        }) || select.selection.as_ref().is_some_and(|expr| {
+            expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
+        }) || select.projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-            })
-            || select.projection.iter().any(|item| match item {
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            }
+            SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => false,
+        }) || matches!(&select.group_by, GroupByExpr::Expressions(exprs) if exprs.iter().any(|expr| {
+            expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
+        })) || select.cluster_by.iter().any(|expr| {
+            expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
+        }) || select.distribute_by.iter().any(|expr| {
+            expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
+        }) || select.sort_by.iter().any(|expr| {
+            expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
+        }) || select.having.as_ref().is_some_and(|expr| {
+            expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
+        }) || select
+            .named_window
+            .iter()
+            .any(|NamedWindowDefinition(_, spec)| {
+                spec.partition_by.iter().any(|expr| {
                     expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-                }
-                SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => false,
-            })
-            || matches!(&select.group_by, GroupByExpr::Expressions(exprs) if exprs.iter().any(|expr| {
-                expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-            }))
-            || select.cluster_by.iter().any(|expr| {
-                expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-            })
-            || select.distribute_by.iter().any(|expr| {
-                expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-            })
-            || select.sort_by.iter().any(|expr| {
-                expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-            })
-            || select.having.as_ref().is_some_and(|expr| {
-                expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
-            })
-            || select
-                .named_window
-                .iter()
-                .any(|NamedWindowDefinition(_, spec)| {
-                    spec.partition_by.iter().any(|expr| {
-                        expr_depends_on_column(
-                            expr,
-                            &scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    }) || spec.order_by.iter().any(|ob| {
-                        expr_depends_on_column(
-                            &ob.expr,
-                            &scope_names,
-                            target_full,
-                            target_bare,
-                            col_lower,
-                        )
-                    })
+                }) || spec.order_by.iter().any(|ob| {
+                    expr_depends_on_column(
+                        &ob.expr,
+                        &scope_names,
+                        target_full,
+                        target_bare,
+                        col_lower,
+                    )
                 })
+            })
             || select.qualify.as_ref().is_some_and(|expr| {
                 expr_depends_on_column(expr, &scope_names, target_full, target_bare, col_lower)
             })

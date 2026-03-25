@@ -186,11 +186,9 @@ async fn build_hnsw_index(
             fill_row_defaults(&mut row, schema)?;
             let pk_values = if schema.pk_indices.is_empty() {
                 let key: &[u8] = pair.key().as_ref().into();
-                let pk_bytes =
-                    key.strip_prefix(data_key_prefix.as_slice())
-                        .ok_or_else(|| {
-                            anyhow!("corrupted row key while validating HNSW index")
-                        })?;
+                let pk_bytes = key
+                    .strip_prefix(data_key_prefix.as_slice())
+                    .ok_or_else(|| anyhow!("corrupted row key while validating HNSW index"))?;
                 crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
             } else {
                 schema.get_pk_values(&row)
@@ -226,14 +224,14 @@ async fn build_hnsw_index(
             fill_row_defaults(&mut row, schema)?;
 
             let pk_values = if schema.pk_indices.is_empty() {
-                let pk_bytes =
-                    key.strip_prefix(data_key_prefix.as_slice())
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "corrupted row key while backfilling index '{}'",
-                                idx_name_str
-                            )
-                        })?;
+                let pk_bytes = key
+                    .strip_prefix(data_key_prefix.as_slice())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "corrupted row key while backfilling index '{}'",
+                            idx_name_str
+                        )
+                    })?;
                 crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
             } else {
                 schema.get_pk_values(&row)
@@ -309,9 +307,8 @@ async fn build_hnsw_index(
             cache_nonce: rand::thread_rng().gen::<u64>() | 1,
         };
         let gv = meta.graph_version;
-        let (gb, mb) =
-            serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
-                .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?;
+        let (gb, mb) = serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
+            .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?;
         (gb, mb, gv)
     };
 
@@ -406,21 +403,20 @@ async fn backfill_btree_index(
     if !rows.is_empty() {
         if schema.pk_indices.is_empty() {
             let pk_types: Vec<DataType> = vec![DataType::Uuid];
-            let (start, end) =
-                crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
             let data_key_prefix = start.clone();
             let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
             while let Some(batch) = scanner.next_batch(txn).await? {
                 for pair in batch {
                     let key: &[u8] = pair.key().as_ref().into();
-                    let pk_bytes = key
-                        .strip_prefix(data_key_prefix.as_slice())
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "corrupted row key while backfilling index '{}'",
-                                idx_name_str
-                            )
-                        })?;
+                    let pk_bytes =
+                        key.strip_prefix(data_key_prefix.as_slice())
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "corrupted row key while backfilling index '{}'",
+                                    idx_name_str
+                                )
+                            })?;
                     let pk_values =
                         crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
@@ -430,9 +426,8 @@ async fn backfill_btree_index(
                     if !index_helpers::eval_index_predicate(new_index, schema, &row)? {
                         continue;
                     }
-                    let idx_values = index_helpers::get_index_values_with_expressions(
-                        new_index, schema, &row,
-                    )?;
+                    let idx_values =
+                        index_helpers::get_index_values_with_expressions(new_index, schema, &row)?;
                     store
                         .create_index_entry(
                             txn,
@@ -460,9 +455,8 @@ async fn backfill_btree_index(
                 if !index_helpers::eval_index_predicate(new_index, schema, row)? {
                     continue;
                 }
-                let idx_values = index_helpers::get_index_values_with_expressions(
-                    new_index, schema, row,
-                )?;
+                let idx_values =
+                    index_helpers::get_index_values_with_expressions(new_index, schema, row)?;
                 let pk_values = schema.get_pk_values(row);
                 store
                     .create_index_entry(
@@ -511,23 +505,21 @@ async fn backfill_gin_index(
     let index_id = new_index.id;
     if schema.pk_indices.is_empty() {
         let pk_types: Vec<DataType> = vec![DataType::Uuid];
-        let (start, end) =
-            crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+        let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let data_key_prefix = start.clone();
         let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
         while let Some(batch) = scanner.next_batch(txn).await? {
             for pair in batch {
                 let key: &[u8] = pair.key().as_ref().into();
-                let pk_bytes =
-                    key.strip_prefix(data_key_prefix.as_slice())
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "corrupted row key while backfilling index '{}'",
-                                idx_name_str
-                            )
-                        })?;
-                let pk_values =
-                    crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+                let pk_bytes = key
+                    .strip_prefix(data_key_prefix.as_slice())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "corrupted row key while backfilling index '{}'",
+                            idx_name_str
+                        )
+                    })?;
+                let pk_values = crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
                 let mut row = crate::storage::deserialize_row(pair.value())?;
                 fill_row_defaults(&mut row, schema)?;
@@ -873,17 +865,44 @@ pub async fn execute_create_index(
 
     let create_result: Result<()> = async {
         if new_index.is_hnsw() {
-            build_hnsw_index(store, txn, db_id, &schema, &new_index, &idx_name_str, keyspace).await?;
+            build_hnsw_index(
+                store,
+                txn,
+                db_id,
+                &schema,
+                &new_index,
+                &idx_name_str,
+                keyspace,
+            )
+            .await?;
         } else if index_helpers::is_index_materializable(&new_index) {
             backfill_btree_index(
-                store, txn, db_id, &schema, &new_index, &idx_name_str, &rows,
-                &mut txn_guard, &mut current_batch_writes, &mut has_committed_batches,
-            ).await?;
+                store,
+                txn,
+                db_id,
+                &schema,
+                &new_index,
+                &idx_name_str,
+                &rows,
+                &mut txn_guard,
+                &mut current_batch_writes,
+                &mut has_committed_batches,
+            )
+            .await?;
         } else if supported_gin_index_column(&schema, &new_index).is_some() && !rows.is_empty() {
             backfill_gin_index(
-                store, txn, db_id, &schema, &new_index, &idx_name_str, &rows,
-                &mut txn_guard, &mut current_batch_writes, &mut has_committed_batches,
-            ).await?;
+                store,
+                txn,
+                db_id,
+                &schema,
+                &new_index,
+                &idx_name_str,
+                &rows,
+                &mut txn_guard,
+                &mut current_batch_writes,
+                &mut has_committed_batches,
+            )
+            .await?;
         }
 
         schema.indexes.push(new_index.clone());

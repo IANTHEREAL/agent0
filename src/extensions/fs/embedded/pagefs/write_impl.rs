@@ -995,8 +995,8 @@ impl EmbeddedPageFs {
         // Single atomic commit for the entire directory group
         txn.commit().await?;
 
-        // Fire events after successful commit
-        self.persist_events_async(event_builders.clone());
+        // Fire events after successful commit (emit_events handles both
+        // in-memory ring and Redis persistence).
         self.emit_events(event_builders);
 
         Ok(written_sizes)

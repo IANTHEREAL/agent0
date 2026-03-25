@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::data_type::DataType;
-use super::value::Value;
 use super::default_owner;
+use super::value::Value;
 use crate::worker::types::IndexState;
 
 /// Column definition
