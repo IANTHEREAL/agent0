@@ -437,9 +437,7 @@ impl Executor {
                 // PostgreSQL errors on unknown parameters (SQLSTATE 42704).
                 // Dotted names (custom GUC namespaces like `db9.foo`) are exempt —
                 // PG silently accepts `RESET ns.key` even when the key is unknown.
-                if !rn.name.contains('.')
-                    && session.show_setting_value(&rn.name).is_none()
-                {
+                if !rn.name.contains('.') && session.show_setting_value(&rn.name).is_none() {
                     // Use original token text (case-preserved) for the error
                     // message, stripping surrounding SQL double-quotes so the
                     // message reads e.g. `"FOOBAR"` not `"foobar"` for quoted

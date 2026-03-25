@@ -1131,7 +1131,8 @@ async fn handle_batch_write_atomic(
     let mut entries = Vec::with_capacity(grouped_result.entries.len());
     let mut committed = 0usize;
     let mut failed = 0usize;
-    let mut oversized_count = 0usize;
+    let mut category_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
     for entry in grouped_result.entries {
         match entry.result {
             Ok(written) => {
@@ -1145,9 +1146,8 @@ async fn handle_batch_write_atomic(
             }
             Err(err) => {
                 failed += 1;
-                let err_str = err.to_string();
-                if err_str.contains("too large for grouped inline write") {
-                    oversized_count += 1;
+                if let Some(category) = entry.failure_category {
+                    *category_counts.entry(category).or_insert(0) += 1;
                 }
                 let (code, msg) = map_fs_error(&err);
                 entries.push(BatchWriteEntryResponse {
@@ -1161,10 +1161,10 @@ async fn handle_batch_write_atomic(
     }
 
     let mut fallback_reasons = serde_json::Map::new();
-    if oversized_count > 0 {
+    for (category, count) in &category_counts {
         fallback_reasons.insert(
-            "planner.oversized".to_string(),
-            serde_json::Value::Number(oversized_count.into()),
+            category.to_string(),
+            serde_json::Value::Number((*count).into()),
         );
     }
 
@@ -1800,9 +1800,15 @@ mod tests {
                             } else {
                                 Ok(file.data.len())
                             };
+                            let failure_category = if failed {
+                                Some("execution.txn_conflict")
+                            } else {
+                                None
+                            };
                             entries.push(FsBatchWriteEntry {
                                 path: file.path.clone(),
                                 result,
+                                failure_category,
                             });
                         }
                     }
@@ -2065,6 +2071,13 @@ mod tests {
             assert_eq!(find("/fail_dir/c.txt")["ok"], false);
             assert!(find("/fail_dir/c.txt")["error"].is_object());
             assert_eq!(find("/fail_dir/d.txt")["ok"], false);
+
+            // fallback_reason_counts should categorize the execution-level failures
+            let reasons = &summary["fallback_reason_counts"];
+            assert_eq!(
+                reasons["execution.txn_conflict"], 2,
+                "2 failed entries should be categorized as txn_conflict"
+            );
         }
 
         /// Exercises the subgroup chunking path directly at the backend level

@@ -41,6 +41,10 @@ pub(crate) struct FsBatchWriteFile {
 pub(crate) struct FsBatchWriteEntry {
     pub path: String,
     pub result: Result<usize>,
+    /// Stable machine-readable failure category for execution-level errors.
+    /// Set by the backend when a subgroup commit fails (e.g., "execution.txn_conflict").
+    /// `None` for successful entries or planner-level errors (handled separately).
+    pub failure_category: Option<&'static str>,
 }
 
 /// Result of a grouped atomic batch write, including execution metadata.
@@ -315,7 +319,11 @@ pub(crate) trait FsBackend: Send + Sync {
         for file in files {
             let path = file.path;
             let result = self.write_file(&path, &file.data, file.mode).await;
-            entries.push(FsBatchWriteEntry { path, result });
+            entries.push(FsBatchWriteEntry {
+                path,
+                result,
+                failure_category: None,
+            });
         }
         Ok(entries)
     }

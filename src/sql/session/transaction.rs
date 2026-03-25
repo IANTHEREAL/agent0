@@ -57,8 +57,7 @@ impl Session {
         }
         self.settings
             .push_settings_savepoint(name_for_settings.clone());
-        self.settings
-            .push_guc_savepoint(name_for_settings.clone());
+        self.settings.push_guc_savepoint(name_for_settings.clone());
         self.push_extension_delta_savepoint(name_for_settings.clone());
         self.push_session_auth_savepoint(name_for_settings);
         self.last_sequence_values.push_savepoint(name_for_seq);

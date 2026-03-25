@@ -114,7 +114,11 @@ impl EmbeddedPageFs {
             let path = file.path;
             let mode = file.mode;
             let result = self.write_file(&path, &file.data, mode).await;
-            entries.push(FsBatchWriteEntry { path, result });
+            entries.push(FsBatchWriteEntry {
+                path,
+                result,
+                failure_category: None,
+            });
         }
         Ok(entries)
     }
@@ -255,6 +259,7 @@ impl EmbeddedPageFs {
             .map(|file| FsBatchWriteEntry {
                 path: file.path,
                 result: Ok(file.size as usize),
+                failure_category: None,
             })
             .collect())
     }
@@ -792,6 +797,7 @@ impl EmbeddedPageFs {
                         "file too large for grouped inline write ({}B > max); use streaming",
                         gf.data.len()
                     )),
+                    failure_category: Some("planner.oversized"),
                 });
             }
         }
@@ -828,15 +834,18 @@ impl EmbeddedPageFs {
                             results[gf.original_index] = Some(FsBatchWriteEntry {
                                 path: gf.full_path.clone(),
                                 result: Ok(written),
+                                failure_category: None,
                             });
                         }
                     }
                     Err(err) => {
                         let elapsed_ms = t0.elapsed().as_millis();
+                        let category = classify_group_commit_error(&err);
                         warn!(
                             parent_dir,
                             chunk_size,
                             elapsed_ms,
+                            category,
                             error = %err,
                             "fs9: directory subgroup commit failed"
                         );
@@ -848,6 +857,7 @@ impl EmbeddedPageFs {
                                     "directory group commit failed: {}",
                                     err_msg
                                 )),
+                                failure_category: Some(category),
                             });
                         }
                     }
@@ -990,5 +1000,135 @@ impl EmbeddedPageFs {
         self.emit_events(event_builders);
 
         Ok(written_sizes)
+    }
+}
+
+/// Recursively check whether a TiKV error contains a write conflict.
+/// Mirrors the logic in `is_retryable_tikv_write_conflict` (pagefs.rs)
+/// but returns bool for use in classification.
+// TODO: consolidate with is_retryable_tikv_write_conflict() in pagefs.rs
+fn tikv_error_contains_write_conflict(err: &tikv_client::Error) -> bool {
+    match err {
+        tikv_client::Error::KeyError(key_error) => key_error.conflict.is_some(),
+        tikv_client::Error::PessimisticLockError { inner, .. } => {
+            tikv_error_contains_write_conflict(inner)
+        }
+        tikv_client::Error::UndeterminedError(inner) => tikv_error_contains_write_conflict(inner),
+        tikv_client::Error::ExtractedErrors(errors)
+        | tikv_client::Error::MultipleKeyErrors(errors) => {
+            errors.iter().any(tikv_error_contains_write_conflict)
+        }
+        _ => false,
+    }
+}
+
+/// Classify a subgroup commit error into a stable `execution.*` category
+/// by downcasting the error chain (no string parsing).
+///
+/// For TiKV container errors (`ExtractedErrors`, `MultipleKeyErrors`,
+/// `UndeterminedError`), recursively inspects inner errors rather than
+/// blanket-labeling — only classifies as `txn_conflict` when the inner
+/// errors actually indicate conflict.
+fn classify_group_commit_error(err: &anyhow::Error) -> &'static str {
+    // Check for TiKV write conflict via recursive inspection of the error chain.
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(tikv_error_contains_write_conflict)
+    }) {
+        return "execution.txn_conflict";
+    }
+
+    // Check for EmbeddedFsError variants
+    for cause in err.chain() {
+        if let Some(fs_err) = cause.downcast_ref::<EmbeddedFsError>() {
+            return match fs_err {
+                EmbeddedFsError::NotFound(_) | EmbeddedFsError::NotDirectory(_) => {
+                    "execution.parent_not_found"
+                }
+                EmbeddedFsError::Conflict(_) | EmbeddedFsError::RestartRequired(_) => {
+                    "execution.txn_conflict"
+                }
+                _ => "execution.other",
+            };
+        }
+    }
+
+    // Check for timeout-like errors (std::io::ErrorKind::TimedOut)
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+    }) {
+        return "execution.timeout";
+    }
+
+    "execution.unknown"
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn classify_tikv_key_conflict() {
+        let key_err =
+            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }));
+        let err = anyhow::anyhow!(key_err);
+        assert_eq!(classify_group_commit_error(&err), "execution.txn_conflict");
+    }
+
+    #[test]
+    fn classify_tikv_container_with_conflict() {
+        let key_err =
+            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }));
+        let container = tikv_client::Error::ExtractedErrors(vec![key_err]);
+        let err = anyhow::anyhow!(container);
+        assert_eq!(classify_group_commit_error(&err), "execution.txn_conflict");
+    }
+
+    #[test]
+    fn classify_tikv_container_without_conflict() {
+        // A container with a non-conflict error should NOT be classified as txn_conflict
+        let non_conflict = tikv_client::Error::InternalError {
+            message: String::from("region not available"),
+        };
+        let container = tikv_client::Error::ExtractedErrors(vec![non_conflict]);
+        let err = anyhow::anyhow!(container);
+        assert_eq!(classify_group_commit_error(&err), "execution.unknown");
+    }
+
+    #[test]
+    fn classify_embedded_fs_not_found() {
+        let err = anyhow::anyhow!(EmbeddedFsError::NotFound("/missing".to_string()));
+        assert_eq!(
+            classify_group_commit_error(&err),
+            "execution.parent_not_found"
+        );
+    }
+
+    #[test]
+    fn classify_embedded_fs_conflict() {
+        let err = anyhow::anyhow!(EmbeddedFsError::Conflict("restart".to_string()));
+        assert_eq!(classify_group_commit_error(&err), "execution.txn_conflict");
+    }
+
+    #[test]
+    fn classify_io_timeout() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out");
+        let err = anyhow::anyhow!(io_err);
+        assert_eq!(classify_group_commit_error(&err), "execution.timeout");
+    }
+
+    #[test]
+    fn classify_unknown_error() {
+        let err = anyhow::anyhow!("something unexpected");
+        assert_eq!(classify_group_commit_error(&err), "execution.unknown");
     }
 }
