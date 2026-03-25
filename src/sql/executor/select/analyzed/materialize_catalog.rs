@@ -2225,6 +2225,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "typname".to_string(),
@@ -2237,6 +2238,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,
@@ -2274,6 +2276,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "TyPnAmE".to_string(),
@@ -2286,6 +2289,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,

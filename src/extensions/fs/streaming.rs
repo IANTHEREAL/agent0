@@ -16,6 +16,7 @@ fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 

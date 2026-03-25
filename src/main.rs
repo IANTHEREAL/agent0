@@ -481,6 +481,14 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         info!("Export snapshot janitor started");
     }
 
+    // fs9 notify event persistence + GC loops
+    if let Some(tikv_client) = store.transaction_client() {
+        extensions::fs::notify::spawn_event_persist_loop(tikv_client.clone());
+        info!("fs9 notify event persist loop started");
+        extensions::fs::notify::spawn_notify_gc_loop(tikv_client);
+        info!("fs9 notify event GC loop started");
+    }
+
     // fs9 WebSocket server
     {
         let fs9_cfg = extensions::fs::config::fs9_config();

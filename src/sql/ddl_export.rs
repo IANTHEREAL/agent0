@@ -39,7 +39,8 @@ fn column_type_sql(schema_col: &crate::model::ColumnDef) -> String {
 pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, String>) -> String {
     let mut definitions: Vec<String> = Vec::new();
 
-    for col in &schema.columns {
+    // Skip logically dropped columns — they must not appear in DDL export.
+    for col in schema.columns.iter().filter(|c| !c.is_dropped) {
         let mut col_sql = format!("{} {}", col.name, column_type_sql(col));
         if !col.nullable {
             col_sql.push_str(" NOT NULL");
@@ -361,7 +362,7 @@ pub async fn export_all_ddl(
             .rsplit_once('.')
             .unwrap_or(("public", schema.name.as_str()));
         let mut serial_sequences: HashMap<String, String> = HashMap::new();
-        for col in &schema.columns {
+        for col in schema.columns.iter().filter(|c| !c.is_dropped) {
             if !col.is_serial {
                 continue;
             }
@@ -394,6 +395,14 @@ pub async fn export_all_ddl(
                     return None;
                 };
                 if owned_table != &schema.name {
+                    return None;
+                }
+                // Skip sequences owned by dropped columns.
+                if schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name == *owned_col && c.is_dropped)
+                {
                     return None;
                 }
                 Some((def.full_name(), owned_col.clone()))
@@ -513,6 +522,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "email".to_string(),
@@ -525,6 +535,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,
@@ -580,6 +591,7 @@ mod tests {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             version: 1,
             pk_constraint_name: None,
@@ -616,6 +628,7 @@ mod tests {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             version: 1,
             pk_constraint_name: None,
@@ -775,6 +788,7 @@ mod tests {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             version: 1,
             pk_constraint_name: None,

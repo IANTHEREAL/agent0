@@ -715,10 +715,7 @@ impl WorkerEngine {
                 return Ok((None, false));
             }
 
-            let Some(db_def) = store
-                .get_database_by_id(&mut txn, entry.db_id)
-                .await?
-            else {
+            let Some(db_def) = store.get_database_by_id(&mut txn, entry.db_id).await? else {
                 tracing::warn!(
                     db_id = entry.db_id,
                     job_id = entry.task_id,
@@ -868,9 +865,7 @@ impl WorkerEngine {
         let store = handle.store().clone();
         let database_name: Arc<str> = {
             let mut db_txn = store.begin().await?;
-            let resolved = store
-                .get_database_by_id(&mut db_txn, entry.db_id)
-                .await?;
+            let resolved = store.get_database_by_id(&mut db_txn, entry.db_id).await?;
             db_txn.commit().await?;
             match resolved {
                 Some(db) => Arc::from(db.name),
@@ -2048,6 +2043,7 @@ mod tests {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }],
             version: 1,
             pk_constraint_name: None,
@@ -2500,6 +2496,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // This is the exact function called in execute_hnsw_merge dispatch.
         // When S3 is not configured, frozen indexes should be skipped.
@@ -2523,6 +2520,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         assert!(!super::should_skip_frozen_merge(&meta));
     }
@@ -2542,6 +2540,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Small graph: no freeze.
         let result = super::check_graph_oversize_freeze(1024, &meta);
@@ -2563,6 +2562,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Oversized graph: should return frozen meta bytes.
         let result = super::check_graph_oversize_freeze(super::HNSW_GRAPH_MAX_BYTES + 1, &meta);
@@ -2589,6 +2589,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Exactly at boundary: not oversize (uses >).
         let result = super::check_graph_oversize_freeze(super::HNSW_GRAPH_MAX_BYTES, &meta);
@@ -2614,6 +2615,7 @@ mod tests {
                     frozen: true,
                     graph_version: 0,
                     dropped_at: None,
+                    cache_nonce: 0,
                 },
             ),
             (
@@ -2630,6 +2632,7 @@ mod tests {
                     frozen: false,
                     graph_version: 0,
                     dropped_at: None,
+                    cache_nonce: 0,
                 },
             ),
         ];

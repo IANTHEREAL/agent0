@@ -118,6 +118,7 @@ fn generated_catalog() -> MockCatalog {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -130,6 +131,7 @@ fn generated_catalog() -> MockCatalog {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "name_vec".to_string(),
@@ -145,6 +147,7 @@ fn generated_catalog() -> MockCatalog {
                     ),
                     generation_expr_authorized_by: Some("admin".to_string()),
                     collation: None,
+                    is_dropped: false,
                 },
             ],
         )

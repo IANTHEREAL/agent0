@@ -35,6 +35,7 @@ pub fn text_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -50,6 +51,7 @@ pub fn name_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -65,6 +67,7 @@ pub fn int_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -80,6 +83,7 @@ pub fn float_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -96,6 +100,7 @@ pub fn char_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -111,6 +116,7 @@ pub fn bool_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -126,6 +132,7 @@ pub fn int2vector_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -141,6 +148,7 @@ pub fn oidvector_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -156,6 +164,7 @@ pub fn int_array_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -171,6 +180,7 @@ pub fn timestamptz_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -186,6 +196,7 @@ pub fn text_array_col(name: &str) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 

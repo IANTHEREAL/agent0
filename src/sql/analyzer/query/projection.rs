@@ -75,6 +75,7 @@ impl<'a> Analyzer<'a> {
                         generation_expr: None,
                         generation_expr_authorized_by: None,
                         collation: None,
+                        is_dropped: false,
                     })
                     .collect(),
                 version: 1,
@@ -105,6 +106,7 @@ impl<'a> Analyzer<'a> {
                         generation_expr: None,
                         generation_expr_authorized_by: None,
                         collation: None,
+                        is_dropped: false,
                     })
                     .collect(),
                 version: 1,
@@ -138,6 +140,7 @@ impl<'a> Analyzer<'a> {
                         generation_expr: None,
                         generation_expr_authorized_by: None,
                         collation: None,
+                        is_dropped: false,
                     })
                     .collect(),
                 version: 1,
@@ -293,6 +296,12 @@ impl<'a> Analyzer<'a> {
                     let scope = self.scopes.current();
                     if let Some(order) = wildcard_order {
                         for (name, column_index) in order {
+                            // Skip hidden (dropped) columns in the ordered path.
+                            if let Some(col) = scope.columns().get(*column_index) {
+                                if col.hidden {
+                                    continue;
+                                }
+                            }
                             if let Some((_col_name, expr, data_type)) =
                                 self.scope_column_projection(scope, *column_index)?
                             {

@@ -303,6 +303,7 @@ pub async fn execute_create_table(
             generation_expr: generation_expr_str,
             generation_expr_authorized_by: None,
             collation,
+            is_dropped: false,
         };
         if let Some(default_expr_ast) = default_expr_ast.as_ref() {
             validate_column_default_expr(
@@ -636,6 +637,7 @@ pub async fn create_table_from_query_result(
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }];
 
     if explicit_columns.is_empty() {
@@ -656,6 +658,7 @@ pub async fn create_table_from_query_result(
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             }
         }));
     } else {
@@ -675,6 +678,7 @@ pub async fn create_table_from_query_result(
                         generation_expr: None,
                         generation_expr_authorized_by: None,
                         collation: None,
+                        is_dropped: false,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -750,6 +754,7 @@ pub async fn create_table_from_stream(
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }];
 
     for (i, col_name) in result_cols.iter().enumerate() {
@@ -766,6 +771,7 @@ pub async fn create_table_from_stream(
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         });
     }
 
@@ -849,6 +855,7 @@ pub async fn create_table_from_select_into(
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }];
 
     col_defs.extend(result_cols.iter().enumerate().map(|(i, col_name)| {
@@ -868,6 +875,7 @@ pub async fn create_table_from_select_into(
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         }
     }));
 

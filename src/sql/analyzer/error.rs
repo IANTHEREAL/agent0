@@ -3,6 +3,7 @@
 //! All errors follow PostgreSQL error message conventions where applicable.
 
 use crate::model::DataType;
+use crate::sql::quoting::quote_ident;
 use std::fmt;
 
 /// Errors produced during semantic analysis.
@@ -143,7 +144,7 @@ impl fmt::Display for AnalyzerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ColumnNotFound { name, available } => {
-                write!(f, "column \"{}\" does not exist", name)?;
+                write!(f, "column {} does not exist", format_missing_column_name(name))?;
                 if !available.is_empty() {
                     // Use edit-distance to find the closest match (PG-style hint).
                     let best = available
@@ -154,7 +155,11 @@ impl fmt::Display for AnalyzerError {
                                 &name.to_lowercase(),
                                 &col_part.to_lowercase(),
                             );
-                            if dist <= 3 { Some((dist, candidate.as_str())) } else { None }
+                            if should_suggest_column_name(name, col_part, dist) {
+                                Some((dist, candidate.as_str()))
+                            } else {
+                                None
+                            }
                         })
                         .min_by_key(|(d, _)| *d)
                         .map(|(_, c)| c);
@@ -340,6 +345,29 @@ impl fmt::Display for AnalyzerError {
 
 impl std::error::Error for AnalyzerError {}
 
+fn format_missing_column_name(name: &str) -> String {
+    if name.contains('.') && !name.contains('*') {
+        name.split('.')
+            .map(quote_ident)
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        format!("\"{}\"", name)
+    }
+}
+
+fn should_suggest_column_name(input: &str, candidate: &str, distance: usize) -> bool {
+    if distance > 3 {
+        return false;
+    }
+
+    let input_len = input.chars().count();
+    let candidate_len = candidate.chars().count();
+    let min_len = input_len.min(candidate_len);
+
+    distance * 2 <= min_len
+}
+
 /// Simple Damerau-Levenshtein distance for column-name suggestions.
 fn strsim_damerau_levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -371,4 +399,68 @@ fn strsim_damerau_levenshtein(a: &str, b: &str) -> usize {
         }
     }
     d[la][lb]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnalyzerError;
+
+    #[test]
+    fn column_not_found_omits_hint_for_weak_match() {
+        // "ab" vs "xy": distance=2, min_len=2, 2*2=4 > 2 → no hint
+        let err = AnalyzerError::ColumnNotFound {
+            name: "ab".to_string(),
+            available: vec!["t.xy".to_string()],
+        };
+
+        assert_eq!(err.to_string(), "column \"ab\" does not exist");
+    }
+
+    #[test]
+    fn column_not_found_omits_hint_for_length_mismatch() {
+        // "age"(3) vs "name"(4): distance=2, min_len=3, 2*2=4 > 3 → no hint (matches PG 17)
+        let err = AnalyzerError::ColumnNotFound {
+            name: "age".to_string(),
+            available: vec!["drop_test.name".to_string()],
+        };
+
+        assert_eq!(err.to_string(), "column \"age\" does not exist");
+    }
+
+    #[test]
+    fn column_not_found_suggests_hint_matching_pg_threshold() {
+        // "xycd"(4) vs "abcd"(4): distance=2, min_len=4, 2*2=4 <= 4 → hint (matches PG 17)
+        let err = AnalyzerError::ColumnNotFound {
+            name: "xycd".to_string(),
+            available: vec!["t.abcd".to_string()],
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "column \"xycd\" does not exist\nHINT:  Perhaps you meant to reference the column \"t.abcd\"."
+        );
+    }
+
+    #[test]
+    fn column_not_found_formats_qualified_name_like_pg() {
+        let err = AnalyzerError::ColumnNotFound {
+            name: "drop_test.age".to_string(),
+            available: vec![],
+        };
+
+        assert_eq!(err.to_string(), "column drop_test.age does not exist");
+    }
+
+    #[test]
+    fn column_not_found_keeps_hint_for_close_typo() {
+        let err = AnalyzerError::ColumnNotFound {
+            name: "nmae".to_string(),
+            available: vec!["users.name".to_string()],
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "column \"nmae\" does not exist\nHINT:  Perhaps you meant to reference the column \"users.name\"."
+        );
+    }
 }

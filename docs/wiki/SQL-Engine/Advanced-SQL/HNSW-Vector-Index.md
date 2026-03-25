@@ -1,7 +1,7 @@
 # HNSW Vector Index
 
 > **Module path:** `src/sql/hnsw/`, `src/sql/operators/hnsw_scan.rs`, `src/sql/planner/hnsw_predicate.rs`
-> **Stability:** Stable for HNSW index DDL, k-NN queries, and DML maintenance. V1 uses whole-graph single-KV storage (suitable for <= 1M vectors).
+> **Stability:** Stable for HNSW index DDL, k-NN queries, DML maintenance, and optional S3 graph offload. Without S3 offload, TiKV-only storage keeps the 8 MB frozen guard; with S3 offload enabled, graph blobs are stored in object storage instead of TiKV.
 
 ---
 
@@ -13,6 +13,7 @@ The HNSW (Hierarchical Navigable Small World) vector index subsystem implements 
 - **Operator classes**: `vector_l2_ops` (L2/Euclidean `<->`), `vector_cosine_ops` (cosine `<=>`), `vector_ip_ops` (inner product `<#>`).
 - **k-NN query**: Automatic HNSW scan selection for `ORDER BY <distance_op> LIMIT k` patterns.
 - **Runtime tuning**: `hnsw.ef_search` GUC (default 40, range 1-1000) controls recall/latency tradeoff.
+- **Storage offload**: Optional HNSW S3 offload removes the TiKV single-value size limit for serialized graph blobs.
 - **DML maintenance**: INSERT adds vectors to the graph in real-time; DELETE uses lazy invalidation with query-time filtering.
 - **EXPLAIN**: Displays `HNSW Scan using <index_name> on <table>` with distance metric and k.
 
@@ -211,6 +212,59 @@ impl HnswScanOperator {
 - **DELETE**: Evicts the cached graph entry, forcing a reload on next query. Deleted vectors are filtered at query time (lazy invalidation).
 - **UPDATE**: Combination of DELETE + INSERT behavior for the vector column.
 
+### Optional HNSW S3 Offload
+
+When `HNSW_S3_BUCKET` is set, db9 stores serialized HNSW graph blobs in S3
+(or an S3-compatible service such as MinIO) instead of TiKV. This removes the
+TiKV single-value size limit for graph blobs. SQL usage does **not** change:
+`CREATE INDEX ... USING hnsw` and `SELECT ... ORDER BY <distance_op> LIMIT k`
+stay the same.
+
+#### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HNSW_S3_BUCKET` | unset | Enables S3 offload and selects the bucket. Required to turn the feature on. |
+| `HNSW_S3_REGION` | unset | S3 region. Falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`. |
+| `HNSW_S3_ENDPOINT` | unset | S3-compatible endpoint URL, for example MinIO. |
+| `HNSW_S3_PREFIX` | `hnsw` | Key prefix for graph objects. |
+| `HNSW_S3_FORCE_PATH_STYLE` | `false` | Enables path-style URLs; usually required for MinIO. |
+| `HNSW_CACHE_MAX_ENTRIES` | `64` | Maximum number of cached graph files in the on-disk LRU cache. |
+| `HNSW_CACHE_DIR` | system temp dir | Base directory for the on-disk graph cache. db9 creates/uses a `db9_hnsw_cache/` subdirectory under this path. |
+| `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | Sweep / merge / S3 GC cadence. Lower values make migration and cleanup happen sooner; minimum `30`. |
+
+#### Usage Examples
+
+```bash
+# AWS S3
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export HNSW_S3_BUCKET=my-hnsw-graphs
+export HNSW_S3_REGION=us-east-1
+./target/release/db9-server
+```
+
+```bash
+# MinIO / S3-compatible
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+export HNSW_S3_BUCKET=hnsw
+export HNSW_S3_ENDPOINT=http://minio:9000
+export HNSW_S3_FORCE_PATH_STYLE=true
+./target/release/db9-server
+```
+
+#### Operational Notes
+
+- When `HNSW_S3_BUCKET` is **unset**, behavior stays TiKV-only with the existing
+  8 MB frozen guard.
+- When S3 is enabled, db9 fails fast on startup if the S3 client cannot be
+  initialized; it does not silently fall back to TiKV-only storage.
+- If a keyspace already contains live S3-backed HNSW indexes, nodes serving that
+  keyspace must also set `HNSW_S3_BUCKET`.
+- Existing HNSW indexes migrate to S3 on a later merge/sweep cycle; recreation is
+  not required.
+
 ### Cache Architecture
 
 ```
@@ -341,6 +395,8 @@ sequenceDiagram
 
 ## 12. See Also
 
+- [Configuration](../../../configuration.md) — deployment examples for `HNSW_S3_*`
+- [Operations config SoT](../../../sot/ops-config.md) — authoritative defaults for `HNSW_S3_*`, cache, and worker sweep settings
 - [Full-Text Search](Full-Text-Search.md) — GIN index, another specialized index type
 - [Planner and Index Selection](../Planner-and-Index-Selection.md) — B-tree index selection (HNSW uses a separate detection path)
 - [Operators](../Operators.md) — Physical operator framework (`HnswScanOperator` implements `PhysicalOperator`)

@@ -34,6 +34,7 @@ fn basic_fs9_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "line".to_string(),
@@ -46,6 +47,7 @@ fn basic_fs9_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "_path".to_string(),
@@ -58,6 +60,7 @@ fn basic_fs9_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         pk_constraint_name: None,
@@ -280,6 +283,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             is_symlink: false,
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },
+            generation: 0,
             mtime,
             storage: None,
             sealed: None,

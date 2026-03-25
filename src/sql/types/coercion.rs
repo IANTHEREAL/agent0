@@ -17,7 +17,7 @@
 
 use crate::model::DataType;
 
-fn is_oid_alias_type(dt: &DataType) -> bool {
+pub fn is_oid_alias_type(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::UserDefined(name)

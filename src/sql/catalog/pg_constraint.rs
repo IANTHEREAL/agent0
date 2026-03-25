@@ -44,7 +44,7 @@ fn build_not_null_constraint_rows(
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     for (idx, col) in schema.columns.iter().enumerate() {
-        if col.nullable {
+        if col.is_dropped || col.nullable {
             continue;
         }
         let conname = format!("{}_{}_not_null", table_short_name, col.name);
@@ -444,6 +444,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 crate::model::ColumnDef {
                     name: "name".to_string(),
@@ -456,6 +457,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 crate::model::ColumnDef {
                     name: "score".to_string(),
@@ -468,6 +470,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             version: 1,

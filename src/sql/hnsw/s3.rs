@@ -367,8 +367,14 @@ pub(crate) struct SharedHnswIndex {
     pub estimated_memory_bytes: usize,
 }
 
-/// Cache key: (keyspace, db_id, table_id, index_id, graph_version).
-/// Including graph_version means version changes are natural cache misses.
+/// Cache key: (keyspace, db_id, table_id, index_id, cache_version).
+///
+/// For S3 graphs (graph_version > 0): `cache_version = graph_version`.
+/// Version is monotonically increasing (TSO-based), so DDL cycles cannot collide.
+///
+/// For TiKV graphs (graph_version == 0): `cache_version = meta_fingerprint(count, capacity)`.
+/// This disambiguates across DROP+CREATE cycles (which reuse index_id with
+/// graph_version=0) and naturally invalidates after merge (count/capacity change).
 type IndexCacheKey = (String, u64, u64, u64, u64);
 
 struct IndexCacheEntry {
@@ -408,13 +414,19 @@ impl HnswIndexCache {
         index_id: u64,
         graph_version: u64,
     ) -> Option<Arc<SharedHnswIndex>> {
-        let key = (keyspace.to_string(), db_id, table_id, index_id, graph_version);
+        let key = (
+            keyspace.to_string(),
+            db_id,
+            table_id,
+            index_id,
+            graph_version,
+        );
         let mut entries = self.entries.lock().unwrap();
         if let Some(entry) = entries.get_mut(&key) {
             entry.last_access = Instant::now();
             debug!(
-                keyspace, db_id, table_id, index_id, graph_version,
-                "hnsw-index-cache: hit"
+                keyspace,
+                db_id, table_id, index_id, graph_version, "hnsw-index-cache: hit"
             );
             Some(Arc::clone(&entry.index))
         } else {
@@ -445,14 +457,25 @@ impl HnswIndexCache {
         // the memory budget permanently.
         if self.max_memory_bytes > 0 && estimated_memory_bytes > self.max_memory_bytes {
             warn!(
-                keyspace, db_id, table_id, index_id, graph_version,
-                estimated_memory_bytes, max_memory_bytes = self.max_memory_bytes,
+                keyspace,
+                db_id,
+                table_id,
+                index_id,
+                graph_version,
+                estimated_memory_bytes,
+                max_memory_bytes = self.max_memory_bytes,
                 "hnsw-index-cache: index too large to cache, serving without caching"
             );
             return shared;
         }
 
-        let key = (keyspace.to_string(), db_id, table_id, index_id, graph_version);
+        let key = (
+            keyspace.to_string(),
+            db_id,
+            table_id,
+            index_id,
+            graph_version,
+        );
 
         let mut entries = self.entries.lock().unwrap();
 
@@ -470,7 +493,10 @@ impl HnswIndexCache {
                     self.total_memory_bytes
                         .fetch_sub(evicted.index.estimated_memory_bytes, Ordering::Relaxed);
                     debug!(
-                        keyspace, db_id, table_id, index_id,
+                        keyspace,
+                        db_id,
+                        table_id,
+                        index_id,
                         old_version = old_key.4,
                         new_version = graph_version,
                         "hnsw-index-cache: evicted stale version"
@@ -524,7 +550,11 @@ impl HnswIndexCache {
         }
 
         debug!(
-            keyspace, db_id, table_id, index_id, graph_version,
+            keyspace,
+            db_id,
+            table_id,
+            index_id,
+            graph_version,
             estimated_memory_bytes,
             total_cached_bytes = self.total_memory_bytes.load(Ordering::Relaxed),
             "hnsw-index-cache: inserted"
@@ -578,7 +608,10 @@ pub(crate) fn hnsw_index_cache() -> &'static HnswIndexCache {
         let max_bytes: usize = config::env_string("HNSW_INDEX_CACHE_MEMORY")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_INDEX_CACHE_MEMORY);
-        info!(max_memory_bytes = max_bytes, "hnsw-index-cache: initializing");
+        info!(
+            max_memory_bytes = max_bytes,
+            "hnsw-index-cache: initializing"
+        );
         HnswIndexCache::new(max_bytes)
     })
 }
@@ -728,7 +761,10 @@ impl HnswS3Client {
                         return Err(anyhow!(
                             "hnsw-s3: graph s3://{}/{} is {} bytes, exceeds \
                              HNSW_MAX_INDEX_MEMORY ({} bytes)",
-                            self.bucket, key, content_length, max_download
+                            self.bucket,
+                            key,
+                            content_length,
+                            max_download
                         ));
                     }
                 }

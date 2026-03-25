@@ -187,6 +187,7 @@ mod owned_sequence_lookup_tests {
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         };
         let sequences = vec![
             make_sequence("public.s1", Some(("public.t", "id"))),

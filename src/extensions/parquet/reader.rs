@@ -170,6 +170,7 @@ pub(crate) fn arrow_schema_to_table_schema(arrow_schema: &ArrowSchema) -> Result
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -363,6 +364,7 @@ mod tests {
                 is_symlink: false,
                 size: data.len() as u64,
                 mode: 0o644,
+                generation: 1,
                 mtime: 0,
                 storage: Some(FsStorage::Inline),
                 sealed: Some(false),

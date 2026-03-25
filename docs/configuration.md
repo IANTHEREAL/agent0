@@ -34,7 +34,7 @@ This document is a convenience overview. The authoritative list of config keys +
 | `HNSW_S3_PREFIX` | `hnsw` | S3 key prefix for graph objects. |
 | `HNSW_S3_FORCE_PATH_STYLE` | `false` | Use path-style URLs (required for MinIO). |
 | `HNSW_CACHE_MAX_ENTRIES` | `64` | Max number of cached HNSW graph files (LRU). Set higher for deployments with many hot indexes. |
-| `HNSW_CACHE_DIR` | `/tmp/db9_hnsw_cache` | Directory for cached HNSW graph files. Use a dedicated volume for high-QPS workloads. |
+| `HNSW_CACHE_DIR` | `/tmp/db9_hnsw_cache` | Base directory for cached HNSW graph files. db9 uses a `db9_hnsw_cache/` subdirectory under this path; use a dedicated volume for high-QPS workloads. |
 
 ## Examples
 

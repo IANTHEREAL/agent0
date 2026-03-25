@@ -141,6 +141,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "content_type".to_string(),
@@ -153,6 +154,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "headers".to_string(),
@@ -165,6 +167,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "content".to_string(),
@@ -177,6 +180,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         pk_constraint_name: None,

@@ -572,6 +572,7 @@ mod tests {
                     is_symlink: false,
                     size: 0,
                     mode: 0o755,
+                    generation: 1,
                     mtime: 0,
                     storage: None,
                     sealed: Some(false),
@@ -591,6 +592,7 @@ mod tests {
                 is_symlink: false,
                 size: file.bytes.len() as u64,
                 mode: 0o644,
+                generation: 1,
                 mtime: 0,
                 storage: Some(if file.sealed {
                     FsStorage::Pack
@@ -634,6 +636,7 @@ mod tests {
                         is_symlink: false,
                         size: if is_dir { 0 } else { file.bytes.len() as u64 },
                         mode: if is_dir { 0o755 } else { 0o644 },
+                        generation: 1,
                         mtime: 0,
                         storage: if is_dir {
                             None

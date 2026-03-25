@@ -206,6 +206,7 @@ mod tests {
                 is_symlink: false,
                 size: file.bytes.len() as u64,
                 mode: if file.is_dir { 0o755 } else { 0o644 },
+                generation: 1,
                 mtime: 0,
                 storage: if file.is_dir {
                     None

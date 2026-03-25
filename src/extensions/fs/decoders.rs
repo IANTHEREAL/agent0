@@ -295,6 +295,7 @@ fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     }
 }
 
@@ -479,6 +480,7 @@ mod tests {
                 is_symlink: false,
                 size: 100,
                 mode: 0o644,
+                generation: 1,
                 mtime: 1705312200,
                 storage: None,
                 sealed: None,
@@ -489,6 +491,7 @@ mod tests {
                 is_symlink: false,
                 size: 0,
                 mode: 0o755,
+                generation: 1,
                 mtime: 1705312200,
                 storage: None,
                 sealed: None,
@@ -508,6 +511,7 @@ mod tests {
             is_symlink: true,
             size: 15,
             mode: 0o777,
+            generation: 1,
             mtime: 1705312200,
             storage: None,
             sealed: Some(false),

@@ -155,6 +155,7 @@ mod tests {
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         }
     }
 
@@ -403,6 +404,7 @@ mod tests {
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         }
     }
 

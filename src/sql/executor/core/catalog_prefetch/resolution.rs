@@ -250,6 +250,7 @@ async fn resolve_view_output_schema(
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         })
         .collect();
 
@@ -382,6 +383,7 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
             generation_expr: None,
             generation_expr_authorized_by: None,
             collation: None,
+            is_dropped: false,
         });
     }
 
@@ -619,6 +621,19 @@ pub(super) async fn prefetch_table_function_schemas(
 
                 let schema = fs::infer_table_function_schema(tenant_keyspace, &mode).await?;
                 snapshot.add_table_function(&call.key, schema);
+                continue;
+            }
+
+            if func_lower == "fs9_events" {
+                // Require fs9 extension installed+enabled.
+                let installed = store.get_extension(txn, db_id, "fs9").await?;
+                let Some(installed) = installed else {
+                    continue;
+                };
+                if !installed.enabled {
+                    continue;
+                }
+                snapshot.add_table_function(&call.key, fs::notify::fs9_events_schema());
                 continue;
             }
 

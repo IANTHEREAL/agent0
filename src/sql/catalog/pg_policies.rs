@@ -46,6 +46,7 @@ impl VirtualTable for PgPolicies {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 text_col("cmd"),
                 text_col("qual"),

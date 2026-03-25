@@ -66,7 +66,11 @@ impl VirtualTable for PgDepend {
             else {
                 continue;
             };
-            let Some(col_idx) = schema.columns.iter().position(|c| c.name == *owned_col) else {
+            let Some(col_idx) = schema
+                .columns
+                .iter()
+                .position(|c| !c.is_dropped && c.name == *owned_col)
+            else {
                 continue;
             };
 

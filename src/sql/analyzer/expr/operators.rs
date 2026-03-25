@@ -280,7 +280,7 @@ impl<'a> Analyzer<'a> {
     /// Returns true if `expr` is "semantically unknown" in PostgreSQL's sense:
     /// an unresolved parameter, a bare (uncast) string literal, or a NULL constant.
     /// This mirrors PG's `unknown` type category for operator overload resolution.
-    fn is_semantically_unknown(&self, expr: &TypedExpr) -> bool {
+    pub(super) fn is_semantically_unknown(&self, expr: &TypedExpr) -> bool {
         match &expr.kind {
             TypedExprKind::Parameter { .. } => self.is_unresolved_param(expr),
             TypedExprKind::Constant(Value::Text(_)) => true,

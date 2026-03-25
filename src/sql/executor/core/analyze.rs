@@ -176,17 +176,30 @@ impl ColumnAccumulator {
         }
     }
 
-    /// Estimate the datum width of a Value, matching PostgreSQL's
-    /// `pg_column_size` semantics (payload bytes, not encoding overhead).
-    /// Estimate PG-compatible datum width for WIDTH_THRESHOLD comparison.
-    /// Matches `pg_column_size()` semantics used by PG's analyze.c.
+    /// Conservative upper-bound estimate of datum width (in bytes) for
+    /// WIDTH_THRESHOLD gating.  Approximates PostgreSQL's on-disk column
+    /// size but intentionally overestimates in several cases:
+    ///
+    /// - Numeric: always returns 20 (PG max), though small values may be 8-12.
+    /// - Array elements: applies blanket INTALIGN (4-byte) padding; PG uses
+    ///   per-type alignment (bool='c'/1, int8='d'/8, etc.).
+    ///
+    /// These overestimates are acceptable because datum_width is only used to
+    /// decide whether a value is "wide" (> WIDTH_THRESHOLD = 1024); a few
+    /// extra bytes never cause a value to wrongly cross the threshold in
+    /// practice.
     fn datum_width(value: &Value) -> usize {
         match value {
             Value::Null => 0,
             Value::Boolean(_) => 1,
             Value::Int32(_) => 4,
             Value::Int64(_) | Value::Float64(_) => 8,
-            Value::Numeric(_) => 8, // rust_decimal: 128-bit fixed
+            // PG numeric on-disk: 4-byte varlena + 2-byte header + 2 bytes
+            // per base-10000 digit group.  rust_decimal max precision is
+            // 28 digits = 7 groups → 4 + 2 + 14 = 20 bytes.
+            // This is the upper bound; small values like 0::numeric are only
+            // 10 bytes in PG.  Conservative for WIDTH_THRESHOLD purposes.
+            Value::Numeric(_) => 20,
             Value::Date(_) => 4,
             Value::Time(_) | Value::Timestamp(_) => 8,
             Value::Interval { .. } => 16,
@@ -197,11 +210,44 @@ impl ColumnAccumulator {
             Value::Tsvector(s) | Value::Tsquery(s) => s.len() + 4,
             Value::Vector(v) => v.len() * 4 + 4, // f32 per dim + header
             Value::Array(a) => {
-                // PG array: 24-byte header (varlena + ndim + flags + elemtype
-                // + dim/lbound) + per-element datum sizes.
-                // Verified: pg_column_size(array[1]::int4[]) = 28 = 24 + 4.
-                let elem_size: usize = a.iter().map(Self::datum_width).sum();
-                elem_size + 24
+                if a.is_empty() {
+                    // PG zero-dimension empty array: 16 bytes.
+                    // Verified: pg_column_size(array[]::int4[]) = 16.
+                    return 16;
+                }
+                // PG array layout (1-D, non-empty):
+                //   24-byte header (varlena + ndim + flags + elemtype + dim/lbound)
+                //   + null bitmap: ceil(n_elements / 8) when any NULL present
+                //   + per-element data with INTALIGN (4-byte) padding between
+                //     varlena elements
+                //
+                // Reference pg_column_size values from PG 17:
+                //   array[1]::int4[]                    = 28 = 24 + 4
+                //   array_fill('x'::text, array[126])   = 1032
+                //     = 24 + 126 * INTALIGN(4+1) = 24 + 126*8
+                //   array_fill(NULL::int4, ARRAY[8001]) = 1032
+                //     = MAXALIGN(24 + ceil(8001/8)) = MAXALIGN(24+1001)
+                //
+                // Note: blanket INTALIGN overestimates for char-aligned types
+                // (bool, int2) and underestimates for double-aligned types
+                // (int8, float8).  Acceptable for WIDTH_THRESHOLD gating.
+                let has_nulls = a.iter().any(|v| matches!(v, Value::Null));
+                let null_bitmap = if has_nulls { a.len().div_ceil(8) } else { 0 };
+                // Non-NULL elements with INTALIGN padding (PG aligns each
+                // varlena element to 4-byte boundary within array payload).
+                let elem_size: usize = a
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Null))
+                    .map(|v| {
+                        let w = Self::datum_width(v);
+                        // INTALIGN: round up to next multiple of 4
+                        (w + 3) & !3
+                    })
+                    .sum();
+                // MAXALIGN the header+bitmap before data payload.
+                let header_plus_bitmap = 24 + null_bitmap;
+                let aligned = (header_plus_bitmap + 7) & !7;
+                aligned + elem_size
             }
         }
     }

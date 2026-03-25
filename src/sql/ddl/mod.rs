@@ -1016,22 +1016,6 @@ pub(super) fn track_active_worker_txn(
 // Pre-scan guard removed: replaced by inline AlterTableBudget tracking
 // that counts actual bytes written during the rewrite (not predicted).
 
-/// Check if a view/matview depends on the specified table.
-///
-/// db9 does not track column-level view dependencies (only table-level via
-/// `ViewDef.deps`).  Fine-grained detection of which columns a view uses
-/// would require full semantic analysis (resolving wildcards, qualified names,
-/// table aliases).  Instead, we take the conservative PostgreSQL-compatible
-/// approach: if a view depends on the table at all, DROP COLUMN is blocked
-/// unless CASCADE is used (which db9 does not support yet).
-///
-/// This may produce false positives (blocking drops of columns the view
-/// doesn't actually use), but never false negatives (allowing drops that
-/// break views).  Column-level dependency tracking is tracked in #2045.
-pub(super) fn view_depends_on_table(view_deps: &[String], table_name: &str) -> bool {
-    view_deps.iter().any(|d| d == table_name)
-}
-
 pub(super) fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Value> {
     let new_type = &target_col.data_type;
     if matches!(val, Value::Null) {

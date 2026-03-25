@@ -140,6 +140,7 @@ pub(crate) fn embedding_usage_table_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "resets_at".to_string(),
@@ -152,6 +153,7 @@ pub(crate) fn embedding_usage_table_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         vec![],

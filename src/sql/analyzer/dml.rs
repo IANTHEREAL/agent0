@@ -55,6 +55,8 @@ impl<'a> Analyzer<'a> {
         };
 
         // Build scope for the target table (needed for RETURNING and ON CONFLICT).
+        // Include all physical columns so ColumnRef indices align with executor's
+        // physical row layout. Dropped columns become hidden placeholders.
         let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
@@ -221,9 +223,34 @@ impl<'a> Analyzer<'a> {
                     )?;
 
                     // Build scope with both target table and "excluded" pseudo-table.
+                    // Use dropped-aware path to preserve physical row alignment.
                     let mut scope = Scope::new();
-                    scope.add_table(table_scope_name, table_cols);
-                    scope.add_table("excluded", table_cols);
+                    let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
+                    if has_dropped {
+                        let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> =
+                            schema
+                                .columns
+                                .iter()
+                                .map(|c| {
+                                    (
+                                        c.name.clone(),
+                                        c.data_type.clone(),
+                                        c.nullable,
+                                        c.collation.clone(),
+                                        c.is_dropped,
+                                    )
+                                })
+                                .collect();
+                        scope.add_table_with_dropped_columns(
+                            table_scope_name,
+                            &cols_with_dropped,
+                            false,
+                        );
+                        scope.add_table_with_dropped_columns("excluded", &cols_with_dropped, false);
+                    } else {
+                        scope.add_table(table_scope_name, table_cols);
+                        scope.add_table("excluded", table_cols);
+                    }
                     self.scopes.push(scope);
 
                     let mut assignments = Vec::new();
@@ -259,10 +286,32 @@ impl<'a> Analyzer<'a> {
             OnInsert::DuplicateKeyUpdate(assignments) => {
                 // MySQL-style ON DUPLICATE KEY UPDATE — treated like DO UPDATE.
                 let mut scope = Scope::new();
-                scope.add_table(table_scope_name, table_cols);
-                // MySQL uses VALUES(col) to reference the row being inserted.
-                // We approximate by adding the same columns under "excluded".
-                scope.add_table("excluded", table_cols);
+                let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
+                if has_dropped {
+                    let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> =
+                        schema
+                            .columns
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.name.clone(),
+                                    c.data_type.clone(),
+                                    c.nullable,
+                                    c.collation.clone(),
+                                    c.is_dropped,
+                                )
+                            })
+                            .collect();
+                    scope.add_table_with_dropped_columns(
+                        table_scope_name,
+                        &cols_with_dropped,
+                        false,
+                    );
+                    scope.add_table_with_dropped_columns("excluded", &cols_with_dropped, false);
+                } else {
+                    scope.add_table(table_scope_name, table_cols);
+                    scope.add_table("excluded", table_cols);
+                }
                 self.scopes.push(scope);
 
                 let mut analyzed_assignments = Vec::new();
@@ -325,6 +374,7 @@ impl<'a> Analyzer<'a> {
         let (resolved_name, table_schema, schema) = self.resolve_dml_target(target_name)?;
 
         // Build scope: target table (+ FROM tables if present).
+        // Include all physical columns so ColumnRef indices align with physical rows.
         let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
@@ -338,9 +388,27 @@ impl<'a> Analyzer<'a> {
             })
             .collect();
 
+        let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
         let mut scope = Scope::new();
         scope.set_add_system_columns(true);
-        scope.add_table(&target_alias, &table_cols);
+        if has_dropped {
+            let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.data_type.clone(),
+                        c.nullable,
+                        c.collation.clone(),
+                        c.is_dropped,
+                    )
+                })
+                .collect();
+            scope.add_table_with_dropped_columns(&target_alias, &cols_with_dropped, true);
+        } else {
+            scope.add_table(&target_alias, &table_cols);
+        }
 
         // Analyze FROM clause if present.
         let analyzed_from = if let Some(from_table) = from {
@@ -433,6 +501,7 @@ impl<'a> Analyzer<'a> {
         let (resolved_name, table_schema, schema) = self.resolve_dml_target(target_name)?;
 
         // Build scope: target table + USING tables.
+        // Include all physical columns so ColumnRef indices align with physical rows.
         let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
@@ -446,9 +515,27 @@ impl<'a> Analyzer<'a> {
             })
             .collect();
 
+        let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
         let mut scope = Scope::new();
         scope.set_add_system_columns(true);
-        scope.add_table(&target_alias, &table_cols);
+        if has_dropped {
+            let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        c.data_type.clone(),
+                        c.nullable,
+                        c.collation.clone(),
+                        c.is_dropped,
+                    )
+                })
+                .collect();
+            scope.add_table_with_dropped_columns(&target_alias, &cols_with_dropped, true);
+        } else {
+            scope.add_table(&target_alias, &table_cols);
+        }
 
         // Analyze USING clause if present.
         let analyzed_using = if !using.is_empty() {
@@ -528,6 +615,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Find a column index by name in a table schema.
+    /// Skips logically dropped columns (PostgreSQL `attisdropped`).
     fn find_column_index(
         &self,
         schema: &crate::model::TableSchema,
@@ -537,7 +625,7 @@ impl<'a> Analyzer<'a> {
         schema
             .columns
             .iter()
-            .position(|c| c.name == col_name)
+            .position(|c| !c.is_dropped && c.name == col_name)
             .ok_or_else(|| AnalyzerError::DmlColumnNotFound {
                 column: col_name.to_string(),
                 table: table_name.to_string(),
@@ -600,13 +688,22 @@ impl<'a> Analyzer<'a> {
         schema: &crate::model::TableSchema,
         source_arity: usize,
     ) -> Result<Vec<usize>, AnalyzerError> {
-        if source_arity > schema.columns.len() {
+        // Skip logically dropped columns — implicit INSERT targets only
+        // visible columns (matching PostgreSQL attisdropped semantics).
+        let visible_indices: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_dropped)
+            .map(|(i, _)| i)
+            .collect();
+        if source_arity > visible_indices.len() {
             return Err(AnalyzerError::InsertColumnCountMismatch {
-                columns: schema.columns.len(),
+                columns: visible_indices.len(),
                 values: source_arity,
             });
         }
-        Ok((0..source_arity).collect())
+        Ok(visible_indices[..source_arity].to_vec())
     }
 
     fn validate_generated_update_target(

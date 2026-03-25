@@ -20,6 +20,7 @@ fn test_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "amount".to_string(),
@@ -32,6 +33,7 @@ fn test_schema() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 1,
@@ -149,6 +151,7 @@ fn test_schema_with_float_partition() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "grp".to_string(),
@@ -161,6 +164,7 @@ fn test_schema_with_float_partition() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 1,
@@ -192,6 +196,7 @@ fn test_schema_with_numeric_partition() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "grp".to_string(),
@@ -207,6 +212,7 @@ fn test_schema_with_numeric_partition() -> TableSchema {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 1,
@@ -401,6 +407,7 @@ fn test_window_row_number_partitioned() {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
             ColumnDef {
                 name: "id".to_string(),
@@ -413,6 +420,7 @@ fn test_window_row_number_partitioned() {
                 generation_expr: None,
                 generation_expr_authorized_by: None,
                 collation: None,
+                is_dropped: false,
             },
         ],
         version: 1,

@@ -190,6 +190,7 @@ impl Executor {
             collation: None,
             is_serial: true,
             unique: true,
+            is_dropped: false,
         }];
         col_defs.extend(columns.iter().enumerate().map(|(i, col_name)| {
             let data_type = if rows.is_empty() {
@@ -208,6 +209,7 @@ impl Executor {
                 collation: None,
                 is_serial: false,
                 unique: false,
+                is_dropped: false,
             }
         }));
 

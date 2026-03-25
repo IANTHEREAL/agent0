@@ -370,6 +370,7 @@ fn coerce_jsonb_to_text_produces_canonical_output() {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     };
     let result =
         coerce_value_for_type_change(Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
@@ -389,6 +390,7 @@ fn coerce_json_to_text_preserves_raw_format() {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     };
     let result =
         coerce_value_for_type_change(Value::Json(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
@@ -655,6 +657,7 @@ fn coerce_uuid_to_text_for_type_change() {
         generation_expr: None,
         generation_expr_authorized_by: None,
         collation: None,
+        is_dropped: false,
     };
     let bytes = *uuid::Uuid::nil().as_bytes();
     let out = coerce_value_for_type_change(Value::Uuid(bytes), &col).unwrap();

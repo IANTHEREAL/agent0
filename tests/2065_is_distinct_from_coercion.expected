@@ -1,0 +1,121 @@
+dept|count
+a|2
+b|1
+(2 rows)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+t
+(1 row)
+?column?
+t
+(1 row)
+?column?
+t
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+ERROR:  operator does not exist: text = integer
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: text = integer
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+?column?
+t
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+ERROR:  could not determine data type of parameter $1
+ERROR:  could not determine data type of parameter $1
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+ERROR:  operator does not exist: unknown = json
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: unknown = json
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+ERROR:  operator does not exist: json = json
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: json = json
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+?column?
+f
+(1 row)
+?column?
+t
+(1 row)
+ERROR:  operator does not exist: integer = boolean
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: jsonb = json
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.

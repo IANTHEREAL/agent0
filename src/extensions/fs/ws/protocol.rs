@@ -330,6 +330,7 @@ pub(crate) struct FileInfoResponse {
     pub file_type: String,
     pub size: u64,
     pub mode: u32,
+    pub generation: u64,
     pub mtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<FsStorage>,
@@ -365,6 +366,7 @@ impl From<FsFileInfo> for FileInfoResponse {
             },
             size: value.size,
             mode: value.mode,
+            generation: value.generation,
             mtime: format_mtime_rfc3339(value.mtime),
             storage: value.storage,
             sealed: value.sealed,
@@ -776,6 +778,7 @@ mod tests {
             is_symlink: false,
             size: 123,
             mode: 0o100644,
+            generation: 1,
             mtime: 0,
             storage: Some(FsStorage::Object),
             sealed: Some(true),
@@ -786,6 +789,7 @@ mod tests {
         assert_eq!(dst.file_type, "file");
         assert_eq!(dst.size, 123);
         assert_eq!(dst.mode, 0o100644);
+        assert_eq!(dst.generation, 1);
         assert_eq!(dst.mtime, "1970-01-01T00:00:00Z");
         assert_eq!(dst.storage, Some(FsStorage::Object));
         assert_eq!(dst.sealed, Some(true));
@@ -1047,6 +1051,7 @@ mod tests {
             is_symlink: true,
             size: 15,
             mode: 0o777,
+            generation: 1,
             mtime: 0,
             storage: None,
             sealed: Some(false),
@@ -1055,5 +1060,6 @@ mod tests {
         let dst = FileInfoResponse::from(src);
         assert_eq!(dst.file_type, "symlink");
         assert_eq!(dst.size, 15);
+        assert_eq!(dst.generation, 1);
     }
 }

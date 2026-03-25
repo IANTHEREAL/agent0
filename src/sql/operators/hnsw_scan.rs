@@ -150,15 +150,18 @@ impl HnswScanOperator {
         k: usize,
         distance_metric: HnswDistanceMetric,
     ) -> Result<Vec<(u64, f64)>> {
-        let permit = hnsw_search_semaphore().acquire().await
+        let permit = hnsw_search_semaphore()
+            .acquire()
+            .await
             .map_err(|_| anyhow!("HNSW search semaphore closed"))?;
         let base = Arc::clone(base);
         let query = query_f32.to_vec();
         tokio::task::spawn_blocking(move || {
             let _permit = permit; // moved in — released when closure returns
             Self::search_and_rank(&base.index, &query, k, distance_metric)
-        }).await
-            .map_err(|e| anyhow!("HNSW search task failed: {}", e))?
+        })
+        .await
+        .map_err(|e| anyhow!("HNSW search task failed: {}", e))?
     }
 
     /// Search a small per-query delta index with semaphore + spawn_blocking.
@@ -170,15 +173,18 @@ impl HnswScanOperator {
         k: usize,
         distance_metric: HnswDistanceMetric,
     ) -> Result<Vec<(u64, f64)>> {
-        let permit = hnsw_search_semaphore().acquire().await
+        let permit = hnsw_search_semaphore()
+            .acquire()
+            .await
             .map_err(|_| anyhow!("HNSW search semaphore closed"))?;
         let delta = Arc::clone(delta);
         let query = query_f32.to_vec();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             Self::search_and_rank(&delta, &query, k, distance_metric)
-        }).await
-            .map_err(|e| anyhow!("HNSW search task failed: {}", e))?
+        })
+        .await
+        .map_err(|e| anyhow!("HNSW search task failed: {}", e))?
     }
 }
 
@@ -236,16 +242,10 @@ impl PhysicalOperator for HnswScanOperator {
 
         // Read meta.
         let meta_key = hnsw_meta_key(ctx.db_id, self.schema.table_id, self.index_id);
-        let Some(meta_bytes) = ctx
-            .txn
-            .get(meta_key)
-            .await
-            .map_err(|e| anyhow!(e))?
-        else {
+        let Some(meta_bytes) = ctx.txn.get(meta_key).await.map_err(|e| anyhow!(e))? else {
             return Ok(());
         };
-        let meta: HnswMeta =
-            serde_json::from_slice(&meta_bytes).map_err(|e| anyhow!(e))?;
+        let meta: HnswMeta = serde_json::from_slice(&meta_bytes).map_err(|e| anyhow!(e))?;
         if meta.dropped_at.is_some() {
             return Ok(());
         }
@@ -259,33 +259,45 @@ impl PhysicalOperator for HnswScanOperator {
         let label_mode = meta.label_mode;
 
         // Scan deltas up to a byte-based budget (adapts to dimensions).
-        // If truncated, search with partial deltas — HNSW is already approximate,
-        // and missing recent inserts is semantically the same as stale deletions
-        // still in the graph. The merge worker will consolidate them into the
-        // base graph, at which point they become visible to all queries.
+        // If truncated, we MUST error rather than return partial results.
+        // Silently dropping deltas causes read-your-writes violations: a row
+        // that exists (visible via seq scan) becomes invisible to HNSW search.
+        // This is not an approximation quality issue — it is a correctness bug.
         let delta_limit = max_deltas_for_budget(meta.dimensions, meta.m);
         let (deltas, delta_truncated) = scan_visible_deltas(
-            ctx.txn, ctx.db_id, self.schema.table_id, self.index_id,
+            ctx.txn,
+            ctx.db_id,
+            self.schema.table_id,
+            self.index_id,
             delta_limit,
-        ).await?;
+        )
+        .await?;
 
         if delta_truncated {
-            tracing::warn!(
-                table = %self.schema.name,
-                index = %self.index_name,
-                collected = deltas.len(),
-                limit = delta_limit,
-                "HNSW scan: delta backlog exceeds memory budget; \
-                 searching with partial deltas until merge catches up"
-            );
+            return Err(anyhow!(
+                "HNSW index \"{}\" on table \"{}\" has {} pending deltas exceeding \
+                 the memory budget (limit: {}). Recent writes may be invisible to \
+                 approximate nearest-neighbor search until the background merge \
+                 completes. Wait for merge or run ANALYZE to trigger it.",
+                self.index_name,
+                self.schema.name,
+                deltas.len(),
+                delta_limit,
+            ));
         }
 
         let delta_count = deltas.len();
 
         // Get shared base graph (cache hit = 0ms, miss = load from disk/S3).
         let shared_base = get_shared_base_graph(
-            ctx.txn, ctx.db_id, self.schema.table_id, self.index_id, &meta, keyspace,
-        ).await?;
+            ctx.txn,
+            ctx.db_id,
+            self.schema.table_id,
+            self.index_id,
+            &meta,
+            keyspace,
+        )
+        .await?;
 
         // Nothing to search.
         if shared_base.is_none() && deltas.is_empty() {

@@ -57,6 +57,9 @@ impl VirtualTable for PgAttrdef {
             let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             for (i, col) in schema.columns.iter().enumerate() {
+                if col.is_dropped {
+                    continue;
+                }
                 let expr = sequences::resolve_serial_display_default(
                     col,
                     &sequence_defs,

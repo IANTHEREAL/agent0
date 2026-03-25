@@ -77,6 +77,7 @@ fn push_attribute_row(
     atttypmod: i64,
     attcollation: i64,
     attgenerated: &str,
+    attisdropped: bool,
 ) {
     rows.push(Row::new(vec![
         int_val(attrelid),
@@ -89,8 +90,8 @@ fn push_attribute_row(
         text_val(""),  // attcompression
         Value::Boolean(attnotnull),
         Value::Boolean(atthasdef),
-        Value::Boolean(false), // attisdropped
-        Value::Boolean(true),  // attislocal
+        Value::Boolean(attisdropped),
+        Value::Boolean(true), // attislocal
         int_val(atttypmod),
         int_val(0), // attinhcount
         int_val(attcollation),
@@ -178,18 +179,33 @@ impl VirtualTable for PgAttribute {
                         &mut rows,
                         base_table_oid,
                         &col.name,
-                        type_oid,
+                        if col.is_dropped { 0 } else { type_oid },
                         (i + 1) as i64,
-                        attlen,
-                        !col.nullable,
-                        col.is_serial || col.default_expr.is_some(),
-                        atttypmod_for_datatype(&col.data_type),
-                        attcollation_for_datatype(&col.data_type),
-                        if col.generation_expr.is_some() {
+                        if col.is_dropped { -1 } else { attlen },
+                        if col.is_dropped { false } else { !col.nullable },
+                        if col.is_dropped {
+                            false
+                        } else {
+                            col.is_serial || col.default_expr.is_some()
+                        },
+                        if col.is_dropped {
+                            -1
+                        } else {
+                            atttypmod_for_datatype(&col.data_type)
+                        },
+                        if col.is_dropped {
+                            0
+                        } else {
+                            attcollation_for_datatype(&col.data_type)
+                        },
+                        if col.is_dropped {
+                            ""
+                        } else if col.generation_expr.is_some() {
                             "s"
                         } else {
                             ""
                         },
+                        col.is_dropped,
                     );
                 }
             }
@@ -226,6 +242,7 @@ impl VirtualTable for PgAttribute {
                     atttypmod_for_datatype(&col.data_type),
                     attcollation_for_datatype(&col.data_type),
                     "",
+                    false, // virtual table columns are never dropped
                 );
             }
         }

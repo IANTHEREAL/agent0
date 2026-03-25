@@ -1,44 +1,29 @@
 SET
- statement_timeout_ok
-
+statement_timeout_ok
 SET
- lock_timeout_ok
-
+lock_timeout_ok
 SET
- idle_in_txn_ok
-
+idle_in_txn_ok
 SET
- client_encoding_ok
-
+client_encoding_ok
 SET
- scs_on_ok
-
+scs_on_ok
 SET
- check_fn_bodies_ok
-
+check_fn_bodies_ok
 SET
- client_min_messages_ok
-
+client_min_messages_ok
 SET
- row_security_ok
-
+row_security_ok
 SET
- default_tablespace_empty_ok
-
+default_tablespace_empty_ok
 SET
- default_tam_heap_ok
-
+default_tam_heap_ok
 SET
- datestyle_ok
+datestyle_ok
+on
+off
 
- on
-
- off
-
- 
-
- heap
-
+heap
 RESET
 RESET
 RESET

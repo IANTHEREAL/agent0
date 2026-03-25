@@ -11,6 +11,7 @@ pub(crate) mod config;
 pub(crate) mod decoders;
 pub(crate) mod embedded;
 pub(crate) mod glob;
+pub(crate) mod notify;
 pub(crate) mod s3;
 pub(crate) mod sql_client;
 pub(crate) mod streaming;
@@ -895,6 +896,7 @@ mod tests {
             is_symlink: false,
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },
+            generation: 0,
             mtime,
             storage: None,
             sealed: None,
@@ -1089,6 +1091,7 @@ mod tests {
                     is_symlink: false,
                     size: 4,
                     mode: 0o644,
+                    generation: 1,
                     mtime: 0,
                     storage: None,
                     sealed: None,

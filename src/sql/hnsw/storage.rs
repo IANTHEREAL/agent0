@@ -101,6 +101,16 @@ pub struct HnswMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dropped_at: Option<u64>,
+    /// Random per-index nonce set on CREATE INDEX. Used as part of the
+    /// shared index cache key to prevent stale-cache hits after DROP+CREATE
+    /// cycles that reuse the same index_id. Without this, two indexes with
+    /// identical parameters (but on different columns) would produce the
+    /// same cache fingerprint. The nonce makes each index instance globally
+    /// unique regardless of parameter coincidence.
+    /// Backward-compatible: old meta without this field deserializes to 0.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_nonce: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -404,6 +414,7 @@ pub fn create_empty_hnsw_index(
         frozen: false,
         graph_version: 0,
         dropped_at: None,
+        cache_nonce: 0,
     };
     Ok((HnswIndexHandle::new(index), meta))
 }
@@ -946,15 +957,10 @@ pub async fn get_shared_base_graph(
         return Ok(None);
     }
 
-    // Empty base graph (post-TRUNCATE or pre-first-merge). Return None so
-    // the caller only searches the delta index. This is the authoritative
-    // guard against stale cache entries after TRUNCATE: meta.count is always
-    // consistent after commit, regardless of cache eviction timing.
+    // Empty base graph (post-TRUNCATE or pre-first-merge).
     if meta.count == 0 {
         return Ok(None);
     }
-
-    let cache = hnsw_index_cache();
 
     // Pre-load size check: reject before any allocation.
     let estimated_bytes = estimate_graph_memory(meta.count, meta.dimensions, meta.m);
@@ -963,18 +969,50 @@ pub async fn get_shared_base_graph(
         return Err(SqlError::Internal(anyhow::anyhow!(
             "HNSW index d_{}_hnsw_{}_{} estimated at {} bytes ({} vectors × {} dims) \
              exceeds HNSW_MAX_INDEX_MEMORY ({} bytes). Reduce index size or increase the limit.",
-            db_id, table_id, index_id, estimated_bytes, meta.count, meta.dimensions, max_index
+            db_id,
+            table_id,
+            index_id,
+            estimated_bytes,
+            meta.count,
+            meta.dimensions,
+            max_index
         )));
     }
 
+    // Cache version: for S3 graphs, graph_version (TSO-based, collision-free).
+    // For TiKV graphs with a nonce, use nonce ^ count. Legacy TiKV indexes
+    // (cache_nonce=0, pre-upgrade) bypass the shared cache entirely to avoid
+    // stale hits — the nonce is the only reliable cross-DDL discriminator.
+    let cache_version = if meta.graph_version > 0 {
+        meta.graph_version
+    } else if meta.cache_nonce != 0 {
+        meta.cache_nonce ^ meta.count
+    } else {
+        // Legacy TiKV index without nonce: load directly, don't cache.
+        let result = load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await?;
+        return match result {
+            Some((handle, _)) => Ok(Some(Arc::new(SharedHnswIndex {
+                index: handle,
+                estimated_memory_bytes: estimated_bytes,
+            }))),
+            None => Ok(None),
+        };
+    };
+
+    let cache = hnsw_index_cache();
+
     // Fast path: cache hit.
-    if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version) {
+    if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, cache_version) {
         return Ok(Some(shared));
     }
 
     // Slow path: cache miss with singleflight coordination.
     let inflight_key = (
-        keyspace.to_string(), db_id, table_id, index_id, meta.graph_version,
+        keyspace.to_string(),
+        db_id,
+        table_id,
+        index_id,
+        cache_version,
     );
 
     loop {
@@ -987,9 +1025,7 @@ pub async fn get_shared_base_graph(
             let mut inflight = INFLIGHT_LOADS.lock().unwrap();
 
             // Re-check cache under inflight lock to close the race window.
-            if let Some(shared) =
-                cache.lookup(keyspace, db_id, table_id, index_id, meta.graph_version)
-            {
+            if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, cache_version) {
                 return Ok(Some(shared));
             }
 
@@ -1004,16 +1040,41 @@ pub async fn get_shared_base_graph(
 
         match role {
             Role::Waiter(mut rx) => {
-                // rx was cloned inside the mutex with version mark at "false".
-                // When the loader sends "true", changed() sees version advance
-                // and returns — even if send() happened before this await.
-                // If the loader failed and dropped tx, changed() returns Err,
-                // and we loop back to become the next loader.
-                let _ = rx.changed().await;
+                if rx.changed().await.is_err() {
+                    // Sender was dropped — the loader either failed normally
+                    // (and already called remove()) or was CANCELLED (client
+                    // disconnect, statement_timeout, task abort) without
+                    // cleanup.  Remove the potentially-stale map entry so
+                    // the next loop iteration can become the new Loader.
+                    // This is idempotent: remove() is a no-op if the key
+                    // was already cleaned up by the normal error path.
+                    INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                }
             }
             Role::Loader(tx) => {
-                let result =
-                    load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await;
+                // CANCELLATION SAFETY: if load_base_graph().await is
+                // cancelled (dropped), this guard ensures the map entry
+                // is removed so waiters don't spin on a closed channel.
+                struct InflightCleanup<'a> {
+                    key: &'a InflightKey,
+                    defused: bool,
+                }
+                impl<'a> Drop for InflightCleanup<'a> {
+                    fn drop(&mut self) {
+                        if !self.defused {
+                            INFLIGHT_LOADS.lock().unwrap().remove(self.key);
+                        }
+                    }
+                }
+                let mut cleanup = InflightCleanup {
+                    key: &inflight_key,
+                    defused: false,
+                };
+
+                let result = load_base_graph(txn, db_id, table_id, index_id, meta, keyspace).await;
+
+                // Defuse the guard — we'll handle cleanup explicitly below.
+                cleanup.defused = true;
 
                 // On success: insert into cache FIRST, then signal waiters.
                 // This ensures waiters always find the value in cache.
@@ -1021,11 +1082,18 @@ pub async fn get_shared_base_graph(
                 match result {
                     Ok(Some((handle, live_meta))) => {
                         let estimated_bytes = estimate_graph_memory(
-                            live_meta.count, live_meta.dimensions, live_meta.m,
+                            live_meta.count,
+                            live_meta.dimensions,
+                            live_meta.m,
                         );
                         let shared = cache.insert(
-                            keyspace, db_id, table_id, index_id,
-                            meta.graph_version, handle, estimated_bytes,
+                            keyspace,
+                            db_id,
+                            table_id,
+                            index_id,
+                            cache_version,
+                            handle,
+                            estimated_bytes,
                         );
                         INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
                         let _ = tx.send(true);
@@ -1592,6 +1660,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"label_mode\":\"Mapped\""));
@@ -1613,6 +1682,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -1680,6 +1750,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
         let deserialized: HnswMeta = serde_json::from_slice(&bytes).unwrap();
@@ -1700,6 +1771,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("frozen"));
@@ -1746,6 +1818,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let (graph_bytes, _) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
         // This graph should exceed the threshold.
@@ -1782,6 +1855,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // The merge dispatch checks meta.frozen and skips.
         assert!(meta.frozen, "frozen index should be skipped by dispatch");
@@ -1807,6 +1881,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let normal_meta = HnswMeta {
             count: 100,
@@ -1820,6 +1895,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Sweep logic: skip frozen, enqueue normal.
         let indexes = [("frozen_idx", &frozen_meta), ("normal_idx", &normal_meta)];
@@ -1870,6 +1946,7 @@ mod tests {
             frozen: true,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         // Re-freeze is a no-op on the bool.
         meta.frozen = true;
@@ -1905,6 +1982,7 @@ mod tests {
             frozen: false,
             graph_version: 0,
             dropped_at: None,
+            cache_nonce: 0,
         };
         let (graph_bytes, _meta_bytes) = serialize_hnsw_snapshot(1, 1, 1, &index, &meta).unwrap();
 

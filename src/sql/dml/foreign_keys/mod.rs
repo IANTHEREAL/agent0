@@ -790,6 +790,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "parent_id".to_string(),
@@ -802,6 +803,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             pk_indices: vec![0],
@@ -947,6 +949,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "parent_id".to_string(),
@@ -959,6 +962,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -971,6 +975,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
                 ColumnDef {
                     name: "unrelated".to_string(),
@@ -983,6 +988,7 @@ mod tests {
                     generation_expr: None,
                     generation_expr_authorized_by: None,
                     collation: None,
+                    is_dropped: false,
                 },
             ],
             pk_indices: vec![0],
