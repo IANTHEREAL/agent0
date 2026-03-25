@@ -797,7 +797,8 @@ fn effective_cron_orphan_timeout_sec(
     cron_config.orphan_timeout_sec.max(worker_timeout_sec)
 }
 
-include!("gc/hnsw_helpers.rs");
+mod hnsw_helpers;
+use hnsw_helpers::*;
 
 #[cfg(test)]
 mod tests;

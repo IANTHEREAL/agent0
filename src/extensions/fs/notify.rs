@@ -534,11 +534,6 @@ pub async fn execute_fs9_events_from_redis(
 // Enqueue helpers (delegate to redis_events module)
 // ---------------------------------------------------------------------------
 
-/// Enqueue a single event for async Redis persistence. Zero I/O on caller.
-pub fn enqueue_persist_event(keyspace: &str, builder: FsEventBuilder) {
-    super::redis_events::enqueue_event(keyspace, builder);
-}
-
 /// Enqueue multiple events for async Redis persistence.
 pub fn enqueue_persist_events(keyspace: &str, builders: Vec<FsEventBuilder>) {
     super::redis_events::enqueue_events(keyspace, builders);

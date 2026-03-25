@@ -204,16 +204,6 @@ fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i64> {
 // Write path: async channel → background pipeline XADD
 // ---------------------------------------------------------------------------
 
-/// Enqueue a single event for async Redis persistence. Zero I/O on caller.
-pub fn enqueue_event(keyspace: &str, builder: FsEventBuilder) {
-    if let Some(tx) = EVENT_TX.get() {
-        let _ = tx.send(RedisEvent {
-            keyspace: keyspace.to_string(),
-            builder,
-        });
-    }
-}
-
 /// Enqueue multiple events for async Redis persistence.
 pub fn enqueue_events(keyspace: &str, builders: Vec<FsEventBuilder>) {
     if let Some(tx) = EVENT_TX.get() {

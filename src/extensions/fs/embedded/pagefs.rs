@@ -753,11 +753,6 @@ impl EmbeddedPageFs {
         }
     }
 
-    /// Enqueue a single event for async Redis persistence (zero I/O on caller).
-    fn persist_event_async(&self, builder: FsEventBuilder) {
-        crate::extensions::fs::notify::enqueue_persist_event(&self.keyspace, builder);
-    }
-
     /// Enqueue multiple events for async Redis persistence (zero I/O on caller).
     fn persist_events_async(&self, builders: Vec<FsEventBuilder>) {
         crate::extensions::fs::notify::enqueue_persist_events(&self.keyspace, builders);
