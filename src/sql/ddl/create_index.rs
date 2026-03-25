@@ -113,6 +113,482 @@ fn resolve_create_index_method(using: Option<&Ident>) -> Result<ResolvedIndexMet
     Ok(resolved)
 }
 
+/// Build an HNSW vector index over existing table rows.
+///
+/// Extracted from `execute_create_index` for readability. All logic is
+/// unchanged — this is a pure move refactoring.
+#[allow(clippy::too_many_arguments)]
+async fn build_hnsw_index(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    new_index: &IndexDef,
+    idx_name_str: &str,
+    keyspace: &str,
+) -> Result<()> {
+    // HNSW indexes require the worker subsystem for background delta-log
+    // merge. Reject early — before expensive table scan + index build.
+    require_worker_for_index(
+        "HNSW",
+        idx_name_str,
+        "HNSW indexes require background merge via the worker engine. \
+         Enable the worker or use a btree index.",
+    )?;
+
+    let col_name = new_index
+        .columns
+        .first()
+        .ok_or_else(|| anyhow!("HNSW indexes only support single vector columns"))?
+        .clone();
+    let col_idx = schema
+        .column_index(&col_name)
+        .ok_or_else(|| anyhow!("Column not found"))?;
+    let vector_dimensions = match schema.columns[col_idx].data_type {
+        DataType::Vector(dim) => dim as usize,
+        _ => return Err(anyhow!("Column {} is not a vector type", col_name)),
+    };
+
+    let distance_metric = new_index
+        .hnsw_distance_metric
+        .clone()
+        .unwrap_or_else(|| "l2".to_string());
+    let metric = metric_from_string(distance_metric.as_str())
+        .map_err(|e| anyhow!("failed to parse HNSW distance metric: {}", e))?;
+    let m = usize::from(new_index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
+    let ef_construction = usize::from(
+        new_index
+            .hnsw_ef_construction
+            .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
+    );
+
+    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+    let data_key_prefix = start.clone();
+    let pk_types = pk_types_for_schema(schema);
+
+    // Determine label mode from PK type.
+    let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
+    let label_mode = if matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
+        crate::sql::hnsw::HnswLabelMode::Direct
+    } else {
+        crate::sql::hnsw::HnswLabelMode::Mapped
+    };
+
+    // ── Reject tables with negative PK values (Direct mode only) ──
+    // In Direct mode, usearch labels are derived from the PK value and
+    // must be non-negative u64. In Mapped mode, internal rowids are used
+    // so negative PKs are fine.
+    if label_mode == crate::sql::hnsw::HnswLabelMode::Direct {
+        let range: tikv_client::BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn.scan(range, 1).await?.collect();
+        if let Some(pair) = pairs.first() {
+            let mut row = crate::storage::deserialize_row(pair.value())?;
+            fill_row_defaults(&mut row, schema)?;
+            let pk_values = if schema.pk_indices.is_empty() {
+                let key: &[u8] = pair.key().as_ref().into();
+                let pk_bytes =
+                    key.strip_prefix(data_key_prefix.as_slice())
+                        .ok_or_else(|| {
+                            anyhow!("corrupted row key while validating HNSW index")
+                        })?;
+                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+            } else {
+                schema.get_pk_values(&row)
+            };
+            let is_negative = pk_values.iter().any(|v| match v {
+                Value::Int32(n) => *n < 0,
+                Value::Int64(n) => *n < 0,
+                _ => false,
+            });
+            if is_negative {
+                let pk_display = pk_values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "cannot create HNSW index: primary key contains negative value \
+                     ({}); HNSW indexes require non-negative INTEGER/BIGINT primary keys",
+                    pk_display
+                ));
+            }
+        }
+    }
+
+    let index_id = new_index.id;
+    let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+    let mut pending_vectors: Vec<(u64, Vec<f32>)> = Vec::new();
+    let mut count = 0u64;
+    while let Some(batch) = scanner.next_batch(txn).await? {
+        for pair in batch {
+            let key: &[u8] = pair.key().as_ref().into();
+            let mut row = crate::storage::deserialize_row(pair.value())?;
+            fill_row_defaults(&mut row, schema)?;
+
+            let pk_values = if schema.pk_indices.is_empty() {
+                let pk_bytes =
+                    key.strip_prefix(data_key_prefix.as_slice())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "corrupted row key while backfilling index '{}'",
+                                idx_name_str
+                            )
+                        })?;
+                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+            } else {
+                schema.get_pk_values(&row)
+            };
+
+            let vector = match row.values.get(col_idx) {
+                Some(Value::Null) | None => continue,
+                Some(Value::Vector(v)) => v,
+                Some(_) => return Err(anyhow!("Column {} is not a vector type", col_name)),
+            };
+            let pk_label = crate::sql::hnsw::hnsw_resolve_label(
+                label_mode,
+                txn,
+                store,
+                db_id,
+                schema.table_id,
+                &pk_values,
+            )
+            .await?;
+            pending_vectors.push((pk_label, vec_f64_to_f32(vector)));
+            count = count.saturating_add(1);
+        }
+    }
+
+    let (graph_bytes, meta_bytes, initial_graph_version) = {
+        let options = IndexOptions {
+            dimensions: vector_dimensions,
+            metric,
+            quantization: ScalarKind::F32,
+            connectivity: m,
+            expansion_add: ef_construction,
+            expansion_search: HNSW_DEFAULT_EF_SEARCH,
+        };
+        let index = usearch::ffi::new_index(&options)
+            .map_err(|e| anyhow!("failed to create HNSW index: {}", e))?;
+        // Reserve capacity before adding — usearch segfaults on add()
+        // to an unreserved index (0 capacity from new_index).
+        if !pending_vectors.is_empty() {
+            index
+                .reserve(pending_vectors.len())
+                .map_err(|e| anyhow!("failed to reserve HNSW capacity: {}", e))?;
+        }
+        for (pk_label, vector) in &pending_vectors {
+            index
+                .add(*pk_label, vector)
+                .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
+        }
+
+        let s3_enabled = crate::sql::hnsw::s3::hnsw_s3_client().is_some();
+        let meta = HnswMeta {
+            count,
+            capacity: index.capacity() as u64,
+            dimensions: vector_dimensions,
+            distance_metric,
+            m,
+            ef_construction,
+            storage_version: if s3_enabled { 2 } else { 1 },
+            label_mode,
+            frozen: false,
+            // Use PD TSO version as initial graph_version (not wall clock).
+            // TSO is cluster-monotonic, so:
+            // 1. DROP + CREATE with index_id reuse always produces a
+            //    higher version, preventing cross-node stale cache hits.
+            // 2. GC's version-ordering classification (current / historical
+            //    / future) remains correct — no clock-skew inversion.
+            graph_version: if s3_enabled {
+                use tikv_client::TimestampExt;
+                txn.start_timestamp().version()
+            } else {
+                0
+            },
+            dropped_at: None,
+            cache_nonce: rand::thread_rng().gen::<u64>() | 1,
+        };
+        let gv = meta.graph_version;
+        let (gb, mb) =
+            serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
+                .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?;
+        (gb, mb, gv)
+    };
+
+    // Register this (keyspace, db_id) in the worker registry so the periodic
+    // HNSW sweeper can discover it. This is FATAL: if registration fails,
+    // CREATE INDEX fails. This guarantees no HNSW index can exist without
+    // a registry entry — closing the crash-orphan discovery gap completely.
+    //
+    // Safety: get_system_store() is guaranteed Some — we checked at the top
+    // of the HNSW branch and returned an error if None.
+    {
+        let system_store = crate::worker::get_system_store()
+            .expect("worker check at HNSW branch entry guarantees Some");
+        let mut sys_txn = system_store.begin().await?;
+        system_store
+            .update_registry_task_types(
+                &mut sys_txn,
+                keyspace,
+                db_id,
+                crate::worker::types::TASK_TYPE_HNSW_MERGE,
+                0,
+            )
+            .await?;
+        sys_txn.commit().await?;
+    }
+
+    if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+        // S3 path: upload graph to S3, skip TiKV graph write and size guard.
+        s3.put_graph(
+            keyspace,
+            db_id,
+            schema.table_id,
+            index_id,
+            initial_graph_version, // timestamp-based, set above
+            bytes::Bytes::from(graph_bytes),
+        )
+        .await
+        .map_err(|e| anyhow!("HNSW S3 put_graph failed during CREATE INDEX: {}", e))?;
+        // Only write meta to TiKV (graph is in S3).
+        txn_put(
+            txn,
+            hnsw_meta_key(db_id, schema.table_id, index_id),
+            meta_bytes,
+        )
+        .await?;
+    } else {
+        // TiKV path: guard against oversized graph, then write both.
+        if graph_bytes.len() > crate::worker::engine::HNSW_GRAPH_MAX_BYTES {
+            return Err(anyhow!(
+                "HNSW index too large for initial build ({} bytes, limit {} bytes). \
+                 Reduce table size or vector dimensions before creating the index.",
+                graph_bytes.len(),
+                crate::worker::engine::HNSW_GRAPH_MAX_BYTES
+            ));
+        }
+
+        txn_put(
+            txn,
+            hnsw_graph_key(db_id, schema.table_id, index_id),
+            graph_bytes,
+        )
+        .await?;
+        txn_put(
+            txn,
+            hnsw_meta_key(db_id, schema.table_id, index_id),
+            meta_bytes,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Backfill a BTree (materializable) index over existing table rows.
+///
+/// Extracted from `execute_create_index` for readability. All logic is
+/// unchanged — this is a pure move refactoring.
+#[allow(clippy::too_many_arguments)]
+async fn backfill_btree_index(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    new_index: &IndexDef,
+    idx_name_str: &str,
+    rows: &[Row],
+    txn_guard: &mut Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
+    current_batch_writes: &mut usize,
+    has_committed_batches: &mut bool,
+) -> Result<()> {
+    let index_id = new_index.id;
+    if !rows.is_empty() {
+        if schema.pk_indices.is_empty() {
+            let pk_types: Vec<DataType> = vec![DataType::Uuid];
+            let (start, end) =
+                crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let data_key_prefix = start.clone();
+            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+            while let Some(batch) = scanner.next_batch(txn).await? {
+                for pair in batch {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    let pk_bytes = key
+                        .strip_prefix(data_key_prefix.as_slice())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "corrupted row key while backfilling index '{}'",
+                                idx_name_str
+                            )
+                        })?;
+                    let pk_values =
+                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+
+                    let mut row = crate::storage::deserialize_row(pair.value())?;
+                    fill_row_defaults(&mut row, schema)?;
+
+                    if !index_helpers::eval_index_predicate(new_index, schema, &row)? {
+                        continue;
+                    }
+                    let idx_values = index_helpers::get_index_values_with_expressions(
+                        new_index, schema, &row,
+                    )?;
+                    store
+                        .create_index_entry(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            index_id,
+                            &idx_values,
+                            &pk_values,
+                            new_index.unique,
+                        )
+                        .await?;
+                    *current_batch_writes += 1;
+                    maybe_rotate_backfill_txn(
+                        store,
+                        txn,
+                        txn_guard,
+                        current_batch_writes,
+                        has_committed_batches,
+                    )
+                    .await?;
+                }
+            }
+        } else {
+            for row in rows {
+                if !index_helpers::eval_index_predicate(new_index, schema, row)? {
+                    continue;
+                }
+                let idx_values = index_helpers::get_index_values_with_expressions(
+                    new_index, schema, row,
+                )?;
+                let pk_values = schema.get_pk_values(row);
+                store
+                    .create_index_entry(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index_id,
+                        &idx_values,
+                        &pk_values,
+                        new_index.unique,
+                    )
+                    .await?;
+                *current_batch_writes += 1;
+                maybe_rotate_backfill_txn(
+                    store,
+                    txn,
+                    txn_guard,
+                    current_batch_writes,
+                    has_committed_batches,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Backfill a GIN index over existing table rows.
+///
+/// Extracted from `execute_create_index` for readability. All logic is
+/// unchanged — this is a pure move refactoring.
+#[allow(clippy::too_many_arguments)]
+async fn backfill_gin_index(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    new_index: &IndexDef,
+    idx_name_str: &str,
+    rows: &[Row],
+    txn_guard: &mut Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
+    current_batch_writes: &mut usize,
+    has_committed_batches: &mut bool,
+) -> Result<()> {
+    let index_id = new_index.id;
+    if schema.pk_indices.is_empty() {
+        let pk_types: Vec<DataType> = vec![DataType::Uuid];
+        let (start, end) =
+            crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+        let data_key_prefix = start.clone();
+        let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+        while let Some(batch) = scanner.next_batch(txn).await? {
+            for pair in batch {
+                let key: &[u8] = pair.key().as_ref().into();
+                let pk_bytes =
+                    key.strip_prefix(data_key_prefix.as_slice())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "corrupted row key while backfilling index '{}'",
+                                idx_name_str
+                            )
+                        })?;
+                let pk_values =
+                    crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+
+                let mut row = crate::storage::deserialize_row(pair.value())?;
+                fill_row_defaults(&mut row, schema)?;
+
+                let hashes = extract_gin_token_hashes_from_row(schema, new_index, &row)?;
+                if hashes.is_empty() {
+                    continue;
+                }
+                store
+                    .create_gin_index_entries(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index_id,
+                        &hashes,
+                        &pk_values,
+                    )
+                    .await?;
+                *current_batch_writes += 1;
+                maybe_rotate_backfill_txn(
+                    store,
+                    txn,
+                    txn_guard,
+                    current_batch_writes,
+                    has_committed_batches,
+                )
+                .await?;
+            }
+        }
+    } else {
+        for row in rows {
+            let hashes = extract_gin_token_hashes_from_row(schema, new_index, row)?;
+            if hashes.is_empty() {
+                continue;
+            }
+            let pk_values = schema.get_pk_values(row);
+            store
+                .create_gin_index_entries(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    index_id,
+                    &hashes,
+                    &pk_values,
+                )
+                .await?;
+            *current_batch_writes += 1;
+            maybe_rotate_backfill_txn(
+                store,
+                txn,
+                txn_guard,
+                current_batch_writes,
+                has_committed_batches,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_create_index(
     store: &Arc<TikvStore>,
@@ -397,421 +873,17 @@ pub async fn execute_create_index(
 
     let create_result: Result<()> = async {
         if new_index.is_hnsw() {
-            // HNSW indexes require the worker subsystem for background delta-log
-            // merge. Reject early — before expensive table scan + index build.
-            require_worker_for_index(
-                "HNSW",
-                &idx_name_str,
-                "HNSW indexes require background merge via the worker engine. \
-                 Enable the worker or use a btree index.",
-            )?;
-
-            let col_name = new_index
-                .columns
-                .first()
-                .ok_or_else(|| anyhow!("HNSW indexes only support single vector columns"))?
-                .clone();
-            let col_idx = schema
-                .column_index(&col_name)
-                .ok_or_else(|| anyhow!("Column not found"))?;
-            let vector_dimensions = match schema.columns[col_idx].data_type {
-                DataType::Vector(dim) => dim as usize,
-                _ => return Err(anyhow!("Column {} is not a vector type", col_name)),
-            };
-
-            let distance_metric = new_index
-                .hnsw_distance_metric
-                .clone()
-                .unwrap_or_else(|| "l2".to_string());
-            let metric = metric_from_string(distance_metric.as_str())
-                .map_err(|e| anyhow!("failed to parse HNSW distance metric: {}", e))?;
-            let m = usize::from(new_index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
-            let ef_construction = usize::from(
-                new_index
-                    .hnsw_ef_construction
-                    .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
-            );
-
-            let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-            let data_key_prefix = start.clone();
-            let pk_types = pk_types_for_schema(&schema);
-
-            // Determine label mode from PK type.
-            let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
-            let label_mode = if matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
-                crate::sql::hnsw::HnswLabelMode::Direct
-            } else {
-                crate::sql::hnsw::HnswLabelMode::Mapped
-            };
-
-            // ── Reject tables with negative PK values (Direct mode only) ──
-            // In Direct mode, usearch labels are derived from the PK value and
-            // must be non-negative u64. In Mapped mode, internal rowids are used
-            // so negative PKs are fine.
-            if label_mode == crate::sql::hnsw::HnswLabelMode::Direct {
-                let range: tikv_client::BoundRange = (start.clone()..end.clone()).into();
-                let pairs: Vec<tikv_client::KvPair> = txn.scan(range, 1).await?.collect();
-                if let Some(pair) = pairs.first() {
-                    let mut row = crate::storage::deserialize_row(pair.value())?;
-                    fill_row_defaults(&mut row, &schema)?;
-                    let pk_values = if schema.pk_indices.is_empty() {
-                        let key: &[u8] = pair.key().as_ref().into();
-                        let pk_bytes =
-                            key.strip_prefix(data_key_prefix.as_slice())
-                                .ok_or_else(|| {
-                                    anyhow!("corrupted row key while validating HNSW index")
-                                })?;
-                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
-                    } else {
-                        schema.get_pk_values(&row)
-                    };
-                    let is_negative = pk_values.iter().any(|v| match v {
-                        Value::Int32(n) => *n < 0,
-                        Value::Int64(n) => *n < 0,
-                        _ => false,
-                    });
-                    if is_negative {
-                        let pk_display = pk_values
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return Err(anyhow!(
-                            "cannot create HNSW index: primary key contains negative value \
-                             ({}); HNSW indexes require non-negative INTEGER/BIGINT primary keys",
-                            pk_display
-                        ));
-                    }
-                }
-            }
-
-            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-            let mut pending_vectors: Vec<(u64, Vec<f32>)> = Vec::new();
-            let mut count = 0u64;
-            while let Some(batch) = scanner.next_batch(txn).await? {
-                for pair in batch {
-                    let key: &[u8] = pair.key().as_ref().into();
-                    let mut row = crate::storage::deserialize_row(pair.value())?;
-                    fill_row_defaults(&mut row, &schema)?;
-
-                    let pk_values = if schema.pk_indices.is_empty() {
-                        let pk_bytes =
-                            key.strip_prefix(data_key_prefix.as_slice())
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "corrupted row key while backfilling index '{}'",
-                                        idx_name_str
-                                    )
-                                })?;
-                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
-                    } else {
-                        schema.get_pk_values(&row)
-                    };
-
-                    let vector = match row.values.get(col_idx) {
-                        Some(Value::Null) | None => continue,
-                        Some(Value::Vector(v)) => v,
-                        Some(_) => return Err(anyhow!("Column {} is not a vector type", col_name)),
-                    };
-                    let pk_label = crate::sql::hnsw::hnsw_resolve_label(
-                        label_mode,
-                        txn,
-                        store,
-                        db_id,
-                        schema.table_id,
-                        &pk_values,
-                    )
-                    .await?;
-                    pending_vectors.push((pk_label, vec_f64_to_f32(vector)));
-                    count = count.saturating_add(1);
-                }
-            }
-
-            let (graph_bytes, meta_bytes, initial_graph_version) = {
-                let options = IndexOptions {
-                    dimensions: vector_dimensions,
-                    metric,
-                    quantization: ScalarKind::F32,
-                    connectivity: m,
-                    expansion_add: ef_construction,
-                    expansion_search: HNSW_DEFAULT_EF_SEARCH,
-                };
-                let index = usearch::ffi::new_index(&options)
-                    .map_err(|e| anyhow!("failed to create HNSW index: {}", e))?;
-                // Reserve capacity before adding — usearch segfaults on add()
-                // to an unreserved index (0 capacity from new_index).
-                if !pending_vectors.is_empty() {
-                    index
-                        .reserve(pending_vectors.len())
-                        .map_err(|e| anyhow!("failed to reserve HNSW capacity: {}", e))?;
-                }
-                for (pk_label, vector) in &pending_vectors {
-                    index
-                        .add(*pk_label, vector)
-                        .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
-                }
-
-                let s3_enabled = crate::sql::hnsw::s3::hnsw_s3_client().is_some();
-                let meta = HnswMeta {
-                    count,
-                    capacity: index.capacity() as u64,
-                    dimensions: vector_dimensions,
-                    distance_metric,
-                    m,
-                    ef_construction,
-                    storage_version: if s3_enabled { 2 } else { 1 },
-                    label_mode,
-                    frozen: false,
-                    // Use PD TSO version as initial graph_version (not wall clock).
-                    // TSO is cluster-monotonic, so:
-                    // 1. DROP + CREATE with index_id reuse always produces a
-                    //    higher version, preventing cross-node stale cache hits.
-                    // 2. GC's version-ordering classification (current / historical
-                    //    / future) remains correct — no clock-skew inversion.
-                    graph_version: if s3_enabled {
-                        use tikv_client::TimestampExt;
-                        txn.start_timestamp().version()
-                    } else {
-                        0
-                    },
-                    dropped_at: None,
-                    cache_nonce: rand::thread_rng().gen::<u64>() | 1,
-                };
-                let gv = meta.graph_version;
-                let (gb, mb) =
-                    serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
-                        .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?;
-                (gb, mb, gv)
-            };
-
-            // Register this (keyspace, db_id) in the worker registry so the periodic
-            // HNSW sweeper can discover it. This is FATAL: if registration fails,
-            // CREATE INDEX fails. This guarantees no HNSW index can exist without
-            // a registry entry — closing the crash-orphan discovery gap completely.
-            //
-            // Safety: get_system_store() is guaranteed Some — we checked at the top
-            // of the HNSW branch and returned an error if None.
-            {
-                let system_store = crate::worker::get_system_store()
-                    .expect("worker check at HNSW branch entry guarantees Some");
-                let mut sys_txn = system_store.begin().await?;
-                system_store
-                    .update_registry_task_types(
-                        &mut sys_txn,
-                        keyspace,
-                        db_id,
-                        crate::worker::types::TASK_TYPE_HNSW_MERGE,
-                        0,
-                    )
-                    .await?;
-                sys_txn.commit().await?;
-            }
-
-            if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
-                // S3 path: upload graph to S3, skip TiKV graph write and size guard.
-                s3.put_graph(
-                    keyspace,
-                    db_id,
-                    schema.table_id,
-                    index_id,
-                    initial_graph_version, // timestamp-based, set above
-                    bytes::Bytes::from(graph_bytes),
-                )
-                .await
-                .map_err(|e| anyhow!("HNSW S3 put_graph failed during CREATE INDEX: {}", e))?;
-                // Only write meta to TiKV (graph is in S3).
-                txn_put(
-                    txn,
-                    hnsw_meta_key(db_id, schema.table_id, index_id),
-                    meta_bytes,
-                )
-                .await?;
-            } else {
-                // TiKV path: guard against oversized graph, then write both.
-                if graph_bytes.len() > crate::worker::engine::HNSW_GRAPH_MAX_BYTES {
-                    return Err(anyhow!(
-                        "HNSW index too large for initial build ({} bytes, limit {} bytes). \
-                         Reduce table size or vector dimensions before creating the index.",
-                        graph_bytes.len(),
-                        crate::worker::engine::HNSW_GRAPH_MAX_BYTES
-                    ));
-                }
-
-                txn_put(
-                    txn,
-                    hnsw_graph_key(db_id, schema.table_id, index_id),
-                    graph_bytes,
-                )
-                .await?;
-                txn_put(
-                    txn,
-                    hnsw_meta_key(db_id, schema.table_id, index_id),
-                    meta_bytes,
-                )
-                .await?;
-            }
+            build_hnsw_index(store, txn, db_id, &schema, &new_index, &idx_name_str, keyspace).await?;
         } else if index_helpers::is_index_materializable(&new_index) {
-            if !rows.is_empty() {
-                if schema.pk_indices.is_empty() {
-                    let pk_types: Vec<DataType> = vec![DataType::Uuid];
-                    let (start, end) =
-                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-                    let data_key_prefix = start.clone();
-                    let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-                    while let Some(batch) = scanner.next_batch(txn).await? {
-                        for pair in batch {
-                            let key: &[u8] = pair.key().as_ref().into();
-                            let pk_bytes = key
-                                .strip_prefix(data_key_prefix.as_slice())
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "corrupted row key while backfilling index '{}'",
-                                        idx_name_str
-                                    )
-                                })?;
-                            let pk_values =
-                                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
-
-                            let mut row = crate::storage::deserialize_row(pair.value())?;
-                            fill_row_defaults(&mut row, &schema)?;
-
-                            if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
-                                continue;
-                            }
-                            let idx_values = index_helpers::get_index_values_with_expressions(
-                                &new_index, &schema, &row,
-                            )?;
-                            store
-                                .create_index_entry(
-                                    txn,
-                                    db_id,
-                                    schema.table_id,
-                                    index_id,
-                                    &idx_values,
-                                    &pk_values,
-                                    new_index.unique,
-                                )
-                                .await?;
-                            current_batch_writes += 1;
-                            maybe_rotate_backfill_txn(
-                                store,
-                                txn,
-                                &mut txn_guard,
-                                &mut current_batch_writes,
-                                &mut has_committed_batches,
-                            )
-                            .await?;
-                        }
-                    }
-                } else {
-                    for row in rows {
-                        if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
-                            continue;
-                        }
-                        let idx_values = index_helpers::get_index_values_with_expressions(
-                            &new_index, &schema, &row,
-                        )?;
-                        let pk_values = schema.get_pk_values(&row);
-                        store
-                            .create_index_entry(
-                                txn,
-                                db_id,
-                                schema.table_id,
-                                index_id,
-                                &idx_values,
-                                &pk_values,
-                                new_index.unique,
-                            )
-                            .await?;
-                        current_batch_writes += 1;
-                        maybe_rotate_backfill_txn(
-                            store,
-                            txn,
-                            &mut txn_guard,
-                            &mut current_batch_writes,
-                            &mut has_committed_batches,
-                        )
-                        .await?;
-                    }
-                }
-            }
+            backfill_btree_index(
+                store, txn, db_id, &schema, &new_index, &idx_name_str, &rows,
+                &mut txn_guard, &mut current_batch_writes, &mut has_committed_batches,
+            ).await?;
         } else if supported_gin_index_column(&schema, &new_index).is_some() && !rows.is_empty() {
-            if schema.pk_indices.is_empty() {
-                let pk_types: Vec<DataType> = vec![DataType::Uuid];
-                let (start, end) =
-                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-                let data_key_prefix = start.clone();
-                let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-                while let Some(batch) = scanner.next_batch(txn).await? {
-                    for pair in batch {
-                        let key: &[u8] = pair.key().as_ref().into();
-                        let pk_bytes =
-                            key.strip_prefix(data_key_prefix.as_slice())
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "corrupted row key while backfilling index '{}'",
-                                        idx_name_str
-                                    )
-                                })?;
-                        let pk_values =
-                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
-
-                        let mut row = crate::storage::deserialize_row(pair.value())?;
-                        fill_row_defaults(&mut row, &schema)?;
-
-                        let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
-                        if hashes.is_empty() {
-                            continue;
-                        }
-                        store
-                            .create_gin_index_entries(
-                                txn,
-                                db_id,
-                                schema.table_id,
-                                index_id,
-                                &hashes,
-                                &pk_values,
-                            )
-                            .await?;
-                        current_batch_writes += 1;
-                        maybe_rotate_backfill_txn(
-                            store,
-                            txn,
-                            &mut txn_guard,
-                            &mut current_batch_writes,
-                            &mut has_committed_batches,
-                        )
-                        .await?;
-                    }
-                }
-            } else {
-                for row in rows {
-                    let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
-                    if hashes.is_empty() {
-                        continue;
-                    }
-                    let pk_values = schema.get_pk_values(&row);
-                    store
-                        .create_gin_index_entries(
-                            txn,
-                            db_id,
-                            schema.table_id,
-                            index_id,
-                            &hashes,
-                            &pk_values,
-                        )
-                        .await?;
-                    current_batch_writes += 1;
-                    maybe_rotate_backfill_txn(
-                        store,
-                        txn,
-                        &mut txn_guard,
-                        &mut current_batch_writes,
-                        &mut has_committed_batches,
-                    )
-                    .await?;
-                }
-            }
+            backfill_gin_index(
+                store, txn, db_id, &schema, &new_index, &idx_name_str, &rows,
+                &mut txn_guard, &mut current_batch_writes, &mut has_committed_batches,
+            ).await?;
         }
 
         schema.indexes.push(new_index.clone());

@@ -1011,6 +1011,9 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
 
         // [enqueue] Write queue entry + registry update for CIC backfill; immediate commit.
         "execute_create_index",
+        // [enqueue] Write registry entry for HNSW merge discovery; immediate commit.
+        // Called from execute_create_index (session-scoped); system_store.begin() is short-lived.
+        "build_hnsw_index",
         // [DDL] Single schema read + state update + commit; bounded by one table.
         "update_index_state",
         // (backfill_index_by_name IS long-lived and has track_active_worker_txn — not in allowlist)
