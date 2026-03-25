@@ -127,6 +127,9 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             handle_batch_inline_read(session, id, paths).await
         }
         WsRequest::BatchWrite { id, files } => handle_batch_write(session, id, files).await,
+        WsRequest::BatchWriteAtomic { id, files } => {
+            handle_batch_write_atomic(session, id, files).await
+        }
     }
 }
 
@@ -936,26 +939,26 @@ fn recursive_readdir_response(
     }
 }
 
-async fn handle_batch_write(
-    session: &WsSession,
+/// Shared validation + decoding for batch_write and batch_write_atomic.
+/// Returns decoded files ready for backend, or an early error response.
+fn validate_and_decode_batch_write(
     id: &str,
+    op_name: &str,
     files: &[crate::extensions::fs::ws::protocol::BatchWriteFileRequest],
-) -> WsResponse {
-    let max_files = fs9_config().batch_write_max_files;
+) -> Result<Vec<FsBatchWriteFile>, WsResponse> {
+    let config = fs9_config();
+    let max_files = config.batch_write_max_files;
     if files.len() > max_files {
-        return WsResponse::error(
+        return Err(WsResponse::error(
             id,
             WsErrorCode::Efbig,
-            format!(
-                "batch_write supports at most {} files per request",
-                max_files
-            ),
-        );
+            format!("{op_name} supports at most {max_files} files per request"),
+        ));
     }
 
-    let inline_max = fs9_config().inline_max_bytes;
-    let max_total_raw = fs9_config().batch_write_max_total_bytes;
-    let max_total_encoded = fs9_config().batch_write_max_encoded_bytes;
+    let inline_max = config.inline_max_bytes;
+    let max_total_raw = config.batch_write_max_total_bytes;
+    let max_total_encoded = config.batch_write_max_encoded_bytes;
     let mut decoded_files = Vec::with_capacity(files.len());
     let mut total_raw = 0usize;
     let mut total_encoded = 0usize;
@@ -963,59 +966,62 @@ async fn handle_batch_write(
 
     for file in files {
         if let Err((code, msg)) = validate_path(&file.path) {
-            return WsResponse::error(id, code, msg);
+            return Err(WsResponse::error(id, code, msg));
         }
         if !seen_paths.insert(file.path.clone()) {
-            return WsResponse::error(
+            return Err(WsResponse::error(
                 id,
                 WsErrorCode::Einval,
-                format!("batch_write requires unique paths: {}", file.path),
-            );
+                format!("{op_name} requires unique paths: {}", file.path),
+            ));
         }
         total_encoded = total_encoded.saturating_add(file.content.len());
         if total_encoded > max_total_encoded {
-            return WsResponse::error(
+            return Err(WsResponse::error(
                 id,
                 WsErrorCode::Efbig,
-                format!(
-                    "batch_write encoded payload exceeds limit {} bytes",
-                    max_total_encoded
-                ),
-            );
+                format!("{op_name} encoded payload exceeds limit {max_total_encoded} bytes"),
+            ));
         }
 
-        let data = match decode_base64_content(id, &file.content, &file.encoding) {
-            Ok(data) => data,
-            Err(resp) => return resp,
-        };
+        let data = decode_base64_content(id, &file.content, &file.encoding)?;
         if data.len() > inline_max {
-            return WsResponse::error(
+            return Err(WsResponse::error(
                 id,
                 WsErrorCode::Efbig,
                 format!(
-                    "batch_write file {} exceeds inline limit {} bytes",
-                    file.path, inline_max
+                    "{op_name} file {} exceeds inline limit {inline_max} bytes",
+                    file.path
                 ),
-            );
+            ));
         }
         total_raw = total_raw.saturating_add(data.len());
         if total_raw > max_total_raw {
-            return WsResponse::error(
+            return Err(WsResponse::error(
                 id,
                 WsErrorCode::Efbig,
-                format!(
-                    "batch_write raw payload exceeds limit {} bytes",
-                    max_total_raw
-                ),
-            );
+                format!("{op_name} raw payload exceeds limit {max_total_raw} bytes"),
+            ));
         }
-        decoded_files.push((file.path.clone(), data, file.mode.map(|m| m & 0o7777)));
+        decoded_files.push(FsBatchWriteFile {
+            path: file.path.clone(),
+            data,
+            mode: file.mode.map(|m| m & 0o7777),
+        });
     }
 
-    let batch_files = decoded_files
-        .into_iter()
-        .map(|(path, data, mode)| FsBatchWriteFile { path, data, mode })
-        .collect::<Vec<_>>();
+    Ok(decoded_files)
+}
+
+async fn handle_batch_write(
+    session: &WsSession,
+    id: &str,
+    files: &[crate::extensions::fs::ws::protocol::BatchWriteFileRequest],
+) -> WsResponse {
+    let batch_files = match validate_and_decode_batch_write(id, "batch_write", files) {
+        Ok(files) => files,
+        Err(resp) => return resp,
+    };
     let results = match session.backend.batch_write(batch_files).await {
         Ok(results) => results,
         Err(err) => {
@@ -1059,6 +1065,122 @@ async fn handle_batch_write(
     }
 
     WsResponse::success(id, json!({ "entries": entries }))
+}
+
+/// Capability-gated fast-path for bulk small-file uploads.
+///
+/// Files are grouped by parent directory and each subgroup (bounded by
+/// `grouped_write_subgroup_size`) is committed atomically in a single TiKV
+/// transaction. Per-subgroup atomic semantics: all files within a subgroup
+/// succeed or fail together. Cross-subgroup partial success is possible.
+///
+/// Response includes a `summary` object for observability:
+///   strategy_used, subgroup_count (actual txn count from backend),
+///   entries_committed, entries_failed, fallback_reason_counts
+async fn handle_batch_write_atomic(
+    session: &WsSession,
+    id: &str,
+    files: &[crate::extensions::fs::ws::protocol::BatchWriteFileRequest],
+) -> WsResponse {
+    // ── Capability gate: reject if backend doesn't support atomic writes ─
+    if !session.backend.supports_batch_write_atomic() {
+        return WsResponse::error(
+            id,
+            WsErrorCode::Enosys,
+            "batch_write_atomic is not supported by this backend",
+        );
+    }
+
+    // ── Validation (shared with batch_write) ────────────────────────────
+    let batch_files = match validate_and_decode_batch_write(id, "batch_write_atomic", files) {
+        Ok(files) => files,
+        Err(resp) => return resp,
+    };
+
+    // ── Execute grouped write ────────────────────────────────────────────
+    let grouped_result = match session.backend.batch_write_grouped(batch_files).await {
+        Ok(result) => result,
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            return WsResponse::success(
+                id,
+                json!({
+                    "entries": files.iter().map(|file| BatchWriteEntryResponse {
+                        path: file.path.clone(),
+                        ok: false,
+                        written: None,
+                        error: Some(WsErrorDetail {
+                            code,
+                            message: msg.clone(),
+                        }),
+                    }).collect::<Vec<_>>(),
+                    "summary": {
+                        "strategy_used": "per_subgroup_atomic",
+                        "subgroup_count": 0,
+                        "entries_committed": 0,
+                        "entries_failed": files.len(),
+                        "fallback_reason_counts": {}
+                    }
+                }),
+            );
+        }
+    };
+    let subgroup_count = grouped_result.actual_subgroup_count;
+
+    // ── Build response ───────────────────────────────────────────────────
+    let mut entries = Vec::with_capacity(grouped_result.entries.len());
+    let mut committed = 0usize;
+    let mut failed = 0usize;
+    let mut oversized_count = 0usize;
+    for entry in grouped_result.entries {
+        match entry.result {
+            Ok(written) => {
+                committed += 1;
+                entries.push(BatchWriteEntryResponse {
+                    path: entry.path,
+                    ok: true,
+                    written: Some(written),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                let err_str = err.to_string();
+                if err_str.contains("too large for grouped inline write") {
+                    oversized_count += 1;
+                }
+                let (code, msg) = map_fs_error(&err);
+                entries.push(BatchWriteEntryResponse {
+                    path: entry.path,
+                    ok: false,
+                    written: None,
+                    error: Some(WsErrorDetail { code, message: msg }),
+                });
+            }
+        }
+    }
+
+    let mut fallback_reasons = serde_json::Map::new();
+    if oversized_count > 0 {
+        fallback_reasons.insert(
+            "planner.oversized".to_string(),
+            serde_json::Value::Number(oversized_count.into()),
+        );
+    }
+
+    WsResponse::success(
+        id,
+        json!({
+            "entries": entries,
+            "summary": {
+                "strategy_used": "per_subgroup_atomic",
+                "subgroup_count": subgroup_count,
+                "entries_committed": committed,
+                "entries_failed": failed,
+                "fallback_reason_counts": fallback_reasons
+            }
+        }),
+    )
 }
 
 fn decode_base64_content(id: &str, content: &str, encoding: &str) -> Result<Vec<u8>, WsResponse> {
@@ -1487,5 +1609,552 @@ mod tests {
         assert!(detail
             .message
             .contains("readdir_recursive response exceeds limit"));
+    }
+
+    // ── batch_write_atomic contract tests ────────────────────────────────
+
+    use super::validate_and_decode_batch_write;
+    use crate::extensions::fs::ws::protocol::BatchWriteFileRequest;
+
+    fn make_file_request(path: &str, content: &[u8]) -> BatchWriteFileRequest {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        BatchWriteFileRequest {
+            path: path.to_string(),
+            content: STANDARD.encode(content),
+            encoding: "base64".to_string(),
+            mode: None,
+        }
+    }
+
+    #[test]
+    fn validate_batch_write_accepts_valid_files() {
+        let files = vec![
+            make_file_request("/dir/a.txt", b"hello"),
+            make_file_request("/dir/b.txt", b"world"),
+        ];
+        let result = validate_and_decode_batch_write("req-v1", "batch_write_atomic", &files);
+        let decoded = result.expect("valid files must decode successfully");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].path, "/dir/a.txt");
+        assert_eq!(decoded[0].data, b"hello");
+        assert_eq!(decoded[1].path, "/dir/b.txt");
+        assert_eq!(decoded[1].data, b"world");
+    }
+
+    #[test]
+    fn validate_batch_write_rejects_duplicate_paths() {
+        let files = vec![
+            make_file_request("/dir/a.txt", b"first"),
+            make_file_request("/dir/a.txt", b"second"),
+        ];
+        let err = validate_and_decode_batch_write("req-v2", "batch_write_atomic", &files)
+            .expect_err("duplicate paths must be rejected");
+        let detail = err.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Einval);
+        assert!(detail.message.contains("unique paths"));
+    }
+
+    #[test]
+    fn validate_batch_write_rejects_bad_encoding() {
+        let files = vec![BatchWriteFileRequest {
+            path: "/dir/a.txt".to_string(),
+            content: "not-base64".to_string(),
+            encoding: "utf8".to_string(),
+            mode: None,
+        }];
+        let err = validate_and_decode_batch_write("req-v3", "batch_write_atomic", &files)
+            .expect_err("unsupported encoding must be rejected");
+        let detail = err.error.expect("error detail should be present");
+        assert_eq!(detail.code, WsErrorCode::Einval);
+        assert!(detail.message.contains("unsupported encoding"));
+    }
+
+    #[test]
+    fn validate_batch_write_rejects_invalid_path() {
+        let files = vec![make_file_request("no-leading-slash", b"data")];
+        let err = validate_and_decode_batch_write("req-v4", "batch_write_atomic", &files)
+            .expect_err("path without leading slash must be rejected");
+        assert!(err.error.is_some());
+    }
+
+    #[test]
+    fn validate_batch_write_applies_mode_mask() {
+        use base64::Engine;
+        let files = vec![BatchWriteFileRequest {
+            path: "/dir/a.txt".to_string(),
+            content: base64::engine::general_purpose::STANDARD.encode(b"x"),
+            encoding: "base64".to_string(),
+            mode: Some(0o100644),
+        }];
+        let decoded = validate_and_decode_batch_write("req-v5", "batch_write_atomic", &files)
+            .expect("valid file with mode must decode");
+        assert_eq!(
+            decoded[0].mode,
+            Some(0o644),
+            "mode must be masked to 0o7777"
+        );
+    }
+
+    // ── Handler-level contract tests with mock backend ──────────────────
+
+    mod handler_contract {
+        use super::*;
+        use crate::extensions::fs::backend::{
+            FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult,
+            FsCreateUpload, FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload,
+            FsPresignedRequest, FsWriteStream, FsWriteStreamOptions,
+        };
+        use crate::extensions::fs::ws::auth::WsSession;
+        use crate::extensions::fs::ws::protocol::WsErrorCode;
+        use anyhow::{anyhow, Result};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use tokio::io::AsyncBufRead;
+
+        /// Minimal mock backend with configurable batch_write_atomic support
+        /// and optional per-directory failure simulation.
+        struct MockFsBackend {
+            atomic_supported: bool,
+            /// Parent dirs that should fail in batch_write_grouped.
+            fail_dirs: std::collections::HashSet<String>,
+        }
+
+        #[async_trait]
+        impl FsBackend for MockFsBackend {
+            async fn stat(&self, _path: &str) -> Result<FsFileInfo> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn readdir(&self, _path: &str) -> Result<Vec<FsFileInfo>> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn read_file_stream(
+                &self,
+                _path: &str,
+                _max_bytes: usize,
+            ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn remove(&self, _path: &str) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn write_file(
+                &self,
+                _path: &str,
+                data: &[u8],
+                _mode: Option<u32>,
+            ) -> Result<usize> {
+                // Legacy batch_write calls write_file per entry via default impl.
+                Ok(data.len())
+            }
+            fn supports_batch_write_atomic(&self) -> bool {
+                self.atomic_supported
+            }
+            async fn batch_write_grouped(
+                &self,
+                files: Vec<FsBatchWriteFile>,
+            ) -> Result<FsBatchWriteGroupedResult> {
+                if !self.atomic_supported {
+                    return Err(anyhow!(
+                        "batch_write_grouped is not supported by this backend"
+                    ));
+                }
+                // Replicate real backend grouping + chunking logic:
+                // 1. Group files by parent directory
+                // 2. Chunk each group by grouped_write_subgroup_size
+                // 3. Count chunks as actual subgroups
+                // Dirs in fail_dirs produce per-entry errors.
+                use std::collections::HashMap;
+                let max_subgroup =
+                    crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
+
+                let mut groups: HashMap<String, Vec<&FsBatchWriteFile>> = HashMap::new();
+                for file in &files {
+                    let parent = file
+                        .path
+                        .rsplit_once('/')
+                        .map(|(p, _)| if p.is_empty() { "/" } else { p })
+                        .unwrap_or("/")
+                        .to_string();
+                    groups.entry(parent).or_default().push(file);
+                }
+
+                let mut entries = Vec::with_capacity(files.len());
+                let mut actual_subgroup_count = 0usize;
+                for (parent, group_files) in &groups {
+                    for chunk in group_files.chunks(max_subgroup) {
+                        actual_subgroup_count += 1;
+                        let failed = self.fail_dirs.contains(parent.as_str());
+                        for file in chunk {
+                            let result = if failed {
+                                Err(anyhow!("simulated subgroup failure for dir {}", parent))
+                            } else {
+                                Ok(file.data.len())
+                            };
+                            entries.push(FsBatchWriteEntry {
+                                path: file.path.clone(),
+                                result,
+                            });
+                        }
+                    }
+                }
+                Ok(FsBatchWriteGroupedResult {
+                    entries,
+                    actual_subgroup_count,
+                })
+            }
+            async fn begin_write_stream(
+                &self,
+                _path: &str,
+                _opts: FsWriteStreamOptions,
+            ) -> Result<Box<dyn FsWriteStream>> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn read_file_at(
+                &self,
+                _path: &str,
+                _offset: u64,
+                _length: usize,
+            ) -> Result<Vec<u8>> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn write_file_at(
+                &self,
+                _path: &str,
+                _offset: u64,
+                _data: &[u8],
+            ) -> Result<usize> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn create_upload(
+                &self,
+                _path: &str,
+                _expected_size: u64,
+                _mode: Option<u32>,
+            ) -> Result<FsCreateUpload> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn presign_upload_part(
+                &self,
+                _upload_token: &str,
+                _part_number: i32,
+            ) -> Result<FsPresignedRequest> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn complete_upload(
+                &self,
+                _upload_token: &str,
+                _parts: Vec<FsMultipartCompletedPart>,
+                _checksum: Option<[u8; 32]>,
+            ) -> Result<usize> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn abort_upload(&self, _upload_token: &str) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn readlink(&self, _path: &str) -> Result<String> {
+                Err(anyhow!("not implemented"))
+            }
+            async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+                Err(anyhow!("not implemented"))
+            }
+        }
+
+        fn mock_session(atomic_supported: bool) -> WsSession {
+            WsSession::new_for_test(Arc::new(MockFsBackend {
+                atomic_supported,
+                fail_dirs: std::collections::HashSet::new(),
+            }))
+        }
+
+        fn mock_session_with_fail_dirs(fail_dirs: Vec<&str>) -> WsSession {
+            WsSession::new_for_test(Arc::new(MockFsBackend {
+                atomic_supported: true,
+                fail_dirs: fail_dirs.into_iter().map(String::from).collect(),
+            }))
+        }
+
+        #[tokio::test]
+        async fn batch_write_atomic_rejects_unsupported_backend_with_enosys() {
+            let session = mock_session(false);
+            let files = vec![make_file_request("/dir/a.txt", b"hello")];
+            let resp = super::super::handle_batch_write_atomic(&session, "req-1", &files).await;
+
+            assert!(!resp.ok, "unsupported backend must return error");
+            let detail = resp.error.expect("error detail should be present");
+            assert_eq!(detail.code, WsErrorCode::Enosys);
+            assert!(detail.message.contains("not supported"));
+        }
+
+        #[tokio::test]
+        async fn batch_write_atomic_returns_correct_summary_on_supported_backend() {
+            let session = mock_session(true);
+            let files = vec![
+                make_file_request("/dir_a/x.txt", b"aaa"),
+                make_file_request("/dir_a/y.txt", b"bbb"),
+                make_file_request("/dir_b/z.txt", b"ccc"),
+            ];
+            let resp = super::super::handle_batch_write_atomic(&session, "req-2", &files).await;
+
+            assert!(resp.ok, "supported backend must succeed");
+            let data = resp.data.expect("success must include data");
+            let summary = &data["summary"];
+
+            assert_eq!(summary["strategy_used"], "per_subgroup_atomic");
+            assert_eq!(summary["subgroup_count"], 2, "2 distinct parent dirs");
+            assert_eq!(summary["entries_committed"], 3);
+            assert_eq!(summary["entries_failed"], 0);
+
+            let entries = data["entries"].as_array().expect("entries must be array");
+            assert_eq!(entries.len(), 3);
+            for entry in entries {
+                assert_eq!(entry["ok"], true);
+                assert!(entry["written"].as_u64().unwrap() > 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn batch_write_atomic_single_dir_reports_one_subgroup() {
+            let session = mock_session(true);
+            let files = vec![
+                make_file_request("/same/a.txt", b"1"),
+                make_file_request("/same/b.txt", b"22"),
+                make_file_request("/same/c.txt", b"333"),
+            ];
+            let resp = super::super::handle_batch_write_atomic(&session, "req-3", &files).await;
+
+            assert!(resp.ok);
+            let data = resp.data.expect("success must include data");
+            assert_eq!(
+                data["summary"]["subgroup_count"], 1,
+                "single dir = 1 subgroup"
+            );
+            assert_eq!(data["summary"]["entries_committed"], 3);
+        }
+
+        #[tokio::test]
+        async fn legacy_batch_write_has_no_summary_field() {
+            let session = mock_session(false);
+            let files = vec![
+                make_file_request("/dir/a.txt", b"hello"),
+                make_file_request("/dir/b.txt", b"world"),
+            ];
+            let resp = super::super::handle_batch_write(&session, "req-4", &files).await;
+
+            assert!(
+                resp.ok,
+                "legacy batch_write must succeed via default write_file"
+            );
+            let data = resp.data.expect("success must include data");
+
+            // Legacy batch_write must NOT have a summary field
+            assert!(
+                data.get("summary").is_none(),
+                "legacy batch_write must not include summary"
+            );
+
+            let entries = data["entries"].as_array().expect("entries must be array");
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0]["ok"], true);
+            assert_eq!(entries[0]["written"], 5);
+            assert_eq!(entries[1]["ok"], true);
+            assert_eq!(entries[1]["written"], 5);
+        }
+
+        /// Pins the auth response JSON shape by calling the same
+        /// `build_auth_success_data()` helper used by the real WebSocket
+        /// handler in ws/mod.rs. No logic duplication.
+        #[test]
+        fn auth_response_includes_capability_on_supported_backend() {
+            let session = mock_session(true);
+            let auth_data = session.build_auth_success_data();
+
+            assert_eq!(auth_data["user"], "test_user");
+            assert_eq!(auth_data["keyspace"], "db9_tenant_test");
+            assert!(auth_data.get("tenant").is_some(), "tenant field must exist");
+
+            let caps = auth_data["capabilities"]
+                .as_array()
+                .expect("capabilities must be an array");
+            assert_eq!(caps.len(), 1);
+            assert_eq!(caps[0], "batch_write_atomic");
+        }
+
+        #[test]
+        fn auth_response_has_empty_capabilities_on_unsupported_backend() {
+            let session = mock_session(false);
+            let auth_data = session.build_auth_success_data();
+
+            assert_eq!(auth_data["user"], "test_user");
+            assert_eq!(auth_data["keyspace"], "db9_tenant_test");
+
+            let caps = auth_data["capabilities"]
+                .as_array()
+                .expect("capabilities must be an array");
+            assert!(
+                caps.is_empty(),
+                "unsupported backend must have empty capabilities"
+            );
+        }
+
+        /// Pins the partial-success boundary: one directory subgroup fails
+        /// while another succeeds. The handler must report both in entries
+        /// and reflect the split in summary counts.
+        #[tokio::test]
+        async fn batch_write_atomic_cross_dir_partial_success() {
+            let session = mock_session_with_fail_dirs(vec!["/fail_dir"]);
+            let files = vec![
+                make_file_request("/ok_dir/a.txt", b"good"),
+                make_file_request("/ok_dir/b.txt", b"also good"),
+                make_file_request("/fail_dir/c.txt", b"will fail"),
+                make_file_request("/fail_dir/d.txt", b"also fails"),
+            ];
+            let resp =
+                super::super::handle_batch_write_atomic(&session, "req-partial", &files).await;
+
+            assert!(resp.ok, "top-level response must be ok (partial success)");
+            let data = resp.data.expect("success must include data");
+            let summary = &data["summary"];
+
+            assert_eq!(summary["strategy_used"], "per_subgroup_atomic");
+            assert_eq!(summary["subgroup_count"], 2, "2 distinct parent dirs");
+            assert_eq!(summary["entries_committed"], 2, "ok_dir files succeed");
+            assert_eq!(summary["entries_failed"], 2, "fail_dir files fail");
+
+            let entries = data["entries"].as_array().expect("entries must be array");
+            assert_eq!(entries.len(), 4);
+
+            // Check by path (HashMap iteration order is non-deterministic)
+            let find = |path: &str| -> &serde_json::Value {
+                entries
+                    .iter()
+                    .find(|e| e["path"] == path)
+                    .unwrap_or_else(|| panic!("entry for {path} not found"))
+            };
+
+            // ok_dir entries succeed
+            assert_eq!(find("/ok_dir/a.txt")["ok"], true);
+            assert!(find("/ok_dir/a.txt")["written"].as_u64().unwrap() > 0);
+            assert_eq!(find("/ok_dir/b.txt")["ok"], true);
+
+            // fail_dir entries fail
+            assert_eq!(find("/fail_dir/c.txt")["ok"], false);
+            assert!(find("/fail_dir/c.txt")["error"].is_object());
+            assert_eq!(find("/fail_dir/d.txt")["ok"], false);
+        }
+
+        /// Exercises the subgroup chunking path directly at the backend level
+        /// (bypassing handler's request-level file count limit). When a single
+        /// directory has more files than grouped_write_subgroup_size, the mock
+        /// backend (which replicates real chunking logic) splits into multiple
+        /// subgroups. CI-covered, pins actual_subgroup_count against config.
+        #[tokio::test]
+        async fn mock_backend_subgroup_chunking_produces_correct_count() {
+            let backend = Arc::new(MockFsBackend {
+                atomic_supported: true,
+                fail_dirs: std::collections::HashSet::new(),
+            });
+            let subgroup_size =
+                crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
+
+            // Generate enough files in one dir to force 3 subgroups
+            let file_count = subgroup_size * 2 + 1;
+            let files: Vec<FsBatchWriteFile> = (0..file_count)
+                .map(|i| FsBatchWriteFile {
+                    path: format!("/chunked/f_{:04}.dat", i),
+                    data: vec![0x42u8; 16],
+                    mode: None,
+                })
+                .collect();
+
+            let result = backend
+                .batch_write_grouped(files)
+                .await
+                .expect("grouped write must succeed");
+
+            let expected_subgroups = file_count.div_ceil(subgroup_size);
+            assert_eq!(
+                result.actual_subgroup_count, expected_subgroups,
+                "ceil({file_count}/{subgroup_size}) = {expected_subgroups} subgroups"
+            );
+            assert_eq!(result.entries.len(), file_count);
+            for entry in &result.entries {
+                assert!(entry.result.is_ok(), "entry {} must succeed", entry.path);
+            }
+        }
+
+        /// Same chunking test with multiple directories: 2 dirs, one exceeding
+        /// subgroup_size. Verifies subgroup count = chunks(dir_a) + chunks(dir_b).
+        #[tokio::test]
+        async fn mock_backend_multi_dir_chunking() {
+            let backend = Arc::new(MockFsBackend {
+                atomic_supported: true,
+                fail_dirs: std::collections::HashSet::new(),
+            });
+            let subgroup_size =
+                crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
+
+            // dir_a: subgroup_size + 1 files -> 2 subgroups
+            // dir_b: 2 files -> 1 subgroup
+            let mut files = Vec::new();
+            for i in 0..(subgroup_size + 1) {
+                files.push(FsBatchWriteFile {
+                    path: format!("/dir_a/f_{:04}.dat", i),
+                    data: vec![0x41u8; 8],
+                    mode: None,
+                });
+            }
+            files.push(FsBatchWriteFile {
+                path: "/dir_b/x.txt".to_string(),
+                data: vec![0x42u8; 8],
+                mode: None,
+            });
+            files.push(FsBatchWriteFile {
+                path: "/dir_b/y.txt".to_string(),
+                data: vec![0x42u8; 8],
+                mode: None,
+            });
+
+            let result = backend
+                .batch_write_grouped(files)
+                .await
+                .expect("grouped write must succeed");
+
+            // dir_a: ceil((subgroup_size+1)/subgroup_size) = 2 subgroups
+            // dir_b: ceil(2/subgroup_size) = 1 subgroup
+            let expected = 2 + 1;
+            assert_eq!(
+                result.actual_subgroup_count, expected,
+                "dir_a=2 + dir_b=1 = {expected} subgroups"
+            );
+            assert_eq!(result.entries.len(), subgroup_size + 1 + 2);
+            for entry in &result.entries {
+                assert!(entry.result.is_ok(), "entry {} must succeed", entry.path);
+            }
+        }
     }
 }

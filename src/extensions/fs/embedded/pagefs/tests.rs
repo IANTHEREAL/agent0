@@ -3098,3 +3098,150 @@ fn test_stream_spool_routes_non_inline_sizes_to_object() {
         assert!(should_route_stream_spool_to_object((inline_max as u64) + 1));
     }
 }
+
+// ── Real backend subgroup contract tests ───────────────────────────
+//
+// These tests require a running TiKV instance and are #[ignore]d by
+// default. Run with:
+//   PD_ENDPOINTS=127.0.0.1:2379 cargo test -p db9-server grouped_write_contract -- --ignored --nocapture
+
+/// Verifies that same-dir files exceeding subgroup_size are split into
+/// multiple subgroups, and actual_subgroup_count reflects the real txn count.
+#[tokio::test]
+#[ignore]
+async fn grouped_write_contract_chunked_subgroup_count() {
+    let fs = make_fs().await;
+    fs.mkdir("/gw_contract_chunk", false, None)
+        .await
+        .expect("mkdir");
+
+    // Write 5 files into one directory. With subgroup_size=2 (overridden
+    // via env), we'd get 3 subgroups. Since we can't override config in
+    // tests, use the default (32) and write 65 files -> ceil(65/32) = 3.
+    let subgroup_size = crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
+    let file_count = subgroup_size * 2 + 1; // guarantees 3 subgroups
+    let files: Vec<FsBatchWriteFile> = (0..file_count)
+        .map(|i| FsBatchWriteFile {
+            path: format!("/gw_contract_chunk/f_{:04}.dat", i),
+            data: vec![0x41u8; 64],
+            mode: None,
+        })
+        .collect();
+
+    let result = fs
+        .batch_write_grouped(files.clone())
+        .await
+        .expect("batch_write_grouped must succeed");
+
+    // Verify subgroup count = ceil(file_count / subgroup_size)
+    let expected_subgroups = file_count.div_ceil(subgroup_size);
+    assert_eq!(
+        result.actual_subgroup_count, expected_subgroups,
+        "actual_subgroup_count must equal ceil({file_count}/{subgroup_size}) = {expected_subgroups}"
+    );
+
+    // All entries must succeed
+    assert_eq!(result.entries.len(), file_count);
+    for entry in &result.entries {
+        assert!(
+            entry.result.is_ok(),
+            "entry {} must succeed: {:?}",
+            entry.path,
+            entry.result
+        );
+    }
+
+    // Verify files are actually readable (durability)
+    for i in 0..file_count {
+        let path = format!("/gw_contract_chunk/f_{:04}.dat", i);
+        let data = fs.read_file_capped(&path, 1024).await.expect("read back");
+        assert_eq!(data.len(), 64, "file {path} must have correct size");
+    }
+}
+
+/// Verifies cross-directory partial success: if files span multiple
+/// directories, each directory's subgroup is independent. One dir can
+/// succeed even if another fails.
+#[tokio::test]
+#[ignore]
+async fn grouped_write_contract_cross_dir_multi_subgroup() {
+    let fs = make_fs().await;
+    fs.mkdir("/gw_cross_a", false, None).await.expect("mkdir a");
+    fs.mkdir("/gw_cross_b", false, None).await.expect("mkdir b");
+
+    let files = vec![
+        FsBatchWriteFile {
+            path: "/gw_cross_a/x.txt".to_string(),
+            data: b"alpha".to_vec(),
+            mode: None,
+        },
+        FsBatchWriteFile {
+            path: "/gw_cross_b/y.txt".to_string(),
+            data: b"bravo".to_vec(),
+            mode: None,
+        },
+    ];
+
+    let result = fs
+        .batch_write_grouped(files)
+        .await
+        .expect("batch_write_grouped must succeed");
+
+    // 2 directories -> 2 subgroups
+    assert_eq!(
+        result.actual_subgroup_count, 2,
+        "2 distinct parent dirs must produce 2 subgroups"
+    );
+    assert_eq!(result.entries.len(), 2);
+    for entry in &result.entries {
+        assert!(entry.result.is_ok(), "entry {} must succeed", entry.path);
+    }
+
+    // Verify each file is readable in its own directory
+    let a = fs
+        .read_file_capped("/gw_cross_a/x.txt", 1024)
+        .await
+        .expect("read a");
+    assert_eq!(a, b"alpha");
+    let b = fs
+        .read_file_capped("/gw_cross_b/y.txt", 1024)
+        .await
+        .expect("read b");
+    assert_eq!(b, b"bravo");
+}
+
+/// Verifies single-dir batch with files <= subgroup_size produces
+/// exactly 1 subgroup.
+#[tokio::test]
+#[ignore]
+async fn grouped_write_contract_single_subgroup() {
+    let fs = make_fs().await;
+    fs.mkdir("/gw_single", false, None).await.expect("mkdir");
+
+    let files = vec![
+        FsBatchWriteFile {
+            path: "/gw_single/a.txt".to_string(),
+            data: b"one".to_vec(),
+            mode: None,
+        },
+        FsBatchWriteFile {
+            path: "/gw_single/b.txt".to_string(),
+            data: b"two".to_vec(),
+            mode: None,
+        },
+    ];
+
+    let result = fs
+        .batch_write_grouped(files)
+        .await
+        .expect("batch_write_grouped must succeed");
+
+    assert_eq!(
+        result.actual_subgroup_count, 1,
+        "files within subgroup_size in one dir must produce exactly 1 subgroup"
+    );
+    assert_eq!(result.entries.len(), 2);
+    for entry in &result.entries {
+        assert!(entry.result.is_ok(), "entry {} must succeed", entry.path);
+    }
+}

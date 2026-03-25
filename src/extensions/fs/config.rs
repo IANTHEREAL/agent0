@@ -64,6 +64,11 @@ pub(crate) struct Fs9Config {
     pub(crate) batch_write_max_files: usize,
     pub(crate) batch_write_max_total_bytes: usize,
     pub(crate) batch_write_max_encoded_bytes: usize,
+    /// Maximum files per directory subgroup in batch_write_atomic.
+    /// Files sharing a parent dir are committed atomically in a single TiKV txn.
+    /// Large directory groups are split into chunks of this size.
+    /// Default: 32 (per micro-benchmark on local single-node TiKV).
+    pub(crate) grouped_write_subgroup_size: usize,
     pub(crate) readdir_recursive_max_depth: usize,
     pub(crate) readdir_recursive_max_entries: usize,
     pub(crate) readdir_recursive_timeout_secs: u64,
@@ -202,6 +207,10 @@ impl Fs9Config {
             batch_write_max_encoded_bytes: config::env_string("FS9_BATCH_WRITE_MAX_ENCODED_BYTES")
                 .and_then(|v| parse_bytes(&v))
                 .unwrap_or(DEFAULT_BATCH_WRITE_MAX_ENCODED_BYTES),
+            grouped_write_subgroup_size: config::env_string("FS9_GROUPED_WRITE_SUBGROUP_SIZE")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(32),
             readdir_recursive_max_depth: config::env_string("FS9_READDIR_RECURSIVE_MAX_DEPTH")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_READDIR_RECURSIVE_MAX_DEPTH),

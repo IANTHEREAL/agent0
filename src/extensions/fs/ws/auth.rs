@@ -8,6 +8,7 @@ use crate::extensions::fs::backend::FsBackend;
 use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
+use crate::extensions::fs::ws::tenant_from_keyspace;
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::protocol::parse_tenant_username;
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
@@ -22,6 +23,36 @@ pub(crate) struct WsSession {
 }
 
 impl WsSession {
+    /// Test-only constructor that creates a session with a mock backend.
+    /// Avoids needing a real TenantHandle / TikvStore for unit tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(backend: Arc<dyn FsBackend>) -> Self {
+        Self {
+            _tenant_handle: TenantHandle::dummy_for_test(),
+            backend,
+            user: "test_user".to_string(),
+            keyspace: "db9_tenant_test".to_string(),
+            upload_slots: Arc::new(Semaphore::new(16)),
+            inflight_uploads: TokioMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Build the auth success response data. This is the single source of
+    /// truth for the auth response JSON shape — used by both the WebSocket
+    /// handler and contract tests.
+    pub(crate) fn build_auth_success_data(&self) -> serde_json::Value {
+        let mut capabilities: Vec<&str> = Vec::new();
+        if self.backend.supports_batch_write_atomic() {
+            capabilities.push("batch_write_atomic");
+        }
+        serde_json::json!({
+            "user": self.user,
+            "tenant": tenant_from_keyspace(&self.keyspace),
+            "keyspace": self.keyspace,
+            "capabilities": capabilities,
+        })
+    }
+
     pub(crate) fn try_acquire_upload_slot(&self) -> Option<OwnedSemaphorePermit> {
         self.upload_slots.clone().try_acquire_owned().ok()
     }

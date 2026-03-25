@@ -1,0 +1,273 @@
+# batch_write_atomic — Backend Audit Spec Stage 1: Service Design Model
+# Per: /tmp/backend_spec.md v0.2
+# Feature: fs9 small-file grouped atomic write
+
+service:
+  name: db9-server
+  domain: fs9-embedded-filesystem
+
+feature:
+  name: batch_write_atomic
+  summary: >
+    Grouped atomic write of small files via WebSocket. Files sharing a parent
+    directory are committed in a single TiKV transaction per subgroup.
+    Capability-gated fast-path operation that coexists with legacy batch_write.
+
+# ─────────────────────────────────────────────────────────
+# 5.1 Required Inputs
+# ─────────────────────────────────────────────────────────
+
+roles:
+  - authenticated_ws_client  # CLI, SDK, agent — must complete fs9 WS auth handshake
+  # No anonymous access (WS auth required)
+  # No admin/operator-only surface (same permission as batch_write)
+
+entry_points:
+  - fs9_websocket  # Only entry — no HTTP REST, no SQL, no CLI direct
+
+preconditions:
+  - WebSocket connection authenticated (auth success response received)
+  - Files count <= batch_write_max_files (default 32)
+  - Each file path passes validation (absolute, no traversal, no root)
+  - No duplicate paths within the same request
+  # Note: capability advertisement is a client-side routing hint, not a server precondition.
+  # Server accepts batch_write_atomic from any authenticated client; unsupported backends return ENOSYS.
+  # Empty file content is currently allowed by the handler (not rejected at validation).
+
+flows:
+  - name: batch_write_atomic_happy_path
+    steps:
+      - client sends batch_write_atomic request with files array
+      - handler validates file count, paths, and data
+      - handler calls backend.batch_write_grouped(files)
+      - backend groups files by parent directory
+      - for each directory group, backend chunks into subgroups of grouped_write_subgroup_size
+      - for each subgroup chunk:
+          - begin TiKV transaction
+          - resolve parent directory (mkdir -p if needed)
+          - for each file in chunk: allocate inode, write pages, create dir entry
+          - commit TiKV transaction atomically
+          - increment actual_subgroup_count
+      - backend returns FsBatchWriteGroupedResult with entries + actual_subgroup_count
+      - handler builds response JSON with summary (strategy, subgroup_count, entries_committed/failed, fallback_reason_counts)
+      - handler sends success response to client
+
+  - name: batch_write_atomic_partial_success
+    steps:
+      - client sends request with files across multiple directories
+      - some directory subgroups commit successfully
+      - one directory subgroup fails (e.g., TiKV txn conflict)
+      - failed subgroup: all files in that subgroup get error entries
+      - successful subgroups: all files committed and durable
+      - handler returns partial success with per-entry ok/error status
+      - summary shows entries_committed and entries_failed counts
+
+  - name: batch_write_atomic_unsupported_backend
+    steps:
+      - client sends batch_write_atomic to backend where supports_batch_write_atomic() == false
+      - handler returns ENOSYS error immediately
+      - no files are written
+      # Note: fallback to legacy batch_write is caller-side behavior, not server contract.
+
+  - name: batch_write_atomic_validation_failure
+    steps:
+      - client sends request with invalid paths or exceeding max files
+      - handler returns validation error before any backend call
+      - no files are written
+
+state_model:
+  # Per-request — no persistent state machine (stateless request/response)
+  states:
+    - validating           # request received, checking preconditions
+    - executing            # backend processing subgroup transactions
+    - completed_success    # all subgroups committed
+    - completed_partial    # some subgroups committed, some failed
+    - completed_failure    # all subgroups failed, or validation error, or ENOSYS
+  transitions:
+    - validating -> executing
+    - validating -> completed_failure          # validation error or ENOSYS
+    - executing -> completed_success           # all entries ok
+    - executing -> completed_partial           # mixed ok/error
+    - executing -> completed_failure           # all entries failed
+
+consistency_model:
+  read_after_write: strong
+  # Files committed in a subgroup txn are immediately visible to subsequent reads
+  # (TiKV snapshot isolation — committed data visible to all subsequent transactions)
+  metadata_storage_consistency: required
+  # Inode metadata and page data written in same TiKV txn — always consistent
+  duplicate_path_in_request: rejected
+  # Handler rejects duplicate paths within a single request at validation time
+  cross_request_overwrite: last_writer_wins
+  # Writing to same path across separate requests overwrites (same as existing batch_write behavior)
+  cross_subgroup_isolation: independent
+  # Subgroups are independent TiKV transactions — no cross-subgroup atomicity guarantee
+  # Client must handle partial success
+
+error_model:
+  validation_error: INVALID_ARGUMENT  # bad path, too many files, duplicate paths
+  enosys: ENOSYS                       # backend doesn't support grouped write
+  txn_conflict: per-entry error        # TiKV transaction conflict within a subgroup
+  parent_not_found: per-entry error    # parent directory cannot be created
+  internal_error: per-entry error      # unexpected backend error
+
+retry_model:
+  safe_to_retry: true
+  # Retrying the full request is safe — files are overwritten (last-writer-wins)
+  # Failed subgroups can be retried independently by re-sending only the failed files
+  retry_key: file_path
+  # Deduplication is by file path — writing same path again overwrites
+  partial_retry_supported: true
+  # Client can inspect per-entry results and retry only failed files
+
+observability:
+  response_summary:
+    - strategy_used: per_subgroup_atomic
+    - subgroup_count: actual_subgroup_count from backend
+    - entries_committed: count of ok entries
+    - entries_failed: count of error entries
+    - fallback_reason_counts: stable machine IDs (planner.*, execution.*)
+  per_entry:
+    - path: file path
+    - ok: boolean
+    - bytes_written: on success
+    - error.code: stable machine code on failure
+    - error.message: human-readable on failure
+  # S1 does NOT emit server-side structured logs or prometheus metrics.
+  # Observability surface is limited to the response payload.
+  server_side_logs: none  # Post-S1 gap
+  server_side_metrics: none  # Post-S1 gap
+  tracing: none  # Not needed for S1 inline execution
+
+failure_modes:
+  - subgroup TiKV transaction conflict (concurrent write to same region)
+  - parent directory resolution failure (corrupted directory tree)
+  - TiKV write timeout (backend latency spike)
+  - client WebSocket disconnect during execution (server completes, client doesn't see response)
+  - subgroup exceeds raft-entry-max-size (extremely large files in one subgroup)
+
+edge_cases:
+  - all files in same directory (1 subgroup)
+  - all files in different directories (N subgroups = N files)
+  - file count exactly equals grouped_write_subgroup_size (no chunking)
+  - file count = grouped_write_subgroup_size + 1 (minimal chunking — 2 subgroups)
+  - empty file data (currently allowed by handler)
+  - path with trailing slash (rejected at validation)
+  - duplicate paths in same request (rejected at validation)
+  - file overwrites existing file (last-writer-wins, same as batch_write)
+  - backend returns supports_batch_write_atomic()=false at runtime (ENOSYS)
+
+# ─────────────────────────────────────────────────────────
+# 6.2 Review Layers — Self-Assessment
+# ─────────────────────────────────────────────────────────
+
+interface_check:
+  contract_defined: true           # FsBatchWriteGroupedResult, WsRequest::BatchWriteAtomic
+  protocol_consistency: true       # Same WS JSON protocol as batch_write
+  parameter_validation_complete: true  # validate_and_decode_batch_write shared helper
+  error_model_defined: true        # ENOSYS, per-entry errors, validation errors
+  retry_semantics_defined: true    # Last-writer-wins, partial retry supported
+  backward_compatible: true        # New op, legacy batch_write unchanged
+
+flow_check:
+  flow_complete: true              # All paths reach terminal state
+  has_terminal_failure_state: true  # ENOSYS, validation error, all-failed
+  retry_safe: true                 # Overwrite semantics make retry safe
+  concurrent_safe: true            # Independent TiKV txns, per-subgroup isolation
+  no_unbounded_wait: true          # TiKV txn timeout bounds execution
+
+state_check:
+  state_machine_complete: true     # Stateless request/response, no persistent states
+  state_transition_validated: true  # 30 CI handler tests + 3 real backend tests
+  data_consistent: true            # Inode + pages in same TiKV txn
+  recovery_defined: true           # TiKV txn rollback on failure — no orphans
+  orphan_cleanup_supported: true   # Failed txn is rolled back atomically
+
+observability_check:
+  structured_logs: false           # S1: response summary only, no server-side structured logs yet
+  metrics_present: false           # S1: no prometheus metrics yet
+  tracing_present: false           # S1: not needed for inline execution
+  failure_reason_observable: true   # Per-entry error codes + fallback_reason_counts
+  alertable: false                 # S1: no alerting integration yet
+
+dx_check:
+  api_intuitive: true              # Same JSON shape as batch_write, plus summary
+  cli_ergonomic: true              # CLI auto-routes via batch_write_best()
+  common_path_simple: true         # Client sends files, gets per-entry results
+  output_human_readable: true      # JSON response with clear ok/error per file
+  output_machine_readable: true    # Stable machine codes in error.code and fallback_reason_counts
+  error_actionable: true           # ENOSYS → use legacy path; per-entry errors → retry failed files
+  latency_visible: true            # Response includes subgroup_count (proxy for txn count)
+  state_visible: true              # Per-entry ok/error, summary counts
+  cognitive_load_acceptable: true  # Same mental model as batch_write, just faster
+
+# ─────────────────────────────────────────────────────────
+# Gaps acknowledged for post-S1
+# ─────────────────────────────────────────────────────────
+
+post_s1_gaps:
+  - structured_logs: "Add tracing::info! for batch_write_atomic_request_received, subgroup_committed, subgroup_failed, batch_write_atomic_completed"
+  - metrics: "Add prometheus counters: batch_write_atomic_requests_total, files_total, subgroup_latency_ms histogram, errors_total by code"
+  - contention_profiling: "Multi-writer hot-directory benchmark (2/4 concurrent writers)"
+  - relaxed_durability: "Option A write-back mode (separate experimental feature)"
+  - coalescing_buffer: "Phase 2 server-side write coalescing"
+
+# ─────────────────────────────────────────────────────────
+# Micro Benchmark Evidence
+# ─────────────────────────────────────────────────────────
+
+benchmark_evidence:
+  methodology: "Server-side isolated micro benchmark, release build, local TiKV"
+  runs: 3
+  results:
+    - scenario: "32 x 1KB, same dir"
+      old_path_ms: 347
+      new_path_ms: 15
+      speedup: "22x"
+      subgroups: 1
+    - scenario: "32 x 4KB, same dir"
+      old_path_ms: 310
+      new_path_ms: 15
+      speedup: "21x"
+      subgroups: 1
+    - scenario: "32 x 1KB, 4 dirs"
+      old_path_ms: 297
+      new_path_ms: 35
+      speedup: "8.5x"
+      subgroups: 4
+    - scenario: "64 x 1KB, same dir (chunked)"
+      old_path_ms: 723
+      new_path_ms: 29
+      speedup: "25x"
+      subgroups: 2
+  txn_ceiling:
+    - files: 32
+      latency_ms: 14
+      per_file_ms: 0.44
+      throughput: "8.9 MB/s"
+    - files: 128
+      latency_ms: 66
+      per_file_ms: 0.52
+      throughput: "7.5 MB/s"
+    - files: 512
+      latency_ms: 254
+      per_file_ms: 0.50
+      throughput: "7.9 MB/s"
+  conclusion: "Grouped commit is the dominant optimization. subgroup_size=32 is well-placed."
+
+# ─────────────────────────────────────────────────────────
+# Test Coverage
+# ─────────────────────────────────────────────────────────
+
+test_coverage:
+  ci_covered:
+    handler_contract_tests: 9
+    handler_validation_tests: 5
+    ws_protocol_tests: 27+
+    total_ws_tests: 81
+  ignored_real_backend:
+    pagefs_subgroup_contract: 3
+    pagefs_benchmark: 2
+  coverage_model: >
+    CI tests pin handler contract (mock backend).
+    Real backend tests run via regression_gate.sh (requires TiKV).

@@ -203,16 +203,7 @@ where
         }
     };
 
-    let auth_user = session.user.clone();
-    let auth_keyspace = session.keyspace.clone();
-    let auth_success = WsResponse::success(
-        &id,
-        json!({
-            "user": auth_user,
-            "tenant": tenant_from_keyspace(&auth_keyspace),
-            "keyspace": auth_keyspace,
-        }),
-    );
+    let auth_success = WsResponse::success(&id, session.build_auth_success_data());
     send_response(&mut ws_stream, &auth_success).await?;
 
     let session = Arc::new(session);
@@ -675,7 +666,7 @@ async fn send_response_tx(
     send_message_tx(out_tx, Message::Text(payload)).await
 }
 
-fn tenant_from_keyspace(keyspace: &str) -> String {
+pub(crate) fn tenant_from_keyspace(keyspace: &str) -> String {
     keyspace
         .strip_prefix(KEYSPACE_PREFIX)
         .unwrap_or(keyspace)

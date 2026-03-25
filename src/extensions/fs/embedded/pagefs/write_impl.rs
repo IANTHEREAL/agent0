@@ -706,4 +706,289 @@ impl EmbeddedPageFs {
 
         self.abort_staged_write(ctx.staging_inode_id).await
     }
+
+    /// Write multiple small files grouped by parent directory, each group in a
+    /// single TiKV transaction. This amortises the per-file txn overhead (begin,
+    /// parent resolution, commit) across all files sharing the same directory.
+    ///
+    /// **Semantics**: per-subgroup atomic — files sharing a parent directory are
+    /// chunked by `grouped_write_subgroup_size` and each chunk is committed in
+    /// one TiKV transaction. All files within a subgroup succeed or fail together.
+    /// Cross-subgroup (including cross-directory) partial success is possible.
+    ///
+    /// Files that are too large for inline storage are silently skipped and
+    /// returned as errors so the caller can fall back to streaming for those.
+    pub(crate) async fn batch_write_grouped(
+        &self,
+        files: Vec<FsBatchWriteFile>,
+    ) -> Result<FsBatchWriteGroupedResult> {
+        use std::collections::HashMap;
+
+        if files.is_empty() {
+            return Ok(FsBatchWriteGroupedResult {
+                entries: Vec::new(),
+                actual_subgroup_count: 0,
+            });
+        }
+
+        // --- Group files by parent directory path ---
+        struct GroupedFile {
+            original_index: usize,
+            file_name: String,
+            full_path: String,
+            data: Vec<u8>,
+            mode: Option<u32>,
+        }
+
+        let total_files = files.len();
+        let mut groups: HashMap<String, Vec<GroupedFile>> = HashMap::new();
+        for (idx, file) in files.into_iter().enumerate() {
+            // Reject files too large for inline storage upfront
+            if !file.data.is_empty() && !can_store_inline_len(file.data.len()) {
+                // Will be filled in as error below
+                groups
+                    .entry("__oversized__".to_string())
+                    .or_default()
+                    .push(GroupedFile {
+                        original_index: idx,
+                        file_name: String::new(),
+                        full_path: file.path,
+                        data: file.data,
+                        mode: file.mode,
+                    });
+                continue;
+            }
+
+            let normalized = normalize_path(&file.path);
+            let (parent, name) = match normalized.rsplit_once('/') {
+                Some((p, n)) => {
+                    let parent = if p.is_empty() {
+                        "/".to_string()
+                    } else {
+                        p.to_string()
+                    };
+                    (parent, n.to_string())
+                }
+                None => ("/".to_string(), normalized.clone()),
+            };
+            groups.entry(parent).or_default().push(GroupedFile {
+                original_index: idx,
+                file_name: name,
+                full_path: file.path,
+                data: file.data,
+                mode: file.mode,
+            });
+        }
+
+        // Pre-allocate results vector
+        let mut results: Vec<Option<FsBatchWriteEntry>> = (0..total_files).map(|_| None).collect();
+
+        // Handle oversized files as errors
+        if let Some(oversized) = groups.remove("__oversized__") {
+            for gf in oversized {
+                results[gf.original_index] = Some(FsBatchWriteEntry {
+                    path: gf.full_path,
+                    result: Err(anyhow::anyhow!(
+                        "file too large for grouped inline write ({}B > max); use streaming",
+                        gf.data.len()
+                    )),
+                });
+            }
+        }
+
+        let subgroup_count = groups.len();
+        debug!(
+            total_files,
+            subgroup_count, "fs9: batch_write_grouped starting"
+        );
+
+        // --- Process each directory group, splitting by subgroup_size ---
+        let max_subgroup = fs9_config().grouped_write_subgroup_size;
+        let mut actual_subgroup_count = 0usize;
+        for (parent_dir, group_files) in &groups {
+            // Split large directory groups into chunks of max_subgroup
+            for chunk in group_files.chunks(max_subgroup) {
+                actual_subgroup_count += 1;
+                let chunk_size = chunk.len();
+                let t0 = std::time::Instant::now();
+
+                let txn_files: Vec<(String, &[u8], Option<u32>)> = chunk
+                    .iter()
+                    .map(|gf| (gf.file_name.clone(), gf.data.as_slice(), gf.mode))
+                    .collect();
+
+                match self.write_directory_group_txn(parent_dir, &txn_files).await {
+                    Ok(written_sizes) => {
+                        let elapsed_ms = t0.elapsed().as_millis();
+                        debug!(
+                            parent_dir,
+                            chunk_size, elapsed_ms, "fs9: directory subgroup committed"
+                        );
+                        for (gf, written) in chunk.iter().zip(written_sizes) {
+                            results[gf.original_index] = Some(FsBatchWriteEntry {
+                                path: gf.full_path.clone(),
+                                result: Ok(written),
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        let elapsed_ms = t0.elapsed().as_millis();
+                        warn!(
+                            parent_dir,
+                            chunk_size,
+                            elapsed_ms,
+                            error = %err,
+                            "fs9: directory subgroup commit failed"
+                        );
+                        let err_msg = err.to_string();
+                        for gf in chunk {
+                            results[gf.original_index] = Some(FsBatchWriteEntry {
+                                path: gf.full_path.clone(),
+                                result: Err(anyhow::anyhow!(
+                                    "directory group commit failed: {}",
+                                    err_msg
+                                )),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(FsBatchWriteGroupedResult {
+            entries: results.into_iter().map(|r| r.unwrap()).collect(),
+            actual_subgroup_count,
+        })
+    }
+
+    /// Write all files in a single directory within one TiKV transaction.
+    /// The parent directory is resolved once and all writes + metadata
+    /// updates are committed atomically.
+    ///
+    /// `files` is a slice of (file_name, data, mode) tuples — all files must
+    /// share the same parent directory (identified by `parent_path`).
+    async fn write_directory_group_txn(
+        &self,
+        parent_path: &str,
+        files: &[(String, &[u8], Option<u32>)],
+    ) -> Result<Vec<usize>> {
+        let mut txn = self.begin().await?;
+
+        // Resolve the parent directory once for the entire group.
+        let parent_inode = if parent_path == "/" {
+            ROOT_INODE
+        } else {
+            let parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
+            let mut current = ROOT_INODE;
+            for part in parts {
+                if let Some(next_id) = lookup(&mut txn, current, part).await? {
+                    let next = load_inode(&mut txn, next_id)
+                        .await?
+                        .ok_or_else(|| anyhow!(EmbeddedFsError::internal("dangling dir entry")))?;
+                    if !next.is_directory() {
+                        return Err(anyhow!(EmbeddedFsError::not_directory(part)));
+                    }
+                    current = next_id;
+                } else {
+                    // Auto-create intermediate directories
+                    let new_id = self.alloc_inode_id().await?;
+                    let inode = Inode::new_directory(new_id, 0o755);
+                    save_inode(&mut txn, &inode).await?;
+                    link(&mut txn, current, part, new_id).await?;
+                    current = new_id;
+                }
+            }
+            current
+        };
+
+        // Write each file within the same transaction
+        let mut written_sizes = Vec::with_capacity(files.len());
+        let mut event_builders = Vec::with_capacity(files.len());
+
+        for (file_name, data, mode) in files {
+            // Check if file already exists under this parent
+            let (inode_id, mut inode, is_new) =
+                if let Some(existing_id) = lookup(&mut txn, parent_inode, file_name).await? {
+                    let existing = load_inode(&mut txn, existing_id).await?.ok_or_else(|| {
+                        anyhow!(EmbeddedFsError::not_found(&format!(
+                            "{}/{}",
+                            parent_path, file_name
+                        )))
+                    })?;
+                    if existing.is_directory() {
+                        return Err(anyhow!(EmbeddedFsError::is_directory(&format!(
+                            "{}/{}",
+                            parent_path, file_name
+                        ))));
+                    }
+                    if existing.is_symlink() {
+                        return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                            "cannot write to symlink as file".to_string()
+                        )));
+                    }
+                    // Retire old data ref
+                    retire_inode_data_ref(
+                        &mut txn,
+                        existing_id,
+                        &existing.data,
+                        self.runtime_state().fs_instance_id,
+                    )
+                    .await?;
+                    let mut ino = existing;
+                    ino.data = DataRef::None;
+                    ino.size = 0;
+                    (existing_id, ino, false)
+                } else {
+                    let new_id = self.alloc_inode_id().await?;
+                    let ino = Inode::new_file(new_id, mode.unwrap_or(0o644));
+                    link(&mut txn, parent_inode, file_name, new_id).await?;
+                    (new_id, ino, true)
+                };
+
+            // Write blob data
+            if data.is_empty() {
+                inode.data = DataRef::None;
+                inode.size = 0;
+            } else {
+                blob::write_blob(&mut txn, inode_id, data).await?;
+                inode.data = DataRef::InlineBlob;
+                inode.size = data.len() as u64;
+            }
+
+            bump_inode_generation(&mut inode)?;
+            inode.touch_mtime();
+            save_inode(&mut txn, &inode).await?;
+
+            let full_path = if parent_path == "/" {
+                format!("/{}", file_name)
+            } else {
+                format!("{}/{}", parent_path, file_name)
+            };
+            event_builders.push(FsEventBuilder {
+                event_type: if is_new {
+                    FsEventType::Create
+                } else {
+                    FsEventType::Write
+                },
+                path: full_path,
+                old_path: None,
+                inode: inode_id,
+                parent_inode,
+                generation: inode.generation,
+                is_dir: false,
+                size: inode.size,
+            });
+
+            written_sizes.push(data.len());
+        }
+
+        // Single atomic commit for the entire directory group
+        txn.commit().await?;
+
+        // Fire events after successful commit
+        self.persist_events_async(event_builders.clone());
+        self.emit_events(event_builders);
+
+        Ok(written_sizes)
+    }
 }

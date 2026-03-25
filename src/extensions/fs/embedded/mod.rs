@@ -6,9 +6,10 @@ pub(crate) mod pagefs;
 pub(crate) mod types;
 
 use crate::extensions::fs::backend::{
-    FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsCreateUpload, FsFileInfo,
-    FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest, FsRecursiveReaddirOptions,
-    FsRecursiveReaddirResult, FsStorage, FsWriteStream, FsWriteStreamOptions,
+    FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult, FsCreateUpload,
+    FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest,
+    FsRecursiveReaddirOptions, FsRecursiveReaddirResult, FsStorage, FsWriteStream,
+    FsWriteStreamOptions,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -158,6 +159,17 @@ impl FsBackend for EmbeddedFsBackend {
 
     async fn batch_write(&self, files: Vec<FsBatchWriteFile>) -> Result<Vec<FsBatchWriteEntry>> {
         self.pagefs.batch_write(files).await
+    }
+
+    fn supports_batch_write_atomic(&self) -> bool {
+        true
+    }
+
+    async fn batch_write_grouped(
+        &self,
+        files: Vec<FsBatchWriteFile>,
+    ) -> Result<FsBatchWriteGroupedResult> {
+        self.pagefs.batch_write_grouped(files).await
     }
 
     async fn begin_write_stream(

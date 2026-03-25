@@ -1,8 +1,8 @@
 use crate::extensions::fs::backend::{
     batch_inline_read_entry_too_large_error, batch_inline_read_payload_too_large_error,
-    FsBatchWriteEntry, FsBatchWriteFile, FsCreateUpload, FsMultipartCompletedPart,
-    FsPreparedDownload, FsPresignedRequest, FsRecursiveReaddirOptions, FsStorage, FsWriteStream,
-    FsWriteStreamOptions,
+    FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult, FsCreateUpload,
+    FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest, FsRecursiveReaddirOptions,
+    FsStorage, FsWriteStream, FsWriteStreamOptions,
 };
 use crate::extensions::fs::channel_reader::ChunkReceiverReader;
 use crate::extensions::fs::config::fs9_config;
@@ -4271,5 +4271,7 @@ async fn remove_inode_recursive(
     Ok(removed)
 }
 
+#[cfg(test)]
+mod bench_grouped_write;
 #[cfg(test)]
 mod tests;

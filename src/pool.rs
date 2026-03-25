@@ -527,6 +527,12 @@ impl TenantHandle {
         Self::new_with_limits(qps_limit, 0)
     }
 
+    /// Minimal TenantHandle for unit tests that don't need pool/store access.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test() -> Self {
+        Self::new_with_limits(0, 0)
+    }
+
     /// Create a TenantHandle with explicit QPS+memory limits.
     #[cfg(test)]
     pub(crate) fn new_with_limits(qps_limit: u64, memory_quota_bytes: usize) -> Self {

@@ -43,6 +43,15 @@ pub(crate) struct FsBatchWriteEntry {
     pub result: Result<usize>,
 }
 
+/// Result of a grouped atomic batch write, including execution metadata.
+#[derive(Debug)]
+pub(crate) struct FsBatchWriteGroupedResult {
+    pub entries: Vec<FsBatchWriteEntry>,
+    /// Number of subgroup transactions actually executed by the backend.
+    /// This accounts for chunking within large directory groups.
+    pub actual_subgroup_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct FsRecursiveReaddirOptions {
     pub max_depth: usize,
@@ -309,6 +318,25 @@ pub(crate) trait FsBackend: Send + Sync {
             entries.push(FsBatchWriteEntry { path, result });
         }
         Ok(entries)
+    }
+    /// Whether this backend supports the `batch_write_atomic` operation with
+    /// per-subgroup atomic semantics. Backends that return `false` must not
+    /// have `batch_write_grouped` called on them.
+    fn supports_batch_write_atomic(&self) -> bool {
+        false
+    }
+    /// Grouped atomic batch write: files are grouped by parent directory and
+    /// each subgroup (bounded by `grouped_write_subgroup_size`) is committed
+    /// in a single transaction. Per-subgroup atomic semantics.
+    /// Only call this if `supports_batch_write_atomic()` returns true.
+    async fn batch_write_grouped(
+        &self,
+        files: Vec<FsBatchWriteFile>,
+    ) -> Result<FsBatchWriteGroupedResult> {
+        let _ = files;
+        Err(anyhow!(
+            "batch_write_grouped is not supported by this backend"
+        ))
     }
     async fn begin_write_stream(
         &self,

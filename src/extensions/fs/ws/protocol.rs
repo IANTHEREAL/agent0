@@ -45,6 +45,7 @@ pub(crate) enum WsErrorCode {
     Eauth,
     Einval,
     Eproto,
+    Enosys,
     Eio,
 }
 
@@ -62,6 +63,7 @@ impl Display for WsErrorCode {
             Self::Eauth => "Authentication failed",
             Self::Einval => "Invalid argument",
             Self::Eproto => "Protocol error",
+            Self::Enosys => "Function not implemented",
             Self::Eio => "I/O error",
         };
         write!(f, "{msg}")
@@ -247,6 +249,18 @@ pub(crate) enum WsRequest {
         id: String,
         files: Vec<BatchWriteFileRequest>,
     },
+    /// BatchWriteAtomic is a capability-gated fast-path for bulk small-file uploads.
+    ///
+    /// Files are grouped by parent directory and each subgroup (bounded by
+    /// `grouped_write_subgroup_size`) is committed atomically in a single TiKV
+    /// transaction. Per-subgroup atomic semantics.
+    ///
+    /// Security invariant: fs9 WS is currently superuser-only (see `ws/auth.rs`).
+    #[serde(rename = "batch_write_atomic")]
+    BatchWriteAtomic {
+        id: String,
+        files: Vec<BatchWriteFileRequest>,
+    },
 }
 
 impl WsRequest {
@@ -275,7 +289,8 @@ impl WsRequest {
             | Self::Chmod { id, .. }
             | Self::BatchStat { id, .. }
             | Self::BatchInlineRead { id, .. }
-            | Self::BatchWrite { id, .. } => id,
+            | Self::BatchWrite { id, .. }
+            | Self::BatchWriteAtomic { id, .. } => id,
         }
     }
 }
