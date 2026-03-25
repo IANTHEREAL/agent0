@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Result;
+use tikv_client::Transaction;
 use tokio::sync::broadcast;
 
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::storage::backpressure::tikv_op;
 
 // ---------------------------------------------------------------------------
 // FsEventType
@@ -112,6 +115,7 @@ pub const RING_CAPACITY_ENV: &str = "FS9_NOTIFY_RING_CAPACITY";
 
 /// Result of a `query` call, including ring metadata for overflow detection.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct QueryResult {
     /// Ring epoch (process incarnation). Consumer compares against cached epoch.
     pub epoch: u64,
@@ -451,6 +455,7 @@ pub fn get_or_create_event_ring(keyspace: &str) -> Arc<EventRing> {
 // ---------------------------------------------------------------------------
 
 /// In-memory counters for fs9 notify observability.
+#[allow(dead_code)]
 pub struct NotifyMetrics {
     pub events_emitted: AtomicU64,
     pub events_create: AtomicU64,
@@ -464,6 +469,7 @@ pub struct NotifyMetrics {
     pub events_coalesced: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl NotifyMetrics {
     pub fn new() -> Self {
         Self {
@@ -584,6 +590,7 @@ pub fn fs9_events_schema() -> TableSchema {
 ///
 /// Returns an error if this process does not own the ring for the given
 /// keyspace (i.e. no mutation path has registered a ring).
+#[allow(dead_code)]
 pub fn execute_fs9_events(
     keyspace: &str,
     since_seq: i64,
@@ -654,6 +661,523 @@ pub fn execute_fs9_events(
     }
 
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// TiKV-backed persistent event log
+// ---------------------------------------------------------------------------
+
+/// Seq counter key: `_fs_ES` — stores the current max seq as big-endian u64.
+fn notify_seq_key() -> Vec<u8> {
+    b"_fs_ES".to_vec()
+}
+
+/// Event key: `_fs_E` + seq (big-endian u64). Natural sort order for range scans.
+fn notify_event_key(seq: u64) -> Vec<u8> {
+    let mut key = b"_fs_E".to_vec();
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// Event key prefix for range scans.
+fn notify_event_prefix() -> Vec<u8> {
+    b"_fs_E".to_vec()
+}
+
+/// End key for event range scans (exclusive). `_fs_F` is the byte after `_fs_E`.
+fn notify_event_range_end() -> Vec<u8> {
+    b"_fs_F".to_vec()
+}
+
+// -- Binary event encoding --------------------------------------------------
+
+/// Encode event type as a single byte.
+fn encode_event_type(et: &FsEventType) -> u8 {
+    match et {
+        FsEventType::Create => 1,
+        FsEventType::Write => 2,
+        FsEventType::Delete => 3,
+        FsEventType::Rename => 4,
+        FsEventType::Mkdir => 5,
+    }
+}
+
+fn decode_event_type(b: u8) -> Option<FsEventType> {
+    match b {
+        1 => Some(FsEventType::Create),
+        2 => Some(FsEventType::Write),
+        3 => Some(FsEventType::Delete),
+        4 => Some(FsEventType::Rename),
+        5 => Some(FsEventType::Mkdir),
+        _ => None,
+    }
+}
+
+/// Binary-encode an FsEvent for TiKV storage.
+///
+/// Format (v1):
+///   event_type: 1 byte
+///   is_dir: 1 byte
+///   timestamp: 8 bytes (i64 BE, milliseconds since epoch)
+///   inode: 8 bytes (u64 BE)
+///   parent_inode: 8 bytes (u64 BE)
+///   generation: 8 bytes (u64 BE)
+///   size: 8 bytes (u64 BE)
+///   path_len: 4 bytes (u32 BE)
+///   path: path_len bytes (UTF-8)
+///   old_path_len: 4 bytes (u32 BE, 0 if None)
+///   old_path: old_path_len bytes (UTF-8)
+fn encode_fs_event(event: &FsEvent) -> Vec<u8> {
+    let path_bytes = event.path.as_bytes();
+    let old_path_bytes = event.old_path.as_deref().map(|s| s.as_bytes());
+    let old_path_len = old_path_bytes.map_or(0, |b| b.len());
+    let capacity = 1 + 1 + 8 + 8 + 8 + 8 + 8 + 4 + path_bytes.len() + 4 + old_path_len;
+    let mut buf = Vec::with_capacity(capacity);
+    buf.push(encode_event_type(&event.event_type));
+    buf.push(event.is_dir as u8);
+    buf.extend_from_slice(&event.timestamp.to_be_bytes());
+    buf.extend_from_slice(&event.inode.to_be_bytes());
+    buf.extend_from_slice(&event.parent_inode.to_be_bytes());
+    buf.extend_from_slice(&event.generation.to_be_bytes());
+    buf.extend_from_slice(&event.size.to_be_bytes());
+    buf.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(path_bytes);
+    buf.extend_from_slice(&(old_path_len as u32).to_be_bytes());
+    if let Some(ob) = old_path_bytes {
+        buf.extend_from_slice(ob);
+    }
+    buf
+}
+
+fn decode_fs_event(seq: u64, data: &[u8]) -> Option<FsEvent> {
+    // minimum: 1+1+8+8+8+8+8+4 = 46
+    if data.len() < 46 {
+        return None;
+    }
+    let event_type = decode_event_type(data[0])?;
+    let is_dir = data[1] != 0;
+    let timestamp = i64::from_be_bytes(data[2..10].try_into().ok()?);
+    let inode = u64::from_be_bytes(data[10..18].try_into().ok()?);
+    let parent_inode = u64::from_be_bytes(data[18..26].try_into().ok()?);
+    let generation = u64::from_be_bytes(data[26..34].try_into().ok()?);
+    let size = u64::from_be_bytes(data[34..42].try_into().ok()?);
+    let path_len = u32::from_be_bytes(data[42..46].try_into().ok()?) as usize;
+    if data.len() < 46 + path_len + 4 {
+        return None;
+    }
+    let path = std::str::from_utf8(&data[46..46 + path_len])
+        .ok()?
+        .to_string();
+    let old_path_offset = 46 + path_len;
+    let old_path_len =
+        u32::from_be_bytes(data[old_path_offset..old_path_offset + 4].try_into().ok()?) as usize;
+    let old_path = if old_path_len > 0 {
+        let start = old_path_offset + 4;
+        if data.len() < start + old_path_len {
+            return None;
+        }
+        Some(
+            std::str::from_utf8(&data[start..start + old_path_len])
+                .ok()?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Some(FsEvent {
+        seq,
+        timestamp,
+        event_type,
+        path,
+        old_path,
+        inode,
+        parent_inode,
+        generation,
+        is_dir,
+        size,
+    })
+}
+
+// -- TiKV persistence -------------------------------------------------------
+
+/// Default max events per tenant in TiKV.
+pub const DEFAULT_EVENT_CAP: u64 = 100_000;
+
+/// Environment variable to override event cap.
+pub const EVENT_CAP_ENV: &str = "FS9_NOTIFY_EVENT_CAP";
+
+/// Default event TTL in seconds (1 hour).
+pub const DEFAULT_EVENT_TTL_SECS: u64 = 3600;
+
+/// Environment variable to override event TTL.
+pub const EVENT_TTL_ENV: &str = "FS9_NOTIFY_TTL_SECS";
+
+/// Default GC interval in seconds.
+pub const DEFAULT_GC_INTERVAL_SECS: u64 = 60;
+
+/// Environment variable to override GC interval.
+pub const GC_INTERVAL_ENV: &str = "FS9_NOTIFY_GC_INTERVAL_SECS";
+
+/// Grace period added to TTL for clock skew tolerance.
+const TTL_GRACE_PERIOD_SECS: u64 = 300;
+
+/// Notify config, loaded once from env.
+struct NotifyConfig {
+    event_cap: u64,
+    event_ttl_secs: u64,
+    gc_interval_secs: u64,
+}
+
+fn notify_config() -> &'static NotifyConfig {
+    static CONFIG: OnceLock<NotifyConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let event_cap = std::env::var(EVENT_CAP_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(DEFAULT_EVENT_CAP);
+        let event_ttl_secs = std::env::var(EVENT_TTL_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(DEFAULT_EVENT_TTL_SECS);
+        let gc_interval_secs = std::env::var(GC_INTERVAL_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(DEFAULT_GC_INTERVAL_SECS);
+        NotifyConfig {
+            event_cap,
+            event_ttl_secs,
+            gc_interval_secs,
+        }
+    })
+}
+
+/// Persist fs9 notify events to TiKV within the given transaction.
+///
+/// Reads and increments the seq counter, writes event keys, all atomically
+/// within the caller's pessimistic transaction. Returns (first_seq, last_seq).
+///
+/// Applies commit-scope coalescing (same path → keep last) before writing.
+pub async fn persist_notify_events(
+    txn: &mut Transaction,
+    builders: Vec<FsEventBuilder>,
+) -> Result<(u64, u64)> {
+    if builders.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Commit-scope coalescing (Hard Contract #2).
+    let mut coalesced: HashMap<String, FsEventBuilder> = HashMap::with_capacity(builders.len());
+    for b in builders {
+        coalesced.insert(b.path.clone(), b);
+    }
+    let final_builders: Vec<FsEventBuilder> = coalesced.into_values().collect();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    // Read current max seq (pessimistic txn locks this key).
+    let seq_key = notify_seq_key();
+    let current_seq =
+        match tikv_op!(txn.get(seq_key.clone()).await).map_err(|e| anyhow::anyhow!("{e}"))? {
+            Some(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
+            _ => 0,
+        };
+
+    let first_seq = current_seq + 1;
+    let mut seq = first_seq;
+
+    for builder in final_builders {
+        let event = builder.into_event(seq, now);
+        let event_key = notify_event_key(seq);
+        let event_value = encode_fs_event(&event);
+        tikv_op!(txn.put(event_key, event_value).await).map_err(|e| anyhow::anyhow!("{e}"))?;
+        seq += 1;
+    }
+    let last_seq = seq - 1;
+
+    // Write back new max seq.
+    tikv_op!(txn.put(seq_key, last_seq.to_be_bytes().to_vec()).await)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok((first_seq, last_seq))
+}
+
+/// Persist a single fs9 notify event to TiKV within the given transaction.
+pub async fn persist_notify_event(txn: &mut Transaction, builder: FsEventBuilder) -> Result<u64> {
+    let (_, last_seq) = persist_notify_events(txn, vec![builder]).await?;
+    Ok(last_seq)
+}
+
+/// Execute `fs9_events()` by reading from TiKV.
+///
+/// Uses the provided transaction to range-scan persisted events.
+pub async fn execute_fs9_events_from_tikv(
+    txn: &mut Transaction,
+    since_seq: i64,
+    path_prefix: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Row>, String> {
+    if since_seq < 0 {
+        return Err("fs9_events: since_seq must be non-negative".to_string());
+    }
+
+    let since = since_seq as u64;
+
+    // Read current max seq.
+    let seq_key = notify_seq_key();
+    let newest_seq = match tikv_op!(txn.get(seq_key).await)
+        .map_err(|e| format!("fs9_events: failed to read seq counter: {e}"))?
+    {
+        Some(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
+        _ => 0,
+    };
+
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    if newest_seq == 0 {
+        // No events at all — return META-only.
+        return Ok(vec![Row::new(vec![
+            Value::Int64(0),
+            Value::Text("META".to_string()),
+            Value::Text(String::new()),
+            Value::Null,
+            Value::Int64(0),
+            Value::Int64(0),
+            Value::Boolean(false),
+            Value::Int64(notify_config().event_cap as i64),
+            Value::Timestamp(now_millis),
+        ])]);
+    }
+
+    // Find oldest_seq by scanning from the beginning (1 key).
+    let oldest_start = notify_event_prefix();
+    let mut oldest_scan = tikv_op!(txn.scan(oldest_start..notify_event_range_end(), 1).await)
+        .map_err(|e| format!("fs9_events: oldest scan failed: {e}"))?;
+    let oldest_seq = oldest_scan
+        .next()
+        .and_then(|kv| {
+            let key: &[u8] = kv.key().as_ref().into();
+            if key.len() >= 13 {
+                Some(u64::from_be_bytes(key[5..13].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    // Overflow detection.
+    let overflow = if since == 0 {
+        oldest_seq > 1
+    } else {
+        since < oldest_seq || since > newest_seq
+    };
+
+    // Normalize path prefix.
+    let prefix = path_prefix.map(|p| {
+        if p.ends_with('/') {
+            p.to_string()
+        } else {
+            format!("{p}/")
+        }
+    });
+
+    // We request more than `limit` to account for path filtering.
+    // Scan up to 10x limit or at least 1000 to reduce round-trips.
+    let scan_limit = (limit * 10).clamp(1000, 100_000) as u32;
+    let start_key = notify_event_key(since + 1);
+    let end_key = notify_event_range_end();
+    let pairs = tikv_op!(txn.scan(start_key..end_key, scan_limit).await)
+        .map_err(|e| format!("fs9_events: range scan failed: {e}"))?;
+
+    let mut rows = Vec::with_capacity(limit + 1);
+
+    // META row.
+    rows.push(Row::new(vec![
+        Value::Int64(newest_seq as i64),
+        Value::Text("META".to_string()),
+        Value::Text(String::new()),
+        Value::Null,
+        Value::Int64(0),
+        Value::Int64(oldest_seq as i64),
+        Value::Boolean(overflow),
+        Value::Int64(notify_config().event_cap as i64),
+        Value::Timestamp(now_millis),
+    ]));
+
+    // Event rows.
+    let mut count = 0;
+    for kv in pairs {
+        if count >= limit {
+            break;
+        }
+        let key: &[u8] = kv.key().as_ref().into();
+        let value: &[u8] = kv.value();
+        if key.len() < 13 {
+            continue;
+        }
+        let seq = u64::from_be_bytes(key[5..13].try_into().unwrap_or([0; 8]));
+        if let Some(event) = decode_fs_event(seq, value) {
+            // Apply path prefix filter.
+            if let Some(ref pfx) = prefix {
+                if !event.path.starts_with(pfx.as_str()) {
+                    continue;
+                }
+            }
+            rows.push(Row::new(vec![
+                Value::Int64(event.seq as i64),
+                Value::Text(event.event_type.as_str().to_string()),
+                Value::Text(event.path.clone()),
+                match &event.old_path {
+                    Some(p) => Value::Text(p.clone()),
+                    None => Value::Null,
+                },
+                Value::Int64(event.inode as i64),
+                Value::Int64(event.generation as i64),
+                Value::Boolean(event.is_dir),
+                Value::Int64(event.size as i64),
+                Value::Timestamp(event.timestamp), // already in milliseconds
+            ]));
+            count += 1;
+        }
+    }
+
+    Ok(rows)
+}
+
+// -- GC ---------------------------------------------------------------------
+
+/// Run one GC cycle: delete events exceeding cap or TTL for a single keyspace.
+///
+/// Safe to run from multiple instances concurrently — worst case is
+/// redundant deletes on already-deleted keys.
+pub async fn gc_notify_events(txn: &mut Transaction) -> Result<u64> {
+    let config = notify_config();
+    let mut deleted = 0u64;
+
+    // Read newest seq to compute count.
+    let seq_key = notify_seq_key();
+    let newest_seq = match tikv_op!(txn.get(seq_key).await).map_err(|e| anyhow::anyhow!("{e}"))? {
+        Some(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
+        _ => return Ok(0), // no events
+    };
+
+    // Find oldest event.
+    let mut oldest_scan = tikv_op!(
+        txn.scan(notify_event_prefix()..notify_event_range_end(), 1)
+            .await
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let oldest_seq = match oldest_scan.next() {
+        Some(kv) => {
+            let key: &[u8] = kv.key().as_ref().into();
+            if key.len() >= 13 {
+                u64::from_be_bytes(key[5..13].try_into().unwrap_or([0; 8]))
+            } else {
+                return Ok(0);
+            }
+        }
+        None => return Ok(0),
+    };
+
+    let count = newest_seq - oldest_seq + 1;
+
+    // Trigger 1: cap exceeded — delete oldest events until at cap.
+    if count > config.event_cap {
+        let to_delete = count - config.event_cap;
+        let start = notify_event_key(oldest_seq);
+        let end = notify_event_key(oldest_seq + to_delete);
+        let pairs: Vec<_> = tikv_op!(txn.scan(start..end, to_delete as u32).await)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .collect();
+        for kv in &pairs {
+            let key: Vec<u8> = kv.key().clone().into();
+            tikv_op!(txn.delete(key).await).map_err(|e| anyhow::anyhow!("{e}"))?;
+            deleted += 1;
+        }
+    }
+
+    // Trigger 2: TTL exceeded — delete events older than TTL + grace period.
+    let ttl_cutoff = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+        - ((config.event_ttl_secs + TTL_GRACE_PERIOD_SECS) * 1000) as i64;
+
+    // Scan from oldest, stop when we find an event newer than the cutoff.
+    let scan_start = notify_event_prefix();
+    let scan_end = notify_event_range_end();
+    let batch_size = 1000u32;
+    let pairs: Vec<_> = tikv_op!(txn.scan(scan_start..scan_end, batch_size).await)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .collect();
+    for kv in &pairs {
+        let value: &[u8] = kv.value();
+        // Decode just the timestamp (bytes 2..10) without full decode.
+        if value.len() >= 10 {
+            let ts = i64::from_be_bytes(value[2..10].try_into().unwrap_or([0; 8]));
+            if ts >= ttl_cutoff {
+                break; // events are ordered by seq (≈ time), stop here
+            }
+            let key: Vec<u8> = kv.key().clone().into();
+            tikv_op!(txn.delete(key).await).map_err(|e| anyhow::anyhow!("{e}"))?;
+            deleted += 1;
+        }
+    }
+
+    Ok(deleted)
+}
+
+/// Spawn a background GC loop for fs9 notify events.
+///
+/// Runs indefinitely, performing GC every `gc_interval_secs`.
+pub fn spawn_notify_gc_loop(client: Arc<tikv_client::TransactionClient>) {
+    let interval = Duration::from_secs(notify_config().gc_interval_secs);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let txn_result = tikv_op!(
+                client
+                    .begin_with_options(
+                        tikv_client::TransactionOptions::new_pessimistic()
+                            .drop_check(tikv_client::CheckLevel::Warn)
+                    )
+                    .await
+            );
+            match txn_result {
+                Ok(mut txn) => {
+                    match gc_notify_events(&mut txn).await {
+                        Ok(deleted) => {
+                            if deleted > 0 {
+                                if let Err(e) = tikv_op!(txn.commit().await) {
+                                    tracing::warn!("fs9_notify gc commit failed: {e}");
+                                } else {
+                                    tracing::debug!("fs9_notify gc: deleted {deleted} events");
+                                }
+                            } else {
+                                // Nothing to delete, rollback.
+                                let _ = tikv_op!(txn.rollback().await);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("fs9_notify gc failed: {e}");
+                            let _ = tikv_op!(txn.rollback().await);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("fs9_notify gc: failed to begin txn: {e}");
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

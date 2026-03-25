@@ -705,7 +705,7 @@ impl EmbeddedPageFs {
         self.maybe_start_background_maintenance();
     }
 
-    /// Emit a single fs event after a successful TiKV commit.
+    /// Emit a single fs event to the in-memory ring after a successful TiKV commit.
     /// Silently drops if the ring lock is poisoned (Hard Contract #4).
     /// Records emit metrics for observability.
     fn emit_event(&self, builder: FsEventBuilder) {
@@ -717,9 +717,7 @@ impl EmbeddedPageFs {
         }
     }
 
-    /// Emit multiple fs events atomically after a successful TiKV commit.
-    /// Used for batch_write to ensure all-or-none visibility (Hard Contract #5).
-    /// Silently drops if the ring lock is poisoned (Hard Contract #4).
+    /// Emit multiple fs events atomically to the in-memory ring after commit.
     /// Applies commit-scope coalescing: same path → keep only last event (Hard Contract #2).
     fn emit_events(&self, builders: Vec<FsEventBuilder>) {
         if builders.is_empty() {
@@ -747,6 +745,32 @@ impl EmbeddedPageFs {
                 }
             }
             Err(_) => metrics.record_emit_error(),
+        }
+    }
+
+    /// Persist a single event to TiKV within the given transaction (before commit).
+    /// Best-effort: logs warning on failure but does not abort the mutation.
+    async fn persist_event(&self, txn: &mut Transaction, builder: &FsEventBuilder) {
+        if let Err(e) =
+            crate::extensions::fs::notify::persist_notify_event(txn, builder.clone()).await
+        {
+            tracing::warn!(
+                keyspace = %self.keyspace,
+                "fs9_notify: failed to persist event to TiKV: {e}"
+            );
+        }
+    }
+
+    /// Persist multiple events to TiKV within the given transaction (before commit).
+    /// Best-effort: logs warning on failure but does not abort the mutation.
+    async fn persist_events(&self, txn: &mut Transaction, builders: &[FsEventBuilder]) {
+        if let Err(e) =
+            crate::extensions::fs::notify::persist_notify_events(txn, builders.to_vec()).await
+        {
+            tracing::warn!(
+                keyspace = %self.keyspace,
+                "fs9_notify: failed to persist events to TiKV: {e}"
+            );
         }
     }
 
@@ -1153,6 +1177,7 @@ impl EmbeddedPageFs {
         }
 
         save_bundle_manifest(&mut txn, manifest).await?;
+        self.persist_events(&mut txn, &event_builders).await;
         txn.commit().await?;
 
         self.emit_events(event_builders);
@@ -3026,11 +3051,9 @@ impl EmbeddedPageFs {
         inode.touch_mtime();
         save_inode(&mut txn, &inode).await?;
 
-        txn.commit().await?;
-
-        // Emit fs9 notify event after successful commit.
+        // Persist event to TiKV before commit.
         let normalized = normalize_path(path);
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: if is_new {
                 FsEventType::Create
             } else {
@@ -3043,7 +3066,13 @@ impl EmbeddedPageFs {
             generation: inode.generation,
             is_dir: false,
             size: inode.size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+
+        txn.commit().await?;
+
+        // Emit to in-memory ring after commit.
+        self.emit_event(builder);
 
         Ok(data.len())
     }
@@ -3747,10 +3776,9 @@ impl EmbeddedPageFs {
             "partial mutation is only supported for inline files up to",
         )
         .await?;
-        txn.commit().await?;
 
         let normalized = normalize_path(path);
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: if is_new {
                 FsEventType::Create
             } else {
@@ -3763,7 +3791,11 @@ impl EmbeddedPageFs {
             generation: inode.generation,
             is_dir: false,
             size: inode.size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok(data.len())
     }
@@ -3793,10 +3825,9 @@ impl EmbeddedPageFs {
             "append is only supported for inline files up to",
         )
         .await?;
-        txn.commit().await?;
 
         let normalized = normalize_path(path);
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: if is_new {
                 FsEventType::Create
             } else {
@@ -3809,7 +3840,11 @@ impl EmbeddedPageFs {
             generation: inode.generation,
             is_dir: false,
             size: inode.size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok(data.len())
     }
@@ -3857,10 +3892,9 @@ impl EmbeddedPageFs {
         inode.touch_mtime();
         save_inode(&mut txn, &inode).await?;
         let (parent_inode, _) = resolve_parent(&mut txn, path).await?;
-        txn.commit().await?;
 
         let normalized = normalize_path(path);
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: FsEventType::Write,
             path: normalized,
             old_path: None,
@@ -3869,7 +3903,11 @@ impl EmbeddedPageFs {
             generation: inode.generation,
             is_dir: false,
             size: inode.size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok(())
     }
@@ -3907,9 +3945,7 @@ impl EmbeddedPageFs {
         unlink(&mut txn, parent_inode, &name).await?;
         delete_inode(&mut txn, inode_id).await?;
 
-        txn.commit().await?;
-
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: FsEventType::Delete,
             path: normalized,
             old_path: None,
@@ -3918,7 +3954,11 @@ impl EmbeddedPageFs {
             generation: inode_generation,
             is_dir,
             size: inode_size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok(())
     }
@@ -3947,10 +3987,8 @@ impl EmbeddedPageFs {
         .await?;
         unlink(&mut txn, parent_inode, &name).await?;
 
-        txn.commit().await?;
-
         // Phase 1: emit single root DELETE (not per-child).
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: FsEventType::Delete,
             path: normalized,
             old_path: None,
@@ -3959,7 +3997,11 @@ impl EmbeddedPageFs {
             generation: inode_generation,
             is_dir,
             size: inode_size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok(removed)
     }
@@ -3998,6 +4040,26 @@ impl EmbeddedPageFs {
                         inode_id: new_inode_id,
                         parent_inode,
                     });
+                    // Persist events to TiKV before commit.
+                    let pre_builders: Vec<FsEventBuilder> = created_dirs
+                        .iter()
+                        .map(|d| FsEventBuilder {
+                            event_type: FsEventType::Mkdir,
+                            path: d.path.clone(),
+                            old_path: None,
+                            inode: d.inode_id,
+                            parent_inode: d.parent_inode,
+                            generation: 1,
+                            is_dir: true,
+                            size: 0,
+                        })
+                        .collect();
+                    if let Err(e) =
+                        crate::extensions::fs::notify::persist_notify_events(&mut txn, pre_builders)
+                            .await
+                    {
+                        tracing::warn!("fs9_notify: failed to persist mkdir events to TiKV: {e}");
+                    }
                     txn.commit().await?;
                     return Ok(());
                 }
@@ -4037,6 +4099,26 @@ impl EmbeddedPageFs {
                     }
                 }
 
+                // Persist events to TiKV before commit.
+                let pre_builders: Vec<FsEventBuilder> = created_dirs
+                    .iter()
+                    .map(|d| FsEventBuilder {
+                        event_type: FsEventType::Mkdir,
+                        path: d.path.clone(),
+                        old_path: None,
+                        inode: d.inode_id,
+                        parent_inode: d.parent_inode,
+                        generation: 1,
+                        is_dir: true,
+                        size: 0,
+                    })
+                    .collect();
+                if let Err(e) =
+                    crate::extensions::fs::notify::persist_notify_events(&mut txn, pre_builders)
+                        .await
+                {
+                    tracing::warn!("fs9_notify: failed to persist mkdir events to TiKV: {e}");
+                }
                 txn.commit().await?;
                 Ok(())
             }
@@ -4156,9 +4238,7 @@ impl EmbeddedPageFs {
         let inode_generation = old_inode.generation;
         let inode_size = old_inode.size;
 
-        txn.commit().await?;
-
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: FsEventType::Rename,
             path: new_normalized,
             old_path: Some(old_normalized),
@@ -4167,7 +4247,11 @@ impl EmbeddedPageFs {
             generation: inode_generation,
             is_dir,
             size: inode_size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok(())
     }
@@ -4468,10 +4552,9 @@ impl EmbeddedPageFs {
         clear_staging_write(&mut txn, staging_inode_id).await?;
         let emit_size = staging_inode.size;
         let emit_generation = staging_inode.generation;
-        txn.commit().await?;
 
         let normalized = normalize_path(path);
-        self.emit_event(FsEventBuilder {
+        let builder = FsEventBuilder {
             event_type: if is_overwrite {
                 FsEventType::Write
             } else {
@@ -4484,7 +4567,11 @@ impl EmbeddedPageFs {
             generation: emit_generation,
             is_dir: false,
             size: emit_size,
-        });
+        };
+        self.persist_event(&mut txn, &builder).await;
+        txn.commit().await?;
+
+        self.emit_event(builder);
 
         Ok((
             usize::try_from(emit_size)
@@ -4795,6 +4882,23 @@ impl EmbeddedPageFs {
                 link(&mut txn, parent_inode, &name, new_inode_id).await?;
                 symlink_inode_id = new_inode_id;
                 symlink_parent_inode = parent_inode;
+                // Persist event to TiKV before commit.
+                let symlink_builder = FsEventBuilder {
+                    event_type: FsEventType::Create,
+                    path: normalized.clone(),
+                    old_path: None,
+                    inode: new_inode_id,
+                    parent_inode,
+                    generation: 1,
+                    is_dir: false,
+                    size: target.len() as u64,
+                };
+                if let Err(e) =
+                    crate::extensions::fs::notify::persist_notify_event(&mut txn, symlink_builder)
+                        .await
+                {
+                    tracing::warn!("fs9_notify: failed to persist symlink event to TiKV: {e}");
+                }
                 txn.commit().await?;
                 Ok(())
             }
@@ -4854,6 +4958,23 @@ impl EmbeddedPageFs {
                 chmod_size = inode.size;
                 chmod_parent_inode = parent_inode;
                 save_inode(&mut txn, &inode).await?;
+                // Persist event to TiKV before commit.
+                let chmod_builder = FsEventBuilder {
+                    event_type: FsEventType::Write,
+                    path: normalized.clone(),
+                    old_path: None,
+                    inode: inode_id,
+                    parent_inode,
+                    generation: inode.generation,
+                    is_dir: inode.is_directory(),
+                    size: inode.size,
+                };
+                if let Err(e) =
+                    crate::extensions::fs::notify::persist_notify_event(&mut txn, chmod_builder)
+                        .await
+                {
+                    tracing::warn!("fs9_notify: failed to persist chmod event to TiKV: {e}");
+                }
                 txn.commit().await?;
                 Ok(())
             }

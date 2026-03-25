@@ -392,13 +392,13 @@ impl Executor {
                 },
                 None => 10_000usize,
             };
-            let keyspace = self.tenant_keyspace();
-            crate::extensions::fs::notify::execute_fs9_events(
-                keyspace,
+            crate::extensions::fs::notify::execute_fs9_events_from_tikv(
+                txn,
                 since_seq,
                 path_prefix,
                 limit,
             )
+            .await
             .map_err(|e| anyhow!("{}", e))?
         } else if func_upper == "UNNEST" {
             let mut columns: Vec<Vec<Value>> = Vec::with_capacity(evaluated_args.len());
