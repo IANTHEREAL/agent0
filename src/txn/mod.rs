@@ -175,6 +175,7 @@ pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>)
         }
     }
 
+    #[allow(clippy::disallowed_methods)]
     tikv_op!(txn.put(key, value).await).map_err(|e| anyhow!(e))
 }
 

@@ -108,10 +108,12 @@ impl Session {
                 entries.sort_by(|(a, _), (b, _)| a.cmp(b));
                 for (key, prev) in entries {
                     match prev {
-                        // Undo records restore values that already existed in
-                        // TiKV — do NOT apply the size guard here. Blocking a
-                        // ROLLBACK TO SAVEPOINT is worse than allowing the
+                        // SAFETY: Direct txn.put() intentionally bypasses both the
+                        // size guard and savepoint undo tracking. These are undo
+                        // records restoring values that already existed in TiKV —
+                        // blocking ROLLBACK TO SAVEPOINT is worse than allowing the
                         // restore of a pre-existing large value.
+                        #[allow(clippy::disallowed_methods)]
                         Some(val) => txn.put(key, val).await.map_err(|e| anyhow!(e))?,
                         None => txn.delete(key).await.map_err(|e| anyhow!(e))?,
                     }
@@ -121,6 +123,9 @@ impl Session {
             prepared.target_undo.sort_by(|a, b| a.key.cmp(&b.key));
             for rec in prepared.target_undo.drain(..) {
                 match rec.prev {
+                    // SAFETY: Same rationale as the nested-savepoint loop above —
+                    // restoring pre-existing values during ROLLBACK TO SAVEPOINT.
+                    #[allow(clippy::disallowed_methods)]
                     Some(val) => txn.put(rec.key, val).await.map_err(|e| anyhow!(e))?,
                     None => txn.delete(rec.key).await.map_err(|e| anyhow!(e))?,
                 }

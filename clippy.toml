@@ -1,3 +1,7 @@
 # db9-server clippy configuration
 # See: https://github.com/c4pt0r/db9-server/issues/411
 too-many-arguments-threshold = 14
+
+disallowed-methods = [
+    { path = "tikv_client::transaction::transaction::Transaction::put", reason = "Use crate::txn::txn_put() for value size guard and savepoint tracking. Raw txn.put() is allowed only in session/transaction.rs for savepoint rollback and in txn/mod.rs for the wrapper itself." },
+]

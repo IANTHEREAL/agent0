@@ -229,10 +229,15 @@ impl TikvStore {
             let current = tikv_op!(txn.get(key.clone()).await)?;
             let (new_value, result) = compute(current)?;
 
-            // Intentional: use raw txn.put/delete (not txn_put/txn_delete) to bypass
-            // savepoint undo tracking — matches PostgreSQL's non-transactional sequence semantics.
+            // SAFETY: Direct txn.put() intentionally bypasses savepoint undo tracking
+            // to match PostgreSQL's non-transactional sequence semantics. Size guard
+            // is applied inline via check_value_size() before each put.
             match new_value {
-                Some(val) => tikv_op!(txn.put(key.clone(), val).await).map_err(|e| anyhow!(e))?,
+                Some(val) => {
+                    crate::txn::check_value_size(&key, &val)?;
+                    #[allow(clippy::disallowed_methods)]
+                    tikv_op!(txn.put(key.clone(), val).await).map_err(|e| anyhow!(e))?
+                }
                 None => tikv_op!(txn.delete(key.clone()).await).map_err(|e| anyhow!(e))?,
             }
 

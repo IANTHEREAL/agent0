@@ -9,6 +9,7 @@ use crate::session_context;
 use crate::sql::error::SqlError;
 use crate::sql::query_context::QueryContext;
 use crate::storage::{encode_embedding_usage_key_v2, encode_extension_key_v2};
+use crate::txn::txn_put;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use dashmap::mapref::entry::Entry;
@@ -424,7 +425,7 @@ pub(crate) async fn record_embedding_tokens(
         let new_total = current
             .checked_add(tokens)
             .ok_or_else(|| anyhow!("embedding: usage counter overflow"))?;
-        txn.put(key.clone(), new_total.to_be_bytes().to_vec())
+        txn_put(&mut txn, key.clone(), new_total.to_be_bytes().to_vec())
             .await?;
         match txn.commit().await {
             Ok(_) => return Ok(new_total),

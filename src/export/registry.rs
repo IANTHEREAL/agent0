@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::storage::backpressure::tikv_op;
 use crate::storage_stats::global_storage_stats_cache;
+use crate::txn::txn_put;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -307,7 +308,7 @@ impl ExportSnapshotRegistry {
         let key = snapshot_key(&snapshot_id);
         let value = bincode::serialize(&snapshot)
             .map_err(|e| ExportSnapshotError::CreationFailed(format!("serialize failed: {e}")))?;
-        if let Err(e) = tikv_op!(txn.put(key, value).await) {
+        if let Err(e) = txn_put(&mut txn, key, value).await {
             // Best-effort: remove the service safe point we just registered.
             self.client
                 .update_service_safepoint(&service_id, 0, snapshot_ts)
@@ -382,7 +383,8 @@ impl ExportSnapshotRegistry {
         let value = bincode::serialize(&snapshot)
             .map_err(|e| ExportSnapshotError::CreationFailed(format!("serialize failed: {e}")))?;
 
-        tikv_op!(txn.put(key, value).await)
+        txn_put(&mut txn, key, value)
+            .await
             .map_err(|e| ExportSnapshotError::CreationFailed(format!("put failed: {e}")))?;
 
         tikv_op!(txn.commit().await)
@@ -469,7 +471,7 @@ impl ExportSnapshotRegistry {
 
         snapshot.state = new_state;
         let value = bincode::serialize(&snapshot).context("serialize snapshot")?;
-        tikv_op!(txn.put(key, value).await).context("put snapshot")?;
+        txn_put(txn, key, value).await.context("put snapshot")?;
 
         Ok(Some(snapshot))
     }

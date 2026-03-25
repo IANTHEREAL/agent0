@@ -13,6 +13,7 @@ use tokio::fs;
 use tracing::warn;
 
 use crate::extensions::fs::embedded::keys;
+use crate::txn::txn_put;
 #[cfg(test)]
 use crate::extensions::fs::embedded::types::FS9_SPOOL_LAYOUT_VERSION;
 
@@ -469,7 +470,8 @@ pub(crate) async fn save_bundle_manifest(
     txn: &mut Transaction,
     manifest: &BundleManifest,
 ) -> Result<()> {
-    txn.put(
+    txn_put(
+        txn,
         keys::bundle_manifest_key(manifest.bundle_id),
         serde_json::to_vec(manifest)?,
     )

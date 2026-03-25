@@ -1117,7 +1117,7 @@ impl EmbeddedPageFs {
                 let new_inode_id = self.alloc_inode_id().await?;
                 let inode = Inode::new_symlink(new_inode_id, 0o777, target.len() as u64);
                 save_inode(&mut txn, &inode).await?;
-                txn.put(keys::blob_key(new_inode_id), target.as_bytes().to_vec())
+                txn_put(&mut txn, keys::blob_key(new_inode_id), target.as_bytes().to_vec())
                     .await?;
                 link(&mut txn, parent_inode, &name, new_inode_id).await?;
                 symlink_inode_id = new_inode_id;

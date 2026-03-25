@@ -14,6 +14,7 @@ use crate::extensions::fs::embedded::bundle::{
 use crate::extensions::fs::embedded::lifecycle::{self, FileLifecycle, UploadReservation};
 use crate::extensions::fs::embedded::types::*;
 use crate::extensions::fs::embedded::{blob, keys};
+use crate::txn::txn_put;
 use crate::extensions::fs::notify::{
     notify_metrics_for_keyspace, EventRing, FsEventBuilder, FsEventType,
 };
@@ -2650,7 +2651,7 @@ async fn load_superblock(txn: &mut Transaction) -> Result<Superblock> {
 
 async fn save_superblock(txn: &mut Transaction, sb: &Superblock) -> Result<()> {
     let data = serde_json::to_vec(sb)?;
-    txn.put(keys::superblock_key(), data).await?;
+    txn_put(txn, keys::superblock_key(), data).await?;
     Ok(())
 }
 
@@ -2672,7 +2673,7 @@ async fn load_allocator_counter(txn: &mut Transaction, key: &[u8], label: &str) 
 }
 
 async fn save_allocator_counter(txn: &mut Transaction, key: &[u8], next: u64) -> Result<()> {
-    txn.put(key.to_vec(), next.to_be_bytes().to_vec()).await?;
+    txn_put(txn, key.to_vec(), next.to_be_bytes().to_vec()).await?;
     Ok(())
 }
 
@@ -2876,7 +2877,7 @@ async fn lookup_dir_entries_batch(
 
 async fn save_inode(txn: &mut Transaction, inode: &Inode) -> Result<()> {
     let data = serde_json::to_vec(inode)?;
-    txn.put(keys::inode_key(inode.id), data).await?;
+    txn_put(txn, keys::inode_key(inode.id), data).await?;
     Ok(())
 }
 
@@ -2903,7 +2904,8 @@ async fn link(
     child_inode: u64,
 ) -> Result<()> {
     validate_dir_entry_name(name)?;
-    txn.put(
+    txn_put(
+        txn,
         keys::dir_entry_key(parent_inode, name),
         child_inode.to_be_bytes().to_vec(),
     )
@@ -3555,7 +3557,8 @@ async fn write_staging_chunk_to_txn(
 }
 
 async fn mark_staging_write(txn: &mut Transaction, inode_id: u64, updated_at: i64) -> Result<()> {
-    txn.put(
+    txn_put(
+        txn,
         keys::staging_write_key(inode_id),
         updated_at.to_be_bytes().to_vec(),
     )
@@ -3569,7 +3572,7 @@ async fn clear_staging_write(txn: &mut Transaction, inode_id: u64) -> Result<()>
 }
 
 async fn mark_orphan_inode(txn: &mut Transaction, inode_id: u64) -> Result<()> {
-    txn.put(keys::orphan_inode_key(inode_id), Vec::new())
+    txn_put(txn, keys::orphan_inode_key(inode_id), Vec::new())
         .await?;
     Ok(())
 }
@@ -3659,7 +3662,7 @@ async fn write_staging_page(
     if page_data.len() < PAGE_SIZE {
         page_data.resize(PAGE_SIZE, 0);
     }
-    txn.put(keys::page_key(inode_id, page_num), page_data)
+    txn_put(txn, keys::page_key(inode_id, page_num), page_data)
         .await?;
     Ok(())
 }

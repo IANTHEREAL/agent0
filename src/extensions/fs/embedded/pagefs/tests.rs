@@ -1536,6 +1536,8 @@ async fn test_readdir_behavioral_ignores_nested_path_dir_entries() {
     let bogus_inode_id = fs.alloc_inode_id().await.unwrap();
     let bogus_inode = Inode::new_file(bogus_inode_id, 0o644);
     save_inode(&mut txn, &bogus_inode).await.unwrap();
+    // Test-only: intentionally creates a bogus dir entry to test robustness.
+    #[allow(clippy::disallowed_methods)]
     txn.put(
         keys::dir_entry_key(
             ROOT_INODE,
@@ -1654,6 +1656,8 @@ async fn test_readdir_recursive_behavioral_dangling_dirent_does_not_consume_budg
 
     let mut txn = fs.begin().await.unwrap();
     let (base_inode_id, _) = resolve_path(&mut txn, &base).await.unwrap();
+    // Test-only: intentionally creates a dangling dir entry to test robustness.
+    #[allow(clippy::disallowed_methods)]
     txn.put(
         keys::dir_entry_key(base_inode_id, "aa-dangling.txt"),
         u64::MAX.to_be_bytes().to_vec(),

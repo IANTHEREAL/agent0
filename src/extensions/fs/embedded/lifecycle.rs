@@ -1,5 +1,6 @@
 use crate::extensions::fs::embedded::keys;
 use crate::extensions::fs::embedded::types::DataRef;
+use crate::txn::txn_put;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use tikv_client::Transaction;
@@ -91,7 +92,7 @@ pub(crate) async fn save_lifecycle(
     lifecycle: &FileLifecycle,
 ) -> Result<()> {
     let data = serde_json::to_vec(lifecycle)?;
-    txn.put(keys::lifecycle_key(inode_id), data).await?;
+    txn_put(txn, keys::lifecycle_key(inode_id), data).await?;
     Ok(())
 }
 

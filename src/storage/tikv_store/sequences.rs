@@ -422,16 +422,12 @@ impl TikvStore {
                 }
                 None => FIRST_SEQUENCE_OID,
             };
-            tikv_op!(
-                txn.put(oid_key.clone(), next_val.to_be_bytes().to_vec())
-                    .await
-            )
-            .map_err(|e| anyhow!(e))?;
+            txn_put(&mut txn, oid_key.clone(), next_val.to_be_bytes().to_vec()).await?;
 
             def.oid = next_val;
             let data =
                 bincode::serialize(&def).context("Failed to serialize sequence definition")?;
-            tikv_op!(txn.put(def_key.clone(), data).await).map_err(|e| anyhow!(e))?;
+            txn_put(&mut txn, def_key.clone(), data).await?;
 
             match tikv_op!(txn.commit().await) {
                 Ok(_) => return Ok(Some(def)),
