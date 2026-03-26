@@ -1260,6 +1260,141 @@ mod tests {
         );
     }
 
+    /// Regression: RESET ALL inside a savepoint must record BASE typed-field
+    /// values to the GUC save-stack, not the effective values that include
+    /// SET LOCAL overlays. Otherwise, ROLLBACK TO writes the local-overlay
+    /// value into the typed field, where it persists after COMMIT.
+    ///
+    /// Reproduces the 237_set_local test-case-13 failure.
+    #[test]
+    fn test_reset_all_inside_savepoint_does_not_pollute_typed_fields() {
+        let mut settings = SessionSettings::new();
+
+        // row_security defaults to None (shows "on")
+        assert_eq!(settings.show_value("row_security").as_deref(), Some("on"));
+
+        // BEGIN
+        settings.begin_transaction_settings();
+
+        // SET LOCAL row_security = off
+        settings
+            .set_local_override("row_security", "off".to_string())
+            .unwrap();
+        assert_eq!(settings.show_value("row_security").as_deref(), Some("off"));
+
+        // SAVEPOINT rs
+        settings.push_settings_savepoint("rs".to_string());
+        settings.push_guc_savepoint("rs".to_string());
+
+        // RESET ALL
+        settings.reset_all_settings();
+        assert_eq!(
+            settings.show_value("row_security").as_deref(),
+            Some("on"),
+            "after RESET ALL, row_security should be default"
+        );
+
+        // ROLLBACK TO rs
+        settings.rollback_settings_to_savepoint("rs");
+        settings.rollback_guc_to_savepoint("rs");
+        assert_eq!(
+            settings.show_value("row_security").as_deref(),
+            Some("off"),
+            "after ROLLBACK TO, SET LOCAL override should be restored"
+        );
+
+        // COMMIT
+        settings.clear_local_overrides();
+        settings.commit_transaction_settings();
+        assert_eq!(
+            settings.show_value("row_security").as_deref(),
+            Some("on"),
+            "after COMMIT, SET LOCAL should revert — typed field must not retain 'off'"
+        );
+    }
+
+    /// Regression: regular SET inside a transaction must be rolled back on
+    /// ROLLBACK, restoring the prior typed-field value.
+    ///
+    /// Reproduces the 1962_guc_set_rollback test-case-1.
+    #[test]
+    fn test_regular_set_rolled_back_on_transaction_rollback() {
+        let mut settings = SessionSettings::new();
+
+        // SET timezone = 'UTC'
+        settings
+            .set_known_setting("timezone", "UTC".to_string())
+            .unwrap();
+        assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
+
+        // BEGIN
+        settings.begin_transaction_settings();
+
+        // SET timezone = 'Asia/Shanghai'
+        settings
+            .set_known_setting("timezone", "Asia/Shanghai".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("Asia/Shanghai"),
+            "during txn, timezone should be Asia/Shanghai"
+        );
+
+        // ROLLBACK
+        settings.rollback_transaction_settings();
+        settings.clear_local_overrides();
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("UTC"),
+            "after ROLLBACK, timezone should revert to UTC"
+        );
+    }
+
+    /// Regression: restore_guc_value must not call remove_local_override.
+    /// SET inside a savepoint + ROLLBACK TO must preserve SET LOCAL overrides.
+    #[test]
+    fn test_guc_rollback_preserves_local_overrides() {
+        let mut settings = SessionSettings::new();
+
+        // BEGIN
+        settings.begin_transaction_settings();
+
+        // SET LOCAL timezone = 'Asia/Shanghai'
+        settings
+            .set_local_override("timezone", "Asia/Shanghai".to_string())
+            .unwrap();
+
+        // SAVEPOINT sp1
+        settings.push_settings_savepoint("sp1".to_string());
+        settings.push_guc_savepoint("sp1".to_string());
+
+        // SET timezone = 'Europe/London' (regular SET inside savepoint)
+        settings
+            .set_known_setting("timezone", "Europe/London".to_string())
+            .unwrap();
+
+        // ROLLBACK TO sp1
+        settings.rollback_settings_to_savepoint("sp1");
+        settings.rollback_guc_to_savepoint("sp1");
+
+        // The SET LOCAL override should be restored by rollback_settings_to_savepoint.
+        // The typed field should be restored by rollback_guc_to_savepoint.
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("Asia/Shanghai"),
+            "SET LOCAL override should be restored after ROLLBACK TO"
+        );
+
+        // COMMIT — SET LOCAL reverts
+        settings.clear_local_overrides();
+        settings.commit_transaction_settings();
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("UTC"),
+            "after COMMIT, SET LOCAL should revert to base value"
+        );
+    }
+
     #[test]
     fn test_record_command_complete_releases_xact_locks_when_idle() {
         struct ConnectionCleanup {

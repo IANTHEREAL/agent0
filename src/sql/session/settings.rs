@@ -515,9 +515,11 @@ impl SessionSettings {
         }
         let normalized = Self::validate_and_normalize_value(canonical, &value)?;
 
-        // Record prior value for transaction rollback (regular SET only).
+        // Record prior BASE value for transaction rollback (regular SET only).
+        // Must use show_base_value (not show_value) to avoid capturing SET LOCAL
+        // overlay values — local overrides have their own save/restore mechanism.
         if self.guc_save_stack.is_some() {
-            let prior = self.show_value(canonical);
+            let prior = self.show_base_value(canonical);
             if let Some(ref mut stack) = self.guc_save_stack {
                 let frame = stack
                     .savepoints
@@ -528,9 +530,18 @@ impl SessionSettings {
             }
         }
 
+        self.apply_setting_value(canonical, &normalized)?;
+        self.remove_local_override(canonical);
+        Ok(true)
+    }
+
+    /// Apply a value to the appropriate typed field or extra_settings map.
+    /// Shared by both the validated path (set_known_setting) and the
+    /// unvalidated restore path (restore_guc_value).
+    fn apply_setting_value(&mut self, canonical: &str, value: &str) -> Result<()> {
         match canonical {
             "search_path" => {
-                self.search_path = normalized
+                self.search_path = value
                     .split(',')
                     .map(|s| {
                         let t = s.trim();
@@ -544,45 +555,41 @@ impl SessionSettings {
                     .collect();
             }
             "statement_timeout" => {
-                self.statement_timeout_ms = Self::parse_timeout_millis(&normalized)?;
+                self.statement_timeout_ms = Self::parse_timeout_millis(value)?;
             }
-            "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(&normalized)?,
+            "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(value)?,
             "idle_in_transaction_session_timeout" => {
-                self.idle_in_transaction_session_timeout_ms =
-                    Self::parse_timeout_millis(&normalized)?
+                self.idle_in_transaction_session_timeout_ms = Self::parse_timeout_millis(value)?
             }
             "db9.dml_table_scan_max_rows" => {
-                self.dml_table_scan_max_rows = normalized
-                    .parse()
-                    .unwrap_or(DEFAULT_DML_TABLE_SCAN_MAX_ROWS);
+                self.dml_table_scan_max_rows =
+                    value.parse().unwrap_or(DEFAULT_DML_TABLE_SCAN_MAX_ROWS);
             }
             "db9.hash_join_work_mem" => {
-                self.hash_join_work_mem = Self::parse_byte_size(&normalized)?;
+                self.hash_join_work_mem = Self::parse_byte_size(value)?;
             }
             "db9.max_sort_bytes" => {
-                self.max_sort_bytes = Self::parse_byte_size(&normalized)?;
+                self.max_sort_bytes = Self::parse_byte_size(value)?;
             }
             "db9.prepared_plan_cache_size" => {
-                self.prepared_plan_cache_size = normalized.parse().unwrap_or(128);
+                self.prepared_plan_cache_size = value.parse().unwrap_or(128);
             }
             "db9.prepared_plan_cache_min_exec" => {
-                self.prepared_plan_cache_min_exec = normalized.parse().unwrap_or(5);
+                self.prepared_plan_cache_min_exec = value.parse().unwrap_or(5);
             }
             "db9.retry_max_attempts" => {
-                self.retry_max_attempts = normalized.parse().unwrap_or(64);
+                self.retry_max_attempts = value.parse().unwrap_or(64);
             }
             "db9.retry_timeout" => {
-                self.retry_timeout_ms = Self::parse_timeout_millis(&normalized)?;
+                self.retry_timeout_ms = Self::parse_timeout_millis(value)?;
             }
             "hnsw.ef_search" => {
-                let v: u16 = normalized
-                    .parse()
-                    .map_err(|_| SqlError::InvalidParameterValue {
-                        message: format!(
-                            "invalid value for parameter \"{}\": \"{}\"",
-                            canonical, normalized
-                        ),
-                    })?;
+                let v: u16 = value.parse().map_err(|_| SqlError::InvalidParameterValue {
+                    message: format!(
+                        "invalid value for parameter \"{}\": \"{}\"",
+                        canonical, value
+                    ),
+                })?;
                 if !(1..=1000).contains(&v) {
                     return Err(SqlError::InvalidParameterValue {
                         message: format!("hnsw.ef_search must be between 1 and 1000, got {}", v),
@@ -592,31 +599,30 @@ impl SessionSettings {
                 self.hnsw_ef_search = v;
             }
             "db9.use_optimizer" => {}
-            "timezone" => self.timezone = Some(normalized.clone()),
-            "application_name" => self.application_name = Some(normalized.clone()),
-            "client_encoding" => self.client_encoding = Some(normalized.clone()),
+            "timezone" => self.timezone = Some(value.to_string()),
+            "application_name" => self.application_name = Some(value.to_string()),
+            "client_encoding" => self.client_encoding = Some(value.to_string()),
             "standard_conforming_strings" => {
-                self.standard_conforming_strings = Some(normalized.clone())
+                self.standard_conforming_strings = Some(value.to_string())
             }
-            "check_function_bodies" => self.check_function_bodies = Some(normalized.clone()),
-            "xmloption" => self.xmloption = Some(normalized.clone()),
-            "client_min_messages" => self.client_min_messages = Some(normalized.clone()),
-            "row_security" => self.row_security = Some(normalized.clone()),
-            "default_tablespace" => self.default_tablespace = Some(normalized.clone()),
+            "check_function_bodies" => self.check_function_bodies = Some(value.to_string()),
+            "xmloption" => self.xmloption = Some(value.to_string()),
+            "client_min_messages" => self.client_min_messages = Some(value.to_string()),
+            "row_security" => self.row_security = Some(value.to_string()),
+            "default_tablespace" => self.default_tablespace = Some(value.to_string()),
             "default_table_access_method" => {
-                self.default_table_access_method = Some(normalized.clone())
+                self.default_table_access_method = Some(value.to_string())
             }
-            "transaction_isolation" => self.transaction_isolation = Some(normalized.clone()),
+            "transaction_isolation" => self.transaction_isolation = Some(value.to_string()),
             "default_transaction_read_only" => {
-                self.default_transaction_read_only = Some(normalized.clone())
+                self.default_transaction_read_only = Some(value.to_string())
             }
             _ => {
                 self.extra_settings
-                    .insert(canonical.to_string(), normalized.clone());
+                    .insert(canonical.to_string(), value.to_string());
             }
         }
-        self.remove_local_override(canonical);
-        Ok(true)
+        Ok(())
     }
 
     /// Set a server-authored reserved GUC entry. This bypasses the client
@@ -727,9 +733,9 @@ impl SessionSettings {
     pub(crate) fn reset_setting(&mut self, name: &str) {
         let canonical = Self::canonical_setting_name(name);
 
-        // Record prior value for transaction rollback.
+        // Record prior BASE value for transaction rollback.
         if self.guc_save_stack.is_some() {
-            let prior = self.show_value(canonical);
+            let prior = self.show_base_value(canonical);
             if let Some(ref mut stack) = self.guc_save_stack {
                 let frame = stack
                     .savepoints
@@ -744,6 +750,13 @@ impl SessionSettings {
             self.remove_local_override(canonical);
             return;
         }
+        self.reset_base_value(canonical);
+        self.remove_local_override(canonical);
+    }
+
+    /// Reset a typed field to its default without touching local_overrides
+    /// or the save-stack. Shared by reset_setting and restore_guc_value.
+    fn reset_base_value(&mut self, canonical: &str) {
         match canonical {
             "search_path" => self.search_path = Self::default_search_path(),
             "statement_timeout" => self.statement_timeout_ms = self.default_statement_timeout_ms,
@@ -779,7 +792,6 @@ impl SessionSettings {
                 self.extra_settings.remove(canonical);
             }
         }
-        self.remove_local_override(canonical);
     }
 
     /// Reset all session settings to their defaults.
@@ -788,9 +800,11 @@ impl SessionSettings {
     /// across RESET ALL so that a client cannot indirectly clear auth-pipeline
     /// values set after JWT verification.
     pub(crate) fn reset_all_settings(&mut self) {
-        // Record prior values for transaction rollback before wiping.
+        // Record prior BASE values for transaction rollback before wiping.
+        // Must use all_base_values (not all_values) to avoid capturing SET LOCAL
+        // overlay values — local overrides have their own save/restore mechanism.
         if self.guc_save_stack.is_some() {
-            let snapshot = self.all_values();
+            let snapshot = self.all_base_values();
             if let Some(ref mut stack) = self.guc_save_stack {
                 let frame = stack
                     .savepoints
@@ -899,13 +913,19 @@ impl SessionSettings {
         self.guc_save_stack = Some(stack);
     }
 
+    /// Restore a previously-saved GUC value during transaction rollback.
+    /// Bypasses validation (values were already valid when saved) and does
+    /// not touch local_overrides (handled by the separate SettingsSavepoint
+    /// mechanism). Does not record to the save-stack (it was taken before
+    /// this is called).
     fn restore_guc_value(&mut self, name: &str, value: Option<String>) {
+        let canonical = Self::canonical_setting_name(name);
         match value {
             Some(v) => {
-                let _ = self.set_known_setting(name, v);
+                let _ = self.apply_setting_value(canonical, &v);
             }
             None => {
-                self.reset_setting(name);
+                self.reset_base_value(canonical);
             }
         }
     }

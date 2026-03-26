@@ -33,3 +33,5 @@
     2 |    2 | foo   | foo
 (2 rows)
 
+NOTICE:  table "t2126_a" does not exist, skipping
+NOTICE:  table "t2126_b" does not exist, skipping

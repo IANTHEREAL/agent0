@@ -46,8 +46,20 @@ impl SessionSettings {
 
     /// Get a session setting value in a Postgres-like string form, for `SHOW`.
     pub(crate) fn show_value(&self, name: &str) -> Option<String> {
+        self.show_value_impl(name, false)
+    }
+
+    /// Return the base (typed-field) value of a setting, ignoring SET LOCAL
+    /// overrides. Used for GUC save-stack recording, which must capture the
+    /// regular SET value — not the SET LOCAL overlay that has its own
+    /// save/restore mechanism (local_overrides + SettingsSavepoint).
+    pub(super) fn show_base_value(&self, name: &str) -> Option<String> {
+        self.show_value_impl(name, true)
+    }
+
+    fn show_value_impl(&self, name: &str, skip_local: bool) -> Option<String> {
         let canonical = Self::canonical_setting_name(name);
-        if !Self::is_immutable_setting(canonical) {
+        if !skip_local && !Self::is_immutable_setting(canonical) {
             if let Some(v) = self.local_overrides.get(canonical) {
                 return Some(v.clone());
             }
@@ -72,11 +84,13 @@ impl SessionSettings {
             "server_version" => Some("16.0".to_string()),
             "server_version_num" => Some("160000".to_string()),
             "server_encoding" => Some("UTF8".to_string()),
-            "search_path" => Some(Self::format_search_path_show(
+            "search_path" => Some(Self::format_search_path_show(if skip_local {
+                &self.search_path
+            } else {
                 self.local_search_path
                     .as_deref()
-                    .unwrap_or(&self.search_path),
-            )),
+                    .unwrap_or(&self.search_path)
+            })),
             "datestyle" => Some("ISO, MDY".to_string()),
             "integer_datetimes" => Some("on".to_string()),
             "intervalstyle" => Some("postgres".to_string()),
@@ -428,6 +442,27 @@ impl SessionSettings {
         let mut map = HashMap::with_capacity(all_keys.len());
         for key in all_keys {
             if let Some(v) = self.show_value(key) {
+                map.insert(key.to_string(), v);
+            }
+        }
+        map
+    }
+
+    /// Like `all_values` but uses base typed-field values (ignoring SET LOCAL
+    /// overrides). Used for GUC save-stack recording in RESET ALL.
+    pub(super) fn all_base_values(&self) -> HashMap<String, String> {
+        use std::collections::HashSet;
+
+        let all_keys: HashSet<&str> = GUC_TABLE
+            .iter()
+            .map(|g| g.name)
+            .chain(self.server_reserved_settings.keys().map(String::as_str))
+            .chain(self.extra_settings.keys().map(String::as_str))
+            .collect();
+
+        let mut map = HashMap::with_capacity(all_keys.len());
+        for key in all_keys {
+            if let Some(v) = self.show_base_value(key) {
                 map.insert(key.to_string(), v);
             }
         }
