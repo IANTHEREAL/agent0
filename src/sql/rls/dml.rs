@@ -73,7 +73,6 @@ fn compile_dml_policies(
             None => None,
         };
         compiled.push(CompiledRlsPolicy {
-            name: policy.name.clone(),
             permissive: policy.permissive,
             using_expr: using,
             with_check_expr: with_check,
@@ -223,13 +222,6 @@ pub struct RlsDmlContext {
     /// Compiled SELECT policies for RETURNING clause validation.
     /// Only populated when the statement has a RETURNING clause.
     pub select_policies: Option<Vec<CompiledRlsPolicy>>,
-
-    /// For UPDATE: compiled USING combined predicate to inject into WHERE.
-    /// Pre-combined as a single `TypedExpr` for efficient injection.
-    /// TODO: Build as TypedExpr for injection into AnalyzedUpdate/Delete.where_clause.
-    /// For now, per-row evaluation via `visibility_policies` handles correctness.
-    #[allow(dead_code)]
-    pub using_predicate: Option<TypedExpr>,
 }
 
 impl RlsDmlContext {
@@ -272,7 +264,6 @@ impl RlsDmlContext {
             command_policies,
             visibility_policies: None,
             select_policies,
-            using_predicate: None,
         })
     }
 
@@ -316,8 +307,6 @@ impl RlsDmlContext {
 
         // TODO: Build combined USING predicate as TypedExpr for WHERE injection.
         // For now, per-row evaluation via visibility_policies handles correctness.
-        let using_predicate = None;
-
         let select_policies = if has_returning {
             Some(select_compiled)
         } else {
@@ -328,7 +317,6 @@ impl RlsDmlContext {
             command_policies,
             visibility_policies,
             select_policies,
-            using_predicate,
         })
     }
 
@@ -369,8 +357,6 @@ impl RlsDmlContext {
         let visibility_policies = Some(visibility);
 
         // TODO: Build combined USING predicate as TypedExpr for WHERE injection.
-        let using_predicate = None;
-
         // Reuse select_compiled for RETURNING (no re-compilation).
         let select_policies = if has_returning {
             Some(select_compiled)
@@ -382,7 +368,6 @@ impl RlsDmlContext {
             command_policies,
             visibility_policies,
             select_policies,
-            using_predicate,
         })
     }
 
@@ -521,7 +506,7 @@ mod tests {
         let qctx = test_qctx("alice");
         let policies = vec![RlsPolicy {
             oid: 0,
-            name: "insert_own".into(),
+            name: String::new(),
             table_id: 1,
             command: RlsCommand::Insert,
             permissive: true,
@@ -548,7 +533,7 @@ mod tests {
         let policies = vec![
             RlsPolicy {
                 oid: 0,
-                name: "insert_any".into(),
+                name: String::new(),
                 table_id: 1,
                 command: RlsCommand::Insert,
                 permissive: true,
@@ -558,7 +543,7 @@ mod tests {
             },
             RlsPolicy {
                 oid: 0,
-                name: "see_own".into(),
+                name: String::new(),
                 table_id: 1,
                 command: RlsCommand::Select,
                 permissive: true,
@@ -587,7 +572,7 @@ mod tests {
         let qctx = test_qctx("alice");
         let policies = vec![RlsPolicy {
             oid: 0,
-            name: "insert_own".into(),
+            name: String::new(),
             table_id: 1,
             command: RlsCommand::Insert,
             permissive: true,

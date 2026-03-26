@@ -150,13 +150,6 @@ mod tests {
         );
     }
 
-    fn dummy_table_schema() -> crate::sql::analyzer::types::TableRefSchema {
-        crate::sql::analyzer::types::TableRefSchema {
-            table_id: 1,
-            columns: vec![],
-        }
-    }
-
     #[test]
     fn compute_privileges_for_insert_update_delete_variants() {
         use crate::sql::analyzer::types::{
@@ -166,7 +159,6 @@ mod tests {
 
         let insert_plain = AnalyzedStatement::Insert(AnalyzedInsert {
             table_name: "public.t".to_string(),
-            table_schema: dummy_table_schema(),
             target_columns: vec![],
             source: AnalyzedInsertSource::DefaultValues,
             on_conflict: None,
@@ -179,7 +171,6 @@ mod tests {
 
         let insert_upsert = AnalyzedStatement::Insert(AnalyzedInsert {
             table_name: "public.t".to_string(),
-            table_schema: dummy_table_schema(),
             target_columns: vec![],
             source: AnalyzedInsertSource::DefaultValues,
             on_conflict: Some(AnalyzedOnConflict::DoUpdate {
@@ -199,8 +190,6 @@ mod tests {
 
         let update_stmt = AnalyzedStatement::Update(AnalyzedUpdate {
             table_name: "app.u".to_string(),
-            table_schema: dummy_table_schema(),
-            table_alias: "u".to_string(),
             assignments: vec![],
             from: vec![],
             where_clause: None,
@@ -213,8 +202,6 @@ mod tests {
 
         let delete_stmt = AnalyzedStatement::Delete(AnalyzedDelete {
             table_name: "app.d".to_string(),
-            table_schema: dummy_table_schema(),
-            table_alias: "d".to_string(),
             using: vec![],
             where_clause: None,
             returning: None,

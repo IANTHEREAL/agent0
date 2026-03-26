@@ -294,11 +294,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             .unwrap();
             format_plan_node(output, child, indent + 6, false);
         }
-        PlanNode::Limit {
-            count: _,
-            cost,
-            child,
-        } => {
+        PlanNode::Limit { cost, child } => {
             writeln!(
                 output,
                 "{}Limit  (cost={:.2}..{:.2} rows={} width={})",

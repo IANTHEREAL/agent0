@@ -21,6 +21,7 @@ pub(crate) struct CharContext {
     pub in_block_comment: bool,
     pub paren_depth: usize,
     /// True when inside an `E'...'` escape string literal.
+    #[cfg(test)]
     pub in_escape_string: bool,
 }
 
@@ -35,13 +36,6 @@ impl CharContext {
     #[inline]
     pub fn in_comment(self) -> bool {
         self.in_line_comment || self.in_block_comment
-    }
-
-    /// True when this byte is at "top level" — not in any string, comment, or nested parens.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_top_level(self) -> bool {
-        !self.in_string() && !self.in_comment() && self.paren_depth == 0
     }
 
     /// True when not inside any string or comment (but may be inside parens).
@@ -145,6 +139,7 @@ impl<'a> SqlCharScanner<'a> {
             in_line_comment: self.in_line_comment,
             in_block_comment: self.block_comment_depth > 0,
             paren_depth: self.paren_depth,
+            #[cfg(test)]
             in_escape_string: self.in_escape_single_quote,
         }
     }

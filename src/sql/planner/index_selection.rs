@@ -155,7 +155,6 @@ fn evaluate_gin_index(
             index_id: m.index_id,
             index_name: m.index_name,
             qual: m.qual,
-            recheck_expr: Box::new(m.recheck_expr),
         },
         cost,
     ))

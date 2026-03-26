@@ -118,7 +118,6 @@ fn test_hash_join_outer_side_mapping_is_logical() {
         vec![0],
         true, // left is build
         None,
-        HashJoinConfig::default(),
     );
     assert!(op.build_outer);
     assert!(!op.probe_outer);
@@ -135,7 +134,6 @@ fn test_hash_join_outer_side_mapping_is_logical() {
         vec![0],
         false, // right is build (left is probe)
         None,
-        HashJoinConfig::default(),
     );
     assert!(!op.build_outer);
     assert!(op.probe_outer);
@@ -184,17 +182,10 @@ fn test_hash_join_full_outer_mapping() {
         vec![0],
         true,
         None,
-        HashJoinConfig::default(),
     );
 
     assert!(op.build_outer);
     assert!(op.probe_outer);
-}
-
-#[test]
-fn test_hash_join_config_default_value() {
-    let cfg = HashJoinConfig::default();
-    assert_eq!(cfg.max_memory_bytes, 256 * 1024 * 1024);
 }
 
 #[test]
@@ -212,7 +203,6 @@ fn test_hash_join_constructor_swaps_build_probe_keys_when_right_is_build() {
         vec![1], // right key
         false,   // right as build
         None,
-        HashJoinConfig::default(),
     );
 
     assert!(!op.left_is_build);
@@ -237,7 +227,6 @@ fn test_hash_join_right_join_outer_mapping_with_left_build() {
         vec![0],
         true, // left is build
         None,
-        HashJoinConfig::default(),
     );
 
     assert!(!op.build_outer);
@@ -259,7 +248,6 @@ fn test_hash_join_output_schema_keeps_left_then_right_column_order() {
         vec![0],
         true,
         None,
-        HashJoinConfig::default(),
     );
 
     let names: Vec<String> = op.schema().columns.iter().map(|c| c.name.clone()).collect();
@@ -402,7 +390,6 @@ fn test_hash_join_metadata_and_children_ordering() {
         vec![0],
         true,
         None,
-        HashJoinConfig::default(),
     );
 
     assert_eq!(op.name(), "HashJoin");
@@ -432,7 +419,6 @@ fn test_hash_join_children_ordering_when_right_is_build() {
         vec![0],
         false,
         None,
-        HashJoinConfig::default(),
     );
 
     assert_eq!(

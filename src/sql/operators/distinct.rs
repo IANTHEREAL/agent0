@@ -69,20 +69,19 @@ impl PhysicalOperator for DistinctOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn children(&self) -> Vec<&dyn PhysicalOperator> {
         vec![self.child.as_ref()]
     }
 
+    #[cfg(test)]
     fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
         vec![self.child.as_mut()]
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "Distinct"
-    }
-
-    fn explain_info(&self) -> Option<String> {
-        None
     }
 }
 
@@ -154,18 +153,12 @@ impl PhysicalOperator for DistinctOnOperator {
         Ok(())
     }
 
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![self.child.as_ref()]
-    }
-
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![self.child.as_mut()]
-    }
-
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "DistinctOn"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         let exprs: Vec<String> = self.on_exprs.iter().map(|e| format!("{:?}", e)).collect();
         Some(format!("on=[{}]", exprs.join(", ")))

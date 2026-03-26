@@ -250,7 +250,7 @@ pub async fn execute_create_view(
         )
         .await?;
 
-    Ok(ExecuteResult::CreateView { view_name })
+    Ok(ExecuteResult::CreateView)
 }
 
 pub async fn execute_drop_view(
@@ -267,7 +267,6 @@ pub async fn execute_drop_view(
     // multi-name DROP statements (e.g. DROP VIEW v1, v2 CASCADE where v2
     // depends on v1) don't error when a later name was already removed.
     let mut cascade_dropped: HashSet<String> = HashSet::new();
-    let mut last = String::new();
     for name in names {
         let resolved =
             match names::resolve_existing_view_name(store.as_ref(), txn, db_id, name, search_path)
@@ -303,9 +302,8 @@ pub async fn execute_drop_view(
         store
             .release_relation_name(txn, db_id, &resolved.full)
             .await?;
-        last = resolved.full;
     }
-    Ok(ExecuteResult::DropView { view_name: last })
+    Ok(ExecuteResult::DropView)
 }
 
 pub async fn execute_create_materialized_view(
@@ -392,7 +390,7 @@ pub async fn execute_create_materialized_view(
     }
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
-    Ok(ExecuteResult::CreateMaterializedView { view_name })
+    Ok(ExecuteResult::CreateMaterializedView)
 }
 
 pub async fn execute_drop_materialized_view(
@@ -406,7 +404,6 @@ pub async fn execute_drop_materialized_view(
     sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
     let mut cascade_dropped: HashSet<String> = HashSet::new();
-    let mut last = String::new();
     for name in names {
         let resolved = match names::resolve_existing_materialized_view_name(
             store.as_ref(),
@@ -468,9 +465,8 @@ pub async fn execute_drop_materialized_view(
                 .release_relation_name(txn, db_id, &resolved.full)
                 .await?;
         }
-        last = resolved.full;
     }
-    Ok(ExecuteResult::DropMaterializedView { view_name: last })
+    Ok(ExecuteResult::DropMaterializedView)
 }
 
 pub async fn execute_refresh_materialized_view(
@@ -514,9 +510,7 @@ pub async fn execute_refresh_materialized_view(
     }
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
-    Ok(ExecuteResult::RefreshMaterializedView {
-        view_name: name.to_string(),
-    })
+    Ok(ExecuteResult::RefreshMaterializedView)
 }
 
 #[cfg(test)]

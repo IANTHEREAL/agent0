@@ -637,9 +637,7 @@ impl Executor {
                 } else {
                     self.store().create_function(txn, db_id, def).await?;
                 }
-                Ok(ExecuteResult::CreateFunction {
-                    func_name: resolved.full,
-                })
+                Ok(ExecuteResult::CreateFunction)
             }
             .await
         )
@@ -664,7 +662,6 @@ impl Executor {
                     .get_mut_txn_sequence_values_and_search_path()
                     .expect("Transaction must be active");
 
-                let mut last_name = None;
                 let mut any_dropped = false;
                 for name in names {
                     let resolved = names::resolve_existing_function_name(
@@ -679,7 +676,6 @@ impl Executor {
                         Some(resolved) => resolved.full,
                         None => names::resolve_ddl_object_name(&name, search_path)?.full,
                     };
-                    last_name = Some(func_full_name.clone());
                     let dropped = self
                         .store()
                         .drop_function(txn, db_id, &func_full_name, cascade)
@@ -695,9 +691,7 @@ impl Executor {
                     self.trigger_cache().invalidate_db(db_id);
                 }
 
-                Ok(ExecuteResult::DropFunction {
-                    func_name: last_name.unwrap_or_else(|| "unknown".to_string()),
-                })
+                Ok(ExecuteResult::DropFunction)
             }
             .await
         )
@@ -755,10 +749,7 @@ impl Executor {
                 };
 
                 self.store().create_trigger(txn, db_id, def).await?;
-                Ok(ExecuteResult::CreateTrigger {
-                    trigger_name,
-                    table_name: table_resolved.full,
-                })
+                Ok(ExecuteResult::CreateTrigger)
             }
             .await
         )
@@ -794,11 +785,8 @@ impl Executor {
                             // PostgreSQL requires the relation to exist for DROP TRIGGER, but db9-server
                             // treats `IF EXISTS` as a fully idempotent no-op to support common
                             // migration patterns and keep scripts deterministic.
-                            let resolved = names::resolve_ddl_object_name(&table, search_path)?;
-                            return Ok(ExecuteResult::DropTrigger {
-                                trigger_name,
-                                table_name: resolved.full,
-                            });
+                            let _resolved = names::resolve_ddl_object_name(&table, search_path)?;
+                            return Ok(ExecuteResult::DropTrigger);
                         }
                         return Err(SqlError::RelationNotFound(table.to_string()).into());
                     }
@@ -816,10 +804,7 @@ impl Executor {
                     ));
                 }
 
-                Ok(ExecuteResult::DropTrigger {
-                    trigger_name,
-                    table_name: table_resolved.full,
-                })
+                Ok(ExecuteResult::DropTrigger)
             }
             .await
         )

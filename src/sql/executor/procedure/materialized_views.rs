@@ -305,9 +305,7 @@ impl Executor {
                     crate::worker::wake_worker();
                 }
 
-                Ok(ExecuteResult::RefreshMaterializedView {
-                    view_name: view_full_name,
-                })
+                Ok(ExecuteResult::RefreshMaterializedView)
             }
             .await;
 

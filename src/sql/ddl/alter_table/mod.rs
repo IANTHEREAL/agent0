@@ -52,7 +52,6 @@ pub async fn execute_alter_table(
             .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
     let table_object_name = resolved.name.clone();
     let t = resolved.full;
-    let mut result_table_name = t.clone();
     let mut schema = store
         .get_schema(txn, db_id, &t)
         .await?
@@ -180,7 +179,6 @@ pub async fn execute_alter_table(
                 &mut schema,
                 &t,
                 &table_object_name,
-                &result_table_name,
                 *if_exists,
                 name,
                 *cascade,
@@ -278,8 +276,6 @@ pub async fn execute_alter_table(
                 .await?;
             // Release the old name's reservation key (no-op if missing).
             store.release_relation_name(txn, db_id, &t).await?;
-            result_table_name = new_full.clone();
-
             // Update referencing-side metadata (FKs store ref_table as a string).
             let tables = store.list_tables(txn, db_id).await?;
             for table in tables {
@@ -326,24 +322,14 @@ pub async fn execute_alter_table(
                 fk.name = new;
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok((
-                    ExecuteResult::AlterTable {
-                        table_name: result_table_name,
-                    },
-                    None,
-                ));
+                return Ok((ExecuteResult::AlterTable, None));
             }
 
             if let Some(pos) = find_check_constraint_index(&schema, &table_object_name, &old) {
                 schema.check_constraints[pos].name = Some(new);
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok((
-                    ExecuteResult::AlterTable {
-                        table_name: result_table_name,
-                    },
-                    None,
-                ));
+                return Ok((ExecuteResult::AlterTable, None));
             }
 
             return Err(anyhow!(
@@ -408,12 +394,7 @@ pub async fn execute_alter_table(
                 }
                 AlterColumnOperation::SetNotNull => {
                     if !schema.columns[col_idx].nullable {
-                        return Ok((
-                            ExecuteResult::AlterTable {
-                                table_name: result_table_name,
-                            },
-                            None,
-                        ));
+                        return Ok((ExecuteResult::AlterTable, None));
                     }
 
                     let (start, end) =
@@ -469,12 +450,7 @@ pub async fn execute_alter_table(
     } else {
         None
     };
-    Ok((
-        ExecuteResult::AlterTable {
-            table_name: result_table_name,
-        },
-        invalidate_table,
-    ))
+    Ok((ExecuteResult::AlterTable, invalidate_table))
 }
 
 #[inline]

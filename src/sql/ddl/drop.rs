@@ -34,7 +34,6 @@ pub async fn execute_drop_table(
     stats_cache: &crate::sql::stats::TableStatsCache,
     sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
-    let mut last = String::new();
     for name in names {
         let resolved =
             match names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
@@ -87,10 +86,8 @@ pub async fn execute_drop_table(
         if let Some(tid) = table_id {
             stats_cache.invalidate(db_id, tid);
         }
-
-        last = resolved.full;
     }
-    Ok(ExecuteResult::DropTable { table_name: last })
+    Ok(ExecuteResult::DropTable)
 }
 
 pub async fn execute_truncate(
@@ -108,7 +105,7 @@ pub async fn execute_truncate(
     if !store.truncate_table(txn, db_id, &t).await? {
         return Err(anyhow!("Table '{}' does not exist", t));
     }
-    Ok(ExecuteResult::TruncateTable { table_name: t })
+    Ok(ExecuteResult::TruncateTable)
 }
 
 pub async fn execute_drop_index(

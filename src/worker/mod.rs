@@ -47,12 +47,6 @@ pub fn set_gc_registry_store(store: Arc<TikvStore>) {
     GC_REGISTRY_STORE.set(store).ok();
 }
 
-/// Get the GC registry store. Returns None only if init failed at startup.
-#[allow(dead_code)] // Will be used by GcRegistryPublisher in Phase 2
-pub fn get_gc_registry_store() -> Option<&'static Arc<TikvStore>> {
-    GC_REGISTRY_STORE.get()
-}
-
 pub fn set_worker_notify(notify: Arc<tokio::sync::Notify>) {
     WORKER_NOTIFY.set(notify).ok();
 }

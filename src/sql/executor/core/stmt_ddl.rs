@@ -389,8 +389,7 @@ impl Executor {
                     self.execute_alter_table(txn, db_id, search_path, name, op)
                         .await?;
                 }
-                let table_name = name.0.last().unwrap().value.clone();
-                Ok(ExecuteResult::AlterTable { table_name })
+                Ok(ExecuteResult::AlterTable)
             }
             Statement::CreateType {
                 name,
@@ -580,7 +579,6 @@ impl Executor {
                 let cascade = option
                     .as_ref()
                     .is_some_and(|action| matches!(action, ReferentialAction::Cascade));
-                let mut last_name = None;
                 for desc in func_desc {
                     let func_name = &desc.name;
                     let resolved = names::resolve_existing_function_name(
@@ -595,7 +593,6 @@ impl Executor {
                         Some(resolved) => resolved.full,
                         None => names::resolve_ddl_object_name(func_name, search_path)?.full,
                     };
-                    last_name = Some(func_full_name.clone());
                     let dropped = self
                         .store
                         .drop_function(txn, db_id, &func_full_name, cascade)
@@ -604,9 +601,7 @@ impl Executor {
                         return Err(anyhow!("Function '{}' does not exist", func_full_name));
                     }
                 }
-                Ok(ExecuteResult::DropFunction {
-                    func_name: last_name.unwrap_or_else(|| "unknown".to_string()),
-                })
+                Ok(ExecuteResult::DropFunction)
             }
             _ => unreachable!("DDL dispatcher received non-DDL statement"),
         }
@@ -869,9 +864,7 @@ impl Executor {
             .release_relation_name(txn, db_id, &old_full)
             .await?;
 
-        Ok(ExecuteResult::AlterIndex {
-            index_name: new_idx_name,
-        })
+        Ok(ExecuteResult::AlterIndex)
     }
 
     /// Handle `ALTER INDEX IF EXISTS <name> RENAME TO <name>`.

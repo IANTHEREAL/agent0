@@ -224,13 +224,13 @@ impl ActiveTxnRegistry {
     }
 
     /// Number of tracked transactions (including quarantined).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.lock().expect("ActiveTxnRegistry poisoned").len()
     }
 
     /// Number of entries currently in quarantine.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn quarantined_len(&self) -> usize {
         self.quarantined
             .lock()

@@ -103,14 +103,6 @@ pub enum PhysicalNode {
         input: Box<PhysicalPlan>,
     },
 
-    /// Stream aggregate (requires sorted input).
-    #[allow(dead_code)] // forward-compat: physical plan variant
-    StreamAggregate {
-        group_by: Vec<TypedExpr>,
-        projections: Vec<AnalyzedProjection>,
-        input: Box<PhysicalPlan>,
-    },
-
     /// Sort operator.
     Sort {
         order_by: Vec<TypedOrderByExpr>,
@@ -184,9 +176,5 @@ pub enum PhysicalNode {
 
     // ── Correlated ──────────────────────────────────────
     /// Subquery (opaque subplan).
-    #[allow(dead_code)] // forward-compat: Phase 2+ alias field
-    Subquery {
-        subplan: Box<PhysicalPlan>,
-        alias: Option<String>,
-    },
+    Subquery { subplan: Box<PhysicalPlan> },
 }

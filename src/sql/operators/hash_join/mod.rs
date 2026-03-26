@@ -19,10 +19,11 @@ mod hash_table;
 mod tests;
 
 // Re-export public API
+#[cfg(test)]
+pub(crate) use hash_table::{hash_join_key, join_keys_equal};
 #[allow(unused_imports)]
 pub(crate) use hash_table::{
-    hash_join_key, hash_row_key_for_join, join_keys_equal, row_key_has_null_for_join,
-    row_keys_equal_for_join, JoinHashTable,
+    hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, JoinHashTable,
 };
 
 use hash_table::HashBucket;
@@ -75,26 +76,6 @@ async fn eval_join_filter(
     }
 }
 
-/// Legacy configuration for hash join planning/execution.
-///
-/// The memory limit is now controlled by the `db9.hash_join_work_mem` session
-/// GUC (read at runtime via `current_hash_join_work_mem()`).  This struct is
-/// retained only for API compatibility with existing callers; the field is not
-/// read at runtime.
-#[derive(Debug, Clone)]
-pub struct HashJoinConfig {
-    #[allow(dead_code)]
-    pub max_memory_bytes: usize,
-}
-
-impl Default for HashJoinConfig {
-    fn default() -> Self {
-        Self {
-            max_memory_bytes: 256 * 1024 * 1024,
-        }
-    }
-}
-
 /// Join type for [`HashJoinOperator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashJoinType {
@@ -141,8 +122,6 @@ pub struct HashJoinOperator {
     probe_outer: bool,
     filter: Option<TypedExpr>,
     output_schema: TableSchema,
-    #[allow(dead_code)]
-    config: HashJoinConfig,
     state: HashJoinState,
 }
 
@@ -161,7 +140,6 @@ impl HashJoinOperator {
         right_key_indices: Vec<usize>,
         left_is_build: bool,
         filter: Option<TypedExpr>,
-        config: HashJoinConfig,
     ) -> Self {
         let mut columns: Vec<ColumnDef> = Vec::new();
         for col in &left_child.schema().columns {
@@ -206,7 +184,6 @@ impl HashJoinOperator {
             probe_outer,
             filter,
             output_schema,
-            config,
             state: HashJoinState::Created,
         }
     }
@@ -462,6 +439,7 @@ impl PhysicalOperator for HashJoinOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn children(&self) -> Vec<&dyn PhysicalOperator> {
         if self.left_is_build {
             vec![self.build_child.as_ref(), self.probe_child.as_ref()]
@@ -470,6 +448,7 @@ impl PhysicalOperator for HashJoinOperator {
         }
     }
 
+    #[cfg(test)]
     fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
         if self.left_is_build {
             vec![self.build_child.as_mut(), self.probe_child.as_mut()]
@@ -478,10 +457,12 @@ impl PhysicalOperator for HashJoinOperator {
         }
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "HashJoin"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         let jt = match self.join_type {
             HashJoinType::Inner => "INNER",

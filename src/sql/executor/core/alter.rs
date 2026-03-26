@@ -52,9 +52,7 @@ impl Executor {
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved.full))?;
                     schema.owner = new_owner;
                     self.store.update_schema(txn, db_id, schema).await?;
-                    Ok(ExecuteResult::AlterTable {
-                        table_name: resolved.full,
-                    })
+                    Ok(ExecuteResult::AlterTable)
                 }
                 alter_owner::AlterOwnerKind::Sequence => {
                     let resolved = names::resolve_existing_sequence_name(
@@ -82,9 +80,7 @@ impl Executor {
                         .ok_or_else(|| SqlError::RelationNotFound(resolved.full.clone()))?;
                     seq.owner = new_owner;
                     self.store.update_sequence_def(txn, db_id, &seq).await?;
-                    Ok(ExecuteResult::AlterSequence {
-                        sequence_name: resolved.full,
-                    })
+                    Ok(ExecuteResult::AlterSequence)
                 }
                 alter_owner::AlterOwnerKind::Function => {
                     let resolved = names::resolve_existing_function_name(
@@ -112,9 +108,7 @@ impl Executor {
                         .ok_or_else(|| anyhow!("Function '{}' does not exist", resolved.full))?;
                     func.owner = new_owner;
                     self.store.replace_function(txn, db_id, func).await?;
-                    Ok(ExecuteResult::AlterFunction {
-                        function_name: resolved.full,
-                    })
+                    Ok(ExecuteResult::AlterFunction)
                 }
             }
         }
@@ -208,9 +202,7 @@ impl Executor {
             };
 
             self.store.update_sequence_def(txn, db_id, &seq).await?;
-            Ok(ExecuteResult::AlterSequence {
-                sequence_name: resolved.full,
-            })
+            Ok(ExecuteResult::AlterSequence)
         }
         .await;
 

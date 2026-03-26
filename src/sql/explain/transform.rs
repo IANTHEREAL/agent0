@@ -140,9 +140,7 @@ pub fn physical_plan_to_plan_node(
             }
         }
         PhysicalNode::TopNSort {
-            order_by,
-            limit,
-            input,
+            order_by, input, ..
         } => {
             let child = physical_plan_to_plan_node(input);
             let sort_keys = format_order_by_keys(order_by);
@@ -152,7 +150,6 @@ pub fn physical_plan_to_plan_node(
                 child: Box::new(child),
             };
             PlanNode::Limit {
-                count: *limit,
                 cost,
                 child: Box::new(sorted),
             }
@@ -160,7 +157,6 @@ pub fn physical_plan_to_plan_node(
         PhysicalNode::Limit { input, .. } => {
             let child = physical_plan_to_plan_node(input);
             PlanNode::Limit {
-                count: phys.cost.rows,
                 cost,
                 child: Box::new(child),
             }
@@ -177,18 +173,6 @@ pub fn physical_plan_to_plan_node(
             };
             PlanNode::Aggregate {
                 strategy,
-                keys,
-                cost,
-                child: Box::new(child),
-            }
-        }
-        PhysicalNode::StreamAggregate {
-            group_by, input, ..
-        } => {
-            let child = physical_plan_to_plan_node(input);
-            let keys: Vec<String> = group_by.iter().map(format_typed_expr).collect();
-            PlanNode::Aggregate {
-                strategy: "GroupAggregate".to_string(),
                 keys,
                 cost,
                 child: Box::new(child),
@@ -502,16 +486,13 @@ mod tests {
         };
 
         match physical_plan_to_plan_node(&topn) {
-            PlanNode::Limit { count, child, .. } => {
-                assert_eq!(count, 5);
-                match *child {
-                    PlanNode::Sort { sort_key, .. } => {
-                        assert_eq!(sort_key.len(), 1);
-                        assert!(sort_key[0].ends_with("DESC"));
-                    }
-                    other => panic!("expected Sort child, got {:?}", other),
+            PlanNode::Limit { child, .. } => match *child {
+                PlanNode::Sort { sort_key, .. } => {
+                    assert_eq!(sort_key.len(), 1);
+                    assert!(sort_key[0].ends_with("DESC"));
                 }
-            }
+                other => panic!("expected Sort child, got {:?}", other),
+            },
             other => panic!("unexpected node: {:?}", other),
         }
 
@@ -590,10 +571,10 @@ mod tests {
                 rows: 2,
             },
         };
-        match physical_plan_to_plan_node(&limit) {
-            PlanNode::Limit { count, .. } => assert_eq!(count, 2),
-            other => panic!("unexpected node: {:?}", other),
-        }
+        assert!(matches!(
+            physical_plan_to_plan_node(&limit),
+            PlanNode::Limit { .. }
+        ));
 
         let hash_agg = PhysicalPlan {
             node: PhysicalNode::HashAggregate {
@@ -606,20 +587,6 @@ mod tests {
         };
         match physical_plan_to_plan_node(&hash_agg) {
             PlanNode::Aggregate { strategy, .. } => assert_eq!(strategy, "Plain"),
-            other => panic!("unexpected node: {:?}", other),
-        }
-
-        let stream_agg = PhysicalPlan {
-            node: PhysicalNode::StreamAggregate {
-                group_by: vec![int_const(1)],
-                projections: vec![],
-                input: Box::new(base.clone()),
-            },
-            schema: one_col_schema("id", DataType::Int32),
-            cost: PhysicalCost::default(),
-        };
-        match physical_plan_to_plan_node(&stream_agg) {
-            PlanNode::Aggregate { strategy, .. } => assert_eq!(strategy, "GroupAggregate"),
             other => panic!("unexpected node: {:?}", other),
         }
 
@@ -741,7 +708,6 @@ mod tests {
         let subquery = PhysicalPlan {
             node: PhysicalNode::Subquery {
                 subplan: Box::new(base),
-                alias: Some("sq".to_string()),
             },
             schema: one_col_schema("id", DataType::Int32),
             cost: PhysicalCost::default(),

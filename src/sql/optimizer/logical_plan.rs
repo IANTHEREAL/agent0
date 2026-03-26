@@ -31,18 +31,19 @@ pub struct PlanSchema {
 }
 
 impl PlanSchema {
-    #[allow(dead_code)] // forward-compat: Phase 2+ logical plan variant
+    pub fn from_columns(columns: Vec<(String, DataType)>) -> Self {
+        Self { columns }
+    }
+}
+
+#[cfg(test)]
+impl PlanSchema {
     pub fn empty() -> Self {
         Self {
             columns: Vec::new(),
         }
     }
 
-    pub fn from_columns(columns: Vec<(String, DataType)>) -> Self {
-        Self { columns }
-    }
-
-    #[allow(dead_code)] // forward-compat: Phase 2+ logical plan variant
     pub fn num_columns(&self) -> usize {
         self.columns.len()
     }

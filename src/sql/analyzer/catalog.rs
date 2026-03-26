@@ -4,9 +4,9 @@
 //! `CatalogSnapshot` implementation is built by pre-fetching all referenced
 //! relations from TiKV before analysis begins (async fetch → sync analysis).
 
-use crate::model::{
-    ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, UserTypeKind, ViewDef,
-};
+#[cfg(test)]
+use crate::model::{ColumnDef, UserTypeKind};
+use crate::model::{DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
 use crate::sql::collation::CollationDef;
 use std::collections::{HashMap, HashSet};
 
@@ -14,17 +14,11 @@ use std::collections::{HashMap, HashSet};
 
 /// Error from catalog operations.
 #[derive(Debug, Clone)]
-pub enum CatalogError {
-    /// Catalog data is inconsistent or corrupted.
-    #[allow(dead_code)] // framework: catalog trait API
-    Internal(String),
-}
+pub enum CatalogError {}
 
 impl std::fmt::Display for CatalogError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal(msg) => write!(f, "catalog error: {}", msg),
-        }
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {}
     }
 }
 
@@ -149,12 +143,6 @@ impl CatalogSnapshot {
     /// Add a table function schema under a stable signature key.
     pub fn add_table_function(&mut self, key: &str, schema: TableSchema) {
         self.table_functions.insert(key.to_string(), schema);
-    }
-
-    /// Add a view to the snapshot.
-    #[allow(dead_code)] // forward-compat: view-aware Analyzer path
-    pub fn add_view(&mut self, name: &str, view: ViewDef) {
-        self.views.insert(name.to_lowercase(), view);
     }
 
     /// Add a user-defined function to the snapshot.
@@ -522,14 +510,13 @@ impl Catalog for NullCatalog {
 /// A simple in-memory catalog for unit testing.
 ///
 /// Build with `MockCatalog::builder()` to fluently add tables.
-// Test infrastructure -- will be wired up when analyzer tests expand.
-#[allow(dead_code)] // test: mock catalog implementation
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct MockCatalog {
     snapshot: CatalogSnapshot,
 }
 
-#[allow(dead_code)] // test: mock catalog implementation
+#[cfg(test)]
 impl MockCatalog {
     pub fn builder() -> MockCatalogBuilder {
         MockCatalogBuilder {
@@ -545,6 +532,7 @@ impl MockCatalog {
     }
 }
 
+#[cfg(test)]
 impl Catalog for MockCatalog {
     fn resolve_table(
         &self,
@@ -601,13 +589,12 @@ impl Catalog for MockCatalog {
 }
 
 /// Builder for `MockCatalog`.
-// Test infrastructure -- will be wired up when analyzer tests expand.
-#[allow(dead_code)] // test: mock catalog implementation
+#[cfg(test)]
 pub struct MockCatalogBuilder {
     snapshot: CatalogSnapshot,
 }
 
-#[allow(dead_code)] // test: mock catalog implementation
+#[cfg(test)]
 impl MockCatalogBuilder {
     pub fn table_with_column_defs(mut self, name: &str, columns: Vec<ColumnDef>) -> Self {
         let schema = TableSchema::new(

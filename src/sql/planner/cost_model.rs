@@ -64,8 +64,4 @@ impl CostModel {
 
     /// Per-result cost: distance computation per candidate.
     pub const HNSW_PER_RESULT_COST: f64 = 0.1;
-
-    #[allow(dead_code)]
-    /// Default HNSW selectivity when no statistics are available.
-    pub const HNSW_DEFAULT_SELECTIVITY: f64 = 0.001;
 }

@@ -74,10 +74,12 @@ impl PhysicalOperator for TableFunctionScanOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "TableFunctionScan"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         Some("function=fs9".to_string())
     }
@@ -168,14 +170,6 @@ impl PhysicalOperator for RuntimeTableFunctionOperator {
         self.position = 0;
         self.opened = false;
         Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "RuntimeTableFunction"
-    }
-
-    fn explain_info(&self) -> Option<String> {
-        Some(format!("function={}", self.function_name))
     }
 }
 

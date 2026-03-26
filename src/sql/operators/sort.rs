@@ -234,18 +234,12 @@ impl PhysicalOperator for SortOperator {
         child_close_result
     }
 
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![self.child.as_ref()]
-    }
-
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![self.child.as_mut()]
-    }
-
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "Sort"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         let keys: Vec<String> = self
             .order_by

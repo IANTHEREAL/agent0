@@ -19,13 +19,11 @@
 //! size from the previous page and reduce `EXPORT_SCAN_PAGE_SIZE` for the
 //! next fetch to keep per-page memory under the byte cap.
 
-use anyhow::{anyhow, Context, Result};
-use tikv_client::{BoundRange, KvPair, TimestampExt, TransactionClient, TransactionOptions};
-use tracing::debug;
-
 use crate::model::Row;
 use crate::storage::backpressure::tikv_op;
-use crate::storage::{deserialize_row, encode_table_data_range_v2};
+use crate::storage::deserialize_row;
+use anyhow::{anyhow, Context, Result};
+use tikv_client::{BoundRange, KvPair, TimestampExt, TransactionClient, TransactionOptions};
 
 /// Maximum rows per TiKV scan request. This bounds the gRPC response size
 /// from TiKV. The actual batch emitted to callers may be smaller due to
@@ -112,58 +110,6 @@ pub(crate) async fn scan_table_page(
 /// byte size (`EXPORT_BATCH_BYTE_CAP`). When cumulative value bytes
 /// across TiKV pages reach the byte cap, the accumulated rows are flushed
 /// to `on_batch` and a new batch starts.
-///
-/// # Backpressure
-///
-/// The callback is `await`ed before the next TiKV page is fetched. A slow
-/// consumer (e.g., a client reading COPY data slowly) blocks the scan,
-/// preventing unbounded buffering.
-pub(crate) async fn export_table_scan<F, Fut>(
-    client: &TransactionClient,
-    snapshot_ts: u64,
-    db_id: u64,
-    table_id: u64,
-    mut on_batch: F,
-) -> Result<u64>
-where
-    F: FnMut(Vec<Row>) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    let (raw_start, raw_end) = encode_table_data_range_v2(db_id, table_id);
-    let mut cursor = raw_start;
-    let mut total_rows: u64 = 0;
-
-    // Accumulate rows across TiKV pages until the byte cap is reached.
-    let mut batch_rows: Vec<Row> = Vec::new();
-    let mut batch_bytes: usize = 0;
-
-    loop {
-        let page = scan_table_page(client, snapshot_ts, cursor, raw_end.clone()).await?;
-        let page_row_count = page.rows.len() as u64;
-        let page_exhausted = page.next_cursor.is_none();
-
-        if page_row_count > 0 {
-            batch_bytes += page.value_bytes;
-            batch_rows.extend(page.rows);
-            total_rows += page_row_count;
-        }
-
-        // Flush batch if byte cap reached or scan exhausted.
-        if !batch_rows.is_empty() && (batch_bytes >= EXPORT_BATCH_BYTE_CAP || page_exhausted) {
-            on_batch(std::mem::take(&mut batch_rows)).await?;
-            batch_bytes = 0;
-        }
-
-        match page.next_cursor {
-            Some(next) => cursor = next,
-            None => break,
-        }
-    }
-
-    debug!(db_id, table_id, total_rows, "export table scan complete");
-    Ok(total_rows)
-}
-
 /// Look up a table schema at a pinned snapshot timestamp.
 ///
 /// Creates a short-lived snapshot reader to fetch the schema, ensuring

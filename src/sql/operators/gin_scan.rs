@@ -625,17 +625,6 @@ impl PhysicalOperator for GinScanOperator {
         self.opened = false;
         Ok(())
     }
-
-    fn name(&self) -> &'static str {
-        "GinScan"
-    }
-
-    fn explain_info(&self) -> Option<String> {
-        Some(format!(
-            "table={}, index={}",
-            self.schema.name, self.index_name
-        ))
-    }
 }
 
 #[cfg(test)]

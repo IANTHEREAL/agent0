@@ -765,9 +765,7 @@ impl Executor {
                 schema.version += 1;
                 self.store().update_schema(txn, db_id, schema).await?;
 
-                Ok(ExecuteResult::AlterTable {
-                    table_name: table_resolved.full,
-                })
+                Ok(ExecuteResult::AlterTable)
             }
             .await
         )

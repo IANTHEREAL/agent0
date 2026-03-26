@@ -91,20 +91,13 @@ impl<'a> Analyzer<'a> {
         let typed_args = self.analyze_table_function_args(func_args)?;
 
         let key = table_function_key(name, func_args);
-        let mut output_cols: Vec<(String, DataType, bool, Option<String>)> = if let Some(schema) =
+        let mut output_cols: Vec<(String, DataType, Option<String>)> = if let Some(schema) =
             self.catalog.resolve_table_function(&key)
         {
             schema
                 .columns
                 .iter()
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        c.data_type.clone(),
-                        c.nullable,
-                        c.collation.clone(),
-                    )
-                })
+                .map(|c| (c.name.clone(), c.data_type.clone(), c.collation.clone()))
                 .collect()
         } else if obj_name.eq_ignore_ascii_case("generate_series") {
             // generate_series(start, stop [, step]) returns a single column.
@@ -160,7 +153,7 @@ impl<'a> Analyzer<'a> {
                 "generate_series".to_string()
             };
 
-            vec![(col_name, out_ty, false, None)]
+            vec![(col_name, out_ty, None)]
         } else if obj_name.eq_ignore_ascii_case("unnest") {
             // unnest(array) as table-valued function (e.g. FROM pg_catalog.unnest(...))
             let positional: Vec<&TypedExpr> = typed_args
@@ -189,7 +182,7 @@ impl<'a> Analyzer<'a> {
                     }
                 })
                 .unwrap_or_else(|| "unnest".to_string());
-            vec![(col_name, elem_type, true, None)]
+            vec![(col_name, elem_type, None)]
         } else if obj_name.eq_ignore_ascii_case("current_schema")
             || obj_name.eq_ignore_ascii_case("current_database")
             || obj_name.eq_ignore_ascii_case("current_user")
@@ -198,7 +191,7 @@ impl<'a> Analyzer<'a> {
         {
             // Scalar functions used in FROM return a single-row, single-column relation.
             let col_name = obj_name.to_lowercase();
-            vec![(col_name, DataType::Text, false, None)]
+            vec![(col_name, DataType::Text, None)]
         } else if obj_name.eq_ignore_ascii_case("jsonb_object_keys")
             || obj_name.eq_ignore_ascii_case("json_object_keys")
         {
@@ -211,7 +204,7 @@ impl<'a> Analyzer<'a> {
             } else {
                 obj_name.to_lowercase()
             };
-            vec![(col_name, DataType::Text, false, None)]
+            vec![(col_name, DataType::Text, None)]
         } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements")
             || obj_name.eq_ignore_ascii_case("json_array_elements")
         {
@@ -220,11 +213,11 @@ impl<'a> Analyzer<'a> {
             } else {
                 DataType::Jsonb
             };
-            vec![("value".to_string(), out_ty, false, None)]
+            vec![("value".to_string(), out_ty, None)]
         } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
             || obj_name.eq_ignore_ascii_case("json_array_elements_text")
         {
-            vec![("value".to_string(), DataType::Text, true, None)]
+            vec![("value".to_string(), DataType::Text, None)]
         } else if obj_name.eq_ignore_ascii_case("jsonb_each")
             || obj_name.eq_ignore_ascii_case("json_each")
         {
@@ -234,15 +227,15 @@ impl<'a> Analyzer<'a> {
                 DataType::Jsonb
             };
             vec![
-                ("key".to_string(), DataType::Text, false, None),
-                ("value".to_string(), val_ty, false, None),
+                ("key".to_string(), DataType::Text, None),
+                ("value".to_string(), val_ty, None),
             ]
         } else if obj_name.eq_ignore_ascii_case("jsonb_each_text")
             || obj_name.eq_ignore_ascii_case("json_each_text")
         {
             vec![
-                ("key".to_string(), DataType::Text, false, None),
-                ("value".to_string(), DataType::Text, true, None),
+                ("key".to_string(), DataType::Text, None),
+                ("value".to_string(), DataType::Text, None),
             ]
         } else if obj_name.eq_ignore_ascii_case("chunk_text") {
             // Require at least 1 arg (positional or named "content")
@@ -258,15 +251,15 @@ impl<'a> Analyzer<'a> {
                 ));
             }
             vec![
-                ("chunk_index".to_string(), DataType::Int32, false, None),
-                ("chunk_text".to_string(), DataType::Text, false, None),
-                ("chunk_pos".to_string(), DataType::Int32, false, None),
+                ("chunk_index".to_string(), DataType::Int32, None),
+                ("chunk_text".to_string(), DataType::Text, None),
+                ("chunk_pos".to_string(), DataType::Int32, None),
             ]
         } else if obj_name.eq_ignore_ascii_case("_db9_sys_record_migration") {
             vec![
-                ("name".to_string(), DataType::Text, false, None),
-                ("applied_at".to_string(), DataType::Text, false, None),
-                ("status".to_string(), DataType::Text, false, None),
+                ("name".to_string(), DataType::Text, None),
+                ("applied_at".to_string(), DataType::Text, None),
+                ("status".to_string(), DataType::Text, None),
             ]
         } else {
             return Err(AnalyzerError::Unsupported(format!(
@@ -307,7 +300,7 @@ impl<'a> Analyzer<'a> {
 
         let output_columns: Vec<(String, DataType)> = output_cols
             .iter()
-            .map(|(n, dt, _, _)| (n.clone(), dt.clone()))
+            .map(|(n, dt, _)| (n.clone(), dt.clone()))
             .collect();
 
         let func = ResolvedFunction {
@@ -435,8 +428,8 @@ impl<'a> Analyzer<'a> {
                             .map(|a| normalize_ident(&a.name))
                             .unwrap_or_else(|| obj_name.clone());
 
-                        let mut output_cols: Vec<(String, DataType, bool, Option<String>)> =
-                            vec![(obj_name.clone(), DataType::Text, false, None)];
+                        let mut output_cols: Vec<(String, DataType, Option<String>)> =
+                            vec![(obj_name.clone(), DataType::Text, None)];
 
                         // Apply alias column list (renames output columns).
                         if let Some(ta) = alias {
@@ -472,7 +465,7 @@ impl<'a> Analyzer<'a> {
 
                         let output_columns: Vec<(String, DataType)> = output_cols
                             .iter()
-                            .map(|(n, dt, _, _)| (n.clone(), dt.clone()))
+                            .map(|(n, dt, _)| (n.clone(), dt.clone()))
                             .collect();
 
                         let func = ResolvedFunction {
@@ -503,11 +496,10 @@ impl<'a> Analyzer<'a> {
                 // Check CTE first (CTEs are always unqualified in PostgreSQL).
                 if schema_opt.is_none() {
                     if let Some(cte_cols) = self.scopes.resolve_cte(&obj_name) {
-                        let columns_for_scope: Vec<(String, DataType, bool, Option<String>)> =
-                            cte_cols
-                                .iter()
-                                .map(|(n, dt, coll)| (n.clone(), dt.clone(), true, coll.clone()))
-                                .collect();
+                        let columns_for_scope: Vec<(String, DataType, Option<String>)> = cte_cols
+                            .iter()
+                            .map(|(n, dt, coll)| (n.clone(), dt.clone(), coll.clone()))
+                            .collect();
 
                         let col_start = self.scopes.current().column_count();
                         self.scopes
@@ -550,33 +542,7 @@ impl<'a> Analyzer<'a> {
                             // All physical columns (including dropped) occupy scope
                             // slots so join-row indexing stays correct. Dropped slots
                             // are marked hidden and excluded from name resolution.
-                            let columns_for_scope: Vec<(
-                                String,
-                                DataType,
-                                bool,
-                                Option<String>,
-                                bool,
-                            )> = table_schema
-                                .columns
-                                .iter()
-                                .map(|c| {
-                                    (
-                                        c.name.clone(),
-                                        c.data_type.clone(),
-                                        c.nullable,
-                                        c.collation.clone(),
-                                        c.is_dropped,
-                                    )
-                                })
-                                .collect();
-                            let include_sys = self.scopes.current().system_columns_enabled();
-                            self.scopes.current_mut().add_table_with_dropped_columns(
-                                &alias_str,
-                                &columns_for_scope,
-                                include_sys,
-                            );
-                        } else {
-                            let columns_for_scope: Vec<(String, DataType, bool, Option<String>)> =
+                            let columns_for_scope: Vec<(String, DataType, Option<String>, bool)> =
                                 table_schema
                                     .columns
                                     .iter()
@@ -584,9 +550,24 @@ impl<'a> Analyzer<'a> {
                                         (
                                             c.name.clone(),
                                             c.data_type.clone(),
-                                            c.nullable,
                                             c.collation.clone(),
+                                            c.is_dropped,
                                         )
+                                    })
+                                    .collect();
+                            let include_sys = self.scopes.current().system_columns_enabled();
+                            self.scopes.current_mut().add_table_with_dropped_columns(
+                                &alias_str,
+                                &columns_for_scope,
+                                include_sys,
+                            );
+                        } else {
+                            let columns_for_scope: Vec<(String, DataType, Option<String>)> =
+                                table_schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| {
+                                        (c.name.clone(), c.data_type.clone(), c.collation.clone())
                                     })
                                     .collect();
                             self.scopes
@@ -660,7 +641,7 @@ impl<'a> Analyzer<'a> {
                     .unwrap_or_else(|| "unnest".to_string());
 
                 let mut typed_args = Vec::with_capacity(array_exprs.len());
-                let mut output_cols: Vec<(String, DataType, bool, Option<String>)> =
+                let mut output_cols: Vec<(String, DataType, Option<String>)> =
                     Vec::with_capacity(array_exprs.len() + usize::from(*with_offset));
 
                 for (i, expr) in array_exprs.iter().enumerate() {
@@ -680,7 +661,7 @@ impl<'a> Analyzer<'a> {
                     } else {
                         format!("unnest_{}", i + 1)
                     };
-                    output_cols.push((col_name, elem_type, true, None));
+                    output_cols.push((col_name, elem_type, None));
                     typed_args.push(TypedFunctionArg::Positional(analyzed));
                 }
 
@@ -689,7 +670,7 @@ impl<'a> Analyzer<'a> {
                         .as_ref()
                         .map(crate::sql::names::normalize_ident)
                         .unwrap_or_else(|| "ordinality".to_string());
-                    output_cols.push((ord_name, DataType::Int64, false, None));
+                    output_cols.push((ord_name, DataType::Int64, None));
                 }
 
                 // Apply alias column list (renames output columns).
@@ -726,7 +707,7 @@ impl<'a> Analyzer<'a> {
 
                 let output_columns: Vec<(String, DataType)> = output_cols
                     .iter()
-                    .map(|(n, dt, _, _)| (n.clone(), dt.clone()))
+                    .map(|(n, dt, _)| (n.clone(), dt.clone()))
                     .collect();
 
                 let func = ResolvedFunction {
@@ -759,11 +740,11 @@ impl<'a> Analyzer<'a> {
 
                 // Add subquery output columns to current scope (preserving collation names)
                 let coll_names = super::extract_output_collation_names(&analyzed);
-                let mut columns: Vec<(String, DataType, bool, Option<String>)> = analyzed
+                let mut columns: Vec<(String, DataType, Option<String>)> = analyzed
                     .output_schema
                     .iter()
                     .zip(coll_names)
-                    .map(|((name, dt, _coll), cn)| (name.clone(), dt.clone(), true, cn))
+                    .map(|((name, dt, _coll), cn)| (name.clone(), dt.clone(), cn))
                     .collect();
 
                 if let Some(a) = alias {

@@ -136,18 +136,16 @@ impl PhysicalOperator for LimitOperator {
         Ok(())
     }
 
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![self.child.as_ref()]
+    fn estimated_rows(&self) -> Option<usize> {
+        self.constant_limit()
     }
 
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![self.child.as_mut()]
-    }
-
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "Limit"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         let limit = self.constant_limit();
         let offset = self.constant_offset().unwrap_or(0);
@@ -157,10 +155,6 @@ impl PhysicalOperator for LimitOperator {
             (None, o) if o > 0 => Some(format!("offset={}", o)),
             _ => None,
         }
-    }
-
-    fn estimated_rows(&self) -> Option<usize> {
-        self.constant_limit()
     }
 }
 

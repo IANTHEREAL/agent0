@@ -179,12 +179,6 @@ impl ExportSnapshotRegistry {
         }
     }
 
-    pub fn with_limits(mut self, per_db: u32, global: u32) -> Self {
-        self.per_db_limit = per_db;
-        self.global_limit = global;
-        self
-    }
-
     /// Begin an export snapshot for the given database.
     ///
     /// Behavior:

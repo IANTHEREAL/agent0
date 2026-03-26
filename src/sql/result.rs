@@ -1,6 +1,6 @@
 //! SQL execution result types
 
-use crate::model::{DataType, Row, TableSchema};
+use crate::model::{DataType, Row};
 use futures::stream::BoxStream;
 use std::sync::Arc;
 
@@ -14,7 +14,6 @@ impl std::fmt::Debug for RowStream {
 }
 
 /// Result of executing a SQL statement
-#[allow(dead_code)] // framework: PG result message structural field
 #[derive(Debug)]
 pub enum ExecuteResult {
     /// SELECT result with rows
@@ -25,81 +24,35 @@ pub enum ExecuteResult {
         timezone: Arc<str>,
     },
     /// CREATE TABLE result
-    CreateTable {
-        table_name: String,
-    },
-    /// DROP TABLE result  
-    DropTable {
-        table_name: String,
-    },
+    CreateTable,
+    /// DROP TABLE result
+    DropTable,
     /// TRUNCATE TABLE result
-    TruncateTable {
-        table_name: String,
-    },
+    TruncateTable,
     /// ALTER TABLE result
-    AlterTable {
-        table_name: String,
-    },
+    AlterTable,
     /// ALTER SEQUENCE result
-    AlterSequence {
-        sequence_name: String,
-    },
+    AlterSequence,
     /// ALTER FUNCTION result
-    AlterFunction {
-        function_name: String,
-    },
+    AlterFunction,
     /// ALTER INDEX result
-    AlterIndex {
-        index_name: String,
-    },
+    AlterIndex,
     /// CREATE INDEX result
-    CreateIndex {
-        index_name: String,
-    },
-    DropIndex {
-        index_name: String,
-    },
-    CreateView {
-        view_name: String,
-    },
-    DropView {
-        view_name: String,
-    },
-    CreateMaterializedView {
-        view_name: String,
-    },
-    DropMaterializedView {
-        view_name: String,
-    },
-    RefreshMaterializedView {
-        view_name: String,
-    },
-    CreateProcedure {
-        proc_name: String,
-    },
-    DropProcedure {
-        proc_name: String,
-    },
-    CreateFunction {
-        func_name: String,
-    },
-    DropFunction {
-        func_name: String,
-    },
-    CreateTrigger {
-        trigger_name: String,
-        table_name: String,
-    },
-    DropTrigger {
-        trigger_name: String,
-        table_name: String,
-    },
-    CreateExtension {
-        ext_name: String,
-    },
-    DropExtension {
-        ext_name: String,
-    },
+    CreateIndex,
+    DropIndex,
+    CreateView,
+    DropView,
+    CreateMaterializedView,
+    DropMaterializedView,
+    RefreshMaterializedView,
+    CreateProcedure,
+    DropProcedure,
+    CreateFunction,
+    DropFunction,
+    CreateTrigger,
+    DropTrigger,
+    CreateExtension,
+    DropExtension,
     Call,
     CreateRole,
     AlterRole,
@@ -122,12 +75,6 @@ pub enum ExecuteResult {
     /// SHOW TABLES result
     ShowTables {
         tables: Vec<String>,
-    },
-    /// DESCRIBE table result
-    #[allow(dead_code)] // framework: PG protocol
-    // variant constructed in protocol layer, field for schema introspection
-    Describe {
-        schema: TableSchema,
     },
     /// Command completed successfully (no rowset).
     CommandComplete {
@@ -161,7 +108,6 @@ pub enum ExecuteResult {
         columns: Vec<String>,
         column_types: Vec<DataType>,
         stream: RowStream,
-        timezone: Arc<str>,
     },
 }
 

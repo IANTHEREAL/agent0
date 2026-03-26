@@ -120,16 +120,18 @@ impl PhysicalOperator for TableScanOperator {
         Ok(())
     }
 
+    fn estimated_rows(&self) -> Option<usize> {
+        None
+    }
+
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "TableScan"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         Some(format!("table={}", self.schema.name))
-    }
-
-    fn estimated_rows(&self) -> Option<usize> {
-        None
     }
 }
 
@@ -357,10 +359,12 @@ impl PhysicalOperator for IndexScanOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "IndexScan"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}",
@@ -449,10 +453,12 @@ impl PhysicalOperator for RangeIndexScanOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "RangeIndexScan"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}",
@@ -537,10 +543,12 @@ impl PhysicalOperator for InListScanOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "InListScan"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}",

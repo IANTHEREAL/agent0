@@ -420,7 +420,7 @@ impl PreparedPlanCache {
     /// Also drops counter-only keys that reference `table_id` via
     /// `PlanCacheKey.resolved_table_ids` so DDL resets miss-path promotion
     /// history for the affected table.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn invalidate_by_table_id(&mut self, table_id: u64) {
         let mut keys_to_remove: HashSet<PlanCacheKey> = self
             .entries

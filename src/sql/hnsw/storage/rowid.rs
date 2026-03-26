@@ -64,19 +64,6 @@ pub async fn put_rowid_mapping(
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn get_pk_for_rowid(
-    txn: &mut Transaction,
-    db_id: u64,
-    table_id: u64,
-    rowid: u64,
-) -> Result<Option<Vec<u8>>, SqlError> {
-    let key = hnsw_rid_rid2pk_key(db_id, table_id, rowid);
-    txn.get(key)
-        .await
-        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))
-}
-
 pub async fn batch_get_pk_for_rowids(
     txn: &mut Transaction,
     db_id: u64,

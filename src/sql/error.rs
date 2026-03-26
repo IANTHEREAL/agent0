@@ -114,9 +114,6 @@ pub enum SqlError {
     #[error("division by zero")]
     DivisionByZero,
 
-    #[error("canceling statement due to statement timeout")]
-    StatementTimeout,
-
     #[error(
         "canceling statement due to retry timeout ({elapsed_ms}ms elapsed, limit {limit_ms}ms)"
     )]
@@ -300,7 +297,6 @@ impl SqlError {
             Self::InvalidArgumentForLogarithm { .. } => "2201E",
             Self::StringDataRightTruncation { .. } => "22001",
             Self::DivisionByZero => "22012",
-            Self::StatementTimeout => "57014",
             Self::RetryTimeout { .. } => "57014",
             Self::IdleInTransactionTimeout => "25P03",
             Self::LockTimeout => "55P03",
@@ -344,11 +340,6 @@ impl SqlError {
             Self::Unsupported(_) => "0A000",
             Self::Internal(_) => "XX000",
         }
-    }
-
-    #[allow(dead_code)] // framework: PG error reporting API
-    pub fn severity(&self) -> &'static str {
-        "ERROR"
     }
 }
 
@@ -517,7 +508,6 @@ mod tests {
             "23514"
         );
         assert_eq!(SqlError::DivisionByZero.sqlstate(), "22012");
-        assert_eq!(SqlError::StatementTimeout.sqlstate(), "57014");
         assert_eq!(SqlError::LockTimeout.sqlstate(), "55P03");
         assert_eq!(SqlError::InFailedTransaction.sqlstate(), "25P02");
         assert_eq!(

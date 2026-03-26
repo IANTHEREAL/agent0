@@ -13,7 +13,7 @@ pub struct CTEScanOperator {
     opened: bool,
 }
 
-#[allow(dead_code)] // framework: operator framework
+#[cfg(test)]
 impl CTEScanOperator {
     pub fn new(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
@@ -56,16 +56,18 @@ impl PhysicalOperator for CTEScanOperator {
         Ok(())
     }
 
+    fn estimated_rows(&self) -> Option<usize> {
+        Some(self.rows.len())
+    }
+
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "CTEScan"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         Some(format!("cte={}", self.schema.name))
-    }
-
-    fn estimated_rows(&self) -> Option<usize> {
-        Some(self.rows.len())
     }
 }
 

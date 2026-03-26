@@ -68,9 +68,7 @@ pub async fn execute_create_table(
     }
 
     if if_not_exists && store.table_exists(txn, db_id, &table_full_name).await? {
-        return Ok(ExecuteResult::CreateTable {
-            table_name: table_full_name,
-        });
+        return Ok(ExecuteResult::CreateTable);
     }
 
     let mut pk_constraint_name: Option<String> = None;
@@ -625,9 +623,7 @@ pub async fn execute_create_table(
         .await?;
     }
 
-    Ok(ExecuteResult::CreateTable {
-        table_name: table_full_name,
-    })
+    Ok(ExecuteResult::CreateTable)
 }
 
 pub async fn create_table_from_query_result(
@@ -641,9 +637,7 @@ pub async fn create_table_from_query_result(
     explicit_columns: &[SqlColumnDef],
 ) -> Result<ExecuteResult> {
     if if_not_exists && store.table_exists(txn, db_id, table_name).await? {
-        return Ok(ExecuteResult::CreateTable {
-            table_name: table_name.to_string(),
-        });
+        return Ok(ExecuteResult::CreateTable);
     }
 
     // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
@@ -695,9 +689,7 @@ pub async fn create_table_from_query_result(
 
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
-    Ok(ExecuteResult::CreateTable {
-        table_name: table_name.to_string(),
-    })
+    Ok(ExecuteResult::CreateTable)
 }
 
 pub async fn create_table_from_stream(
@@ -711,9 +703,7 @@ pub async fn create_table_from_stream(
     stream: crate::sql::result::RowStream,
 ) -> Result<ExecuteResult> {
     if if_not_exists && store.table_exists(txn, db_id, table_name).await? {
-        return Ok(ExecuteResult::CreateTable {
-            table_name: table_name.to_string(),
-        });
+        return Ok(ExecuteResult::CreateTable);
     }
 
     // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
@@ -765,9 +755,7 @@ pub async fn create_table_from_stream(
 
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
-    Ok(ExecuteResult::CreateTable {
-        table_name: table_name.to_string(),
-    })
+    Ok(ExecuteResult::CreateTable)
 }
 
 pub async fn create_table_from_select_into(

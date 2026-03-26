@@ -53,7 +53,7 @@ impl Executor {
             .create_procedure(txn, db_id, &proc_name, &definition)
             .await?;
 
-        Ok(ExecuteResult::CreateProcedure { proc_name })
+        Ok(ExecuteResult::CreateProcedure)
     }
 
     pub(crate) async fn execute_call_cmd(
@@ -276,9 +276,7 @@ impl Executor {
                     .create_procedure(txn, db_id, &proc_full_name, &definition)
                     .await?;
             }
-            Ok(ExecuteResult::CreateProcedure {
-                proc_name: proc_full_name,
-            })
+            Ok(ExecuteResult::CreateProcedure)
         }
         .await;
 
@@ -349,9 +347,7 @@ impl Executor {
             if !dropped && !if_exists {
                 return Err(anyhow!("Procedure '{}' does not exist", proc_full_name));
             }
-            Ok(ExecuteResult::DropProcedure {
-                proc_name: proc_full_name,
-            })
+            Ok(ExecuteResult::DropProcedure)
         }
         .await;
 

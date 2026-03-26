@@ -477,18 +477,12 @@ impl PhysicalOperator for ProjectOperator {
         Ok(())
     }
 
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![self.child.as_ref()]
-    }
-
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![self.child.as_mut()]
-    }
-
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "Project"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         let cols = self.output_names.join(", ");
         Some(format!("columns=[{}]", cols))

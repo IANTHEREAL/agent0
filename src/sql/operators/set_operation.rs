@@ -159,14 +159,7 @@ impl PhysicalOperator for SetOperationOperator {
         Ok(())
     }
 
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![self.left.as_ref(), self.right.as_ref()]
-    }
-
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![self.left.as_mut(), self.right.as_mut()]
-    }
-
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         match self.op_type {
             SetOperationType::Union => "Union",
@@ -176,10 +169,6 @@ impl PhysicalOperator for SetOperationOperator {
             SetOperationType::Except => "Except",
             SetOperationType::ExceptAll => "ExceptAll",
         }
-    }
-
-    fn explain_info(&self) -> Option<String> {
-        None
     }
 }
 

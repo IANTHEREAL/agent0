@@ -19,8 +19,6 @@ use sqlparser::parser::Parser;
 /// A policy with its USING/WITH CHECK expressions compiled to `TypedExpr`.
 #[derive(Debug, Clone)]
 pub struct CompiledRlsPolicy {
-    #[allow(dead_code)] // Used by DML enforcement (PR #1814)
-    pub name: String,
     pub permissive: bool,
     pub using_expr: Option<TypedExpr>,
     #[allow(dead_code)] // Used by DML enforcement (PR #1814)
@@ -164,7 +162,6 @@ pub fn compile_applicable_using_policies(
             continue;
         }
         compiled.push(CompiledRlsPolicy {
-            name: p.name.clone(),
             permissive: p.permissive,
             using_expr: using,
             with_check_expr: None, // WITH CHECK compiled separately for DML
@@ -310,7 +307,7 @@ mod tests {
     fn test_policy_role_matching() {
         let public_policy = RlsPolicy {
             oid: 1,
-            name: "p1".into(),
+            name: String::new(),
             table_id: 1,
             command: RlsCommand::Select,
             permissive: true,
@@ -380,7 +377,6 @@ mod tests {
     fn combine_no_permissive_returns_false() {
         // RLS enabled but no permissive policies → deny all
         let policies = vec![CompiledRlsPolicy {
-            name: "r1".into(),
             permissive: false,
             using_expr: Some(TypedExpr::new(
                 TypedExprKind::Constant(Value::Boolean(true)),
@@ -403,7 +399,6 @@ mod tests {
             DataType::Boolean,
         );
         let policies = vec![CompiledRlsPolicy {
-            name: "p1".into(),
             permissive: true,
             using_expr: Some(expr.clone()),
             with_check_expr: None,
@@ -427,13 +422,11 @@ mod tests {
         );
         let policies = vec![
             CompiledRlsPolicy {
-                name: "p1".into(),
                 permissive: true,
                 using_expr: Some(t),
                 with_check_expr: None,
             },
             CompiledRlsPolicy {
-                name: "p2".into(),
                 permissive: true,
                 using_expr: Some(f),
                 with_check_expr: None,
@@ -520,13 +513,11 @@ mod tests {
         );
         let policies = vec![
             CompiledRlsPolicy {
-                name: "p1".into(),
                 permissive: true,
                 using_expr: Some(t.clone()),
                 with_check_expr: None,
             },
             CompiledRlsPolicy {
-                name: "r1".into(),
                 permissive: false,
                 using_expr: Some(t),
                 with_check_expr: None,

@@ -683,12 +683,7 @@ impl Executor {
                 .is_some()
             {
                 if if_not_exists {
-                    return Ok((
-                        super::super::ExecuteResult::CreateExtension {
-                            ext_name: ext_name.clone(),
-                        },
-                        false,
-                    ));
+                    return Ok((super::super::ExecuteResult::CreateExtension, false));
                 }
                 return Err(anyhow!("extension \"{}\" already exists", ext_name));
             }
@@ -705,12 +700,7 @@ impl Executor {
                 self.store().set_cron_enabled(txn, db_id).await?;
             }
 
-            Ok((
-                super::super::ExecuteResult::CreateExtension {
-                    ext_name: ext_name.clone(),
-                },
-                true,
-            ))
+            Ok((super::super::ExecuteResult::CreateExtension, true))
         }
         .await;
 
@@ -816,12 +806,7 @@ impl Executor {
                 }
             }
 
-            Ok((
-                super::super::ExecuteResult::DropExtension {
-                    ext_name: ext_name.clone(),
-                },
-                dropped,
-            ))
+            Ok((super::super::ExecuteResult::DropExtension, dropped))
         }
         .await;
 

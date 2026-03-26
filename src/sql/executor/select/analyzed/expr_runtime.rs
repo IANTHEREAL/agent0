@@ -49,49 +49,6 @@ impl<'a> ExprRuntime<'a> {
         }
     }
 
-    // ── Phase 2: Sync evaluation ────────────────────────────────
-
-    /// Pure sync evaluation (hot path). Wraps `eval_typed_expr`.
-    ///
-    /// Will be wired when mod.rs hand-written loops are replaced.
-    #[inline]
-    #[allow(dead_code)] // framework: ExprRuntime field
-    pub fn eval(&self, expr: &TypedExpr, row: &Row) -> Result<Value> {
-        eval_typed_expr(expr, row, &self.qctx)
-    }
-
-    // ── Phase 3: Per-row async evaluation ───────────────────────
-
-    /// Materialize correlated subqueries/catalog funcs for a row, then evaluate.
-    ///
-    /// Will be wired when mod.rs hand-written loops are replaced.
-    #[allow(dead_code)] // framework: ExprRuntime field
-    pub async fn resolve_and_eval(
-        &self,
-        expr: &TypedExpr,
-        row: &Row,
-        schema: &TableSchema,
-        txn: &mut Transaction,
-        seq: &mut SequenceSession,
-    ) -> Result<Value> {
-        let materialized = self
-            .executor
-            .materialize_expr_for_row(
-                expr,
-                row,
-                None,
-                Some(schema),
-                txn,
-                self.db_id,
-                seq,
-                self.search_path,
-                self.ctes,
-                &self.qctx,
-            )
-            .await?;
-        eval_typed_expr(&materialized, row, &self.qctx)
-    }
-
     // ── Composite operations ────────────────────────────────────
 
     /// Project rows: evaluate projection expressions per-row.

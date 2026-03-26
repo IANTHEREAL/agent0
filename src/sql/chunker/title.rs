@@ -1,33 +1,5 @@
 //! Title extraction and embedding format helpers.
 
-use regex::Regex;
-use std::sync::LazyLock;
-
-#[allow(dead_code)]
-static H1_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^#\s+(.+)$").unwrap());
-#[allow(dead_code)]
-static H2_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^##\s+(.+)$").unwrap());
-
-/// Extract a title from markdown content.
-///
-/// Priority: first H1 > first H2 > first line (if < 100 chars) > fallback.
-#[allow(dead_code)]
-pub(crate) fn extract_title(content: &str, fallback: Option<&str>) -> String {
-    if let Some(m) = H1_RE.captures(content) {
-        return m[1].trim().to_string();
-    }
-    if let Some(m) = H2_RE.captures(content) {
-        return m[1].trim().to_string();
-    }
-    if let Some(first_line) = content.lines().next() {
-        let trimmed = first_line.trim();
-        if !trimmed.is_empty() && trimmed.len() < 100 {
-            return trimmed.to_string();
-        }
-    }
-    fallback.unwrap_or("Untitled").to_string()
-}
-
 /// Format a chunk for embedding with title prefix.
 pub(crate) fn format_for_embedding(text: &str, title: &str) -> String {
     format!("title: {} | text: {}", title, text)
@@ -36,6 +8,27 @@ pub(crate) fn format_for_embedding(text: &str, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static H1_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^#\s+(.+)$").unwrap());
+    static H2_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^##\s+(.+)$").unwrap());
+
+    fn extract_title(content: &str, fallback: Option<&str>) -> String {
+        if let Some(m) = H1_RE.captures(content) {
+            return m[1].trim().to_string();
+        }
+        if let Some(m) = H2_RE.captures(content) {
+            return m[1].trim().to_string();
+        }
+        if let Some(first_line) = content.lines().next() {
+            let trimmed = first_line.trim();
+            if !trimmed.is_empty() && trimmed.len() < 100 {
+                return trimmed.to_string();
+            }
+        }
+        fallback.unwrap_or("Untitled").to_string()
+    }
 
     #[test]
     fn extracts_h1_title() {

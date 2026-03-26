@@ -50,10 +50,6 @@ impl PhysicalOperator for MockOperator {
         Ok(())
     }
 
-    fn name(&self) -> &'static str {
-        "Mock"
-    }
-
     fn estimated_rows(&self) -> Option<usize> {
         Some(self.rows.len())
     }
@@ -88,7 +84,7 @@ async fn test_mock_operator_lifecycle() {
     assert!(!op.opened);
     assert!(!op.closed);
     assert_eq!(op.position, 0);
-    assert_eq!(op.name(), "Mock");
+    assert_eq!(op.name(), "Unknown");
     assert_eq!(op.estimated_rows(), Some(3));
     assert_eq!(op.schema().name, "test");
 }

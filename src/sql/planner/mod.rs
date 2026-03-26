@@ -85,11 +85,6 @@ pub enum ScanType {
         index_name: String,
         /// Boolean expression of token hashes (superset filter — no false negatives).
         qual: GinQual,
-        /// The original predicate expression, used for per-row recheck after
-        /// fetching candidate rows.  GIN scans always recheck because hash
-        /// collisions and lossy tokenisation can produce false positives.
-        #[allow(dead_code)]
-        recheck_expr: Box<crate::sql::analyzer::types::TypedExpr>,
     },
     /// HNSW approximate nearest-neighbor index scan.
     ///

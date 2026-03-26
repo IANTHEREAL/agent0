@@ -589,13 +589,6 @@ impl Session {
         &mut self.plan_cache
     }
 
-    /// Invalidate all cached plans that depend on the given table_id.
-    /// Called after DDL that changes a table's schema.
-    #[allow(dead_code)]
-    pub(crate) fn invalidate_plan_cache_for_table(&mut self, table_id: u64) {
-        self.plan_cache.invalidate_by_table_id(table_id);
-    }
-
     /// Clear the entire plan cache. Called on transaction rollback.
     pub(crate) fn clear_plan_cache(&mut self) {
         self.plan_cache.clear();

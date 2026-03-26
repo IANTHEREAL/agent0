@@ -804,13 +804,12 @@ impl PhysicalPlanner {
                 }
             }
 
-            LogicalNode::Subquery { subplan, alias } => {
+            LogicalNode::Subquery { subplan, .. } => {
                 let child = Self::plan_node(subplan, ctx);
                 let cost = child.cost.clone();
                 PhysicalPlan {
                     node: PhysicalNode::Subquery {
                         subplan: Box::new(child),
-                        alias: alias.clone(),
                     },
                     schema: logical.schema.clone(),
                     cost,

@@ -112,10 +112,11 @@ pub const DEFAULT_RING_CAPACITY: usize = 10_000;
 pub const RING_CAPACITY_ENV: &str = "FS9_NOTIFY_RING_CAPACITY";
 
 /// Result of a `query` call, including ring metadata for overflow detection.
+#[cfg(test)]
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct QueryResult {
     /// Ring epoch (process incarnation). Consumer compares against cached epoch.
+    #[allow(dead_code)]
     pub epoch: u64,
     /// Oldest seq still in the ring (0 if empty).
     pub oldest_seq: u64,
@@ -124,6 +125,7 @@ pub struct QueryResult {
     /// Whether this query is in overflow state.
     pub overflow: bool,
     /// Configured ring capacity.
+    #[allow(dead_code)]
     pub capacity: usize,
     /// Matching events (may be empty even when ring is non-empty, due to filters).
     pub events: Vec<FsEvent>,
@@ -138,6 +140,7 @@ pub struct EventRing {
     capacity: usize,
     /// Process incarnation nonce — set once at construction. Consumers use this
     /// to detect process restarts.
+    #[cfg_attr(not(test), allow(dead_code))]
     epoch: u64,
     /// Broadcast sender for wake-up notifications. Sends the latest seq.
     notify_tx: broadcast::Sender<u64>,
@@ -145,7 +148,6 @@ pub struct EventRing {
     evicted: std::sync::atomic::AtomicU64,
 }
 
-#[allow(dead_code)] // Accessor methods are part of the public API surface, used in tests and future consumers.
 impl EventRing {
     /// Create a new EventRing with the given capacity and a fresh epoch.
     pub fn new(capacity: usize) -> Self {
@@ -176,30 +178,6 @@ impl EventRing {
             .filter(|&c| c > 0)
             .unwrap_or(DEFAULT_RING_CAPACITY);
         Self::new(capacity)
-    }
-
-    /// Returns the ring epoch.
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    /// Returns the configured capacity.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Returns the total number of evicted events.
-    pub fn evicted_count(&self) -> u64 {
-        self.evicted.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Current ring size.
-    pub fn len(&self) -> usize {
-        self.events.read().expect("lock poisoned").len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     // -- push ---------------------------------------------------------------
@@ -275,8 +253,28 @@ impl EventRing {
         let _ = first_seq;
         Ok(last_seq)
     }
+}
 
-    // -- query --------------------------------------------------------------
+#[cfg(test)]
+impl EventRing {
+    /// Returns the configured capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns the total number of evicted events.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current ring size.
+    pub fn len(&self) -> usize {
+        self.events.read().expect("lock poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Query events with `seq > since_seq`, optional path prefix filter, and limit.
     pub fn query(&self, since_seq: u64, path_prefix: Option<&str>, limit: usize) -> QueryResult {
@@ -329,34 +327,9 @@ impl EventRing {
         }
     }
 
-    /// Convenience: query without path filter, returning up to `limit` events.
-    pub fn query_since(&self, since_seq: u64, limit: usize) -> QueryResult {
-        self.query(since_seq, None, limit)
-    }
-
-    // -- subscribe ----------------------------------------------------------
-
     /// Subscribe to push notifications.
     pub fn subscribe(&self) -> broadcast::Receiver<u64> {
         self.notify_tx.subscribe()
-    }
-
-    // -- introspection (for metrics) ----------------------------------------
-
-    pub fn oldest_seq(&self) -> Option<u64> {
-        self.events
-            .read()
-            .expect("lock poisoned")
-            .front()
-            .map(|e| e.seq)
-    }
-
-    pub fn newest_seq(&self) -> Option<u64> {
-        self.events
-            .read()
-            .expect("lock poisoned")
-            .back()
-            .map(|e| e.seq)
     }
 }
 
@@ -444,6 +417,7 @@ impl NotifyMetrics {
         };
     }
 
+    #[cfg(test)]
     pub fn record_overflow(&self) {
         self.overflow_queries.fetch_add(1, Ordering::Relaxed);
     }

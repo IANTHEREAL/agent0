@@ -24,9 +24,6 @@ pub struct ScopeColumn {
     pub column_index: usize,
     /// Resolved data type.
     pub data_type: DataType,
-    /// Whether the column is nullable.
-    #[allow(dead_code)] // framework: scope resolution field
-    pub nullable: bool,
     /// Whether this column is hidden from SELECT * and unqualified resolution.
     /// Used for USING join right-side duplicates and dropped columns.
     pub hidden: bool,
@@ -243,14 +240,13 @@ impl Scope {
         let mut scope = Self::new();
         let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
         if has_dropped {
-            let cols: Vec<(String, DataType, bool, Option<String>, bool)> = schema
+            let cols: Vec<(String, DataType, Option<String>, bool)> = schema
                 .columns
                 .iter()
                 .map(|c| {
                     (
                         c.name.clone(),
                         c.data_type.clone(),
-                        c.nullable,
                         c.collation.clone(),
                         c.is_dropped,
                     )
@@ -258,17 +254,10 @@ impl Scope {
                 .collect();
             scope.add_table_with_dropped_columns(alias, &cols, false);
         } else {
-            let cols: Vec<(String, DataType, bool, Option<String>)> = schema
+            let cols: Vec<(String, DataType, Option<String>)> = schema
                 .columns
                 .iter()
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        c.data_type.clone(),
-                        c.nullable,
-                        c.collation.clone(),
-                    )
-                })
+                .map(|c| (c.name.clone(), c.data_type.clone(), c.collation.clone()))
                 .collect();
             scope.add_table(alias, &cols);
         }
@@ -280,7 +269,7 @@ impl Scope {
     /// `alias` is the table alias (or real name if no alias). Columns are
     /// appended to the flattened row, with `column_index` set to the absolute
     /// position starting from the current column count.
-    pub fn add_table(&mut self, alias: &str, columns: &[(String, DataType, bool, Option<String>)]) {
+    pub fn add_table(&mut self, alias: &str, columns: &[(String, DataType, Option<String>)]) {
         self.add_table_internal(alias, columns, self.add_system_columns);
     }
 
@@ -290,7 +279,7 @@ impl Scope {
     pub fn add_table_without_system_columns(
         &mut self,
         alias: &str,
-        columns: &[(String, DataType, bool, Option<String>)],
+        columns: &[(String, DataType, Option<String>)],
     ) {
         self.add_table_internal(alias, columns, false);
     }
@@ -308,7 +297,6 @@ impl Scope {
             column_name: name.to_string(),
             column_index: abs_index,
             data_type,
-            nullable: false,
             hidden: true,
             is_dropped: false,
             collation: None,
@@ -318,18 +306,17 @@ impl Scope {
     fn add_table_internal(
         &mut self,
         alias: &str,
-        columns: &[(String, DataType, bool, Option<String>)],
+        columns: &[(String, DataType, Option<String>)],
         include_system_columns: bool,
     ) {
         let base_offset = self.columns.len();
-        for (idx, (name, data_type, nullable, collation)) in columns.iter().enumerate() {
+        for (idx, (name, data_type, collation)) in columns.iter().enumerate() {
             let abs_index = base_offset + idx;
             let col = ScopeColumn {
                 table_alias: Some(alias.to_string()),
                 column_name: name.clone(),
                 column_index: abs_index,
                 data_type: data_type.clone(),
-                nullable: *nullable,
                 hidden: false,
                 is_dropped: false,
                 collation: collation.clone(),
@@ -356,7 +343,6 @@ impl Scope {
 
     /// Add columns from a table where the physical row index may differ from
     /// the scope position (e.g., tables with logically dropped columns).
-    /// Each entry is `(physical_row_index, name, data_type, nullable, collation)`.
     /// Add columns from a table that has logically dropped columns.
     ///
     /// ALL physical columns (including dropped ones) occupy scope slots to
@@ -366,20 +352,17 @@ impl Scope {
     pub fn add_table_with_dropped_columns(
         &mut self,
         alias: &str,
-        all_columns: &[(String, DataType, bool, Option<String>, bool)], // (name, type, nullable, collation, is_dropped)
+        all_columns: &[(String, DataType, Option<String>, bool)], // (name, type, collation, is_dropped)
         include_system_columns: bool,
     ) {
         let base_offset = self.columns.len();
-        for (idx, (name, data_type, nullable, collation, is_dropped)) in
-            all_columns.iter().enumerate()
-        {
+        for (idx, (name, data_type, collation, is_dropped)) in all_columns.iter().enumerate() {
             let abs_index = base_offset + idx;
             let col = ScopeColumn {
                 table_alias: Some(alias.to_string()),
                 column_name: name.clone(),
                 column_index: abs_index,
                 data_type: data_type.clone(),
-                nullable: *nullable,
                 hidden: *is_dropped,
                 is_dropped: *is_dropped,
                 collation: collation.clone(),
@@ -410,7 +393,6 @@ impl Scope {
         alias: Option<&str>,
         name: &str,
         data_type: DataType,
-        nullable: bool,
         collation: Option<String>,
     ) {
         let abs_index = self.columns.len();
@@ -419,7 +401,6 @@ impl Scope {
             column_name: name.to_string(),
             column_index: abs_index,
             data_type,
-            nullable,
             hidden: false,
             is_dropped: false,
             collation,
@@ -800,12 +781,12 @@ impl ScopeStack {
 mod tests {
     use super::*;
 
-    fn int_col(name: &str) -> (String, DataType, bool, Option<String>) {
-        (name.to_string(), DataType::Int32, false, None)
+    fn int_col(name: &str) -> (String, DataType, Option<String>) {
+        (name.to_string(), DataType::Int32, None)
     }
 
-    fn text_col(name: &str) -> (String, DataType, bool, Option<String>) {
-        (name.to_string(), DataType::Text, true, None)
+    fn text_col(name: &str) -> (String, DataType, Option<String>) {
+        (name.to_string(), DataType::Text, None)
     }
 
     #[test]

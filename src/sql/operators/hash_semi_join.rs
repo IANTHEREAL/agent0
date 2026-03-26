@@ -173,14 +173,17 @@ impl PhysicalOperator for HashSemiJoinOperator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn children(&self) -> Vec<&dyn PhysicalOperator> {
         vec![self.left_child.as_ref(), self.right_child.as_ref()]
     }
 
+    #[cfg(test)]
     fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
         vec![self.left_child.as_mut(), self.right_child.as_mut()]
     }
 
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         if self.anti {
             "HashAntiJoin"
@@ -189,8 +192,9 @@ impl PhysicalOperator for HashSemiJoinOperator {
         }
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
-        Some(format!("anti={}", self.anti,))
+        Some(format!("anti={}", self.anti))
     }
 }
 
@@ -219,9 +223,6 @@ mod tests {
         }
         async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
             Ok(())
-        }
-        fn name(&self) -> &'static str {
-            "TestOp"
         }
     }
 

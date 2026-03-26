@@ -123,7 +123,7 @@ impl RlsPolicyCache {
     // ── Invalidation ─────────────────────────────────────────
 
     /// Remove all cached data for a database.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn invalidate_db(&self, db_id: u64) {
         self.policies.retain(|&(did, _), _| did != db_id);
         self.exprs.retain(|&(did, _, _, _), _| did != db_id);

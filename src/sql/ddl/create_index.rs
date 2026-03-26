@@ -623,9 +623,7 @@ pub async fn execute_create_index(
     )
     .await?
     {
-        return Ok(ExecuteResult::CreateIndex {
-            index_name: idx_name_str,
-        });
+        return Ok(ExecuteResult::CreateIndex);
     }
 
     let resolved_method = resolve_create_index_method(using)?;
@@ -854,9 +852,7 @@ pub async fn execute_create_index(
             crate::worker::wake_worker();
         } // end system_store block
 
-        return Ok(ExecuteResult::CreateIndex {
-            index_name: idx_name_str,
-        });
+        return Ok(ExecuteResult::CreateIndex);
     }
 
     let mut current_batch_writes = 0usize;
@@ -954,9 +950,7 @@ pub async fn execute_create_index(
         return Err(err);
     }
 
-    Ok(ExecuteResult::CreateIndex {
-        index_name: idx_name_str,
-    })
+    Ok(ExecuteResult::CreateIndex)
 }
 
 /// Gate: reject index creation when worker subsystem is unavailable.

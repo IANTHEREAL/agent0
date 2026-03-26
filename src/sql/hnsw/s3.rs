@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use aws_config::BehaviorVersion;
@@ -80,8 +80,6 @@ impl HnswS3Config {
 #[allow(dead_code)] // Used by GC sweep (Phase 4), not yet wired
 pub(crate) struct S3ObjectInfo {
     pub key: String,
-    pub last_modified: SystemTime,
-    pub size: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -886,17 +884,7 @@ impl HnswS3Client {
                     Some(k) => k.to_string(),
                     None => continue,
                 };
-                let last_modified = obj
-                    .last_modified()
-                    .and_then(|dt| SystemTime::try_from(*dt).ok())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let size = obj.size().and_then(|s| u64::try_from(s).ok()).unwrap_or(0);
-
-                results.push(S3ObjectInfo {
-                    key,
-                    last_modified,
-                    size,
-                });
+                results.push(S3ObjectInfo { key });
             }
 
             match output.next_continuation_token() {

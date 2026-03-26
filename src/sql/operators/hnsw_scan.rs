@@ -524,18 +524,4 @@ impl PhysicalOperator for HnswScanOperator {
         self.opened = false;
         Ok(())
     }
-
-    fn name(&self) -> &'static str {
-        "HnswScan"
-    }
-
-    fn explain_info(&self) -> Option<String> {
-        Some(format!(
-            "table={}, index={}, metric={}, k={}",
-            self.schema.name,
-            self.index_name,
-            self.distance_metric.as_str(),
-            self.k
-        ))
-    }
 }

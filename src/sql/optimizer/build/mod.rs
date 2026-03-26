@@ -29,10 +29,10 @@ use crate::model::{DataType, Row, TableSchema};
 use crate::sql::analyzer::types::{JoinType, SetOpKind, TypedExpr};
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::operators::{
-    BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashJoinConfig,
-    HashJoinOperator, HashJoinType, HashSemiJoinOperator, LimitOperator, NestedLoopJoinOperator,
-    ProjectOperator, RuntimeTableFunctionOperator, SetOperationOperator, SetOperationType,
-    SortOperator, TableScanOperator,
+    BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashJoinOperator,
+    HashJoinType, HashSemiJoinOperator, LimitOperator, NestedLoopJoinOperator, ProjectOperator,
+    RuntimeTableFunctionOperator, SetOperationOperator, SetOperationType, SortOperator,
+    TableScanOperator,
 };
 
 /// Context needed to translate a [`PhysicalPlan`] into operator trees.
@@ -60,16 +60,12 @@ impl BuildContext {
             correlated_table_functions: HashSet::new(),
         }
     }
+}
 
-    #[allow(dead_code)] // framework: optimizer build context field
+#[cfg(test)]
+impl BuildContext {
     pub fn with_schema(mut self, name: String, schema: TableSchema) -> Self {
         self.table_schemas.insert(name, schema);
-        self
-    }
-
-    #[allow(dead_code)] // framework: optimizer build context field
-    pub fn with_preloaded_rows(mut self, name: String, rows: Vec<Row>) -> Self {
-        self.preloaded_rows.insert(name, rows);
         self
     }
 }
@@ -218,16 +214,6 @@ impl PhysicalPlan {
                 aggregate::build_hash_aggregate(child, group_by, projections)
             }
 
-            PhysicalNode::StreamAggregate {
-                group_by,
-                projections,
-                input,
-            } => {
-                // Phase 1: stream aggregate falls back to hash aggregate.
-                let child = input.build_operators(ctx)?;
-                aggregate::build_hash_aggregate(child, group_by, projections)
-            }
-
             PhysicalNode::Sort { order_by, input } => {
                 let child = input.build_operators(ctx)?;
                 Ok(Box::new(SortOperator::new(child, order_by.clone())))
@@ -348,7 +334,6 @@ impl PhysicalPlan {
                     right_key_indices,
                     *left_is_build,
                     filter,
-                    HashJoinConfig::default(),
                 )))
             }
 

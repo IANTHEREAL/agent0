@@ -53,11 +53,6 @@ pub(super) fn plan_has_correlated_refs(plan: &PhysicalPlan) -> bool {
             group_by,
             projections,
             input,
-        }
-        | PhysicalNode::StreamAggregate {
-            group_by,
-            projections,
-            input,
         } => {
             group_by.iter().any(has_correlated_ref)
                 || projections.iter().any(|p| has_correlated_ref(&p.expr))

@@ -122,25 +122,27 @@ pub trait PhysicalOperator: Send + Sync + Debug {
     /// - Call `close()` on child operators
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()>;
 
-    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![]
-    }
-
-    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![]
-    }
-
     /// Estimated output row count for query planning.
     fn estimated_rows(&self) -> Option<usize> {
         None
     }
 
-    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
-    fn name(&self) -> &'static str;
+    #[cfg(test)]
+    fn children(&self) -> Vec<&dyn PhysicalOperator> {
+        vec![]
+    }
 
-    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
+    #[cfg(test)]
+    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
+        vec![]
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "Unknown"
+    }
+
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         None
     }

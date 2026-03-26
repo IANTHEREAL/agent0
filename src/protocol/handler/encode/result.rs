@@ -137,63 +137,57 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
             Ok(Response::Query(results))
         }
 
-        ExecuteResult::CreateTable { .. } => Ok(Response::Execution(Tag::new("CREATE TABLE"))),
+        ExecuteResult::CreateTable => Ok(Response::Execution(Tag::new("CREATE TABLE"))),
 
-        ExecuteResult::DropTable { .. } => Ok(Response::Execution(Tag::new("DROP TABLE"))),
+        ExecuteResult::DropTable => Ok(Response::Execution(Tag::new("DROP TABLE"))),
 
-        ExecuteResult::TruncateTable { .. } => Ok(Response::Execution(Tag::new("TRUNCATE TABLE"))),
+        ExecuteResult::TruncateTable => Ok(Response::Execution(Tag::new("TRUNCATE TABLE"))),
 
-        ExecuteResult::CreateIndex { .. } => Ok(Response::Execution(Tag::new("CREATE INDEX"))),
+        ExecuteResult::CreateIndex => Ok(Response::Execution(Tag::new("CREATE INDEX"))),
 
-        ExecuteResult::DropIndex { .. } => Ok(Response::Execution(Tag::new("DROP INDEX"))),
+        ExecuteResult::DropIndex => Ok(Response::Execution(Tag::new("DROP INDEX"))),
 
-        ExecuteResult::CreateView { .. } => Ok(Response::Execution(Tag::new("CREATE VIEW"))),
+        ExecuteResult::CreateView => Ok(Response::Execution(Tag::new("CREATE VIEW"))),
 
-        ExecuteResult::DropView { .. } => Ok(Response::Execution(Tag::new("DROP VIEW"))),
+        ExecuteResult::DropView => Ok(Response::Execution(Tag::new("DROP VIEW"))),
 
-        ExecuteResult::CreateMaterializedView { .. } => {
+        ExecuteResult::CreateMaterializedView => {
             Ok(Response::Execution(Tag::new("CREATE MATERIALIZED VIEW")))
         }
 
-        ExecuteResult::DropMaterializedView { .. } => {
+        ExecuteResult::DropMaterializedView => {
             Ok(Response::Execution(Tag::new("DROP MATERIALIZED VIEW")))
         }
 
-        ExecuteResult::RefreshMaterializedView { .. } => {
+        ExecuteResult::RefreshMaterializedView => {
             Ok(Response::Execution(Tag::new("REFRESH MATERIALIZED VIEW")))
         }
 
-        ExecuteResult::CreateProcedure { .. } => {
-            Ok(Response::Execution(Tag::new("CREATE PROCEDURE")))
-        }
+        ExecuteResult::CreateProcedure => Ok(Response::Execution(Tag::new("CREATE PROCEDURE"))),
 
-        ExecuteResult::DropProcedure { .. } => Ok(Response::Execution(Tag::new("DROP PROCEDURE"))),
+        ExecuteResult::DropProcedure => Ok(Response::Execution(Tag::new("DROP PROCEDURE"))),
 
-        ExecuteResult::CreateFunction { .. } => {
-            Ok(Response::Execution(Tag::new("CREATE FUNCTION")))
-        }
+        ExecuteResult::CreateFunction => Ok(Response::Execution(Tag::new("CREATE FUNCTION"))),
 
-        ExecuteResult::DropFunction { .. } => Ok(Response::Execution(Tag::new("DROP FUNCTION"))),
+        ExecuteResult::DropFunction => Ok(Response::Execution(Tag::new("DROP FUNCTION"))),
 
-        ExecuteResult::CreateTrigger { .. } => Ok(Response::Execution(Tag::new("CREATE TRIGGER"))),
+        ExecuteResult::CreateTrigger => Ok(Response::Execution(Tag::new("CREATE TRIGGER"))),
 
-        ExecuteResult::DropTrigger { .. } => Ok(Response::Execution(Tag::new("DROP TRIGGER"))),
+        ExecuteResult::DropTrigger => Ok(Response::Execution(Tag::new("DROP TRIGGER"))),
 
-        ExecuteResult::CreateExtension { .. } => {
-            Ok(Response::Execution(Tag::new("CREATE EXTENSION")))
-        }
+        ExecuteResult::CreateExtension => Ok(Response::Execution(Tag::new("CREATE EXTENSION"))),
 
-        ExecuteResult::DropExtension { .. } => Ok(Response::Execution(Tag::new("DROP EXTENSION"))),
+        ExecuteResult::DropExtension => Ok(Response::Execution(Tag::new("DROP EXTENSION"))),
 
         ExecuteResult::Call => Ok(Response::Execution(Tag::new("CALL"))),
 
-        ExecuteResult::AlterTable { .. } => Ok(Response::Execution(Tag::new("ALTER TABLE"))),
+        ExecuteResult::AlterTable => Ok(Response::Execution(Tag::new("ALTER TABLE"))),
 
-        ExecuteResult::AlterSequence { .. } => Ok(Response::Execution(Tag::new("ALTER SEQUENCE"))),
+        ExecuteResult::AlterSequence => Ok(Response::Execution(Tag::new("ALTER SEQUENCE"))),
 
-        ExecuteResult::AlterFunction { .. } => Ok(Response::Execution(Tag::new("ALTER FUNCTION"))),
+        ExecuteResult::AlterFunction => Ok(Response::Execution(Tag::new("ALTER FUNCTION"))),
 
-        ExecuteResult::AlterIndex { .. } => Ok(Response::Execution(Tag::new("ALTER INDEX"))),
+        ExecuteResult::AlterIndex => Ok(Response::Execution(Tag::new("ALTER INDEX"))),
 
         ExecuteResult::Insert { affected_rows } => Ok(Response::Execution(
             Tag::new("INSERT")
@@ -223,77 +217,6 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
             for table in tables {
                 let mut encoder = DataRowEncoder::new(fields.clone());
                 encoder.encode_field(&table)?;
-                data_rows.push(encoder.finish());
-            }
-
-            let row_stream = stream::iter(data_rows);
-            let results = QueryResponse::new(fields, row_stream);
-
-            Ok(Response::Query(results))
-        }
-
-        ExecuteResult::Describe { schema } => {
-            let fields = vec![
-                FieldInfo::new(
-                    "column_name".to_string(),
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                ),
-                FieldInfo::new(
-                    "data_type".to_string(),
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                ),
-                FieldInfo::new(
-                    "nullable".to_string(),
-                    None,
-                    None,
-                    Type::BOOL,
-                    FieldFormat::Text,
-                ),
-                FieldInfo::new(
-                    "primary_key".to_string(),
-                    None,
-                    None,
-                    Type::BOOL,
-                    FieldFormat::Text,
-                ),
-                FieldInfo::new(
-                    "default".to_string(),
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                ),
-            ];
-            let fields = Arc::new(fields);
-
-            let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
-            for col in &schema.columns {
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                encoder.encode_field(&col.name)?;
-                encoder.encode_field(&col.data_type.to_string())?;
-                encoder.encode_field(&col.nullable)?;
-                encoder.encode_field(&col.primary_key)?;
-
-                let default_val = if col.is_serial {
-                    use crate::sql::sequences::{classify_serial_default, SerialDefaultBehavior};
-                    match classify_serial_default(col.default_expr.as_deref()) {
-                        SerialDefaultBehavior::ImplicitSequence => {
-                            Some("SERIAL (AUTO_INC)".to_string())
-                        }
-                        SerialDefaultBehavior::ExplicitExpr(expr) => Some(expr.to_string()),
-                        SerialDefaultBehavior::ExplicitNull => None,
-                    }
-                } else {
-                    col.default_expr.clone()
-                };
-                encoder.encode_field(&default_val)?;
-
                 data_rows.push(encoder.finish());
             }
 

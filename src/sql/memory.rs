@@ -43,12 +43,6 @@ pub fn estimate_values_payload_size(values: &[Value]) -> usize {
     std::mem::size_of_val(values) + values.iter().map(estimate_value_size).sum::<usize>()
 }
 
-/// Estimate size of a `Vec<Value>` allocation plus pointed-to value contents.
-#[allow(dead_code)]
-pub fn estimate_values_size(values: &[Value]) -> usize {
-    std::mem::size_of::<Vec<Value>>() + estimate_values_payload_size(values)
-}
-
 /// Estimate size of a binary key stored inside hash sets/maps.
 pub fn estimate_key_size(key: &[u8]) -> usize {
     std::mem::size_of::<Vec<u8>>() + key.len()

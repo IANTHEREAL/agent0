@@ -6,7 +6,7 @@ use crate::sql::analyzer::types::{
 };
 use crate::sql::expr::typed_eval::eval_const_usize as eval_const_usize_shared;
 use crate::sql::operators::{
-    BoxedOperator, HashJoinConfig, HashJoinOperator, HashJoinType, JoinType as OpJoinType,
+    BoxedOperator, HashJoinOperator, HashJoinType, JoinType as OpJoinType,
     NestedLoopJoinOperator,
 };
 use crate::model::{DataType, TableSchema};
@@ -64,7 +64,6 @@ pub(super) fn build_join_operator(
                     right_keys,
                     left_is_build,
                     residual,
-                    HashJoinConfig::default(),
                 )))
             } else {
                 // Nested loop join with full condition.
@@ -91,7 +90,6 @@ pub(super) fn build_join_operator(
                     right_keys,
                     left_is_build,
                     None,
-                    HashJoinConfig::default(),
                 )))
             } else {
                 // Fall back to nested loop with synthesized equality condition.

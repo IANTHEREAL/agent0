@@ -29,7 +29,7 @@ impl<'a> Analyzer<'a> {
         on_conflict: &Option<OnInsert>,
     ) -> Result<AnalyzedInsert, AnalyzerError> {
         // Resolve target table.
-        let (resolved_name, table_schema, schema) = self.resolve_dml_target(table_name)?;
+        let (resolved_name, schema) = self.resolve_dml_target(table_name)?;
         // DML name resolution should follow relation-name semantics for qualified refs:
         // `schema.table.col` and `table.col` both target relation `table`.
         let target_scope_name = resolved_name
@@ -57,17 +57,10 @@ impl<'a> Analyzer<'a> {
         // Build scope for the target table (needed for RETURNING and ON CONFLICT).
         // Include all physical columns so ColumnRef indices align with executor's
         // physical row layout. Dropped columns become hidden placeholders.
-        let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
+        let table_cols: Vec<(String, DataType, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    c.data_type.clone(),
-                    c.nullable,
-                    c.collation.clone(),
-                )
-            })
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.collation.clone()))
             .collect();
 
         // Analyze source rows.
@@ -165,7 +158,6 @@ impl<'a> Analyzer<'a> {
 
         Ok(AnalyzedInsert {
             table_name: resolved_name,
-            table_schema,
             target_columns,
             source: analyzed_source,
             on_conflict: analyzed_on_conflict,
@@ -206,7 +198,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_on_conflict(
         &mut self,
         on_insert: &OnInsert,
-        table_cols: &[(String, DataType, bool, Option<String>)],
+        table_cols: &[(String, DataType, Option<String>)],
         schema: &crate::model::TableSchema,
         table_scope_name: &str,
         table_name_for_errors: &str,
@@ -227,7 +219,7 @@ impl<'a> Analyzer<'a> {
                     let mut scope = Scope::new();
                     let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
                     if has_dropped {
-                        let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> =
+                        let cols_with_dropped: Vec<(String, DataType, Option<String>, bool)> =
                             schema
                                 .columns
                                 .iter()
@@ -235,7 +227,6 @@ impl<'a> Analyzer<'a> {
                                     (
                                         c.name.clone(),
                                         c.data_type.clone(),
-                                        c.nullable,
                                         c.collation.clone(),
                                         c.is_dropped,
                                     )
@@ -288,20 +279,18 @@ impl<'a> Analyzer<'a> {
                 let mut scope = Scope::new();
                 let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
                 if has_dropped {
-                    let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> =
-                        schema
-                            .columns
-                            .iter()
-                            .map(|c| {
-                                (
-                                    c.name.clone(),
-                                    c.data_type.clone(),
-                                    c.nullable,
-                                    c.collation.clone(),
-                                    c.is_dropped,
-                                )
-                            })
-                            .collect();
+                    let cols_with_dropped: Vec<(String, DataType, Option<String>, bool)> = schema
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.name.clone(),
+                                c.data_type.clone(),
+                                c.collation.clone(),
+                                c.is_dropped,
+                            )
+                        })
+                        .collect();
                     scope.add_table_with_dropped_columns(
                         table_scope_name,
                         &cols_with_dropped,
@@ -371,35 +360,27 @@ impl<'a> Analyzer<'a> {
                 ))
             }
         };
-        let (resolved_name, table_schema, schema) = self.resolve_dml_target(target_name)?;
+        let (resolved_name, schema) = self.resolve_dml_target(target_name)?;
 
         // Build scope: target table (+ FROM tables if present).
         // Include all physical columns so ColumnRef indices align with physical rows.
-        let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
+        let table_cols: Vec<(String, DataType, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    c.data_type.clone(),
-                    c.nullable,
-                    c.collation.clone(),
-                )
-            })
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.collation.clone()))
             .collect();
 
         let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
         let mut scope = Scope::new();
         scope.set_add_system_columns(true);
         if has_dropped {
-            let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> = schema
+            let cols_with_dropped: Vec<(String, DataType, Option<String>, bool)> = schema
                 .columns
                 .iter()
                 .map(|c| {
                     (
                         c.name.clone(),
                         c.data_type.clone(),
-                        c.nullable,
                         c.collation.clone(),
                         c.is_dropped,
                     )
@@ -460,8 +441,6 @@ impl<'a> Analyzer<'a> {
 
         Ok(AnalyzedUpdate {
             table_name: resolved_name,
-            table_schema,
-            table_alias: target_alias,
             assignments: analyzed_assignments,
             from: analyzed_from,
             where_clause: analyzed_where,
@@ -498,35 +477,27 @@ impl<'a> Analyzer<'a> {
                 ))
             }
         };
-        let (resolved_name, table_schema, schema) = self.resolve_dml_target(target_name)?;
+        let (resolved_name, schema) = self.resolve_dml_target(target_name)?;
 
         // Build scope: target table + USING tables.
         // Include all physical columns so ColumnRef indices align with physical rows.
-        let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
+        let table_cols: Vec<(String, DataType, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    c.data_type.clone(),
-                    c.nullable,
-                    c.collation.clone(),
-                )
-            })
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.collation.clone()))
             .collect();
 
         let has_dropped = schema.columns.iter().any(|c| c.is_dropped);
         let mut scope = Scope::new();
         scope.set_add_system_columns(true);
         if has_dropped {
-            let cols_with_dropped: Vec<(String, DataType, bool, Option<String>, bool)> = schema
+            let cols_with_dropped: Vec<(String, DataType, Option<String>, bool)> = schema
                 .columns
                 .iter()
                 .map(|c| {
                     (
                         c.name.clone(),
                         c.data_type.clone(),
-                        c.nullable,
                         c.collation.clone(),
                         c.is_dropped,
                     )
@@ -577,8 +548,6 @@ impl<'a> Analyzer<'a> {
 
         Ok(AnalyzedDelete {
             table_name: resolved_name,
-            table_schema,
-            table_alias: target_alias,
             using: analyzed_using,
             where_clause: analyzed_where,
             returning: analyzed_returning,
@@ -589,11 +558,11 @@ impl<'a> Analyzer<'a> {
 
     /// Resolve a DML target table via the catalog.
     ///
-    /// Returns (resolved_table_name, table_ref_schema, full_table_schema).
+    /// Returns (resolved_table_name, full_table_schema).
     fn resolve_dml_target(
         &self,
         name: &ObjectName,
-    ) -> Result<(String, TableRefSchema, crate::model::TableSchema), AnalyzerError> {
+    ) -> Result<(String, crate::model::TableSchema), AnalyzerError> {
         let (schema_opt, obj_name) =
             split_object_name(name).map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
         let (resolved_name, table_schema) = self
@@ -602,16 +571,7 @@ impl<'a> Analyzer<'a> {
             .map_err(|e| AnalyzerError::Internal(e.to_string()))?
             .ok_or_else(|| AnalyzerError::TableNotFound(obj_name.clone()))?;
 
-        let ref_schema = TableRefSchema {
-            table_id: table_schema.table_id,
-            columns: table_schema
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-                .collect(),
-        };
-
-        Ok((resolved_name, ref_schema, table_schema))
+        Ok((resolved_name, table_schema))
     }
 
     /// Find a column index by name in a table schema.

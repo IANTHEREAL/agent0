@@ -170,7 +170,6 @@ async fn try_streaming_ctas_for_read_parquet(
         columns,
         column_types,
         stream: crate::sql::result::RowStream(boxed),
-        timezone: std::sync::Arc::from("UTC"),
     }))
 }
 
@@ -426,7 +425,6 @@ impl Executor {
         index_names: &[ObjectName],
         if_exists: bool,
     ) -> Result<ExecuteResult> {
-        let mut last_index = String::new();
         let tables = self.store().list_tables(txn, db_id).await?;
         for name in index_names {
             let (schema_opt, idx_name) = names::split_object_name(name)?;
@@ -495,14 +493,11 @@ impl Executor {
                 rows,
             )
             .await?;
-            let Some(dropped) = dropped else {
+            if dropped.is_none() {
                 return Err(SqlError::RelationNotFound(idx_name.to_string()).into());
-            };
-            last_index = dropped;
+            }
         }
-        Ok(ExecuteResult::DropIndex {
-            index_name: last_index,
-        })
+        Ok(ExecuteResult::DropIndex)
     }
 
     pub(crate) async fn execute_alter_table(

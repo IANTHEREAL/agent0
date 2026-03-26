@@ -127,13 +127,13 @@ fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     scope.add_table(
         "users",
         &[
-            ("id".to_string(), DataType::Int32, false, None),
-            ("name".to_string(), DataType::Text, true, None),
-            ("age".to_string(), DataType::Int32, true, None),
-            ("email".to_string(), DataType::Text, true, None),
-            ("active".to_string(), DataType::Boolean, true, None),
-            ("score".to_string(), DataType::Float64, true, None),
-            ("created_at".to_string(), DataType::Timestamp, true, None),
+            ("id".to_string(), DataType::Int32, None),
+            ("name".to_string(), DataType::Text, None),
+            ("age".to_string(), DataType::Int32, None),
+            ("email".to_string(), DataType::Text, None),
+            ("active".to_string(), DataType::Boolean, None),
+            ("score".to_string(), DataType::Float64, None),
+            ("created_at".to_string(), DataType::Timestamp, None),
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
@@ -156,9 +156,9 @@ fn analyze_expr_with_vector_column(sql: &str) -> Result<TypedExpr, AnalyzerError
     scope.add_table(
         "docs",
         &[
-            ("id".to_string(), DataType::Int32, false, None),
-            ("content".to_string(), DataType::Text, true, None),
-            ("content_vec".to_string(), DataType::Vector(256), true, None),
+            ("id".to_string(), DataType::Int32, None),
+            ("content".to_string(), DataType::Text, None),
+            ("content_vec".to_string(), DataType::Vector(256), None),
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
@@ -173,13 +173,13 @@ fn analyze_expr_no_aggregates(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     scope.add_table(
         "users",
         &[
-            ("id".to_string(), DataType::Int32, false, None),
-            ("name".to_string(), DataType::Text, true, None),
-            ("age".to_string(), DataType::Int32, true, None),
-            ("email".to_string(), DataType::Text, true, None),
-            ("active".to_string(), DataType::Boolean, true, None),
-            ("score".to_string(), DataType::Float64, true, None),
-            ("created_at".to_string(), DataType::Timestamp, true, None),
+            ("id".to_string(), DataType::Int32, None),
+            ("name".to_string(), DataType::Text, None),
+            ("age".to_string(), DataType::Int32, None),
+            ("email".to_string(), DataType::Text, None),
+            ("active".to_string(), DataType::Boolean, None),
+            ("score".to_string(), DataType::Float64, None),
+            ("created_at".to_string(), DataType::Timestamp, None),
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
@@ -3770,8 +3770,8 @@ fn analyze_pg_get_serial_sequence_existing_schema_returns_function_not_found() {
     scope.add_table(
         "users",
         &[
-            ("id".to_string(), DataType::Int32, false, None),
-            ("name".to_string(), DataType::Text, true, None),
+            ("id".to_string(), DataType::Int32, None),
+            ("name".to_string(), DataType::Text, None),
         ],
     );
     let err = Analyzer::analyze_expr_with_scope(

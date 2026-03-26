@@ -465,7 +465,6 @@ pub(super) async fn alter_table_drop_constraint(
     schema: &mut crate::model::TableSchema,
     full_table_name: &str,
     table_object_name: &str,
-    result_table_name: &str,
     if_exists: bool,
     name: &sqlparser::ast::Ident,
     cascade: bool,
@@ -521,9 +520,7 @@ pub(super) async fn alter_table_drop_constraint(
             schema.pk_constraint_name = None;
             schema.version += 1;
             store.update_schema(txn, db_id, schema.clone()).await?;
-            return Ok(Some(ExecuteResult::AlterTable {
-                table_name: result_table_name.to_string(),
-            }));
+            return Ok(Some(ExecuteResult::AlterTable));
         }
     }
 
@@ -535,18 +532,14 @@ pub(super) async fn alter_table_drop_constraint(
         schema.foreign_keys.remove(pos);
         schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
-        return Ok(Some(ExecuteResult::AlterTable {
-            table_name: result_table_name.to_string(),
-        }));
+        return Ok(Some(ExecuteResult::AlterTable));
     }
 
     if let Some(pos) = find_check_constraint_index(schema, table_object_name, &constraint_name) {
         schema.check_constraints.remove(pos);
         schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
-        return Ok(Some(ExecuteResult::AlterTable {
-            table_name: result_table_name.to_string(),
-        }));
+        return Ok(Some(ExecuteResult::AlterTable));
     }
 
     if let Some(pos) = find_unique_constraint_index(schema, &constraint_name) {
@@ -573,9 +566,7 @@ pub(super) async fn alter_table_drop_constraint(
 
         schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
-        return Ok(Some(ExecuteResult::AlterTable {
-            table_name: result_table_name.to_string(),
-        }));
+        return Ok(Some(ExecuteResult::AlterTable));
     }
 
     if !if_exists {

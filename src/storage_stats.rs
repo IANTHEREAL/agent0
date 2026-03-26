@@ -268,7 +268,7 @@ impl StorageStatsCache {
     }
 
     /// Remove cached stats for a database (e.g., on DROP DATABASE).
-    #[allow(dead_code)] // used by DROP DATABASE cleanup (Phase 3)
+    #[cfg(test)]
     pub fn evict(&self, keyspace: &str, db_id: u64) {
         let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
         map.remove(&(keyspace.to_string(), db_id));

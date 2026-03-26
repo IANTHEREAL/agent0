@@ -984,10 +984,7 @@ pub enum AnalyzedStatement {
 pub struct AnalyzedInsert {
     /// Fully qualified table name (for storage ops).
     pub table_name: String,
-    /// Resolved table schema (for IR completeness; executor re-fetches from store).
-    #[allow(dead_code)] // framework: typed IR variant
-    pub table_schema: TableRefSchema,
-    /// Column indices being inserted (maps to positions in `table_schema.columns`).
+    /// Column indices being inserted (maps to positions in table columns).
     pub target_columns: Vec<usize>,
     /// Row source.
     pub source: AnalyzedInsertSource,
@@ -1042,12 +1039,6 @@ pub enum AnalyzedOnConflict {
 pub struct AnalyzedUpdate {
     /// Fully qualified table name.
     pub table_name: String,
-    /// Resolved table schema (for IR completeness; executor re-fetches from store).
-    #[allow(dead_code)] // framework: typed IR variant
-    pub table_schema: TableRefSchema,
-    /// Table alias (or bare table name).
-    #[allow(dead_code)] // framework: typed IR variant
-    pub table_alias: String,
     /// SET assignments: (column_index, typed value expression).
     pub assignments: Vec<(usize, TypedExpr)>,
     /// FROM clause tables (for UPDATE ... FROM ... WHERE ...).
@@ -1063,12 +1054,6 @@ pub struct AnalyzedUpdate {
 pub struct AnalyzedDelete {
     /// Fully qualified table name.
     pub table_name: String,
-    /// Resolved table schema (for IR completeness; executor re-fetches from store).
-    #[allow(dead_code)] // framework: typed IR variant
-    pub table_schema: TableRefSchema,
-    /// Table alias (or bare table name).
-    #[allow(dead_code)] // framework: typed IR variant
-    pub table_alias: String,
     /// USING clause tables (for DELETE ... USING ... WHERE ...).
     pub using: Vec<AnalyzedTableRef>,
     /// WHERE predicate (type-checked to boolean).

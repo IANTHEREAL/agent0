@@ -124,19 +124,6 @@ impl NestedLoopJoinOperator {
     }
 
     #[allow(dead_code)] // forward-compat: correlated/LATERAL subquery joins
-    pub fn new_with_outer_dependency(
-        left: BoxedOperator,
-        right: BoxedOperator,
-        join_type: JoinType,
-        condition: Option<TypedExpr>,
-        right_depends_on_outer: bool,
-    ) -> Self {
-        let mut op = Self::new(left, right, join_type, condition);
-        op.right_depends_on_outer = right_depends_on_outer;
-        op
-    }
-
-    #[allow(dead_code)] // forward-compat: correlated/LATERAL subquery joins
     pub fn with_outer_dependency(mut self, right_depends_on_outer: bool) -> Self {
         self.right_depends_on_outer = right_depends_on_outer;
         self
@@ -330,18 +317,12 @@ impl PhysicalOperator for NestedLoopJoinOperator {
         Ok(())
     }
 
-    fn children(&self) -> Vec<&dyn PhysicalOperator> {
-        vec![self.left.as_ref(), self.right.as_ref()]
-    }
-
-    fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
-        vec![self.left.as_mut(), self.right.as_mut()]
-    }
-
+    #[cfg(test)]
     fn name(&self) -> &'static str {
         "NestedLoopJoin"
     }
 
+    #[cfg(test)]
     fn explain_info(&self) -> Option<String> {
         let join_type_str = match self.join_type {
             JoinType::Inner => "INNER",

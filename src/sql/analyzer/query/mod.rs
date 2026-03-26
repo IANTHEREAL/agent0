@@ -176,7 +176,7 @@ impl<'a> Analyzer<'a> {
                 for (name, dt, _coll) in &output_schema {
                     self.scopes
                         .current_mut()
-                        .add_column(None, name, dt.clone(), true, None);
+                        .add_column(None, name, dt.clone(), None);
                 }
 
                 let analyzed_order_by = self.analyze_order_by_exprs(&query.order_by, &[])?;
@@ -338,7 +338,7 @@ impl<'a> Analyzer<'a> {
         for (name, dt, _coll) in &output_schema {
             self.scopes
                 .current_mut()
-                .add_column(None, name, dt.clone(), true, None);
+                .add_column(None, name, dt.clone(), None);
         }
 
         // Build synthetic projection so ORDER BY positional refs (ORDER BY 1) map correctly.
