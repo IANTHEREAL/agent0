@@ -4276,6 +4276,131 @@ async fn remove_inode_recursive(
     Ok(removed)
 }
 
+// ---------------------------------------------------------------------------
+// Storage statistics aggregation (used by fs9_storage_stats() TVF)
+// ---------------------------------------------------------------------------
+
+/// Aggregated filesystem storage statistics.
+pub(crate) struct FsStorageStats {
+    pub total_files: i64,
+    pub total_directories: i64,
+    pub total_logical_bytes: i64,
+}
+
+/// Non-initializing, validated superblock probe.
+///
+/// Returns `Ok(Some(superblock))` if the filesystem is fully initialized
+/// (superblock + root inode + allocators all present and valid).
+/// Returns `Ok(None)` if no superblock key exists (fs never initialized).
+/// Returns `Err(...)` if the superblock exists but the filesystem is in a
+/// corrupt or partially-initialized state.
+///
+/// Uses a read-only transaction — no writes, no side effects.
+pub(crate) async fn probe_superblock_readonly(
+    client: &Arc<TransactionClient>,
+) -> Result<Option<Superblock>> {
+    let mut txn = begin_read_transaction(client).await?;
+    let maybe_superblock = load_current_superblock_if_present(&mut txn).await?;
+    let Some(superblock) = maybe_superblock else {
+        return Ok(None);
+    };
+
+    if load_inode(&mut txn, ROOT_INODE).await?.is_none() {
+        return Err(anyhow!(EmbeddedFsError::internal(
+            "filesystem root inode missing for initialized fs9 keyspace",
+        )));
+    }
+    let _ = load_allocator_counter(&mut txn, &keys::inode_allocator_key(), "inode").await?;
+    let _ = load_allocator_counter(&mut txn, &keys::bundle_allocator_key(), "bundle").await?;
+
+    Ok(Some(superblock))
+}
+
+/// Scan all inode metadata keys and aggregate storage statistics.
+///
+/// This performs a single TiKV range scan over the `_fs_I` prefix, reading only
+/// inode metadata (~200 bytes each). Page data (`_fs_P`) is never touched,
+/// making this efficient even for large namespaces.
+pub(crate) async fn aggregate_storage_stats(
+    client: &Arc<TransactionClient>,
+) -> Result<FsStorageStats> {
+    let mut txn = begin_read_transaction(client).await?;
+    let prefix = keys::inode_prefix();
+    let end = keys::scan_end_key(&prefix);
+
+    let mut total_files: i64 = 0;
+    let mut total_directories: i64 = 0;
+    let mut total_logical_bytes: i64 = 0;
+
+    // Paginated scan to bound memory usage for large namespaces.
+    const SCAN_BATCH: u32 = 4096;
+    let mut scan_start = prefix.clone();
+
+    loop {
+        let pairs: Vec<_> = txn
+            .scan(scan_start.clone()..end.clone(), SCAN_BATCH)
+            .await?
+            .collect();
+
+        if pairs.is_empty() {
+            break;
+        }
+
+        let mut last_key: Option<Vec<u8>> = None;
+
+        for pair in &pairs {
+            let key: Vec<u8> = pair.0.clone().into();
+            let value = &pair.1;
+            last_key = Some(key.clone());
+
+            // Extract inode_id from key for error context.
+            let inode_id = if key.len() >= prefix.len() + 8 {
+                u64::from_be_bytes(
+                    key[prefix.len()..prefix.len() + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                )
+            } else {
+                continue; // malformed key, skip
+            };
+
+            let inode = match deserialize_inode(inode_id, value) {
+                Ok(inode) => inode,
+                Err(_) => continue, // skip corrupt/unrecognized inodes
+            };
+
+            match inode.inode_type {
+                InodeType::File => {
+                    total_files += 1;
+                    total_logical_bytes += inode.size as i64;
+                }
+                InodeType::Directory => {
+                    total_directories += 1;
+                }
+                _ => {} // symlinks etc — count but don't add size
+            }
+        }
+
+        // If we got fewer than SCAN_BATCH, we've exhausted the range.
+        if (pairs.len() as u32) < SCAN_BATCH {
+            break;
+        }
+
+        // Advance past the last key for the next batch.
+        if let Some(last) = last_key {
+            scan_start = next_scan_start_key(&last);
+        } else {
+            break;
+        }
+    }
+
+    Ok(FsStorageStats {
+        total_files,
+        total_directories,
+        total_logical_bytes,
+    })
+}
+
 #[cfg(test)]
 mod bench_grouped_write;
 #[cfg(test)]

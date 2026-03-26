@@ -514,6 +514,61 @@ pub fn enqueue_persist_events(keyspace: &str, builders: Vec<FsEventBuilder>) {
 }
 
 // ---------------------------------------------------------------------------
+// fs9_storage_stats() table function schema + execution
+// ---------------------------------------------------------------------------
+
+/// Return the output schema for `fs9_storage_stats()`.
+pub fn fs9_storage_stats_schema() -> TableSchema {
+    TableSchema::virtual_table(
+        "fs9_storage_stats",
+        vec![
+            ColumnDef::new("total_files", DataType::Int64, false),
+            ColumnDef::new("total_directories", DataType::Int64, false),
+            ColumnDef::new("total_logical_bytes", DataType::Int64, false),
+        ],
+    )
+}
+
+/// Execute `fs9_storage_stats()` by scanning inode metadata in TiKV.
+///
+/// Returns a single row with aggregated file count, directory count,
+/// and total logical bytes across all files in the filesystem namespace.
+///
+/// If the filesystem has not been initialized (no superblock), returns zeros
+/// without creating any state. Real errors (corruption, TiKV failures) are
+/// propagated, not flattened.
+pub async fn execute_fs9_storage_stats(_tenant_keyspace: &str) -> Result<Vec<Row>, String> {
+    let client = crate::extensions::context::tikv_client().ok_or_else(|| {
+        "fs9_storage_stats: TiKV client not available in extension context".to_string()
+    })?;
+
+    // Non-initializing, validated superblock probe: read-only, no side effects.
+    // Returns zeros only when fs is genuinely absent (no superblock).
+    // Propagates errors for corrupt or partially-initialized state.
+    let superblock = super::embedded::pagefs::probe_superblock_readonly(&client)
+        .await
+        .map_err(|e| format!("fs9_storage_stats: {e}"))?;
+
+    if superblock.is_none() {
+        return Ok(vec![Row::new(vec![
+            Value::Int64(0),
+            Value::Int64(0),
+            Value::Int64(0),
+        ])]);
+    }
+
+    let stats = super::embedded::pagefs::aggregate_storage_stats(&client)
+        .await
+        .map_err(|e| format!("fs9_storage_stats: {e}"))?;
+
+    Ok(vec![Row::new(vec![
+        Value::Int64(stats.total_files),
+        Value::Int64(stats.total_directories),
+        Value::Int64(stats.total_logical_bytes),
+    ])])
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -37,6 +37,13 @@ pub(crate) fn bundle_allocator_key() -> Vec<u8> {
     b"_fs_AB".to_vec()
 }
 
+/// Inode prefix for scanning all inodes: `_fs_I`
+///
+/// Used for range scans to iterate over all inode metadata entries.
+pub(crate) fn inode_prefix() -> Vec<u8> {
+    b"_fs_I".to_vec()
+}
+
 /// Inode key: `_fs_I` + inode_id (big-endian u64)
 ///
 /// Each inode stores file/directory metadata (size, mode, timestamps, etc.).

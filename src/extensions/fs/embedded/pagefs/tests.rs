@@ -3333,3 +3333,102 @@ async fn test_write_file_event_visible_through_fs9_events() {
 
     cleanup(&fs, base).await;
 }
+
+// ── Storage stats probe regression tests (require TiKV) ─────────────
+//
+// Verifies that probe_superblock_readonly() and aggregate_storage_stats()
+// behave correctly on both fresh (uninitialized) and initialized keyspaces.
+//
+//   cargo test -p db9-server storage_stats_behavioral -- --ignored
+
+/// Fresh keyspace: probe_superblock_readonly returns None without creating
+/// any filesystem state. This is a regression guard — the first version of
+/// fs9_storage_stats() accidentally walked through load_runtime_superblock
+/// which could initialize the filesystem as a side effect.
+#[tokio::test]
+#[ignore]
+async fn test_storage_stats_fresh_keyspace_returns_none_without_init() {
+    // Use a unique keyspace that has never been initialized.
+    let keyspace = format!("fs9_stats_noinit_{}_{}", std::process::id(), 0);
+    let pd_raw = std::env::var("PD_ENDPOINTS").unwrap_or("127.0.0.1:2379".into());
+    let pd_addrs: Vec<String> = pd_raw.split(',').map(|s| s.trim().to_string()).collect();
+    ensure_behavioral_test_keyspace(&pd_addrs, &keyspace).await;
+
+    let mut config = tikv_client::Config::default().with_keyspace(&keyspace);
+    if let (Ok(ca), Ok(cert), Ok(key)) = (
+        std::env::var("TIKV_CA_PATH"),
+        std::env::var("TIKV_CERT_PATH"),
+        std::env::var("TIKV_KEY_PATH"),
+    ) {
+        config = config.with_security(ca, cert, key);
+    }
+    let client = TransactionClient::new_with_config(pd_addrs, config)
+        .await
+        .expect("TiKV connection required for behavioral tests");
+    let client = Arc::new(client);
+
+    // Probe should return None (not initialized).
+    let result = probe_superblock_readonly(&client).await.unwrap();
+    assert!(
+        result.is_none(),
+        "fresh keyspace must return None from probe_superblock_readonly"
+    );
+
+    // Aggregate stats should also work (returns zeros).
+    let stats = aggregate_storage_stats(&client).await.unwrap();
+    assert_eq!(stats.total_files, 0);
+    assert_eq!(stats.total_directories, 0);
+    assert_eq!(stats.total_logical_bytes, 0);
+
+    // Verify no side effects: superblock key must still be absent.
+    let result_after = probe_superblock_readonly(&client).await.unwrap();
+    assert!(
+        result_after.is_none(),
+        "probe_superblock_readonly must not create fs state as a side effect"
+    );
+}
+
+/// Initialized keyspace: aggregate_storage_stats returns correct counts.
+#[tokio::test]
+#[ignore]
+async fn test_storage_stats_initialized_keyspace_returns_counts() {
+    let fs = make_fs().await;
+
+    // Write some test files.
+    let base = "/tmp/storage_stats_test";
+    cleanup(&fs, base).await;
+    ensure_dir(&fs, base).await;
+    fs.write_file(&format!("{base}/a.txt"), b"hello", None)
+        .await
+        .unwrap();
+    fs.write_file(&format!("{base}/b.txt"), b"world!", None)
+        .await
+        .unwrap();
+
+    // Probe should return Some.
+    let result = probe_superblock_readonly(&fs.client).await.unwrap();
+    assert!(
+        result.is_some(),
+        "initialized keyspace must have superblock"
+    );
+
+    // Aggregate stats should reflect our files.
+    let stats = aggregate_storage_stats(&fs.client).await.unwrap();
+    assert!(
+        stats.total_files >= 2,
+        "expected at least 2 files, got {}",
+        stats.total_files
+    );
+    assert!(
+        stats.total_logical_bytes >= 11,
+        "expected at least 11 bytes (hello + world!), got {}",
+        stats.total_logical_bytes
+    );
+    assert!(
+        stats.total_directories >= 1,
+        "expected at least 1 directory, got {}",
+        stats.total_directories
+    );
+
+    cleanup(&fs, base).await;
+}

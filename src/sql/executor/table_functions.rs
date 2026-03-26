@@ -403,6 +403,12 @@ impl Executor {
             )
             .await
             .map_err(|e| anyhow!("{}", e))?
+        } else if func_upper == "FS9_STORAGE_STATS" {
+            // fs9_storage_stats() — no arguments
+            let keyspace = self.tenant_keyspace();
+            crate::extensions::fs::notify::execute_fs9_storage_stats(keyspace)
+                .await
+                .map_err(|e| anyhow!("{}", e))?
         } else if func_upper == "UNNEST" {
             let mut columns: Vec<Vec<Value>> = Vec::with_capacity(evaluated_args.len());
             for arg in &evaluated_args {
