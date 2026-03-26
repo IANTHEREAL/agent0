@@ -54,6 +54,10 @@ pub(crate) struct FsBatchWriteGroupedResult {
     /// Number of subgroup transactions actually executed by the backend.
     /// This accounts for chunking within large directory groups.
     pub actual_subgroup_count: usize,
+    /// Total number of server-side retries across all subgroups (txn_conflict).
+    pub total_retries: usize,
+    /// Number of subgroups where retries were exhausted (still failed after all attempts).
+    pub retries_exhausted: usize,
 }
 
 #[derive(Debug, Clone)]

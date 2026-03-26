@@ -1119,6 +1119,8 @@ async fn handle_batch_write_atomic(
                         "subgroup_count": 0,
                         "entries_committed": 0,
                         "entries_failed": files.len(),
+                        "retry_count": 0,
+                        "retries_exhausted": 0,
                         "fallback_reason_counts": {}
                     }
                 }),
@@ -1126,6 +1128,8 @@ async fn handle_batch_write_atomic(
         }
     };
     let subgroup_count = grouped_result.actual_subgroup_count;
+    let total_retries = grouped_result.total_retries;
+    let retries_exhausted = grouped_result.retries_exhausted;
 
     // ── Build response ───────────────────────────────────────────────────
     let mut entries = Vec::with_capacity(grouped_result.entries.len());
@@ -1177,6 +1181,8 @@ async fn handle_batch_write_atomic(
                 "subgroup_count": subgroup_count,
                 "entries_committed": committed,
                 "entries_failed": failed,
+                "retry_count": total_retries,
+                "retries_exhausted": retries_exhausted,
                 "fallback_reason_counts": fallback_reasons
             }
         }),
@@ -1816,6 +1822,8 @@ mod tests {
                 Ok(FsBatchWriteGroupedResult {
                     entries,
                     actual_subgroup_count,
+                    total_retries: 0,
+                    retries_exhausted: 0,
                 })
             }
             async fn begin_write_stream(

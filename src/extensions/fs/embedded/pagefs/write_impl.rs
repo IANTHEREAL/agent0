@@ -733,6 +733,8 @@ impl EmbeddedPageFs {
             return Ok(FsBatchWriteGroupedResult {
                 entries: Vec::new(),
                 actual_subgroup_count: 0,
+                total_retries: 0,
+                retries_exhausted: 0,
             });
         }
 
@@ -810,7 +812,10 @@ impl EmbeddedPageFs {
 
         // --- Process each directory group, splitting by subgroup_size ---
         let max_subgroup = fs9_config().grouped_write_subgroup_size;
+        let retry_attempts = fs9_config().tikv_commit_retry_attempts.max(1);
         let mut actual_subgroup_count = 0usize;
+        let mut total_retries = 0usize;
+        let mut retries_exhausted = 0usize;
         for (parent_dir, group_files) in &groups {
             // Split large directory groups into chunks of max_subgroup
             for chunk in group_files.chunks(max_subgroup) {
@@ -823,13 +828,34 @@ impl EmbeddedPageFs {
                     .map(|gf| (gf.file_name.clone(), gf.data.as_slice(), gf.mode))
                     .collect();
 
-                match self.write_directory_group_txn(parent_dir, &txn_files).await {
+                // Retry loop: on txn_conflict, retry with exponential backoff
+                // before returning failure to the client.
+                let outcome = retry_subgroup_op(retry_attempts, |_attempt| {
+                    self.write_directory_group_txn(parent_dir, &txn_files)
+                })
+                .await;
+
+                if outcome.retried {
+                    total_retries += outcome.attempts_used.saturating_sub(1) as usize;
+                }
+
+                match outcome.result {
                     Ok(written_sizes) => {
                         let elapsed_ms = t0.elapsed().as_millis();
-                        debug!(
-                            parent_dir,
-                            chunk_size, elapsed_ms, "fs9: directory subgroup committed"
-                        );
+                        if outcome.retried {
+                            debug!(
+                                parent_dir,
+                                chunk_size,
+                                elapsed_ms,
+                                attempts = outcome.attempts_used,
+                                "fs9: directory subgroup committed after retry"
+                            );
+                        } else {
+                            debug!(
+                                parent_dir,
+                                chunk_size, elapsed_ms, "fs9: directory subgroup committed"
+                            );
+                        }
                         for (gf, written) in chunk.iter().zip(written_sizes) {
                             results[gf.original_index] = Some(FsBatchWriteEntry {
                                 path: gf.full_path.clone(),
@@ -841,6 +867,9 @@ impl EmbeddedPageFs {
                     Err(err) => {
                         let elapsed_ms = t0.elapsed().as_millis();
                         let category = classify_group_commit_error(&err);
+                        if category == "execution.txn_conflict" {
+                            retries_exhausted += 1;
+                        }
                         warn!(
                             parent_dir,
                             chunk_size,
@@ -868,6 +897,8 @@ impl EmbeddedPageFs {
         Ok(FsBatchWriteGroupedResult {
             entries: results.into_iter().map(|r| r.unwrap()).collect(),
             actual_subgroup_count,
+            total_retries,
+            retries_exhausted,
         })
     }
 
@@ -1066,6 +1097,61 @@ fn classify_group_commit_error(err: &anyhow::Error) -> &'static str {
     "execution.unknown"
 }
 
+/// Determine whether a subgroup commit error should be retried.
+/// Only `execution.txn_conflict` is retryable.
+fn is_retryable_subgroup_error(err: &anyhow::Error) -> bool {
+    classify_group_commit_error(err) == "execution.txn_conflict"
+}
+
+/// Result of a subgroup retry loop.
+#[derive(Debug)]
+struct SubgroupRetryOutcome<T> {
+    result: Result<T>,
+    attempts_used: u32,
+    retried: bool,
+}
+
+/// Execute `op` up to `max_attempts` times, retrying on retryable subgroup errors
+/// with exponential backoff. Returns the outcome including retry accounting.
+///
+/// This is the core retry logic extracted for testability.
+async fn retry_subgroup_op<F, Fut, T>(max_attempts: u32, mut op: F) -> SubgroupRetryOutcome<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..max_attempts {
+        match op(attempt).await {
+            Ok(val) => {
+                return SubgroupRetryOutcome {
+                    result: Ok(val),
+                    attempts_used: attempt + 1,
+                    retried: attempt > 0,
+                };
+            }
+            Err(err) => {
+                if is_retryable_subgroup_error(&err) && attempt + 1 < max_attempts {
+                    super::fs9_commit_backoff(attempt).await;
+                    last_err = Some(err);
+                } else {
+                    return SubgroupRetryOutcome {
+                        result: Err(err),
+                        attempts_used: attempt + 1,
+                        retried: attempt > 0,
+                    };
+                }
+            }
+        }
+    }
+    // All attempts exhausted via retryable errors
+    SubgroupRetryOutcome {
+        result: Err(last_err.unwrap()),
+        attempts_used: max_attempts,
+        retried: max_attempts > 1,
+    }
+}
+
 #[cfg(test)]
 mod classify_tests {
     use super::*;
@@ -1130,5 +1216,109 @@ mod classify_tests {
     fn classify_unknown_error() {
         let err = anyhow::anyhow!("something unexpected");
         assert_eq!(classify_group_commit_error(&err), "execution.unknown");
+    }
+
+    // --- Retry decision tests ---
+
+    #[test]
+    fn retryable_on_txn_conflict() {
+        let key_err =
+            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }));
+        let err = anyhow::anyhow!(key_err);
+        assert!(is_retryable_subgroup_error(&err));
+    }
+
+    #[test]
+    fn retryable_on_embedded_fs_conflict() {
+        let err = anyhow::anyhow!(EmbeddedFsError::Conflict("restart".to_string()));
+        assert!(is_retryable_subgroup_error(&err));
+    }
+
+    #[test]
+    fn not_retryable_on_timeout() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out");
+        let err = anyhow::anyhow!(io_err);
+        assert!(!is_retryable_subgroup_error(&err));
+    }
+
+    #[test]
+    fn not_retryable_on_parent_not_found() {
+        let err = anyhow::anyhow!(EmbeddedFsError::NotFound("/missing".to_string()));
+        assert!(!is_retryable_subgroup_error(&err));
+    }
+
+    #[test]
+    fn not_retryable_on_unknown() {
+        let err = anyhow::anyhow!("something unexpected");
+        assert!(!is_retryable_subgroup_error(&err));
+    }
+
+    // --- Retry loop behavior tests ---
+
+    fn make_txn_conflict_error() -> anyhow::Error {
+        anyhow::anyhow!(tikv_client::Error::KeyError(Box::new(
+            tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }
+        )))
+    }
+
+    #[tokio::test]
+    async fn retry_loop_conflict_then_success() {
+        // First attempt: txn_conflict, second attempt: success
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let outcome = retry_subgroup_op(3, |_attempt| {
+            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(make_txn_conflict_error())
+                } else {
+                    Ok(42usize)
+                }
+            }
+        })
+        .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.result.unwrap(), 42);
+        assert_eq!(outcome.attempts_used, 2);
+        assert!(outcome.retried);
+    }
+
+    #[tokio::test]
+    async fn retry_loop_conflict_exhausted() {
+        // All attempts: txn_conflict → retries exhaust
+        let outcome = retry_subgroup_op(3, |_attempt| async {
+            Err::<usize, _>(make_txn_conflict_error())
+        })
+        .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.attempts_used, 3);
+        assert!(outcome.retried);
+        assert_eq!(
+            classify_group_commit_error(&outcome.result.unwrap_err()),
+            "execution.txn_conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_loop_non_retryable_no_retry() {
+        // Non-retryable error → no retry, immediate failure
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let outcome = retry_subgroup_op(3, |_attempt| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<usize, _>(anyhow::anyhow!("something unexpected")) }
+        })
+        .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.attempts_used, 1);
+        assert!(!outcome.retried);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

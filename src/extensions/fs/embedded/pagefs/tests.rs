@@ -3300,15 +3300,14 @@ async fn test_write_file_event_visible_through_fs9_events() {
         let rows = execute_fs9_events_from_redis(&fs.keyspace, &since_id, Some(base), 100)
             .await
             .unwrap_or_default();
-        let matching = rows.iter().any(|r| {
-            matches!(&r.values[2], crate::model::Value::Text(p) if p == &path)
-        });
+        let matching = rows
+            .iter()
+            .any(|r| matches!(&r.values[2], crate::model::Value::Text(p) if p == &path));
         if matching {
             // Verify event type is CREATE or WRITE.
             let event_row = rows
                 .iter()
-                .filter(|r| matches!(&r.values[2], crate::model::Value::Text(p) if p == &path))
-                .last()
+                .rfind(|r| matches!(&r.values[2], crate::model::Value::Text(p) if p == &path))
                 .unwrap();
             let event_type = match &event_row.values[1] {
                 crate::model::Value::Text(t) => t.as_str(),

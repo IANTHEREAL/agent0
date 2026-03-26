@@ -4196,7 +4196,7 @@ fn is_retryable_tikv_write_conflict(err: &anyhow::Error) -> bool {
     })
 }
 
-async fn fs9_commit_backoff(attempt: u32) {
+pub(super) async fn fs9_commit_backoff(attempt: u32) {
     let base_ms = fs9_config().tikv_commit_retry_base_ms.max(1);
     let factor = 1u64 << attempt.min(10);
     sleep(std::time::Duration::from_millis(
