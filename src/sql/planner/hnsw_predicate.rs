@@ -143,9 +143,56 @@ fn try_extract_constant_vector(expr: &TypedExpr) -> Option<Vec<Value>> {
                 _ => None,
             })
             .collect(),
-        TypedExprKind::Cast { expr, .. } => try_extract_constant_vector(expr),
+        // Handle text-literal vector syntax: '[1,0,0]'::vector produces
+        // Cast(Constant(Text("[1,0,0]")), Vector(N)). We handle this in the
+        // Cast arm (below) rather than as a bare Constant(Text) to avoid
+        // hijacking vec_embed_* text arguments that happen to look like vectors.
+        TypedExprKind::Cast {
+            expr, target_type, ..
+        } => {
+            // When the Cast target is Vector and the inner expr is a text
+            // literal, parse the text as a vector at plan time.
+            if matches!(target_type, DataType::Vector(_)) {
+                if let TypedExprKind::Constant(Value::Text(s)) = &expr.kind {
+                    return parse_text_as_vector(s);
+                }
+            }
+            // Otherwise recurse into the inner expression.
+            try_extract_constant_vector(expr)
+        }
         _ => None,
     }
+}
+
+/// Parse a text string like `"[1,0,0]"` into a vector of f64 values.
+/// Returns `None` if the text is not a valid vector literal.
+/// Matches the runtime parsing in `cast_to_vector` (types/cast/mod.rs:580-620)
+/// but only used at plan time for constant extraction.
+fn parse_text_as_vector(s: &str) -> Option<Vec<Value>> {
+    const MAX_DIMENSIONS: usize = 16384;
+    let trimmed = s.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if inner.trim().is_empty() {
+        return None;
+    }
+    // Bound allocation: reject before parsing if too many elements.
+    let elem_count = inner.split(',').take(MAX_DIMENSIONS + 1).count();
+    if elem_count > MAX_DIMENSIONS {
+        return None;
+    }
+    inner
+        .split(',')
+        .map(|tok| {
+            tok.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::Float64)
+        })
+        .collect()
 }
 
 /// Variant of `try_extract_constant_vector` that also handles Text constants
@@ -235,6 +282,105 @@ mod tests {
             nulls_first: false,
         }
     }
+
+    // ── parse_text_as_vector tests ─────────────────────────────
+
+    #[test]
+    fn parse_text_vector_standard() {
+        let v = parse_text_as_vector("[1,0,0]").unwrap();
+        assert_eq!(
+            v,
+            vec![
+                Value::Float64(1.0),
+                Value::Float64(0.0),
+                Value::Float64(0.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_text_vector_with_whitespace() {
+        let v = parse_text_as_vector("  [ 1 , 2 , 3 ]  ").unwrap();
+        assert_eq!(
+            v,
+            vec![
+                Value::Float64(1.0),
+                Value::Float64(2.0),
+                Value::Float64(3.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_text_vector_negative() {
+        let v = parse_text_as_vector("[-1,0.5,1]").unwrap();
+        assert_eq!(
+            v,
+            vec![
+                Value::Float64(-1.0),
+                Value::Float64(0.5),
+                Value::Float64(1.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_text_vector_empty_brackets() {
+        assert!(parse_text_as_vector("[]").is_none());
+    }
+
+    #[test]
+    fn parse_text_vector_non_numeric() {
+        assert!(parse_text_as_vector("[a,b,c]").is_none());
+    }
+
+    #[test]
+    fn parse_text_vector_nan_rejected() {
+        assert!(parse_text_as_vector("[NaN,0,0]").is_none());
+    }
+
+    #[test]
+    fn parse_text_vector_inf_rejected() {
+        assert!(parse_text_as_vector("[inf,0,0]").is_none());
+    }
+
+    #[test]
+    fn parse_text_vector_not_brackets() {
+        assert!(parse_text_as_vector("hello").is_none());
+    }
+
+    // ── try_extract_constant_vector tests ────────────────────
+
+    #[test]
+    fn extract_text_vector_through_cast() {
+        // Simulates: '[1,0,0]'::vector(3) → Cast(Constant(Text("[1,0,0]")), Vector(3))
+        let expr = TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Text("[1,0,0]".to_string())),
+                    DataType::Text,
+                )),
+                target_type: DataType::Vector(3),
+                cast_context: crate::sql::types::CastContext::Explicit,
+            },
+            DataType::Vector(3),
+        );
+        let v = try_extract_constant_vector(&expr).unwrap();
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn extract_bare_text_not_treated_as_vector() {
+        // Bare Constant(Text("[1,0,0]")) without Cast → should NOT match.
+        // This prevents vec_embed_* text arguments from being hijacked.
+        let expr = TypedExpr::new(
+            TypedExprKind::Constant(Value::Text("[1,0,0]".to_string())),
+            DataType::Text,
+        );
+        assert!(try_extract_constant_vector(&expr).is_none());
+    }
+
+    // ── detect_hnsw_scan_opportunity tests ───────────────────
 
     #[test]
     fn detect_hnsw_scan_carries_pending_embedding_dimensions() {
