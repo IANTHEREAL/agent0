@@ -1,10 +1,10 @@
- id |   x   | val
+ id |   x   |  val
 ----+-------+-------
   1 | hello | alpha
   2 | foo   | beta
 (2 rows)
 
- id |   x   | id | val
+ id |   x   | id |  val
 ----+-------+----+-------
   1 | hello |  1 | alpha
   2 | foo   |  2 | beta
@@ -14,5 +14,22 @@
 ----+-------+-----
   1 | hello |   1
   2 | foo   |   1
+(2 rows)
+
+ id |   val
+----+---------
+  1 | updated
+  2 | beta
+(2 rows)
+
+ id |   val
+----+---------
+  1 | updated
+(1 row)
+
+ a_id | b_id |   x   |  bx
+------+------+-------+-------
+    1 |    1 | hello | hello
+    2 |    2 | foo   | foo
 (2 rows)
 

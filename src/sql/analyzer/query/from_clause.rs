@@ -569,8 +569,7 @@ impl<'a> Analyzer<'a> {
                                     )
                                 })
                                 .collect();
-                            let include_sys =
-                                self.scopes.current().system_columns_enabled();
+                            let include_sys = self.scopes.current().system_columns_enabled();
                             self.scopes.current_mut().add_table_with_dropped_columns(
                                 &alias_str,
                                 &columns_for_scope,

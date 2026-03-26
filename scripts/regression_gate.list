@@ -257,6 +257,8 @@ tests/safety_math_domain_errors.sql
 tests/safety_parameterized_limit_negative.sql
 # #2033 – COPY FORMAT binary rejection
 tests/safety_copy_binary_rejection.sql
+# #2126 – JOIN on table with dropped column (scope ctid fix)
+tests/2126_join_dropped_column.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

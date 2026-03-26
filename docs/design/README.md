@@ -59,8 +59,8 @@ Each document may include:
 
 ## Vector Search
 
-- `docs/design/31_hnsw_s3_graph_offload.md`: HNSW graph S3 offload
-  - draft design for versioned S3 graph blobs, MVCC-safe cleanup, and runtime operating envelope
+- `docs/design/31_hnsw_s3_graph_offload.md`: active S3-offload architecture for HNSW graphs
+  - versioned S3 objects, MVCC-safe tombstone cleanup, explicit runtime operating envelope
 - `docs/design/27_hnsw_vector_index.md`: HNSW vector index (approximate nearest neighbor search)
   - historical original implementation design; current architecture no longer uses the process-level cache described there
   - PR: [#1241](https://github.com/c4pt0r/db9-server/pull/1241), Issue: [#1220](https://github.com/c4pt0r/db9-server/issues/1220)
