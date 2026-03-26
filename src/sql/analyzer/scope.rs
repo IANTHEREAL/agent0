@@ -156,6 +156,11 @@ impl Scope {
         self.add_system_columns = enabled;
     }
 
+    /// Whether system columns (ctid) are added for subsequent `add_table` calls.
+    pub fn system_columns_enabled(&self) -> bool {
+        self.add_system_columns
+    }
+
     /// Record the source schema and column range for a table alias.
     /// `col_range` is the range of column indices in this scope that belong
     /// to this particular table binding.
