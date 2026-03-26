@@ -611,6 +611,22 @@ pub(super) async fn prefetch_table_function_schemas(
                 continue;
             }
 
+            if func_lower == "fs9_cached_storage_stats" {
+                // Require fs9 extension installed+enabled.
+                let installed = store.get_extension(txn, db_id, "fs9").await?;
+                let Some(installed) = installed else {
+                    continue;
+                };
+                if !installed.enabled {
+                    continue;
+                }
+                snapshot.add_table_function(
+                    &call.key,
+                    fs::stats_worker::fs9_cached_storage_stats_schema(),
+                );
+                continue;
+            }
+
             #[cfg(feature = "parquet")]
             if func_lower == "read_parquet" {
                 let fallback_schema = parquet_fallback_table_function_schema();

@@ -1,0 +1,3 @@
+-- The TVF always returns exactly one row with boolean true for each column check.
+has_files_col|has_dirs_col|has_bytes_col|has_computed_at_col
+t|t|t|t

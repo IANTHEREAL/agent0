@@ -486,6 +486,18 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     extensions::fs::redis_events::spawn_event_loop();
     info!("Redis event streaming initialized");
 
+    // fs9 storage stats background worker — periodically computes and caches
+    // aggregate FS stats for O(1) reads by `db9 inspect`.
+    if let Some(fs9_tikv_client) = store.transaction_client() {
+        tokio::spawn(async move {
+            supervised_background_loop("fs9 stats worker", || {
+                extensions::fs::stats_worker::run_fs9_stats_worker(fs9_tikv_client.clone())
+            })
+            .await;
+        });
+        info!("fs9 stats background worker started (supervised)");
+    }
+
     // fs9 WebSocket server
     {
         let fs9_cfg = extensions::fs::config::fs9_config();
