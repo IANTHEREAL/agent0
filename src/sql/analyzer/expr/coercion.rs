@@ -81,16 +81,14 @@ impl<'a> Analyzer<'a> {
     /// types in the IR -- the evaluator never needs runtime coercion.
     ///
     /// NULL constants are retyped directly (no Cast node needed).
-    /// Unresolved parameters are re-typed (no Cast node) and their inferred type
-    /// is recorded for `finalize_param_types()`.
+    /// Parameters always get a Cast node so the runtime converts the
+    /// wire-decoded value; their inferred type is also recorded for
+    /// `finalize_param_types()`.
     pub(in crate::sql::analyzer) fn coerce_if_needed(
         &mut self,
         expr: TypedExpr,
         target: &DataType,
     ) -> Result<TypedExpr, AnalyzerError> {
-        // Snapshot before resolve_param_type mutates inferred_params
-        let was_unresolved = self.is_unresolved_param(&expr);
-
         // For any parameter, always register type for conflict detection.
         // This ensures InconsistentParameterTypes fires when the same $N
         // appears in incompatible type contexts (e.g. WHERE id=$1 AND flag=$1).
@@ -103,16 +101,6 @@ impl<'a> Analyzer<'a> {
         } else if expr.is_null_constant() {
             // NULL constants can be retyped directly -- no Cast node needed.
             Ok(TypedExpr::null(target.clone()))
-        } else if was_unresolved {
-            // Unresolved parameter -- re-type without Cast
-            if let TypedExprKind::Parameter { index } = &expr.kind {
-                Ok(TypedExpr::new(
-                    TypedExprKind::Parameter { index: *index },
-                    target.clone(),
-                ))
-            } else {
-                unreachable!()
-            }
         } else {
             Ok(TypedExpr::new(
                 TypedExprKind::Cast {

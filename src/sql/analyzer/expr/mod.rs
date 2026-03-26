@@ -391,15 +391,13 @@ impl<'a> Analyzer<'a> {
                 let inner = self.analyze_expr(expr)?;
                 let target = self.resolve_sql_data_type(data_type)?;
                 // Explicit cast resolves parameter type: `$1::int4`
+                // Always record the inferred type for finalize_param_types,
+                // but always emit a Cast node so the runtime converts the
+                // value even if the wire decoder produces a different Value
+                // variant (e.g. parse_pg_array yields Value::Text for UUID
+                // strings — the Cast node converts them at eval time).
                 if let TypedExprKind::Parameter { index } = &inner.kind {
-                    let was_unresolved = self.is_unresolved_param(&inner);
                     self.resolve_param_type(*index, &target)?;
-                    if was_unresolved {
-                        return Ok(TypedExpr::new(
-                            TypedExprKind::Parameter { index: *index },
-                            target,
-                        ));
-                    }
                 }
                 Ok(TypedExpr::new(
                     TypedExprKind::Cast {
@@ -1182,8 +1180,8 @@ impl<'a> Analyzer<'a> {
             return self.analyze_any_all_subquery(left, compare_op, subquery, false);
         }
 
-        let left_expr = self.analyze_expr(left)?;
-        let right_expr = self.analyze_expr(right)?;
+        let mut left_expr = self.analyze_expr(left)?;
+        let mut right_expr = self.analyze_expr(right)?;
 
         // Optimize: `x = ANY(ARRAY[a, b, c])` -> `x IN (a, b, c)`
         if matches!(compare_op, BinaryOperator::Eq) {
@@ -1326,6 +1324,30 @@ impl<'a> Analyzer<'a> {
                             || s.eq_ignore_ascii_case("oidvector")
                 ))
         {
+            // Coerce element types so LHS and array elements are compatible.
+            // e.g. uuid_col = ANY(text_array) → cast array to uuid[], matching
+            // how analyze_binary_op uses comparison_target_type for plain `=`.
+            if let DataType::Array(elem_type) = &right_expr.data_type {
+                if **elem_type != left_expr.data_type {
+                    use crate::sql::types::coercion::comparison_target_type;
+                    if let Some(target) = comparison_target_type(&left_expr.data_type, elem_type) {
+                        if **elem_type != target {
+                            right_expr = TypedExpr::new(
+                                TypedExprKind::Cast {
+                                    expr: Box::new(right_expr),
+                                    target_type: DataType::Array(Box::new(target.clone())),
+                                    cast_context: crate::sql::types::CastContext::Implicit,
+                                },
+                                DataType::Array(Box::new(target.clone())),
+                            );
+                        }
+                        if left_expr.data_type != target {
+                            left_expr = self.coerce_if_needed(left_expr, &target)?;
+                        }
+                    }
+                }
+            }
+
             let array_pos =
                 self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
             return Ok(TypedExpr::new(

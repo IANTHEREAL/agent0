@@ -211,12 +211,29 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
         DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::UserDefined(_) => {
             Ok(Value::Text(unescaped))
         }
-        DataType::Array(_) => parse_pg_array(trimmed).map(Value::Array).map_err(|_| {
-            anyhow::Error::from(SqlError::InvalidInputSyntax {
-                type_name: "array".into(),
-                value: unescaped.clone(),
-            })
-        }),
+        DataType::Array(elem_type) => {
+            let elements = parse_pg_array(trimmed).map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "array".into(),
+                    value: unescaped.clone(),
+                })
+            })?;
+            // Cast each element to the declared element type so that e.g.
+            // UUID strings become Value::Uuid, not Value::Text.
+            let mut typed = Vec::with_capacity(elements.len());
+            for v in elements {
+                if v == Value::Null {
+                    typed.push(Value::Null);
+                } else {
+                    typed.push(crate::sql::types::cast::cast(
+                        v,
+                        elem_type,
+                        crate::sql::types::CastContext::Assignment,
+                    )?);
+                }
+            }
+            Ok(Value::Array(typed))
+        }
         DataType::Json => {
             serde_json::from_str::<serde_json::Value>(&unescaped).map_err(|e| {
                 SqlError::InvalidInputSyntax {

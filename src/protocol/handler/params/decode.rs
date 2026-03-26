@@ -662,9 +662,32 @@ fn decode_text_value(
             || *t == Type::TIME_ARRAY
             || *t == Type::NUMERIC_ARRAY =>
         {
-            crate::sql::value_coercion::parse_pg_array(trimmed)
-                .map(Value::Array)
-                .map_err(|_| err(format!("\"{}\"", trimmed)))
+            let elements = crate::sql::value_coercion::parse_pg_array(trimmed)
+                .map_err(|_| err(format!("\"{}\"", trimmed)))?;
+            // Re-decode each element through the scalar decode path for the
+            // element type so that e.g. UUID strings become Value::Uuid, not
+            // Value::Text. Skip for TEXT/VARCHAR/NAME arrays (already correct).
+            if let Some(elem_type) = array_element_type(pg_type) {
+                if elem_type == Type::TEXT || elem_type == Type::VARCHAR || elem_type == Type::NAME
+                {
+                    return Ok(Value::Array(elements));
+                }
+                let mut typed = Vec::with_capacity(elements.len());
+                for v in elements {
+                    if v == Value::Null {
+                        typed.push(Value::Null);
+                    } else {
+                        let s = match &v {
+                            Value::Text(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        typed.push(decode_text_value(&s, s.trim(), &elem_type, index)?);
+                    }
+                }
+                Ok(Value::Array(typed))
+            } else {
+                Ok(Value::Array(elements))
+            }
         }
         // Default: treat as text
         _ => Ok(Value::Text(raw.to_string())),

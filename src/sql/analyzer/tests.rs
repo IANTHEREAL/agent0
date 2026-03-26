@@ -4109,13 +4109,19 @@ fn analyze_parameter_explicit_cast() {
     let result = analyzer.analyze_statement(&stmt).unwrap();
     let types = analyzer.finalize_param_types().unwrap();
     assert_eq!(types, vec![DataType::Int32]);
-    // The result should be a Parameter node (not Cast), since we resolve
-    // the param type directly from the explicit cast target.
+    // The result is a Cast(Parameter, Int32) — the Cast node is always
+    // emitted so the runtime converts the wire-decoded value even when
+    // the decoder produces a different Value variant.
     if let AnalyzedStatement::Query(q) = result {
         if let AnalyzedQueryBody::Select(s) = &q.body {
             assert!(matches!(
                 s.projection[0].expr.kind,
-                TypedExprKind::Parameter { index: 0 }
+                TypedExprKind::Cast {
+                    ref expr,
+                    ref target_type,
+                    ..
+                } if matches!(expr.kind, TypedExprKind::Parameter { index: 0 })
+                     && *target_type == DataType::Int32
             ));
         }
     }
