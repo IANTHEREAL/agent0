@@ -92,6 +92,12 @@ impl<'a> Analyzer<'a> {
     ) -> Result<(TypedExpr, TypedExpr), AnalyzerError> {
         // 1. If both types already match, return as-is.
         if left.data_type == right.data_type {
+            // Both Unknown → resolve to Text before returning.
+            if left.data_type == DataType::Unknown {
+                let l = TypedExpr::new(left.kind.clone(), DataType::Text);
+                let r = TypedExpr::new(right.kind.clone(), DataType::Text);
+                return Ok((l, r));
+            }
             return Ok((left, right));
         }
         // 2. NULL constant retyping — no Cast node needed.
@@ -140,6 +146,12 @@ impl<'a> Analyzer<'a> {
         } else if expr.is_null_constant() {
             // NULL constants can be retyped directly -- no Cast node needed.
             Ok(TypedExpr::null(target.clone()))
+        } else if expr.data_type == DataType::Unknown && *target == DataType::Text {
+            // Unknown → Text: the underlying Value::Text is already the correct
+            // representation.  Retype directly (no Cast node) to keep the IR
+            // simple and preserve constant-detection for downstream optimizations
+            // (e.g. GIN predicate extraction sees Constant, not Cast wrapping it).
+            Ok(TypedExpr::new(expr.kind.clone(), target.clone()))
         } else {
             Ok(TypedExpr::new(
                 TypedExprKind::Cast {
@@ -166,7 +178,11 @@ impl<'a> Analyzer<'a> {
     ) -> Result<DataType, AnalyzerError> {
         let concrete_types: Vec<DataType> = exprs
             .iter()
-            .filter(|e| !e.is_null_constant() && !self.is_unresolved_param(e))
+            .filter(|e| {
+                !e.is_null_constant()
+                    && !self.is_unresolved_param(e)
+                    && e.data_type != DataType::Unknown
+            })
             .map(|e| e.data_type.clone())
             .collect();
 

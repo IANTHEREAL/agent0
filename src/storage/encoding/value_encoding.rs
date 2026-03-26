@@ -304,6 +304,9 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let d = Decimal::from_parts(lo, mid, hi, is_negative, scale_i32 as u32);
             (Value::Numeric(d), expected)
         }
+        DataType::Unknown => {
+            unreachable!("DataType::Unknown must be resolved before reaching storage decoding")
+        }
     };
 
     Ok((value, 1 + consumed))

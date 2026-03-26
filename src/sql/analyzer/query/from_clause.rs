@@ -169,7 +169,15 @@ impl<'a> Analyzer<'a> {
                 ));
             }
             let elem_type = match &positional[0].data_type {
-                DataType::Array(inner) => inner.as_ref().clone(),
+                DataType::Array(inner) => {
+                    let t = inner.as_ref().clone();
+                    // Unknown array elements default to Text (PG resolves unknown[] to text[]).
+                    if t == DataType::Unknown {
+                        DataType::Text
+                    } else {
+                        t
+                    }
+                }
                 _ => DataType::Text,
             };
             let col_name = alias
@@ -647,7 +655,14 @@ impl<'a> Analyzer<'a> {
                 for (i, expr) in array_exprs.iter().enumerate() {
                     let analyzed = self.analyze_expr(expr)?;
                     let elem_type = match &analyzed.data_type {
-                        DataType::Array(inner) => inner.as_ref().clone(),
+                        DataType::Array(inner) => {
+                            let t = inner.as_ref().clone();
+                            if t == DataType::Unknown {
+                                DataType::Text
+                            } else {
+                                t
+                            }
+                        }
                         _ => {
                             return Err(AnalyzerError::FunctionNotFound {
                                 name: "unnest".to_string(),

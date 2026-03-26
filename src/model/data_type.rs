@@ -73,6 +73,12 @@ pub enum DataType {
     Tsquery,
     Name,
     Varchar(u64),
+    /// PostgreSQL's UNKNOWN type (OID 705).  Bare string literals and NULL
+    /// start with this type; context (comparison, assignment, function call)
+    /// resolves it to a concrete type.  **Invariant: Unknown must never escape
+    /// the Analyzer — it must be resolved before reaching the executor,
+    /// storage, or wire protocol layers.**
+    Unknown,
 }
 
 impl fmt::Display for DataType {
@@ -109,6 +115,7 @@ impl fmt::Display for DataType {
             DataType::Tsquery => write!(f, "TSQUERY"),
             DataType::Varchar(0) => write!(f, "VARCHAR"),
             DataType::Varchar(n) => write!(f, "VARCHAR({})", n),
+            DataType::Unknown => write!(f, "unknown"),
         }
     }
 }

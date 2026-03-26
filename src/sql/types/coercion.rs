@@ -52,6 +52,7 @@ pub fn type_precedence(dt: &DataType) -> i32 {
         DataType::UserDefined(_) => 200,
         DataType::Tsvector => 140,
         DataType::Tsquery => 141,
+        DataType::Unknown => 0, // lowest precedence — adapts to the other type
     }
 }
 
@@ -63,8 +64,26 @@ pub fn is_numeric(dt: &DataType) -> bool {
 }
 
 pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
+    // Both Unknown → resolve to Text (PG defaults UNKNOWNOID to TEXT).
+    if matches!(a, DataType::Unknown) && matches!(b, DataType::Unknown) {
+        return Some(DataType::Text);
+    }
+
     if a == b {
         return Some(a.clone());
+    }
+
+    // Unknown adapts to the other type (PG's UNKNOWNOID semantics).
+    if matches!(a, DataType::Unknown) {
+        return Some(b.clone());
+    }
+    if matches!(b, DataType::Unknown) {
+        return Some(a.clone());
+    }
+
+    // Array(Unknown) adapts recursively.
+    if let (DataType::Array(inner_a), DataType::Array(inner_b)) = (a, b) {
+        return common_type(inner_a, inner_b).map(|t| DataType::Array(Box::new(t)));
     }
 
     // Numeric type promotion
@@ -110,7 +129,19 @@ pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
 /// `Text/Name` mixed comparisons, matching PostgreSQL semantics where
 /// `'42' = 42` coerces text to integer.
 pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
+    // Both Unknown → resolve to Text (matches common_type guard).
+    if matches!(a, DataType::Unknown) && matches!(b, DataType::Unknown) {
+        return Some(DataType::Text);
+    }
     if a == b {
+        return Some(a.clone());
+    }
+
+    // Unknown adapts to the other type.
+    if matches!(a, DataType::Unknown) {
+        return Some(b.clone());
+    }
+    if matches!(b, DataType::Unknown) {
         return Some(a.clone());
     }
 
@@ -166,8 +197,15 @@ pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
 /// coercion. Text remains universally assignable via I/O coercion; other types
 /// are compatible when they share a common type.
 pub fn is_assignment_compatible(from: &DataType, to: &DataType) -> bool {
+    // Unknown is coercible to any type (PG's UNKNOWNOID semantics).
+    if matches!(from, DataType::Unknown) {
+        return true;
+    }
     if matches!(from, DataType::Text) || matches!(to, DataType::Text) {
         return true;
+    }
+    if let (DataType::Array(inner_from), DataType::Array(inner_to)) = (from, to) {
+        return is_assignment_compatible(inner_from, inner_to);
     }
     if let (DataType::Vector(from_dim), DataType::Vector(to_dim)) = (from, to) {
         return match (*from_dim, *to_dim) {

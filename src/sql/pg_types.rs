@@ -340,6 +340,7 @@ pub(crate) fn oid_and_typlen_for_datatype(dt: &DataType) -> (i64, i32) {
         {
             (OID_REGTYPE, 4)
         }
+        DataType::Unknown => (705, -2),
         DataType::UserDefined(_) => (OID_TEXT, -1),
     }
 }

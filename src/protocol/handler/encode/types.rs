@@ -96,6 +96,9 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         }
         Some(DataType::UserDefined(s)) if s == "char" => Type::CHAR,
         Some(DataType::Varchar(_)) => Type::VARCHAR,
+        Some(DataType::Unknown) => {
+            unreachable!("DataType::Unknown must be resolved before reaching wire protocol")
+        }
         Some(DataType::Vector(_))
         | Some(DataType::Text)
         | Some(DataType::UserDefined(_))

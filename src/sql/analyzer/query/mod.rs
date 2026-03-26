@@ -25,6 +25,16 @@ use super::scope::Scope;
 use super::types::*;
 use super::Analyzer;
 
+/// Recursively resolve any `Unknown` in a DataType to `Text`.
+/// Handles bare `Unknown` and nested forms like `Array(Unknown)`.
+fn resolve_unknown_to_text(dt: DataType) -> DataType {
+    match dt {
+        DataType::Unknown => DataType::Text,
+        DataType::Array(inner) => DataType::Array(Box::new(resolve_unknown_to_text(*inner))),
+        other => other,
+    }
+}
+
 /// Extract collation names from an AnalyzedQuery's projection expressions.
 ///
 /// For SELECT bodies, walks each projection expression to find the collation
@@ -441,6 +451,9 @@ impl<'a> Analyzer<'a> {
                 expr = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
             }
         }
+        // Unknown in output context defaults to Text (PG resolves UNKNOWNOID to TEXT in target lists).
+        // Also handle Array(Unknown) → Array(Text) for UNNEST and similar.
+        expr.data_type = resolve_unknown_to_text(expr.data_type);
         Ok(expr)
     }
 
@@ -518,7 +531,7 @@ impl<'a> Analyzer<'a> {
                         }
                     })?;
                 }
-                unified
+                resolve_unknown_to_text(unified)
             };
 
             for row in &mut analyzed_rows {

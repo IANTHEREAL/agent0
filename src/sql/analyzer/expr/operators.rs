@@ -59,12 +59,12 @@ impl<'a> Analyzer<'a> {
                         );
                     }
                 }
-                // Ensure NULLs carry Text data_type for downstream resolution
-                if l.is_null_constant() {
-                    l = TypedExpr::null(DataType::Text);
+                // Resolve any remaining Unknown to Text for downstream processing.
+                if l.data_type == DataType::Unknown {
+                    l = TypedExpr::new(l.kind.clone(), DataType::Text);
                 }
-                if r.is_null_constant() {
-                    r = TypedExpr::null(DataType::Text);
+                if r.data_type == DataType::Unknown {
+                    r = TypedExpr::new(r.kind.clone(), DataType::Text);
                 }
             } else if Self::is_ambiguous_unknown_pair_op(&typed_op) {
                 return Err(AnalyzerError::AmbiguousOperator {
@@ -73,6 +73,38 @@ impl<'a> Analyzer<'a> {
                     right: "unknown".to_string(),
                 });
             }
+        }
+
+        // One-concrete-one-unknown resolution: coerce Unknown to match the concrete side,
+        // with operator-specific overrides where PG resolves Unknown differently:
+        //   - Concat (||) with non-jsonb: Unknown → Text (string concatenation).
+        //     Concat with jsonb keeps Unknown → Jsonb (jsonb merge).
+        //   - Sub (-) with jsonb LHS: Unknown → Text (delete-by-text-key).
+        if l.data_type == DataType::Unknown
+            && r.data_type != DataType::Unknown
+            && !matches!(r.kind, TypedExprKind::Parameter { .. })
+        {
+            let resolve_type = if typed_op == BinaryOp::Concat && r.data_type != DataType::Jsonb {
+                DataType::Text
+            } else {
+                r.data_type.clone()
+            };
+            l = self.coerce_if_needed(l, &resolve_type)?;
+        }
+        if r.data_type == DataType::Unknown
+            && l.data_type != DataType::Unknown
+            && !matches!(l.kind, TypedExprKind::Parameter { .. })
+        {
+            let resolve_type = if typed_op == BinaryOp::Concat && l.data_type != DataType::Jsonb {
+                DataType::Text
+            } else if typed_op == BinaryOp::Sub && l.data_type == DataType::Jsonb {
+                // jsonb - text (delete key), jsonb - int (delete by index)
+                // Unknown string literals should resolve to Text, not Jsonb.
+                DataType::Text
+            } else {
+                l.data_type.clone()
+            };
+            r = self.coerce_if_needed(r, &resolve_type)?;
         }
 
         // Contextual parameter typing (mirrors NULL typing above).
@@ -278,14 +310,13 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Returns true if `expr` is "semantically unknown" in PostgreSQL's sense:
-    /// an unresolved parameter, a bare (uncast) string literal, or a NULL constant.
-    /// This mirrors PG's `unknown` type category for operator overload resolution.
+    /// an unresolved parameter, an expression with DataType::Unknown (bare
+    /// string literals and NULL constants), or a NULL constant that was
+    /// contextually retyped (its data_type changed but it's still NULL).
     pub(super) fn is_semantically_unknown(&self, expr: &TypedExpr) -> bool {
         match &expr.kind {
             TypedExprKind::Parameter { .. } => self.is_unresolved_param(expr),
-            TypedExprKind::Constant(Value::Text(_)) => true,
-            TypedExprKind::Constant(Value::Null) => true,
-            _ => false,
+            _ => expr.data_type == DataType::Unknown || expr.is_null_constant(),
         }
     }
 

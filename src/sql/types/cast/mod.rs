@@ -130,6 +130,8 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         DataType::Vector(_) => cast_to_vector(val, target),
         DataType::UserDefined(u) if is_regclass_udt(u) => cast_to_regclass(val),
         DataType::UserDefined(u) if is_regtype_udt(u) => cast_to_regtype(val),
+        // Unknown target: resolve to Text (PG defaults UNKNOWNOID → TEXT).
+        DataType::Unknown => cast_to_text(val),
         _ => cast_catchall(val, target, context),
     }
 }

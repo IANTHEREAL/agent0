@@ -307,12 +307,12 @@ impl<'a> Analyzer<'a> {
             | ast::Value::DoubleQuotedString(s)
             | ast::Value::EscapedStringLiteral(s) => Ok(TypedExpr::new(
                 TypedExprKind::Constant(Value::Text(s.clone())),
-                DataType::Text,
+                DataType::Unknown,
             )),
 
             ast::Value::DollarQuotedString(dqs) => Ok(TypedExpr::new(
                 TypedExprKind::Constant(Value::Text(dqs.value.clone())),
-                DataType::Text,
+                DataType::Unknown,
             )),
 
             ast::Value::Boolean(b) => Ok(TypedExpr::new(
@@ -321,9 +321,10 @@ impl<'a> Analyzer<'a> {
             )),
 
             ast::Value::Null => {
-                // Untyped NULL -- default type is Text (PostgreSQL semantics).
-                // The Analyzer may override via contextual coercion in binary ops.
-                Ok(TypedExpr::null(DataType::Text))
+                // Untyped NULL — starts as Unknown (PostgreSQL's UNKNOWNOID).
+                // The Analyzer resolves it to a concrete type via contextual
+                // coercion in binary ops, function args, or assignment.
+                Ok(TypedExpr::null(DataType::Unknown))
             }
 
             ast::Value::HexStringLiteral(s) => {

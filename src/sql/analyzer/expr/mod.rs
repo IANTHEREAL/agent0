@@ -30,14 +30,14 @@ impl<'a> Analyzer<'a> {
     fn is_text_like_type(data_type: &DataType) -> bool {
         matches!(
             data_type,
-            DataType::Text | DataType::Name | DataType::Varchar(_)
+            DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::Unknown
         )
     }
 
     fn is_untyped_text_literal(expr: &TypedExpr) -> bool {
         matches!(
             (&expr.kind, &expr.data_type),
-            (TypedExprKind::Constant(Value::Text(_)), DataType::Text)
+            (TypedExprKind::Constant(Value::Text(_)), DataType::Unknown)
         )
     }
 
@@ -87,6 +87,13 @@ impl<'a> Analyzer<'a> {
     ///   recover element type from the concrete non-text members
     /// - Respect explicit text-like members/casts (do not recover past them)
     fn array_literal_elem_type(&self, elems: &[TypedExpr]) -> Result<DataType, AnalyzerError> {
+        // If every element is Unknown, keep the array element type as Unknown so
+        // downstream comparison paths (e.g. `1 = ANY(ARRAY['1','2'])`) can coerce
+        // elements to the LHS type.  This matches PG's unknown[] behavior.
+        if elems.iter().all(|e| e.data_type == DataType::Unknown) {
+            return Ok(DataType::Unknown);
+        }
+
         let refs: Vec<&TypedExpr> = elems.iter().collect();
         let mut elem_type = self.unify_expr_types(&refs, "ARRAY")?;
 
@@ -214,6 +221,14 @@ impl<'a> Analyzer<'a> {
         right_type: &DataType,
     ) -> Option<DataType> {
         if left_expr.is_null_constant() {
+            return Some(right_type.clone());
+        }
+
+        // Unknown adapts to any type (PG's UNKNOWNOID semantics).
+        if matches!(right_type, DataType::Unknown) {
+            return Some(left_expr.data_type.clone());
+        }
+        if left_expr.data_type == DataType::Unknown {
             return Some(right_type.clone());
         }
 
@@ -863,7 +878,7 @@ impl<'a> Analyzer<'a> {
                 let analyzed_expr = self.analyze_expr(expr)?;
                 // Validate that the expression is a text type
                 match &analyzed_expr.data_type {
-                    DataType::Text | DataType::Varchar(_) => {}
+                    DataType::Text | DataType::Varchar(_) | DataType::Unknown => {}
                     other => {
                         return Err(AnalyzerError::Unsupported(format!(
                             "COLLATE can only be applied to text types, got {}",
@@ -1527,6 +1542,13 @@ impl<'a> Analyzer<'a> {
                     self.resolve_param_type(*index, &DataType::Text)?;
                     r = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
                 }
+            }
+            // Resolve remaining Unknown literals to Text (bare string constants).
+            if l.data_type == DataType::Unknown {
+                l = TypedExpr::new(l.kind.clone(), DataType::Text);
+            }
+            if r.data_type == DataType::Unknown {
+                r = TypedExpr::new(r.kind.clone(), DataType::Text);
             }
         }
 

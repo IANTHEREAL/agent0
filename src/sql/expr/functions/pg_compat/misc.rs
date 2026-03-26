@@ -67,6 +67,7 @@ pub(crate) fn pg_typeof_name_for_datatype(dt: &DataType) -> String {
         DataType::UserDefined(name) if name.eq_ignore_ascii_case("pg_catalog.regtype") => {
             "regtype".to_string()
         }
+        DataType::Unknown => "unknown".to_string(),
         DataType::UserDefined(name) => name
             .strip_prefix("pg_catalog.")
             .unwrap_or(name.as_str())

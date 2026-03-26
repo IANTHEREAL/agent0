@@ -218,7 +218,7 @@ fn analyze_numeric_literal() {
 #[test]
 fn analyze_string_literal() {
     let expr = analyze_expr_with_users("'hello'").unwrap();
-    assert_eq!(expr.data_type, DataType::Text);
+    assert_eq!(expr.data_type, DataType::Unknown);
 }
 
 #[test]
@@ -230,7 +230,7 @@ fn analyze_boolean_literal() {
 #[test]
 fn analyze_null_literal() {
     let expr = analyze_expr_with_users("NULL").unwrap();
-    assert_eq!(expr.data_type, DataType::Text); // PG default
+    assert_eq!(expr.data_type, DataType::Unknown); // PG: bare NULL has type unknown
     assert!(expr.is_null_constant());
 }
 
@@ -379,8 +379,12 @@ fn analyze_json_access_comparison_precedence_stays_binary_comparison() {
         other => panic!("expected JsonAccess on comparison left, got {:?}", other),
     }
 
+    // Bare string literal is Unknown, resolved to Text for comparison with ->> result.
+    // Unknown → Text is a direct retype (no Cast node needed since the underlying
+    // Value::Text is already the correct representation).
+    assert_eq!(right.data_type, DataType::Text);
     assert!(matches!(
-        right.kind,
+        &right.kind,
         TypedExprKind::Constant(crate::model::Value::Text(ref s)) if s == "senior"
     ));
 }
@@ -751,13 +755,19 @@ fn analyze_ne_any_non_empty_array_mixed_unknown_rhs_literals_use_typed_compariso
 }
 
 #[test]
-fn analyze_any_non_empty_array_all_unknown_text_literals_reject_non_text_lhs() {
-    let err = analyze_expr_with_users("1 = ANY(ARRAY['1', '2'])").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
-            if operator == "=" && left == "integer" && right == "text"
-    ));
+fn analyze_any_non_empty_array_all_unknown_text_literals_coerce_to_lhs_type() {
+    // Unknown string literals in ARRAY['1', '2'] are coerced to Int32 to match the LHS.
+    // This matches PostgreSQL: SELECT 1 = ANY(ARRAY['1', '2']) succeeds.
+    let typed = analyze_expr_with_users("1 = ANY(ARRAY['1', '2'])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::InList { expr, list, .. } => {
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert_eq!(list.len(), 2);
+            assert!(list.iter().all(|e| e.data_type == DataType::Int32));
+        }
+        _ => panic!("expected InList, got {:?}", typed.kind),
+    }
 }
 
 #[test]

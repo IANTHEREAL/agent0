@@ -98,7 +98,8 @@ impl<'a> Analyzer<'a> {
             .zip(right.output_schema.iter())
             .map(|((name, left_dt, left_coll), (_, right_dt, _right_coll))| {
                 if left_dt == right_dt {
-                    Ok((name.clone(), left_dt.clone(), left_coll.clone()))
+                    let dt = super::resolve_unknown_to_text(left_dt.clone());
+                    Ok((name.clone(), dt, left_coll.clone()))
                 } else {
                     let unified = common_type(left_dt, right_dt).ok_or_else(|| {
                         AnalyzerError::TypesCannotBeMatched {
@@ -106,6 +107,7 @@ impl<'a> Analyzer<'a> {
                             context: op_name.to_string(),
                         }
                     })?;
+                    let unified = super::resolve_unknown_to_text(unified);
                     Ok((name.clone(), unified, left_coll.clone()))
                 }
             })

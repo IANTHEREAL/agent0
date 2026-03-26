@@ -287,6 +287,9 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
             crate::sql::fts::validate_tsquery_syntax(&unescaped)?;
             Ok(Value::Tsquery(unescaped))
         }
+        DataType::Unknown => {
+            unreachable!("DataType::Unknown must be resolved before reaching COPY parsing")
+        }
     }
 }
 

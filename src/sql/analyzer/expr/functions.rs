@@ -390,13 +390,13 @@ impl<'a> Analyzer<'a> {
                 });
             }
 
-            // quote_ident() only accepts text-like types (text, varchar, name).
+            // quote_ident() only accepts text-like types (text, varchar, name, unknown).
             // PG rejects non-text arguments with SQLSTATE 42883.
             if func_name == "QUOTE_IDENT" {
                 if let Some(arg_type) = arg_types.first() {
                     if !matches!(
                         arg_type,
-                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
                     ) {
                         return Err(AnalyzerError::FunctionNotFound {
                             name: func_name.to_lowercase(),
@@ -679,8 +679,11 @@ impl<'a> Analyzer<'a> {
                 coerced.push(arg);
                 continue;
             };
-            if self.is_unresolved_param(&arg) || arg.is_null_constant() {
-                // Case 1: infer type for unresolved param
+            if self.is_unresolved_param(&arg)
+                || arg.is_null_constant()
+                || arg.data_type == DataType::Unknown
+            {
+                // Case 1: infer type for unresolved param or unknown-typed literal
                 coerced.push(self.coerce_if_needed(arg, target)?);
             } else if matches!(arg.kind, TypedExprKind::Parameter { .. }) {
                 // Case 2: pre-typed parameter — validate against declared type
@@ -737,7 +740,7 @@ impl<'a> Analyzer<'a> {
             let compatible = match target {
                 DataType::Text => matches!(
                     arg.data_type,
-                    DataType::Text | DataType::Varchar(_) | DataType::Name
+                    DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
                 ),
                 DataType::Jsonb => matches!(arg.data_type, DataType::Jsonb | DataType::Json),
                 _ => arg.data_type == *target,
@@ -907,7 +910,7 @@ impl<'a> Analyzer<'a> {
     ) -> Result<TypedExpr, AnalyzerError> {
         let arg_is_text_like = matches!(
             arg.data_type,
-            DataType::Text | DataType::Varchar(_) | DataType::Name
+            DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
         );
         if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
             return Err(AnalyzerError::FunctionNotFound {
@@ -929,7 +932,7 @@ impl<'a> Analyzer<'a> {
         }
         let arg_is_text_like = matches!(
             arg.data_type,
-            DataType::Text | DataType::Varchar(_) | DataType::Name
+            DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
         );
         if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
             return Err(AnalyzerError::FunctionNotFound {
@@ -1075,7 +1078,7 @@ impl<'a> Analyzer<'a> {
         for arg in args {
             let arg_is_text_like = matches!(
                 arg.data_type,
-                DataType::Text | DataType::Varchar(_) | DataType::Name
+                DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
             );
             if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
                 let display_name = match function_schema_name(func) {
@@ -1106,7 +1109,7 @@ impl<'a> Analyzer<'a> {
         let arg_types = vec![arg.data_type.clone()];
         let arg_is_text_like = matches!(
             arg.data_type,
-            DataType::Text | DataType::Varchar(_) | DataType::Name
+            DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
         );
         if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
             return Err(AnalyzerError::FunctionNotFound {
@@ -1132,7 +1135,7 @@ impl<'a> Analyzer<'a> {
         for arg in args {
             let arg_is_text_like = matches!(
                 arg.data_type,
-                DataType::Text | DataType::Varchar(_) | DataType::Name
+                DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
             );
             if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
                 return Err(AnalyzerError::FunctionNotFound {
@@ -1161,7 +1164,7 @@ impl<'a> Analyzer<'a> {
                 0 | 1 => {
                     let arg_is_text_like = matches!(
                         arg.data_type,
-                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
                     );
                     if !arg_is_text_like
                         && !self.is_unresolved_param(&arg)
@@ -1177,7 +1180,7 @@ impl<'a> Analyzer<'a> {
                 2 => {
                     let arg_is_text_like = matches!(
                         arg.data_type,
-                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
                     );
                     if !arg_is_text_like
                         && !self.is_unresolved_param(&arg)
@@ -1212,7 +1215,7 @@ impl<'a> Analyzer<'a> {
                 0 | 1 => {
                     let arg_is_text_like = matches!(
                         arg.data_type,
-                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
                     );
                     if !arg_is_text_like
                         && !self.is_unresolved_param(&arg)
@@ -1274,7 +1277,7 @@ impl<'a> Analyzer<'a> {
         } else {
             let second_is_text_like = matches!(
                 second.data_type,
-                DataType::Text | DataType::Varchar(_) | DataType::Name
+                DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Unknown
             );
             if !second_is_text_like
                 && !self.is_unresolved_param(&second)
