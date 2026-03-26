@@ -192,6 +192,35 @@ python3 scripts/integration_test.py
 cd orm-tests && npm test
 ```
 
+## Dev Environment (EKS, us-west-2)
+
+AWS SSO login: `aws sso login --profile sso` (PingCAP SSO, account `385595570414`)
+
+### TiKV (namespace: `tidb-serverless`)
+
+| Item | Value |
+|------|-------|
+| PD Endpoint | `serverless-cluster-pd.tidb-serverless.svc.cluster.local:2379` |
+| TiKV nodes | 9 (3 pools × 3 replicas) |
+| TLS secret | `serverless-cluster-cluster-client-secret` (ca.crt, tls.crt, tls.key) |
+
+### S3
+
+| Item | Value |
+|------|-------|
+| FS9 dev bucket | `dev-us-west-2-f02-db9-fs` |
+| FS9 staging bucket | `staging-us-west-2-f02-db9-fs` |
+| IRSA ServiceAccount | `db9-fs-access` (namespace `db9`) → `arn:aws:iam::385595570414:role/dev-us-west-2-f02-db9-fs-irsa` |
+| Region | `us-west-2` |
+
+### db9-server (namespace: `db9`)
+
+| Item | Value |
+|------|-------|
+| External LB | `a0082d61f575740c0a6c8043480822b8-5c40c37ca03be403.elb.us-west-2.amazonaws.com:5433` |
+| Credentials | `admin` / `admin` |
+| ECR image | `385595570414.dkr.ecr.us-west-2.amazonaws.com/pg-tikv:latest` |
+
 ## SQL Test Contract (must follow)
 
 - `.expected` > `.errors` > `.assert` priority; use only one validation mode per test.
