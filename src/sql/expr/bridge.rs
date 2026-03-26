@@ -39,17 +39,14 @@ pub fn eval_const_ast_expr(expr: &sqlparser::ast::Expr) -> Result<Value> {
 ///
 /// This matches PostgreSQL's BIND-time behaviour where parameter values are
 /// converted using the declared type's input function before execution begins.
-pub fn eval_execute_param(
-    expr: &sqlparser::ast::Expr,
-    target_type: &DataType,
-) -> Result<Value> {
+pub fn eval_execute_param(expr: &sqlparser::ast::Expr, target_type: &DataType) -> Result<Value> {
     let qctx = QueryContext::from_task_locals();
     let catalog = NullCatalog;
 
     // Analyze the expression to determine its natural type.
     // We do NOT fold yet — folding happens after we insert the cast.
-    let analyzed = Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr)
-        .map_err(SqlError::from)?;
+    let analyzed =
+        Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr).map_err(SqlError::from)?;
 
     // If types already match, fold and evaluate directly.
     let coerced = if analyzed.data_type == *target_type {
@@ -70,6 +67,21 @@ pub fn eval_execute_param(
 
     let folded = fold_typed_expr(&coerced, &qctx);
     eval_typed_expr(&folded, &Row::new(vec![]), &qctx)
+}
+
+/// Evaluate an AST expression against a single-table row.
+///
+/// The scope is built from the table schema so column references resolve
+/// to positional indices matching the row layout.
+pub fn eval_ast_expr_with_row(
+    expr: &sqlparser::ast::Expr,
+    row: &Row,
+    schema: &TableSchema,
+    alias: &str,
+) -> Result<Value> {
+    let qctx = QueryContext::from_task_locals();
+    let typed = compile_row_expr_for_table(expr, schema, alias, &qctx)?;
+    eval_typed_expr(&typed, row, &qctx)
 }
 
 #[cfg(test)]
@@ -162,19 +174,4 @@ mod tests {
         let val = eval_execute_param(&expr, &DataType::Uuid).unwrap();
         assert!(matches!(val, Value::Uuid(_)));
     }
-}
-
-/// Evaluate an AST expression against a single-table row.
-///
-/// The scope is built from the table schema so column references resolve
-/// to positional indices matching the row layout.
-pub fn eval_ast_expr_with_row(
-    expr: &sqlparser::ast::Expr,
-    row: &Row,
-    schema: &TableSchema,
-    alias: &str,
-) -> Result<Value> {
-    let qctx = QueryContext::from_task_locals();
-    let typed = compile_row_expr_for_table(expr, schema, alias, &qctx)?;
-    eval_typed_expr(&typed, row, &qctx)
 }

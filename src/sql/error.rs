@@ -151,6 +151,12 @@ pub enum SqlError {
     ValueTooLarge { message: String },
 
     #[error("{message}")]
+    IndexKeyTooLarge { message: String },
+
+    #[error("{message}")]
+    KeyTooLarge { message: String },
+
+    #[error("{message}")]
     StatementTooComplex { message: String },
 
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
@@ -306,6 +312,8 @@ impl SqlError {
             Self::DmlTableScanTooLarge { .. } => "54000",
             Self::AdvisoryLockCounterOverflow => "54000",
             Self::ValueTooLarge { .. } => "54000",
+            Self::IndexKeyTooLarge { .. } => "54000",
+            Self::KeyTooLarge { .. } => "54000",
             Self::StatementTooComplex { .. } => "54001",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
@@ -539,6 +547,20 @@ mod tests {
         assert_eq!(
             SqlError::ValueTooLarge {
                 message: "value too large".into()
+            }
+            .sqlstate(),
+            "54000"
+        );
+        assert_eq!(
+            SqlError::IndexKeyTooLarge {
+                message: "index key too large".into()
+            }
+            .sqlstate(),
+            "54000"
+        );
+        assert_eq!(
+            SqlError::KeyTooLarge {
+                message: "key too large".into()
             }
             .sqlstate(),
             "54000"

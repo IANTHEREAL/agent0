@@ -1,8 +1,30 @@
 use super::*;
 use crate::sql::error::SqlError;
 use crate::storage::backpressure::tikv_op;
+use crate::txn::configured_key_size_limit;
 
 const INDEX_SENTINEL_VALUE: &[u8] = &[0x01];
+
+/// Check an encoded index key against TiKV's `max-key-size` limit and return
+/// an actionable `IndexKeyTooLarge` error when it exceeds the threshold.
+fn check_index_key_size(idx_key: &[u8]) -> Result<()> {
+    let limit = configured_key_size_limit();
+    if limit == 0 || idx_key.len() < limit {
+        return Ok(());
+    }
+    Err(SqlError::IndexKeyTooLarge {
+        message: format!(
+            "index row requires {} bytes, exceeds maximum {} bytes\n\
+             HINT: Values larger than {} bytes cannot be indexed with btree. \
+             Consider an expression index on a prefix (e.g. CREATE INDEX ON t (left(col, 200))), \
+             a GIN index for full-text search, or removing the btree index on this column.",
+            idx_key.len(),
+            limit,
+            limit,
+        ),
+    }
+    .into())
+}
 
 /// A single index entry to be created as part of a batch insert.
 #[derive(Debug, Clone)]
@@ -159,6 +181,7 @@ impl TikvStore {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
+            check_index_key_size(&idx_key)?;
             if tikv_op!(txn.get(idx_key.clone()).await)?.is_some() {
                 return Err(crate::storage::unique_index_duplicate_error());
             }
@@ -174,6 +197,7 @@ impl TikvStore {
                 values,
                 Some(pk_values),
             ));
+            check_index_key_size(&idx_key)?;
             let bytes_written = idx_key.len() + INDEX_SENTINEL_VALUE.len();
             txn_put(txn, idx_key, INDEX_SENTINEL_VALUE.to_vec()).await?;
             Ok(bytes_written)
@@ -222,6 +246,7 @@ impl TikvStore {
                     &entry.idx_values,
                     None,
                 ));
+                check_index_key_size(&idx_key)?;
                 let idx_val = encode_pk_values(&entry.pk_values);
                 unique_entries.push(UniqueEntry {
                     idx_key,
@@ -236,6 +261,7 @@ impl TikvStore {
                     &entry.idx_values,
                     Some(&entry.pk_values),
                 ));
+                check_index_key_size(&idx_key)?;
                 non_unique_entries.push(NonUniqueEntry { idx_key });
             }
         }

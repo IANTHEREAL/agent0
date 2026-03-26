@@ -1,0 +1,17 @@
+# Test 2: Large value rejected
+index row requires
+
+# Test 4: Boundary just over limit rejected
+index row requires
+
+# Test 5: Composite index combined exceeds limit
+index row requires
+
+# Test 6: CREATE INDEX backfill rejects oversized
+index row requires
+
+# Test 8: UPDATE that pushes indexed column over limit
+index row requires
+
+# Test 9: UNIQUE index oversized key rejected
+index row requires

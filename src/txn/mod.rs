@@ -32,11 +32,37 @@ pub(crate) use state::SavepointState;
 /// so 8 MiB provides 50% margin for key + protobuf + raft entry overhead.
 const DEFAULT_VALUE_SIZE_LIMIT: usize = 8 * 1024 * 1024;
 
+/// Default per-key size limit: 8 KiB.
+/// TiKV enforces `max-key-size` (default 8192 bytes).  Keys exceeding this
+/// limit cause opaque `KeyTooLarge` errors from TiKV.
+const DEFAULT_KEY_SIZE_LIMIT: usize = 8 * 1024;
+
 struct ValueSizeGuard {
     limit: usize, // 0 = disabled
 }
 
 static VALUE_SIZE_GUARD: OnceLock<ValueSizeGuard> = OnceLock::new();
+
+struct KeySizeGuard {
+    limit: usize, // 0 = disabled
+}
+
+static KEY_SIZE_GUARD: OnceLock<KeySizeGuard> = OnceLock::new();
+
+fn key_size_guard() -> &'static KeySizeGuard {
+    KEY_SIZE_GUARD.get_or_init(|| {
+        let limit = std::env::var("DB9_TXN_KEY_SIZE_LIMIT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_KEY_SIZE_LIMIT);
+        KeySizeGuard { limit }
+    })
+}
+
+/// Return the configured key size limit (for index-layer diagnostics).
+pub(crate) fn configured_key_size_limit() -> usize {
+    key_size_guard().limit
+}
 
 fn value_size_guard() -> &'static ValueSizeGuard {
     VALUE_SIZE_GUARD.get_or_init(|| {
@@ -135,6 +161,37 @@ pub(crate) fn check_value_size(key: &[u8], value: &[u8]) -> Result<()> {
     .into())
 }
 
+/// Reject a key if it exceeds the TiKV `max-key-size` limit (default 8 KiB).
+/// This is a defence-in-depth guard — the index layer performs its own check
+/// with a richer error message, but this catches any key path we missed.
+#[inline]
+pub(crate) fn check_key_size(key: &[u8]) -> Result<()> {
+    let guard = key_size_guard();
+    if guard.limit == 0 {
+        return Ok(());
+    }
+    if key.len() < guard.limit {
+        return Ok(());
+    }
+    let subsystem = key_subsystem(key);
+    let preview_len = key.len().min(32);
+    let key_hex: String = key[..preview_len]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    Err(SqlError::KeyTooLarge {
+        message: format!(
+            "key too large: {} bytes exceeds TiKV max-key-size limit of {} bytes ({}). \
+             [key={}]",
+            key.len(),
+            guard.limit,
+            subsystem,
+            key_hex,
+        ),
+    }
+    .into())
+}
+
 tokio::task_local! {
     /// Session-scoped savepoint state for the currently executing query.
     static SAVEPOINTS: Arc<SavepointState>;
@@ -160,6 +217,7 @@ pub(crate) async fn with_savepoints<R>(
 /// TiKV `put` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+    check_key_size(&key)?;
     check_value_size(&key, &value)?;
 
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
@@ -191,6 +249,13 @@ pub(crate) async fn txn_batch_mutate(
         return Ok(());
     }
 
+    // Size guards must run before any TiKV I/O (including savepoint
+    // undo recording) so that oversized keys never hit the network.
+    for (k, v) in &mutations {
+        check_key_size(k)?;
+        check_value_size(k, v)?;
+    }
+
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
 
     if let Some(ref sp) = savepoints {
@@ -200,10 +265,6 @@ pub(crate) async fn txn_batch_mutate(
                 sp.record_prev_value(key.clone(), prev).await?;
             }
         }
-    }
-
-    for (k, v) in &mutations {
-        check_value_size(k, v)?;
     }
 
     let tikv_mutations: Vec<Mutation> = mutations
@@ -445,6 +506,60 @@ mod tests {
         let sql_err = err
             .downcast_ref::<SqlError>()
             .expect("check_value_size should return SqlError::ValueTooLarge");
+        assert_eq!(sql_err.sqlstate(), "54000");
+    }
+
+    // ── check_key_size tests ───────────────────────────────────────
+
+    #[test]
+    fn check_key_size_allows_small_keys() {
+        let key = db_key(1, b"i_\x00\x00\x00\x00\x00\x00\x00\x01_data");
+        assert!(check_key_size(&key).is_ok());
+    }
+
+    #[test]
+    fn check_key_size_rejects_oversized_keys() {
+        let mut key = db_key(1, b"i_");
+        key.extend(vec![0u8; DEFAULT_KEY_SIZE_LIMIT]);
+        let err = check_key_size(&key).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("key too large"), "msg: {msg}");
+        assert!(msg.contains("index entry"), "msg: {msg}");
+    }
+
+    #[test]
+    fn check_key_size_rejects_at_exact_boundary() {
+        // TiKV rejects keys >= max-key-size, so exactly at limit must fail.
+        let prefix = db_key(1, b"i_");
+        let padding = DEFAULT_KEY_SIZE_LIMIT - prefix.len();
+        let mut key = prefix;
+        key.extend(vec![0u8; padding]);
+        assert_eq!(key.len(), DEFAULT_KEY_SIZE_LIMIT);
+        assert!(
+            check_key_size(&key).is_err(),
+            "key at exactly the limit should be rejected"
+        );
+    }
+
+    #[test]
+    fn check_key_size_allows_one_under_boundary() {
+        let prefix = db_key(1, b"i_");
+        let padding = DEFAULT_KEY_SIZE_LIMIT - prefix.len() - 1;
+        let mut key = prefix;
+        key.extend(vec![0u8; padding]);
+        assert_eq!(key.len(), DEFAULT_KEY_SIZE_LIMIT - 1);
+        assert!(check_key_size(&key).is_ok());
+    }
+
+    #[test]
+    fn check_key_size_returns_correct_sqlstate() {
+        use crate::sql::error::SqlError;
+        let mut key = db_key(1, b"i_");
+        key.extend(vec![0u8; DEFAULT_KEY_SIZE_LIMIT]);
+        let err = check_key_size(&key).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("check_key_size should return SqlError::KeyTooLarge");
         assert_eq!(sql_err.sqlstate(), "54000");
     }
 
