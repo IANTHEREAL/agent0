@@ -6,7 +6,7 @@ use super::super::prepared_stmt::PreparedExec;
 use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
 use super::utils::{apply_pending_set_config_mutations, apply_statement_timeout};
-use crate::sql::expr::bridge::eval_const_ast_expr;
+use crate::sql::expr::bridge::eval_execute_param;
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 use crate::sql::scanner::count_sql_parameters;
 use crate::sql::sequences::SequenceSession;
@@ -133,6 +133,7 @@ fn update_plan_cache_after_attempt(
         }
     }
 }
+
 impl Executor {
     /// Execute a prepared analyzed statement without re-parsing SQL text.
     ///
@@ -1084,8 +1085,12 @@ impl Executor {
             }
 
             let mut param_values: Vec<Option<Value>> = Vec::with_capacity(parameters.len());
-            for expr in parameters {
-                param_values.push(Some(eval_const_ast_expr(expr)?));
+            for (i, expr) in parameters.iter().enumerate() {
+                // Length guard above guarantees param_data_types[i] exists.
+                param_values.push(Some(eval_execute_param(
+                    expr,
+                    &prepared.param_data_types[i],
+                )?));
             }
 
             self.execute_prepared(

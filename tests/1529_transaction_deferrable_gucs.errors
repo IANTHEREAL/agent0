@@ -1,7 +1,8 @@
-# db9-specific guardrail: PostgreSQL mutates these GUCs instead of rejecting them.
-parameter "transaction_deferrable" cannot be changed
-parameter "default_transaction_deferrable" cannot be changed
-parameter "transaction_deferrable" cannot be changed
-parameter "default_transaction_deferrable" cannot be changed
-parameter "transaction_deferrable" cannot be changed
-parameter "default_transaction_deferrable" cannot be changed
+# db9-specific guardrail: PostgreSQL allows DEFERRABLE GUCs; db9 rejects them
+# because SERIALIZABLE isolation is not supported.
+DEFERRABLE transactions are not supported (requires SERIALIZABLE isolation)
+DEFERRABLE transactions are not supported (requires SERIALIZABLE isolation)
+DEFERRABLE transactions are not supported (requires SERIALIZABLE isolation)
+DEFERRABLE transactions are not supported (requires SERIALIZABLE isolation)
+DEFERRABLE transactions are not supported (requires SERIALIZABLE isolation)
+DEFERRABLE transactions are not supported (requires SERIALIZABLE isolation)

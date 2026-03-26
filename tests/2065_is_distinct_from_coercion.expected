@@ -100,15 +100,9 @@ t
 ?column?
 f
 (1 row)
-?column?
-t
-(1 row)
-?column?
-f
-(1 row)
-?column?
-t
-(1 row)
+ERROR:  invalid input syntax for type regclass: "t_2065"
+ERROR:  invalid input syntax for type bigint: "integer"
+ERROR:  invalid input syntax for type bigint: "integer"
 ?column?
 f
 (1 row)

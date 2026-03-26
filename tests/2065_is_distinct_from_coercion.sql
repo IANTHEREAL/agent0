@@ -94,6 +94,9 @@ EXECUTE p2065k('{}');
 DEALLOCATE p2065k;
 
 -- OID alias: PG infers unresolved param as oid (Int64), not the alias type
+-- db9 limitation: param_inference_target maps OID aliases to Int64, and
+-- cast_to_regclass only resolves pg_catalog names (not user tables).
+-- These currently error; fixing requires catalog-aware regclass input function (#2146).
 PREPARE p2065l(regclass) AS SELECT $1 IS DISTINCT FROM $2;
 EXECUTE p2065l('t_2065', 0);
 DEALLOCATE p2065l;

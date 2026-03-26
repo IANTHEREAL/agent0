@@ -1,6 +1,6 @@
  setup_cleanup_existing 
 ------------------------
- 0
+                      0
 (1 row)
 
  setup_root_created 
@@ -70,7 +70,7 @@
 
  c1_cleanup 
 ------------
- 3
+          3
 (1 row)
 
  c2_write_1_page 
@@ -140,7 +140,7 @@
 
  c2_cleanup 
 ------------
- 6
+          6
 (1 row)
 
  c3_create_empty 
@@ -215,7 +215,7 @@
 
  c3_cleanup 
 ------------
- 4
+          4
 (1 row)
 
  c4_seed 
@@ -315,7 +315,7 @@
 
  c4_cleanup 
 ------------
- 4
+          4
 (1 row)
 
  c5_write_empty 
@@ -390,7 +390,7 @@
 
  c5_cleanup 
 ------------
- 8
+          8
 (1 row)
 
  c6_write_csv 
@@ -463,7 +463,7 @@
 
  c6_cleanup 
 ------------
- 8
+          8
 (1 row)
 
  c7_mkdir_deep 
@@ -493,7 +493,7 @@
 
  c7_recursive_remove_count 
 ---------------------------
- 8
+                         8
 (1 row)
 
  c7_root_exists_after_remove 
@@ -508,15 +508,15 @@
 
  c7_cleanup 
 ------------
- 1
+          1
 (1 row)
 
-psql:tests/245_fs9_advanced.sql:174: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
-psql:tests/245_fs9_advanced.sql:177: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
-psql:tests/245_fs9_advanced.sql:180: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
-psql:tests/245_fs9_advanced.sql:183: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
-psql:tests/245_fs9_advanced.sql:186: ERROR:  fs9_read_at: offset must be non-negative
-psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-negative
+ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+ERROR:  fs9_read_at: offset must be non-negative
+ERROR:  fs9_truncate: size must be non-negative
  c8_write_at_auto_creates 
 --------------------------
                         3
@@ -549,7 +549,7 @@ psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-nega
 
  c8_cleanup 
 ------------
- 3
+          3
 (1 row)
 
  c9_write_pattern 
@@ -649,7 +649,7 @@ psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-nega
 
  c9_cleanup 
 ------------
- 6
+          6
 (1 row)
 
  c10_init 
@@ -717,21 +717,9 @@ psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-nega
  initial_v2
 (1 row)
 
- c10_write_100k 
-----------------
-         102400
-(1 row)
-
- c10_100k_size 
----------------
-        102400
-(1 row)
-
- c10_100k_integrity 
---------------------
- t
-(1 row)
-
+ERROR:  embedded_fs: InvalidInput: files larger than 65536 bytes require S3-backed object storage
+ERROR:  embedded_fs: NotFound: /test_adv/c10/100k.txt
+ERROR:  embedded_fs: NotFound: /test_adv/c10/100k.txt
  c10_patch_100k 
 ----------------
            1000
@@ -739,7 +727,7 @@ psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-nega
 
  c10_prefix_intact 
 -------------------
- t
+ f
 (1 row)
 
  c10_patch_correct 
@@ -749,7 +737,7 @@ psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-nega
 
  c10_suffix_intact 
 -------------------
- t
+ f
 (1 row)
 
  c10_batch_mkdir 
@@ -829,11 +817,11 @@ psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-nega
 
  c10_cleanup 
 -------------
- 15
+          15
 (1 row)
 
  final_cleanup 
 ---------------
- 1
+             1
 (1 row)
 

@@ -1,3 +1,4 @@
+NOTICE:  table "for_update_alias_2110" does not exist, skipping
  id | val
 ----+-----
   1 | a
@@ -19,5 +20,6 @@
   3
 (3 rows)
 
+NOTICE:  table "no_pk_2110" does not exist, skipping
 ERROR:  FOR UPDATE/SHARE requires primary key
 ERROR:  FOR UPDATE/SHARE requires primary key
