@@ -189,12 +189,23 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                         ExecuteResult::Select { rows, .. } => rows,
                         _ => return Err(anyhow!("Expected SELECT from IN subquery")),
                     };
+                    // Use the subquery's declared output type (not the LHS
+                    // type) so that build_any_all_rhs_constant_expr can
+                    // insert a Cast when types differ (e.g., int8 IN (SELECT int4)).
+                    let rhs_declared_type = subquery
+                        .output_schema
+                        .first()
+                        .map(|(_, dt, _)| dt.clone())
+                        .unwrap_or_else(|| rewritten_expr.data_type.clone());
                     let list: Vec<TypedExpr> = rows
                         .into_iter()
                         .filter_map(|r| r.values.into_iter().next())
-                        .map(|v| TypedExpr {
-                            data_type: rewritten_expr.data_type.clone(),
-                            kind: TypedExprKind::Constant(v),
+                        .map(|v| {
+                            build_any_all_rhs_constant_expr(
+                                &rewritten_expr.data_type,
+                                &rhs_declared_type,
+                                v,
+                            )
                         })
                         .collect();
                     Ok(TypedExpr {
@@ -253,14 +264,21 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                                 .enumerate()
                                 .map(|(i, lhs)| {
                                     let rhs_val = r.values.get(i).cloned().unwrap_or(Value::Null);
+                                    let rhs_declared = subquery
+                                        .output_schema
+                                        .get(i)
+                                        .map(|(_, dt, _)| dt.clone())
+                                        .unwrap_or_else(|| lhs.data_type.clone());
+                                    let rhs = build_any_all_rhs_constant_expr(
+                                        &lhs.data_type,
+                                        &rhs_declared,
+                                        rhs_val,
+                                    );
                                     TypedExpr {
                                         kind: TypedExprKind::BinaryOp {
                                             left: Box::new(lhs.clone()),
                                             op: TypedBinaryOp::Eq,
-                                            right: Box::new(TypedExpr::new(
-                                                TypedExprKind::Constant(rhs_val),
-                                                lhs.data_type.clone(),
-                                            )),
+                                            right: Box::new(rhs),
                                         },
                                         data_type: DataType::Boolean,
                                     }

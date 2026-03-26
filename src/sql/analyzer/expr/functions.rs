@@ -1359,10 +1359,15 @@ impl<'a> Analyzer<'a> {
                 got: args.len(),
             });
         }
-        let dt = args[0].data_type.clone();
         let mut it = args.into_iter();
         let a = it.next().unwrap();
         let b = it.next().unwrap();
+        // NULLIF(a, b) compares a and b — coerce so comparison is type-safe.
+        // PG: the result type is the first-argument type as resolved by the
+        // `=` operator.  Since db9 has no cross-type `=` operators, this is
+        // the coerced (common) type after ensure_comparison_compatible.
+        let (a, b) = self.ensure_comparison_compatible(a, b)?;
+        let dt = a.data_type.clone();
         Ok(TypedExpr::new(
             TypedExprKind::NullIf(Box::new(a), Box::new(b)),
             dt,

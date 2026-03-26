@@ -567,7 +567,7 @@ impl<'a> Analyzer<'a> {
             } => {
                 // Tuple form: (col1, col2, ...) [NOT] IN (SELECT ...)
                 if let Expr::Tuple(tuple_exprs) = expr.as_ref() {
-                    let analyzed_exprs: Vec<TypedExpr> = tuple_exprs
+                    let mut analyzed_exprs: Vec<TypedExpr> = tuple_exprs
                         .iter()
                         .map(|e| self.analyze_expr(e))
                         .collect::<Result<Vec<_>, _>>()?;
@@ -576,6 +576,25 @@ impl<'a> Analyzer<'a> {
                         return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
                             got: analyzed.output_schema.len(),
                         });
+                    }
+                    // Pairwise coercion: coerce each tuple element to be
+                    // comparison-compatible with the corresponding subquery
+                    // output column, matching the scalar InSubquery path.
+                    for (i, (_, sub_type, _)) in analyzed.output_schema.iter().enumerate() {
+                        let elem = &analyzed_exprs[i];
+                        if elem.data_type != *sub_type {
+                            if elem.is_null_constant() {
+                                analyzed_exprs[i] = TypedExpr::null(sub_type.clone());
+                            } else if let Some(target) =
+                                crate::sql::types::coercion::comparison_target_type(
+                                    &elem.data_type,
+                                    sub_type,
+                                )
+                            {
+                                analyzed_exprs[i] =
+                                    self.coerce_if_needed(analyzed_exprs[i].clone(), &target)?;
+                            }
+                        }
                     }
                     return Ok(TypedExpr::new(
                         TypedExprKind::TupleInSubquery {
@@ -587,12 +606,23 @@ impl<'a> Analyzer<'a> {
                     ));
                 }
 
-                let e = self.analyze_expr(expr)?;
+                let mut e = self.analyze_expr(expr)?;
                 let analyzed = self.analyze_query(subquery)?;
                 if analyzed.output_schema.len() != 1 {
                     return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
                         got: analyzed.output_schema.len(),
                     });
+                }
+                // Coerce LHS to be comparison-compatible with subquery output.
+                // We cannot easily wrap the subquery output in a cast, so coerce
+                // the LHS to the comparison target type (mirrors analyze_any_all_subquery).
+                let sub_type = &analyzed.output_schema[0].1;
+                if e.data_type != *sub_type {
+                    if e.is_null_constant() {
+                        e = TypedExpr::null(sub_type.clone());
+                    } else if let Some(target) = comparison_target_type(&e.data_type, sub_type) {
+                        e = self.coerce_if_needed(e, &target)?;
+                    }
                 }
                 Ok(TypedExpr::new(
                     TypedExprKind::InSubquery {
@@ -1421,19 +1451,21 @@ impl<'a> Analyzer<'a> {
             }
             let op = self.any_all_compare_op(compare_op)?;
             // Build: (left op elem[0]) AND (left op elem[1]) AND ...
+            // Coerce each element to be comparison-compatible with the LHS.
             let comparisons: Vec<TypedExpr> = elems
                 .into_iter()
                 .map(|elem| {
-                    TypedExpr::new(
+                    let (l, r) = self.ensure_comparison_compatible(left_expr.clone(), elem)?;
+                    Ok(TypedExpr::new(
                         TypedExprKind::BinaryOp {
-                            left: Box::new(left_expr.clone()),
+                            left: Box::new(l),
                             op: op.clone(),
-                            right: Box::new(elem),
+                            right: Box::new(r),
                         },
                         DataType::Boolean,
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, AnalyzerError>>()?;
             let mut result = comparisons.into_iter();
             let first = result.next().unwrap();
             let combined = result.fold(first, |acc, next| {

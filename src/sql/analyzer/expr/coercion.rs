@@ -1,13 +1,16 @@
 //! Parameter typing, implicit coercion, type unification, and ORDER BY analysis.
 //!
-//! Contains `is_unresolved_param`, `resolve_param_type`, `coerce_if_needed`,
-//! `unify_expr_types`, `analyze_order_by_exprs`, and `extract_array_literal_elems`.
+//! Contains `is_unresolved_param`, `resolve_param_type`, `ensure_comparison_compatible`,
+//! `coerce_if_needed`, `unify_expr_types`, `analyze_order_by_exprs`, and
+//! `extract_array_literal_elems`.
 
 use sqlparser::ast::{self as ast, Expr};
 
 use crate::model::DataType;
 use crate::sql::types::cast::CastContext;
-use crate::sql::types::coercion::{common_type, is_oid_alias_type, unify_types};
+use crate::sql::types::coercion::{
+    common_type, comparison_target_type, is_oid_alias_type, unify_types,
+};
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;
@@ -71,6 +74,42 @@ impl<'a> Analyzer<'a> {
     fn oid_alias_compat(a: &DataType, b: &DataType) -> bool {
         (is_oid_alias_type(a) && matches!(b, DataType::Int64 | DataType::Int32))
             || (is_oid_alias_type(b) && matches!(a, DataType::Int64 | DataType::Int32))
+    }
+
+    // -- Helper: comparison coercion --
+
+    /// Ensure two expressions are comparison-compatible by inserting
+    /// implicit casts as needed.  Handles NULL retyping and
+    /// `comparison_target_type`-based cast insertion.
+    ///
+    /// Currently used by `ALL` literal expansion and `NULLIF`. Other
+    /// comparison paths (`analyze_binary_op`, `IS DISTINCT FROM`, etc.)
+    /// have their own inline coercion that predates this helper.
+    pub(in crate::sql::analyzer) fn ensure_comparison_compatible(
+        &mut self,
+        left: TypedExpr,
+        right: TypedExpr,
+    ) -> Result<(TypedExpr, TypedExpr), AnalyzerError> {
+        // 1. If both types already match, return as-is.
+        if left.data_type == right.data_type {
+            return Ok((left, right));
+        }
+        // 2. NULL constant retyping — no Cast node needed.
+        if left.is_null_constant() {
+            return Ok((TypedExpr::null(right.data_type.clone()), right));
+        }
+        if right.is_null_constant() {
+            let null_typed = TypedExpr::null(left.data_type.clone());
+            return Ok((left, null_typed));
+        }
+        // 3. Find comparison target type and insert implicit casts.
+        if let Some(target) = comparison_target_type(&left.data_type, &right.data_type) {
+            let l = self.coerce_if_needed(left, &target)?;
+            let r = self.coerce_if_needed(right, &target)?;
+            return Ok((l, r));
+        }
+        // 4. No common type found — return as-is (runtime will error if types mismatch).
+        Ok((left, right))
     }
 
     // -- Helper: implicit cast insertion --
