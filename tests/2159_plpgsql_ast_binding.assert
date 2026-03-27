@@ -37,5 +37,8 @@ final
 # 1A.6 DECLARE expression binding
 /root/project-x/data
 
+# 1A.7 DECLARE variable chaining (local depends on local)
+/swarm/proj-1/claims/proj-1.json
+
 # Final table state
 i1 | final

@@ -184,6 +184,20 @@ $$;
 
 SELECT test_declare_expr('project-x');
 
+-- 1A.7  DECLARE variable chaining (local var depends on prior local var)
+CREATE OR REPLACE FUNCTION test_declare_chain(p_id text)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  root text := '/swarm/' || p_id;
+  claim_dir text := root || '/claims';
+  claim_path text := claim_dir || '/' || p_id || '.json';
+BEGIN
+  RETURN claim_path;
+END;
+$$;
+
+SELECT test_declare_chain('proj-1');
+
 -- ============================================================
 -- Verify table state (pins 1A correctness)
 -- ============================================================
@@ -206,4 +220,5 @@ DROP FUNCTION IF EXISTS test_select_into;
 DROP FUNCTION IF EXISTS test_perform_target;
 DROP FUNCTION IF EXISTS test_perform_caller;
 DROP FUNCTION IF EXISTS test_declare_expr;
+DROP FUNCTION IF EXISTS test_declare_chain;
 DROP TABLE IF EXISTS test_ast_bind_items;
