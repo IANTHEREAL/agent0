@@ -311,7 +311,13 @@ async fn execute_insert_row_inner(
             }
         };
         super::foreign_keys::validate_foreign_keys_with_cache(
-            store, txn, db_id, schema, &row, ref_cache, fk_lock_cache,
+            store,
+            txn,
+            db_id,
+            schema,
+            &row,
+            ref_cache,
+            fk_lock_cache,
         )
         .await?;
     }

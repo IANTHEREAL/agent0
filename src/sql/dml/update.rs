@@ -125,7 +125,8 @@ async fn execute_update_row_by_pk_inner(
                 &owned_cache
             }
         };
-        validate_foreign_keys_with_cache(store, txn, db_id, schema, &new_row, ref_cache, None).await?;
+        validate_foreign_keys_with_cache(store, txn, db_id, schema, &new_row, ref_cache, None)
+            .await?;
     }
 
     update_row_indexes(
@@ -648,7 +649,8 @@ async fn execute_update_row_inner(
                 &owned_cache
             }
         };
-        validate_foreign_keys_with_cache(store, txn, db_id, schema, &new_row, ref_cache, None).await?;
+        validate_foreign_keys_with_cache(store, txn, db_id, schema, &new_row, ref_cache, None)
+            .await?;
     }
 
     if pk_changed {

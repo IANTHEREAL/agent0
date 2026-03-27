@@ -585,13 +585,7 @@ pub(crate) async fn collect_deferred_self_fk_checks(
         let parent_exists = match lookup {
             FkRefLookup::Pk => {
                 store
-                    .check_and_lock_pk_keys(
-                        txn,
-                        db_id,
-                        schema.table_id,
-                        &[fk_values.clone()],
-                        None,
-                    )
+                    .check_and_lock_pk_keys(txn, db_id, schema.table_id, &[fk_values.clone()], None)
                     .await?
             }
             FkRefLookup::UniqueIndex { index_id, pk_types } => {
@@ -609,13 +603,7 @@ pub(crate) async fn collect_deferred_self_fk_checks(
                     .await?;
                 if !pks.is_empty() {
                     store
-                        .check_and_lock_pk_keys(
-                            txn,
-                            db_id,
-                            schema.table_id,
-                            &pks,
-                            None,
-                        )
+                        .check_and_lock_pk_keys(txn, db_id, schema.table_id, &pks, None)
                         .await?
                 } else {
                     false
@@ -789,13 +777,7 @@ async fn validate_foreign_keys_inner(
                 if !pks.is_empty() {
                     // Atomic read + lock on the parent row's actual PK.
                     store
-                        .check_and_lock_pk_keys(
-                            txn,
-                            db_id,
-                            ref_schema.table_id,
-                            &pks,
-                            None,
-                        )
+                        .check_and_lock_pk_keys(txn, db_id, ref_schema.table_id, &pks, None)
                         .await?
                 } else {
                     false

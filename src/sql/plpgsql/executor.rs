@@ -42,6 +42,7 @@ pub fn execute_plpgsql_function<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         let mut ctx = PlpgsqlContext::new();
+        ctx.function_name = func_def.name.to_lowercase();
 
         // SECURITY DEFINER: set the role override so all statements inside
         // this function execute with the owner's identity for RLS evaluation.

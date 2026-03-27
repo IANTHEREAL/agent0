@@ -271,6 +271,8 @@ tests/2165_returning_into_plpgsql.sql
 tests/2140_statement_timeout_sqlstate.sql
 # #2152 – Plan A swarm SQL end-to-end acceptance (all blockers resolved)
 tests/plan_a_capability_matrix.sql
+# #2184 – PL/pgSQL function_name.param_name qualified parameter binding
+tests/2184_plpgsql_qualified_param.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

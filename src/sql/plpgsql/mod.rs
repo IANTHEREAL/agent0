@@ -32,6 +32,10 @@ pub struct PlpgsqlContext {
     /// When set, all statements within this function execute using the given
     /// role identity (SECURITY DEFINER). `None` means SECURITY INVOKER (default).
     pub security_definer_role: Option<String>,
+    /// The name of the currently executing function (lowercase).
+    /// Used to resolve `function_name.param_name` qualified parameter references
+    /// in embedded SQL, matching PostgreSQL's disambiguation semantics.
+    pub function_name: String,
 }
 
 impl PlpgsqlContext {
@@ -41,6 +45,7 @@ impl PlpgsqlContext {
             variable_types: HashMap::new(),
             notices: Vec::new(),
             security_definer_role: None,
+            function_name: String::new(),
         }
     }
 

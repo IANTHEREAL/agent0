@@ -1,0 +1,22 @@
+# PL/pgSQL function_name.param_name qualified parameter binding (#2184)
+
+# Test 1: INSERT via qualified params + SELECT
+proj-1|T1|first task
+proj-1|T2|second task
+
+# Test 2: UPDATE via qualified params
+done
+open
+
+# Test 3: SELECT count with qualified param
+2
+
+# Test 4: DELETE via qualified params (only T1 remains)
+proj-1|T1|first task|done
+
+# Test 5: Mixed qualified + bare params
+ok
+proj-2|T10|mixed test
+
+# Test 6: Upsert with qualified params
+updated title

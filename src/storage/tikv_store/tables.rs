@@ -125,8 +125,7 @@ impl TikvStore {
         let num_requested = keys.len();
 
         let do_lock = async {
-            let pairs =
-                tikv_op!(txn.batch_get_for_update(keys).await).map_err(|e| anyhow!(e))?;
+            let pairs = tikv_op!(txn.batch_get_for_update(keys).await).map_err(|e| anyhow!(e))?;
             // All requested PKs must exist for the FK check to pass.
             Ok::<bool, anyhow::Error>(pairs.len() == num_requested)
         };

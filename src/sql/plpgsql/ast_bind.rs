@@ -213,8 +213,27 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
             }
         }
 
-        // Qualified identifiers are always column refs — never replace
-        Expr::CompoundIdentifier(_) => {}
+        // Qualified identifiers: if the qualifier matches the current function name
+        // and the second part is a known parameter, resolve it (PostgreSQL's
+        // `function_name.param_name` disambiguation syntax). Otherwise treat as
+        // a column/object reference and leave untouched.
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2
+                && !ctx.function_name.is_empty()
+                && parts[0].quote_style.is_none()
+                && parts[0].value.to_lowercase() == ctx.function_name
+            {
+                let param_name = parts[1].value.to_lowercase();
+                if let Some(value) = ctx.variables.get(&param_name) {
+                    let data_type = ctx
+                        .variable_types
+                        .get(&param_name)
+                        .cloned()
+                        .unwrap_or(DataType::Text);
+                    *expr = value_to_ast_expr(value, &data_type);
+                }
+            }
+        }
 
         Expr::BinaryOp { left, right, .. } => {
             bind_variables_in_expr(left, ctx);
