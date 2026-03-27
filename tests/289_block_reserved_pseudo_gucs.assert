@@ -1,0 +1,7 @@
+-- Reserved pseudo-GUC readback succeeds
+is_superuser_readable
+session_auth_readable
+-- SET session_authorization TO DEFAULT is allowed
+session_auth_after_reset
+-- Non-reserved GUC SET unaffected by pseudo-GUC blocking
+timeout_set=500ms
