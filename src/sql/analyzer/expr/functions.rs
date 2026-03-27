@@ -633,6 +633,7 @@ impl<'a> Analyzer<'a> {
             }
             "HTTP_GET" | "HTTP_HEAD" | "HTTP_DELETE" | "HTTP_POST" | "HTTP_PUT" | "HTTP_PATCH"
             | "HTTP" => self.coerce_http_signature(func_name, args),
+            "MAKE_INTERVAL" => self.reorder_make_interval_named_args(args, func),
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -649,6 +650,96 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
+    }
+
+    /// Reorder named arguments for MAKE_INTERVAL to positional order.
+    ///
+    /// PostgreSQL parameter order: years(0), months(1), weeks(2), days(3),
+    /// hours(4), mins(5), secs(6). All default to 0. When named args are used,
+    /// `extract_function_args` discards the names, so we must reorder here using
+    /// the original `func.args` which still has the names.
+    fn reorder_make_interval_named_args(
+        &mut self,
+        args: Vec<TypedExpr>,
+        func: &Function,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        // If no named args, return as-is (pure positional or zero-arg call).
+        let has_named = func
+            .args
+            .iter()
+            .any(|a| matches!(a, FunctionArg::Named { .. }));
+        if !has_named {
+            return Ok(args);
+        }
+
+        // Parameter name → positional index.
+        let param_index = |name: &str| -> Option<usize> {
+            match name.to_lowercase().as_str() {
+                "years" => Some(0),
+                "months" => Some(1),
+                "weeks" => Some(2),
+                "days" => Some(3),
+                "hours" => Some(4),
+                "mins" => Some(5),
+                "secs" => Some(6),
+                _ => None,
+            }
+        };
+
+        // Build a slot array of 7 positions, filled with defaults.
+        let default_int = TypedExpr::new(TypedExprKind::Constant(Value::Int32(0)), DataType::Int32);
+        let default_secs = TypedExpr::new(
+            TypedExprKind::Constant(Value::Float64(0.0)),
+            DataType::Float64,
+        );
+        let mut slots: [Option<TypedExpr>; 7] = Default::default();
+
+        // The analyzed args are in the same order as func.args (names discarded).
+        // Walk func.args to recover the mapping.
+        let mut arg_idx = 0;
+        for fa in &func.args {
+            match fa {
+                FunctionArg::Named { name, .. } => {
+                    let param_name = name.value.as_str();
+                    let slot = param_index(param_name).ok_or_else(|| {
+                        AnalyzerError::SqlStructure(format!(
+                            "make_interval: unknown parameter \"{}\"",
+                            param_name
+                        ))
+                    })?;
+                    if slot < slots.len() {
+                        slots[slot] = Some(args[arg_idx].clone());
+                    }
+                    arg_idx += 1;
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(_)) => {
+                    // Positional args fill slots in order (only valid before any named arg,
+                    // which is already validated by validate_no_positional_after_named).
+                    if arg_idx < 7 {
+                        slots[arg_idx] = Some(args[arg_idx].clone());
+                    }
+                    arg_idx += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Fill defaults and collect.
+        let result: Vec<TypedExpr> = slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| {
+                    if i == 6 {
+                        default_secs.clone()
+                    } else {
+                        default_int.clone()
+                    }
+                })
+            })
+            .collect();
+
+        Ok(result)
     }
 
     fn coerce_advisory_lock_two_arg_signature(

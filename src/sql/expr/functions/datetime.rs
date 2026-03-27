@@ -13,6 +13,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("DATE", eval_date);
     map.insert("AGE", eval_age);
     map.insert("TO_CHAR", eval_to_char);
+    map.insert("MAKE_INTERVAL", eval_make_interval);
 }
 
 /// DATE_PART(field, source) — extract a sub-field from a date/time value.
@@ -288,4 +289,86 @@ fn add_months(dt: chrono::NaiveDateTime, months: i32) -> Result<chrono::NaiveDat
     let new_date =
         chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| anyhow!("invalid date"))?;
     Ok(new_date.and_time(dt.time()))
+}
+
+/// MAKE_INTERVAL(years, months, weeks, days, hours, mins, secs) → interval
+///
+/// PostgreSQL signature: all parameters optional with default 0 (secs is float8).
+/// Positional order: years(0), months(1), weeks(2), days(3), hours(4), mins(5), secs(6).
+/// Named-arg reordering is handled by the analyzer before args reach here.
+fn eval_make_interval(args: Vec<Value>) -> Result<Value> {
+    fn arg_to_i32(v: &Value, name: &str) -> Result<i32> {
+        match v {
+            Value::Int32(i) => Ok(*i),
+            Value::Int64(i) => Ok(*i as i32),
+            Value::Float64(f) => Ok(*f as i32),
+            Value::Null => Ok(0),
+            other => Err(anyhow!(
+                "make_interval: {} must be integer, got {:?}",
+                name,
+                other
+            )),
+        }
+    }
+    fn arg_to_f64(v: &Value, name: &str) -> Result<f64> {
+        match v {
+            Value::Float64(f) => Ok(*f),
+            Value::Int32(i) => Ok(*i as f64),
+            Value::Int64(i) => Ok(*i as f64),
+            Value::Null => Ok(0.0),
+            other => Err(anyhow!(
+                "make_interval: {} must be numeric, got {:?}",
+                name,
+                other
+            )),
+        }
+    }
+
+    let years = args
+        .first()
+        .map(|v| arg_to_i32(v, "years"))
+        .transpose()?
+        .unwrap_or(0);
+    let months = args
+        .get(1)
+        .map(|v| arg_to_i32(v, "months"))
+        .transpose()?
+        .unwrap_or(0);
+    let weeks = args
+        .get(2)
+        .map(|v| arg_to_i32(v, "weeks"))
+        .transpose()?
+        .unwrap_or(0);
+    let days = args
+        .get(3)
+        .map(|v| arg_to_i32(v, "days"))
+        .transpose()?
+        .unwrap_or(0);
+    let hours = args
+        .get(4)
+        .map(|v| arg_to_i32(v, "hours"))
+        .transpose()?
+        .unwrap_or(0);
+    let mins = args
+        .get(5)
+        .map(|v| arg_to_i32(v, "mins"))
+        .transpose()?
+        .unwrap_or(0);
+    let secs = args
+        .get(6)
+        .map(|v| arg_to_f64(v, "secs"))
+        .transpose()?
+        .unwrap_or(0.0);
+
+    let total_months = years * 12 + months;
+    let total_days = weeks * 7 + days;
+    let millis = (total_days as i64) * 86_400_000
+        + (hours as i64) * 3_600_000
+        + (mins as i64) * 60_000
+        + (secs * 1000.0) as i64;
+
+    Ok(Value::Interval(crate::model::IntervalValue::new(
+        total_months,
+        millis,
+    )))
 }

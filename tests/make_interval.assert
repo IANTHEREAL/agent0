@@ -1,0 +1,31 @@
+# make_interval() regression assertions (#2162)
+
+# 1. Zero-arg defaults
+00:00:00
+
+# 2. Named: secs => 120
+00:02:00
+
+# 3. Named: days + hours
+1 day 02:00:00
+
+# 4. Named: years + months
+1 year 6 mons
+
+# 5. Positional: 1h30m
+01:30:00
+
+# 6. Named: weeks => 2 (= 14 days)
+14 days
+
+# 7. Named: secs => 90 (1m30s)
+00:01:30
+
+# 8. Arithmetic: now() + interval
+future_ok
+
+# 9. Named: mins => 45
+00:45:00
+
+# 10. Mixed positional: 1y 2m 3w (= 1y 2m 21d)
+1 year 2 mons 21 days
