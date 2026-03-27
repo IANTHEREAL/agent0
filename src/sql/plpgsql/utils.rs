@@ -2,6 +2,7 @@
 //! identifier replacement, and exit signal management.
 
 use crate::model::{DataType, Value};
+use crate::sql::scanner::SqlCharScanner;
 
 use super::PlpgsqlContext;
 use crate::sql::quoting;
@@ -186,6 +187,147 @@ pub(crate) fn replace_identifier(s: &str, name: &str, replacement: &str) -> Stri
 
 fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BlockKind {
+    Begin,
+    Case,
+}
+
+/// Scan the outer PL/pgSQL `BEGIN .. END;` block while ignoring strings,
+/// comments, and dollar-quoted SQL text.
+fn plpgsql_outer_block_scan(body: &str) -> Option<(usize, usize, bool)> {
+    let bytes = body.as_bytes();
+    let mut skip_until = 0usize;
+    let mut stack: Vec<BlockKind> = Vec::new();
+    let mut block_start: Option<usize> = None;
+
+    for ctx in SqlCharScanner::new(body) {
+        if !ctx.is_code() || ctx.pos < skip_until {
+            continue;
+        }
+
+        let i = ctx.pos;
+        let b = bytes[i];
+        if !(b.is_ascii_alphabetic() || b == b'_') {
+            continue;
+        }
+
+        let start = i;
+        let mut end = i + 1;
+        while end < bytes.len() {
+            let b = bytes[end];
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        skip_until = end;
+
+        let token = &body[start..end];
+        if token.eq_ignore_ascii_case("BEGIN") {
+            if stack.is_empty() {
+                block_start = Some(end);
+            }
+            stack.push(BlockKind::Begin);
+            continue;
+        }
+
+        if token.eq_ignore_ascii_case("CASE") {
+            if !stack.is_empty() {
+                stack.push(BlockKind::Case);
+            }
+            continue;
+        }
+
+        if !token.eq_ignore_ascii_case("END") || stack.is_empty() {
+            continue;
+        }
+
+        let mut j = end;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+
+        let mut next_token_end = j;
+        let mut next_token: Option<&str> = None;
+        if next_token_end < bytes.len()
+            && (bytes[next_token_end].is_ascii_alphabetic() || bytes[next_token_end] == b'_')
+        {
+            let next_start = next_token_end;
+            next_token_end += 1;
+            while next_token_end < bytes.len() {
+                let b = bytes[next_token_end];
+                if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                    next_token_end += 1;
+                } else {
+                    break;
+                }
+            }
+            next_token = Some(&body[next_start..next_token_end]);
+        }
+
+        if let Some(next) = next_token {
+            if next.eq_ignore_ascii_case("IF") || next.eq_ignore_ascii_case("LOOP") {
+                continue;
+            }
+            if next.eq_ignore_ascii_case("CASE") {
+                if matches!(stack.last(), Some(BlockKind::Case)) {
+                    stack.pop();
+                }
+                skip_until = next_token_end;
+                continue;
+            }
+        }
+
+        if matches!(stack.last(), Some(BlockKind::Case)) {
+            stack.pop();
+            continue;
+        }
+
+        if matches!(stack.last(), Some(BlockKind::Begin)) {
+            if j < bytes.len() && bytes[j] == b';' {
+                stack.pop();
+                if stack.is_empty() {
+                    return Some((block_start.unwrap_or(start), start, true));
+                }
+                continue;
+            }
+
+            if next_token.is_some() {
+                let mut k = next_token_end;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b';' {
+                    stack.pop();
+                    if stack.is_empty() {
+                        return Some((block_start.unwrap_or(start), start, true));
+                    }
+                }
+            }
+        }
+    }
+
+    block_start.map(|start| (start, body.len(), false))
+}
+
+/// Find the outer PL/pgSQL `BEGIN .. END;` block while allowing an
+/// unterminated body to extend to EOF. Trigger extraction uses this relaxed
+/// behavior.
+pub(crate) fn plpgsql_outer_block_range(body: &str) -> Option<(usize, usize)> {
+    plpgsql_outer_block_scan(body).map(|(start, end, _closed)| (start, end))
+}
+
+/// Find the outer PL/pgSQL `BEGIN .. END;` block and require an explicit outer
+/// `END;` terminator. Body validation/parsing uses this strict behavior.
+pub(crate) fn plpgsql_outer_block_range_strict(body: &str) -> Option<(usize, usize)> {
+    match plpgsql_outer_block_scan(body) {
+        Some((start, end, true)) => Some((start, end)),
+        _ => None,
+    }
 }
 
 pub(super) const EXIT_SIGNAL_VAR: &str = "__db9_plpgsql_exit_signal__";

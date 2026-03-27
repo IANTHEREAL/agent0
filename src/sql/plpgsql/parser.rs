@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 
-use super::utils::parse_plpgsql_type;
+use super::utils::{parse_plpgsql_type, plpgsql_outer_block_range_strict};
 use crate::model::DataType;
 
 /// Represents a single PL/pgSQL statement.
@@ -104,81 +104,11 @@ pub(super) fn parse_begin_block(
     body: &str,
     declared_vars: &HashSet<String>,
 ) -> Result<Vec<PlpgsqlStatement>> {
-    let begin_pos =
-        find_ascii_keyword(body.as_bytes(), b"BEGIN").ok_or_else(|| anyhow!("Missing BEGIN"))?;
-    let end_pos = find_matching_end(&body[begin_pos..])
+    let (block_start, end_pos) = plpgsql_outer_block_range_strict(body)
         .ok_or_else(|| anyhow!("Missing END for BEGIN block"))?;
 
-    let block_content = &body[begin_pos + 5..begin_pos + end_pos];
+    let block_content = &body[block_start..end_pos];
     parse_statements(block_content, declared_vars)
-}
-
-fn find_matching_end(s: &str) -> Option<usize> {
-    let mut depth = 0;
-    let mut i = 0;
-    let bytes = s.as_bytes();
-
-    while i < bytes.len() {
-        if ascii_keyword_at(bytes, i, b"BEGIN")
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            && (i + 5 == bytes.len() || !bytes[i + 5].is_ascii_alphanumeric())
-        {
-            depth += 1;
-            i += 5;
-            continue;
-        }
-        if ascii_keyword_at(bytes, i, b"IF")
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            && (i + 2 == bytes.len() || !bytes[i + 2].is_ascii_alphanumeric())
-        {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        if ascii_keyword_at(bytes, i, b"END LOOP")
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-        {
-            depth -= 1;
-            i += 8;
-            continue;
-        }
-        if ascii_keyword_at(bytes, i, b"LOOP")
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
-        {
-            depth += 1;
-            i += 4;
-            continue;
-        }
-        if ascii_keyword_at(bytes, i, b"END IF")
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-        {
-            depth -= 1;
-            i += 6;
-            continue;
-        }
-        if ascii_keyword_at(bytes, i, b"END")
-            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-            && (i + 3 == bytes.len()
-                || !bytes[i + 3].is_ascii_alphanumeric()
-                || (i + 4 <= bytes.len() && bytes[i + 3] == b';'))
-        {
-            let mut rest_pos = i + 3;
-            while rest_pos < bytes.len() && bytes[rest_pos].is_ascii_whitespace() {
-                rest_pos += 1;
-            }
-            if !ascii_keyword_at(bytes, rest_pos, b"IF") {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            i += 3;
-            continue;
-        }
-        i += 1;
-    }
-    None
 }
 
 pub(super) fn parse_statements(

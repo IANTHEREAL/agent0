@@ -48,3 +48,21 @@ fn test_validate_plpgsql_body_with_emoji() {
     let body = "BEGIN\n    -- 🎉 celebration\n    RETURN 42;\nEND;";
     assert!(validate_plpgsql_body(body).is_ok());
 }
+
+#[test]
+fn test_validate_plpgsql_body_with_create_table_if_not_exists() {
+    let body = r#"
+BEGIN
+    CREATE TABLE IF NOT EXISTS t_ddl_breaks(id int);
+    RETURN 'ok';
+END;
+"#;
+    assert!(validate_plpgsql_body(body).is_ok());
+}
+
+#[test]
+fn test_validate_plpgsql_body_requires_outer_end() {
+    let body = "BEGIN\n    RETURN 1;\n";
+    let err = validate_plpgsql_body(body).expect_err("missing END must be rejected");
+    assert!(err.to_string().contains("Missing END for BEGIN block"));
+}

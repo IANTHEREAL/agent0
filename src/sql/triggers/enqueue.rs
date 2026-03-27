@@ -1,8 +1,9 @@
-use super::execute::{execute_trigger_body_standalone, plpgsql_outer_block_range};
+use super::execute::execute_trigger_body_standalone;
 use super::queue::TriggerOp;
 use super::rewrite::substitute_row_references;
 use crate::model::{Row, TriggerDef};
 use crate::sql::executor::{Executor, PendingAsyncTrigger};
+use crate::sql::plpgsql::utils::plpgsql_outer_block_range;
 use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 use anyhow::Result;
