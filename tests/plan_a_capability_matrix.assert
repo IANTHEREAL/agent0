@@ -1,0 +1,7 @@
+# Plan A swarm SQL end-to-end acceptance (#2152)
+# All 5 functions must create and execute successfully.
+# try_claim returns true (agent claimed the task)
+t
+# heartbeat_claim returns true (lease extended)
+heartbeat_claim
+t
