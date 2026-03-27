@@ -546,3 +546,54 @@ fn test_flush_pending_hnsw_merges_clears_buffer_without_system_store() {
     executor.flush_pending_hnsw_merges();
     assert_eq!(executor.pending_hnsw_merges.lock().unwrap().len(), 0);
 }
+
+// ── Lock resolution backoff tests (#2156) ──────────────────
+
+#[test]
+fn lock_backoff_budget_does_not_exceed_20s() {
+    use tikv_client::backoff::PESSIMISTIC_BACKOFF;
+
+    let mut b = PESSIMISTIC_BACKOFF.clone();
+    let mut total_ms = 0u64;
+    let mut count = 0u32;
+    while let Some(d) = b.next_delay_duration() {
+        total_ms += d.as_millis() as u64;
+        count += 1;
+    }
+    assert!(total_ms <= 20_000, "total {total_ms}ms exceeds 20s budget");
+    assert!(
+        total_ms >= 19_000,
+        "total {total_ms}ms too far below 20s budget"
+    );
+    assert!(
+        count > 10,
+        "should use >10 attempts with budget, got {count}"
+    );
+}
+
+#[test]
+fn lock_backoff_budget_clamps_last_delay() {
+    use tikv_client::backoff::Backoff;
+
+    // Budget=10ms, base=2, cap=3000
+    let mut b = Backoff::no_jitter_backoff_with_budget(2, 3000, 10);
+    let d1 = b.next_delay_duration().unwrap().as_millis() as u64; // 2
+    let d2 = b.next_delay_duration().unwrap().as_millis() as u64; // 4
+    let d3 = b.next_delay_duration().unwrap().as_millis() as u64; // clamped to 4 (remaining)
+    assert_eq!(d1, 2);
+    assert_eq!(d2, 4);
+    assert_eq!(d3, 4); // 10 - 2 - 4 = 4
+    assert!(b.next_delay_duration().is_none()); // budget exhausted
+}
+
+#[test]
+fn lock_backoff_count_based_unchanged() {
+    use tikv_client::backoff::Backoff;
+
+    // Count-based (max_total_ms=0) still works as before
+    let mut b = Backoff::no_jitter_backoff(2, 500, 3);
+    assert!(b.next_delay_duration().is_some());
+    assert!(b.next_delay_duration().is_some());
+    assert!(b.next_delay_duration().is_some());
+    assert!(b.next_delay_duration().is_none());
+}
