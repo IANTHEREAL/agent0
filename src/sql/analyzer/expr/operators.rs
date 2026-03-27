@@ -107,6 +107,19 @@ impl<'a> Analyzer<'a> {
             r = self.coerce_if_needed(r, &resolve_type)?;
         }
 
+        // Array(Unknown) contextual coercion: when one side is a concrete type
+        // and the other is Array(Unknown) (e.g. ARRAY['a','c'] with all-unknown
+        // elements), coerce the array element type based on the operator context.
+        // This mirrors PostgreSQL's behavior where unknown[] resolves to text[]
+        // in operator contexts that expect a text-like array.
+        if matches!(r.data_type, DataType::Array(ref inner) if **inner == DataType::Unknown)
+            && typed_op == BinaryOp::Sub
+            && l.data_type == DataType::Jsonb
+        {
+            // jsonb - unknown[] → jsonb - text[] (multi-key deletion)
+            r = self.coerce_if_needed(r, &DataType::Array(Box::new(DataType::Text)))?;
+        }
+
         // Contextual parameter typing (mirrors NULL typing above).
         // Resolve parameter from the concrete type on the other side.
         // Always call resolve_param_type for conflict detection, even for

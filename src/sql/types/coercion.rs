@@ -272,7 +272,10 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                     if (op == "Minus" || op == "-")
                         && matches!(
                             inner.as_ref(),
-                            DataType::Text | DataType::Varchar(_) | DataType::Name
+                            DataType::Text
+                                | DataType::Varchar(_)
+                                | DataType::Name
+                                | DataType::Unknown
                         ) =>
                 {
                     Some(DataType::Jsonb)
