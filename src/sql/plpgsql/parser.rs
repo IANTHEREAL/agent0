@@ -45,12 +45,12 @@ pub(super) enum PlpgsqlStatement {
 pub(super) fn parse_declare_block(
     body: &str,
 ) -> Result<(
-    HashMap<String, Option<String>>,
+    Vec<(String, Option<String>)>,
     HashMap<String, DataType>,
     &str,
 )> {
     let body_bytes = body.as_bytes();
-    let mut var_defaults: HashMap<String, Option<String>> = HashMap::new();
+    let mut var_defaults: Vec<(String, Option<String>)> = Vec::new();
     let mut types = HashMap::new();
 
     let declare_pos = find_ascii_keyword(body_bytes, b"DECLARE");
@@ -87,7 +87,7 @@ pub(super) fn parse_declare_block(
 
                     let data_type = parse_plpgsql_type(type_str);
                     types.insert(var_name.clone(), data_type);
-                    var_defaults.insert(var_name, default_expr);
+                    var_defaults.push((var_name, default_expr));
                 }
             }
         }

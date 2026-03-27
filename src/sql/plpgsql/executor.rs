@@ -19,6 +19,7 @@ use crate::sql::ExecuteResult;
 use crate::sql::Executor;
 use crate::storage::TikvStore;
 
+use super::ast_bind;
 use super::parser::{parse_begin_block, parse_declare_block, PlpgsqlStatement};
 use super::utils::{
     consume_exit_signal, format_raise_message, has_exit_signal, is_type_keyword,
@@ -225,11 +226,15 @@ fn execute_statements<'a>(
                 }
 
                 PlpgsqlStatement::Sql(sql) => {
-                    let expanded = substitute_variables(ctx, sql);
                     let exec = executor
                         .ok_or_else(|| anyhow!("SQL statement requires execution context"))?;
 
-                    let raw_trimmed = expanded.trim().trim_end_matches(';').trim();
+                    // Check for CREATE TYPE ... AS ENUM (needs text form for classify).
+                    // NOTE: This path still uses text substitution for both classification
+                    // and execution. CREATE TYPE ENUM bodies don't reference table columns,
+                    // so text substitution is safe here. Plan A does not use this path.
+                    let expanded_for_classify = substitute_variables(ctx, sql);
+                    let raw_trimmed = expanded_for_classify.trim().trim_end_matches(';').trim();
                     let raw_upper = raw_trimmed.to_ascii_uppercase();
                     if matches!(classify(&raw_upper), Some(RawSqlKind::CreateTypeEnum)) {
                         let _ = exec
@@ -238,7 +243,14 @@ fn execute_statements<'a>(
                         continue;
                     }
 
-                    let stmts = parse_sql(&expanded)?;
+                    // AST-aware binding: parse raw SQL first, then bind variables in AST.
+                    // No fallback to text substitution — parse/bind failure is an error.
+                    let stmts = ast_bind::bind_sql_statements(sql, ctx)?;
+                    let expanded = stmts
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ");
                     let mut create_index_with_params =
                         crate::sql::extract_create_index_with_params(&expanded).into_iter();
                     for stmt in stmts {
@@ -263,11 +275,10 @@ fn execute_statements<'a>(
                 }
 
                 PlpgsqlStatement::Perform(query) => {
-                    let expanded = substitute_variables(ctx, query);
-                    let select_sql = format!("SELECT {}", expanded);
                     let exec =
                         executor.ok_or_else(|| anyhow!("PERFORM requires execution context"))?;
-                    let stmts = parse_sql(&select_sql)?;
+                    let select_sql = format!("SELECT {}", query);
+                    let stmts = ast_bind::bind_sql_statements(&select_sql, ctx)?;
                     for stmt in stmts {
                         let _ = exec
                             .execute_statement_on_txn(
@@ -288,9 +299,8 @@ fn execute_statements<'a>(
                     query,
                     strict,
                 } => {
-                    let expanded = substitute_variables(ctx, query);
+                    let stmts = ast_bind::bind_sql_statements(query, ctx)?;
                     if let Some(exec) = executor {
-                        let stmts = parse_sql(&expanded)?;
                         if let Some(stmt) = stmts.into_iter().next() {
                             let result = exec
                                 .execute_statement_on_txn(
@@ -333,9 +343,8 @@ fn execute_statements<'a>(
                     query,
                     body,
                 } => {
-                    let expanded = substitute_variables(ctx, query);
+                    let stmts = ast_bind::bind_sql_statements(query, ctx)?;
                     if let Some(exec) = executor {
-                        let stmts = parse_sql(&expanded)?;
                         if let Some(stmt) = stmts.into_iter().next() {
                             let result = exec
                                 .execute_statement_on_txn(
@@ -522,8 +531,9 @@ async fn evaluate_expression(
     expr_str: &str,
     executor: Option<&Executor>,
 ) -> Result<Value> {
-    let expanded = substitute_variables(ctx, expr_str);
-    let sql = format!("SELECT {}", expanded);
+    // AST-aware binding: parse expression first, bind variables, reconstruct SQL.
+    // No fallback to text substitution — parse/bind failure is an error.
+    let sql = ast_bind::bind_expression(expr_str, ctx)?;
 
     if let Some(exec) = executor {
         let stmts = parse_sql(&sql)?;
@@ -571,7 +581,9 @@ async fn evaluate_expression(
         }
     }
 
-    parse_literal_value(&expanded, &DataType::Text)
+    // Last-resort fallback: strip the "SELECT " prefix and try parsing as a literal
+    let expr_part = sql.strip_prefix("SELECT ").unwrap_or(&sql);
+    parse_literal_value(expr_part, &DataType::Text)
 }
 
 /// Try to look up and execute a user-defined function by name. Returns `Ok(None)` if

@@ -259,6 +259,8 @@ tests/safety_parameterized_limit_negative.sql
 tests/safety_copy_binary_rejection.sql
 # #2126 – JOIN on table with dropped column (scope ctid fix)
 tests/2126_join_dropped_column.sql
+# #2159 – Phase 1 AST-aware PL/pgSQL variable binding (typed literals, no fallback)
+tests/2159_plpgsql_ast_binding.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
