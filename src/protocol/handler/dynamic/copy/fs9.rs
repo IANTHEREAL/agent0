@@ -126,6 +126,19 @@ impl DynamicPgHandler {
         // All fallible work after begin() is wrapped in an async block so that
         // every `?` is caught by the single cleanup site below.
         let result: PgWireResult<usize> = async {
+            // Server-file privilege check first (PG checks file permission
+            // before table privilege for COPY … FROM 'filename').
+            // Without this, a non-superuser can probe table existence by
+            // observing whether the error is "table not found" vs "permission
+            // denied for table".
+            if !session.is_superuser() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42501".to_string(),
+                    "permission denied to COPY from a file".to_string(),
+                ))));
+            }
+
             // INSERT privilege check
             {
                 let current_role = session.current_user().map(|s| s.to_string());
@@ -260,13 +273,7 @@ impl DynamicPgHandler {
                         "fs9: TiKV storage backend not available".to_string(),
                     ))));
                 }
-                if !session.is_superuser() {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "42501".to_string(),
-                        "fs9: permission denied".to_string(),
-                    ))));
-                }
+                // superuser check already done above (before table privilege)
 
                 let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
                 let tenant = executor.tenant_keyspace().to_string();
@@ -596,6 +603,17 @@ impl DynamicPgHandler {
         // All fallible work after begin() is wrapped in an async block so that
         // every `?` is caught by the single cleanup site below.
         let result: PgWireResult<usize> = async {
+            // Server-file privilege check first for fs9:// URLs (same as
+            // the CSV/TEXT handler — PG checks file permission before table
+            // privilege for COPY FROM 'filename').
+            if crate::extensions::parquet::reader::is_fs9_url(&url) && !session.is_superuser() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42501".to_string(),
+                    "permission denied to COPY from a file".to_string(),
+                ))));
+            }
+
             let db_id = session.current_database_id();
 
             // Check extension is installed

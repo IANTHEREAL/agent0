@@ -1,6 +1,6 @@
-ERROR:  permission denied for table t_copy_fs9_priv_1471
+ERROR:  permission denied to COPY from a file
 ERROR:  SAVEPOINT can only be used in transaction blocks
-ERROR:  permission denied for table t_copy_fs9_priv_1471
+ERROR:  permission denied to COPY from a file
 ERROR:  current transaction is aborted, commands ignored until end of transaction block
 after_rollback
 2
