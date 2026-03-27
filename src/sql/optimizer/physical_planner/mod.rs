@@ -481,20 +481,12 @@ impl PhysicalPlanner {
                                         Some(limit_val),
                                         &schema.indexes,
                                     ) {
-                                        // HNSW scan requires table statistics for a
-                                        // well-informed cost decision.  Without ANALYZE,
-                                        // the row estimate defaults to 1000 which makes
-                                        // HNSW always look cheaper than sort.  Skip HNSW
-                                        // when no stats exist to avoid selecting it on
-                                        // tiny tables where the cost model is unreliable.
-                                        let has_stats = ctx.get_stats(&scan_key).is_some();
-
                                         let full_scan_sort_cost = sort_input.cost.total
                                             + (sort_input.cost.rows as f64
                                                 * (sort_input.cost.rows as f64).log2().max(1.0));
                                         let hnsw_scan_cost = estimate_hnsw_scan_cost(hnsw_params.k);
 
-                                        if has_stats && hnsw_scan_cost < full_scan_sort_cost {
+                                        if hnsw_scan_cost < full_scan_sort_cost {
                                             let hnsw_scan_plan = PhysicalPlan {
                                                 node: PhysicalNode::HnswScan {
                                                     table_name: table_name.clone(),

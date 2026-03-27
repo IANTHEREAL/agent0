@@ -370,12 +370,10 @@ impl PhysicalOperator for HnswScanOperator {
                 return Ok(());
             }
 
-            // Build rank and distance maps keyed by label (= rowid in Mapped mode).
-            let rank_by_label: HashMap<u64, usize> = ranked_labels
-                .iter()
-                .enumerate()
-                .map(|(rank, (label, _))| (*label, rank))
-                .collect();
+            // Build distance map keyed by label for initial candidate filtering.
+            // Note: these are graph-derived distances used only for candidate
+            // selection.  After batch_get_rows, exact distances are recomputed
+            // from current row vectors (see "Exact rerank" below).
             distance_by_label = ranked_labels.iter().copied().collect();
 
             // Convert labels → PK values for batch_get_rows.
@@ -447,25 +445,73 @@ impl PhysicalOperator for HnswScanOperator {
                 valid.push(r);
             }
 
-            // Sort by HNSW search rank (closest first).
-            let pk_to_label_ref = &pk_to_label;
-            valid.sort_by_key(|row| {
+            // Exact rerank: compute actual distances from current row vectors
+            // instead of relying on graph-derived ranks.  The HNSW graph is an
+            // approximate index for candidate retrieval — after batch_get_rows
+            // returns the current MVCC-visible vectors, we recompute distances
+            // to produce correct ordering.  This handles stale graph entries
+            // left by usearch's append-only semantics on UPDATE.
+            let query_f64: Vec<f64> = self
+                .query_vector
+                .iter()
+                .map(|v| match v {
+                    Value::Float64(f) => *f,
+                    _ => 0.0,
+                })
+                .collect();
+
+            // Compute exact distance for each row from its current vector.
+            let mut row_distances: Vec<(usize, f64)> = valid
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let dist = vector_col_idx
+                        .and_then(|vi| row.values.get(vi))
+                        .map(|val| match val {
+                            Value::Vector(v) => {
+                                self.distance_metric.compute_distance(v, &query_f64)
+                            }
+                            _ => f64::MAX,
+                        })
+                        .unwrap_or(f64::MAX);
+                    (i, dist)
+                })
+                .collect();
+            row_distances
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Build distance_by_label BEFORE reordering — row_distances indices
+            // refer to positions in the original `valid` array.
+            if self.distance_expr.is_some() {
+                distance_by_label.clear();
                 let pk_col_idx = self.schema.pk_indices.first().copied().unwrap_or(0);
-                let label = match label_mode {
-                    HnswLabelMode::Direct => row.values.get(pk_col_idx).and_then(Self::pk_as_u64),
-                    HnswLabelMode::Mapped => {
-                        let pk_key = row
-                            .values
-                            .get(pk_col_idx)
-                            .map(|v| v.to_string())
-                            .unwrap_or_default();
-                        pk_to_label_ref.get(&pk_key).copied()
+                for &(i, dist) in &row_distances {
+                    let label = match label_mode {
+                        HnswLabelMode::Direct => valid
+                            .get(i)
+                            .and_then(|r| r.values.get(pk_col_idx))
+                            .and_then(Self::pk_as_u64),
+                        HnswLabelMode::Mapped => {
+                            let pk_key = valid
+                                .get(i)
+                                .and_then(|r| r.values.get(pk_col_idx))
+                                .map(|v| v.to_string())
+                                .unwrap_or_default();
+                            pk_to_label.get(&pk_key).copied()
+                        }
+                    };
+                    if let Some(l) = label {
+                        distance_by_label.insert(l, dist);
                     }
-                };
-                label
-                    .and_then(|l| rank_by_label.get(&l).copied())
-                    .unwrap_or(usize::MAX)
-            });
+                }
+            }
+
+            // Reorder valid rows by exact distance.
+            let reordered: Vec<Row> = row_distances
+                .iter()
+                .map(|(i, _)| valid[*i].clone())
+                .collect();
+            valid = reordered;
 
             valid.truncate(self.k);
             rows = valid;

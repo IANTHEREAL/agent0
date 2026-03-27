@@ -105,6 +105,41 @@ impl HnswDistanceMetric {
             Self::InnerProduct => raw - 1.0,
         }
     }
+
+    /// Compute exact distance between two vectors using the SQL-facing metric.
+    ///
+    /// Used by HNSW scan to re-rank candidates after `batch_get_rows` so that
+    /// distances reflect the current row vectors, not stale graph entries.
+    pub fn compute_distance(self, a: &[f64], b: &[f64]) -> f64 {
+        match self {
+            Self::L2 => {
+                let sum_sq: f64 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
+                sum_sq.sqrt()
+            }
+            Self::Cosine => {
+                let (mut dot, mut norm_a, mut norm_b) = (0.0, 0.0, 0.0);
+                for (x, y) in a.iter().zip(b) {
+                    dot += x * y;
+                    norm_a += x * x;
+                    norm_b += y * y;
+                }
+                let denom = norm_a.sqrt() * norm_b.sqrt();
+                if denom == 0.0 {
+                    1.0
+                } else {
+                    // Clamp to [-1, 1] to handle floating-point imprecision,
+                    // matching the SQL cosine_distance() function.
+                    let sim = (dot / denom).clamp(-1.0, 1.0);
+                    1.0 - sim
+                }
+            }
+            Self::InnerProduct => {
+                // pgvector-compatible: negative dot product
+                let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                -dot
+            }
+        }
+    }
 }
 
 /// Default M parameter for HNSW graph connectivity.
@@ -330,5 +365,50 @@ mod tests {
         let (name, signature) = HnswDistanceMetric::InnerProduct.deferred_embedding_function();
         assert_eq!(name, "vec_embed_inner_product");
         assert_eq!(signature, "vec_embed_inner_product(vector, text)");
+    }
+
+    // ── compute_distance tests ───────────────────────────────
+
+    #[test]
+    fn compute_distance_l2() {
+        let d = HnswDistanceMetric::L2.compute_distance(&[0.0, 0.0], &[3.0, 4.0]);
+        assert!((d - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_distance_l2_identical() {
+        let d = HnswDistanceMetric::L2.compute_distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+        assert!(d.abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_distance_cosine_identical() {
+        let d = HnswDistanceMetric::Cosine.compute_distance(&[1.0, 0.0], &[1.0, 0.0]);
+        assert!(d.abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_distance_cosine_orthogonal() {
+        let d = HnswDistanceMetric::Cosine.compute_distance(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!((d - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_distance_cosine_opposite() {
+        let d = HnswDistanceMetric::Cosine.compute_distance(&[1.0, 0.0], &[-1.0, 0.0]);
+        assert!((d - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_distance_cosine_zero_vector() {
+        let d = HnswDistanceMetric::Cosine.compute_distance(&[0.0, 0.0], &[1.0, 0.0]);
+        assert!((d - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_distance_inner_product() {
+        // pgvector-compatible: negative dot product
+        let d = HnswDistanceMetric::InnerProduct.compute_distance(&[1.0, 2.0], &[3.0, 4.0]);
+        assert!((d - (-11.0)).abs() < 1e-10); // -(1*3 + 2*4) = -11
     }
 }

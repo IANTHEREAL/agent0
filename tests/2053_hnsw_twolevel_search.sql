@@ -6,9 +6,11 @@
 -- ================================================================
 DROP TABLE IF EXISTS hnsw_2l;
 CREATE TABLE hnsw_2l (id INT PRIMARY KEY, v VECTOR(3));
+-- id=2 is deliberately closer to the x-axis than id=3 to break ties
+-- deterministically when id=1 is moved away from [1,0,0].
 INSERT INTO hnsw_2l (id, v) VALUES
     (1, '[0.9, 0.0, 0.0]'),
-    (2, '[0.0, 0.9, 0.0]'),
+    (2, '[0.5, 0.0, 0.0]'),
     (3, '[0.0, 0.0, 0.9]');
 CREATE INDEX idx_2l ON hnsw_2l USING hnsw (v vector_l2_ops);
 
