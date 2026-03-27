@@ -22,7 +22,7 @@ mod stmt_ddl;
 mod stmt_dml;
 mod stmt_query;
 mod stmt_rbac;
-mod timeout;
+pub(crate) mod timeout;
 pub(crate) mod view_rewrite;
 
 #[cfg(test)]

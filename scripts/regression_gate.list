@@ -265,6 +265,8 @@ tests/2159_plpgsql_ast_binding.sql
 tests/make_interval.sql
 # #2165 – PL/pgSQL RETURNING ... INTO (Plan A B4 gap)
 tests/2165_returning_into_plpgsql.sql
+# #2140 – StatementTimeout SQLSTATE must be 57014 (query_canceled)
+tests/2140_statement_timeout_sqlstate.sql
 # #2152 – Plan A swarm SQL end-to-end acceptance (all blockers resolved)
 tests/plan_a_capability_matrix.sql
 [python]

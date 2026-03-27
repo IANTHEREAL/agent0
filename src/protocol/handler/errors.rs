@@ -1,4 +1,5 @@
 use crate::sql::error::SqlError;
+use crate::sql::executor::core::timeout::StatementTimeoutError;
 use pgwire::error::{ErrorInfo, PgWireError};
 
 fn is_ident_char(b: u8) -> bool {
@@ -70,6 +71,10 @@ fn is_tikv_lock_resolution_failure(err: &anyhow::Error) -> bool {
 pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     if let Some(sql_err) = err.downcast_ref::<SqlError>() {
         return sql_err.sqlstate();
+    }
+    // Statement timeout → 57014 (query_canceled), matching PostgreSQL.
+    if err.is::<StatementTimeoutError>() {
+        return "57014";
     }
     // WriteConflict → 40001 (serialization_failure): client should retry the txn.
     if is_tikv_write_conflict(err) {

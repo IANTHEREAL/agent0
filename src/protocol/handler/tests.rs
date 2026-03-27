@@ -268,6 +268,11 @@ fn test_sqlstate_for_executor_error() {
     let failed: anyhow::Error = SqlError::InFailedTransaction.into();
     assert_eq!(sqlstate_for_executor_error(&failed), "25P02");
 
+    // StatementTimeoutError → 57014 (query_canceled), matching PostgreSQL.
+    let timeout_err =
+        anyhow::Error::new(crate::sql::executor::core::timeout::StatementTimeoutError);
+    assert_eq!(sqlstate_for_executor_error(&timeout_err), "57014");
+
     // Untyped anyhow → XX000
     let other = anyhow::anyhow!("boom");
     assert_eq!(sqlstate_for_executor_error(&other), "XX000");
