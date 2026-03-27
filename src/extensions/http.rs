@@ -105,18 +105,21 @@ impl TenantLimiters {
 }
 
 static LIMITERS: OnceLock<TenantLimiters> = OnceLock::new();
-static CLIENT: OnceLock<Client> = OnceLock::new();
-
-fn client() -> &'static Client {
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client init")
-    })
+/// Build a reqwest client pinned to a specific resolved IP.
+///
+/// A fresh client is built per-request rather than reused from a static pool.
+/// This prevents DNS rebinding attacks: the `.resolve()` call pins the
+/// connection to the IP validated by `validate_url`, so reqwest never
+/// re-resolves DNS independently.
+fn build_pinned_client(host: &str, ip: IpAddr, port: u16) -> Result<Client> {
+    Client::builder()
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, std::net::SocketAddr::new(ip, port))
+        .build()
+        .map_err(|e| anyhow!("http: failed to build pinned client: {}", e))
 }
 
 fn limiters() -> &'static TenantLimiters {
@@ -179,10 +182,20 @@ fn headers_to_jsonb(headers: &reqwest::header::HeaderMap) -> Result<String> {
 fn is_ip_forbidden(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                // CGNAT / Shared Address Space (RFC 6598) — used in AWS VPC
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+                // Benchmarking (RFC 2544)
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xFE) == 18)
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+            // Only unwrap IPv4-mapped addresses (::ffff:x.x.x.x).
+            // Do NOT use to_ipv4() — it treats ::1 as IPv4-compatible
+            // 0.0.0.1, which bypasses all IPv4 forbidden checks.
+            if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_ip_forbidden(IpAddr::V4(v4));
             }
             v6.is_loopback()
@@ -193,11 +206,20 @@ fn is_ip_forbidden(ip: IpAddr) -> bool {
     }
 }
 
-async fn validate_url(url: &Url) -> Result<()> {
+/// Validated URL info returned by `validate_url`.  Contains the first
+/// resolved IP so the caller can pin the connection and prevent DNS
+/// rebinding (TOCTOU between validation and reqwest's own resolution).
+#[derive(Debug)]
+struct ValidatedUrl {
+    /// First non-forbidden resolved IP (or the IP literal from the URL).
+    resolved_ip: IpAddr,
+}
+
+async fn validate_url(url: &Url) -> Result<ValidatedUrl> {
     validate_url_with_policy(url, allow_insecure_http()).await
 }
 
-async fn validate_url_with_policy(url: &Url, allow_insecure: bool) -> Result<()> {
+async fn validate_url_with_policy(url: &Url, allow_insecure: bool) -> Result<ValidatedUrl> {
     let scheme = url.scheme();
     let is_https = scheme == "https";
     let is_http = scheme == "http";
@@ -235,8 +257,23 @@ async fn validate_url_with_policy(url: &Url, allow_insecure: bool) -> Result<()>
     let host_lower = host.to_ascii_lowercase();
 
     // In insecure mode, allow localhost and private IPs for local development.
+    // Still resolve DNS to return an IP for connection pinning.
     if allow_insecure {
-        return Ok(());
+        let host_for_parse = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host_for_parse.parse::<IpAddr>() {
+            return Ok(ValidatedUrl { resolved_ip: ip });
+        }
+        let addrs: Vec<_> = lookup_host((host, port))
+            .await
+            .map_err(|e| anyhow!("http: dns lookup failed: {}", e))?
+            .collect();
+        let first_ip = addrs
+            .first()
+            .map(|a| a.ip())
+            .ok_or_else(|| anyhow!("http: dns lookup returned no addresses"))?;
+        return Ok(ValidatedUrl {
+            resolved_ip: first_ip,
+        });
     }
 
     if host_lower == "localhost"
@@ -251,24 +288,25 @@ async fn validate_url_with_policy(url: &Url, allow_insecure: bool) -> Result<()>
         if is_ip_forbidden(ip) {
             return Err(anyhow!("http: ip is not allowed"));
         }
-        return Ok(());
+        return Ok(ValidatedUrl { resolved_ip: ip });
     }
 
-    let addrs = lookup_host((host, port))
+    let addrs: Vec<_> = lookup_host((host, port))
         .await
-        .map_err(|e| anyhow!("http: dns lookup failed: {}", e))?;
-    let mut any = false;
-    for addr in addrs {
-        any = true;
+        .map_err(|e| anyhow!("http: dns lookup failed: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow!("http: dns lookup returned no addresses"));
+    }
+    for addr in &addrs {
         if is_ip_forbidden(addr.ip()) {
             return Err(anyhow!("http: resolved ip is not allowed"));
         }
     }
-    if !any {
-        return Err(anyhow!("http: dns lookup returned no addresses"));
-    }
 
-    Ok(())
+    Ok(ValidatedUrl {
+        resolved_ip: addrs[0].ip(),
+    })
 }
 
 fn redirect_target(base: &Url, location: &str) -> Result<Url> {
@@ -379,9 +417,17 @@ async fn execute_request(
     let _permit = acquire_quota_permit(quota, context::execution_kind()).await?;
 
     for redirect_count in 0..=MAX_REDIRECTS {
-        validate_url(&url).await?;
+        let validated = validate_url(&url).await?;
 
-        let mut req = client().request(method.clone(), url.clone());
+        // Pin the connection to the validated IP to prevent DNS rebinding
+        // (TOCTOU between validate_url's DNS lookup and reqwest's own).
+        // We build a per-request client with `.resolve()` so reqwest uses
+        // our validated IP instead of re-resolving DNS.  TLS SNI and Host
+        // header are preserved because the URL still contains the hostname.
+        let host = url.host_str().unwrap_or("").to_string();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let pinned_client = build_pinned_client(&host, validated.resolved_ip, port)?;
+        let mut req = pinned_client.request(method.clone(), url.clone());
         if let Some(ref ct) = content_type {
             req = req.header(CONTENT_TYPE, ct);
         }
@@ -834,5 +880,42 @@ mod tests {
             MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE,
             "Pools must sum to total capacity"
         );
+    }
+
+    // ── is_ip_forbidden security tests ──────────────────────
+
+    #[test]
+    fn test_ipv6_loopback_is_forbidden() {
+        assert!(is_ip_forbidden("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_loopback_is_forbidden() {
+        // ::ffff:127.0.0.1
+        assert!(is_ip_forbidden("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cgnat_is_forbidden() {
+        // 100.64.0.0/10 — CGNAT / Shared Address Space (RFC 6598)
+        assert!(is_ip_forbidden("100.64.0.1".parse().unwrap()));
+        assert!(is_ip_forbidden("100.127.255.254".parse().unwrap()));
+        // Just outside CGNAT range
+        assert!(!is_ip_forbidden("100.128.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_benchmarking_is_forbidden() {
+        // 198.18.0.0/15 — Benchmarking (RFC 2544)
+        assert!(is_ip_forbidden("198.18.0.1".parse().unwrap()));
+        assert!(is_ip_forbidden("198.19.255.254".parse().unwrap()));
+        // Just outside range
+        assert!(!is_ip_forbidden("198.20.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_public_ip_is_allowed() {
+        assert!(!is_ip_forbidden("8.8.8.8".parse().unwrap()));
+        assert!(!is_ip_forbidden("1.1.1.1".parse().unwrap()));
     }
 }

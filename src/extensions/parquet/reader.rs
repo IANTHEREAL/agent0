@@ -8,7 +8,7 @@ use futures::stream::{self, BoxStream};
 use futures::{Stream, StreamExt};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 
-use super::http_reader::{fetch_parquet_file_size, parquet_http_client, HttpParquetReader};
+use super::http_reader::{build_pinned_parquet_client, fetch_parquet_file_size, HttpParquetReader};
 use super::types::{arrow_array_to_value, arrow_type_to_pg_type};
 use crate::model::{ColumnDef, TableSchema, Value};
 
@@ -57,8 +57,9 @@ pub(crate) async fn infer_schema(url: &str) -> Result<TableSchema> {
     }
 
     super::http_reader::validate_parquet_url(url)?;
-    super::http_reader::validate_parquet_url_security(url).await?;
-    let client = parquet_http_client().clone();
+    let validated = super::http_reader::validate_parquet_url_security(url).await?;
+    let client =
+        build_pinned_parquet_client(&validated.host, validated.resolved_ip, validated.port)?;
     let file_size = fetch_parquet_file_size(&client, url)
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -73,8 +74,9 @@ pub(crate) async fn open_row_stream(url: &str) -> Result<(TableSchema, RowStream
     }
 
     super::http_reader::validate_parquet_url(url)?;
-    super::http_reader::validate_parquet_url_security(url).await?;
-    let client = parquet_http_client().clone();
+    let validated = super::http_reader::validate_parquet_url_security(url).await?;
+    let client =
+        build_pinned_parquet_client(&validated.host, validated.resolved_ip, validated.port)?;
     let file_size = fetch_parquet_file_size(&client, url)
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -89,8 +91,9 @@ pub(crate) async fn open_batch_stream(url: &str) -> Result<(TableSchema, BatchSt
     }
 
     super::http_reader::validate_parquet_url(url)?;
-    super::http_reader::validate_parquet_url_security(url).await?;
-    let client = parquet_http_client().clone();
+    let validated = super::http_reader::validate_parquet_url_security(url).await?;
+    let client =
+        build_pinned_parquet_client(&validated.host, validated.resolved_ip, validated.port)?;
     let file_size = fetch_parquet_file_size(&client, url)
         .await
         .map_err(|e| anyhow!("{e}"))?;

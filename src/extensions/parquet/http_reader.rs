@@ -9,25 +9,31 @@ use parquet::file::metadata::ParquetMetaData;
 use reqwest::header::{CONTENT_LENGTH, RANGE};
 use reqwest::StatusCode;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_REDIRECTS: usize = 5;
 
-static PARQUET_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-pub(crate) fn parquet_http_client() -> &'static reqwest::Client {
-    PARQUET_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-            .build()
-            .expect("parquet http client init")
-    })
+/// Build a parquet HTTP client pinned to a specific resolved IP.
+///
+/// Prevents DNS rebinding TOCTOU: the `.resolve()` call pins the connection
+/// to the IP validated by `validate_parquet_url_security`, so reqwest never
+/// re-resolves DNS independently.  Redirects are disabled to prevent
+/// bypassing SSRF checks via unvalidated redirect targets.
+pub(crate) fn build_pinned_parquet_client(
+    host: &str,
+    ip: std::net::IpAddr,
+    port: u16,
+) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, std::net::SocketAddr::new(ip, port))
+        .build()
+        .map_err(|e| anyhow::anyhow!("parquet: failed to build pinned client: {}", e))
 }
 
 /// Validate that a URL uses a supported scheme for Parquet import.
@@ -45,7 +51,17 @@ pub(crate) fn validate_parquet_url(url: &str) -> anyhow::Result<()> {
 /// Validate URL against SSRF: block private IPs, localhost, link-local.
 /// Mirrors the network policy in `src/extensions/http.rs`.
 /// In insecure mode (DB9_HTTP_ALLOW_INSECURE=true), all hosts are allowed.
-pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<()> {
+/// Validated parquet URL info with resolved IP for connection pinning.
+#[derive(Debug)]
+pub(crate) struct ValidatedParquetUrl {
+    pub resolved_ip: std::net::IpAddr,
+    pub host: String,
+    pub port: u16,
+}
+
+pub(crate) async fn validate_parquet_url_security(
+    url: &str,
+) -> anyhow::Result<ValidatedParquetUrl> {
     use std::net::IpAddr;
     use tokio::net::lookup_host;
 
@@ -61,10 +77,19 @@ pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<(
     fn is_ip_forbidden(ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    // CGNAT / Shared Address Space (RFC 6598) — used in AWS VPC
+                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+                    // Benchmarking (RFC 2544)
+                    || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xFE) == 18)
             }
             IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                // Only unwrap IPv4-mapped (::ffff:x.x.x.x), NOT IPv4-compatible.
+                // to_ipv4() converts ::1 to 0.0.0.1, bypassing forbidden checks.
+                if let Some(v4) = v6.to_ipv4_mapped() {
                     return is_ip_forbidden(IpAddr::V4(v4));
                 }
                 v6.is_loopback()
@@ -76,7 +101,31 @@ pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<(
     }
 
     if allow_insecure() {
-        return Ok(());
+        let parsed =
+            reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid Parquet URL: {}", e))?;
+        let host = parsed.host_str().unwrap_or("").to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let host_for_parse = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host_for_parse.parse::<IpAddr>() {
+            return Ok(ValidatedParquetUrl {
+                resolved_ip: ip,
+                host,
+                port,
+            });
+        }
+        let addrs: Vec<std::net::SocketAddr> = lookup_host(format!("{}:{}", host, port))
+            .await
+            .map_err(|e| anyhow::anyhow!("parquet: DNS lookup failed for {}: {}", host, e))?
+            .collect();
+        let first_ip = addrs
+            .first()
+            .map(|a| a.ip())
+            .ok_or_else(|| anyhow::anyhow!("parquet: DNS lookup returned no addresses"))?;
+        return Ok(ValidatedParquetUrl {
+            resolved_ip: first_ip,
+            host,
+            port,
+        });
     }
 
     let parsed =
@@ -111,7 +160,11 @@ pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<(
                 ip
             ));
         }
-        return Ok(());
+        return Ok(ValidatedParquetUrl {
+            resolved_ip: ip,
+            host: host.to_string(),
+            port,
+        });
     }
 
     let addrs: Vec<std::net::SocketAddr> = lookup_host(format!("{}:{}", host, port))
@@ -136,7 +189,11 @@ pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<(
         ));
     }
 
-    Ok(())
+    Ok(ValidatedParquetUrl {
+        resolved_ip: addrs[0].ip(),
+        host: host.to_string(),
+        port,
+    })
 }
 
 pub(crate) struct HttpParquetReader {
@@ -315,9 +372,16 @@ pub(crate) async fn fetch_parquet_file_size(client: &reqwest::Client, url: &str)
 mod tests {
     use super::*;
 
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client")
+    }
+
     #[tokio::test]
     async fn fetch_file_size_rejects_ftp_scheme() {
-        let client = parquet_http_client().clone();
+        let client = test_client();
         let err = fetch_parquet_file_size(&client, "ftp://example.com/file.parquet")
             .await
             .unwrap_err();
@@ -327,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_file_size_rejects_file_scheme() {
-        let client = parquet_http_client().clone();
+        let client = test_client();
         let err = fetch_parquet_file_size(&client, "file:///tmp/data.parquet")
             .await
             .unwrap_err();
@@ -337,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_file_size_accepts_http() {
-        let client = parquet_http_client().clone();
+        let client = test_client();
         let err = fetch_parquet_file_size(&client, "http://nonexistent.invalid/data.parquet")
             .await
             .unwrap_err();
@@ -347,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_file_size_accepts_https() {
-        let client = parquet_http_client().clone();
+        let client = test_client();
         let err = fetch_parquet_file_size(&client, "https://nonexistent.invalid/data.parquet")
             .await
             .unwrap_err();
@@ -377,15 +441,8 @@ mod tests {
     }
 
     #[test]
-    fn client_singleton_returns_same_instance() {
-        let c1 = parquet_http_client() as *const reqwest::Client;
-        let c2 = parquet_http_client() as *const reqwest::Client;
-        assert_eq!(c1, c2);
-    }
-
-    #[test]
     fn http_parquet_reader_stores_fields() {
-        let client = parquet_http_client().clone();
+        let client = test_client();
         let reader = HttpParquetReader::new(
             client,
             "https://example.com/test.parquet".to_string(),
