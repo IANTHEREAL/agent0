@@ -44,7 +44,7 @@ env:
   ECR_REPOSITORY: pg-tikv
   EKS_CLUSTER_NAME: staging-us-west-2-f02
   K8S_NAMESPACE: db9
-  K8S_DEPLOYMENT: db9-server
+  K8S_WORKLOAD: statefulset/db9-server-sts
   K8S_CONTAINER: db9-server
 
 jobs:
@@ -181,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PREV_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          PREV_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "${K8S_WORKLOAD}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
           echo "previous_image=${PREV_IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Roll out server image to shared staging
@@ -192,9 +192,9 @@ jobs:
           IMAGE_REF_DIGEST: ${{ steps.manifest.outputs.image_ref_digest }}
         run: |
           set -euo pipefail
-          kubectl -n "${K8S_NAMESPACE}" set image "deployment/${K8S_DEPLOYMENT}" "${K8S_CONTAINER}=${IMAGE_REF_DIGEST}"
-          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout=10m
-          DEPLOYED_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          kubectl -n "${K8S_NAMESPACE}" set image "${K8S_WORKLOAD}" "${K8S_CONTAINER}=${IMAGE_REF_DIGEST}"
+          kubectl -n "${K8S_NAMESPACE}" rollout status "${K8S_WORKLOAD}" --timeout=10m
+          DEPLOYED_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "${K8S_WORKLOAD}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
           echo "deployed_image=${DEPLOYED_IMAGE}" >> "$GITHUB_OUTPUT"
           if [[ "${DEPLOYED_IMAGE}" != "${IMAGE_REF_DIGEST}" ]]; then
             echo "::error::deployment image mismatch after rollout"
@@ -210,9 +210,9 @@ jobs:
         run: |
           set -euo pipefail
           echo "::notice::attempting automatic rollback via kubectl rollout undo"
-          kubectl -n "${K8S_NAMESPACE}" rollout undo "deployment/${K8S_DEPLOYMENT}" || true
-          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout=10m || true
-          ROLLED_BACK_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          kubectl -n "${K8S_NAMESPACE}" rollout undo "${K8S_WORKLOAD}" || true
+          kubectl -n "${K8S_NAMESPACE}" rollout status "${K8S_WORKLOAD}" --timeout=10m || true
+          ROLLED_BACK_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "${K8S_WORKLOAD}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
           echo "rolled_back_image=${ROLLED_BACK_IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Summarize shared staging deploy
@@ -237,7 +237,7 @@ jobs:
             echo "- **Health Gate**: kubectl rollout status only"
             echo "- **Cluster**: ${EKS_CLUSTER_NAME}"
             echo "- **Namespace**: ${K8S_NAMESPACE}"
-            echo "- **Deployment**: ${K8S_DEPLOYMENT}"
+            echo "- **Deployment**: ${K8S_WORKLOAD}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   deploy-manual:
@@ -293,7 +293,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PREV_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          PREV_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "${K8S_WORKLOAD}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
           echo "previous_image=${PREV_IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Roll out manual image to shared staging
@@ -301,9 +301,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "${K8S_NAMESPACE}" set image "deployment/${K8S_DEPLOYMENT}" "${K8S_CONTAINER}=${MANUAL_IMAGE_REF_DIGEST}"
-          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout="${{ github.event.inputs.rollout_timeout_minutes }}m"
-          DEPLOYED_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          kubectl -n "${K8S_NAMESPACE}" set image "${K8S_WORKLOAD}" "${K8S_CONTAINER}=${MANUAL_IMAGE_REF_DIGEST}"
+          kubectl -n "${K8S_NAMESPACE}" rollout status "${K8S_WORKLOAD}" --timeout="${{ github.event.inputs.rollout_timeout_minutes }}m"
+          DEPLOYED_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "${K8S_WORKLOAD}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
           echo "deployed_image=${DEPLOYED_IMAGE}" >> "$GITHUB_OUTPUT"
           if [[ "${DEPLOYED_IMAGE}" != "${MANUAL_IMAGE_REF_DIGEST}" ]]; then
             echo "::error::deployment image mismatch after rollout"
@@ -319,9 +319,9 @@ jobs:
         run: |
           set -euo pipefail
           echo "::notice::attempting automatic rollback via kubectl rollout undo"
-          kubectl -n "${K8S_NAMESPACE}" rollout undo "deployment/${K8S_DEPLOYMENT}" || true
-          kubectl -n "${K8S_NAMESPACE}" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout=10m || true
-          ROLLED_BACK_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "deployment/${K8S_DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
+          kubectl -n "${K8S_NAMESPACE}" rollout undo "${K8S_WORKLOAD}" || true
+          kubectl -n "${K8S_NAMESPACE}" rollout status "${K8S_WORKLOAD}" --timeout=10m || true
+          ROLLED_BACK_IMAGE="$(kubectl -n "${K8S_NAMESPACE}" get "${K8S_WORKLOAD}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"${K8S_CONTAINER}"'")].image}')"
           echo "rolled_back_image=${ROLLED_BACK_IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Summarize manual shared staging deploy
@@ -340,5 +340,5 @@ jobs:
             echo "- **Health Gate**: kubectl rollout status only"
             echo "- **Cluster**: ${{ github.event.inputs.cluster_name }}"
             echo "- **Namespace**: ${K8S_NAMESPACE}"
-            echo "- **Deployment**: ${K8S_DEPLOYMENT}"
+            echo "- **Deployment**: ${K8S_WORKLOAD}"
           } >> "$GITHUB_STEP_SUMMARY"
