@@ -294,6 +294,42 @@ fn execute_statements<'a>(
                     }
                 }
 
+                PlpgsqlStatement::DmlReturningInto { sql, variables } => {
+                    let exec = executor
+                        .ok_or_else(|| anyhow!("DML RETURNING INTO requires execution context"))?;
+
+                    let stmts = ast_bind::bind_sql_statements(sql, ctx)?;
+                    if let Some(stmt) = stmts.into_iter().next() {
+                        let result = exec
+                            .execute_statement_on_txn(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &stmt,
+                                ctx.security_definer_role.as_deref(),
+                                None,
+                            )
+                            .await?;
+                        if let ExecuteResult::Select { rows, .. } = result {
+                            let row_count = rows.len();
+                            if row_count > 1 {
+                                return Err(anyhow!("query returned more than one row"));
+                            }
+                            if let Some(row) = rows.into_iter().next() {
+                                for (i, var_name) in variables.iter().enumerate() {
+                                    let val = row.values.get(i).cloned().unwrap_or(Value::Null);
+                                    ctx.set_var(var_name, val);
+                                }
+                            } else {
+                                for var_name in variables {
+                                    ctx.set_var(var_name, Value::Null);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 PlpgsqlStatement::SelectInto {
                     variables,
                     query,

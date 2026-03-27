@@ -17,6 +17,13 @@ pub(super) enum PlpgsqlStatement {
     RaiseException(String),
     Sql(String),
     Perform(String),
+    /// INSERT/UPDATE/DELETE ... RETURNING expr_list INTO var_list
+    DmlReturningInto {
+        /// The DML SQL with RETURNING clause but without the INTO var_list part
+        sql: String,
+        /// Target PL/pgSQL variables to receive the RETURNING values
+        variables: Vec<String>,
+    },
     SelectInto {
         variables: Vec<String>,
         query: String,
@@ -70,20 +77,23 @@ pub(super) fn parse_declare_block(
                     let var_name = parts[0].trim().to_lowercase();
                     let rest = parts[1].trim();
 
-                    let (type_str, default_expr) =
-                        if let Some(def_pos) = find_ascii_keyword(rest.as_bytes(), b"DEFAULT") {
-                            (
-                                rest[..def_pos].trim(),
-                                Some(rest[def_pos + 7..].trim().to_string()),
-                            )
-                        } else if let Some(assign_pos) = rest.find(":=") {
-                            (
-                                rest[..assign_pos].trim(),
-                                Some(rest[assign_pos + 2..].trim().to_string()),
-                            )
-                        } else {
-                            (rest, None)
-                        };
+                    // Check := first (unambiguous), then DEFAULT with word-boundary
+                    // awareness to avoid matching inside string literals like 'default'.
+                    let (type_str, default_expr) = if let Some(assign_pos) = rest.find(":=") {
+                        (
+                            rest[..assign_pos].trim(),
+                            Some(rest[assign_pos + 2..].trim().to_string()),
+                        )
+                    } else if let Some(def_pos) =
+                        find_word_boundary_keyword(rest.as_bytes(), b"DEFAULT")
+                    {
+                        (
+                            rest[..def_pos].trim(),
+                            Some(rest[def_pos + 7..].trim().to_string()),
+                        )
+                    } else {
+                        (rest, None)
+                    };
 
                     let data_type = parse_plpgsql_type(type_str);
                     types.insert(var_name.clone(), data_type);
@@ -244,7 +254,15 @@ fn parse_single_statement(s: &str, declared_vars: &HashSet<String>) -> Result<Pl
     if ascii_keyword_at(s_bytes, 0, b"INSERT ")
         || ascii_keyword_at(s_bytes, 0, b"UPDATE ")
         || ascii_keyword_at(s_bytes, 0, b"DELETE ")
-        || ascii_keyword_at(s_bytes, 0, b"CREATE ")
+    {
+        // Check for RETURNING ... INTO var_list pattern
+        if let Some(stmt) = parse_dml_returning_into(s, declared_vars)? {
+            return Ok(stmt);
+        }
+        return Ok(PlpgsqlStatement::Sql(s.to_string()));
+    }
+
+    if ascii_keyword_at(s_bytes, 0, b"CREATE ")
         || ascii_keyword_at(s_bytes, 0, b"DROP ")
         || ascii_keyword_at(s_bytes, 0, b"ALTER ")
         || ascii_keyword_at(s_bytes, 0, b"TRUNCATE ")
@@ -259,6 +277,94 @@ fn parse_single_statement(s: &str, declared_vars: &HashSet<String>) -> Result<Pl
     }
 
     Ok(PlpgsqlStatement::Sql(s.to_string()))
+}
+
+/// Parse `INSERT/UPDATE/DELETE ... RETURNING expr_list INTO var_list`.
+///
+/// Scans backwards from the end of the statement to find the last `INTO` keyword
+/// that appears after a `RETURNING` keyword. The portion between RETURNING and INTO
+/// is the expression list, and everything after INTO is the variable list.
+fn parse_dml_returning_into(
+    s: &str,
+    declared_vars: &HashSet<String>,
+) -> Result<Option<PlpgsqlStatement>> {
+    let s_bytes = s.as_bytes();
+
+    // Find the last RETURNING keyword (case-insensitive, word-boundary).
+    let mut returning_pos = None;
+    let returning_kw = b"RETURNING";
+    let kw_len = returning_kw.len();
+    if s_bytes.len() >= kw_len {
+        let mut i = s_bytes.len() - kw_len;
+        loop {
+            if ascii_keyword_at(s_bytes, i, returning_kw)
+                && (i == 0 || !s_bytes[i - 1].is_ascii_alphanumeric())
+                && (i + kw_len == s_bytes.len() || !s_bytes[i + kw_len].is_ascii_alphanumeric())
+            {
+                returning_pos = Some(i);
+                break;
+            }
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+        }
+    }
+
+    let returning_pos = match returning_pos {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    // After RETURNING, look for INTO keyword
+    let after_returning = &s[returning_pos + kw_len..];
+    let after_bytes = after_returning.as_bytes();
+    let into_pos = find_ascii_keyword(after_bytes, b"INTO");
+
+    let into_pos = match into_pos {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    // Verify INTO is at a word boundary
+    let abs_into = returning_pos + kw_len + into_pos;
+    if abs_into > 0 && s_bytes[abs_into - 1].is_ascii_alphanumeric() {
+        return Ok(None);
+    }
+    if abs_into + 4 < s_bytes.len() && s_bytes[abs_into + 4].is_ascii_alphanumeric() {
+        return Ok(None);
+    }
+
+    // The variable list is after INTO
+    let var_str = after_returning[into_pos + 4..].trim();
+    if var_str.is_empty() {
+        return Ok(None);
+    }
+
+    let variables: Vec<String> = var_str
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    if variables.is_empty() {
+        return Ok(None);
+    }
+
+    // Verify at least one target is a declared variable (avoid false positives
+    // where INTO is part of an INSERT INTO subquery in the RETURNING clause).
+    let any_declared = variables
+        .iter()
+        .any(|v| declared_vars.contains(&v.to_lowercase()));
+    if !any_declared {
+        return Ok(None);
+    }
+
+    // The DML SQL is everything up to and including the RETURNING expr_list,
+    // but excluding the INTO var_list part.
+    let sql = s[..abs_into].trim().to_string();
+
+    Ok(Some(PlpgsqlStatement::DmlReturningInto { sql, variables }))
 }
 
 fn parse_select_into_statement(
@@ -623,6 +729,22 @@ fn ascii_keyword_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool {
         .iter()
         .zip(keyword.iter())
         .all(|(a, b)| a.to_ascii_uppercase() == *b)
+}
+
+/// Like `find_ascii_keyword` but requires word boundaries: the character before
+/// must be whitespace (or start-of-string) and the character after must be
+/// whitespace (or end-of-string). This prevents matching keywords inside string
+/// literals like 'default'.
+fn find_word_boundary_keyword(bytes: &[u8], keyword: &[u8]) -> Option<usize> {
+    if keyword.is_empty() || keyword.len() > bytes.len() {
+        return None;
+    }
+    (0..=bytes.len() - keyword.len()).find(|&i| {
+        ascii_keyword_at(bytes, i, keyword)
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + keyword.len() == bytes.len()
+                || !bytes[i + keyword.len()].is_ascii_alphanumeric())
+    })
 }
 
 fn find_ascii_keyword(bytes: &[u8], keyword: &[u8]) -> Option<usize> {

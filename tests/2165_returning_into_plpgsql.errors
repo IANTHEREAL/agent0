@@ -1,0 +1,2 @@
+# Test 7: Multi-row RETURNING INTO must error
+query returned more than one row

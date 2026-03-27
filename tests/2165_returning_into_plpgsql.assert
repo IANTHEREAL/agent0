@@ -1,0 +1,17 @@
+# B4: PL/pgSQL RETURNING ... INTO (#2165)
+# Test 1: INSERT RETURNING single column INTO
+insert_id
+1
+# Test 2: INSERT RETURNING multiple columns INTO
+bob:2
+# Test 3: UPDATE RETURNING INTO
+110
+# Test 4: DELETE RETURNING INTO
+delete_name
+bob
+# Test 5: RETURNING expression INTO
+charlie:30
+# Test 6: RETURNING INTO with no matching rows
+null_result
+# Test 8: DECLARE DEFAULT string literal containing 'default'
+default

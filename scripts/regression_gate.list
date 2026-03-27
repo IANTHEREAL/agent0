@@ -263,6 +263,8 @@ tests/2126_join_dropped_column.sql
 tests/2159_plpgsql_ast_binding.sql
 # #2162 – make_interval() datetime function (Plan A B3 gap)
 tests/make_interval.sql
+# #2165 – PL/pgSQL RETURNING ... INTO (Plan A B4 gap)
+tests/2165_returning_into_plpgsql.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
