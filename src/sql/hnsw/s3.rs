@@ -215,7 +215,7 @@ impl HnswGraphCache {
         version: u64,
         data: &[u8],
     ) -> anyhow::Result<PathBuf> {
-        let ks_hex = hex::encode(keyspace.as_bytes());
+        let ks_hex = hex::encode(keyspace.to_lowercase().as_bytes());
         let persistent_name = format!("{ks_hex}_{db_id}_{table_id}_{index_id}_v{version}.usearch");
         let persistent_path = self.cache_dir.join(&persistent_name);
 
@@ -670,7 +670,11 @@ impl HnswS3Client {
         index_id: u64,
         version: u64,
     ) -> String {
-        let ks_hex = hex::encode(keyspace.as_bytes());
+        // Normalize keyspace to lowercase for S3 key consistency.
+        // TiKV API V2 uses "DEFAULT" (uppercase) but CREATE INDEX writes
+        // via tenant_keyspace() which is "default" (lowercase).  Without
+        // normalization, PUT and GET use different S3 paths.  See #2170.
+        let ks_hex = hex::encode(keyspace.to_lowercase().as_bytes());
         format!(
             "{}/{}/{}/{}/{}/graph_v{}.usearch",
             self.prefix, ks_hex, db_id, table_id, index_id, version
@@ -680,7 +684,7 @@ impl HnswS3Client {
     /// Build the S3 prefix for all versions of a specific index.
     #[allow(dead_code)] // Used by GC/delete_prefix
     fn index_prefix(&self, keyspace: &str, db_id: u64, table_id: u64, index_id: u64) -> String {
-        let ks_hex = hex::encode(keyspace.as_bytes());
+        let ks_hex = hex::encode(keyspace.to_lowercase().as_bytes());
         format!(
             "{}/{}/{}/{}/{}/",
             self.prefix, ks_hex, db_id, table_id, index_id
@@ -690,7 +694,7 @@ impl HnswS3Client {
     /// Build the S3 prefix for all indexes in a database.
     #[allow(dead_code)] // Used by GC list_objects
     fn db_prefix(&self, keyspace: &str, db_id: u64) -> String {
-        let ks_hex = hex::encode(keyspace.as_bytes());
+        let ks_hex = hex::encode(keyspace.to_lowercase().as_bytes());
         format!("{}/{}/{}/", self.prefix, ks_hex, db_id)
     }
 
