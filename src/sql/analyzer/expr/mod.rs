@@ -87,13 +87,11 @@ impl<'a> Analyzer<'a> {
     ///   recover element type from the concrete non-text members
     /// - Respect explicit text-like members/casts (do not recover past them)
     fn array_literal_elem_type(&self, elems: &[TypedExpr]) -> Result<DataType, AnalyzerError> {
-        // If every element is Unknown, keep the array element type as Unknown so
-        // downstream comparison paths (e.g. `1 = ANY(ARRAY['1','2'])`) can coerce
-        // elements to the LHS type.  This matches PG's unknown[] behavior.
-        if elems.iter().all(|e| e.data_type == DataType::Unknown) {
-            return Ok(DataType::Unknown);
-        }
-
+        // PG resolves ARRAY['1','2'] to text[] at construction time — it does
+        // NOT keep unknown[].  When all elements are Unknown, unify_expr_types
+        // filters them out and returns Text (the PG default for unresolved
+        // unknown literals).  This means `1 = ANY(ARRAY['1','2'])` correctly
+        // errors with "operator does not exist: integer = text", matching PG.
         let refs: Vec<&TypedExpr> = elems.iter().collect();
         let mut elem_type = self.unify_expr_types(&refs, "ARRAY")?;
 

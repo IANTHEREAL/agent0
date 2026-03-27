@@ -755,19 +755,12 @@ fn analyze_ne_any_non_empty_array_mixed_unknown_rhs_literals_use_typed_compariso
 }
 
 #[test]
-fn analyze_any_non_empty_array_all_unknown_text_literals_coerce_to_lhs_type() {
-    // Unknown string literals in ARRAY['1', '2'] are coerced to Int32 to match the LHS.
-    // This matches PostgreSQL: SELECT 1 = ANY(ARRAY['1', '2']) succeeds.
-    let typed = analyze_expr_with_users("1 = ANY(ARRAY['1', '2'])").unwrap();
-    assert_eq!(typed.data_type, DataType::Boolean);
-    match &typed.kind {
-        TypedExprKind::InList { expr, list, .. } => {
-            assert_eq!(expr.data_type, DataType::Int32);
-            assert_eq!(list.len(), 2);
-            assert!(list.iter().all(|e| e.data_type == DataType::Int32));
-        }
-        _ => panic!("expected InList, got {:?}", typed.kind),
-    }
+fn analyze_any_non_empty_array_all_unknown_text_literals_reject_non_text_lhs() {
+    // PG resolves ARRAY['1','2'] to text[] at construction time.
+    // `1 = ANY(text[])` is a type mismatch: integer vs text.
+    // Verified: PG 17 returns ERROR "operator does not exist: integer = text".
+    let err = analyze_expr_with_users("1 = ANY(ARRAY['1', '2'])").unwrap_err();
+    assert!(matches!(err, AnalyzerError::OperatorTypeMismatch { .. }));
 }
 
 #[test]
