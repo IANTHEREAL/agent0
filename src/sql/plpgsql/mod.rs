@@ -3,6 +3,7 @@
 //! Supports: DECLARE, BEGIN/END, RETURN, IF/THEN/ELSIF/ELSE/END IF, RAISE, assignment (:=),
 //! SELECT INTO, FOR loops (query and range), PERFORM, EXIT, and user function dispatch.
 
+pub(super) mod ast_bind;
 mod executor;
 mod parser;
 pub(crate) mod utils;
