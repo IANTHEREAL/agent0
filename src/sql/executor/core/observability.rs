@@ -69,7 +69,13 @@ pub(super) fn is_observability_system_query(stmt: &Statement) -> bool {
         return false;
     };
     let base_upper = base.value.to_ascii_uppercase();
-    if base_upper != "_DB9_SYS_OBSERVABILITY" && base_upper != "_DB9_SYS_QUERY_SAMPLES" {
+    if !matches!(
+        base_upper.as_str(),
+        "_DB9_SYS_OBSERVABILITY"
+            | "_DB9_SYS_QUERY_SAMPLES"
+            | "_DB9_SYS_STORAGE_STATS"
+            | "FS9_CACHED_STORAGE_STATS"
+    ) {
         return false;
     }
 
@@ -101,4 +107,65 @@ pub(super) fn is_observability_tableless_query(stmt: &Statement) -> bool {
         return false;
     }
     select.from.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_observability_system_query;
+    use crate::sql::parse_sql;
+    use sqlparser::ast::Statement;
+
+    fn parse_stmt(sql: &str) -> Statement {
+        let mut stmts = parse_sql(sql).expect("parse");
+        stmts.remove(0)
+    }
+
+    #[test]
+    fn allows_observability_tvf() {
+        assert!(is_observability_system_query(&parse_stmt(
+            "SELECT * FROM _db9_sys_observability()"
+        )));
+    }
+
+    #[test]
+    fn allows_query_samples() {
+        assert!(is_observability_system_query(&parse_stmt(
+            "SELECT * FROM _db9_sys_query_samples"
+        )));
+    }
+
+    #[test]
+    fn allows_storage_stats_virtual_table() {
+        assert!(is_observability_system_query(&parse_stmt(
+            "SELECT total_bytes FROM _db9_sys_storage_stats LIMIT 1"
+        )));
+    }
+
+    #[test]
+    fn allows_fs9_cached_storage_stats_tvf() {
+        assert!(is_observability_system_query(&parse_stmt(
+            "SELECT total_logical_bytes FROM extensions.fs9_cached_storage_stats() LIMIT 1"
+        )));
+    }
+
+    #[test]
+    fn denies_arbitrary_table() {
+        assert!(!is_observability_system_query(&parse_stmt(
+            "SELECT * FROM users"
+        )));
+    }
+
+    #[test]
+    fn denies_subquery() {
+        assert!(!is_observability_system_query(&parse_stmt(
+            "SELECT * FROM _db9_sys_observability() WHERE id IN (SELECT 1)"
+        )));
+    }
+
+    #[test]
+    fn denies_join() {
+        assert!(!is_observability_system_query(&parse_stmt(
+            "SELECT * FROM _db9_sys_observability() JOIN users ON true"
+        )));
+    }
 }
