@@ -21,7 +21,8 @@ pub struct AggregateExpr {
     pub func_name: String,
     pub arg: Option<TypedExpr>,
     pub distinct: bool,
-    pub delimiter: Option<String>,
+    /// The raw delimiter expression for `string_agg`, evaluated per-row.
+    pub delimiter: Option<TypedExpr>,
     pub filter: Option<TypedExpr>,
     pub order_by: Vec<TypedOrderByExpr>,
 }
@@ -72,8 +73,7 @@ impl HashAggregateOperator {
 
     fn create_aggregator(agg_expr: &AggregateExpr, return_type: &DataType) -> Result<Aggregator> {
         if agg_expr.func_name == "STRING_AGG" {
-            let delim = agg_expr.delimiter.as_deref().unwrap_or(",").to_string();
-            return Ok(Aggregator::new_string_agg(delim));
+            return Ok(Aggregator::new_string_agg());
         }
         Aggregator::new(&agg_expr.func_name, Some(return_type.clone()))
     }
@@ -95,7 +95,7 @@ impl PhysicalOperator for HashAggregateOperator {
             group_values: Vec<Value>,
             aggregators: Vec<Aggregator>,
             seen_distinct: Vec<HashSet<Vec<u8>>>,
-            ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>>,
+            ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value, String)>>>,
             charged_bytes: usize,
         }
 
@@ -124,7 +124,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 let seen_distinct: Vec<HashSet<Vec<u8>>> = (0..self.aggregate_exprs.len())
                     .map(|_| HashSet::new())
                     .collect();
-                let ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>> = self
+                let ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value, String)>>> = self
                     .aggregate_exprs
                     .iter()
                     .map(|agg_expr| {
@@ -188,21 +188,41 @@ impl PhysicalOperator for HashAggregateOperator {
                     state.charged_bytes = state.charged_bytes.saturating_add(distinct_entry_bytes);
                 }
 
+                // Evaluate per-row delimiter for string_agg.
+                let row_delimiter = if agg_expr.func_name == "STRING_AGG" {
+                    if let Some(ref delim_expr) = agg_expr.delimiter {
+                        let dv = eval_typed_expr(delim_expr, row, ctx.query_ctx)?;
+                        match dv {
+                            Value::Text(s) => s,
+                            Value::Null => String::new(),
+                            Value::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                            other => other.to_string(),
+                        }
+                    } else {
+                        ",".to_string()
+                    }
+                } else {
+                    String::new()
+                };
+
                 if let Some(buf) = state.ordered_agg_buffers[i].as_mut() {
                     let mut keys = Vec::with_capacity(agg_expr.order_by.len());
                     for o in &agg_expr.order_by {
                         let key = eval_typed_expr(&o.expr, row, ctx.query_ctx)?;
                         keys.push(key);
                     }
-                    let ordered_entry_bytes = std::mem::size_of::<(Vec<Value>, Value)>()
+                    let ordered_entry_bytes = std::mem::size_of::<(Vec<Value>, Value, String)>()
                         + estimate_values_payload_size(&keys)
-                        + estimate_value_size(&val);
+                        + estimate_value_size(&val)
+                        + row_delimiter.len();
                     try_grow_statement_memory_scope(
                         "operators.hash_aggregate.ordered_buffer",
                         ordered_entry_bytes,
                     )?;
                     state.charged_bytes = state.charged_bytes.saturating_add(ordered_entry_bytes);
-                    buf.push((keys, val));
+                    buf.push((keys, val, row_delimiter));
+                } else if agg_expr.func_name == "STRING_AGG" {
+                    state.aggregators[i].update_string_agg(&val, &row_delimiter)?;
                 } else {
                     state.aggregators[i].update(&val)?;
                 }
@@ -241,7 +261,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 for (i, mut agg) in aggregators.into_iter().enumerate() {
                     if let Some(mut buf) = ordered_agg_buffers.get_mut(i).and_then(Option::take) {
                         let order_by = &self.aggregate_exprs[i].order_by;
-                        sort_by_fallible(&mut buf, |(keys_a, _), (keys_b, _)| {
+                        sort_by_fallible(&mut buf, |(keys_a, _, _), (keys_b, _, _)| {
                             for (key_idx, order_expr) in order_by.iter().enumerate() {
                                 let asc = order_expr.asc;
                                 let nulls_first = order_expr.nulls_first;
@@ -257,8 +277,14 @@ impl PhysicalOperator for HashAggregateOperator {
                             }
                             Ok(std::cmp::Ordering::Equal)
                         })?;
-                        for (_, sorted_value) in buf {
-                            agg.update(&sorted_value)?;
+                        let is_string_agg =
+                            self.aggregate_exprs[i].func_name == "STRING_AGG";
+                        for (_, sorted_value, delim) in buf {
+                            if is_string_agg {
+                                agg.update_string_agg(&sorted_value, &delim)?;
+                            } else {
+                                agg.update(&sorted_value)?;
+                            }
                         }
                     }
                     values.push(agg.result()?);
@@ -516,7 +542,12 @@ mod tests {
             func_name: "STRING_AGG".to_string(),
             arg: Some(category_ref()),
             distinct: false,
-            delimiter: Some(", ".to_string()),
+            delimiter: Some(TypedExpr {
+                kind: crate::sql::analyzer::types::TypedExprKind::Constant(
+                    Value::Text(", ".to_string()),
+                ),
+                data_type: DataType::Text,
+            }),
             filter: None,
             order_by: vec![],
         };

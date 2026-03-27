@@ -1,18 +1,9 @@
 //! Utility functions for aggregate expression collection and GROUP BY matching.
 
 use super::aggregate::aggregate_identity_matches;
-use crate::model::{DataType, Value};
+use crate::model::DataType;
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::operators::AggregateExpr;
-
-pub(crate) fn normalize_string_agg_delimiter(expr: &TypedExpr) -> Option<String> {
-    match &expr.kind {
-        TypedExprKind::Constant(Value::Text(s)) => Some(s.clone()),
-        TypedExprKind::Constant(Value::Null) => Some(String::new()),
-        TypedExprKind::Cast { expr: inner, .. } => normalize_string_agg_delimiter(inner),
-        _ => None,
-    }
-}
 
 /// Find the index of a GROUP BY expression that matches `expr`.
 pub(crate) fn find_matching_group_by(expr: &TypedExpr, group_by: &[TypedExpr]) -> Option<usize> {
@@ -42,7 +33,7 @@ pub(crate) fn collect_agg_exprs_from(
             if !already_exists {
                 let arg = args.first().cloned();
                 let delimiter = if func.name.eq_ignore_ascii_case("string_agg") {
-                    args.get(1).and_then(normalize_string_agg_delimiter)
+                    args.get(1).cloned()
                 } else {
                     None
                 };

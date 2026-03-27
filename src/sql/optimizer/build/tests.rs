@@ -580,8 +580,20 @@ fn test_aggregate_delimiter_gets_distinct_slots() {
         2,
         "different delimiters must produce distinct slots"
     );
-    assert_eq!(agg_exprs[0].delimiter, Some(",".to_string()));
-    assert_eq!(agg_exprs[1].delimiter, Some(";".to_string()));
+    assert_eq!(
+        agg_exprs[0].delimiter,
+        Some(TypedExpr {
+            kind: TypedExprKind::Constant(Value::Text(",".to_string())),
+            data_type: DataType::Text,
+        })
+    );
+    assert_eq!(
+        agg_exprs[1].delimiter,
+        Some(TypedExpr {
+            kind: TypedExprKind::Constant(Value::Text(";".to_string())),
+            data_type: DataType::Text,
+        })
+    );
 }
 
 #[test]
@@ -628,7 +640,19 @@ fn test_aggregate_cast_text_delimiter_is_unwrapped() {
     );
 
     assert_eq!(agg_exprs.len(), 1);
-    assert_eq!(agg_exprs[0].delimiter, Some(";".to_string()));
+    // Now stores the raw TypedExpr (including the Cast wrapper).
+    let expected_delim = TypedExpr {
+        kind: TypedExprKind::Cast {
+            expr: Box::new(TypedExpr {
+                kind: TypedExprKind::Constant(Value::Text(";".to_string())),
+                data_type: DataType::Text,
+            }),
+            target_type: DataType::Text,
+            cast_context: CastContext::Explicit,
+        },
+        data_type: DataType::Text,
+    };
+    assert_eq!(agg_exprs[0].delimiter, Some(expected_delim));
 
     if let TypedExprKind::AggregateCall {
         func,
@@ -695,7 +719,19 @@ fn test_aggregate_cast_null_delimiter_keeps_no_separator_sentinel() {
     );
 
     assert_eq!(agg_exprs.len(), 1);
-    assert_eq!(agg_exprs[0].delimiter, Some(String::new()));
+    // Now stores the raw TypedExpr (Cast wrapping NULL).
+    let expected_delim = TypedExpr {
+        kind: TypedExprKind::Cast {
+            expr: Box::new(TypedExpr {
+                kind: TypedExprKind::Constant(Value::Null),
+                data_type: DataType::Text,
+            }),
+            target_type: DataType::Text,
+            cast_context: CastContext::Explicit,
+        },
+        data_type: DataType::Text,
+    };
+    assert_eq!(agg_exprs[0].delimiter, Some(expected_delim));
 
     if let TypedExprKind::AggregateCall {
         func,

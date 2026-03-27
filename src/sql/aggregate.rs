@@ -36,8 +36,10 @@ pub enum Aggregator {
         count: i64,
     },
     StringAgg {
-        values: Vec<String>,
-        delimiter: String,
+        /// Each entry is `(value, delimiter)`. For i > 0, delimiter[i] is
+        /// placed before value[i] (i.e., between value[i-1] and value[i]).
+        /// The first row's delimiter is unused. Matches PostgreSQL semantics.
+        entries: Vec<(String, String)>,
     },
     ArrayAgg {
         values: Vec<Value>,
@@ -72,8 +74,7 @@ impl Aggregator {
                 count: 0,
             }),
             "STRING_AGG" => Ok(Aggregator::StringAgg {
-                values: Vec::new(),
-                delimiter: ",".to_string(),
+                entries: Vec::new(),
             }),
             "ARRAY_AGG" => Ok(Aggregator::ArrayAgg { values: Vec::new() }),
             "BOOL_AND" | "EVERY" => Ok(Aggregator::BoolAnd(None)),
@@ -86,10 +87,26 @@ impl Aggregator {
         }
     }
 
-    pub fn new_string_agg(delimiter: String) -> Self {
+    pub fn new_string_agg() -> Self {
         Aggregator::StringAgg {
-            values: Vec::new(),
-            delimiter,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Append a `(value, delimiter)` pair for `string_agg`.
+    /// The delimiter is evaluated per-row to match PostgreSQL semantics.
+    pub fn update_string_agg(&mut self, val: &Value, delimiter: &str) -> Result<()> {
+        if let Aggregator::StringAgg { entries } = self {
+            if !matches!(val, Value::Null) {
+                let s = match val {
+                    Value::Text(s) => s.clone(),
+                    v => v.to_string(),
+                };
+                entries.push((s, delimiter.to_string()));
+            }
+            Ok(())
+        } else {
+            Err(anyhow!("update_string_agg called on non-StringAgg aggregator"))
         }
     }
 
@@ -196,13 +213,16 @@ impl Aggregator {
                     *count += 1;
                 }
             }
-            Aggregator::StringAgg { values, .. } => {
+            Aggregator::StringAgg { entries } => {
                 if !matches!(val, Value::Null) {
                     let s = match val {
                         Value::Text(s) => s.clone(),
                         v => v.to_string(),
                     };
-                    values.push(s);
+                    // When called via generic update() (no per-row delimiter),
+                    // use "," as the fallback. The per-row path goes through
+                    // update_string_agg() instead.
+                    entries.push((s, ",".to_string()));
                 }
             }
             Aggregator::ArrayAgg { values } => {
@@ -255,11 +275,18 @@ impl Aggregator {
                     Value::Numeric(pg_numeric_div(*sum, denom)?)
                 }
             }
-            Aggregator::StringAgg { values, delimiter } => {
-                if values.is_empty() {
+            Aggregator::StringAgg { entries } => {
+                if entries.is_empty() {
                     Value::Null
                 } else {
-                    Value::Text(values.join(delimiter))
+                    // PostgreSQL semantics: for i > 0, delimiter[i] is placed
+                    // before value[i] (between value[i-1] and value[i]).
+                    let mut result = entries[0].0.clone();
+                    for (val, delim) in &entries[1..] {
+                        result.push_str(delim);
+                        result.push_str(val);
+                    }
+                    Value::Text(result)
                 }
             }
             Aggregator::ArrayAgg { values } => {
@@ -814,10 +841,13 @@ mod tests {
 
     #[test]
     fn test_string_agg() {
-        let mut agg = Aggregator::new_string_agg(", ".to_string());
-        agg.update(&Value::Text("apple".to_string())).unwrap();
-        agg.update(&Value::Text("banana".to_string())).unwrap();
-        agg.update(&Value::Text("cherry".to_string())).unwrap();
+        let mut agg = Aggregator::new_string_agg();
+        agg.update_string_agg(&Value::Text("apple".to_string()), ", ")
+            .unwrap();
+        agg.update_string_agg(&Value::Text("banana".to_string()), ", ")
+            .unwrap();
+        agg.update_string_agg(&Value::Text("cherry".to_string()), ", ")
+            .unwrap();
         assert_eq!(
             agg.result().unwrap(),
             Value::Text("apple, banana, cherry".to_string())
@@ -826,17 +856,33 @@ mod tests {
 
     #[test]
     fn test_string_agg_with_null() {
-        let mut agg = Aggregator::new_string_agg(",".to_string());
-        agg.update(&Value::Text("a".to_string())).unwrap();
-        agg.update(&Value::Null).unwrap();
-        agg.update(&Value::Text("b".to_string())).unwrap();
+        let mut agg = Aggregator::new_string_agg();
+        agg.update_string_agg(&Value::Text("a".to_string()), ",")
+            .unwrap();
+        agg.update_string_agg(&Value::Null, ",").unwrap();
+        agg.update_string_agg(&Value::Text("b".to_string()), ",")
+            .unwrap();
         assert_eq!(agg.result().unwrap(), Value::Text("a,b".to_string()));
     }
 
     #[test]
     fn test_string_agg_empty() {
-        let agg = Aggregator::new_string_agg(",".to_string());
+        let agg = Aggregator::new_string_agg();
         assert_eq!(agg.result().unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_string_agg_varying_delimiters() {
+        // PostgreSQL: delimiter from row *i* is placed between value[i] and value[i+1]
+        let mut agg = Aggregator::new_string_agg();
+        agg.update_string_agg(&Value::Text("a".to_string()), ",")
+            .unwrap();
+        agg.update_string_agg(&Value::Text("b".to_string()), ";")
+            .unwrap();
+        agg.update_string_agg(&Value::Text("c".to_string()), "|")
+            .unwrap();
+        // delimiter[1]=; goes between a and b, delimiter[2]=| goes between b and c
+        assert_eq!(agg.result().unwrap(), Value::Text("a;b|c".to_string()));
     }
 
     #[test]

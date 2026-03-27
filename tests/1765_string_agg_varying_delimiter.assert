@@ -1,0 +1,19 @@
+# Core repro: per-row delimiters with ORDER BY
+# PG 17: string_agg(v, d ORDER BY ord) → a;b|c
+# delimiter[1]=; between a and b, delimiter[2]=| between b and c
+a;b|c
+
+# Without ORDER BY (subquery provides deterministic order)
+a;b|c
+
+# NULL delimiter on row 4 → treated as empty string (no separator between c and d)
+a;b|cd
+
+# All delimiters NULL → all values concatenated with no separator
+abcd
+
+# FILTER (WHERE ord > 1) → only rows b,c,d
+b|cd
+
+# Grouped with varying delimiter
+string_agg

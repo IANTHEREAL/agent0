@@ -2,9 +2,7 @@
 
 use anyhow::{anyhow, Result};
 
-use super::utils::{
-    collect_agg_exprs_from, find_matching_group_by, normalize_string_agg_delimiter,
-};
+use super::utils::{collect_agg_exprs_from, find_matching_group_by};
 use crate::model::DataType;
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::operators::{AggregateExpr, BoxedOperator, HashAggregateOperator, ProjectOperator};
@@ -41,7 +39,7 @@ pub(crate) fn aggregate_identity_matches(
     }
     // 4. delimiter (string_agg second argument)
     let call_delimiter = if func.name.eq_ignore_ascii_case("string_agg") {
-        args.get(1).and_then(normalize_string_agg_delimiter)
+        args.get(1).cloned()
     } else {
         None
     };
