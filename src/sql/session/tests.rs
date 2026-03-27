@@ -75,7 +75,7 @@ mod tests {
         );
         assert_eq!(
             settings.show_value("db9.max_sort_bytes").as_deref(),
-            Some("268435456")
+            Some("67108864")
         );
         assert_eq!(
             settings.show_value("client_encoding").as_deref(),

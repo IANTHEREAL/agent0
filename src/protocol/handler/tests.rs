@@ -2648,6 +2648,53 @@ async fn test_extended_query_notice_respects_client_min_messages() {
     assert!(client.messages.is_empty());
 }
 
+#[tokio::test]
+async fn test_serializable_warning_notice_sent_to_client() {
+    // Validates that the SERIALIZABLE downgrade WARNING (added for #2180)
+    // would be delivered to the client through the notice pipeline.
+    let mut client = RecordingSink::default();
+    let results = crate::sql::ExecuteResults(vec![
+        ExecuteResult::Notice {
+            message: "TiKV provides snapshot isolation; SERIALIZABLE has been \
+                      downgraded to REPEATABLE READ"
+                .to_string(),
+            severity: "WARNING".to_string(),
+            sqlstate: "01000".to_string(),
+        },
+        ExecuteResult::CommandComplete { tag: "SET" },
+    ]);
+
+    let resp = send_notices_and_get_last_response(&mut client, None, results)
+        .await
+        .unwrap();
+
+    match resp {
+        Response::Execution(tag) => {
+            let complete = CommandComplete::from(tag);
+            assert_eq!(complete.tag, "SET");
+        }
+        _ => panic!("expected Execution"),
+    }
+
+    assert_eq!(client.messages.len(), 1);
+    match &client.messages[0] {
+        PgWireBackendMessage::NoticeResponse(notice) => {
+            assert!(notice
+                .fields
+                .iter()
+                .any(|(code, value)| *code == b'S' && value == "WARNING"));
+            assert!(notice
+                .fields
+                .iter()
+                .any(|(code, value)| *code == b'C' && value == "01000"));
+            assert!(notice.fields.iter().any(|(code, value)| {
+                *code == b'M' && value.contains("SERIALIZABLE has been downgraded")
+            }));
+        }
+        other => panic!("expected NoticeResponse, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_client_allows_message_defaults_to_notice_threshold() {
     // PG default client_min_messages is NOTICE.

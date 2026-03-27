@@ -43,14 +43,17 @@ fn tenant_qps_limit() -> u64 {
 }
 
 /// Read the per-tenant aggregate memory quota from environment once.
-/// `0` means unlimited.
+/// `0` means unlimited.  Default is 1 GiB to prevent a single tenant from
+/// OOM-killing the process.  Set `DB9_TENANT_MEMORY_QUOTA_BYTES=0` to disable.
+const DEFAULT_TENANT_MEMORY_QUOTA_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+
 fn tenant_memory_quota_bytes() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
         std::env::var("DB9_TENANT_MEMORY_QUOTA_BYTES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0)
+            .unwrap_or(DEFAULT_TENANT_MEMORY_QUOTA_BYTES)
     })
 }
 

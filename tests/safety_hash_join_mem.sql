@@ -1,5 +1,5 @@
 -- Safety regression tests for hash join memory limit (PR #2043).
--- Default: 256 MB. Comparison: memory_bytes > max_memory (strictly >).
+-- Default: 64 MB. Comparison: memory_bytes > max_memory (strictly >).
 
 CREATE TABLE hjm_sa (id INT PRIMARY KEY, val TEXT);
 CREATE TABLE hjm_sb (id INT PRIMARY KEY, val TEXT);

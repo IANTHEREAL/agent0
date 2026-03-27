@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tikv_client::{TimestampExt, Transaction};
 
-pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
-pub(crate) const DEFAULT_HASH_JOIN_WORK_MEM: usize = 256 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_HASH_JOIN_WORK_MEM: usize = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_DML_TABLE_SCAN_MAX_ROWS: usize = 10_000;
 
 pub enum TransactionState {
@@ -824,6 +824,7 @@ impl Session {
     }
 
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
+        self.warn_if_serializable(name, &value);
         let changed = self.settings.set_known_setting(name, value)?;
         self.sync_plan_cache_settings();
         Ok(changed)
@@ -840,6 +841,7 @@ impl Session {
     }
 
     pub(crate) fn set_local_setting(&mut self, name: &str, value: String) -> Result<bool> {
+        self.warn_if_serializable(name, &value);
         let changed = self.settings.set_local_override(name, value)?;
         self.sync_plan_cache_settings();
         Ok(changed)
@@ -981,7 +983,24 @@ impl Session {
         );
     }
 
+    /// Emit a client-visible WARNING when SERIALIZABLE is requested, since
+    /// TiKV only provides snapshot isolation (REPEATABLE READ).
+    fn warn_if_serializable(&mut self, name: &str, value: &str) {
+        if (name == "transaction_isolation" || name == "default_transaction_isolation")
+            && value.eq_ignore_ascii_case("serializable")
+        {
+            self.push_pending_notice(
+                "WARNING".to_string(),
+                "01000".to_string(),
+                "TiKV provides snapshot isolation; SERIALIZABLE has been \
+                 downgraded to REPEATABLE READ"
+                    .to_string(),
+            );
+        }
+    }
+
     /// Queue a notice to be delivered by the protocol handler.
+    ///
     /// Used when a warning must precede an error in the same statement
     /// (e.g., SET LOCAL outside transaction before a reserved-GUC error).
     pub(crate) fn push_pending_notice(
@@ -1016,6 +1035,42 @@ impl Drop for Session {
         if let Some(ref registry) = self.active_txn_registry {
             registry.quarantine_connection(self.connection_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod serializable_warning_contract_tests {
+    /// Both `set_known_setting` and `set_local_setting` must call
+    /// `warn_if_serializable` so every path that accepts SERIALIZABLE
+    /// emits a client-visible WARNING.  If either call is removed during
+    /// a refactor, this test fails.
+    #[test]
+    fn both_setting_paths_call_warn_if_serializable() {
+        let source = include_str!("mod.rs");
+        let prod = source
+            .split("#[cfg(test)] mod serializable_warning_contract_tests")
+            .next()
+            .unwrap();
+
+        let set_known = prod
+            .split("fn set_known_setting(")
+            .nth(1)
+            .expect("must have set_known_setting");
+        let set_known_body = set_known.split("\n    }").next().unwrap();
+        assert!(
+            set_known_body.contains("warn_if_serializable"),
+            "set_known_setting must call warn_if_serializable"
+        );
+
+        let set_local = prod
+            .split("fn set_local_setting(")
+            .nth(1)
+            .expect("must have set_local_setting");
+        let set_local_body = set_local.split("\n    }").next().unwrap();
+        assert!(
+            set_local_body.contains("warn_if_serializable"),
+            "set_local_setting must call warn_if_serializable"
+        );
     }
 }
 

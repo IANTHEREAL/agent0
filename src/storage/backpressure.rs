@@ -41,7 +41,7 @@ pub(crate) struct BackpressureConfig {
 impl Default for BackpressureConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             min_permits: 4,
             max_permits: 256,
             latency_threshold_us: 200_000, // 200 ms
@@ -56,7 +56,14 @@ impl BackpressureConfig {
     #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn from_env() -> Self {
         let mut cfg = Self::default();
-        cfg.enabled = crate::config::env_bool("DB9_TIKV_BP_ENABLED");
+        // Only override the default when the env var is explicitly set,
+        // so that `default().enabled = true` takes effect in production.
+        if let Ok(v) = std::env::var("DB9_TIKV_BP_ENABLED") {
+            cfg.enabled = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
         if let Ok(v) = std::env::var("DB9_TIKV_BP_MIN_PERMITS") {
             if let Ok(n) = v.trim().parse::<u32>() {
                 cfg.min_permits = n.max(1);
@@ -482,7 +489,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let cfg = BackpressureConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         assert_eq!(cfg.min_permits, 4);
         assert_eq!(cfg.max_permits, 256);
         assert_eq!(cfg.latency_threshold_us, 200_000);
