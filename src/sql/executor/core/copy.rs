@@ -216,6 +216,7 @@ impl Executor {
                     dml::build_fk_ref_schema_cache(&self.store, txn, db_id, &schema, true)
                         .await
                         .map_err(CopyInsertBatchError::non_row)?;
+                let mut fk_lock_cache = dml::FkLockCache::new();
                 for (row, row_offset) in &prepared_rows {
                     dml::validate_foreign_keys_non_self_ref(
                         &self.store,
@@ -224,6 +225,7 @@ impl Executor {
                         &schema,
                         row,
                         &fk_ref_cache,
+                        Some(&mut fk_lock_cache),
                     )
                     .await
                     .map_err(|e| CopyInsertBatchError::row(*row_offset, e))?;
@@ -713,6 +715,7 @@ impl Executor {
                     row,
                     dml::ConflictBehavior::Error,
                     &enum_cache,
+                    None,
                     None,
                 )
                 .await

@@ -90,6 +90,56 @@ impl TikvStore {
         Ok(keys)
     }
 
+    /// Atomically check existence and acquire pessimistic locks on rows
+    /// identified by primary-key values.
+    ///
+    /// Uses `batch_get_for_update` which reads and locks in a single TiKV
+    /// round-trip, eliminating the TOCTOU gap between a snapshot read and a
+    /// separate lock call.  Returns `true` if **all** requested PKs exist
+    /// (and are now locked), `false` if any is missing.
+    ///
+    /// This is the TiKV equivalent of PostgreSQL's `FOR KEY SHARE` lock
+    /// acquired during FK validation (`ri_PerformCheck`).  TiKV only has
+    /// exclusive pessimistic locks, so it is effectively `FOR UPDATE`.
+    ///
+    /// An optional `lock_timeout` caps how long we wait for a conflicting
+    /// lock held by another transaction.
+    pub async fn check_and_lock_pk_keys(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        pks: &[Vec<Value>],
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<bool> {
+        if pks.is_empty() {
+            return Ok(false);
+        }
+        let keys: Vec<Vec<u8>> = pks
+            .iter()
+            .map(|pk| {
+                let row_key = encode_pk_values(pk);
+                self.key(&encode_data_key_v2(db_id, table_id, &row_key))
+            })
+            .collect();
+        let num_requested = keys.len();
+
+        let do_lock = async {
+            let pairs =
+                tikv_op!(txn.batch_get_for_update(keys).await).map_err(|e| anyhow!(e))?;
+            // All requested PKs must exist for the FK check to pass.
+            Ok::<bool, anyhow::Error>(pairs.len() == num_requested)
+        };
+
+        match lock_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, do_lock).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(SqlError::LockTimeout.into()),
+            },
+            None => do_lock.await,
+        }
+    }
+
     /// Acquire pessimistic (exclusive) locks on the given rows.
     ///
     /// Used for both FOR UPDATE and FOR SHARE.  TiKV only supports exclusive

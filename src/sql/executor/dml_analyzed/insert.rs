@@ -155,6 +155,7 @@ impl Executor {
         } else {
             None
         };
+        let mut fk_lock_cache = dml::FkLockCache::new();
 
         for (source_vals, default_positions) in &source_rows {
             // Build full row: map source values to column positions + fill defaults.
@@ -262,6 +263,7 @@ impl Executor {
                     conflict_behavior,
                     &enum_cache,
                     fk_ref_cache.as_ref(),
+                    Some(&mut fk_lock_cache),
                 )
                 .await?
             } else {
@@ -275,6 +277,7 @@ impl Executor {
                     conflict_behavior,
                     &enum_cache,
                     fk_ref_cache.as_ref(),
+                    Some(&mut fk_lock_cache),
                 )
                 .await?
             };

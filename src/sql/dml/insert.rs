@@ -218,6 +218,7 @@ pub async fn execute_insert_row(
     on_conflict: ConflictBehavior,
     enum_cache: &EnumLabelCache,
     fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
+    fk_lock_cache: Option<&mut super::foreign_keys::FkLockCache>,
 ) -> Result<InsertRowResult> {
     execute_insert_row_inner(
         store,
@@ -230,6 +231,7 @@ pub async fn execute_insert_row(
         enum_cache,
         false,
         fk_ref_cache,
+        fk_lock_cache,
     )
     .await
 }
@@ -249,6 +251,7 @@ pub async fn execute_insert_row_defer_hnsw(
     on_conflict: ConflictBehavior,
     enum_cache: &EnumLabelCache,
     fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
+    fk_lock_cache: Option<&mut super::foreign_keys::FkLockCache>,
 ) -> Result<InsertRowResult> {
     execute_insert_row_inner(
         store,
@@ -261,6 +264,7 @@ pub async fn execute_insert_row_defer_hnsw(
         enum_cache,
         true,
         fk_ref_cache,
+        fk_lock_cache,
     )
     .await
 }
@@ -276,6 +280,7 @@ async fn execute_insert_row_inner(
     enum_cache: &EnumLabelCache,
     skip_hnsw: bool,
     fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
+    fk_lock_cache: Option<&mut super::foreign_keys::FkLockCache>,
 ) -> Result<InsertRowResult> {
     let mut row_values = row.values;
     coerce_row_values(schema, &mut row_values)?;
@@ -306,7 +311,7 @@ async fn execute_insert_row_inner(
             }
         };
         super::foreign_keys::validate_foreign_keys_with_cache(
-            store, txn, db_id, schema, &row, ref_cache,
+            store, txn, db_id, schema, &row, ref_cache, fk_lock_cache,
         )
         .await?;
     }

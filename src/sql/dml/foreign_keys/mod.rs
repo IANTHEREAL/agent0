@@ -35,6 +35,16 @@ pub(crate) type ConstraintId = usize;
 /// per-row `store.get_schema` calls from the hot path.
 pub(crate) type FkRefSchemaCache = HashMap<String, TableSchema>;
 
+/// Statement-scoped cache of parent PKs already locked via
+/// `check_and_lock_pk_keys`.  Keyed by `(table_id, pk_hash)` where
+/// `pk_hash` is the collision-resistant [`pk_to_hash_key`] string.
+///
+/// When a parent PK is in this cache, the current transaction already
+/// holds a pessimistic lock on it and has verified its existence, so we
+/// can skip the TiKV round-trip for subsequent rows referencing the same
+/// parent.
+pub(crate) type FkLockCache = HashSet<(u64, String)>;
+
 /// Prefetch schemas for all distinct FK-referenced tables.
 ///
 /// When `skip_self_ref` is true, self-referencing FK targets are excluded
@@ -462,15 +472,18 @@ pub async fn validate_foreign_keys(
         &HashMap::new(),
         false,
         &cache,
+        None,
     )
     .await
 }
 
-/// Like [`validate_foreign_keys`] but accepts a pre-built ref-schema cache.
+/// Like [`validate_foreign_keys`] but accepts a pre-built ref-schema cache
+/// and an optional lock cache for deduplicating parent-row lock RPCs.
 ///
 /// Use this variant when validating multiple rows in a loop so that
 /// referenced table schemas are loaded once per statement instead of once
-/// per row.
+/// per row.  Pass a `&mut FkLockCache` to avoid redundant
+/// `check_and_lock_pk_keys` calls when many rows reference the same parent.
 pub(crate) async fn validate_foreign_keys_with_cache(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -478,6 +491,7 @@ pub(crate) async fn validate_foreign_keys_with_cache(
     schema: &TableSchema,
     row: &Row,
     ref_schema_cache: &FkRefSchemaCache,
+    fk_lock_cache: Option<&mut FkLockCache>,
 ) -> Result<()> {
     validate_foreign_keys_inner(
         store,
@@ -488,6 +502,7 @@ pub(crate) async fn validate_foreign_keys_with_cache(
         &HashMap::new(),
         false,
         ref_schema_cache,
+        fk_lock_cache,
     )
     .await
 }
@@ -495,7 +510,8 @@ pub(crate) async fn validate_foreign_keys_with_cache(
 /// Validate only non-self-referencing foreign keys for a row.
 /// Self-referencing FK validation is deferred to CopyDone for COPY.
 ///
-/// Accepts a pre-built ref-schema cache built with `skip_self_ref=true`.
+/// Accepts a pre-built ref-schema cache built with `skip_self_ref=true`
+/// and an optional lock cache for deduplication.
 pub(crate) async fn validate_foreign_keys_non_self_ref(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -503,6 +519,7 @@ pub(crate) async fn validate_foreign_keys_non_self_ref(
     schema: &TableSchema,
     row: &Row,
     ref_schema_cache: &FkRefSchemaCache,
+    fk_lock_cache: Option<&mut FkLockCache>,
 ) -> Result<()> {
     validate_foreign_keys_inner(
         store,
@@ -513,6 +530,7 @@ pub(crate) async fn validate_foreign_keys_non_self_ref(
         &HashMap::new(),
         true,
         ref_schema_cache,
+        fk_lock_cache,
     )
     .await
 }
@@ -566,10 +584,15 @@ pub(crate) async fn collect_deferred_self_fk_checks(
         let lookup = resolve_fk_ref_lookup(&fk.ref_columns, schema)?;
         let parent_exists = match lookup {
             FkRefLookup::Pk => {
-                let ref_rows = store
-                    .batch_get_rows(txn, db_id, schema.table_id, vec![fk_values.clone()], schema)
-                    .await?;
-                !ref_rows.is_empty()
+                store
+                    .check_and_lock_pk_keys(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        &[fk_values.clone()],
+                        None,
+                    )
+                    .await?
             }
             FkRefLookup::UniqueIndex { index_id, pk_types } => {
                 let pks = store
@@ -584,7 +607,19 @@ pub(crate) async fn collect_deferred_self_fk_checks(
                         Some(1),
                     )
                     .await?;
-                !pks.is_empty()
+                if !pks.is_empty() {
+                    store
+                        .check_and_lock_pk_keys(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            &pks,
+                            None,
+                        )
+                        .await?
+                } else {
+                    false
+                }
             }
         };
 
@@ -661,6 +696,7 @@ async fn validate_foreign_keys_inner(
     pending_ref_keys: &HashMap<String, HashSet<String>>,
     skip_self_ref: bool,
     ref_schema_cache: &FkRefSchemaCache,
+    mut fk_lock_cache: Option<&mut FkLockCache>,
 ) -> Result<()> {
     for fk in &schema.foreign_keys {
         if skip_self_ref && fk.ref_table == schema.name {
@@ -712,18 +748,30 @@ async fn validate_foreign_keys_inner(
             }
         }
 
+        // Fast path: if this parent PK was already locked in this statement,
+        // skip the TiKV round-trip.  The lock is still held by our txn.
+        let pk_hash = pk_to_hash_key(&fk_values);
+        let cache_key = (ref_schema.table_id, pk_hash.clone());
+        if let Some(ref cache) = fk_lock_cache {
+            if cache.contains(&cache_key) {
+                continue;
+            }
+        }
+
         let parent_exists = match lookup {
             FkRefLookup::Pk => {
-                let ref_rows = store
-                    .batch_get_rows(
+                // Atomic read + lock: eliminates TOCTOU gap between
+                // existence check and lock acquisition.  Equivalent to
+                // PostgreSQL's SELECT ... FOR KEY SHARE in ri_PerformCheck().
+                store
+                    .check_and_lock_pk_keys(
                         txn,
                         db_id,
                         ref_schema.table_id,
-                        vec![fk_values.clone()],
-                        ref_schema,
+                        &[fk_values.clone()],
+                        None,
                     )
-                    .await?;
-                !ref_rows.is_empty()
+                    .await?
             }
             FkRefLookup::UniqueIndex { index_id, pk_types } => {
                 let pks = store
@@ -738,9 +786,28 @@ async fn validate_foreign_keys_inner(
                         Some(1),
                     )
                     .await?;
-                !pks.is_empty()
+                if !pks.is_empty() {
+                    // Atomic read + lock on the parent row's actual PK.
+                    store
+                        .check_and_lock_pk_keys(
+                            txn,
+                            db_id,
+                            ref_schema.table_id,
+                            &pks,
+                            None,
+                        )
+                        .await?
+                } else {
+                    false
+                }
             }
         };
+
+        if parent_exists {
+            if let Some(ref mut cache) = fk_lock_cache {
+                cache.insert(cache_key);
+            }
+        }
 
         // For self-referencing FKs, also check the pending batch rows that
         // have been prepared but not yet flushed to storage.
