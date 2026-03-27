@@ -299,12 +299,20 @@ impl<'a> Analyzer<'a> {
 
         let mut func_name = function_name_upper(func);
 
-        // Preserve schema prefix for schema-qualified functions (e.g., cron.schedule).
-        // function_name_upper() only takes the last segment of ObjectName, stripping
-        // schema qualifiers. We need the full qualified name for dispatch in classify.rs,
-        // materialize.rs, and typed_eval.rs.
-        if func.name.0.len() > 1 {
-            let schema = func.name.0[0].value.to_lowercase();
+        // Extract schema qualifier for schema-qualified function calls (e.g.,
+        // cron.schedule, swarm.my_func). function_name_upper() only takes the
+        // last segment, so we need to reconstruct the qualified name for both
+        // builtin dispatch and UDF catalog resolution.
+        let func_schema: Option<String> = if func.name.0.len() > 1 {
+            Some(func.name.0[0].value.to_lowercase())
+        } else {
+            None
+        };
+
+        // Preserve schema prefix in func_name for builtin registry dispatch
+        // (cron.*, auth.* have schema-qualified entries in the registry).
+        // For UDFs, the schema is passed separately to resolve_function().
+        if let Some(ref schema) = func_schema {
             if schema == "cron" || schema == "auth" {
                 func_name = format!("{}.{}", schema, func_name);
             }
@@ -504,8 +512,15 @@ impl<'a> Analyzer<'a> {
             ));
         }
 
-        // Not in builtin registry -- check catalog for UDF
-        if let Ok(Some(func_def)) = self.catalog.resolve_function(&func_name, None, &arg_types) {
+        // Not in builtin registry -- check catalog for UDF.
+        // For schema-qualified calls (e.g. swarm.tmp()), pass the schema to
+        // resolve_function so it looks up "schema.name" directly instead of
+        // searching the search_path. For unqualified calls, schema is None
+        // and the catalog falls through to search_path resolution.
+        if let Ok(Some(func_def)) =
+            self.catalog
+                .resolve_function(&func_name, func_schema.as_deref(), &arg_types)
+        {
             let return_type = self
                 .resolve_sql_type_text(&func_def.return_type)
                 .map_err(|e| {
@@ -515,8 +530,16 @@ impl<'a> Analyzer<'a> {
                     ))
                 })?;
 
+            // Store the fully qualified name (schema.name) in the IR so the
+            // executor can resolve the function without relying on search_path.
+            let resolved_name = if let Some(ref schema) = func_schema {
+                format!("{}.{}", schema, func_name.to_lowercase())
+            } else {
+                func_name.clone()
+            };
+
             let resolved = ResolvedFunction {
-                name: func_name,
+                name: resolved_name,
                 kind: FunctionKind::UserDefined { oid: func_def.oid },
                 return_type: return_type.clone(),
             };
