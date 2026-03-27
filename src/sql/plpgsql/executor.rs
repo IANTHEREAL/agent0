@@ -19,13 +19,13 @@ use crate::sql::ExecuteResult;
 use crate::sql::Executor;
 use crate::storage::TikvStore;
 
+use super::ast_bind;
 use super::parser::{parse_begin_block, parse_declare_block, PlpgsqlStatement};
 use super::utils::{
     consume_exit_signal, format_raise_message, has_exit_signal, is_type_keyword,
     parse_literal_value, parse_plpgsql_type, replace_identifier, set_exit_signal,
     substitute_variables,
 };
-use super::ast_bind;
 use super::PlpgsqlContext;
 use crate::sql::sequences::SequenceSession;
 
@@ -231,10 +231,7 @@ fn execute_statements<'a>(
 
                     // Check for CREATE TYPE ... AS ENUM (needs text form)
                     let expanded_for_classify = substitute_variables(ctx, sql);
-                    let raw_trimmed = expanded_for_classify
-                        .trim()
-                        .trim_end_matches(';')
-                        .trim();
+                    let raw_trimmed = expanded_for_classify.trim().trim_end_matches(';').trim();
                     let raw_upper = raw_trimmed.to_ascii_uppercase();
                     if matches!(classify(&raw_upper), Some(RawSqlKind::CreateTypeEnum)) {
                         let _ = exec

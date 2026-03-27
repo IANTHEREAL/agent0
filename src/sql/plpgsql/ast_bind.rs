@@ -217,7 +217,9 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
         Expr::Nested(inner) => {
             bind_variables_in_expr(inner, ctx);
         }
-        Expr::Cast { expr: inner, .. } | Expr::TryCast { expr: inner, .. } | Expr::SafeCast { expr: inner, .. } => {
+        Expr::Cast { expr: inner, .. }
+        | Expr::TryCast { expr: inner, .. }
+        | Expr::SafeCast { expr: inner, .. } => {
             bind_variables_in_expr(inner, ctx);
         }
         Expr::Function(func) => {
@@ -355,9 +357,7 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
                 bind_variables_in_expr(e, ctx);
             }
         }
-        Expr::AtTimeZone {
-            timestamp, ..
-        } => {
+        Expr::AtTimeZone { timestamp, .. } => {
             bind_variables_in_expr(timestamp, ctx);
         }
 
@@ -589,12 +589,12 @@ fn cast_string_literal(s: &str, data_type: &DataType) -> Expr {
 fn model_type_to_ast_type(dt: &DataType) -> AstDataType {
     match dt {
         DataType::Text | DataType::Unknown => AstDataType::Text,
-        DataType::Varchar(len) => AstDataType::Varchar(Some(
-            sqlparser::ast::CharacterLength::IntegerLength {
+        DataType::Varchar(len) => {
+            AstDataType::Varchar(Some(sqlparser::ast::CharacterLength::IntegerLength {
                 length: *len,
                 unit: None,
-            },
-        )),
+            }))
+        }
         DataType::Int32 => AstDataType::Integer(None),
         DataType::Int64 => AstDataType::BigInt(None),
         DataType::Float64 => AstDataType::DoublePrecision,
