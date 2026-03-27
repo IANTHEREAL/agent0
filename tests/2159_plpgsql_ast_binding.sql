@@ -83,7 +83,7 @@ BEGIN
 END;
 $$;
 
-SELECT length(test_bind_jsonb_pretty('{"k":"v"}'::jsonb)) > 0 AS has_output;
+SELECT CASE WHEN length(test_bind_jsonb_pretty('{"k":"v"}'::jsonb)) > 0 THEN 'jsonb_pretty_ok' ELSE 'jsonb_pretty_fail' END AS result;
 
 -- 1B.7  negative int (must not produce -- comment)
 CREATE OR REPLACE FUNCTION test_bind_negative_int(p_val int)

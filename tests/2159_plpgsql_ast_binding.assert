@@ -17,7 +17,7 @@ was_null
 alice
 
 # 1B.6 jsonb_pretty produces output
-has_output | t
+jsonb_pretty_ok
 
 # 1B.7 negative int (-5 * 2 = -10)
 -10
