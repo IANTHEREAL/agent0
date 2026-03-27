@@ -131,6 +131,30 @@ $$;
 SELECT qp_upsert_item('proj-1', 'T1', 'updated title', 9);
 SELECT task_id, title, priority FROM qp_items WHERE project_id = 'proj-1' ORDER BY task_id;
 
+-- ============================================================
+-- Test 7: EXISTS subquery with qualified params (swarm_try_claim pattern)
+-- ============================================================
+CREATE OR REPLACE FUNCTION qp_check_exists(
+  project_id text,
+  task_id text
+) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+  found boolean := false;
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM qp_items t
+    WHERE t.project_id = qp_check_exists.project_id
+      AND t.task_id = qp_check_exists.task_id
+  ) THEN
+    found := true;
+  END IF;
+  RETURN found;
+END;
+$$;
+
+SELECT qp_check_exists('proj-1', 'T1');
+SELECT qp_check_exists('proj-1', 'T999');
+
 -- Cleanup
 DROP FUNCTION IF EXISTS qp_insert_item(text, text, text);
 DROP FUNCTION IF EXISTS qp_update_status(text, text, text);
@@ -138,4 +162,5 @@ DROP FUNCTION IF EXISTS qp_count_by_project(text);
 DROP FUNCTION IF EXISTS qp_delete_task(text, text);
 DROP FUNCTION IF EXISTS qp_mixed_refs(text, text, text, int);
 DROP FUNCTION IF EXISTS qp_upsert_item(text, text, text, int);
+DROP FUNCTION IF EXISTS qp_check_exists(text, text);
 DROP TABLE IF EXISTS qp_items;

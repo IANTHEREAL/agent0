@@ -287,8 +287,11 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
                 bind_variables_in_expr(item, ctx);
             }
         }
-        Expr::InSubquery { expr: e, .. } => {
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
             bind_variables_in_expr(e, ctx);
+            bind_variables_in_query(subquery, ctx);
         }
         Expr::Between {
             expr: e, low, high, ..
@@ -316,7 +319,12 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
                 bind_variables_in_expr(else_r, ctx);
             }
         }
-        Expr::Exists { .. } | Expr::Subquery(_) => {}
+        Expr::Exists { subquery, .. } => {
+            bind_variables_in_query(subquery, ctx);
+        }
+        Expr::Subquery(query) => {
+            bind_variables_in_query(query, ctx);
+        }
         Expr::ArrayIndex { obj, indexes } => {
             bind_variables_in_expr(obj, ctx);
             for idx in indexes {

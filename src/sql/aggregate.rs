@@ -106,7 +106,9 @@ impl Aggregator {
             }
             Ok(())
         } else {
-            Err(anyhow!("update_string_agg called on non-StringAgg aggregator"))
+            Err(anyhow!(
+                "update_string_agg called on non-StringAgg aggregator"
+            ))
         }
     }
 

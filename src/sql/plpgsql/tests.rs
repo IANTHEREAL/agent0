@@ -196,6 +196,76 @@ fn test_qualified_param_bool_type() {
 }
 
 #[test]
+fn test_qualified_param_in_exists_subquery() {
+    // Real-world pattern from swarm_try_claim:
+    // IF NOT EXISTS (SELECT 1 FROM swarm_tasks t WHERE t.project_id = swarm_try_claim.project_id)
+    let ctx = make_ctx_with_function(
+        "swarm_try_claim",
+        &[
+            ("project_id", Value::Text("demo".into()), DataType::Text),
+            ("task_id", Value::Text("T1".into()), DataType::Text),
+        ],
+    );
+    let stmts = bind_sql_statements(
+        "SELECT NOT EXISTS (SELECT 1 FROM swarm_tasks t WHERE t.project_id = swarm_try_claim.project_id AND t.task_id = swarm_try_claim.task_id)",
+        &ctx,
+    )
+    .unwrap();
+    let sql = stmts[0].to_string();
+    assert!(
+        sql.contains("'demo'"),
+        "project_id inside EXISTS subquery not bound, got: {sql}"
+    );
+    assert!(
+        sql.contains("'T1'"),
+        "task_id inside EXISTS subquery not bound, got: {sql}"
+    );
+    // The table alias t.project_id should remain
+    assert!(
+        sql.contains("t.project_id"),
+        "table.col should remain in subquery, got: {sql}"
+    );
+}
+
+#[test]
+fn test_qualified_param_in_scalar_subquery() {
+    // Scalar subquery: (SELECT count(*) FROM t WHERE t.id = func.id)
+    let ctx = make_ctx_with_function(
+        "my_func",
+        &[("id", Value::Text("abc".into()), DataType::Text)],
+    );
+    let stmts = bind_sql_statements(
+        "SELECT (SELECT count(*) FROM t WHERE t.id = my_func.id)",
+        &ctx,
+    )
+    .unwrap();
+    let sql = stmts[0].to_string();
+    assert!(
+        sql.contains("'abc'"),
+        "param inside scalar subquery not bound, got: {sql}"
+    );
+}
+
+#[test]
+fn test_qualified_param_in_subquery() {
+    // IN subquery: WHERE x IN (SELECT id FROM t WHERE t.pid = func.pid)
+    let ctx = make_ctx_with_function(
+        "my_func",
+        &[("pid", Value::Text("p1".into()), DataType::Text)],
+    );
+    let stmts = bind_sql_statements(
+        "SELECT * FROM s WHERE s.id IN (SELECT id FROM t WHERE t.pid = my_func.pid)",
+        &ctx,
+    )
+    .unwrap();
+    let sql = stmts[0].to_string();
+    assert!(
+        sql.contains("'p1'"),
+        "param inside IN subquery not bound, got: {sql}"
+    );
+}
+
+#[test]
 fn test_qualified_param_three_part_identifier_untouched() {
     // schema.table.column should never be touched even if middle part matches function name
     let ctx = make_ctx_with_function(

@@ -20,3 +20,7 @@ proj-2|T10|mixed test
 
 # Test 6: Upsert with qualified params
 updated title
+
+# Test 7: EXISTS subquery with qualified params
+t
+f

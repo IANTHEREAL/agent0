@@ -277,8 +277,7 @@ impl PhysicalOperator for HashAggregateOperator {
                             }
                             Ok(std::cmp::Ordering::Equal)
                         })?;
-                        let is_string_agg =
-                            self.aggregate_exprs[i].func_name == "STRING_AGG";
+                        let is_string_agg = self.aggregate_exprs[i].func_name == "STRING_AGG";
                         for (_, sorted_value, delim) in buf {
                             if is_string_agg {
                                 agg.update_string_agg(&sorted_value, &delim)?;
@@ -543,9 +542,9 @@ mod tests {
             arg: Some(category_ref()),
             distinct: false,
             delimiter: Some(TypedExpr {
-                kind: crate::sql::analyzer::types::TypedExprKind::Constant(
-                    Value::Text(", ".to_string()),
-                ),
+                kind: crate::sql::analyzer::types::TypedExprKind::Constant(Value::Text(
+                    ", ".to_string(),
+                )),
                 data_type: DataType::Text,
             }),
             filter: None,
