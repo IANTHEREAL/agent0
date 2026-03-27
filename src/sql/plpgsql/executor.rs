@@ -229,7 +229,10 @@ fn execute_statements<'a>(
                     let exec = executor
                         .ok_or_else(|| anyhow!("SQL statement requires execution context"))?;
 
-                    // Check for CREATE TYPE ... AS ENUM (needs text form)
+                    // Check for CREATE TYPE ... AS ENUM (needs text form for classify).
+                    // NOTE: This path still uses text substitution for both classification
+                    // and execution. CREATE TYPE ENUM bodies don't reference table columns,
+                    // so text substitution is safe here. Plan A does not use this path.
                     let expanded_for_classify = substitute_variables(ctx, sql);
                     let raw_trimmed = expanded_for_classify.trim().trim_end_matches(';').trim();
                     let raw_upper = raw_trimmed.to_ascii_uppercase();

@@ -361,7 +361,9 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
             bind_variables_in_expr(timestamp, ctx);
         }
 
-        // Leaf nodes / complex nodes we don't recurse into in Phase 1
+        // Leaf nodes / complex nodes we don't recurse into in Phase 1.
+        // TODO(phase-2): add tracing/warn for unhandled Expr variants that may contain
+        // variable identifiers (silent miss risk for shapes outside Plan A coverage).
         _ => {}
     }
 }

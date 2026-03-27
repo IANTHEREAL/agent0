@@ -1,0 +1,41 @@
+# Phase 1 AST-aware binding regression assertions (#2159)
+# Each line must appear in the test output.
+
+# 1B.1 text binding
+hello
+
+# 1B.2 int binding (41 + 1 = 42)
+42
+
+# 1B.3 bool binding (NOT false = true)
+t
+
+# 1B.4 null handling
+was_null
+
+# 1B.5 jsonb field access (B2 fix)
+alice
+
+# 1B.6 jsonb_pretty produces output
+has_output | t
+
+# 1B.7 negative int (-5 * 2 = -10)
+-10
+
+# 1A.1 INSERT VALUES — verify row
+i1 | first | 10 | test
+
+# 1A.2 ON CONFLICT DO UPDATE — verify upserted row
+i1 | updated | 20
+
+# 1A.3 UPDATE SET WHERE — verify updated row
+i1 | final
+
+# 1A.4 SELECT INTO — returns label
+final
+
+# 1A.6 DECLARE expression binding
+/root/project-x/data
+
+# Final table state
+i1 | final

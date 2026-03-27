@@ -18,13 +18,12 @@ pub(super) fn parse_plpgsql_type(type_str: &str) -> DataType {
         "text" => DataType::Text,
         "varchar" | "character varying" => DataType::Varchar(0),
         "real" | "float4" | "double precision" | "float8" | "float" => DataType::Float64,
-        "timestamp"
-        | "timestamptz"
-        | "timestamp with time zone"
-        | "timestamp without time zone" => DataType::Timestamp,
+        "timestamp" | "timestamp without time zone" => DataType::Timestamp,
+        "timestamptz" | "timestamp with time zone" => DataType::TimestampTz,
         "date" => DataType::Date,
         "uuid" => DataType::Uuid,
-        "json" | "jsonb" => DataType::Json,
+        "json" => DataType::Json,
+        "jsonb" => DataType::Jsonb,
         "bytea" => DataType::Bytes,
         _ if t.starts_with("varchar") || t.starts_with("character varying") => DataType::Varchar(0),
         _ if t.starts_with("numeric") || t.starts_with("decimal") => DataType::Float64,
