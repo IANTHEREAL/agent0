@@ -7,6 +7,13 @@
 // without changing behavior, so keep it out of the warning budget.
 #![allow(clippy::uninlined_format_args)]
 
+// Use jemalloc instead of glibc malloc.  glibc's per-thread arena policy
+// causes severe RSS bloat in multi-tenant deployments (30 GB+ with 22
+// keyspaces, see #2141).  jemalloc purges unused pages aggressively and
+// keeps fragmentation under control.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod auth;
 mod cli;
 mod config;

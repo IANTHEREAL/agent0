@@ -7,6 +7,11 @@ rust-version = "1.88"
 resolver = "3"
 
 [dependencies]
+# Memory allocator — jemalloc replaces glibc malloc to prevent arena
+# fragmentation that inflates RSS 5-10× in multi-tenant deployments.
+# TiKV itself uses jemalloc for the same reason.
+tikv-jemallocator = "0.6"
+
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
 tokio-tungstenite = "0.24"
