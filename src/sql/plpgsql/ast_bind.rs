@@ -89,7 +89,11 @@ pub(super) fn value_to_ast_expr(value: &Value, data_type: &DataType) -> Expr {
         },
 
         Value::Timestamp(ts) => {
-            let ts_str = ts.to_string();
+            // Format epoch millis as ISO 8601 string (not raw number).
+            let ts_str = match chrono::DateTime::from_timestamp_millis(*ts) {
+                Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                None => ts.to_string(),
+            };
             let target_type = match data_type {
                 DataType::Timestamp => AstDataType::Timestamp(None, ast::TimezoneInfo::None),
                 _ => AstDataType::Timestamp(None, ast::TimezoneInfo::WithTimeZone),
@@ -101,11 +105,16 @@ pub(super) fn value_to_ast_expr(value: &Value, data_type: &DataType) -> Expr {
             }
         }
 
-        Value::Date(d) => Expr::Cast {
-            expr: Box::new(Expr::Value(AstValue::SingleQuotedString(d.to_string()))),
-            data_type: AstDataType::Date,
-            format: None,
-        },
+        Value::Date(d) => {
+            // Format days-since-epoch as YYYY-MM-DD string (not raw number).
+            let date_str =
+                crate::model::date::format_date_days(*d).unwrap_or_else(|_| d.to_string());
+            Expr::Cast {
+                expr: Box::new(Expr::Value(AstValue::SingleQuotedString(date_str))),
+                data_type: AstDataType::Date,
+                format: None,
+            }
+        }
 
         Value::Time(t) => Expr::Cast {
             expr: Box::new(Expr::Value(AstValue::SingleQuotedString(t.to_string()))),
