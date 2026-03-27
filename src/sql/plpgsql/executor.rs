@@ -653,24 +653,27 @@ async fn execute_user_function_by_name(
     }
 
     if lang == "sql" {
-        // SECURITY DEFINER scalar SQL functions must go through the executor
-        // path so that the owner's role identity is applied for RLS evaluation.
-        // The fast path (execute_sql_function) uses eval_expr_with_sequences
-        // which doesn't support role context switching.
-        if func_def.security_definer {
-            if let Some(exec) = executor {
-                return execute_sql_function_via_executor(
-                    exec,
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    &func_def,
-                    args,
-                )
-                .await;
-            }
+        // Always prefer the full executor path for SQL-language functions.
+        // The old fast path (execute_sql_function) extracted only the first
+        // projection expression and evaluated it via eval_expr_with_sequences,
+        // which silently discarded CTEs (WITH), FROM clauses, WHERE clauses,
+        // and subqueries — breaking any non-trivial SQL function body.
+        // The executor path handles all SQL constructs correctly.
+        if let Some(exec) = executor {
+            return execute_sql_function_via_executor(
+                exec,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &func_def,
+                args,
+            )
+            .await;
         }
+        // Fallback for call sites without an executor reference (e.g.,
+        // sequence expression evaluation). This path only works for trivial
+        // scalar expressions like `SELECT 1 + 1`.
         return execute_sql_function(
             store,
             txn,
