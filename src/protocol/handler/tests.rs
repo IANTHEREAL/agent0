@@ -272,9 +272,26 @@ fn test_sqlstate_for_executor_error() {
     let other = anyhow::anyhow!("boom");
     assert_eq!(sqlstate_for_executor_error(&other), "XX000");
 
-    // TiKV lock conflicts surfaced as anyhow should map to lock-not-available.
+    // TiKV ResolveLockError → 40001 (serialization_failure), NOT 55P03.
+    // 55P03 is reserved for explicit NOWAIT/SKIP LOCKED via SqlError variants.
     let tikv_lock = anyhow::Error::new(tikv_client::Error::ResolveLockError(Vec::new()));
-    assert_eq!(sqlstate_for_executor_error(&tikv_lock), "55P03");
+    assert_eq!(sqlstate_for_executor_error(&tikv_lock), "40001");
+
+    // TiKV WriteConflict → 40001 (serialization_failure).
+    let write_conflict_ke = tikv_client::proto::kvrpcpb::KeyError {
+        conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+        ..Default::default()
+    };
+    let tikv_wc = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(write_conflict_ke)));
+    assert_eq!(sqlstate_for_executor_error(&tikv_wc), "40001");
+
+    // TiKV Deadlock → 40P01 (deadlock_detected).
+    let deadlock_ke = tikv_client::proto::kvrpcpb::KeyError {
+        deadlock: Some(tikv_client::proto::kvrpcpb::Deadlock::default()),
+        ..Default::default()
+    };
+    let tikv_dl = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(deadlock_ke)));
+    assert_eq!(sqlstate_for_executor_error(&tikv_dl), "40P01");
 
     // SqlError downcast path: each variant gets correct SQLSTATE
     let cases: Vec<(SqlError, &str)> = vec![

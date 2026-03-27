@@ -5,26 +5,65 @@ fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
-fn is_tikv_lock_conflict(err: &anyhow::Error) -> bool {
-    fn is_conflict(err: &tikv_client::Error) -> bool {
+/// Check if a TiKV error contains a write conflict (KeyError with `conflict` field set).
+/// PostgreSQL equivalent: `40001 serialization_failure` — the client should retry.
+fn is_tikv_write_conflict(err: &anyhow::Error) -> bool {
+    fn has_conflict(err: &tikv_client::Error) -> bool {
         match err {
-            tikv_client::Error::KeyError(key_err) => {
-                key_err.locked.is_some() || key_err.conflict.is_some() || key_err.deadlock.is_some()
-            }
-            tikv_client::Error::PessimisticLockError { inner, .. } => is_conflict(inner),
-            tikv_client::Error::UndeterminedError(inner) => is_conflict(inner),
+            tikv_client::Error::KeyError(key_err) => key_err.conflict.is_some(),
+            tikv_client::Error::PessimisticLockError { inner, .. } => has_conflict(inner),
+            tikv_client::Error::UndeterminedError(inner) => has_conflict(inner),
             tikv_client::Error::ExtractedErrors(errors)
-            | tikv_client::Error::MultipleKeyErrors(errors) => {
-                !errors.is_empty() && errors.iter().all(is_conflict)
-            }
-            _ => err.is_lock_conflict(),
+            | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_conflict),
+            _ => false,
         }
     }
-
     err.chain().any(|cause| {
         cause
             .downcast_ref::<tikv_client::Error>()
-            .is_some_and(is_conflict)
+            .is_some_and(has_conflict)
+    })
+}
+
+/// Check if a TiKV error contains a deadlock (KeyError with `deadlock` field set).
+/// PostgreSQL equivalent: `40P01 deadlock_detected`.
+fn is_tikv_deadlock(err: &anyhow::Error) -> bool {
+    fn has_deadlock(err: &tikv_client::Error) -> bool {
+        match err {
+            tikv_client::Error::KeyError(key_err) => key_err.deadlock.is_some(),
+            tikv_client::Error::PessimisticLockError { inner, .. } => has_deadlock(inner),
+            tikv_client::Error::UndeterminedError(inner) => has_deadlock(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_deadlock),
+            _ => false,
+        }
+    }
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(has_deadlock)
+    })
+}
+
+/// Check if a TiKV error is a lock-resolution failure or locked-key error.
+/// These are transient MVCC lock encounters — mapped to `40001` because the
+/// client should retry the transaction (not `55P03`, which is NOWAIT-only).
+fn is_tikv_lock_resolution_failure(err: &anyhow::Error) -> bool {
+    fn has_lock_failure(err: &tikv_client::Error) -> bool {
+        match err {
+            tikv_client::Error::ResolveLockError(_) => true,
+            tikv_client::Error::KeyError(key_err) => key_err.locked.is_some(),
+            tikv_client::Error::PessimisticLockError { inner, .. } => has_lock_failure(inner),
+            tikv_client::Error::UndeterminedError(inner) => has_lock_failure(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_lock_failure),
+            _ => err.is_lock_conflict(),
+        }
+    }
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(has_lock_failure)
     })
 }
 
@@ -32,8 +71,19 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     if let Some(sql_err) = err.downcast_ref::<SqlError>() {
         return sql_err.sqlstate();
     }
-    if is_tikv_lock_conflict(err) {
-        return "55P03";
+    // WriteConflict → 40001 (serialization_failure): client should retry the txn.
+    if is_tikv_write_conflict(err) {
+        return "40001";
+    }
+    // Deadlock → 40P01 (deadlock_detected).
+    if is_tikv_deadlock(err) {
+        return "40P01";
+    }
+    // Lock resolution failure → 40001 (serialization_failure): transient,
+    // client should retry.  NOT 55P03 — that is reserved for NOWAIT/SKIP LOCKED
+    // (routed through SqlError::LockNotAvailable / SqlError::LockTimeout).
+    if is_tikv_lock_resolution_failure(err) {
+        return "40001";
     }
     "XX000"
 }
