@@ -581,12 +581,19 @@ pub(crate) async fn collect_deferred_self_fk_checks(
             continue;
         }
 
+        // Use snapshot reads (not pessimistic locks) to check parent existence.
+        // This function is only called during COPY FROM STDIN where self-FK
+        // checks are deferred to CopyDone.  Acquiring pessimistic locks here
+        // interferes with batch_mutate's own pessimistic_lock calls when
+        // inserting the child rows, causing TiKV to silently drop writes
+        // after transaction rotation (see #2192 regression).
         let lookup = resolve_fk_ref_lookup(&fk.ref_columns, schema)?;
         let parent_exists = match lookup {
             FkRefLookup::Pk => {
-                store
-                    .check_and_lock_pk_keys(txn, db_id, schema.table_id, &[fk_values.clone()], None)
-                    .await?
+                let ref_rows = store
+                    .batch_get_rows(txn, db_id, schema.table_id, vec![fk_values.clone()], schema)
+                    .await?;
+                !ref_rows.is_empty()
             }
             FkRefLookup::UniqueIndex { index_id, pk_types } => {
                 let pks = store
@@ -602,9 +609,10 @@ pub(crate) async fn collect_deferred_self_fk_checks(
                     )
                     .await?;
                 if !pks.is_empty() {
-                    store
-                        .check_and_lock_pk_keys(txn, db_id, schema.table_id, &pks, None)
-                        .await?
+                    let ref_rows = store
+                        .batch_get_rows(txn, db_id, schema.table_id, pks, schema)
+                        .await?;
+                    !ref_rows.is_empty()
                 } else {
                     false
                 }
