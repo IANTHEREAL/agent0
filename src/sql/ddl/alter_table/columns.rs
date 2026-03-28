@@ -238,24 +238,67 @@ pub(super) async fn alter_table_add_column(
             last_col.default_expr = Some(sequences::format_nextval_default(&seq_full_name));
         }
 
+        // Read the OID assigned by create_sequence so we can clean up
+        // orphaned autocommit state keys if the backfill fails (#2049).
+        let seq_oid = store
+            .get_sequence(txn, db_id, &seq_full_name)
+            .await?
+            .map(|def| def.oid)
+            .unwrap_or(0);
+
         let new_col_idx = schema.columns.len() - 1;
-        let mut budget =
-            AlterTableBudget::new(&schema.name, "ADD COLUMN (identity/serial backfill)");
-        let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-        let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-        while let Some(batch) = scanner.next_batch(txn).await? {
-            for pair in batch {
-                let (key, value): (tikv_client::Key, tikv_client::Value) = pair.into();
-                let mut row = crate::storage::deserialize_row(&value)?;
-                fill_row_defaults(&mut row, schema)?;
-                let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
-                row.values[new_col_idx] =
-                    coerce_value_for_column(Value::Int64(seq_val), &schema.columns[new_col_idx])?;
-                let row_data = crate::storage::serialize_row(&row)?;
-                let key_vec: Vec<u8> = key.into();
-                budget.track_write(key_vec.len(), row_data.len())?;
-                txn_put(txn, key_vec, row_data).await?;
+        let backfill_result: Result<()> = async {
+            let mut budget =
+                AlterTableBudget::new(&schema.name, "ADD COLUMN (identity/serial backfill)");
+            let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+            while let Some(batch) = scanner.next_batch(txn).await? {
+                for pair in batch {
+                    let (key, value): (tikv_client::Key, tikv_client::Value) = pair.into();
+                    let mut row = crate::storage::deserialize_row(&value)?;
+                    fill_row_defaults(&mut row, schema)?;
+                    let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
+                    row.values[new_col_idx] = coerce_value_for_column(
+                        Value::Int64(seq_val),
+                        &schema.columns[new_col_idx],
+                    )?;
+                    let row_data = crate::storage::serialize_row(&row)?;
+                    let key_vec: Vec<u8> = key.into();
+                    budget.track_write(key_vec.len(), row_data.len())?;
+                    txn_put(txn, key_vec, row_data).await?;
+                }
             }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = backfill_result {
+            // The sequence definition will roll back with the main txn, but
+            // autocommitted state keys (from nextval) survive.  Clean them
+            // up in a separate optimistic txn so they don't orphan (#2049).
+            if seq_oid != 0 {
+                let state_key = crate::storage::encode_sequence_value_key_v2(db_id, seq_oid);
+                let cleanup: Result<()> = async {
+                    let mut cleanup_txn = store.begin_optimistic().await?;
+                    if cleanup_txn.get(state_key.clone()).await?.is_some() {
+                        // Use raw delete to bypass savepoint undo tracking —
+                        // this cleanup txn is not part of the session's
+                        // savepoint scope.
+                        cleanup_txn.delete(state_key).await?;
+                    }
+                    cleanup_txn.commit().await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(cleanup_err) = cleanup {
+                    tracing::warn!(
+                        seq_oid,
+                        %cleanup_err,
+                        "failed to clean up orphaned sequence state key"
+                    );
+                }
+            }
+            return Err(err);
         }
     }
     // Backfill existing rows for generated stored columns.
