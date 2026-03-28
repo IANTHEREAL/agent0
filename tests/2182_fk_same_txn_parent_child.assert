@@ -1,0 +1,35 @@
+# Same-txn INSERT parent + child succeeds
+1 | 1
+
+# Multi-row same-txn
+1 | 1
+2 | 2
+3 | 3
+4 | 4
+
+# Cross-txn FK works
+1 | 1
+2 | 2
+3 | 3
+4 | 4
+5 | 1
+
+# FK violation for non-existent parent
+violates foreign key constraint
+
+# Composite PK same-txn
+1 | 1 | 10
+2 | 2 | 20
+
+# Same-txn INSERT parent + UPDATE child to reference it
+1 | 2
+
+# UNIQUE column FK same-txn
+1 | alpha
+2 | beta
+
+# FK violation on UNIQUE ref
+violates foreign key constraint
+
+# NULL FK value allowed
+1 |

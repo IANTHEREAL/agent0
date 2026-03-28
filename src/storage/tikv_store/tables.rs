@@ -125,9 +125,32 @@ impl TikvStore {
         let num_requested = keys.len();
 
         let do_lock = async {
-            let pairs = tikv_op!(txn.batch_get_for_update(keys).await).map_err(|e| anyhow!(e))?;
-            // All requested PKs must exist for the FK check to pass.
-            Ok::<bool, anyhow::Error>(pairs.len() == num_requested)
+            // Phase 1: acquire pessimistic locks on all keys via TiKV.
+            // batch_get_for_update bypasses the client-side buffer in
+            // pessimistic mode — it only sees committed data in TiKV.
+            let locked_pairs =
+                tikv_op!(txn.batch_get_for_update(keys.clone()).await).map_err(|e| anyhow!(e))?;
+            let locked_count = locked_pairs.len();
+
+            if locked_count == num_requested {
+                // Fast path: all parent rows found in TiKV and locked.
+                return Ok::<bool, anyhow::Error>(true);
+            }
+
+            // Phase 2: some keys were not found in TiKV.  They may have been
+            // written earlier in this same transaction (read-your-own-writes).
+            // batch_get checks the client-side buffer first.
+            let locked_keys: std::collections::HashSet<Vec<u8>> =
+                locked_pairs.into_iter().map(|kv| kv.0.into()).collect();
+            let missing_keys: Vec<Vec<u8>> = keys
+                .into_iter()
+                .filter(|k| !locked_keys.contains(k.as_slice()))
+                .collect();
+            let buffer_found = tikv_op!(txn.batch_get(missing_keys).await)
+                .map_err(|e| anyhow!(e))?
+                .count();
+
+            Ok::<bool, anyhow::Error>(locked_count + buffer_found == num_requested)
         };
 
         match lock_timeout {
