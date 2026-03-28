@@ -458,58 +458,24 @@ fn evaluate_index(
         ));
     }
 
-    let lower_inclusive = predicates.iter().find_map(|p| {
-        if let TypedPredicate::Comparison {
-            column,
-            op: CmpOp::Ge,
-            value,
-        } = p
-        {
+    // Extract all range bounds in a single pass (was 4 separate O(N) scans).
+    let mut lower_inclusive = None;
+    let mut lower_exclusive = None;
+    let mut upper_inclusive = None;
+    let mut upper_exclusive = None;
+    for p in predicates {
+        if let TypedPredicate::Comparison { column, op, value } = p {
             if column.eq_ignore_ascii_case(next_col) {
-                return Some(value);
+                match op {
+                    CmpOp::Ge => lower_inclusive = lower_inclusive.or(Some(value)),
+                    CmpOp::Gt => lower_exclusive = lower_exclusive.or(Some(value)),
+                    CmpOp::Le => upper_inclusive = upper_inclusive.or(Some(value)),
+                    CmpOp::Lt => upper_exclusive = upper_exclusive.or(Some(value)),
+                    _ => {}
+                }
             }
         }
-        None
-    });
-    let lower_exclusive = predicates.iter().find_map(|p| {
-        if let TypedPredicate::Comparison {
-            column,
-            op: CmpOp::Gt,
-            value,
-        } = p
-        {
-            if column.eq_ignore_ascii_case(next_col) {
-                return Some(value);
-            }
-        }
-        None
-    });
-    let upper_inclusive = predicates.iter().find_map(|p| {
-        if let TypedPredicate::Comparison {
-            column,
-            op: CmpOp::Le,
-            value,
-        } = p
-        {
-            if column.eq_ignore_ascii_case(next_col) {
-                return Some(value);
-            }
-        }
-        None
-    });
-    let upper_exclusive = predicates.iter().find_map(|p| {
-        if let TypedPredicate::Comparison {
-            column,
-            op: CmpOp::Lt,
-            value,
-        } = p
-        {
-            if column.eq_ignore_ascii_case(next_col) {
-                return Some(value);
-            }
-        }
-        None
-    });
+    }
 
     let (range_start, start_inclusive) = if let Some(val) = lower_inclusive {
         (

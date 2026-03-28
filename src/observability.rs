@@ -287,6 +287,8 @@ impl TenantObservability {
         let minute = now / 1000 / BUCKET_SECS;
         self.window.record_statement(minute, latency_us, ok);
 
+        let is_slow = latency_us >= self.config.slow_query_threshold_us;
+
         if self.should_sample(latency_us, ok) {
             let mut sql = normalize_sql(&sql_supplier(), self.config.max_sql_len);
             if sql.is_empty() {
@@ -296,6 +298,15 @@ impl TenantObservability {
             if is_observability_system_sql(&sql) {
                 return;
             }
+
+            if is_slow {
+                tracing::warn!(
+                    latency_ms = latency_us / 1000,
+                    ok,
+                    "slow query: {sql}"
+                );
+            }
+
             if sql.contains('|') {
                 sql = sql.replace('|', " ");
             }
@@ -877,5 +888,134 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].query, "SELECT 1");
         assert_eq!(groups[0].sample_count, 1);
+    }
+
+    #[test]
+    fn test_slow_query_is_sampled_and_counted() {
+        let threshold_us = 200_000; // 200ms
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            slow_query_threshold_us: threshold_us,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        // Query exactly at threshold — should be sampled as slow
+        tenant.record_statement_us(threshold_us, true, || "SELECT slow_at_boundary".to_string());
+        let groups = tenant.snapshot_query_samples();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].query, "SELECT slow_at_boundary");
+
+        // Statement count should reflect it
+        assert_eq!(tenant.snapshot_summary().statement_count, 1);
+    }
+
+    #[test]
+    fn test_slow_error_query_is_sampled() {
+        let threshold_us = 200_000;
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            slow_query_threshold_us: threshold_us,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        // Slow AND error — both conditions trigger sampling
+        tenant.record_statement_us(threshold_us + 1, false, || {
+            "SELECT slow_error".to_string()
+        });
+        let groups = tenant.snapshot_query_samples();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].error_count, 1);
+        assert_eq!(tenant.snapshot_summary().error_count, 1);
+    }
+
+    #[test]
+    fn test_fast_query_below_threshold_not_always_sampled() {
+        let cfg = ObservabilityConfig {
+            sample_every: u64::MAX, // effectively never sample randomly
+            slow_query_threshold_us: 200_000,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        // Fast successful query with max sample_every — should not be sampled
+        tenant.record_statement_us(100, true, || "SELECT fast".to_string());
+        assert!(tenant.snapshot_query_samples().is_empty());
+        // But statement count should still increment
+        assert_eq!(tenant.snapshot_summary().statement_count, 1);
+    }
+
+    #[test]
+    fn test_disabled_observability_skips_all_work() {
+        let cfg = ObservabilityConfig {
+            enabled: false,
+            sample_every: 1,
+            slow_query_threshold_us: 1, // extremely low threshold
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        // Even a very slow query should not be recorded
+        tenant.record_statement_us(999_999_999, true, || {
+            panic!("sql_supplier should not be called when disabled")
+        });
+        assert!(tenant.snapshot_query_samples().is_empty());
+        assert_eq!(tenant.snapshot_summary().statement_count, 0);
+    }
+
+    #[test]
+    fn test_slow_query_with_password_is_redacted_in_sample() {
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            slow_query_threshold_us: 1, // 1us threshold
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        tenant.record_statement_us(1_000_000, true, || {
+            "CREATE ROLE admin WITH PASSWORD 'supersecret'".to_string()
+        });
+        let groups = tenant.snapshot_query_samples();
+        assert_eq!(groups.len(), 1);
+        assert!(
+            groups[0].query.contains("'***'"),
+            "password should be redacted, got: {}",
+            groups[0].query
+        );
+        assert!(
+            !groups[0].query.contains("supersecret"),
+            "raw password should not appear in sample"
+        );
+    }
+
+    #[test]
+    fn test_slow_system_query_not_sampled() {
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            slow_query_threshold_us: 1,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        // Even slow observability system queries are filtered out
+        tenant.record_statement_us(1_000_000, true, || {
+            "SELECT * FROM _db9_sys_observability()".to_string()
+        });
+        assert!(tenant.snapshot_query_samples().is_empty());
+    }
+
+    #[test]
+    fn test_slow_empty_sql_not_sampled() {
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            slow_query_threshold_us: 1,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+
+        // Empty SQL supplier — should not produce a sample even if slow
+        tenant.record_statement_us(1_000_000, true, || String::new());
+        assert!(tenant.snapshot_query_samples().is_empty());
     }
 }

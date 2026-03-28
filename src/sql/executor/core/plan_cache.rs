@@ -5,7 +5,7 @@
 //! for runtime invalidation.
 
 use crate::sql::optimizer::physical_plan::PhysicalPlan;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Dependency metadata for a cached plan:
 /// `(table_name, table_id, schema_version)`.
@@ -291,10 +291,10 @@ pub(crate) struct PreparedPlanCache {
     counters: HashMap<PlanCacheKey, PromotionState>,
     /// Entry LRU ordering: head=least-recently-used, tail=most-recently-used.
     lru: LruState,
-    /// Counter LRU ordering for miss-path promotion tracking.
+    /// Counter LRU ordering for miss-path promotion tracking (O(1) touch/evict).
     ///
-    /// Keys in this list must be a duplicate-free mirror of `counters`.
-    counter_lru_order: Vec<PlanCacheKey>,
+    /// Keys in this structure must be a duplicate-free mirror of `counters`.
+    counter_lru: LruState,
 }
 
 impl PreparedPlanCache {
@@ -306,7 +306,7 @@ impl PreparedPlanCache {
             entries: HashMap::new(),
             counters: HashMap::new(),
             lru: LruState::new(),
-            counter_lru_order: Vec::new(),
+            counter_lru: LruState::new(),
         }
     }
 
@@ -422,6 +422,7 @@ impl PreparedPlanCache {
     /// history for the affected table.
     #[cfg(test)]
     pub fn invalidate_by_table_id(&mut self, table_id: u64) {
+        use std::collections::HashSet;
         let mut keys_to_remove: HashSet<PlanCacheKey> = self
             .entries
             .iter()
@@ -446,7 +447,7 @@ impl PreparedPlanCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.counters.clear();
-        self.counter_lru_order.clear();
+        self.counter_lru.clear();
         self.lru.clear();
     }
 
@@ -471,7 +472,7 @@ impl PreparedPlanCache {
     /// Number of keys in counter LRU order.
     #[cfg(test)]
     pub fn counter_order_len(&self) -> usize {
-        self.counter_lru_order.len()
+        self.counter_lru.index.len()
     }
 
     /// Current counter for a key if tracked.
@@ -483,12 +484,11 @@ impl PreparedPlanCache {
     /// Assert duplicate-free and aligned counter map/order internals.
     #[cfg(test)]
     pub fn assert_counter_internal_consistency(&self) {
-        let mut seen = HashSet::new();
-        for key in &self.counter_lru_order {
-            assert!(seen.insert(key), "counter_lru_order contains duplicate key");
+        // LruState.index is a HashMap so duplicates are impossible by construction.
+        for key in self.counter_lru.index.keys() {
             assert!(
                 self.counters.contains_key(key),
-                "counter_lru_order contains orphan key"
+                "counter_lru contains orphan key"
             );
             assert!(
                 !self.entries.contains_key(key),
@@ -497,7 +497,7 @@ impl PreparedPlanCache {
         }
         assert_eq!(
             self.counters.len(),
-            self.counter_lru_order.len(),
+            self.counter_lru.index.len(),
             "counter map/order size mismatch"
         );
         assert!(
@@ -520,22 +520,21 @@ impl PreparedPlanCache {
         true
     }
 
-    /// Move a counter key to MRU position.
+    /// Move a counter key to MRU position (O(1)).
     fn touch_counter_lru(&mut self, key: &PlanCacheKey) {
-        self.counter_lru_order.retain(|k| k != key);
-        self.counter_lru_order.push(key.clone());
+        self.counter_lru.push_back(key.clone());
     }
 
-    /// Remove counter state and LRU membership for a key.
+    /// Remove counter state and LRU membership for a key (O(1)).
     fn remove_counter(&mut self, key: &PlanCacheKey) {
         self.counters.remove(key);
-        self.counter_lru_order.retain(|k| k != key);
+        self.counter_lru.remove(key);
     }
 
-    /// Evict one oldest counter entry by counter LRU order.
+    /// Evict one oldest counter entry by counter LRU order (O(1)).
     fn evict_oldest_counter(&mut self) -> bool {
-        if let Some(evict_key) = self.counter_lru_order.first().cloned() {
-            self.remove_counter(&evict_key);
+        if let Some(evict_key) = self.counter_lru.pop_front() {
+            self.counters.remove(&evict_key);
             true
         } else {
             false
@@ -546,25 +545,23 @@ impl PreparedPlanCache {
     fn trim_counters_to_capacity(&mut self) {
         if self.capacity == 0 {
             self.counters.clear();
-            self.counter_lru_order.clear();
+            self.counter_lru.clear();
             return;
         }
 
-        self.counters
-            .retain(|key, _| !self.entries.contains_key(key));
-        self.counter_lru_order
-            .retain(|key| self.counters.contains_key(key) && !self.entries.contains_key(key));
-
-        let mut seen = HashSet::new();
-        let mut deduped_rev = Vec::with_capacity(self.counter_lru_order.len());
-        for key in self.counter_lru_order.iter().rev() {
-            if seen.insert(key.clone()) {
-                deduped_rev.push(key.clone());
-            }
+        // Remove promoted keys from counters and rebuild counter_lru.
+        let promoted_keys: Vec<PlanCacheKey> = self
+            .counters
+            .keys()
+            .filter(|key| self.entries.contains_key(key))
+            .cloned()
+            .collect();
+        for key in &promoted_keys {
+            self.counters.remove(key);
+            self.counter_lru.remove(key);
         }
-        deduped_rev.reverse();
-        self.counter_lru_order = deduped_rev;
 
+        // Evict oldest counters until within capacity.
         while self.counters.len() > self.capacity {
             if !self.evict_oldest_counter() {
                 if let Some(any_key) = self.counters.keys().next().cloned() {
@@ -574,8 +571,6 @@ impl PreparedPlanCache {
                 }
             }
         }
-        self.counter_lru_order
-            .retain(|k| self.counters.contains_key(k));
     }
 }
 
@@ -1053,6 +1048,175 @@ mod tests {
             PromotionCounterOutcome::NotTracked,
             "already-cached key_int should be NotTracked"
         );
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn counter_lru_repeated_touch_no_duplicates() {
+        let mut cache = PreparedPlanCache::new(5, 10);
+        let k1 = make_key("SELECT 1");
+
+        // First touch creates one counter entry
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        assert_eq!(cache.counter_len(), 1);
+        assert_eq!(cache.counter_order_len(), 1);
+
+        // Second touch increments count but must NOT create a duplicate
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::MissCount(2)
+        );
+        assert_eq!(cache.counter_len(), 1);
+        assert_eq!(cache.counter_order_len(), 1);
+
+        // Third touch — still one entry
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::MissCount(3)
+        );
+        assert_eq!(cache.counter_len(), 1);
+        assert_eq!(cache.counter_order_len(), 1);
+
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn counter_lru_touch_order_determines_eviction() {
+        let mut cache = PreparedPlanCache::new(3, 10);
+        let k1 = make_key("SELECT 1");
+        let k2 = make_key("SELECT 2");
+        let k3 = make_key("SELECT 3");
+        let k4 = make_key("SELECT 4");
+
+        // Record k1, k2, k3 — fills to capacity
+        cache.record_execution(&k1);
+        cache.record_execution(&k2);
+        cache.record_execution(&k3);
+
+        // Touch k1 again — moves to back, so k2 is now oldest
+        cache.record_execution(&k1);
+
+        // Adding k4 should evict k2 (oldest counter)
+        cache.record_execution(&k4);
+        assert_eq!(cache.counter_len(), 3);
+        assert!(cache.counter_count_for(&k1).is_some(), "k1 should survive (touched recently)");
+        assert!(cache.counter_count_for(&k2).is_none(), "k2 should be evicted (oldest)");
+        assert!(cache.counter_count_for(&k3).is_some(), "k3 should survive");
+        assert!(cache.counter_count_for(&k4).is_some(), "k4 was just added");
+
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn promoted_key_removed_from_counter_lru() {
+        let mut cache = PreparedPlanCache::new(4, 2);
+        let k1 = make_key("SELECT 1");
+        let k2 = make_key("SELECT 2");
+
+        // Build up counters for both keys
+        cache.record_execution(&k1);
+        cache.record_execution(&k1);
+        cache.record_execution(&k2);
+        assert_eq!(cache.counter_len(), 2);
+        assert_eq!(cache.counter_order_len(), 2);
+
+        // Promote k1 into the cache — should clear its counter
+        cache.insert(k1.clone(), make_entry(vec![]));
+        assert_eq!(cache.counter_count_for(&k1), None);
+        assert_eq!(cache.counter_len(), 1);
+        assert_eq!(cache.counter_order_len(), 1);
+
+        // k2 counter should still exist
+        assert_eq!(cache.counter_count_for(&k2), Some(1));
+
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn trim_counters_removes_promoted_keys_and_respects_capacity() {
+        let mut cache = PreparedPlanCache::new(4, 1);
+        let k1 = make_key("SELECT 1");
+        let k2 = make_key("SELECT 2");
+        let k3 = make_key("SELECT 3");
+        let k4 = make_key("SELECT 4");
+
+        // Record all four counters
+        cache.record_execution(&k1);
+        cache.record_execution(&k2);
+        cache.record_execution(&k3);
+        cache.record_execution(&k4);
+        assert_eq!(cache.counter_len(), 4);
+
+        // Promote k2 and k3
+        cache.insert(k2.clone(), make_entry(vec![]));
+        cache.insert(k3.clone(), make_entry(vec![]));
+
+        // Reconfigure to smaller capacity — triggers trim_counters_to_capacity
+        cache.reconfigure(2, 1);
+        assert_eq!(cache.counter_count_for(&k2), None, "promoted key removed from counters");
+        assert_eq!(cache.counter_count_for(&k3), None, "promoted key removed from counters");
+        assert!(cache.counter_len() <= 2, "counters within new capacity");
+
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn evict_oldest_counter_on_empty_is_safe() {
+        let mut cache = PreparedPlanCache::new(5, 10);
+
+        // No counters recorded — capacity limit should not panic
+        assert_eq!(cache.counter_len(), 0);
+        assert_eq!(cache.counter_order_len(), 0);
+
+        // Record and remove, verify consistency
+        let k1 = make_key("SELECT 1");
+        cache.record_execution(&k1);
+        assert_eq!(cache.counter_len(), 1);
+        cache.insert(k1.clone(), make_entry(vec![]));
+        assert_eq!(cache.counter_len(), 0);
+        assert_eq!(cache.counter_order_len(), 0);
+
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn invalidate_syncs_counter_and_counter_lru() {
+        let mut cache = PreparedPlanCache::new(5, 10);
+        let k1 = PlanCacheKey::new(
+            "SELECT * FROM t WHERE id = $1".to_string(),
+            &[],
+            1,
+            &["public".to_string()],
+            &[42],
+            None,
+        );
+        let k2 = PlanCacheKey::new(
+            "SELECT * FROM t2 WHERE id = $1".to_string(),
+            &[],
+            1,
+            &["public".to_string()],
+            &[99],
+            None,
+        );
+
+        // Build counters
+        cache.record_execution(&k1);
+        cache.record_execution(&k2);
+        assert_eq!(cache.counter_len(), 2);
+        assert_eq!(cache.counter_order_len(), 2);
+
+        // Invalidate k1 by table_id — should remove counter AND LRU entry
+        cache.invalidate_by_table_id(42);
+        assert_eq!(cache.counter_count_for(&k1), None);
+        assert_eq!(cache.counter_len(), 1);
+        assert_eq!(cache.counter_order_len(), 1);
+
+        // k2 should survive (different table_id)
+        assert_eq!(cache.counter_count_for(&k2), Some(1));
+
         cache.assert_counter_internal_consistency();
     }
 }

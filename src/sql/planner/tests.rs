@@ -1183,3 +1183,390 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
         path.cost,
     );
 }
+
+// ── Range scan tests (bounded range, single-pass predicate extraction) ──
+
+fn range_schema() -> TableSchema {
+    let mut s = TableSchema::new(
+        "events".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+            crate::model::ColumnDef::new("ts", DataType::Int64, false),
+            crate::model::ColumnDef::new("region", DataType::Text, false),
+        ],
+        vec![0],
+    );
+    s.pk_constraint_name = None;
+    s.owner = String::new();
+    s.indexes = vec![IndexDef {
+        id: 10,
+        name: "idx_ts".to_string(),
+        columns: vec!["ts".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
+    }];
+    s
+}
+
+fn composite_range_schema() -> TableSchema {
+    let mut s = TableSchema::new(
+        "events".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+            crate::model::ColumnDef::new("region", DataType::Text, false),
+            crate::model::ColumnDef::new("ts", DataType::Int64, false),
+        ],
+        vec![0],
+    );
+    s.pk_constraint_name = None;
+    s.owner = String::new();
+    s.indexes = vec![IndexDef {
+        id: 20,
+        name: "idx_region_ts".to_string(),
+        columns: vec!["region".to_string(), "ts".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
+    }];
+    s
+}
+
+#[test]
+fn test_range_scan_lower_inclusive_bound() {
+    let schema = range_schema();
+    // WHERE ts >= 1000
+    let filter = typed_binop(
+        typed_column("ts", DataType::Int64),
+        TypedBinaryOp::GtEq,
+        typed_constant(Value::Int64(1000), DataType::Int64),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            index_name,
+            prefix_values,
+            range_start,
+            start_inclusive,
+            range_end,
+            ..
+        } => {
+            assert_eq!(index_name, "idx_ts");
+            assert!(prefix_values.is_empty());
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(1000)));
+            assert!(*start_inclusive, "Ge should be inclusive");
+            assert!(range_end.is_none(), "single-sided: no upper bound");
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_scan_upper_exclusive_bound() {
+    let schema = range_schema();
+    // WHERE ts < 5000
+    let filter = typed_binop(
+        typed_column("ts", DataType::Int64),
+        TypedBinaryOp::Lt,
+        typed_constant(Value::Int64(5000), DataType::Int64),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            index_name,
+            range_start,
+            range_end,
+            end_inclusive,
+            ..
+        } => {
+            assert_eq!(index_name, "idx_ts");
+            assert!(range_start.is_none(), "single-sided: no lower bound");
+            assert_eq!(range_end.as_ref(), Some(&Value::Int64(5000)));
+            assert!(!*end_inclusive, "Lt should be exclusive");
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_scan_two_sided_bounded() {
+    let schema = range_schema();
+    // WHERE ts >= 1000 AND ts <= 5000
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::GtEq,
+            typed_constant(Value::Int64(1000), DataType::Int64),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::LtEq,
+            typed_constant(Value::Int64(5000), DataType::Int64),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            index_name,
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => {
+            assert_eq!(index_name, "idx_ts");
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(1000)));
+            assert!(*start_inclusive);
+            assert_eq!(range_end.as_ref(), Some(&Value::Int64(5000)));
+            assert!(*end_inclusive);
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_scan_exclusive_bounds() {
+    let schema = range_schema();
+    // WHERE ts > 100 AND ts < 900
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::Gt,
+            typed_constant(Value::Int64(100), DataType::Int64),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::Lt,
+            typed_constant(Value::Int64(900), DataType::Int64),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => {
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(100)));
+            assert!(!*start_inclusive, "Gt should be exclusive");
+            assert_eq!(range_end.as_ref(), Some(&Value::Int64(900)));
+            assert!(!*end_inclusive, "Lt should be exclusive");
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_scan_mixed_inclusive_exclusive() {
+    let schema = range_schema();
+    // WHERE ts >= 100 AND ts < 900
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::GtEq,
+            typed_constant(Value::Int64(100), DataType::Int64),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::Lt,
+            typed_constant(Value::Int64(900), DataType::Int64),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => {
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(100)));
+            assert!(*start_inclusive, "Ge should be inclusive");
+            assert_eq!(range_end.as_ref(), Some(&Value::Int64(900)));
+            assert!(!*end_inclusive, "Lt should be exclusive");
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_scan_with_equality_prefix() {
+    let schema = composite_range_schema();
+    // WHERE region = 'us-west' AND ts >= 1000 AND ts <= 5000
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("region", DataType::Text),
+            TypedBinaryOp::Eq,
+            typed_constant(Value::Text("us-west".to_string()), DataType::Text),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_binop(
+                typed_column("ts", DataType::Int64),
+                TypedBinaryOp::GtEq,
+                typed_constant(Value::Int64(1000), DataType::Int64),
+                DataType::Boolean,
+            ),
+            TypedBinaryOp::And,
+            typed_binop(
+                typed_column("ts", DataType::Int64),
+                TypedBinaryOp::LtEq,
+                typed_constant(Value::Int64(5000), DataType::Int64),
+                DataType::Boolean,
+            ),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            index_name,
+            prefix_values,
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => {
+            assert_eq!(index_name, "idx_region_ts");
+            assert_eq!(prefix_values, &[Value::Text("us-west".to_string())]);
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(1000)));
+            assert!(*start_inclusive);
+            assert_eq!(range_end.as_ref(), Some(&Value::Int64(5000)));
+            assert!(*end_inclusive);
+        }
+        other => panic!("expected IndexBoundedRangeScan with prefix, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_scan_duplicate_ge_predicates_keeps_first() {
+    let schema = range_schema();
+    // WHERE ts >= 5 AND ts >= 10 — both Ge, first should win
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::GtEq,
+            typed_constant(Value::Int64(5), DataType::Int64),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::GtEq,
+            typed_constant(Value::Int64(10), DataType::Int64),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            range_start,
+            start_inclusive,
+            ..
+        } => {
+            // First Ge predicate (value=5) is kept — matches find_map semantics
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(5)));
+            assert!(*start_inclusive);
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_range_on_non_indexed_column_falls_back() {
+    let schema = range_schema();
+    // WHERE region >= 'us' — range on non-indexed column
+    let filter = typed_binop(
+        typed_column("region", DataType::Text),
+        TypedBinaryOp::GtEq,
+        typed_constant(Value::Text("us".to_string()), DataType::Text),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    assert!(
+        matches!(path.scan_type, ScanType::FullTableScan),
+        "range on non-indexed column should fall back to full scan, got {:?}",
+        path.scan_type,
+    );
+}
+
+#[test]
+fn test_range_with_both_ge_and_gt_prefers_inclusive() {
+    let schema = range_schema();
+    // WHERE ts >= 100 AND ts > 50 — Ge takes precedence over Gt (line 514-526)
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::GtEq,
+            typed_constant(Value::Int64(100), DataType::Int64),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_column("ts", DataType::Int64),
+            TypedBinaryOp::Gt,
+            typed_constant(Value::Int64(50), DataType::Int64),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
+    match &path.scan_type {
+        ScanType::IndexBoundedRangeScan {
+            range_start,
+            start_inclusive,
+            ..
+        } => {
+            // Ge (inclusive) takes precedence over Gt (exclusive)
+            assert_eq!(range_start.as_ref(), Some(&Value::Int64(100)));
+            assert!(*start_inclusive);
+        }
+        other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+    }
+}
