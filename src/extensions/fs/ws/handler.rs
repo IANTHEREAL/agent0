@@ -10,7 +10,7 @@ use crate::extensions::fs::backend::{
 };
 use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
-use crate::extensions::fs::ws::auth::WsSession;
+use crate::extensions::fs::ws::auth::{FsAccessMode, WsSession};
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, BatchInlineReadEntryResponse, BatchStatEntryResponse,
     BatchWriteEntryResponse, CreateUploadResponse, FileInfoResponse, HeaderPairResponse,
@@ -20,7 +20,38 @@ use crate::extensions::fs::ws::protocol::{
 };
 use crate::extensions::fs::MAX_BYTES_PER_FILE;
 
+/// Returns `true` if the request is a write operation that mutates the filesystem.
+fn is_write_operation(request: &WsRequest) -> bool {
+    matches!(
+        request,
+        WsRequest::Write { .. }
+            | WsRequest::Pwrite { .. }
+            | WsRequest::Append { .. }
+            | WsRequest::Truncate { .. }
+            | WsRequest::Mkdir { .. }
+            | WsRequest::Unlink { .. }
+            | WsRequest::Rm { .. }
+            | WsRequest::Rename { .. }
+            | WsRequest::Symlink { .. }
+            | WsRequest::Chmod { .. }
+            | WsRequest::CreateUpload { .. }
+            | WsRequest::PresignPart { .. }
+            | WsRequest::CompleteUpload { .. }
+            | WsRequest::AbortUpload { .. }
+            | WsRequest::BatchWrite { .. }
+            | WsRequest::BatchWriteAtomic { .. }
+    )
+}
+
 pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> WsResponse {
+    if session.access_mode == FsAccessMode::ReadOnly && is_write_operation(request) {
+        return WsResponse::error(
+            request.id(),
+            WsErrorCode::Eacces,
+            "fs9: read-only session — write operations are not permitted",
+        );
+    }
+
     match request {
         WsRequest::Auth { id, .. } => {
             WsResponse::error(id, WsErrorCode::Eproto, "already authenticated")
@@ -2175,6 +2206,73 @@ mod tests {
             assert_eq!(result.entries.len(), subgroup_size + 1 + 2);
             for entry in &result.entries {
                 assert!(entry.result.is_ok(), "entry {} must succeed", entry.path);
+            }
+        }
+
+        fn mock_readonly_session() -> WsSession {
+            use crate::extensions::fs::ws::auth::FsAccessMode;
+            WsSession::new_for_test_with_mode(
+                Arc::new(MockFsBackend {
+                    atomic_supported: false,
+                    fail_dirs: std::collections::HashSet::new(),
+                }),
+                FsAccessMode::ReadOnly,
+            )
+        }
+
+        #[tokio::test]
+        async fn readonly_session_rejects_write() {
+            use crate::extensions::fs::ws::protocol::WsRequest;
+            let session = mock_readonly_session();
+            let request = WsRequest::Write {
+                id: "r1".to_string(),
+                path: "/test.txt".to_string(),
+                content: Some("aGVsbG8=".to_string()),
+                encoding: "base64".to_string(),
+                streaming: false,
+                size: None,
+                mode: None,
+            };
+            let resp = crate::extensions::fs::ws::handler::handle_request(&session, &request).await;
+            assert!(!resp.ok);
+            let detail = resp.error.expect("error detail should be present");
+            assert_eq!(detail.code, WsErrorCode::Eacces);
+            assert!(detail.message.contains("read-only session"));
+        }
+
+        #[tokio::test]
+        async fn readonly_session_rejects_mkdir() {
+            use crate::extensions::fs::ws::protocol::WsRequest;
+            let session = mock_readonly_session();
+            let request = WsRequest::Mkdir {
+                id: "r2".to_string(),
+                path: "/newdir".to_string(),
+                recursive: false,
+                mode: None,
+            };
+            let resp = crate::extensions::fs::ws::handler::handle_request(&session, &request).await;
+            assert!(!resp.ok);
+            let detail = resp.error.expect("error detail should be present");
+            assert_eq!(detail.code, WsErrorCode::Eacces);
+        }
+
+        #[tokio::test]
+        async fn readonly_session_allows_stat() {
+            use crate::extensions::fs::ws::protocol::WsRequest;
+            let session = mock_readonly_session();
+            let request = WsRequest::Stat {
+                id: "r3".to_string(),
+                path: "/test.txt".to_string(),
+            };
+            let resp = crate::extensions::fs::ws::handler::handle_request(&session, &request).await;
+            // Stat will fail because mock backend returns "not implemented",
+            // but it should NOT fail with Eacces — the read-only guard must not block it.
+            if let Some(detail) = &resp.error {
+                assert_ne!(
+                    detail.code,
+                    WsErrorCode::Eacces,
+                    "read operations must not be blocked by read-only mode"
+                );
             }
         }
     }

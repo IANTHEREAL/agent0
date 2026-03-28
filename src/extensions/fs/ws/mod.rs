@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::extensions::fs::backend::{FsWriteStream, FsWriteStreamOptions};
 use crate::extensions::fs::config::fs9_config;
-use crate::extensions::fs::ws::auth::{WsConnectionTracker, WsSession};
+use crate::extensions::fs::ws::auth::{FsAccessMode, WsConnectionTracker, WsSession};
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, StreamEnd, StreamStartResponse, StreamWriteReady, WsErrorCode,
     WsRequest, WsResponse, AUTH_TIMEOUT_SECS, DEFAULT_CHUNK_SIZE,
@@ -404,6 +404,16 @@ where
                         mode,
                         encoding: _,
                     } => {
+                        if session.access_mode == FsAccessMode::ReadOnly {
+                            let resp = WsResponse::error(
+                                &id,
+                                WsErrorCode::Eacces,
+                                "fs9: read-only session — write operations are not permitted",
+                            );
+                            let _ = send_response_tx(&out_tx, &resp).await;
+                            continue;
+                        }
+
                         if let Err((code, msg)) = validate_path(&path) {
                             let _ =
                                 send_response_tx(&out_tx, &WsResponse::error(&id, code, msg)).await;

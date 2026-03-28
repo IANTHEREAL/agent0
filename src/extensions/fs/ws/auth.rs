@@ -13,11 +13,37 @@ use crate::pool::{TenantHandle, TikvClientPool};
 use crate::protocol::parse_tenant_username;
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
+/// File-system access mode derived from the authenticated PG role.
+///
+/// Determined once at session creation via [`access_mode_for_role`] and immutable for the
+/// lifetime of the WebSocket connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsAccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Centralized role → access-mode mapping.
+///
+/// Design constraints (locked 2026-03-27):
+/// - Single source of truth — no scattered role checks elsewhere.
+/// - Unknown roles fail-closed (reject).
+pub(crate) fn access_mode_for_role(role: &str) -> Result<FsAccessMode, String> {
+    match role {
+        "_db9_sys_readonly" => Ok(FsAccessMode::ReadOnly),
+        "admin" => Ok(FsAccessMode::ReadWrite),
+        _ => Err(format!(
+            "fs9: unknown role \"{role}\" — cannot determine access mode"
+        )),
+    }
+}
+
 pub(crate) struct WsSession {
     pub(crate) _tenant_handle: TenantHandle,
     pub(crate) backend: Arc<dyn FsBackend>,
     pub(crate) user: String,
     pub(crate) keyspace: String,
+    pub(crate) access_mode: FsAccessMode,
     upload_slots: Arc<Semaphore>,
     inflight_uploads: TokioMutex<HashMap<String, OwnedSemaphorePermit>>,
 }
@@ -27,11 +53,20 @@ impl WsSession {
     /// Avoids needing a real TenantHandle / TikvStore for unit tests.
     #[cfg(test)]
     pub(crate) fn new_for_test(backend: Arc<dyn FsBackend>) -> Self {
+        Self::new_for_test_with_mode(backend, FsAccessMode::ReadWrite)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_mode(
+        backend: Arc<dyn FsBackend>,
+        access_mode: FsAccessMode,
+    ) -> Self {
         Self {
             _tenant_handle: TenantHandle::dummy_for_test(),
             backend,
             user: "test_user".to_string(),
             keyspace: "db9_tenant_test".to_string(),
+            access_mode,
             upload_slots: Arc::new(Semaphore::new(16)),
             inflight_uploads: TokioMutex::new(HashMap::new()),
         }
@@ -182,19 +217,16 @@ pub(crate) async fn handle_auth(
         ));
     }
 
-    // Security invariant: the fs9 WebSocket interface is superuser-only today.
-    //
-    // Several protocol operations (notably the bounded batch APIs) can act as a fast namespace
-    // enumeration oracle. If this check is ever relaxed, revisit the security properties of all
-    // ws ops before shipping.
-    if !user.is_superuser {
-        let _ = auth_txn.rollback().await;
-        return Err(WsResponse::error(
-            id,
-            WsErrorCode::Eacces,
-            "fs9: permission denied (superuser required)",
-        ));
-    }
+    // Determine fs access mode from the verified PG role identity.
+    // This is the single source of truth for read/write permissions on this session.
+    // Unknown roles are rejected (fail-closed).
+    let access_mode = match access_mode_for_role(&actual_user) {
+        Ok(mode) => mode,
+        Err(msg) => {
+            let _ = auth_txn.rollback().await;
+            return Err(WsResponse::error(id, WsErrorCode::Eacces, msg));
+        }
+    };
 
     auth_txn.commit().await.map_err(|err| {
         WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}"))
@@ -223,6 +255,7 @@ pub(crate) async fn handle_auth(
         backend: Arc::new(backend),
         user: actual_user,
         keyspace,
+        access_mode,
         upload_slots: Arc::new(Semaphore::new(
             fs9_config().ws_max_inflight_uploads_per_connection,
         )),
@@ -492,5 +525,27 @@ mod tests {
         let (keyspace, user) = resolve_auth_target("admin", None);
         assert_eq!(keyspace, "default");
         assert_eq!(user, "admin");
+    }
+
+    #[test]
+    fn test_access_mode_admin_is_readwrite() {
+        assert_eq!(
+            access_mode_for_role("admin").unwrap(),
+            FsAccessMode::ReadWrite
+        );
+    }
+
+    #[test]
+    fn test_access_mode_readonly_role() {
+        assert_eq!(
+            access_mode_for_role("_db9_sys_readonly").unwrap(),
+            FsAccessMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn test_access_mode_unknown_role_rejected() {
+        let err = access_mode_for_role("mysterious_user").unwrap_err();
+        assert!(err.contains("unknown role"));
     }
 }
