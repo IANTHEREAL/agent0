@@ -261,6 +261,135 @@ pub(crate) fn decode_jsonl(data: &[u8], path: &str, max_rows: usize) -> DecodedR
     DecodedRows { schema, rows }
 }
 
+/// Fixed schema for `extensions.fs9_jg()` TVF.
+pub(crate) fn fs9_jg_schema() -> TableSchema {
+    TableSchema::virtual_table(
+        "fs9_jg",
+        vec![
+            ColumnDef::new("_path", DataType::Text, false),
+            ColumnDef::new("_line_number", DataType::Int64, false),
+            ColumnDef::new("_match_path", DataType::Text, false),
+            ColumnDef::new("value", DataType::Jsonb, false),
+        ],
+    )
+}
+
+/// Maximum size of a single JSONL line (10 MB).
+pub(crate) const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Decode JSONL data and apply a jsongrep query, returning matching rows.
+///
+/// Each JSONL line is parsed independently. For each line, the jsongrep query
+/// is applied and every match produces one output row with columns:
+/// `(_path, _line_number, _match_path, value)`.
+///
+/// Invalid JSON lines and lines exceeding `MAX_LINE_BYTES` are skipped silently.
+/// Returns the total number of skipped lines via the second tuple element.
+#[cfg(test)]
+pub(crate) fn decode_jsonl_jg(
+    data: &[u8],
+    path: &str,
+    query: &jsongrep::query::ast::Query,
+    max_rows: usize,
+) -> (DecodedRows, usize) {
+    use jsongrep::query::dfa::DFAQueryEngine;
+    use jsongrep::query::QueryEngine;
+
+    let schema = fs9_jg_schema();
+    let text = String::from_utf8_lossy(data);
+    let mut rows = Vec::new();
+    let path_value = Value::Text(path.to_string());
+    let engine = DFAQueryEngine;
+    let mut skipped = 0usize;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if rows.len() >= max_rows {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.len() > MAX_LINE_BYTES {
+            skipped += 1;
+            continue;
+        }
+
+        let json_val: serde_json_borrow::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let results = engine.find(&json_val, query);
+        let line_number = Value::Int64((line_idx + 1) as i64);
+
+        for pointer in &results {
+            if rows.len() >= max_rows {
+                break;
+            }
+            let match_path = format_match_path(&pointer.path);
+            let value_str = pointer.value.to_string();
+            rows.push(Row::new(vec![
+                path_value.clone(),
+                line_number.clone(),
+                Value::Text(match_path),
+                Value::Jsonb(value_str),
+            ]));
+        }
+    }
+
+    (DecodedRows { schema, rows }, skipped)
+}
+
+/// Format a jsongrep match path as dot-separated notation.
+///
+/// Field names are dot-separated, array indices are bare numbers.
+/// Non-identifier keys (containing `.`, spaces, or other special chars)
+/// are double-quoted: `config."special-key".value`.
+pub(crate) fn format_match_path(path: &[jsongrep::query::PathType]) -> String {
+    use jsongrep::query::PathType;
+    let mut out = String::new();
+    for (i, segment) in path.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        match segment {
+            PathType::Field(name) => {
+                if needs_quoting_match_path(name) {
+                    out.push('"');
+                    out.push_str(name);
+                    out.push('"');
+                } else {
+                    out.push_str(name);
+                }
+            }
+            PathType::Index(idx) => {
+                use std::fmt::Write;
+                let _ = write!(out, "{idx}");
+            }
+        }
+    }
+    out
+}
+
+/// Returns true if a field name in `_match_path` needs quoting.
+/// Quote if the name is empty, starts with a digit, or contains
+/// characters that would be ambiguous in dot-separated notation.
+fn needs_quoting_match_path(name: &str) -> bool {
+    name.is_empty()
+        || name.as_bytes()[0].is_ascii_digit()
+        || name.contains(|c: char| {
+            matches!(c, '.' | '"' | ' ' | '[' | ']' | '-')
+                || c.is_whitespace()
+                || c.is_ascii_control()
+        })
+}
+
 /// Extract user-visible column names from an fs9 CSV schema,
 /// excluding synthetic columns (_line_number, _path).
 pub(crate) fn csv_user_column_names(schema: &TableSchema) -> Vec<&str> {
@@ -575,5 +704,185 @@ mod tests {
         let data = b"{\"obj\":true}\n[1,2,3]\n42\n\"string\"";
         let decoded = decode_jsonl(data, "/tmp/test.jsonl", 100);
         assert_eq!(decoded.rows.len(), 4);
+    }
+
+    // ── fs9_jg tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_fs9_jg_schema() {
+        let schema = fs9_jg_schema();
+        assert_eq!(schema.columns.len(), 4);
+        assert_eq!(schema.columns[0].name, "_path");
+        assert_eq!(schema.columns[0].data_type, DataType::Text);
+        assert_eq!(schema.columns[1].name, "_line_number");
+        assert_eq!(schema.columns[1].data_type, DataType::Int64);
+        assert_eq!(schema.columns[2].name, "_match_path");
+        assert_eq!(schema.columns[2].data_type, DataType::Text);
+        assert_eq!(schema.columns[3].name, "value");
+        assert_eq!(schema.columns[3].data_type, DataType::Jsonb);
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_basic() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "msg".parse().unwrap();
+        let data =
+            b"{\"level\":\"INFO\",\"msg\":\"started\"}\n{\"level\":\"ERROR\",\"msg\":\"failed\"}";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/logs/app.jsonl", &query, 100);
+        assert_eq!(skipped, 0);
+        assert_eq!(decoded.rows.len(), 2);
+        // Row 0: line 1, msg = "started"
+        assert_eq!(
+            decoded.rows[0].values[0],
+            Value::Text("/logs/app.jsonl".to_string())
+        );
+        assert_eq!(decoded.rows[0].values[1], Value::Int64(1));
+        assert_eq!(decoded.rows[0].values[2], Value::Text("msg".to_string()));
+        assert_eq!(
+            decoded.rows[0].values[3],
+            Value::Jsonb("\"started\"".to_string())
+        );
+        // Row 1: line 2, msg = "failed"
+        assert_eq!(decoded.rows[1].values[1], Value::Int64(2));
+        assert_eq!(decoded.rows[1].values[2], Value::Text("msg".to_string()));
+        assert_eq!(
+            decoded.rows[1].values[3],
+            Value::Jsonb("\"failed\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_multi_match_per_line() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "*".parse().unwrap();
+        let data = b"{\"a\":1,\"b\":2}";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/test.jsonl", &query, 100);
+        assert_eq!(skipped, 0);
+        // Wildcard * matches both "a" and "b"
+        assert_eq!(decoded.rows.len(), 2);
+        // Both rows should have line_number = 1
+        assert_eq!(decoded.rows[0].values[1], Value::Int64(1));
+        assert_eq!(decoded.rows[1].values[1], Value::Int64(1));
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_skip_invalid() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "x".parse().unwrap();
+        let data = b"{\"x\":1}\nnot valid json\n{\"x\":2}";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/test.jsonl", &query, 100);
+        assert_eq!(skipped, 1);
+        assert_eq!(decoded.rows.len(), 2);
+        assert_eq!(decoded.rows[0].values[1], Value::Int64(1)); // line 1
+        assert_eq!(decoded.rows[1].values[1], Value::Int64(3)); // line 3
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_skip_empty_lines() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "x".parse().unwrap();
+        let data = b"\n{\"x\":1}\n\n{\"x\":2}\n";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/test.jsonl", &query, 100);
+        assert_eq!(skipped, 0);
+        assert_eq!(decoded.rows.len(), 2);
+        assert_eq!(decoded.rows[0].values[1], Value::Int64(2)); // line 2
+        assert_eq!(decoded.rows[1].values[1], Value::Int64(4)); // line 4
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_max_rows() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "x".parse().unwrap();
+        let data = b"{\"x\":1}\n{\"x\":2}\n{\"x\":3}";
+        let (decoded, _) = decode_jsonl_jg(data, "/test.jsonl", &query, 2);
+        assert_eq!(decoded.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_no_match() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "nonexistent".parse().unwrap();
+        let data = b"{\"a\":1}\n{\"b\":2}";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/test.jsonl", &query, 100);
+        assert_eq!(skipped, 0);
+        assert_eq!(decoded.rows.len(), 0);
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_nested_query() {
+        use jsongrep::query::ast::Query;
+        let query: Query = "errors.[*].message".parse().unwrap();
+        let data = b"{\"errors\":[{\"message\":\"timeout\"},{\"message\":\"refused\"}]}";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/test.jsonl", &query, 100);
+        assert_eq!(skipped, 0);
+        assert_eq!(decoded.rows.len(), 2);
+        assert_eq!(
+            decoded.rows[0].values[2],
+            Value::Text("errors.0.message".to_string())
+        );
+        assert_eq!(
+            decoded.rows[0].values[3],
+            Value::Jsonb("\"timeout\"".to_string())
+        );
+        assert_eq!(
+            decoded.rows[1].values[2],
+            Value::Text("errors.1.message".to_string())
+        );
+        assert_eq!(
+            decoded.rows[1].values[3],
+            Value::Jsonb("\"refused\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decode_jsonl_jg_quoted_key_in_match_path() {
+        use jsongrep::query::ast::Query;
+        // Query for a key with special chars (hyphen, space)
+        let query: Query = "\"special-key\"".parse().unwrap();
+        let data = b"{\"special-key\":42}";
+        let (decoded, skipped) = decode_jsonl_jg(data, "/test.jsonl", &query, 100);
+        assert_eq!(skipped, 0);
+        assert_eq!(decoded.rows.len(), 1);
+        // Non-identifier key must be quoted in _match_path
+        assert_eq!(
+            decoded.rows[0].values[2],
+            Value::Text("\"special-key\"".to_string())
+        );
+        assert_eq!(decoded.rows[0].values[3], Value::Jsonb("42".to_string()));
+    }
+
+    #[test]
+    fn test_format_match_path_quoting() {
+        use jsongrep::query::PathType;
+        use std::rc::Rc;
+
+        // Simple identifier — no quoting
+        let path = vec![PathType::Field(Rc::new("foo".to_string()))];
+        assert_eq!(format_match_path(&path), "foo");
+
+        // Key with dot — needs quoting
+        let path = vec![PathType::Field(Rc::new("a.b".to_string()))];
+        assert_eq!(format_match_path(&path), "\"a.b\"");
+
+        // Key with space — needs quoting
+        let path = vec![PathType::Field(Rc::new("has space".to_string()))];
+        assert_eq!(format_match_path(&path), "\"has space\"");
+
+        // Key starting with digit — needs quoting
+        let path = vec![PathType::Field(Rc::new("0abc".to_string()))];
+        assert_eq!(format_match_path(&path), "\"0abc\"");
+
+        // Mixed path with index
+        let path = vec![
+            PathType::Field(Rc::new("config".to_string())),
+            PathType::Field(Rc::new("special-key".to_string())),
+            PathType::Index(0),
+            PathType::Field(Rc::new("value".to_string())),
+        ];
+        assert_eq!(format_match_path(&path), "config.\"special-key\".0.value");
+
+        // Empty field name — needs quoting
+        let path = vec![PathType::Field(Rc::new(String::new()))];
+        assert_eq!(format_match_path(&path), "\"\"");
     }
 }

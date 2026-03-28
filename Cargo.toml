@@ -70,6 +70,8 @@ dashmap = "6.0"
 csv = "1.3"
 globset = "0.4"
 cron = "0.15"
+jsongrep = "0.7"
+serde_json_borrow = "0.9"
 
 # S3 object store (fs9 v2)
 aws-config = { version = "=1.8.13", default-features = false, features = ["rt-tokio", "rustls"] }
@@ -107,3 +109,4 @@ parquet = ["dep:parquet", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "d
 [patch.crates-io]
 pgwire = { path = "crates/pgwire" }
 sqlparser = { path = "crates/sqlparser" }
+jsongrep = { path = "crates/jsongrep" }

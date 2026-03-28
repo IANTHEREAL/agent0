@@ -599,6 +599,232 @@ impl Executor {
             return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
         }
 
+        if func_upper == "FS9_JG" {
+            if args.len() != 2 {
+                return Err(anyhow!(
+                    "fs9_jg(path text, query text) requires exactly 2 arguments"
+                ));
+            }
+
+            // Extract path (first positional arg)
+            let path_expr = match &args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                _ => return Err(anyhow!("fs9_jg: first argument must be a path string")),
+            };
+            let path = match eval_const_ast_expr(path_expr)? {
+                Value::Text(s) => s,
+                Value::Null => return Err(anyhow!("fs9_jg: path must not be NULL")),
+                _ => return Err(anyhow!("fs9_jg: path must be TEXT")),
+            };
+
+            // Extract query (second positional arg)
+            let query_expr = match &args[1] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                _ => return Err(anyhow!("fs9_jg: second argument must be a query string")),
+            };
+            let query_str = match eval_const_ast_expr(query_expr)? {
+                Value::Text(s) => s,
+                Value::Null => return Err(anyhow!("fs9_jg: query must not be NULL")),
+                _ => return Err(anyhow!("fs9_jg: query must be TEXT")),
+            };
+
+            // Validate jsongrep query syntax (fail fast on invalid syntax)
+            let _: jsongrep::query::ast::Query = query_str
+                .parse()
+                .map_err(|e| anyhow!("fs9_jg: invalid query '{}': {}", query_str, e))?;
+
+            // Check fs9 extension is installed
+            let installed = self.store().get_extension(txn, db_id, "fs9").await?;
+            let Some(installed) = installed else {
+                return Err(anyhow!("extension \"fs9\" is not installed"));
+            };
+            if !installed.enabled {
+                return Err(anyhow!("extension \"fs9\" is disabled"));
+            }
+
+            let tenant = self.tenant_keyspace();
+            let backend = fs::backend::acquire_statement_backend(tenant).await?;
+
+            // Resolve files to process
+            let files = if fs::glob::is_glob_pattern(&path) {
+                let mut matched =
+                    fs::glob::expand_glob(backend.as_ref(), &path, fs::MAX_FILES_PER_GLOB, None)
+                        .await?;
+                matched.sort();
+                matched
+            } else {
+                vec![path.clone()]
+            };
+
+            // Validate all files are .jsonl or .ndjson
+            for file_path in &files {
+                let fmt = fs::decoders::detect_format(file_path, None);
+                if fmt != "jsonl" {
+                    return Err(anyhow!(
+                        "fs9_jg: unsupported file format for '{}', expected .jsonl or .ndjson",
+                        file_path
+                    ));
+                }
+            }
+
+            // Stream results via read_file_stream + line-by-line decode.
+            // Each line is parsed and queried independently; receiver drop
+            // (e.g. LIMIT) terminates scanning mid-file.
+            let mut schema = fs::decoders::fs9_jg_schema();
+            apply_table_function_alias(&mut schema, alias)?;
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<Row>(256);
+
+            // Use a dedicated streaming task. jsongrep QueryDFA uses Rc<String>
+            // (not Send), so we use spawn_local via a LocalSet, or process
+            // lines on a blocking thread. Here we use a channel bridge:
+            // a blocking thread builds the DFA and processes lines, the async
+            // task reads the file stream and feeds lines to the blocking side.
+            let query_str_owned = query_str.clone();
+
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+
+                let mut total_skipped = 0usize;
+
+                // Build DFA on this task (single-threaded within spawn)
+                // We use the fact that tokio::spawn runs futures on a
+                // thread pool but each future runs on one thread at a time.
+                // However Rc isn't Send, so we can't hold it across awaits.
+                // Solution: rebuild DFA per-file is wasteful. Instead, process
+                // each line's jsongrep query synchronously in a spawn_blocking.
+                // But that's expensive per line. Better: read all lines from
+                // the stream into a bounded buffer, process synchronously,
+                // then send results. We read one line at a time from the async
+                // stream, then process it with spawn_blocking, keeping the DFA
+                // alive on the blocking thread.
+
+                // Actually the simplest correct approach: read lines async,
+                // send them to a blocking thread that owns the DFA and sends
+                // rows back. Two channels: lines_tx -> blocking -> rows_tx.
+
+                let (lines_tx, mut lines_rx) =
+                    tokio::sync::mpsc::channel::<(String, String, usize)>(256);
+
+                // Blocking thread: owns DFA, processes lines, sends rows
+                let rows_tx = tx;
+                let jg_handle = tokio::task::spawn_blocking(move || {
+                    let dfa = jsongrep::query::QueryDFA::from_query_str(&query_str_owned)
+                        .expect("query already validated");
+                    let mut skipped = 0usize;
+
+                    while let Some((file_path, line, line_idx)) = lines_rx.blocking_recv() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed.len() > fs::decoders::MAX_LINE_BYTES {
+                            skipped += 1;
+                            continue;
+                        }
+
+                        let json_val: serde_json_borrow::Value = match serde_json::from_str(trimmed)
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                skipped += 1;
+                                continue;
+                            }
+                        };
+
+                        let results =
+                            jsongrep::query::DFAQueryEngine::find_with_dfa(&json_val, &dfa);
+                        let line_number = Value::Int64(line_idx as i64);
+                        let path_value = Value::Text(file_path);
+
+                        for pointer in &results {
+                            let match_path = fs::decoders::format_match_path(&pointer.path);
+                            let value_str = pointer.value.to_string();
+                            let row = Row::new(vec![
+                                path_value.clone(),
+                                line_number.clone(),
+                                Value::Text(match_path),
+                                Value::Jsonb(value_str),
+                            ]);
+                            if rows_tx.blocking_send(row).is_err() {
+                                return skipped; // receiver dropped (LIMIT)
+                            }
+                        }
+                    }
+                    skipped
+                });
+
+                // Async reader: read lines from file streams, feed to blocking thread
+                for file_path in &files {
+                    let mut reader = match backend
+                        .read_file_stream(file_path, fs::MAX_BYTES_PER_FILE)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("fs9_jg: failed to open '{}': {}", file_path, e);
+                            continue;
+                        }
+                    };
+
+                    let mut line_buf = String::new();
+                    let mut line_idx: usize = 0;
+
+                    loop {
+                        line_buf.clear();
+                        let n = match reader.read_line(&mut line_buf).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "fs9_jg: read error in '{}' at line {}: {}",
+                                    file_path,
+                                    line_idx + 1,
+                                    e
+                                );
+                                break;
+                            }
+                        };
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        line_idx += 1;
+
+                        if lines_tx
+                            .send((file_path.clone(), line_buf.clone(), line_idx))
+                            .await
+                            .is_err()
+                        {
+                            return; // blocking side exited (LIMIT reached)
+                        }
+                    }
+                }
+
+                // Signal EOF to blocking thread
+                drop(lines_tx);
+
+                // Wait for blocking thread to finish and collect skipped count
+                if let Ok(skipped) = jg_handle.await {
+                    total_skipped = skipped;
+                }
+
+                if total_skipped > 0 {
+                    tracing::warn!(
+                        "fs9_jg: {} lines skipped (invalid JSON or oversized) across {} files",
+                        total_skipped,
+                        files.len()
+                    );
+                }
+            });
+
+            let operator: BoxedOperator = Box::new(TableFunctionScanOperator::new_with_channel(
+                schema.clone(),
+                rx,
+            ));
+            return Ok(Some(ExtensionTableFunctionResult::Streaming(
+                schema, operator,
+            )));
+        }
+
         #[cfg(feature = "parquet")]
         if func_name.eq_ignore_ascii_case("read_parquet") {
             let installed = self.store().get_extension(txn, db_id, "parquet").await?;
