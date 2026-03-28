@@ -42,7 +42,7 @@ impl Default for BackpressureConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_permits: 4,
+            min_permits: 16,
             max_permits: 256,
             latency_threshold_us: 200_000, // 200 ms
             window_size: 1024,
@@ -103,6 +103,10 @@ pub(crate) struct TikvBackpressure {
     current_limit: AtomicU32,
     outstanding: AtomicU32,
     completions_since_eval: AtomicU32,
+    /// Counts consecutive evaluations where additive increase was chosen while
+    /// the limit sits at `min_permits`.  Used to trigger slow-start (exponential
+    /// increase) so we escape the floor quickly after a transient overload.
+    evals_at_floor: AtomicU32,
     latency_tracker: LatencyTracker,
     config: BackpressureConfig,
 }
@@ -113,6 +117,7 @@ impl TikvBackpressure {
             current_limit: AtomicU32::new(config.max_permits),
             outstanding: AtomicU32::new(0),
             completions_since_eval: AtomicU32::new(0),
+            evals_at_floor: AtomicU32::new(0),
             latency_tracker: LatencyTracker::new(config.window_size.max(1)),
             config,
         }
@@ -159,14 +164,21 @@ impl TikvBackpressure {
 
     fn evaluate(&self) {
         let p99 = self.latency_tracker.p99_us();
-        if p99 > self.config.latency_threshold_us {
+        // Hysteresis: require 1.5× the threshold before decreasing to avoid
+        // oscillation around the boundary.
+        let decrease_threshold = self.config.latency_threshold_us + self.config.latency_threshold_us / 2;
+        if p99 > decrease_threshold {
             self.multiplicative_decrease();
-        } else {
+        } else if p99 <= self.config.latency_threshold_us {
+            // Only increase when clearly below the threshold (the gap between
+            // threshold and decrease_threshold is a dead zone — no action).
             self.additive_increase();
         }
     }
 
     fn multiplicative_decrease(&self) {
+        // Reset slow-start counter: we just had an overload event.
+        self.evals_at_floor.store(0, Ordering::Relaxed);
         loop {
             let old = self.current_limit.load(Ordering::Relaxed);
             let new = (old / 2).max(self.config.min_permits);
@@ -184,15 +196,42 @@ impl TikvBackpressure {
         }
     }
 
+    /// Slow-start aware additive increase.  When the limit has been sitting at
+    /// `min_permits` for several consecutive healthy evaluations we switch to
+    /// exponential (doubling) increase to escape the floor quickly — mirroring
+    /// TCP slow-start.  Once above 2× min_permits we revert to +1 linear
+    /// increase so we approach the ceiling gently.
     fn additive_increase(&self) {
+        let min = self.config.min_permits;
         loop {
             let old = self.current_limit.load(Ordering::Relaxed);
             if old >= self.config.max_permits {
+                self.evals_at_floor.store(0, Ordering::Relaxed);
                 return;
             }
+
+            let increment = if old <= min {
+                // Track how many healthy evals we've had while at the floor.
+                let at_floor = self.evals_at_floor.fetch_add(1, Ordering::Relaxed) + 1;
+                if at_floor >= 3 {
+                    // Slow-start: double (but don't exceed max).
+                    old.max(1) // doubling applied below via new = old + increment
+                } else {
+                    1
+                }
+            } else if old < min.saturating_mul(2) {
+                // Still in slow-start region: keep doubling.
+                old.max(1)
+            } else {
+                // Normal AIMD additive increase.
+                self.evals_at_floor.store(0, Ordering::Relaxed);
+                1
+            };
+
+            let new = (old + increment).min(self.config.max_permits);
             if self
                 .current_limit
-                .compare_exchange(old, old + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 return;
@@ -490,11 +529,61 @@ mod tests {
     fn test_config_defaults() {
         let cfg = BackpressureConfig::default();
         assert!(cfg.enabled);
-        assert_eq!(cfg.min_permits, 4);
+        assert_eq!(cfg.min_permits, 16);
         assert_eq!(cfg.max_permits, 256);
         assert_eq!(cfg.latency_threshold_us, 200_000);
         assert_eq!(cfg.window_size, 1024);
         assert_eq!(cfg.eval_interval, 128);
+    }
+
+    // ── Slow-start recovery ─────────────────────────────────────────────
+
+    #[test]
+    fn test_slow_start_recovery_from_floor() {
+        let cfg = BackpressureConfig {
+            enabled: true,
+            min_permits: 8,
+            max_permits: 256,
+            latency_threshold_us: 200_000,
+            window_size: 16,
+            eval_interval: 4,
+        };
+        let bp = Arc::new(TikvBackpressure::new(cfg));
+        // Crash limit to floor
+        for _ in 0..100 {
+            bp.record_operation(1_000, true);
+        }
+        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 8);
+        // Now send healthy ops — slow-start should kick in after 3 evals at floor
+        // and double the limit each eval, recovering much faster than +1.
+        for _ in 0..80 {
+            bp.record_operation(1_000, false); // 20 evals × 4 interval
+        }
+        // With slow-start doubling from 8, after several evals we should be
+        // well above the floor (8→9→10→16→32→64→...).
+        assert!(bp.current_limit.load(Ordering::Relaxed) >= 32);
+    }
+
+    #[test]
+    fn test_hysteresis_prevents_oscillation() {
+        // Latencies at exactly 1.2× threshold should NOT trigger decrease
+        // (decrease requires 1.5× threshold).
+        let cfg = BackpressureConfig {
+            enabled: true,
+            min_permits: 4,
+            max_permits: 256,
+            latency_threshold_us: 200_000,
+            window_size: 16,
+            eval_interval: 8,
+        };
+        let bp = Arc::new(TikvBackpressure::new(cfg));
+        bp.current_limit.store(100, Ordering::Relaxed);
+        // Fill with 240ms latencies (above threshold but below 1.5×=300ms)
+        for _ in 0..16 {
+            bp.record_operation(240_000, false);
+        }
+        // Should NOT have decreased — in the dead zone
+        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 100);
     }
 
     // ── Error classifier ─────────────────────────────────────────────────

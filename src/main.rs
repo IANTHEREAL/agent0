@@ -691,8 +691,10 @@ fn configure_pgwire_socket_keepalive(
         return Ok(());
     }
 
-    let keepalive =
-        TcpKeepalive::new().with_time(Duration::from_millis(server_config.tcp_keepalive_idle_ms));
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_millis(server_config.tcp_keepalive_idle_ms))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
     socket_ref.set_tcp_keepalive(&keepalive)
 }
 
