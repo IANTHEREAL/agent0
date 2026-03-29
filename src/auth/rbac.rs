@@ -1527,7 +1527,9 @@ mod tests {
 
         // 6th rotation should fail — too many pending.
         let err = user.rotate_password("p6", 3600).unwrap_err();
-        assert!(err.to_string().contains("too many pending password rotations"));
+        assert!(err
+            .to_string()
+            .contains("too many pending password rotations"));
     }
 
     #[test]

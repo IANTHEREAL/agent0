@@ -387,14 +387,8 @@ mod tests {
 
     #[test]
     fn test_password_grace_seconds_valid() {
-        assert_eq!(
-            validate_db9_password_grace_seconds("0").unwrap(),
-            "0"
-        );
-        assert_eq!(
-            validate_db9_password_grace_seconds("3600").unwrap(),
-            "3600"
-        );
+        assert_eq!(validate_db9_password_grace_seconds("0").unwrap(), "0");
+        assert_eq!(validate_db9_password_grace_seconds("3600").unwrap(), "3600");
         assert_eq!(
             validate_db9_password_grace_seconds("2592000").unwrap(),
             "2592000"

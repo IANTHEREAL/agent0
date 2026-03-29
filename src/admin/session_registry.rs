@@ -129,8 +129,10 @@ impl SessionInfo {
     /// Set the current query text and create a child cancellation token.
     /// Returns the child token for the caller to pass into the executor.
     pub fn begin_query(&self, query: &str) -> CancellationToken {
+        // Use floor_char_boundary to avoid panicking on multi-byte UTF-8.
         let truncated = if query.len() > MAX_QUERY_LEN {
-            &query[..MAX_QUERY_LEN]
+            let end = floor_char_boundary(query, MAX_QUERY_LEN);
+            &query[..end]
         } else {
             query
         };
@@ -490,6 +492,14 @@ impl SessionRegistry {
         }
     }
 
+    /// List all connection IDs for a tenant (for pre-terminate audit snapshots).
+    pub fn list_connection_ids_by_tenant(&self, tenant_id: &str) -> Vec<i64> {
+        match self.tenant_index.get(tenant_id) {
+            Some(set) => set.iter().map(|r| *r).collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Total active session count.
     pub fn count(&self) -> usize {
         self.sessions.len()
@@ -527,6 +537,19 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("POD_NAME"))
         .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+/// Find the largest byte index <= `index` that is a valid UTF-8 char boundary.
+/// Avoids panicking when slicing multi-byte characters.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +890,22 @@ mod tests {
 
         let q = info.current_query.read().unwrap();
         assert_eq!(q.len(), MAX_QUERY_LEN);
+    }
+
+    #[test]
+    fn query_text_truncation_multibyte_safe() {
+        let info = make_info(1, "t", "alice");
+        // Build a string of multi-byte characters that crosses the MAX_QUERY_LEN boundary.
+        // Each '中' is 3 bytes, so 400 chars = 1200 bytes > 1024.
+        let multibyte_query = "中".repeat(400);
+        assert!(multibyte_query.len() > MAX_QUERY_LEN);
+        // This must not panic.
+        let _child = info.begin_query(&multibyte_query);
+
+        let q = info.current_query.read().unwrap();
+        assert!(q.len() <= MAX_QUERY_LEN);
+        // Must be valid UTF-8 (would fail to read if not).
+        assert!(std::str::from_utf8(q.as_bytes()).is_ok());
     }
 
     #[test]

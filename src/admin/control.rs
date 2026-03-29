@@ -132,21 +132,19 @@ impl<'a> AdminControlService<'a> {
         admin_actor: &str,
         reason: Option<&str>,
     ) -> Result<SessionActionResponse, ControlError> {
-        // Grab the query text before cancelling (for audit/response).
-        let query_was = self
-            .registry
-            .get(connection_id)
+        // Snapshot query text and tenant_id BEFORE the cancel to avoid TOCTOU
+        // (concurrent disconnect could clear the session between cancel and audit).
+        let snapshot = self.registry.get(connection_id);
+        let query_was = snapshot
+            .as_ref()
             .map(|s| s.current_query.clone())
+            .unwrap_or_default();
+        let tenant_id = snapshot
+            .as_ref()
+            .map(|s| s.tenant_id.clone())
             .unwrap_or_default();
 
         let result = self.registry.cancel_query(connection_id);
-
-        // Determine tenant_id for audit (best-effort).
-        let tenant_id = self
-            .registry
-            .get(connection_id)
-            .map(|s| s.tenant_id.clone())
-            .unwrap_or_default();
 
         let (audit_result, response_result) = match &result {
             Ok(()) => (AuditResult::Success, "cancelled"),
@@ -182,15 +180,14 @@ impl<'a> AdminControlService<'a> {
         admin_actor: &str,
         reason: Option<&str>,
     ) -> Result<SessionActionResponse, ControlError> {
-        let query_was = self
-            .registry
-            .get(connection_id)
+        // Snapshot BEFORE terminate to avoid TOCTOU audit gap.
+        let snapshot = self.registry.get(connection_id);
+        let query_was = snapshot
+            .as_ref()
             .map(|s| s.current_query.clone())
             .unwrap_or_default();
-
-        let tenant_id = self
-            .registry
-            .get(connection_id)
+        let tenant_id = snapshot
+            .as_ref()
             .map(|s| s.tenant_id.clone())
             .unwrap_or_default();
 
@@ -199,9 +196,7 @@ impl<'a> AdminControlService<'a> {
         let audit_result = match &result {
             Ok(()) => AuditResult::Success,
             Err(CancelError::NotFound) => AuditResult::NotFound,
-            Err(CancelError::NoActiveQuery) => {
-                unreachable!("terminate never returns NoActiveQuery")
-            }
+            Err(CancelError::NoActiveQuery) => AuditResult::Success,
         };
 
         emit_audit_log(
@@ -221,7 +216,7 @@ impl<'a> AdminControlService<'a> {
                 query_was,
             }),
             Err(CancelError::NotFound) => Err(ControlError::NotFound),
-            Err(CancelError::NoActiveQuery) => unreachable!(),
+            Err(CancelError::NoActiveQuery) => Err(ControlError::NoActiveQuery),
         }
     }
 
@@ -238,20 +233,20 @@ impl<'a> AdminControlService<'a> {
             return Err(ControlError::EmptyTenantId);
         }
 
+        // Snapshot connection IDs BEFORE termination for audit forensics.
+        let target_conn_ids = self.registry.list_connection_ids_by_tenant(tenant_id);
+
         let TerminateAllResult {
             requested,
             terminated,
             already_closed,
         } = self.registry.terminate_all(tenant_id);
 
-        // Collect connection IDs for audit (best-effort from tenant index).
-        // After terminate_all, connections may already be gone, so we log
-        // the counts rather than exact IDs.
         emit_audit_log(
             admin_actor,
             AuditAction::TerminateAll,
             tenant_id,
-            &[],
+            &target_conn_ids,
             self.registry.server_id(),
             AuditResult::Success,
             reason,
