@@ -256,7 +256,7 @@ impl Default for SessionFilter {
 }
 
 /// Max limit when listing across all tenants.
-const ALL_TENANTS_MAX_LIMIT: usize = 1000;
+pub const ALL_TENANTS_MAX_LIMIT: usize = 1000;
 
 // ---------------------------------------------------------------------------
 // CancelError / TerminateAllResult
@@ -349,25 +349,27 @@ impl SessionRegistry {
     }
 
     /// List sessions matching the filter.
+    /// List sessions matching the filter.
+    ///
+    /// The registry returns up to `filter.limit` results. Policy caps
+    /// (e.g. `ALL_TENANTS_MAX_LIMIT`) are enforced by the control service
+    /// layer, not here — keeping the registry a policy-free primitive.
     pub fn list(&self, filter: &SessionFilter) -> Vec<SessionSnapshot> {
-        let effective_limit = if filter.all_tenants && filter.tenant_id.is_none() {
-            filter.limit.min(ALL_TENANTS_MAX_LIMIT)
-        } else {
-            filter.limit
-        };
-
         let now_mono = Instant::now();
 
         // If filtering by tenant, use the tenant index for efficiency.
+        // Sort by connection_id for deterministic pagination order.
         if let Some(ref tid) = filter.tenant_id {
-            let conn_ids: Vec<i64> = match self.tenant_index.get(tid) {
+            let mut conn_ids: Vec<i64> = match self.tenant_index.get(tid) {
                 Some(set) => set.iter().map(|r| *r).collect(),
                 None => return Vec::new(),
             };
-            self.collect_snapshots(&conn_ids, filter, effective_limit, now_mono)
+            conn_ids.sort_unstable();
+            self.collect_snapshots(&conn_ids, filter, filter.limit, now_mono)
         } else if filter.all_tenants {
-            let conn_ids: Vec<i64> = self.sessions.iter().map(|r| *r.key()).collect();
-            self.collect_snapshots(&conn_ids, filter, effective_limit, now_mono)
+            let mut conn_ids: Vec<i64> = self.sessions.iter().map(|r| *r.key()).collect();
+            conn_ids.sort_unstable();
+            self.collect_snapshots(&conn_ids, filter, filter.limit, now_mono)
         } else {
             // Neither tenant_id nor all_tenants — return empty.
             Vec::new()
@@ -688,6 +690,41 @@ mod tests {
         };
         let results = reg.list(&filter);
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn list_deterministic_order() {
+        let reg = make_registry();
+        // Register in non-sequential order.
+        for &id in &[50, 10, 30, 20, 40] {
+            reg.register(make_info(id, "t", "user"));
+        }
+
+        let filter = SessionFilter {
+            tenant_id: Some("t".to_owned()),
+            ..Default::default()
+        };
+        let results = reg.list(&filter);
+        let ids: Vec<i64> = results.iter().map(|s| s.connection_id).collect();
+        assert_eq!(ids, vec![10, 20, 30, 40, 50], "results must be sorted by connection_id");
+
+        // Pagination must also be deterministic.
+        let page1 = SessionFilter {
+            tenant_id: Some("t".to_owned()),
+            limit: 2,
+            offset: 0,
+            ..Default::default()
+        };
+        let page2 = SessionFilter {
+            tenant_id: Some("t".to_owned()),
+            limit: 2,
+            offset: 2,
+            ..Default::default()
+        };
+        let r1: Vec<i64> = reg.list(&page1).iter().map(|s| s.connection_id).collect();
+        let r2: Vec<i64> = reg.list(&page2).iter().map(|s| s.connection_id).collect();
+        assert_eq!(r1, vec![10, 20]);
+        assert_eq!(r2, vec![30, 40]);
     }
 
     #[test]
