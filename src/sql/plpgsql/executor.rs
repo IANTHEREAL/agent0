@@ -270,6 +270,7 @@ fn execute_statements<'a>(
                             with_params.as_deref(),
                             ctx.security_definer_role.as_deref(),
                             None,
+                            0,
                         )
                         .await?;
                     }

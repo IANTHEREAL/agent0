@@ -355,3 +355,67 @@ pub(super) fn validate_db9_positive_u64(value: &str) -> Result<String> {
         })?;
     Ok(v.to_string())
 }
+
+/// Maximum allowed grace period: 720 hours (30 days) in seconds.
+const MAX_PASSWORD_GRACE_SECONDS: u32 = 2_592_000;
+
+pub(super) fn validate_db9_password_grace_seconds(value: &str) -> Result<String> {
+    let v: u32 = value
+        .trim()
+        .parse()
+        .map_err(|_| SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"db9.password_grace_seconds\": \"{}\"",
+                value
+            ),
+        })?;
+    if v > MAX_PASSWORD_GRACE_SECONDS {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "\"db9.password_grace_seconds\" must be between 0 and {} (720 hours), got {}",
+                MAX_PASSWORD_GRACE_SECONDS, v
+            ),
+        }
+        .into());
+    }
+    Ok(v.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_password_grace_seconds_valid() {
+        assert_eq!(
+            validate_db9_password_grace_seconds("0").unwrap(),
+            "0"
+        );
+        assert_eq!(
+            validate_db9_password_grace_seconds("3600").unwrap(),
+            "3600"
+        );
+        assert_eq!(
+            validate_db9_password_grace_seconds("2592000").unwrap(),
+            "2592000"
+        );
+    }
+
+    #[test]
+    fn test_password_grace_seconds_exceeds_max() {
+        let err = validate_db9_password_grace_seconds("2592001").unwrap_err();
+        assert!(err.to_string().contains("must be between 0 and 2592000"));
+    }
+
+    #[test]
+    fn test_password_grace_seconds_invalid_string() {
+        let err = validate_db9_password_grace_seconds("abc").unwrap_err();
+        assert!(err.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn test_password_grace_seconds_negative() {
+        let err = validate_db9_password_grace_seconds("-1").unwrap_err();
+        assert!(err.to_string().contains("invalid value"));
+    }
+}

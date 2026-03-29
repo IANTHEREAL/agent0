@@ -119,6 +119,19 @@ pub struct GrantedPrivilege {
     pub with_grant_option: bool,
 }
 
+/// A previous password retained during credential rotation so that connections
+/// authenticated with the old credential continue to work until `expires_at`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OldPassword {
+    pub password_hash: String,
+    pub password_salt: String,
+    /// Unix epoch seconds after which this old password is no longer accepted.
+    pub expires_at: i64,
+}
+
+/// Maximum number of old passwords retained per user.
+const MAX_OLD_PASSWORDS: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub name: String,
@@ -134,9 +147,11 @@ pub struct User {
     pub valid_until: Option<i64>,
     #[serde(default)]
     pub bypass_rls: bool,
+    #[serde(default)]
+    pub old_passwords: Vec<OldPassword>,
 }
 
-/// Legacy User struct without the `bypass_rls` field, for backward-compatible
+/// Legacy User struct without `bypass_rls` or `old_passwords`, for backward-compatible
 /// bincode deserialization of data written before the RLS BYPASSRLS feature.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
@@ -169,16 +184,62 @@ impl From<UserLegacy> for User {
             connection_limit: legacy.connection_limit,
             valid_until: legacy.valid_until,
             bypass_rls: false,
+            old_passwords: Vec::new(),
         }
     }
 }
 
-/// Deserialize a User from bincode, falling back to the legacy format (without
-/// `bypass_rls`) if the data was written before the BYPASSRLS feature.
+/// Legacy User struct with `bypass_rls` but without `old_passwords`, for
+/// backward-compatible bincode deserialization of data written before the
+/// dual-password credential rotation feature.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct UserLegacyV2 {
+    name: String,
+    password_hash: String,
+    password_salt: String,
+    roles: HashSet<String>,
+    privileges: Vec<GrantedPrivilege>,
+    is_superuser: bool,
+    can_login: bool,
+    can_create_db: bool,
+    can_create_role: bool,
+    connection_limit: i32,
+    valid_until: Option<i64>,
+    bypass_rls: bool,
+}
+
+impl From<UserLegacyV2> for User {
+    fn from(legacy: UserLegacyV2) -> Self {
+        Self {
+            name: legacy.name,
+            password_hash: legacy.password_hash,
+            password_salt: legacy.password_salt,
+            roles: legacy.roles,
+            privileges: legacy.privileges,
+            is_superuser: legacy.is_superuser,
+            can_login: legacy.can_login,
+            can_create_db: legacy.can_create_db,
+            can_create_role: legacy.can_create_role,
+            connection_limit: legacy.connection_limit,
+            valid_until: legacy.valid_until,
+            bypass_rls: legacy.bypass_rls,
+            old_passwords: Vec::new(),
+        }
+    }
+}
+
+/// Deserialize a User from bincode, falling back through legacy formats:
+/// 1. Current format (with `old_passwords`)
+/// 2. V2 format (with `bypass_rls`, without `old_passwords`)
+/// 3. V1 format (without `bypass_rls` or `old_passwords`)
 fn deserialize_user(data: &[u8]) -> Result<User> {
     match bincode::deserialize::<User>(data) {
         Ok(user) => Ok(user),
-        Err(_) => Ok(bincode::deserialize::<UserLegacy>(data)?.into()),
+        Err(_) => match bincode::deserialize::<UserLegacyV2>(data) {
+            Ok(v2) => Ok(v2.into()),
+            Err(_) => Ok(bincode::deserialize::<UserLegacy>(data)?.into()),
+        },
     }
 }
 
@@ -199,6 +260,7 @@ impl User {
             connection_limit: -1,
             valid_until: None,
             bypass_rls: false,
+            old_passwords: Vec::new(),
         }
     }
 
@@ -210,13 +272,65 @@ impl User {
         user
     }
 
+    /// Verify a password against the current hash and, if that fails, against
+    /// any non-expired old passwords.  All comparisons are constant-time.
     pub fn verify_password(&self, password: &str) -> bool {
-        super::password::verify_password(password, &self.password_salt, &self.password_hash)
+        if super::password::verify_password_ct(password, &self.password_salt, &self.password_hash) {
+            return true;
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.old_passwords.iter().any(|old| {
+            old.expires_at > now
+                && super::password::verify_password_ct(
+                    password,
+                    &old.password_salt,
+                    &old.password_hash,
+                )
+        })
     }
 
+    /// Replace the password immediately, discarding all old passwords.
     pub fn set_password(&mut self, password: &str) {
         self.password_salt = super::password::generate_salt();
         self.password_hash = super::password::hash_password(password, &self.password_salt);
+        self.old_passwords.clear();
+    }
+
+    /// Rotate the password: demote the current password to `old_passwords`
+    /// with a grace period of `grace_seconds`, then set the new password.
+    /// Expired old passwords are pruned first.  If the list is still at
+    /// [`MAX_OLD_PASSWORDS`] after pruning, the rotation is rejected so
+    /// that callers can surface a 409 / too-many-pending-rotations error.
+    pub fn rotate_password(&mut self, password: &str, grace_seconds: u32) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+
+        // Prune expired entries first.
+        self.old_passwords.retain(|old| old.expires_at > now);
+
+        // After pruning, adding the current password would exceed the cap → reject.
+        if self.old_passwords.len() >= MAX_OLD_PASSWORDS {
+            return Err(SqlError::Unsupported(format!(
+                "too many pending password rotations ({} active); \
+                 wait for existing grace periods to expire or use ALTER ROLE \
+                 without db9.password_grace_seconds to replace immediately",
+                self.old_passwords.len()
+            ))
+            .into());
+        }
+
+        let expires_at = now + i64::from(grace_seconds);
+
+        // Demote current password.
+        self.old_passwords.push(OldPassword {
+            password_hash: std::mem::take(&mut self.password_hash),
+            password_salt: std::mem::take(&mut self.password_salt),
+            expires_at,
+        });
+
+        // Set new password.
+        self.password_salt = super::password::generate_salt();
+        self.password_hash = super::password::hash_password(password, &self.password_salt);
+        Ok(())
     }
 
     pub fn grant_privilege(
@@ -1372,6 +1486,125 @@ mod tests {
         let superusers = AuthManager::superuser_names(users.iter());
         let result = AuthManager::resolve_bootstrap_user_for_backfill(None, &superusers).unwrap();
         assert_eq!(result, (None, false, None));
+    }
+
+    #[test]
+    fn test_rotate_password_grace_period() {
+        let mut user = User::new("test", "old_pass");
+        user.rotate_password("new_pass", 3600).unwrap();
+
+        // Both old and new password should work during grace period.
+        assert!(user.verify_password("new_pass"));
+        assert!(user.verify_password("old_pass"));
+        assert!(!user.verify_password("wrong"));
+
+        // One old password entry should exist.
+        assert_eq!(user.old_passwords.len(), 1);
+        assert!(user.old_passwords[0].expires_at > chrono::Utc::now().timestamp());
+    }
+
+    #[test]
+    fn test_rotate_password_expired_old_not_accepted() {
+        let mut user = User::new("test", "old_pass");
+        // Rotate with a grace period that's already expired (0 seconds would
+        // still be in the future for the duration of the test, so we manually
+        // set expires_at to the past).
+        user.rotate_password("new_pass", 1).unwrap();
+        user.old_passwords[0].expires_at = chrono::Utc::now().timestamp() - 1;
+
+        assert!(user.verify_password("new_pass"));
+        assert!(!user.verify_password("old_pass")); // expired
+    }
+
+    #[test]
+    fn test_rotate_password_cap_enforcement() {
+        let mut user = User::new("test", "p0");
+        // Fill up to MAX_OLD_PASSWORDS (5).
+        for i in 1..=5 {
+            user.rotate_password(&format!("p{}", i), 3600).unwrap();
+        }
+        assert_eq!(user.old_passwords.len(), 5);
+
+        // 6th rotation should fail — too many pending.
+        let err = user.rotate_password("p6", 3600).unwrap_err();
+        assert!(err.to_string().contains("too many pending password rotations"));
+    }
+
+    #[test]
+    fn test_rotate_password_cap_after_expiry_pruning() {
+        let mut user = User::new("test", "p0");
+        for i in 1..=5 {
+            user.rotate_password(&format!("p{}", i), 3600).unwrap();
+        }
+        // Expire all old passwords.
+        let past = chrono::Utc::now().timestamp() - 1;
+        for old in &mut user.old_passwords {
+            old.expires_at = past;
+        }
+        // Now rotation should succeed — expired entries are pruned first.
+        user.rotate_password("p6", 3600).unwrap();
+        // Only one old password should remain (the just-demoted p5).
+        assert_eq!(user.old_passwords.len(), 1);
+        assert!(user.verify_password("p6"));
+    }
+
+    #[test]
+    fn test_set_password_clears_old_passwords() {
+        let mut user = User::new("test", "old");
+        user.rotate_password("mid", 3600).unwrap();
+        assert_eq!(user.old_passwords.len(), 1);
+
+        // Immediate set_password (no grace) should clear all old passwords.
+        user.set_password("final");
+        assert!(user.old_passwords.is_empty());
+        assert!(user.verify_password("final"));
+        assert!(!user.verify_password("mid"));
+        assert!(!user.verify_password("old"));
+    }
+
+    #[test]
+    fn test_legacy_v2_deserialization_empty_old_passwords() {
+        let legacy = UserLegacyV2 {
+            name: "test".to_string(),
+            password_hash: "hash".to_string(),
+            password_salt: "salt".to_string(),
+            roles: HashSet::new(),
+            privileges: Vec::new(),
+            is_superuser: false,
+            can_login: true,
+            can_create_db: false,
+            can_create_role: false,
+            connection_limit: -1,
+            valid_until: None,
+            bypass_rls: true,
+        };
+        let data = bincode::serialize(&legacy).unwrap();
+        let user = deserialize_user(&data).unwrap();
+        assert_eq!(user.name, "test");
+        assert!(user.bypass_rls);
+        assert!(user.old_passwords.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_v1_deserialization_empty_old_passwords() {
+        let legacy = UserLegacy {
+            name: "test".to_string(),
+            password_hash: "hash".to_string(),
+            password_salt: "salt".to_string(),
+            roles: HashSet::new(),
+            privileges: Vec::new(),
+            is_superuser: false,
+            can_login: true,
+            can_create_db: false,
+            can_create_role: false,
+            connection_limit: -1,
+            valid_until: None,
+        };
+        let data = bincode::serialize(&legacy).unwrap();
+        let user = deserialize_user(&data).unwrap();
+        assert_eq!(user.name, "test");
+        assert!(!user.bypass_rls);
+        assert!(user.old_passwords.is_empty());
     }
 
     #[test]

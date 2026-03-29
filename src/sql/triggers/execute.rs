@@ -194,6 +194,7 @@ pub(crate) async fn execute_trigger_statement_standalone(
                 with_params.as_deref(),
                 None,
                 None,
+                0,
             )
             .await?;
     }

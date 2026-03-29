@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 pub fn hash_password(password: &str, salt: &str) -> String {
     let mut hasher = Sha256::new();
@@ -8,8 +9,15 @@ pub fn hash_password(password: &str, salt: &str) -> String {
     hex::encode(result)
 }
 
+#[cfg(test)]
 pub fn verify_password(password: &str, salt: &str, hash: &str) -> bool {
     hash_password(password, salt) == hash
+}
+
+/// Constant-time password verification to prevent timing side-channel attacks.
+pub fn verify_password_ct(password: &str, salt: &str, hash: &str) -> bool {
+    let computed = hash_password(password, salt);
+    computed.as_bytes().ct_eq(hash.as_bytes()).into()
 }
 
 pub fn generate_salt() -> String {

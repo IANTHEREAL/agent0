@@ -14,6 +14,7 @@ impl Executor {
         stmt: &Statement,
         current_role: Option<&str>,
         session_user: Option<&str>,
+        password_grace_seconds: u32,
     ) -> Result<ExecuteResult> {
         match stmt {
             Statement::CreateRole {
@@ -68,6 +69,7 @@ impl Executor {
                     session_user,
                     name,
                     operation,
+                    password_grace_seconds,
                 )
                 .await
             }

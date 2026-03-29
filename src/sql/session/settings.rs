@@ -133,6 +133,11 @@ pub(crate) struct SessionSettings {
     /// HNSW ef_search beam width during search. Default: 40, range: 1-1000.
     hnsw_ef_search: u16,
 
+    /// Grace period in seconds for the old password after ALTER ROLE WITH PASSWORD.
+    /// Consumed (reset to 0) after each ALTER ROLE WITH PASSWORD execution.
+    /// Default: 0 (immediate replacement, no grace period).
+    pub(crate) password_grace_seconds: u32,
+
     /// Maximum retry attempts for autocommit DML/DDL on write conflict. Default: 64.
     pub(crate) retry_max_attempts: u64,
     /// Maximum wall-time for retries per statement, in milliseconds. Default: 0 (disabled).
@@ -613,6 +618,9 @@ impl SessionSettings {
             "db9.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(value)?;
             }
+            "db9.password_grace_seconds" => {
+                self.password_grace_seconds = value.parse().unwrap_or(0);
+            }
             "db9.prepared_plan_cache_size" => {
                 self.prepared_plan_cache_size = value.parse().unwrap_or(128);
             }
@@ -812,6 +820,7 @@ impl SessionSettings {
             }
             "db9.hash_join_work_mem" => self.hash_join_work_mem = DEFAULT_HASH_JOIN_WORK_MEM,
             "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
+            "db9.password_grace_seconds" => self.password_grace_seconds = 0,
             "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
             "db9.prepared_plan_cache_min_exec" => self.prepared_plan_cache_min_exec = 5,
             "hnsw.ef_search" => self.hnsw_ef_search = 40,

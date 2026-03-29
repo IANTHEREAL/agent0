@@ -779,6 +779,19 @@ impl Session {
         &self.settings
     }
 
+    /// Read and consume the `db9.password_grace_seconds` session variable.
+    /// Returns the current value and resets it to 0, so each ALTER ROLE WITH
+    /// PASSWORD consumes the grace period exactly once.
+    /// Resolves SET LOCAL overrides via the accessor, then clears both the
+    /// base field and any local_overrides entry.
+    pub(crate) fn take_password_grace_seconds(&mut self) -> u32 {
+        let val = self.settings.password_grace_seconds();
+        self.settings.password_grace_seconds = 0;
+        self.settings
+            .remove_local_override("db9.password_grace_seconds");
+        val
+    }
+
     /// Set the shared server configuration reference.
     pub fn set_server_config(&mut self, config: SharedServerConfig) {
         self.server_config = Some(config);

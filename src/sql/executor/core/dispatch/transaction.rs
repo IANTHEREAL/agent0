@@ -146,6 +146,22 @@ pub(super) async fn check_observability_statement_permission(
     }
 }
 
+/// Returns `true` when the statement is `ALTER ROLE ... WITH PASSWORD ...`,
+/// i.e. the exact path that should consume `db9.password_grace_seconds`.
+fn is_alter_role_with_password(stmt: &Statement) -> bool {
+    if let Statement::AlterRole {
+        operation: sqlparser::ast::AlterRoleOperation::WithOptions { options },
+        ..
+    } = stmt
+    {
+        options
+            .iter()
+            .any(|opt| matches!(opt, sqlparser::ast::RoleOption::Password(_)))
+    } else {
+        false
+    }
+}
+
 /// Returns `true` for DDL statements that can alter table schemas and
 /// therefore invalidate cached prepared plans.
 fn is_plan_cache_invalidating_ddl(stmt: &Statement) -> bool {
@@ -222,6 +238,22 @@ impl Executor {
             }
         };
 
+        // Snapshot grace seconds ONCE before the retry loop so that
+        // retryable TiKV conflicts do not consume the grace window.
+        // Consumed only after final success or non-retryable failure.
+        let password_grace_seconds = session.settings().password_grace_seconds();
+        let consume_grace = password_grace_seconds > 0 && is_alter_role_with_password(stmt);
+
+        // Use a macro to consume the grace-period GUC exactly once on any
+        // non-retry exit from the loop (success or non-retryable failure).
+        macro_rules! consume_grace_if_needed {
+            ($session:expr) => {
+                if consume_grace {
+                    $session.take_password_grace_seconds();
+                }
+            };
+        }
+
         for attempt in 0..max_attempts {
             // On retry iterations (after backoff), re-check wall-time ceiling.
             // This catches the case where backoff sleep pushed us past the deadline.
@@ -240,6 +272,7 @@ impl Executor {
                             self.clear_trigger_activations();
                         }
                         self.observability.record_retry_timeout_abort();
+                        consume_grace_if_needed!(session);
                         return Err(SqlError::RetryTimeout {
                             elapsed_ms: retry_start.elapsed().as_millis() as u64,
                             limit_ms: timeout.as_millis() as u64,
@@ -274,6 +307,7 @@ impl Executor {
                         create_index_with_params,
                         current_role.as_deref(),
                         session_user.as_deref(),
+                        password_grace_seconds,
                     )
                     .await?;
                 Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((notices, result))
@@ -326,6 +360,7 @@ impl Executor {
                         }
                         let mut stmt_results = notices;
                         stmt_results.push(result);
+                        consume_grace_if_needed!(session);
                         return Ok(stmt_results);
                     }
                     Err(err) => {
@@ -345,6 +380,7 @@ impl Executor {
                                         "retry timeout exceeded, aborting retries"
                                     );
                                     self.observability.record_retry_timeout_abort();
+                                    consume_grace_if_needed!(session);
                                     return Err(SqlError::RetryTimeout {
                                         elapsed_ms: retry_start.elapsed().as_millis() as u64,
                                         limit_ms: timeout.as_millis() as u64,
@@ -372,6 +408,7 @@ impl Executor {
                             );
                             self.observability.record_retry_budget_exhausted();
                         }
+                        consume_grace_if_needed!(session);
                         return Err(err);
                     }
                 }
@@ -384,6 +421,7 @@ impl Executor {
                         }
                         let mut stmt_results = notices;
                         stmt_results.push(result);
+                        consume_grace_if_needed!(session);
                         return Ok(stmt_results);
                     }
                     Err(err) => {
@@ -404,6 +442,7 @@ impl Executor {
                                     session.rollback().await?;
                                     self.clear_trigger_activations();
                                     self.observability.record_retry_timeout_abort();
+                                    consume_grace_if_needed!(session);
                                     return Err(SqlError::RetryTimeout {
                                         elapsed_ms: retry_start.elapsed().as_millis() as u64,
                                         limit_ms: timeout.as_millis() as u64,
@@ -434,6 +473,7 @@ impl Executor {
                             );
                             self.observability.record_retry_budget_exhausted();
                         }
+                        consume_grace_if_needed!(session);
                         return Err(err);
                     }
                 }
