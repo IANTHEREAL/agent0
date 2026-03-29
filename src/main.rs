@@ -509,6 +509,39 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         info!("fs9 stats background worker started (supervised)");
     }
 
+    // Break-glass admin surface (Option C secondary path — emergency ops only)
+    {
+        let bg_port: u16 = env::var("BREAK_GLASS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+
+        if bg_port > 0 {
+            let bg_secret = env::var("BREAK_GLASS_SECRET").unwrap_or_default();
+            if bg_secret.is_empty() {
+                warn!("Break-glass server disabled: BREAK_GLASS_SECRET is not set");
+            } else {
+                // Hardcoded to loopback — break-glass is local-only by design.
+                let bg_addr = "127.0.0.1";
+
+                match TcpListener::bind((bg_addr, bg_port)).await {
+                    Ok(bg_listener) => {
+                        info!("Break-glass server listening on {}:{}", bg_addr, bg_port);
+                        tokio::spawn(async move {
+                            admin::http::start_break_glass_server(bg_listener, bg_secret).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Break-glass server failed to bind {}:{}: {}",
+                            bg_addr, bg_port, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // fs9 WebSocket server
     {
         let fs9_cfg = extensions::fs::config::fs9_config();

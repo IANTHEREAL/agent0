@@ -5,6 +5,7 @@
 pub mod audit;
 #[allow(dead_code)]
 pub mod control;
+pub mod http;
 #[allow(dead_code)]
 pub mod session_registry;
 
