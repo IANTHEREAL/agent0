@@ -48,7 +48,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, TryAcquireError};
 use tokio::task::{Id as TaskId, JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_PG_PORT: u16 = 5433;
@@ -520,6 +520,12 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             let bg_secret = env::var("BREAK_GLASS_SECRET").unwrap_or_default();
             if bg_secret.is_empty() {
                 warn!("Break-glass server disabled: BREAK_GLASS_SECRET is not set");
+            } else if bg_secret.len() < admin::http::MIN_SECRET_LENGTH {
+                error!(
+                    "Break-glass server disabled: BREAK_GLASS_SECRET is too short \
+                     (minimum {} characters)",
+                    admin::http::MIN_SECRET_LENGTH
+                );
             } else {
                 // Hardcoded to loopback — break-glass is local-only by design.
                 let bg_addr = "127.0.0.1";
