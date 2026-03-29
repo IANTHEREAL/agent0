@@ -202,6 +202,13 @@ impl TikvBackpressure {
     /// exponential (doubling) increase to escape the floor quickly — mirroring
     /// TCP slow-start.  Once above 2× min_permits we revert to +1 linear
     /// increase so we approach the ceiling gently.
+    /// Slow-start aware additive increase.
+    ///
+    /// Three phases:
+    /// 1. **At floor** (`old <= min`): hold at floor, count healthy evals.
+    ///    After 3 consecutive healthy evals, switch to doubling.
+    /// 2. **Slow-start region** (`old < min * 2`): double each eval.
+    /// 3. **Normal** (`old >= min * 2`): linear +1 per eval.
     fn additive_increase(&self) {
         let min = self.config.min_permits;
         loop {
@@ -211,17 +218,22 @@ impl TikvBackpressure {
                 return;
             }
 
-            let increment = if old <= min {
-                // Track how many healthy evals we've had while at the floor.
-                let at_floor = self.evals_at_floor.fetch_add(1, Ordering::Relaxed) + 1;
-                if at_floor >= 3 {
-                    // Slow-start: double (but don't exceed max).
-                    old.max(1) // doubling applied below via new = old + increment
+            let increment = if old < min {
+                // Below floor (shouldn't happen, but be safe): jump to floor.
+                self.evals_at_floor.store(0, Ordering::Relaxed);
+                min.saturating_sub(old)
+            } else if old == min {
+                // At the floor: count consecutive healthy evals before slow-starting.
+                // We DON'T increment the limit yet — hold at floor while counting.
+                let at_floor = self.evals_at_floor.load(Ordering::Relaxed);
+                if at_floor >= 2 {
+                    // 3rd healthy eval (after 2 holds at 0,1): switch to doubling.
+                    old.max(1) // new = old + old = 2 * min
                 } else {
-                    1
+                    0 // hold at floor, just count
                 }
             } else if old < min.saturating_mul(2) {
-                // Still in slow-start region: keep doubling.
+                // Slow-start region: keep doubling.
                 old.max(1)
             } else {
                 // Normal AIMD additive increase.
@@ -229,12 +241,16 @@ impl TikvBackpressure {
                 1
             };
 
-            let new = (old + increment).min(self.config.max_permits);
+            let new = old.saturating_add(increment).min(self.config.max_permits);
             if self
                 .current_limit
                 .compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                // Only update evals_at_floor AFTER successful CAS (avoid inflation on retry).
+                if old == min && increment == 0 {
+                    self.evals_at_floor.fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
         }
@@ -555,13 +571,30 @@ mod tests {
             bp.record_operation(1_000, true);
         }
         assert_eq!(bp.current_limit.load(Ordering::Relaxed), 8);
-        // Now send healthy ops — slow-start should kick in after 3 evals at floor
-        // and double the limit each eval, recovering much faster than +1.
-        for _ in 0..80 {
-            bp.record_operation(1_000, false); // 20 evals × 4 interval
+
+        // Eval 1-2: hold at floor (8), counting healthy evals (increment=0).
+        for _ in 0..8 {
+            bp.record_operation(1_000, false); // 2 evals × 4 interval
         }
-        // With slow-start doubling from 8, after several evals we should be
-        // well above the floor (8→9→10→16→32→64→...).
+        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 8, "should hold at floor for 2 evals");
+
+        // Eval 3: slow-start kicks in (evals_at_floor=2 >= 2) — double from 8 to 16.
+        for _ in 0..4 {
+            bp.record_operation(1_000, false);
+        }
+        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 16, "should double 8->16");
+
+        // Eval 4: 16 is NOT < 8*2=16, so enters normal +1 territory.
+        for _ in 0..4 {
+            bp.record_operation(1_000, false);
+        }
+        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 17, "should be normal +1 after leaving slow-start region");
+
+        // Continue: more healthy evals recover linearly.
+        for _ in 0..60 {
+            bp.record_operation(1_000, false); // 15 more evals
+        }
+        // 17 + 15 = 32
         assert!(bp.current_limit.load(Ordering::Relaxed) >= 32);
     }
 
