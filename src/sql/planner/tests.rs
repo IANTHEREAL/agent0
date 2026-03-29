@@ -1476,7 +1476,10 @@ fn test_range_scan_with_equality_prefix() {
             assert_eq!(range_end.as_ref(), Some(&Value::Int64(5000)));
             assert!(*end_inclusive);
         }
-        other => panic!("expected IndexBoundedRangeScan with prefix, got {:?}", other),
+        other => panic!(
+            "expected IndexBoundedRangeScan with prefix, got {:?}",
+            other
+        ),
     }
 }
 

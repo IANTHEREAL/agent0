@@ -3,9 +3,14 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 60_000;
+// Hard cap is intentionally lower than the default timeout.
+// Sessions are initialized with DEFAULT_STATEMENT_TIMEOUT_MS, which is then
+// clamped down to the hard cap for non-superuser sessions at startup.
+const DEFAULT_STATEMENT_TIMEOUT_HARD_CAP_MS: u64 = 30_000;
 const DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_TCP_KEEPALIVE_IDLE_MS: u64 = 30_000;
 const DEFAULT_MAX_CONNECTIONS: u32 = 1000;
+const DEFAULT_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL: u32 = 10;
 const DEFAULT_EMBEDDING_ENDPOINT: &str =
     "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings";
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-v4";
@@ -188,18 +193,22 @@ pub fn init_embedding_config() {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub statement_timeout_ms: u64,
+    pub statement_timeout_hard_cap_ms: u64,
     pub idle_in_transaction_session_timeout_ms: u64,
     pub tcp_keepalive_idle_ms: u64,
     pub max_connections: u32,
+    pub max_concurrent_queries_per_principal: u32,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
+            statement_timeout_hard_cap_ms: DEFAULT_STATEMENT_TIMEOUT_HARD_CAP_MS,
             idle_in_transaction_session_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS,
             tcp_keepalive_idle_ms: DEFAULT_TCP_KEEPALIVE_IDLE_MS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_concurrent_queries_per_principal: DEFAULT_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL,
         }
     }
 }
@@ -210,6 +219,12 @@ impl ServerConfig {
 
         if let Ok(v) = env::var("DB9_STATEMENT_TIMEOUT_MS") {
             cfg.statement_timeout_ms = v.parse::<u64>().ok().unwrap_or(cfg.statement_timeout_ms);
+        }
+        if let Ok(v) = env::var("DB9_STATEMENT_TIMEOUT_HARD_CAP_MS") {
+            cfg.statement_timeout_hard_cap_ms = v
+                .parse::<u64>()
+                .ok()
+                .unwrap_or(cfg.statement_timeout_hard_cap_ms);
         }
         if let Ok(v) = env::var("DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS") {
             cfg.idle_in_transaction_session_timeout_ms = v
@@ -226,6 +241,12 @@ impl ServerConfig {
                 .ok()
                 .filter(|&n| n > 0)
                 .unwrap_or(cfg.max_connections);
+        }
+        if let Ok(v) = env::var("DB9_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL") {
+            cfg.max_concurrent_queries_per_principal = v
+                .parse::<u32>()
+                .ok()
+                .unwrap_or(cfg.max_concurrent_queries_per_principal);
         }
 
         cfg
@@ -253,9 +274,11 @@ mod tests {
     fn test_default_values() {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
+        assert_eq!(cfg.statement_timeout_hard_cap_ms, 30_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 300_000);
         assert_eq!(cfg.tcp_keepalive_idle_ms, 30_000);
         assert_eq!(cfg.max_connections, 1000);
+        assert_eq!(cfg.max_concurrent_queries_per_principal, 10);
     }
 
     #[test]
@@ -264,9 +287,11 @@ mod tests {
 
         let keys = [
             "DB9_STATEMENT_TIMEOUT_MS",
+            "DB9_STATEMENT_TIMEOUT_HARD_CAP_MS",
             "DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
             "DB9_TCP_KEEPALIVE_IDLE_MS",
             "DB9_MAX_CONNECTIONS",
+            "DB9_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL",
         ];
 
         let saved: Vec<(String, Option<String>)> = keys
@@ -282,9 +307,11 @@ mod tests {
 
         let cfg = ServerConfig::from_env();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
+        assert_eq!(cfg.statement_timeout_hard_cap_ms, 30_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 300_000);
         assert_eq!(cfg.tcp_keepalive_idle_ms, 30_000);
         assert_eq!(cfg.max_connections, 1000);
+        assert_eq!(cfg.max_concurrent_queries_per_principal, 10);
 
         for (key, value) in saved {
             match value {
@@ -514,9 +541,11 @@ mod tests {
     fn test_shared_config() {
         let cfg = ServerConfig {
             statement_timeout_ms: 30_000,
+            statement_timeout_hard_cap_ms: 15_000,
             idle_in_transaction_session_timeout_ms: 45_000,
             tcp_keepalive_idle_ms: 20_000,
             max_connections: 500,
+            max_concurrent_queries_per_principal: 5,
         };
         let shared = cfg.shared();
 
@@ -536,6 +565,52 @@ mod tests {
             let read_cfg = shared.read().unwrap();
             assert_eq!(read_cfg.statement_timeout_ms, 20_000);
             assert_eq!(read_cfg.tcp_keepalive_idle_ms, 20_000);
+        }
+    }
+
+    #[test]
+    fn test_max_concurrent_queries_per_principal_env_override() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "25");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.max_concurrent_queries_per_principal, 25);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+    }
+
+    #[test]
+    fn test_max_concurrent_queries_per_principal_zero_disables() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "0");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.max_concurrent_queries_per_principal, 0);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
         }
     }
 

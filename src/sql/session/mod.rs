@@ -959,6 +959,11 @@ impl Session {
         self.settings.statement_timeout()
     }
 
+    /// Apply a server-enforced hard cap on statement_timeout.
+    pub(crate) fn set_statement_timeout_hard_cap(&mut self, max_ms: u64) {
+        self.settings.set_statement_timeout_hard_cap(max_ms);
+    }
+
     pub(crate) fn lock_timeout(&self) -> Option<Duration> {
         self.settings.lock_timeout()
     }

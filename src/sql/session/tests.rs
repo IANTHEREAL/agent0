@@ -1678,4 +1678,114 @@ mod tests {
             .set_known_setting("bytea_output", "".to_string())
             .is_err());
     }
+
+    // ── statement_timeout hard cap tests ────────────────────────────────
+
+    #[test]
+    fn hard_cap_allows_timeout_below_limit() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 0);
+        settings.set_statement_timeout_hard_cap(30_000);
+        // Setting below the cap should succeed
+        assert!(settings
+            .set_known_setting("statement_timeout", "10000".to_string())
+            .is_ok());
+        assert_eq!(settings.statement_timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn hard_cap_allows_timeout_equal_to_limit() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 0);
+        settings.set_statement_timeout_hard_cap(30_000);
+        assert!(settings
+            .set_known_setting("statement_timeout", "30000".to_string())
+            .is_ok());
+        assert_eq!(settings.statement_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn hard_cap_rejects_timeout_above_limit() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 0);
+        settings.set_statement_timeout_hard_cap(30_000);
+        let err = settings
+            .set_known_setting("statement_timeout", "60000".to_string())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("statement_timeout cannot exceed server limit of 30000ms"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn hard_cap_rejects_timeout_zero_disable() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 0);
+        settings.set_statement_timeout_hard_cap(30_000);
+        // Setting to 0 (disable timeout) should be rejected when hard cap is active
+        let err = settings
+            .set_known_setting("statement_timeout", "0".to_string())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("statement_timeout cannot be disabled"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn hard_cap_clamps_existing_timeout_on_set() {
+        // Start with a timeout of 60s, then set hard cap of 30s
+        let mut settings = SessionSettings::new_with_defaults(60_000, 0);
+        assert_eq!(settings.statement_timeout_ms, 60_000);
+        settings.set_statement_timeout_hard_cap(30_000);
+        // Should have been clamped down to 30s
+        assert_eq!(settings.statement_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn hard_cap_clamps_zero_timeout_on_set() {
+        // Start with timeout disabled (0), then set hard cap
+        let mut settings = SessionSettings::new_with_defaults(0, 0);
+        assert_eq!(settings.statement_timeout_ms, 0);
+        settings.set_statement_timeout_hard_cap(30_000);
+        // 0 means disabled, which violates the cap — should be clamped to 30s
+        assert_eq!(settings.statement_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn hard_cap_zero_means_disabled() {
+        // A hard cap of 0 means no cap — anything goes
+        let mut settings = SessionSettings::new_with_defaults(5_000, 0);
+        settings.set_statement_timeout_hard_cap(0);
+        assert!(settings
+            .set_known_setting("statement_timeout", "999999".to_string())
+            .is_ok());
+        assert!(settings
+            .set_known_setting("statement_timeout", "0".to_string())
+            .is_ok());
+    }
+
+    /// Verify the superuser exemption pattern: superuser sessions don't get
+    /// a hard cap applied, so they can SET statement_timeout freely.
+    /// This mirrors the startup.rs logic: `if hard_cap_ms > 0 && !is_superuser`.
+    #[test]
+    fn superuser_session_has_no_hard_cap() {
+        // Simulate a superuser session: hard cap is never set.
+        // In startup.rs: `if hard_cap_ms > 0 && !is_superuser { ... }`
+        // Superuser sessions skip set_statement_timeout_hard_cap entirely.
+        let mut settings = SessionSettings::new_with_defaults(5_000, 0);
+
+        // Superuser can set timeout to 0 (disable).
+        assert!(settings
+            .set_known_setting("statement_timeout", "0".to_string())
+            .is_ok());
+        assert_eq!(settings.statement_timeout_ms, 0);
+
+        // Superuser can set timeout above what would be the hard cap.
+        assert!(settings
+            .set_known_setting("statement_timeout", "999999".to_string())
+            .is_ok());
+        assert_eq!(settings.statement_timeout_ms, 999_999);
+    }
 }

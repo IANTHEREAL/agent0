@@ -308,6 +308,95 @@ pub fn split_statement_memory_scope(bytes: usize) -> Option<TenantMemoryReservat
         .flatten()
 }
 
+/// Error returned when a principal's concurrent query limit is reached.
+#[derive(Debug)]
+pub(crate) struct ConcurrencyRejection {
+    pub(crate) limit: u32,
+}
+
+/// Per-principal concurrent query limiter.
+///
+/// Tracks in-flight queries per principal identity (e.g., authenticated username).
+/// Uses a `Mutex<HashMap>` to keep per-principal counters. When a principal's
+/// counter reaches 0, the entry is removed to avoid unbounded growth.
+#[derive(Debug)]
+pub(crate) struct PrincipalConcurrencyTracker {
+    counters: std::sync::Mutex<HashMap<String, u32>>,
+    limit: u32,
+}
+
+impl PrincipalConcurrencyTracker {
+    fn new(limit: u32) -> Self {
+        Self {
+            counters: std::sync::Mutex::new(HashMap::new()),
+            limit,
+        }
+    }
+
+    /// Maximum concurrent queries per principal. 0 = disabled.
+    pub(crate) fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Try to acquire a concurrency slot for the given principal.
+    ///
+    /// Returns a [`ConcurrencyGuard`] on success that will automatically
+    /// decrement the counter when dropped (RAII pattern).
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        principal: &str,
+    ) -> Result<ConcurrencyGuard, ConcurrencyRejection> {
+        if self.limit == 0 {
+            // Disabled — should not be called, but be safe.
+            return Ok(ConcurrencyGuard {
+                tracker: Arc::clone(self),
+                principal: principal.to_string(),
+            });
+        }
+
+        let mut map = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(principal.to_string()).or_insert(0);
+        if *count >= self.limit {
+            return Err(ConcurrencyRejection { limit: self.limit });
+        }
+        *count += 1;
+        Ok(ConcurrencyGuard {
+            tracker: Arc::clone(self),
+            principal: principal.to_string(),
+        })
+    }
+
+    /// Current in-flight count for a principal (for tests/diagnostics).
+    #[cfg(test)]
+    pub(crate) fn current_count(&self, principal: &str) -> u32 {
+        let map = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(principal).copied().unwrap_or(0)
+    }
+}
+
+/// RAII guard that decrements the principal's in-flight counter on drop.
+#[derive(Debug)]
+pub(crate) struct ConcurrencyGuard {
+    tracker: Arc<PrincipalConcurrencyTracker>,
+    principal: String,
+}
+
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        let mut map = self
+            .tracker
+            .counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.principal) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.principal);
+            }
+        }
+    }
+}
+
 /// Simple token bucket rate limiter.
 ///
 /// Allows up to `rate` requests per second with burst capacity equal to `rate`.
@@ -379,6 +468,8 @@ pub(crate) struct TenantEntry {
     rate_limiter: Option<TokenBucket>,
     /// Shared per-tenant aggregate memory ledger/quota.
     memory_accountant: TenantMemoryAccountant,
+    /// Per-principal concurrent query limiter.
+    concurrency_tracker: Arc<PrincipalConcurrencyTracker>,
     /// Per-user active connection counts for `rolconnlimit` enforcement.
     user_connections: std::sync::Mutex<HashMap<String, u32>>,
     /// Back-reference to the pool-level idle index for Drop-time updates.
@@ -387,7 +478,12 @@ pub(crate) struct TenantEntry {
 }
 
 impl TenantEntry {
-    fn new(store: Arc<TikvStore>, keyspace: String, idle_index: Arc<IdleIndex>) -> Self {
+    fn new(
+        store: Arc<TikvStore>,
+        keyspace: String,
+        idle_index: Arc<IdleIndex>,
+        concurrency_limit: u32,
+    ) -> Self {
         let qps_limit = tenant_qps_limit();
         let memory_quota = tenant_memory_quota_bytes();
         Self {
@@ -403,6 +499,7 @@ impl TenantEntry {
             } else {
                 None
             },
+            concurrency_tracker: Arc::new(PrincipalConcurrencyTracker::new(concurrency_limit)),
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace, memory_quota),
             user_connections: std::sync::Mutex::new(HashMap::new()),
             idle_index: Some(idle_index),
@@ -497,6 +594,10 @@ impl TenantHandle {
         self.entry.rate_limiter.as_ref()
     }
 
+    pub fn concurrency_tracker(&self) -> &Arc<PrincipalConcurrencyTracker> {
+        &self.entry.concurrency_tracker
+    }
+
     pub fn keyspace(&self) -> &str {
         &self.entry.keyspace
     }
@@ -539,6 +640,16 @@ impl TenantHandle {
     /// Create a TenantHandle with explicit QPS+memory limits.
     #[cfg(test)]
     pub(crate) fn new_with_limits(qps_limit: u64, memory_quota_bytes: usize) -> Self {
+        Self::new_with_all_limits(qps_limit, memory_quota_bytes, 0)
+    }
+
+    /// Create a TenantHandle with explicit QPS, memory, and concurrency limits.
+    #[cfg(test)]
+    pub(crate) fn new_with_all_limits(
+        qps_limit: u64,
+        memory_quota_bytes: usize,
+        concurrency_limit: u32,
+    ) -> Self {
         let entry = Arc::new(TenantEntry {
             store: TikvStore::new_stub(),
             active_connections: AtomicU32::new(1),
@@ -552,6 +663,7 @@ impl TenantHandle {
             } else {
                 None
             },
+            concurrency_tracker: Arc::new(PrincipalConcurrencyTracker::new(concurrency_limit)),
             memory_accountant: TenantMemoryAccountant::new_with_quota(
                 "test_ks".to_string(),
                 memory_quota_bytes,
@@ -624,6 +736,9 @@ pub struct TikvClientPool {
     /// Idle-time index: tenants ordered by `(idle_at_epoch_ms, keyspace)`.
     /// Enables O(k) eviction where k = candidates due, instead of O(n) full scan.
     idle_index: Arc<IdleIndex>,
+    /// Per-principal concurrent query limit. 0 = disabled.
+    /// Sourced from `ServerConfig::max_concurrent_queries_per_principal`.
+    concurrency_limit: u32,
 }
 
 impl TikvClientPool {
@@ -635,7 +750,15 @@ impl TikvClientPool {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             reaper_interval: DEFAULT_REAPER_INTERVAL,
             idle_index: Arc::new(StdMutex::new(BTreeSet::new())),
+            concurrency_limit: 0,
         }
+    }
+
+    /// Set the per-principal concurrent query limit.
+    /// Value comes from `ServerConfig::max_concurrent_queries_per_principal`.
+    pub fn with_concurrency_limit(mut self, limit: u32) -> Self {
+        self.concurrency_limit = limit;
+        self
     }
 
     #[cfg(test)]
@@ -651,6 +774,7 @@ impl TikvClientPool {
             idle_timeout,
             reaper_interval,
             idle_index: Arc::new(StdMutex::new(BTreeSet::new())),
+            concurrency_limit: 0,
         }
     }
 
@@ -731,6 +855,7 @@ impl TikvClientPool {
             store,
             key.clone(),
             self.idle_index.clone(),
+            self.concurrency_limit,
         ));
         entry.active_connections.fetch_add(1, Ordering::Relaxed);
         // Construct handle before any `.await` so that async cancellation
@@ -803,6 +928,7 @@ impl TikvClientPool {
             store,
             key.clone(),
             self.idle_index.clone(),
+            self.concurrency_limit,
         ));
         // Mark as idle immediately since no handle is held.
         let idle_at = now_epoch_ms();
@@ -991,6 +1117,7 @@ mod tests {
             rls_policy_cache: Arc::new(RlsPolicyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: None,
+            concurrency_tracker: Arc::new(PrincipalConcurrencyTracker::new(0)),
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace.to_string(), 0),
             user_connections: std::sync::Mutex::new(HashMap::new()),
             idle_index,
@@ -1585,5 +1712,79 @@ mod tests {
         assert_eq!(idx.len(), 1);
         let (_, ks) = idx.iter().next().unwrap();
         assert_eq!(ks, "drop_ks");
+    }
+
+    // --- PrincipalConcurrencyTracker tests ---
+
+    #[test]
+    fn test_concurrency_tracker_acquire_under_limit() {
+        let tracker = Arc::new(PrincipalConcurrencyTracker::new(3));
+        let g1 = tracker.try_acquire("alice").unwrap();
+        let g2 = tracker.try_acquire("alice").unwrap();
+        assert_eq!(tracker.current_count("alice"), 2);
+        drop(g1);
+        assert_eq!(tracker.current_count("alice"), 1);
+        drop(g2);
+        assert_eq!(tracker.current_count("alice"), 0);
+    }
+
+    #[test]
+    fn test_concurrency_tracker_reject_at_limit() {
+        let tracker = Arc::new(PrincipalConcurrencyTracker::new(2));
+        let _g1 = tracker.try_acquire("bob").unwrap();
+        let _g2 = tracker.try_acquire("bob").unwrap();
+        let result = tracker.try_acquire("bob");
+        assert!(result.is_err());
+        let rejection = result.unwrap_err();
+        assert_eq!(rejection.limit, 2);
+    }
+
+    #[test]
+    fn test_concurrency_tracker_guard_drop_decrements() {
+        let tracker = Arc::new(PrincipalConcurrencyTracker::new(2));
+        let g1 = tracker.try_acquire("carol").unwrap();
+        let _g2 = tracker.try_acquire("carol").unwrap();
+        assert_eq!(tracker.current_count("carol"), 2);
+        // At limit — reject.
+        assert!(tracker.try_acquire("carol").is_err());
+        // Drop one guard — should allow new acquisition.
+        drop(g1);
+        assert_eq!(tracker.current_count("carol"), 1);
+        let _g3 = tracker.try_acquire("carol").unwrap();
+        assert_eq!(tracker.current_count("carol"), 2);
+    }
+
+    #[test]
+    fn test_concurrency_tracker_multiple_principals() {
+        let tracker = Arc::new(PrincipalConcurrencyTracker::new(1));
+        let _g1 = tracker.try_acquire("alice").unwrap();
+        // alice is at limit, but bob should still be allowed.
+        let _g2 = tracker.try_acquire("bob").unwrap();
+        assert!(tracker.try_acquire("alice").is_err());
+        assert!(tracker.try_acquire("bob").is_err());
+        assert_eq!(tracker.current_count("alice"), 1);
+        assert_eq!(tracker.current_count("bob"), 1);
+    }
+
+    #[test]
+    fn test_concurrency_tracker_zero_limit_disabled() {
+        let tracker = Arc::new(PrincipalConcurrencyTracker::new(0));
+        // With limit 0, try_acquire should always succeed (disabled).
+        let _g1 = tracker.try_acquire("alice").unwrap();
+        let _g2 = tracker.try_acquire("alice").unwrap();
+        let _g3 = tracker.try_acquire("alice").unwrap();
+        // All succeed — no rejection.
+    }
+
+    #[test]
+    fn test_concurrency_tracker_entry_removed_at_zero() {
+        let tracker = Arc::new(PrincipalConcurrencyTracker::new(5));
+        let g1 = tracker.try_acquire("dave").unwrap();
+        assert_eq!(tracker.current_count("dave"), 1);
+        drop(g1);
+        assert_eq!(tracker.current_count("dave"), 0);
+        // Verify the entry is actually removed from the map.
+        let map = tracker.counters.lock().unwrap();
+        assert!(!map.contains_key("dave"));
     }
 }

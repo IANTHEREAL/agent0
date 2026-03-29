@@ -1102,8 +1102,14 @@ mod tests {
         // Adding k4 should evict k2 (oldest counter)
         cache.record_execution(&k4);
         assert_eq!(cache.counter_len(), 3);
-        assert!(cache.counter_count_for(&k1).is_some(), "k1 should survive (touched recently)");
-        assert!(cache.counter_count_for(&k2).is_none(), "k2 should be evicted (oldest)");
+        assert!(
+            cache.counter_count_for(&k1).is_some(),
+            "k1 should survive (touched recently)"
+        );
+        assert!(
+            cache.counter_count_for(&k2).is_none(),
+            "k2 should be evicted (oldest)"
+        );
         assert!(cache.counter_count_for(&k3).is_some(), "k3 should survive");
         assert!(cache.counter_count_for(&k4).is_some(), "k4 was just added");
 
@@ -1156,8 +1162,16 @@ mod tests {
 
         // Reconfigure to smaller capacity — triggers trim_counters_to_capacity
         cache.reconfigure(2, 1);
-        assert_eq!(cache.counter_count_for(&k2), None, "promoted key removed from counters");
-        assert_eq!(cache.counter_count_for(&k3), None, "promoted key removed from counters");
+        assert_eq!(
+            cache.counter_count_for(&k2),
+            None,
+            "promoted key removed from counters"
+        );
+        assert_eq!(
+            cache.counter_count_for(&k3),
+            None,
+            "promoted key removed from counters"
+        );
         assert!(cache.counter_len() <= 2, "counters within new capacity");
 
         cache.assert_counter_internal_consistency();

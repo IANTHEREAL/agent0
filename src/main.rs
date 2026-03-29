@@ -298,7 +298,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     }
 
     storage::backpressure::init(storage::backpressure::BackpressureConfig::from_env());
-    let client_pool = Arc::new(TikvClientPool::new(pd_addrs.clone()));
+    let client_pool = Arc::new(
+        TikvClientPool::new(pd_addrs.clone())
+            .with_concurrency_limit(initial_server_config.max_concurrent_queries_per_principal),
+    );
 
     let startup_keyspace = default_keyspace
         .clone()

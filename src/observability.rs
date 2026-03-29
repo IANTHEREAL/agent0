@@ -300,11 +300,7 @@ impl TenantObservability {
             }
 
             if is_slow {
-                tracing::warn!(
-                    latency_ms = latency_us / 1000,
-                    ok,
-                    "slow query: {sql}"
-                );
+                tracing::warn!(latency_ms = latency_us / 1000, ok, "slow query: {sql}");
             }
 
             if sql.contains('|') {
@@ -921,9 +917,7 @@ mod tests {
         let tenant = TenantObservability::new(cfg);
 
         // Slow AND error — both conditions trigger sampling
-        tenant.record_statement_us(threshold_us + 1, false, || {
-            "SELECT slow_error".to_string()
-        });
+        tenant.record_statement_us(threshold_us + 1, false, || "SELECT slow_error".to_string());
         let groups = tenant.snapshot_query_samples();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].error_count, 1);
@@ -1015,7 +1009,7 @@ mod tests {
         let tenant = TenantObservability::new(cfg);
 
         // Empty SQL supplier — should not produce a sample even if slow
-        tenant.record_statement_us(1_000_000, true, || String::new());
+        tenant.record_statement_us(1_000_000, true, String::new);
         assert!(tenant.snapshot_query_samples().is_empty());
     }
 }

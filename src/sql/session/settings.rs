@@ -141,6 +141,9 @@ pub(crate) struct SessionSettings {
     // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
     pub(crate) statement_timeout_ms: u64,
     pub(crate) default_statement_timeout_ms: u64,
+    /// Server-enforced hard cap on statement_timeout. None = no cap.
+    /// When set, users cannot SET statement_timeout above this value or to 0 (disable).
+    max_statement_timeout_ms: Option<u64>,
     lock_timeout_ms: u64,
     pub(crate) idle_in_transaction_session_timeout_ms: u64,
     pub(crate) default_idle_in_transaction_session_timeout_ms: u64,
@@ -263,6 +266,17 @@ impl SessionSettings {
             idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
             default_idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
             ..Default::default()
+        }
+    }
+
+    /// Apply a server-enforced hard cap on statement_timeout.
+    /// When max_ms > 0, users cannot SET statement_timeout above max_ms or to 0.
+    /// Also clamps the current statement_timeout if it violates the cap.
+    pub(crate) fn set_statement_timeout_hard_cap(&mut self, max_ms: u64) {
+        self.max_statement_timeout_ms = Some(max_ms);
+        // Enforce: if current statement_timeout exceeds max, clamp it
+        if max_ms > 0 && (self.statement_timeout_ms == 0 || self.statement_timeout_ms > max_ms) {
+            self.statement_timeout_ms = max_ms;
         }
     }
 
@@ -555,7 +569,30 @@ impl SessionSettings {
                     .collect();
             }
             "statement_timeout" => {
-                self.statement_timeout_ms = Self::parse_timeout_millis(value)?;
+                let new_ms = Self::parse_timeout_millis(value)?;
+                if let Some(max) = self.max_statement_timeout_ms {
+                    if max > 0 {
+                        if new_ms == 0 {
+                            return Err(SqlError::InsufficientPrivilege {
+                                message: format!(
+                                    "statement_timeout cannot be disabled (server enforces a maximum of {}ms)",
+                                    max
+                                ),
+                            }
+                            .into());
+                        }
+                        if new_ms > max {
+                            return Err(SqlError::InsufficientPrivilege {
+                                message: format!(
+                                    "statement_timeout cannot exceed server limit of {}ms",
+                                    max
+                                ),
+                            }
+                            .into());
+                        }
+                    }
+                }
+                self.statement_timeout_ms = new_ms;
             }
             "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(value)?,
             "idle_in_transaction_session_timeout" => {

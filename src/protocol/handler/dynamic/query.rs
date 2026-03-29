@@ -7,6 +7,7 @@
 use super::DynamicPgHandler;
 use crate::auth::Privilege;
 use crate::model::DataType;
+use crate::pool::ConcurrencyGuard;
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::prepared_analysis::PreparedAnalysis;
 use crate::sql::ExecuteResult;
@@ -299,6 +300,52 @@ impl DynamicPgHandler {
             }
         }
         Ok(None)
+    }
+
+    /// Check per-principal concurrent query limit.
+    ///
+    /// Returns a [`ConcurrencyGuard`] that decrements the in-flight counter on
+    /// drop. The caller must hold the guard for the duration of the query.
+    fn check_principal_concurrency(&self) -> PgWireResult<Option<ConcurrencyGuard>> {
+        if let Some(handle) = self.tenant_handle.get() {
+            let tracker = handle.concurrency_tracker();
+            if tracker.limit() == 0 {
+                return Ok(None); // disabled
+            }
+            let principal = self.principal_identity();
+            match tracker.try_acquire(principal) {
+                Ok(guard) => Ok(Some(guard)),
+                Err(rejection) => {
+                    warn!(
+                        keyspace = handle.keyspace(),
+                        principal = %principal,
+                        limit = rejection.limit,
+                        "Query rejected: too many concurrent queries for principal"
+                    );
+                    Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "53300".to_string(),
+                        format!(
+                            "too many concurrent queries for principal (limit: {})",
+                            rejection.limit
+                        ),
+                    ))))
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Return the principal identity string used as the concurrency bucket key.
+    ///
+    /// Uses the cached identity set during authentication — no session lock needed.
+    /// This will be replaced with `budget_owner_id` from JWT claims in the future.
+    fn principal_identity(&self) -> &str {
+        self.principal_identity
+            .get()
+            .map(|s| s.as_str())
+            .unwrap_or("unknown")
     }
 
     /// Normalize a single SQL identifier token from the COPY tokenizer.
@@ -659,11 +706,13 @@ impl SimpleQueryHandler for DynamicPgHandler {
         // Transaction-control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, …)
         // are exempt from rate limiting -- blocking them would prevent transaction
         // cleanup and violate PostgreSQL recovery semantics.
-        let _bp_guard = if !is_transaction_control(query) {
+        let (_bp_guard, _concurrency_guard) = if !is_transaction_control(query) {
             self.check_rate_limit()?;
-            Some(self.check_backpressure()?)
+            let bp = Some(self.check_backpressure()?);
+            let cg = self.check_principal_concurrency()?;
+            (bp, cg)
         } else {
-            None
+            (None, None)
         };
 
         let state = self.auth();
@@ -1209,11 +1258,13 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let prepared = &portal.statement.statement;
 
         // Transaction-control statements bypass rate limiting (see simple-query path).
-        let _bp_guard = if !is_transaction_control(&prepared.sql) {
+        let (_bp_guard, _concurrency_guard) = if !is_transaction_control(&prepared.sql) {
             self.check_rate_limit()?;
-            Some(self.check_backpressure()?)
+            let bp = Some(self.check_backpressure()?);
+            let cg = self.check_principal_concurrency()?;
+            (bp, cg)
         } else {
-            None
+            (None, None)
         };
 
         let state = self.auth();
@@ -1617,5 +1668,99 @@ mod tests {
             }
         }
         assert!(blocked, "expected non-transaction SQL to be rate-limited");
+    }
+
+    /// Verify that check_principal_concurrency rejects when the limit is reached.
+    #[test]
+    fn concurrency_guard_rejects_at_limit() {
+        use crate::pool::TenantHandle;
+
+        let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+        let handler = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
+
+        // Set up tenant with concurrency limit of 1.
+        let tenant = TenantHandle::new_with_all_limits(0, 0, 1);
+        assert!(handler.tenant_handle.set(tenant).is_ok());
+
+        // Cache a principal identity (simulating post-authentication state).
+        let _ = handler.principal_identity.set("test_user".to_string());
+
+        // First acquire should succeed.
+        let guard1 = handler.check_principal_concurrency().unwrap();
+        assert!(guard1.is_some(), "first query should acquire a slot");
+
+        // Second acquire should be rejected (limit=1).
+        let err = handler.check_principal_concurrency().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too many concurrent queries"),
+            "expected concurrency rejection, got: {msg}"
+        );
+        assert!(msg.contains("53300"), "expected SQLSTATE 53300, got: {msg}");
+
+        // After dropping the guard, next acquire should succeed.
+        drop(guard1);
+        let guard2 = handler.check_principal_concurrency().unwrap();
+        assert!(
+            guard2.is_some(),
+            "should acquire slot after guard is dropped"
+        );
+    }
+
+    /// Verify that transaction-control statements bypass concurrency limits.
+    #[test]
+    fn transaction_control_bypasses_concurrency_limit() {
+        // Transaction-control exemption works at the do_query level via
+        // is_transaction_control(). When it returns true, check_principal_concurrency
+        // is never called. This test verifies the structural property.
+        for sql in &[
+            "BEGIN",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "SAVEPOINT sp1",
+            "RELEASE SAVEPOINT sp1",
+        ] {
+            assert!(
+                is_transaction_control(sql),
+                "{sql} must be recognized as transaction control (exempt from concurrency limit)"
+            );
+        }
+
+        // Non-transaction SQL is NOT exempt.
+        assert!(!is_transaction_control("SELECT 1"));
+        assert!(!is_transaction_control("INSERT INTO t VALUES (1)"));
+        assert!(!is_transaction_control("SET statement_timeout = 1000"));
+    }
+
+    /// Verify that concurrency check returns None (disabled) when limit is 0.
+    #[test]
+    fn concurrency_guard_disabled_when_limit_zero() {
+        use crate::pool::TenantHandle;
+
+        let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+        let handler = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
+
+        // Concurrency limit = 0 means disabled.
+        let tenant = TenantHandle::new_with_all_limits(0, 0, 0);
+        assert!(handler.tenant_handle.set(tenant).is_ok());
+        let _ = handler.principal_identity.set("test_user".to_string());
+
+        // Should return None (no guard needed), not an error.
+        let result = handler.check_principal_concurrency().unwrap();
+        assert!(result.is_none(), "limit=0 should disable concurrency check");
     }
 }

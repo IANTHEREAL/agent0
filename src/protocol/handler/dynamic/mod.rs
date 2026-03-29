@@ -61,6 +61,10 @@ pub struct DynamicPgHandler {
     pub(super) server_config: SharedServerConfig,
     pub(super) cancel_token: CancellationToken,
     pub(super) idle_watchdog_handle: StdMutex<Option<JoinHandle<()>>>,
+    /// Cached principal identity for concurrency tracking.
+    /// Set once during authentication so the query path never needs to lock
+    /// the session just to read the username.
+    pub(super) principal_identity: OnceCell<String>,
 }
 
 impl DynamicPgHandler {
@@ -84,6 +88,7 @@ impl DynamicPgHandler {
             server_config,
             cancel_token,
             idle_watchdog_handle: StdMutex::new(None),
+            principal_identity: OnceCell::new(),
         }
     }
 

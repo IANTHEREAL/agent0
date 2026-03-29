@@ -166,7 +166,8 @@ impl TikvBackpressure {
         let p99 = self.latency_tracker.p99_us();
         // Hysteresis: require 1.5× the threshold before decreasing to avoid
         // oscillation around the boundary.
-        let decrease_threshold = self.config.latency_threshold_us + self.config.latency_threshold_us / 2;
+        let decrease_threshold =
+            self.config.latency_threshold_us + self.config.latency_threshold_us / 2;
         if p99 > decrease_threshold {
             self.multiplicative_decrease();
         } else if p99 <= self.config.latency_threshold_us {
