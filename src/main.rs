@@ -542,6 +542,49 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         }
     }
 
+    // Internal control endpoint (Option C primary path — backend proxy target)
+    {
+        let ic_port: u16 = env::var("INTERNAL_CONTROL_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+
+        if ic_port > 0 {
+            let ic_secret = env::var("INTERNAL_CONTROL_SECRET").unwrap_or_default();
+            if ic_secret.is_empty() {
+                warn!("Internal control endpoint disabled: INTERNAL_CONTROL_SECRET is not set");
+            } else {
+                let ic_addr = env::var("INTERNAL_CONTROL_LISTEN_ADDR")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "0.0.0.0".to_string());
+
+                match TcpListener::bind((ic_addr.as_str(), ic_port)).await {
+                    Ok(ic_listener) => {
+                        info!(
+                            "Internal control endpoint listening on {}:{}",
+                            ic_addr, ic_port
+                        );
+                        tokio::spawn(async move {
+                            admin::internal_control::start_internal_control_server(
+                                ic_listener,
+                                ic_secret,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Internal control endpoint failed to bind {}:{}: {}",
+                            ic_addr, ic_port, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // fs9 WebSocket server
     {
         let fs9_cfg = extensions::fs::config::fs9_config();
