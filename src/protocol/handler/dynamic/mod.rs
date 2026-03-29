@@ -73,6 +73,13 @@ pub struct DynamicPgHandler {
     /// When set and lower than the server's per-principal limit, this tighter
     /// value is used. `None` means use the server default.
     pub(super) budget_max_concurrent: OnceCell<u32>,
+    /// Reference to this session's entry in the admin session registry.
+    /// Set after authentication, used for state updates during query execution.
+    pub(super) session_info: OnceCell<std::sync::Arc<crate::admin::session_registry::SessionInfo>>,
+    /// Query-level cancellation token. Created by `begin_query()` as a child of
+    /// `cancel_token`. Cancelling this token aborts the current statement
+    /// (SQLSTATE 57014) without terminating the connection.
+    pub(super) active_query_cancel: StdMutex<Option<CancellationToken>>,
 }
 
 impl DynamicPgHandler {
@@ -99,6 +106,8 @@ impl DynamicPgHandler {
             principal_identity: OnceCell::new(),
             admission_budget: OnceCell::new(),
             budget_max_concurrent: OnceCell::new(),
+            session_info: OnceCell::new(),
+            active_query_cancel: StdMutex::new(None),
         }
     }
 
@@ -128,6 +137,7 @@ impl Drop for DynamicPgHandler {
         {
             watchdog.abort();
         }
+        crate::admin::global_session_registry().unregister(self.connection_id);
         crate::sql::advisory_locks::global_lock_manager()
             .release_all_for_connection(self.connection_id);
         // Do NOT unregister the GC active transaction registry here.

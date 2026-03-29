@@ -687,6 +687,29 @@ impl StartupHandler for DynamicPgHandler {
                                 keyspace.as_deref().unwrap_or("default"),
                             );
 
+                            // Register in the admin session registry (post-auth).
+                            {
+                                let db_name = {
+                                    let s = self.auth().session.lock().await;
+                                    s.current_database_name_arc().to_string()
+                                };
+                                let tenant = keyspace.as_deref().unwrap_or("default").to_owned();
+                                let registry = crate::admin::global_session_registry();
+                                registry.register(
+                                    crate::admin::session_registry::SessionInfo::new(
+                                        self.connection_id,
+                                        tenant,
+                                        actual_user.clone(),
+                                        db_name,
+                                        format!("{}:{}", peer.ip(), peer.port()),
+                                        self.cancel_token.clone(),
+                                    ),
+                                );
+                                if let Some(info) = registry.get_session(self.connection_id) {
+                                    let _ = self.session_info.set(info);
+                                }
+                            }
+
                             // Spawn idle-in-transaction watchdog task.
                             // Periodically checks if the session has been idle in a
                             // transaction too long. On timeout: rollback + cancel the

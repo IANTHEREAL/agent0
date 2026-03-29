@@ -4077,3 +4077,313 @@ fn test_bytea_output_escape_with_control_chars() {
     );
     assert_eq!(s, "\\000\\001\\377");
 }
+
+// ── cancel_query handler-path regression tests ─────────────────────
+//
+// These tests drive the REAL handler execution path (SimpleQueryHandler::do_query
+// / ExtendedQueryHandler::do_query) with a pre-cancelled query-level token,
+// asserting SQLSTATE 57014 and connection survival.
+
+/// Helper: build a DynamicPgHandler with stubbed Executor + Session in auth_state,
+/// registered in the global session registry with session_info set.
+fn make_cancel_test_handler() -> DynamicPgHandler {
+    use crate::pool::TenantMemoryAccountant;
+    use crate::sql::Executor;
+    use std::sync::atomic::Ordering;
+
+    static CANCEL_TEST_ID: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(900_000);
+    let fixture_id = CANCEL_TEST_ID.fetch_add(1, Ordering::Relaxed);
+
+    let cancel_token = pgwire::tokio::CancellationToken::new();
+    let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+    let server_config = crate::config::ServerConfig::default().shared();
+    let handler = DynamicPgHandler::new_with_pool(pool, None, server_config, cancel_token.clone());
+
+    // Stub executor + session via TikvStore::new_stub().
+    let keyspace = format!("cancel_test_{fixture_id}");
+    let store = crate::storage::TikvStore::new_stub();
+    let observability = crate::observability::registry().tenant(&keyspace);
+    let trigger_cache = Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let rls_policy_cache = Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
+    let stats_cache = Arc::new(crate::sql::stats::TableStatsCache::new());
+    let executor = Arc::new(Executor::new(
+        store.clone(),
+        keyspace,
+        observability.clone(),
+        TenantMemoryAccountant::unlimited("cancel_test".to_string()),
+        trigger_cache,
+        rls_policy_cache,
+        stats_cache,
+    ));
+    let session = crate::sql::Session::new_with_user_and_database(
+        store,
+        observability,
+        format!("cancel_user_{fixture_id}"),
+        false,
+        false,
+        handler.connection_id,
+        1,
+        "postgres".to_string(),
+        0,
+        0,
+    )
+    .unwrap();
+
+    handler
+        .auth_state
+        .set(dynamic::AuthenticatedState {
+            executor,
+            session: Arc::new(tokio::sync::Mutex::new(session)),
+        })
+        .ok()
+        .expect("auth_state already set");
+
+    // Register in session registry + set session_info.
+    let registry = crate::admin::global_session_registry();
+    let info = crate::admin::session_registry::SessionInfo::new(
+        handler.connection_id,
+        "cancel-test-tenant".to_owned(),
+        format!("cancel_user_{fixture_id}"),
+        "postgres".to_owned(),
+        "127.0.0.1:0".to_owned(),
+        cancel_token,
+    );
+    registry.register(info);
+    if let Some(session_info) = registry.get_session(handler.connection_id) {
+        let _ = handler.session_info.set(session_info);
+    }
+
+    handler
+}
+
+/// Simple query path: cancel_query → real do_query → SQLSTATE 57014,
+/// connection survives.
+///
+/// Flow: begin_query_tracking (outside do_query) → cancel via registry →
+/// call real SimpleQueryHandler::do_query → pre-executor cancel check fires.
+#[tokio::test]
+async fn cancel_query_simple_path_returns_57014() {
+    use pgwire::api::query::SimpleQueryHandler;
+
+    let handler = make_cancel_test_handler();
+    let conn_id = handler.connection_id;
+    let registry = crate::admin::global_session_registry();
+
+    // Begin query tracking → creates child cancel token (same as on_query does).
+    handler.begin_query_tracking("SELECT pg_sleep(60)");
+
+    // Admin cancel_query → cancels the child token in both SessionInfo and
+    // handler.active_query_cancel (they share the same underlying token).
+    registry
+        .cancel_query(conn_id)
+        .expect("cancel_query should succeed");
+
+    // Call REAL SimpleQueryHandler::do_query — pre-executor cancel check fires → 57014.
+    let mut client = TestClient::new();
+    client.set_state(PgWireConnectionState::ReadyForQuery);
+    let result =
+        <DynamicPgHandler as SimpleQueryHandler>::do_query(&handler, &mut client, "SELECT 1").await;
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected 57014 error from cancelled query"),
+    };
+    match err {
+        PgWireError::UserError(ref info) => {
+            assert_eq!(
+                info.code, "57014",
+                "expected SQLSTATE 57014, got: {}",
+                info.code
+            );
+            assert!(
+                info.message
+                    .contains("canceling statement due to user request"),
+                "unexpected message: {}",
+                info.message
+            );
+            assert_eq!(info.severity, "ERROR", "cancel should be ERROR not FATAL");
+        }
+        other => panic!("expected UserError with 57014, got: {other}"),
+    }
+
+    // Connection-level token must NOT be cancelled.
+    assert!(
+        !handler.cancel_token.is_cancelled(),
+        "connection token must stay alive after cancel_query"
+    );
+
+    // Post-cancel reuse: verify a fresh query token can be created and the
+    // session accepts a new query. Run executor.execute on a thread with
+    // explicit stack size to avoid debug-build stack overflow from deep
+    // parser frames.
+    handler.end_query_tracking(false, false);
+    handler.begin_query_tracking("SET client_encoding = 'UTF8'");
+    let fresh_token = handler
+        .query_cancel_token()
+        .expect("fresh query should have cancel token");
+    assert!(
+        !fresh_token.is_cancelled(),
+        "fresh query token must not be cancelled"
+    );
+    let executor = handler.auth().executor.clone();
+    let session_mu = handler.auth().session.clone();
+    let follow_up = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut session = session_mu.lock().await;
+                    executor
+                        .execute(&mut session, "SET client_encoding = 'UTF8'")
+                        .await
+                })
+        })
+        .expect("thread spawn failed")
+        .join()
+        .expect("follow-up thread panicked");
+    assert!(
+        follow_up.is_ok(),
+        "follow-up query after cancel must succeed, got: {:?}",
+        follow_up.err()
+    );
+    handler.end_query_tracking(false, false);
+
+    // Cleanup.
+    registry.unregister(conn_id);
+}
+
+/// Extended query path: cancel_query → real do_query (ExtendedQueryHandler) →
+/// SQLSTATE 57014, connection survives.
+///
+/// Extended do_query calls begin_query_tracking internally (creating a fresh
+/// child token). We use the session lock to create a yield point: hold the
+/// lock, spawn do_query (which blocks at session.lock().await after
+/// begin_query_tracking), cancel via registry (cancelling the fresh child
+/// token), then release the lock. do_query resumes and hits the pre-executor
+/// cancel check → 57014.
+#[tokio::test]
+async fn cancel_query_extended_path_returns_57014() {
+    use pgwire::api::query::ExtendedQueryHandler;
+
+    let handler = Arc::new(make_cancel_test_handler());
+    let conn_id = handler.connection_id;
+    let registry = crate::admin::global_session_registry();
+
+    // Build a Portal<PreparedStatement> for the extended query path.
+    let prepared = PreparedStatement {
+        sql: "SELECT pg_sleep(60)".to_string(),
+        exec: PreparedExec::RawSqlUtility,
+        output_schema: vec![],
+        param_data_types: vec![],
+        table_versions: vec![],
+        rls_sensitive: false,
+    };
+    let stored = Arc::new(StoredStatement::new("".to_string(), prepared, vec![]));
+    let bind = pgwire::messages::extendedquery::Bind::new(None, None, vec![], vec![], vec![]);
+    let portal = Portal::try_new(&bind, stored).expect("bind should succeed");
+
+    // Hold the session lock so do_query blocks after begin_query_tracking.
+    let session_guard = handler.auth().session.lock().await;
+
+    let handler_clone = handler.clone();
+    let portal_clone = portal.clone();
+    let do_query_task = tokio::spawn(async move {
+        let mut client = TestPreparedClient::new();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let result = <DynamicPgHandler as ExtendedQueryHandler>::do_query(
+            &handler_clone,
+            &mut client,
+            &portal_clone,
+            0,
+        )
+        .await;
+        // Map Ok to drop the borrowed Response before the task ends.
+        result.map(|_| ())
+    });
+
+    // Give do_query time to reach session.lock().await (after begin_query_tracking).
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Cancel via registry — the child token from begin_query_tracking is now cancelled.
+    registry
+        .cancel_query(conn_id)
+        .expect("cancel_query should succeed (extended path)");
+
+    // Release the session lock — do_query resumes, hits pre-executor cancel check.
+    drop(session_guard);
+
+    let result = do_query_task.await.expect("do_query task panicked");
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected 57014 error from cancelled extended query"),
+    };
+    match err {
+        PgWireError::UserError(ref info) => {
+            assert_eq!(
+                info.code, "57014",
+                "expected SQLSTATE 57014, got: {}",
+                info.code
+            );
+            assert!(
+                info.message
+                    .contains("canceling statement due to user request"),
+                "unexpected message: {}",
+                info.message
+            );
+            assert_eq!(info.severity, "ERROR", "cancel should be ERROR not FATAL");
+        }
+        other => panic!("expected UserError with 57014, got: {other}"),
+    }
+
+    // Connection-level token must NOT be cancelled.
+    assert!(
+        !handler.cancel_token.is_cancelled(),
+        "connection token must stay alive after cancel_query"
+    );
+
+    // Post-cancel reuse: verify a fresh query token can be created and the
+    // session accepts a new query. Run executor.execute on a thread with
+    // explicit stack size to avoid debug-build stack overflow from deep
+    // parser frames.
+    handler.end_query_tracking(false, false);
+    handler.begin_query_tracking("SET client_encoding = 'UTF8'");
+    let fresh_token = handler
+        .query_cancel_token()
+        .expect("fresh query should have cancel token");
+    assert!(
+        !fresh_token.is_cancelled(),
+        "fresh query token must not be cancelled"
+    );
+    let executor = handler.auth().executor.clone();
+    let session_mu = handler.auth().session.clone();
+    let follow_up = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut session = session_mu.lock().await;
+                    executor
+                        .execute(&mut session, "SET client_encoding = 'UTF8'")
+                        .await
+                })
+        })
+        .expect("thread spawn failed")
+        .join()
+        .expect("follow-up thread panicked");
+    assert!(
+        follow_up.is_ok(),
+        "follow-up query after cancel must succeed, got: {:?}",
+        follow_up.err()
+    );
+    handler.end_query_tracking(false, false);
+
+    // Cleanup.
+    registry.unregister(conn_id);
+}
