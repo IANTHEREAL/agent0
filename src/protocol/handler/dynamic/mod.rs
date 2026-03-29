@@ -65,6 +65,14 @@ pub struct DynamicPgHandler {
     /// Set once during authentication so the query path never needs to lock
     /// the session just to read the username.
     pub(super) principal_identity: OnceCell<String>,
+    /// Per-budget-owner admission token bucket. Set during authentication for
+    /// connect-token sessions that carry budget claims. Direct pgwire sessions
+    /// do not have an admission budget (this stays `None`).
+    pub(super) admission_budget: OnceCell<Arc<crate::pool::TokenBucket>>,
+    /// Per-session concurrency limit from JWT `budget_max_concurrent` claim.
+    /// When set and lower than the server's per-principal limit, this tighter
+    /// value is used. `None` means use the server default.
+    pub(super) budget_max_concurrent: OnceCell<u32>,
 }
 
 impl DynamicPgHandler {
@@ -89,6 +97,8 @@ impl DynamicPgHandler {
             cancel_token,
             idle_watchdog_handle: StdMutex::new(None),
             principal_identity: OnceCell::new(),
+            admission_budget: OnceCell::new(),
+            budget_max_concurrent: OnceCell::new(),
         }
     }
 

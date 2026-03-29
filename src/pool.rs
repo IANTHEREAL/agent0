@@ -338,15 +338,26 @@ impl PrincipalConcurrencyTracker {
         self.limit
     }
 
-    /// Try to acquire a concurrency slot for the given principal.
-    ///
-    /// Returns a [`ConcurrencyGuard`] on success that will automatically
-    /// decrement the counter when dropped (RAII pattern).
+    /// Try to acquire a concurrency slot for the given principal using the
+    /// tracker's configured limit.
     pub(crate) fn try_acquire(
         self: &Arc<Self>,
         principal: &str,
     ) -> Result<ConcurrencyGuard, ConcurrencyRejection> {
-        if self.limit == 0 {
+        self.try_acquire_with_limit(principal, self.limit)
+    }
+
+    /// Try to acquire a concurrency slot for the given principal using the
+    /// given effective limit (which may be tighter than the tracker's default).
+    ///
+    /// Returns a [`ConcurrencyGuard`] on success that will automatically
+    /// decrement the counter when dropped (RAII pattern).
+    pub(crate) fn try_acquire_with_limit(
+        self: &Arc<Self>,
+        principal: &str,
+        effective_limit: u32,
+    ) -> Result<ConcurrencyGuard, ConcurrencyRejection> {
+        if effective_limit == 0 {
             // Disabled — should not be called, but be safe.
             return Ok(ConcurrencyGuard {
                 tracker: Arc::clone(self),
@@ -356,8 +367,10 @@ impl PrincipalConcurrencyTracker {
 
         let mut map = self.counters.lock().unwrap_or_else(|e| e.into_inner());
         let count = map.entry(principal.to_string()).or_insert(0);
-        if *count >= self.limit {
-            return Err(ConcurrencyRejection { limit: self.limit });
+        if *count >= effective_limit {
+            return Err(ConcurrencyRejection {
+                limit: effective_limit,
+            });
         }
         *count += 1;
         Ok(ConcurrencyGuard {
@@ -399,10 +412,12 @@ impl Drop for ConcurrencyGuard {
 
 /// Simple token bucket rate limiter.
 ///
-/// Allows up to `rate` requests per second with burst capacity equal to `rate`.
+/// Allows up to `rate` requests per second. Burst capacity defaults to `rate`
+/// but can be set independently via `new_with_burst`.
 pub(crate) struct TokenBucket {
     state: std::sync::Mutex<TokenBucketState>,
     rate: u64,
+    burst: u64,
 }
 
 struct TokenBucketState {
@@ -412,12 +427,17 @@ struct TokenBucketState {
 
 impl TokenBucket {
     fn new(rate: u64) -> Self {
+        Self::new_with_burst(rate, rate)
+    }
+
+    pub(crate) fn new_with_burst(rate: u64, burst: u64) -> Self {
         Self {
             state: std::sync::Mutex::new(TokenBucketState {
-                tokens: rate as f64,
+                tokens: burst as f64,
                 last_refill: std::time::Instant::now(),
             }),
             rate,
+            burst,
         }
     }
 
@@ -426,8 +446,9 @@ impl TokenBucket {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-        let capacity = self.rate as f64;
-        state.tokens = (state.tokens + elapsed * capacity).min(capacity);
+        let refill_rate = self.rate as f64;
+        let capacity = self.burst as f64;
+        state.tokens = (state.tokens + elapsed * refill_rate).min(capacity);
         state.last_refill = now;
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
@@ -449,6 +470,49 @@ impl TokenBucket {
         state.tokens = 0.0;
         state.last_refill = std::time::Instant::now();
     }
+}
+
+/// Budget parameters extracted from JWT connect-token claims.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionBudgetParams {
+    pub owner_id: String,
+    pub rps: u64,
+    pub burst: u64,
+}
+
+/// Global registry of per-budget-owner token buckets.
+///
+/// All sessions sharing the same `budget_owner_id` (= tenant_id) share one
+/// token bucket. The registry is process-global so that connect-token sessions
+/// across different connections to the same tenant are correctly metered together.
+pub(crate) struct AdmissionBudgetRegistry {
+    buckets: StdMutex<HashMap<String, Arc<TokenBucket>>>,
+}
+
+impl AdmissionBudgetRegistry {
+    fn new() -> Self {
+        Self {
+            buckets: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get or create a token bucket for the given budget owner.
+    ///
+    /// If a bucket already exists for this owner, it is returned as-is (the
+    /// first session's budget params win). This is correct because all tokens
+    /// for the same tenant carry identical budget claims.
+    pub(crate) fn get_or_create(&self, params: &AdmissionBudgetParams) -> Arc<TokenBucket> {
+        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(params.owner_id.clone())
+            .or_insert_with(|| Arc::new(TokenBucket::new_with_burst(params.rps, params.burst)))
+            .clone()
+    }
+}
+
+/// Process-global admission budget registry.
+pub(crate) fn admission_budget_registry() -> &'static AdmissionBudgetRegistry {
+    static REGISTRY: OnceLock<AdmissionBudgetRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(AdmissionBudgetRegistry::new)
 }
 
 /// Per-tenant metadata inside the pool.
@@ -1786,5 +1850,84 @@ mod tests {
         // Verify the entry is actually removed from the map.
         let map = tracker.counters.lock().unwrap();
         assert!(!map.contains_key("dave"));
+    }
+
+    // ─── TokenBucket with separate burst ────────────────────────────
+
+    #[test]
+    fn token_bucket_with_burst_allows_burst_above_rate() {
+        // rate=2, burst=5 → should allow 5 immediate requests, then reject
+        let bucket = TokenBucket::new_with_burst(2, 5);
+        for _ in 0..5 {
+            assert!(bucket.try_acquire(), "should allow up to burst capacity");
+        }
+        assert!(!bucket.try_acquire(), "should reject after burst exhausted");
+    }
+
+    #[test]
+    fn token_bucket_with_burst_refills_at_rate_not_burst() {
+        let bucket = TokenBucket::new_with_burst(1000, 2000);
+        bucket.drain();
+        // After draining, immediate acquire should fail
+        assert!(!bucket.try_acquire());
+        // After a small sleep, refill rate is 1000/sec, so ~10ms → ~10 tokens
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert!(bucket.try_acquire(), "should refill at rate, not burst");
+    }
+
+    // ─── AdmissionBudgetRegistry ────────────────────────────────────
+
+    #[test]
+    fn admission_registry_returns_same_bucket_for_same_owner() {
+        let registry = AdmissionBudgetRegistry::new();
+        let params = AdmissionBudgetParams {
+            owner_id: "tenant_1".to_string(),
+            rps: 100,
+            burst: 200,
+        };
+        let b1 = registry.get_or_create(&params);
+        let b2 = registry.get_or_create(&params);
+        assert!(Arc::ptr_eq(&b1, &b2), "same owner should share one bucket");
+    }
+
+    #[test]
+    fn admission_registry_separate_buckets_for_different_owners() {
+        let registry = AdmissionBudgetRegistry::new();
+        let p1 = AdmissionBudgetParams {
+            owner_id: "tenant_a".to_string(),
+            rps: 100,
+            burst: 200,
+        };
+        let p2 = AdmissionBudgetParams {
+            owner_id: "tenant_b".to_string(),
+            rps: 50,
+            burst: 100,
+        };
+        let b1 = registry.get_or_create(&p1);
+        let b2 = registry.get_or_create(&p2);
+        assert!(
+            !Arc::ptr_eq(&b1, &b2),
+            "different owners should have separate buckets"
+        );
+        assert_eq!(b1.rate(), 100);
+        assert_eq!(b2.rate(), 50);
+    }
+
+    #[test]
+    fn admission_registry_shared_bucket_enforces_cross_session() {
+        let registry = AdmissionBudgetRegistry::new();
+        let params = AdmissionBudgetParams {
+            owner_id: "tenant_shared".to_string(),
+            rps: 5,
+            burst: 5,
+        };
+        let b1 = registry.get_or_create(&params);
+        let b2 = registry.get_or_create(&params);
+        // Drain via session 1
+        for _ in 0..5 {
+            assert!(b1.try_acquire());
+        }
+        // Session 2 should also be rejected (shared bucket)
+        assert!(!b2.try_acquire(), "cross-session enforcement must work");
     }
 }

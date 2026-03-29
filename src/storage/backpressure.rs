@@ -576,19 +576,31 @@ mod tests {
         for _ in 0..8 {
             bp.record_operation(1_000, false); // 2 evals × 4 interval
         }
-        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 8, "should hold at floor for 2 evals");
+        assert_eq!(
+            bp.current_limit.load(Ordering::Relaxed),
+            8,
+            "should hold at floor for 2 evals"
+        );
 
         // Eval 3: slow-start kicks in (evals_at_floor=2 >= 2) — double from 8 to 16.
         for _ in 0..4 {
             bp.record_operation(1_000, false);
         }
-        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 16, "should double 8->16");
+        assert_eq!(
+            bp.current_limit.load(Ordering::Relaxed),
+            16,
+            "should double 8->16"
+        );
 
         // Eval 4: 16 is NOT < 8*2=16, so enters normal +1 territory.
         for _ in 0..4 {
             bp.record_operation(1_000, false);
         }
-        assert_eq!(bp.current_limit.load(Ordering::Relaxed), 17, "should be normal +1 after leaving slow-start region");
+        assert_eq!(
+            bp.current_limit.load(Ordering::Relaxed),
+            17,
+            "should be normal +1 after leaving slow-start region"
+        );
 
         // Continue: more healthy evals recover linearly.
         for _ in 0..60 {

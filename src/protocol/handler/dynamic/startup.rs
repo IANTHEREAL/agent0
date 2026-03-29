@@ -49,6 +49,62 @@ fn apply_trusted_jwt_claims(
     Ok(())
 }
 
+/// Extract admission budget parameters from verified JWT claims.
+///
+/// Returns `Some(params)` if the token carries `budget_owner_id` and `budget_rps`
+/// claims. Direct pgwire sessions (no JWT) return `None`.
+fn extract_budget_params(claims: &VerifiedJwtClaims) -> Option<crate::pool::AdmissionBudgetParams> {
+    let owner_id = claims.setting("request.jwt.claim.budget_owner_id")?;
+    let rps: u64 = claims
+        .setting("request.jwt.claim.budget_rps")?
+        .parse()
+        .ok()?;
+    if rps == 0 {
+        return None; // 0 = unlimited / disabled
+    }
+    let burst: u64 = claims
+        .setting("request.jwt.claim.budget_burst")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(rps); // default burst = rps
+    Some(crate::pool::AdmissionBudgetParams {
+        owner_id: owner_id.to_string(),
+        rps,
+        burst,
+    })
+}
+
+/// Tighten session hard guards based on JWT budget claims.
+///
+/// If the token carries `budget_timeout_ms` or `budget_max_concurrent` and
+/// those values are lower than the current server defaults, clamp them down.
+/// Claims can only tighten — values higher than the server default are ignored.
+/// Superusers are exempt from tightening.
+fn apply_budget_hard_guard_tightening(
+    session: &mut Session,
+    claims: &VerifiedJwtClaims,
+    is_superuser: bool,
+) {
+    if is_superuser {
+        return;
+    }
+    // Tighten statement_timeout hard cap if claim is lower.
+    if let Some(claim_timeout) = claims
+        .setting("request.jwt.claim.budget_timeout_ms")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if claim_timeout > 0 {
+            let current_cap = session.statement_timeout_hard_cap_ms();
+            if current_cap == 0 || claim_timeout < current_cap {
+                session.set_statement_timeout_hard_cap(claim_timeout);
+                debug!(
+                    claim_timeout_ms = claim_timeout,
+                    "Tightened statement_timeout hard cap from JWT claim"
+                );
+            }
+        }
+    }
+}
+
 type AuthDispatchOutcome = (
     Option<crate::auth::User>,
     Option<VerifiedJwtClaims>,
@@ -571,6 +627,39 @@ impl StartupHandler for DynamicPgHandler {
                                             )))
                                         },
                                     )?;
+                                    // Extract admission budget from JWT claims and register
+                                    // a shared token bucket for this budget owner.
+                                    if let Some(budget_params) = extract_budget_params(claims) {
+                                        let bucket = crate::pool::admission_budget_registry()
+                                            .get_or_create(&budget_params);
+                                        let _ = self.admission_budget.set(bucket);
+                                        debug!(
+                                            budget_owner = %budget_params.owner_id,
+                                            rps = budget_params.rps,
+                                            burst = budget_params.burst,
+                                            "Admission budget active for connection"
+                                        );
+                                    }
+                                    // Extract budget_max_concurrent claim for per-session
+                                    // concurrency tightening.
+                                    if !is_superuser {
+                                        if let Some(claim_concurrent) = claims
+                                            .setting("request.jwt.claim.budget_max_concurrent")
+                                            .and_then(|v| v.parse::<u32>().ok())
+                                        {
+                                            if claim_concurrent > 0 {
+                                                let _ = self
+                                                    .budget_max_concurrent
+                                                    .set(claim_concurrent);
+                                            }
+                                        }
+                                    }
+                                    // Claims can only tighten hard guards, never relax them.
+                                    apply_budget_hard_guard_tightening(
+                                        &mut session,
+                                        claims,
+                                        is_superuser,
+                                    );
                                 }
                                 for (key, value) in startup_setting_overrides(client) {
                                     if let Err(e) = session.set_known_setting(&key, value) {
@@ -1002,5 +1091,75 @@ mod tests {
         drop(guard2);
         let guard3 = tracker.try_acquire(principal);
         assert!(guard3.is_ok(), "should acquire after guards dropped");
+    }
+
+    // ─── extract_budget_params tests ────────────────────────────────
+
+    fn make_claims(pairs: &[(&str, &str)]) -> crate::auth::VerifiedJwtClaims {
+        let mut settings = std::collections::BTreeMap::new();
+        for (k, v) in pairs {
+            settings.insert(k.to_string(), v.to_string());
+        }
+        crate::auth::VerifiedJwtClaims::from_settings(settings)
+    }
+
+    #[test]
+    fn extract_budget_params_complete() {
+        let claims = make_claims(&[
+            ("request.jwt.claim.budget_owner_id", "tenant_xyz"),
+            ("request.jwt.claim.budget_rps", "100"),
+            ("request.jwt.claim.budget_burst", "200"),
+        ]);
+        let params = super::extract_budget_params(&claims).expect("should extract params");
+        assert_eq!(params.owner_id, "tenant_xyz");
+        assert_eq!(params.rps, 100);
+        assert_eq!(params.burst, 200);
+    }
+
+    #[test]
+    fn extract_budget_params_burst_defaults_to_rps() {
+        let claims = make_claims(&[
+            ("request.jwt.claim.budget_owner_id", "tenant_abc"),
+            ("request.jwt.claim.budget_rps", "50"),
+        ]);
+        let params = super::extract_budget_params(&claims).expect("should extract params");
+        assert_eq!(params.rps, 50);
+        assert_eq!(params.burst, 50, "burst should default to rps");
+    }
+
+    #[test]
+    fn extract_budget_params_missing_owner_returns_none() {
+        let claims = make_claims(&[
+            ("request.jwt.claim.budget_rps", "100"),
+            ("request.jwt.claim.budget_burst", "200"),
+        ]);
+        assert!(super::extract_budget_params(&claims).is_none());
+    }
+
+    #[test]
+    fn extract_budget_params_missing_rps_returns_none() {
+        let claims = make_claims(&[
+            ("request.jwt.claim.budget_owner_id", "tenant_xyz"),
+            ("request.jwt.claim.budget_burst", "200"),
+        ]);
+        assert!(super::extract_budget_params(&claims).is_none());
+    }
+
+    #[test]
+    fn extract_budget_params_zero_rps_returns_none() {
+        let claims = make_claims(&[
+            ("request.jwt.claim.budget_owner_id", "tenant_xyz"),
+            ("request.jwt.claim.budget_rps", "0"),
+        ]);
+        assert!(
+            super::extract_budget_params(&claims).is_none(),
+            "rps=0 should disable admission budget"
+        );
+    }
+
+    #[test]
+    fn extract_budget_params_no_jwt_claims_returns_none() {
+        let claims = make_claims(&[]);
+        assert!(super::extract_budget_params(&claims).is_none());
     }
 }

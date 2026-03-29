@@ -57,9 +57,13 @@ impl VerifiedJwtClaims {
         self.settings.iter()
     }
 
-    #[cfg(test)]
-    fn setting(&self, name: &str) -> Option<&str> {
+    pub(crate) fn setting(&self, name: &str) -> Option<&str> {
         self.settings.get(name).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_settings(settings: BTreeMap<String, String>) -> Self {
+        Self { settings }
     }
 }
 

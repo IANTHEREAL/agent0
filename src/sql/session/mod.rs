@@ -964,6 +964,11 @@ impl Session {
         self.settings.set_statement_timeout_hard_cap(max_ms);
     }
 
+    /// Returns the current hard cap on statement_timeout, or 0 if none is set.
+    pub(crate) fn statement_timeout_hard_cap_ms(&self) -> u64 {
+        self.settings.statement_timeout_hard_cap_ms()
+    }
+
     pub(crate) fn lock_timeout(&self) -> Option<Duration> {
         self.settings.lock_timeout()
     }

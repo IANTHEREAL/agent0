@@ -280,6 +280,11 @@ impl SessionSettings {
         }
     }
 
+    /// Returns the current hard cap on statement_timeout, or 0 if none is set.
+    pub(crate) fn statement_timeout_hard_cap_ms(&self) -> u64 {
+        self.max_statement_timeout_ms.unwrap_or(0)
+    }
+
     pub(crate) fn search_path(&self) -> &[String] {
         self.local_search_path
             .as_deref()

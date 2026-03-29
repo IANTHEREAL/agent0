@@ -309,11 +309,28 @@ impl DynamicPgHandler {
     fn check_principal_concurrency(&self) -> PgWireResult<Option<ConcurrencyGuard>> {
         if let Some(handle) = self.tenant_handle.get() {
             let tracker = handle.concurrency_tracker();
-            if tracker.limit() == 0 {
+            // Effective limit = min(server default, JWT budget_max_concurrent claim).
+            // Claims can only tighten, never relax.
+            let effective_limit = match self.budget_max_concurrent.get() {
+                Some(&claim_limit) if claim_limit > 0 => {
+                    if tracker.limit() == 0 {
+                        claim_limit
+                    } else {
+                        tracker.limit().min(claim_limit)
+                    }
+                }
+                _ => tracker.limit(),
+            };
+            if effective_limit == 0 {
                 return Ok(None); // disabled
             }
             let principal = self.principal_identity();
-            match tracker.try_acquire(principal) {
+            let result = if effective_limit == tracker.limit() {
+                tracker.try_acquire(principal)
+            } else {
+                tracker.try_acquire_with_limit(principal, effective_limit)
+            };
+            match result {
                 Ok(guard) => Ok(Some(guard)),
                 Err(rejection) => {
                     warn!(
@@ -340,12 +357,43 @@ impl DynamicPgHandler {
     /// Return the principal identity string used as the concurrency bucket key.
     ///
     /// Uses the cached identity set during authentication — no session lock needed.
-    /// This will be replaced with `budget_owner_id` from JWT claims in the future.
+    /// Note: concurrency is keyed by principal, while admission budget is keyed
+    /// by `budget_owner_id` (tenant). These are intentionally different scopes.
     fn principal_identity(&self) -> &str {
         self.principal_identity
             .get()
             .map(|s| s.as_str())
             .unwrap_or("unknown")
+    }
+
+    /// Check per-budget-owner admission rate limit (connect-token sessions only).
+    ///
+    /// Returns an error if the token bucket for this budget owner is exhausted.
+    /// Direct pgwire sessions (no JWT budget claims) bypass this check.
+    fn check_admission_budget(&self) -> PgWireResult<()> {
+        if let Some(bucket) = self.admission_budget.get() {
+            if !bucket.try_acquire() {
+                if let Some(handle) = self.tenant_handle.get() {
+                    crate::observability::registry()
+                        .tenant(handle.keyspace())
+                        .record_rate_limited();
+                }
+                warn!(
+                    principal = %self.principal_identity(),
+                    rate = bucket.rate(),
+                    "Query rejected: admission budget exhausted"
+                );
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "53300".to_string(),
+                    format!(
+                        "too many queries: admission budget exhausted (limit: {} QPS)",
+                        bucket.rate()
+                    ),
+                ))));
+            }
+        }
+        Ok(())
     }
 
     /// Normalize a single SQL identifier token from the COPY tokenizer.
@@ -708,6 +756,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
         // cleanup and violate PostgreSQL recovery semantics.
         let (_bp_guard, _concurrency_guard) = if !is_transaction_control(query) {
             self.check_rate_limit()?;
+            self.check_admission_budget()?;
             let bp = Some(self.check_backpressure()?);
             let cg = self.check_principal_concurrency()?;
             (bp, cg)
@@ -1260,6 +1309,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         // Transaction-control statements bypass rate limiting (see simple-query path).
         let (_bp_guard, _concurrency_guard) = if !is_transaction_control(&prepared.sql) {
             self.check_rate_limit()?;
+            self.check_admission_budget()?;
             let bp = Some(self.check_backpressure()?);
             let cg = self.check_principal_concurrency()?;
             (bp, cg)
@@ -1762,5 +1812,141 @@ mod tests {
         // Should return None (no guard needed), not an error.
         let result = handler.check_principal_concurrency().unwrap();
         assert!(result.is_none(), "limit=0 should disable concurrency check");
+    }
+
+    /// Verify that check_admission_budget rejects when the token bucket is exhausted.
+    #[test]
+    fn admission_budget_rejects_when_exhausted() {
+        use crate::pool::TokenBucket;
+
+        let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+        let handler = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
+        let _ = handler.principal_identity.set("test_user".to_string());
+
+        // Set up a budget bucket with burst=2 (only 2 queries allowed).
+        let bucket = Arc::new(TokenBucket::new_with_burst(1, 2));
+        let _ = handler.admission_budget.set(bucket);
+
+        // First two should succeed.
+        assert!(handler.check_admission_budget().is_ok());
+        assert!(handler.check_admission_budget().is_ok());
+
+        // Third should be rejected.
+        let err = handler.check_admission_budget().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("admission budget exhausted"),
+            "expected budget rejection, got: {msg}"
+        );
+        assert!(msg.contains("53300"), "expected SQLSTATE 53300, got: {msg}");
+    }
+
+    /// Verify that connections without admission budget (direct pgwire) are not checked.
+    #[test]
+    fn admission_budget_skipped_when_not_set() {
+        let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+        let handler = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
+
+        // No admission_budget set — should always succeed.
+        assert!(handler.check_admission_budget().is_ok());
+        assert!(handler.check_admission_budget().is_ok());
+    }
+
+    /// Verify that multiple sessions sharing the same budget owner share one bucket.
+    #[test]
+    fn admission_budget_shared_across_sessions() {
+        use crate::pool::{admission_budget_registry, AdmissionBudgetParams};
+
+        let params = AdmissionBudgetParams {
+            owner_id: format!("test_shared_{}", std::process::id()),
+            rps: 3,
+            burst: 3,
+        };
+
+        let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+
+        // Simulate two connections for the same budget owner.
+        let handler1 = DynamicPgHandler::new_with_pool(
+            pool.clone(),
+            None,
+            server_config.clone(),
+            pgwire::tokio::CancellationToken::new(),
+        );
+        let handler2 = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
+
+        let bucket = admission_budget_registry().get_or_create(&params);
+        let _ = handler1.admission_budget.set(bucket.clone());
+        let _ = handler2
+            .admission_budget
+            .set(admission_budget_registry().get_or_create(&params));
+
+        // Consume 2 tokens via handler1.
+        assert!(handler1.check_admission_budget().is_ok());
+        assert!(handler1.check_admission_budget().is_ok());
+
+        // Handler2 should only have 1 token left (shared bucket).
+        assert!(handler2.check_admission_budget().is_ok());
+        assert!(
+            handler2.check_admission_budget().is_err(),
+            "shared bucket should be exhausted"
+        );
+    }
+
+    /// Verify that budget_max_concurrent tightens the server's concurrency limit.
+    #[test]
+    fn budget_max_concurrent_tightens_concurrency() {
+        use crate::pool::TenantHandle;
+
+        let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+        let handler = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
+
+        // Server limit = 5, but budget claim tightens to 2.
+        let tenant = TenantHandle::new_with_all_limits(0, 0, 5);
+        assert!(handler.tenant_handle.set(tenant).is_ok());
+        let _ = handler.principal_identity.set("test_user".to_string());
+        let _ = handler.budget_max_concurrent.set(2);
+
+        // First two should succeed (budget claim limit = 2).
+        let guard1 = handler.check_principal_concurrency().unwrap();
+        assert!(guard1.is_some());
+        let guard2 = handler.check_principal_concurrency().unwrap();
+        assert!(guard2.is_some());
+
+        // Third should be rejected at the tighter claim limit.
+        let err = handler.check_principal_concurrency().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too many concurrent queries"),
+            "expected rejection at tightened limit, got: {msg}"
+        );
+
+        // After dropping a guard, next should succeed.
+        drop(guard1);
+        let guard3 = handler.check_principal_concurrency().unwrap();
+        assert!(guard3.is_some());
     }
 }
