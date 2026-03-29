@@ -91,7 +91,10 @@ impl<'a> AdminControlService<'a> {
     ///
     /// Enforces fail-closed rule: returns `MissingTenantScope` if neither
     /// `tenant_id` nor `all_tenants=true` is provided.
-    pub fn list_sessions(&self, filter: &SessionFilter) -> Result<ListSessionsResponse, ControlError> {
+    pub fn list_sessions(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<ListSessionsResponse, ControlError> {
         if filter.tenant_id.is_none() && !filter.all_tenants {
             return Err(ControlError::MissingTenantScope);
         }
@@ -196,7 +199,9 @@ impl<'a> AdminControlService<'a> {
         let audit_result = match &result {
             Ok(()) => AuditResult::Success,
             Err(CancelError::NotFound) => AuditResult::NotFound,
-            Err(CancelError::NoActiveQuery) => unreachable!("terminate never returns NoActiveQuery"),
+            Err(CancelError::NoActiveQuery) => {
+                unreachable!("terminate never returns NoActiveQuery")
+            }
         };
 
         emit_audit_log(
@@ -372,7 +377,9 @@ mod tests {
         let qc = info.begin_query("SELECT 1");
 
         let svc = AdminControlService::new(&reg);
-        let resp = svc.cancel_query(1, "admin@test", Some("slow query")).unwrap();
+        let resp = svc
+            .cancel_query(1, "admin@test", Some("slow query"))
+            .unwrap();
         assert_eq!(resp.connection_id, 1);
         assert_eq!(resp.result, "cancelled");
         assert_eq!(resp.query_was, "SELECT 1");
@@ -444,7 +451,9 @@ mod tests {
             .collect();
 
         let svc = AdminControlService::new(&reg);
-        let resp = svc.terminate_all("tenant_x", "admin", Some("incident")).unwrap();
+        let resp = svc
+            .terminate_all("tenant_x", "admin", Some("incident"))
+            .unwrap();
         assert_eq!(resp.tenant_id, "tenant_x");
         assert_eq!(resp.requested, 3);
         assert_eq!(resp.terminated, 3);
@@ -487,7 +496,10 @@ mod tests {
         };
         let resp = svc.list_sessions(&filter).unwrap();
         assert_eq!(resp.sessions.len(), 5);
-        assert!(!resp.has_more, "has_more must be false when result count == limit with no extra rows");
+        assert!(
+            !resp.has_more,
+            "has_more must be false when result count == limit with no extra rows"
+        );
     }
 
     #[test]
@@ -507,7 +519,10 @@ mod tests {
         };
         let resp = svc.list_sessions(&filter).unwrap();
         assert_eq!(resp.sessions.len(), 5);
-        assert!(resp.has_more, "has_more must be true when more rows exist beyond limit");
+        assert!(
+            resp.has_more,
+            "has_more must be true when more rows exist beyond limit"
+        );
     }
 
     #[test]

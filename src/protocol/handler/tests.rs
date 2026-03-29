@@ -4166,7 +4166,7 @@ fn make_cancel_test_handler() -> DynamicPgHandler {
 async fn cancel_query_simple_path_returns_57014() {
     use pgwire::api::query::SimpleQueryHandler;
 
-    let handler = make_cancel_test_handler();
+    let handler = Arc::new(make_cancel_test_handler());
     let conn_id = handler.connection_id;
     let registry = crate::admin::global_session_registry();
 
@@ -4213,44 +4213,47 @@ async fn cancel_query_simple_path_returns_57014() {
         "connection token must stay alive after cancel_query"
     );
 
-    // Post-cancel reuse: verify a fresh query token can be created and the
-    // session accepts a new query. Run executor.execute on a thread with
-    // explicit stack size to avoid debug-build stack overflow from deep
-    // parser frames.
+    // Post-cancel reuse: verify a follow-up query through the real handler
+    // path succeeds on the same connection. Uses an explicit thread with a
+    // large stack to avoid debug-build stack overflow from deep parser frames.
     handler.end_query_tracking(false, false);
-    handler.begin_query_tracking("SET client_encoding = 'UTF8'");
-    let fresh_token = handler
-        .query_cancel_token()
-        .expect("fresh query should have cancel token");
-    assert!(
-        !fresh_token.is_cancelled(),
-        "fresh query token must not be cancelled"
-    );
-    let executor = handler.auth().executor.clone();
-    let session_mu = handler.auth().session.clone();
-    let follow_up = std::thread::Builder::new()
+    let handler_for_reuse = handler.clone();
+    std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            let handler_ref: &DynamicPgHandler = &handler_for_reuse;
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap()
-                .block_on(async move {
-                    let mut session = session_mu.lock().await;
-                    executor
-                        .execute(&mut session, "SET client_encoding = 'UTF8'")
-                        .await
-                })
+                .unwrap();
+            rt.block_on(async {
+                handler_ref.begin_query_tracking("SET client_encoding = 'UTF8'");
+                let fresh_token = handler_ref
+                    .query_cancel_token()
+                    .expect("fresh query should have cancel token");
+                assert!(
+                    !fresh_token.is_cancelled(),
+                    "fresh query token must not be cancelled"
+                );
+                let mut client2 = TestClient::new();
+                client2.set_state(PgWireConnectionState::ReadyForQuery);
+                let result = <DynamicPgHandler as SimpleQueryHandler>::do_query(
+                    handler_ref,
+                    &mut client2,
+                    "SET client_encoding = 'UTF8'",
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "post-cancel follow-up query must succeed on same handler: {:?}",
+                    result.err()
+                );
+            });
+            handler_for_reuse.end_query_tracking(false, false);
         })
         .expect("thread spawn failed")
         .join()
         .expect("follow-up thread panicked");
-    assert!(
-        follow_up.is_ok(),
-        "follow-up query after cancel must succeed, got: {:?}",
-        follow_up.err()
-    );
-    handler.end_query_tracking(false, false);
 
     // Cleanup.
     registry.unregister(conn_id);
@@ -4345,44 +4348,61 @@ async fn cancel_query_extended_path_returns_57014() {
         "connection token must stay alive after cancel_query"
     );
 
-    // Post-cancel reuse: verify a fresh query token can be created and the
-    // session accepts a new query. Run executor.execute on a thread with
-    // explicit stack size to avoid debug-build stack overflow from deep
-    // parser frames.
+    // Post-cancel reuse: verify a follow-up query through the real extended
+    // handler path succeeds on the same connection.
     handler.end_query_tracking(false, false);
-    handler.begin_query_tracking("SET client_encoding = 'UTF8'");
-    let fresh_token = handler
-        .query_cancel_token()
-        .expect("fresh query should have cancel token");
-    assert!(
-        !fresh_token.is_cancelled(),
-        "fresh query token must not be cancelled"
-    );
-    let executor = handler.auth().executor.clone();
-    let session_mu = handler.auth().session.clone();
-    let follow_up = std::thread::Builder::new()
+    let handler_for_reuse = handler.clone();
+    std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            let handler_ref: &DynamicPgHandler = &handler_for_reuse;
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap()
-                .block_on(async move {
-                    let mut session = session_mu.lock().await;
-                    executor
-                        .execute(&mut session, "SET client_encoding = 'UTF8'")
-                        .await
-                })
+                .unwrap();
+            rt.block_on(async {
+                handler_ref.begin_query_tracking("SET client_encoding = 'UTF8'");
+                let fresh_token = handler_ref
+                    .query_cancel_token()
+                    .expect("fresh query should have cancel token");
+                assert!(
+                    !fresh_token.is_cancelled(),
+                    "fresh query token must not be cancelled"
+                );
+                let reuse_prepared = PreparedStatement {
+                    sql: "SET client_encoding = 'UTF8'".to_string(),
+                    exec: PreparedExec::RawSqlUtility,
+                    output_schema: vec![],
+                    param_data_types: vec![],
+                    table_versions: vec![],
+                    rls_sensitive: false,
+                };
+                let reuse_stored =
+                    Arc::new(StoredStatement::new("".to_string(), reuse_prepared, vec![]));
+                let reuse_bind =
+                    pgwire::messages::extendedquery::Bind::new(None, None, vec![], vec![], vec![]);
+                let reuse_portal =
+                    Portal::try_new(&reuse_bind, reuse_stored).expect("reuse bind should succeed");
+                let mut client2 = TestPreparedClient::new();
+                client2.set_state(PgWireConnectionState::QueryInProgress);
+                let result = <DynamicPgHandler as ExtendedQueryHandler>::do_query(
+                    handler_ref,
+                    &mut client2,
+                    &reuse_portal,
+                    0,
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "post-cancel follow-up extended query must succeed on same handler: {:?}",
+                    result.err()
+                );
+            });
+            handler_for_reuse.end_query_tracking(false, false);
         })
         .expect("thread spawn failed")
         .join()
         .expect("follow-up thread panicked");
-    assert!(
-        follow_up.is_ok(),
-        "follow-up query after cancel must succeed, got: {:?}",
-        follow_up.err()
-    );
-    handler.end_query_tracking(false, false);
 
     // Cleanup.
     registry.unregister(conn_id);

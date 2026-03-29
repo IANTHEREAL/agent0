@@ -706,7 +706,11 @@ mod tests {
         };
         let results = reg.list(&filter);
         let ids: Vec<i64> = results.iter().map(|s| s.connection_id).collect();
-        assert_eq!(ids, vec![10, 20, 30, 40, 50], "results must be sorted by connection_id");
+        assert_eq!(
+            ids,
+            vec![10, 20, 30, 40, 50],
+            "results must be sorted by connection_id"
+        );
 
         // Pagination must also be deterministic.
         let page1 = SessionFilter {
