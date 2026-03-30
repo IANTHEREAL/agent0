@@ -60,6 +60,41 @@ fn eval_date_part(args: Vec<Value>) -> Result<Value> {
             dt.and_utc().timestamp_millis()
         }
         Value::Null => return Ok(Value::Null),
+        Value::Interval(iv) => {
+            // EXTRACT from interval — PostgreSQL semantics.
+            // EPOCH returns total seconds (months approximated as 30 days).
+            let result = match field.as_str() {
+                "EPOCH" => {
+                    let month_secs = iv.months as f64 * 30.0 * 86400.0;
+                    month_secs + (iv.millis as f64 / 1000.0)
+                }
+                "HOUR" => {
+                    let total_secs = iv.millis / 1000;
+                    let after_days = total_secs % 86400;
+                    (after_days / 3600) as f64
+                }
+                "MINUTE" => {
+                    let total_secs = iv.millis / 1000;
+                    let after_hours = total_secs % 3600;
+                    (after_hours / 60) as f64
+                }
+                "SECOND" => {
+                    let total_secs = iv.millis / 1000;
+                    (total_secs % 60) as f64
+                }
+                "DAY" => (iv.millis / 1000 / 86400) as f64,
+                "MONTH" => (iv.months % 12) as f64,
+                "YEAR" => (iv.months / 12) as f64,
+                _ => {
+                    return Err(SqlError::Unsupported(format!(
+                        "Unsupported EXTRACT field for interval: {}",
+                        field
+                    ))
+                    .into())
+                }
+            };
+            return Ok(Value::Float64(result));
+        }
         _ => return Ok(Value::Null),
     };
 

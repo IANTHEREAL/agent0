@@ -107,3 +107,33 @@ date_plus_bigint
 date_minus_bigint
 2024-01-05
 (1 row)
+two_gt_one
+t
+(1 row)
+month_gt_31d
+f
+(1 row)
+month_eq_30d
+t
+(1 row)
+month_lt_29d
+f
+(1 row)
+mon1d_gt_30d
+t
+(1 row)
+neg_lt_zero
+t
+(1 row)
+v
+1 mon
+59 days
+2 mons
+61 days
+(4 rows)
+neg_epoch
+-7200
+(1 row)
+neg_day_epoch
+-86400
+(1 row)

@@ -148,6 +148,35 @@ SELECT DATE '2024-01-10' + CAST(5 AS BIGINT) AS date_plus_bigint;
 SELECT DATE '2024-01-10' - CAST(5 AS BIGINT) AS date_minus_bigint;
 
 -- ================================================================
+-- 9. Month-based interval comparisons (to_millis_approx coverage)
+-- ================================================================
+
+-- 9a. Month vs month
+SELECT '2 months'::interval > '1 month'::interval AS two_gt_one;
+
+-- 9b. Month vs days (30 days/month normalization)
+SELECT '1 month'::interval > '31 days'::interval AS month_gt_31d;
+SELECT '1 month'::interval = '30 days'::interval AS month_eq_30d;
+SELECT '1 month'::interval < '29 days'::interval AS month_lt_29d;
+
+-- 9c. Mixed month + time vs pure days
+SELECT '1 month 1 day'::interval > '30 days'::interval AS mon1d_gt_30d;
+
+-- 9d. Negative month comparison
+SELECT '-1 month'::interval < '0 seconds'::interval AS neg_lt_zero;
+
+-- 9e. ORDER BY with month intervals
+SELECT v FROM (VALUES ('2 months'::interval), ('59 days'::interval), ('61 days'::interval), ('1 month'::interval)) AS t(v) ORDER BY v;
+
+-- ================================================================
+-- 10. EXTRACT from negative intervals (sign preservation)
+-- ================================================================
+
+-- Use subtraction to produce negative intervals (parser doesn't handle '-HH:MM:SS')
+SELECT EXTRACT(EPOCH FROM '2024-06-15 10:00:00+00'::timestamptz - '2024-06-15 12:00:00+00'::timestamptz) AS neg_epoch;
+SELECT EXTRACT(EPOCH FROM '2024-06-14 00:00:00+00'::timestamptz - '2024-06-15 00:00:00+00'::timestamptz) AS neg_day_epoch;
+
+-- ================================================================
 -- Cleanup
 -- ================================================================
 

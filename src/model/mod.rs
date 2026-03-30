@@ -240,10 +240,12 @@ impl fmt::Display for IntervalValue {
             ));
         }
         if remaining != 0 || parts.is_empty() {
-            let hours = remaining / (1000 * 60 * 60);
-            let mins = (remaining % (1000 * 60 * 60)) / (1000 * 60);
-            let secs = (remaining % (1000 * 60)) / 1000;
-            parts.push(format!("{:02}:{:02}:{:02}", hours, mins, secs));
+            let sign = if remaining < 0 { "-" } else { "" };
+            let abs_rem = remaining.unsigned_abs();
+            let hours = abs_rem / (1000 * 60 * 60);
+            let mins = (abs_rem % (1000 * 60 * 60)) / (1000 * 60);
+            let secs = (abs_rem % (1000 * 60)) / 1000;
+            parts.push(format!("{}{:02}:{:02}:{:02}", sign, hours, mins, secs));
         }
         write!(f, "{}", parts.join(" "))
     }

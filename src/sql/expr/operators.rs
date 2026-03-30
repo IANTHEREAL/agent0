@@ -1054,6 +1054,11 @@ fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
             Ok(l.len().cmp(&r.len()) as i8)
         }
         (Value::Jsonb(l), Value::Jsonb(r)) => compare_jsonb_pg(l, r),
+        (Value::Interval(l), Value::Interval(r)) => {
+            // PostgreSQL normalizes intervals to total duration for comparison
+            // using 30 days/month approximation.
+            Ok(l.to_millis_approx().cmp(&r.to_millis_approx()) as i8)
+        }
         _ => Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right)),
     }
 }
