@@ -1,0 +1,109 @@
+tstz_minus_tstz
+02:00:00
+(1 row)
+ts_minus_tstz
+02:00:00
+(1 row)
+tstz_minus_ts
+02:00:00
+(1 row)
+tstz_minus_date
+12:00:00
+(1 row)
+date_minus_tstz
+-12:00:00
+(1 row)
+ts_minus_date
+12:00:00
+(1 row)
+date_minus_ts
+-12:00:00
+(1 row)
+negative_interval
+-02:00:00
+(1 row)
+zero_interval
+00:00:00
+(1 row)
+five_days
+5 days
+(1 row)
+now_minus_now
+00:00:00
+(1 row)
+ct_minus_ct
+00:00:00
+(1 row)
+result_type
+interval
+(1 row)
+id|duration
+1|01:30:00
+2|04:00:00
+3|06:00:00
+(3 rows)
+id
+2
+3
+(2 rows)
+id
+3
+2
+1
+(3 rows)
+epoch_diff
+7200
+(1 row)
+id|duration_secs
+1|5400
+2|14400
+3|21600
+(3 rows)
+abs_epoch
+7200
+(1 row)
+id
+1
+2
+3
+(3 rows)
+id
+1
+(1 row)
+id
+1
+2
+(2 rows)
+is_null
+t
+(1 row)
+is_null
+t
+(1 row)
+is_null
+t
+(1 row)
+coalesced
+00:00:00
+(1 row)
+same_instant
+00:00:00
+(1 row)
+tz_diff
+05:00:00
+(1 row)
+one_sec
+00:00:01
+(1 row)
+pre_epoch
+00:00:01
+(1 row)
+four_years
+1461 days
+(1 row)
+date_plus_bigint
+2024-01-15
+(1 row)
+date_minus_bigint
+2024-01-05
+(1 row)

@@ -1,0 +1,25 @@
+id
+1
+(1 row)
+id|pb
+1|10
+2|999
+(2 rows)
+id
+1
+2
+(2 rows)
+id
+(0 rows)
+id|extra
+1|ok
+3|no fk check
+(2 rows)
+id|pid
+1|1
+2|1
+(2 rows)
+id|pcode
+1|A
+2|ANYTHING
+(2 rows)

@@ -1,0 +1,2 @@
+# Test 4: FK violation for non-existent parent in same txn
+violates foreign key constraint

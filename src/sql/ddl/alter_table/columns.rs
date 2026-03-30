@@ -20,7 +20,7 @@ use crate::txn::txn_put;
 
 use super::super::{
     analyze_row_level_expr_with_udts, check_expr_references_column, coerce_value_for_type_change,
-    eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
+    delete_range, eval_row_level_expr, index_prefix_range, resolve_alter_column_set_data_type,
     resolve_column_data_type, validate_column_default_expr, validate_generated_column_expr,
     AlterTableBudget, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
@@ -375,12 +375,6 @@ pub(super) async fn alter_table_drop_column(
     if_exists: bool,
     cascade: bool,
 ) -> Result<bool> {
-    if cascade {
-        return Err(
-            SqlError::Unsupported("DROP COLUMN ... CASCADE is not supported".into()).into(),
-        );
-    }
-
     let col_name = normalize_ident(column_name);
     let col_idx = schema.column_index(&col_name);
     let drop_changes_schema = should_invalidate_stats_for_drop_column(col_idx.is_some());
@@ -389,42 +383,165 @@ pub(super) async fn alter_table_drop_column(
             if schema.pk_indices.contains(&idx) {
                 return Err(anyhow!("Cannot drop primary key column '{}'", col_name));
             }
-            for index in &schema.indexes {
-                if index.columns.contains(&col_name) {
+            // Check index dependencies. Constraint-backing indexes
+            // (UNIQUE constraints) are auto-dropped with CASCADE; all others
+            // (user-created indexes, expression indexes) always block.
+            {
+                let mut blocked_indexes: Vec<&str> = Vec::new();
+                for index in &schema.indexes {
+                    if index.columns.contains(&col_name) {
+                        if index.is_constraint && cascade {
+                            // CASCADE: will be dropped below via retain
+                            continue;
+                        }
+                        blocked_indexes.push(&index.name);
+                    }
+                    // Expression indexes always block.
+                    for expr_str in &index.expressions {
+                        if check_expr_references_column(expr_str, &col_name)? {
+                            return Err(anyhow!(
+                                "Cannot drop column '{}' referenced in expression index '{}'",
+                                col_name,
+                                index.name
+                            ));
+                        }
+                    }
+                    if let Some(pred) = &index.predicate {
+                        if check_expr_references_column(pred, &col_name)? {
+                            return Err(anyhow!(
+                                "Cannot drop column '{}' referenced in index predicate for '{}'",
+                                col_name,
+                                index.name
+                            ));
+                        }
+                    }
+                }
+                if !blocked_indexes.is_empty() {
                     return Err(anyhow!(
                         "Cannot drop column '{}' used in index '{}'",
                         col_name,
-                        index.name
+                        blocked_indexes[0]
                     ));
                 }
-                // Check expression indexes referencing this column.
-                for expr_str in &index.expressions {
-                    if check_expr_references_column(expr_str, &col_name)? {
-                        return Err(anyhow!(
-                            "Cannot drop column '{}' referenced in expression index '{}'",
-                            col_name,
-                            index.name
-                        ));
+                if cascade {
+                    // Physical cleanup: delete index KV data and release name.
+                    let owning_schema = schema.name.split('.').next().unwrap_or("public");
+                    let to_drop: Vec<_> = schema
+                        .indexes
+                        .iter()
+                        .filter(|idx| idx.is_constraint && idx.columns.contains(&col_name))
+                        .map(|idx| (idx.id, idx.name.clone()))
+                        .collect();
+                    for (index_id, index_name) in &to_drop {
+                        let (start, end) = index_prefix_range(db_id, schema.table_id, *index_id);
+                        delete_range(txn, start, end).await?;
+                        let idx_full = format!("{}.{}", owning_schema, index_name);
+                        store.release_relation_name(txn, db_id, &idx_full).await?;
                     }
-                }
-                // Check partial index predicates.
-                if let Some(pred) = &index.predicate {
-                    if check_expr_references_column(pred, &col_name)? {
-                        return Err(anyhow!(
-                            "Cannot drop column '{}' referenced in index predicate for '{}'",
-                            col_name,
-                            index.name
-                        ));
-                    }
+                    schema
+                        .indexes
+                        .retain(|idx| !(idx.is_constraint && idx.columns.contains(&col_name)));
                 }
             }
-            for fk in &schema.foreign_keys {
-                if fk.columns.contains(&col_name) {
-                    return Err(anyhow!(
-                        "Cannot drop column '{}' used in foreign key '{}'",
-                        col_name,
-                        fk.name
-                    ));
+            // --- FK dependency handling (PostgreSQL parity) ---
+            // PostgreSQL auto-drops FK constraints whose referencing columns
+            // (fk.columns) include the dropped column — no CASCADE needed.
+            schema
+                .foreign_keys
+                .retain(|fk| !fk.columns.contains(&col_name));
+
+            // For self-referencing FKs where the dropped column is in
+            // ref_columns (the referenced/parent side), RESTRICT must error.
+            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+            let self_ref_deps: Vec<String> = schema
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.ref_table == schema.name && fk.ref_columns.contains(&col_name))
+                .map(|fk| fk.name.clone())
+                .collect();
+            if !self_ref_deps.is_empty() {
+                if !cascade {
+                    let detail = self_ref_deps
+                        .iter()
+                        .map(|name| {
+                            format!(
+                                "constraint {} on table {} depends on column {} of table {}",
+                                name, short_table, col_name, short_table
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(SqlError::DependentObjectsStillExist {
+                        message: format!(
+                            "cannot drop column \"{}\" of table \"{}\" because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                            col_name, short_table, detail
+                        ),
+                    }
+                    .into());
+                }
+                schema.foreign_keys.retain(|fk| {
+                    !(fk.ref_table == schema.name && fk.ref_columns.contains(&col_name))
+                });
+            }
+
+            // Cross-table scan: check if other tables have FK constraints
+            // referencing the dropped column on this table.
+            {
+                let all_tables = store.list_tables(txn, db_id).await?;
+                let mut inbound_deps: Vec<(String, String)> = Vec::new();
+                for table_name in &all_tables {
+                    if *table_name == schema.name {
+                        continue; // self-ref handled above
+                    }
+                    let other = match store.get_schema(txn, db_id, table_name).await? {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    for fk in &other.foreign_keys {
+                        if fk.ref_table == schema.name && fk.ref_columns.contains(&col_name) {
+                            let child_short = table_name.rsplit('.').next().unwrap_or(table_name);
+                            inbound_deps.push((child_short.to_string(), fk.name.clone()));
+                        }
+                    }
+                }
+                if !inbound_deps.is_empty() {
+                    if !cascade {
+                        let detail = inbound_deps
+                            .iter()
+                            .map(|(child, name)| {
+                                format!(
+                                    "constraint {} on table {} depends on column {} of table {}",
+                                    name, child, col_name, short_table
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(SqlError::DependentObjectsStillExist {
+                            message: format!(
+                                "cannot drop column \"{}\" of table \"{}\" because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                                col_name, short_table, detail
+                            ),
+                        }
+                        .into());
+                    }
+                    // CASCADE: remove FK constraints from child tables.
+                    for table_name in &all_tables {
+                        if *table_name == schema.name {
+                            continue;
+                        }
+                        let mut other = match store.get_schema(txn, db_id, table_name).await? {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let before = other.foreign_keys.len();
+                        other.foreign_keys.retain(|fk| {
+                            !(fk.ref_table == schema.name && fk.ref_columns.contains(&col_name))
+                        });
+                        if other.foreign_keys.len() != before {
+                            other.version += 1;
+                            store.update_schema(txn, db_id, other).await?;
+                        }
+                    }
                 }
             }
             for check in &schema.check_constraints {

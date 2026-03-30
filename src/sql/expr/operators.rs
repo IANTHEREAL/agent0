@@ -441,6 +441,18 @@ pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(
             crate::model::IntervalValue::from_millis(l - r),
         )),
+        (Value::Timestamp(ts), Value::Date(days)) => {
+            let date_ts = crate::model::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Interval(crate::model::IntervalValue::from_millis(
+                ts - date_ts,
+            )))
+        }
+        (Value::Date(days), Value::Timestamp(ts)) => {
+            let date_ts = crate::model::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Interval(crate::model::IntervalValue::from_millis(
+                date_ts - ts,
+            )))
+        }
         (Value::Timestamp(ts), Value::Interval(iv)) => {
             Ok(Value::Timestamp(sub_interval_from_timestamp(ts, &iv)?))
         }

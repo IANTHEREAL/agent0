@@ -259,8 +259,21 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 (DataType::Date, DataType::Int32) | (DataType::Int32, DataType::Date) => {
                     Some(DataType::Date)
                 }
+                (DataType::Date, DataType::Int64) => Some(DataType::Date),
+                (DataType::Int64, DataType::Date) if op == "Plus" || op == "+" => {
+                    Some(DataType::Date)
+                }
                 (DataType::Interval, DataType::Interval) => Some(DataType::Interval),
-                (DataType::Timestamp, DataType::Timestamp) if op == "Minus" || op == "-" => {
+                (DataType::Timestamp, DataType::Timestamp)
+                | (DataType::TimestampTz, DataType::TimestampTz)
+                | (DataType::Timestamp, DataType::TimestampTz)
+                | (DataType::TimestampTz, DataType::Timestamp)
+                | (DataType::Timestamp, DataType::Date)
+                | (DataType::Date, DataType::Timestamp)
+                | (DataType::TimestampTz, DataType::Date)
+                | (DataType::Date, DataType::TimestampTz)
+                    if op == "Minus" || op == "-" =>
+                {
                     Some(DataType::Interval)
                 }
                 (DataType::Date, DataType::Date) if op == "Minus" || op == "-" => {
