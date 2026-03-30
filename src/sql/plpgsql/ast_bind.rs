@@ -635,6 +635,7 @@ fn model_type_to_ast_type(dt: &DataType) -> AstDataType {
         }
         DataType::Int32 => AstDataType::Integer(None),
         DataType::Int64 => AstDataType::BigInt(None),
+        DataType::Oid => custom_ast_type("oid"),
         DataType::Float64 => AstDataType::DoublePrecision,
         DataType::Numeric { .. } => custom_ast_type("numeric"),
         DataType::Boolean => AstDataType::Boolean,

@@ -90,7 +90,7 @@ impl HnswScanOperator {
             .unwrap_or(DataType::Int64);
 
         match pk_ty {
-            DataType::Int64 => {
+            DataType::Int64 | DataType::Oid => {
                 let v = i64::try_from(label)
                     .map_err(|_| anyhow!("HNSW label {} does not fit BIGINT primary key", label))?;
                 Ok(Value::Int64(v))

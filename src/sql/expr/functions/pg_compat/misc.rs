@@ -37,6 +37,7 @@ pub(crate) fn pg_typeof_name_for_datatype(dt: &DataType) -> String {
         DataType::Boolean => "boolean".to_string(),
         DataType::Int32 => "integer".to_string(),
         DataType::Int64 => "bigint".to_string(),
+        DataType::Oid => "oid".to_string(),
         DataType::Float64 => "double precision".to_string(),
         DataType::Numeric { .. } => "numeric".to_string(),
         DataType::Text => "text".to_string(),

@@ -166,7 +166,7 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let v: i32 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Int32(v), deserializer.position())
         }
-        DataType::Int64 => {
+        DataType::Int64 | DataType::Oid => {
             let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Int64(v), deserializer.position())
         }

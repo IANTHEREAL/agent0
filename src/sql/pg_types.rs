@@ -290,6 +290,7 @@ pub(crate) fn oid_and_typlen_for_datatype(dt: &DataType) -> (i64, i32) {
         DataType::Boolean => (OID_BOOL, 1),
         DataType::Int32 => (OID_INT4, 4),
         DataType::Int64 => (OID_INT8, 8),
+        DataType::Oid => (OID_OID, 4),
         DataType::Float64 => (OID_FLOAT8, 8),
         DataType::Text => (OID_TEXT, -1),
         DataType::Bytes => (OID_BYTEA, -1),

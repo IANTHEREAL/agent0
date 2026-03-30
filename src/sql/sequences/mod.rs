@@ -312,7 +312,7 @@ pub(crate) fn build_implicit_sequence_def(
     };
 
     let max_value = match data_type {
-        DataType::Int64 => i64::MAX,
+        DataType::Int64 | DataType::Oid => i64::MAX,
         _ => i32::MAX as i64,
     };
 

@@ -25,8 +25,7 @@ impl<'a> Analyzer<'a> {
         }
         if is_oid_alias_type(context_type) {
             // PG infers the unresolved param as `oid`, not as the alias type.
-            // db9 stores OIDs as Int64.
-            return DataType::Int64;
+            return DataType::Oid;
         }
         context_type.clone()
     }
@@ -198,9 +197,9 @@ impl<'a> Analyzer<'a> {
                 // OID alias types (regclass, regtype) are integers at the
                 // storage level.  comparison_target_type returns the alias,
                 // but the runtime cast layer doesn't support Int64→alias.
-                // Use Int64 instead — it's the actual storage type for OIDs.
+                // Use Oid (the base OID type) instead.
                 if is_oid_alias_type(&target) {
-                    target = DataType::Int64;
+                    target = DataType::Oid;
                 }
                 l = self.coerce_if_needed(l, &target)?;
                 r = self.coerce_if_needed(r, &target)?;

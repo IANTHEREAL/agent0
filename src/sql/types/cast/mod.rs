@@ -115,7 +115,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         DataType::Text | DataType::Name => cast_to_text(val),
         DataType::Boolean => cast_to_boolean(val, context),
         DataType::Int32 => cast_to_int32(val, context),
-        DataType::Int64 => cast_to_int64(val, context),
+        DataType::Int64 | DataType::Oid => cast_to_int64(val, context),
         DataType::Float64 => cast_to_float64(val, context),
         DataType::Bytes => cast_to_bytea(val),
         DataType::Date
@@ -977,9 +977,14 @@ pub(crate) fn parse_typed_value(val: &str, data_type: &DataType) -> Result<Value
                 value: val.to_string(),
             })
         }),
-        DataType::Int64 => trimmed.parse::<i64>().map(Value::Int64).map_err(|_| {
+        DataType::Int64 | DataType::Oid => trimmed.parse::<i64>().map(Value::Int64).map_err(|_| {
             anyhow::Error::from(SqlError::InvalidInputSyntax {
-                type_name: "bigint".into(),
+                type_name: if matches!(data_type, DataType::Oid) {
+                    "oid"
+                } else {
+                    "bigint"
+                }
+                .into(),
                 value: val.to_string(),
             })
         }),

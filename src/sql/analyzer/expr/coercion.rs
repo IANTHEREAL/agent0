@@ -70,10 +70,11 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
-    /// OID alias types (regclass, regtype) are storage-compatible with Int64/Int32.
+    /// OID alias types (regclass, regtype) are storage-compatible with Int64/Int32/Oid.
     fn oid_alias_compat(a: &DataType, b: &DataType) -> bool {
-        (is_oid_alias_type(a) && matches!(b, DataType::Int64 | DataType::Int32))
-            || (is_oid_alias_type(b) && matches!(a, DataType::Int64 | DataType::Int32))
+        (is_oid_alias_type(a) && matches!(b, DataType::Int64 | DataType::Int32 | DataType::Oid))
+            || (is_oid_alias_type(b)
+                && matches!(a, DataType::Int64 | DataType::Int32 | DataType::Oid))
     }
 
     // -- Helper: comparison coercion --

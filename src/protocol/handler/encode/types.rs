@@ -28,6 +28,7 @@ pub(in crate::protocol::handler) fn pgtype_to_datatype(pg: &Type) -> Option<Data
         }),
         Type::REGCLASS => Some(DataType::UserDefined("pg_catalog.regclass".to_string())),
         Type::REGTYPE => Some(DataType::UserDefined("pg_catalog.regtype".to_string())),
+        Type::OID => Some(DataType::Oid),
         Type::NAME => Some(DataType::Name),
         Type::INT2_VECTOR => Some(DataType::UserDefined("int2vector".to_string())),
         Type::OID_VECTOR => Some(DataType::UserDefined("oidvector".to_string())),
@@ -57,6 +58,7 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         Some(DataType::Jsonb) => Type::JSONB,
         Some(DataType::Time) => Type::TIME,
         Some(DataType::Numeric { .. }) => Type::NUMERIC,
+        Some(DataType::Oid) => Type::OID,
         Some(DataType::Name) => Type::NAME,
         Some(DataType::Array(inner)) => match inner.as_ref() {
             DataType::Boolean => Type::BOOL_ARRAY,
@@ -150,5 +152,22 @@ mod tests {
             pgtype_to_datatype(&Type::REGTYPE),
             Some(DataType::UserDefined("pg_catalog.regtype".to_string()))
         );
+    }
+
+    #[test]
+    fn pgtype_to_datatype_maps_oid() {
+        assert_eq!(pgtype_to_datatype(&Type::OID), Some(DataType::Oid));
+    }
+
+    #[test]
+    fn datatype_to_pgtype_maps_oid() {
+        assert_eq!(datatype_to_pgtype(Some(&DataType::Oid)), Type::OID);
+    }
+
+    #[test]
+    fn oid_roundtrip() {
+        // pgtype -> datatype -> pgtype should roundtrip
+        let dt = pgtype_to_datatype(&Type::OID).unwrap();
+        assert_eq!(datatype_to_pgtype(Some(&dt)), Type::OID);
     }
 }
