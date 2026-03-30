@@ -368,8 +368,7 @@ src/sql/
 ├── statement_time.rs          # Statement timing
 ├── table_functions.rs         # Table function runtime
 ├── timezone.rs                # Timezone handling
-├── udt.rs                     # User-defined type helpers
-└── value_coercion.rs          # Value-level type coercion
+└── udt.rs                     # User-defined type helpers
 ```
 
 ## Where to Look

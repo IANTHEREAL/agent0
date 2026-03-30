@@ -73,4 +73,3 @@ pub(crate) mod session;
 pub use session::*;
 mod aggregate;
 pub use aggregate::*;
-pub(crate) mod value_coercion;

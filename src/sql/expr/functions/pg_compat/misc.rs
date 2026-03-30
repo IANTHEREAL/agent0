@@ -81,27 +81,31 @@ pub fn pg_typeof(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn pg_column_size(args: Vec<Value>) -> Result<Value> {
+    use crate::sql::types::sizing;
+
     let val = args.into_iter().next().unwrap_or(Value::Null);
+    // PG's pg_column_size() is strict: returns NULL for NULL input.
+    if matches!(val, Value::Null) {
+        return Ok(Value::Null);
+    }
     let size = match &val {
-        Value::Null => 0,
+        Value::Null => unreachable!(), // handled above
         Value::Boolean(_) => 1,
         Value::Int32(_) => 4,
-        Value::Int64(_) => 8,
-        Value::Float64(_) => 8,
-        Value::Numeric(_) => 16,
-        Value::Text(s) => s.len() as i32 + 4,
-        Value::Bytes(b) => b.len() as i32 + 4,
-        Value::Timestamp(_) => 8,
+        Value::Int64(_) | Value::Float64(_) => 8,
+        Value::Numeric(d) => sizing::numeric_datum_width(d),
         Value::Date(_) => 4,
-        Value::Time(_) => 8,
-        Value::Interval(_) => 16,
+        Value::Time(_) | Value::Timestamp(_) => 8,
+        Value::Interval { .. } => 16,
         Value::Uuid(_) => 16,
-        Value::Json(s) | Value::Jsonb(s) => s.len() as i32 + 4,
-        Value::Array(a) => a.len() as i32 * 8 + 4,
-        Value::Vector(v) => v.len() as i32 * 4 + 4,
-        Value::Tsvector(s) | Value::Tsquery(s) => s.len() as i32 + 4,
+        Value::Text(s) => s.len() + 4,
+        Value::Json(s) | Value::Jsonb(s) => s.len() + 4,
+        Value::Bytes(b) => b.len() + 4,
+        Value::Tsvector(s) | Value::Tsquery(s) => s.len() + 4,
+        Value::Vector(v) => v.len() * 4 + 4,
+        Value::Array(a) => sizing::array_datum_width(a),
     };
-    Ok(Value::Int32(size))
+    Ok(Value::Int32(size as i32))
 }
 
 pub fn format_type(args: Vec<Value>) -> Result<Value> {

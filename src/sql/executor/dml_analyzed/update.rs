@@ -200,7 +200,7 @@ impl Executor {
                     )
                     .await?;
                 let col = &schema.columns[*col_idx];
-                new_vals[*col_idx] = crate::sql::value_coercion::coerce_value_for_column(val, col)?;
+                new_vals[*col_idx] = crate::sql::types::cast::coerce_value_for_column(val, col)?;
             }
 
             let new_row = Row::new(new_vals);

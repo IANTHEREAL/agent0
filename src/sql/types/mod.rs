@@ -9,6 +9,7 @@ pub(crate) mod cast;
 pub(crate) mod coercion;
 pub(crate) mod mapping;
 pub(crate) mod registry;
+pub(crate) mod sizing;
 
 pub(crate) use cast::CastContext;
 pub(crate) use mapping::sql_datatype_to_internal_strict;

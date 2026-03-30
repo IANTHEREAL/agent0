@@ -607,3 +607,133 @@ fn jsonb_to_json_canonical() {
     .unwrap();
     assert_eq!(result, Value::Json(r#"{"a": 2, "b": 1}"#.into()));
 }
+
+// ---- Tests moved from value_coercion.rs ----
+
+use crate::model::ColumnDef;
+
+fn test_col(name: &str, data_type: DataType) -> ColumnDef {
+    ColumnDef::new(name, data_type, true)
+}
+
+#[test]
+fn test_coerce_timestamp_time_array_vector_from_text() {
+    let ts_col = test_col("ts", DataType::Timestamp);
+    let got = coerce_value_for_column(Value::Text("2026-01-01 00:00:00".into()), &ts_col).unwrap();
+    assert!(matches!(got, Value::Timestamp(_)));
+
+    let tstz_col = test_col("tsz", DataType::TimestampTz);
+    let got = coerce_value_for_column(
+        Value::Text("2026-02-02 23:39:52.850 +00:00".into()),
+        &tstz_col,
+    )
+    .unwrap();
+    assert!(matches!(got, Value::Timestamp(_)));
+
+    let ts_bad = coerce_value_for_column(Value::Text("not-a-ts".into()), &ts_col)
+        .unwrap_err()
+        .to_string();
+    assert!(ts_bad.contains("invalid input syntax for type timestamp"));
+
+    let time_col = test_col("t", DataType::Time);
+    let got = coerce_value_for_column(Value::Text("01:02:03.004005".into()), &time_col).unwrap();
+    assert_eq!(got, Value::Time(3_723_004_005));
+
+    let time_bad = coerce_value_for_column(Value::Text("99:99".into()), &time_col)
+        .unwrap_err()
+        .to_string();
+    assert!(time_bad.contains("invalid input syntax for type time"));
+
+    let arr_col = test_col("a", DataType::Array(Box::new(DataType::Int32)));
+    let got = coerce_value_for_column(Value::Text("{1,2}".into()), &arr_col).unwrap();
+    assert_eq!(got, Value::Array(vec![Value::Int32(1), Value::Int32(2)]));
+
+    let arr_bad = coerce_value_for_column(Value::Text("not-an-array".into()), &arr_col)
+        .unwrap_err()
+        .to_string();
+    assert!(arr_bad.contains("invalid input syntax for type array"));
+
+    let vec_col = test_col("v", DataType::Vector(3));
+    let got = coerce_value_for_column(Value::Text("[1, 2, 3]".into()), &vec_col).unwrap();
+    assert_eq!(got, Value::Vector(vec![1.0, 2.0, 3.0]));
+
+    let vec_bad = coerce_value_for_column(Value::Text("not-a-vector".into()), &vec_col)
+        .unwrap_err()
+        .to_string();
+    assert!(vec_bad.contains("invalid input syntax for type vector"));
+}
+
+#[test]
+fn test_value_to_sql_expr_timestamp_preserves_timestamp_semantics() {
+    use chrono::{TimeZone, Utc};
+    use sqlparser::ast::BinaryOperator;
+
+    let ts1 = Utc
+        .with_ymd_and_hms(2000, 1, 1, 0, 0, 1)
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    let ts2 = Utc
+        .with_ymd_and_hms(2000, 1, 1, 0, 0, 2)
+        .single()
+        .unwrap()
+        .timestamp_millis();
+
+    let right_expr = value_to_sql_expr(&Value::Timestamp(ts1));
+    let right_val = crate::sql::expr::bridge::eval_const_ast_expr(&right_expr).unwrap();
+
+    let diff = crate::sql::expr::operators::eval_binary_op(
+        Value::Timestamp(ts2),
+        &BinaryOperator::Minus,
+        right_val,
+    )
+    .unwrap();
+
+    assert_eq!(
+        diff,
+        Value::Interval(crate::model::IntervalValue::from_millis(1_000))
+    );
+}
+
+#[test]
+fn test_parse_pg_array() {
+    let result = parse_pg_array("{1,2,3}").unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0], Value::Int32(1));
+    assert_eq!(result[1], Value::Int32(2));
+    assert_eq!(result[2], Value::Int32(3));
+}
+
+#[test]
+fn test_parse_pg_array_empty() {
+    let result = parse_pg_array("{}").unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_parse_pg_array_strings() {
+    let result = parse_pg_array("{hello,world}").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], Value::Text("hello".to_string()));
+    assert_eq!(result[1], Value::Text("world".to_string()));
+}
+
+#[test]
+fn test_parse_pg_array_quoted_null_is_text() {
+    let result = parse_pg_array("{NULL,\"NULL\"}").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], Value::Null);
+    assert_eq!(result[1], Value::Text("NULL".to_string()));
+}
+
+#[test]
+fn test_infer_data_type() {
+    assert_eq!(infer_data_type(&Value::Int32(1)), DataType::Int32);
+    assert_eq!(infer_data_type(&Value::Int64(1)), DataType::Int64);
+    assert_eq!(infer_data_type(&Value::Float64(1.0)), DataType::Float64);
+    assert_eq!(infer_data_type(&Value::Boolean(true)), DataType::Boolean);
+    assert_eq!(
+        infer_data_type(&Value::Text("".to_string())),
+        DataType::Text
+    );
+}

@@ -158,7 +158,7 @@ pub(crate) async fn execute_trigger_statement_standalone(
                                     crate::sql::expr::bridge::eval_const_ast_expr(&expr)?
                                 };
 
-                                let coerced = crate::sql::value_coercion::coerce_value_for_column(
+                                let coerced = crate::sql::types::cast::coerce_value_for_column(
                                     value,
                                     &schema.columns[idx],
                                 )?;

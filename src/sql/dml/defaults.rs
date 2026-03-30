@@ -16,7 +16,7 @@ use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::sql::sequences;
 use crate::sql::sequences::{classify_serial_default, SequenceSession, SerialDefaultBehavior};
-use crate::sql::value_coercion::coerce_value_for_column;
+use crate::sql::types::cast::coerce_value_for_column;
 use crate::storage::TikvStore;
 
 /// Build a `CatalogSnapshot` populated with all UDTs in the database so that

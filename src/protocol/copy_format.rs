@@ -1,7 +1,11 @@
 //! PostgreSQL COPY format encoding (text and CSV).
 
-use crate::model::Value;
+use crate::model::{DataType, Value};
+use crate::sql::error::SqlError;
+use anyhow::Result;
 use chrono::{TimeZone, Utc};
+use rust_decimal::Decimal;
+use std::str::FromStr;
 
 const TAB: u8 = b'\t';
 const NEWLINE: u8 = b'\n';
@@ -411,6 +415,248 @@ fn write_hex_byte(byte: u8, buf: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     buf.push(HEX[(byte >> 4) as usize]);
     buf.push(HEX[(byte & 0xf) as usize]);
+}
+
+const MAX_RUNTIME_NUMERIC_SCALE: u32 = Decimal::MAX_SCALE;
+
+/// Parse a text-format COPY field into a typed Value.
+pub(crate) fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
+    let unescaped = unescape_copy_text(val);
+    let trimmed = unescaped.trim();
+
+    match data_type {
+        DataType::Boolean => match trimmed.to_lowercase().as_str() {
+            "t" | "true" | "1" | "yes" | "on" => Ok(Value::Boolean(true)),
+            "f" | "false" | "0" | "no" | "off" => Ok(Value::Boolean(false)),
+            _ => Err(SqlError::InvalidInputSyntax {
+                type_name: "boolean".into(),
+                value: unescaped.clone(),
+            }
+            .into()),
+        },
+        DataType::Int32 => trimmed.parse::<i32>().map(Value::Int32).map_err(|_| {
+            anyhow::Error::from(SqlError::InvalidInputSyntax {
+                type_name: "integer".into(),
+                value: unescaped.clone(),
+            })
+        }),
+        DataType::Int64 => trimmed.parse::<i64>().map(Value::Int64).map_err(|_| {
+            anyhow::Error::from(SqlError::InvalidInputSyntax {
+                type_name: "bigint".into(),
+                value: unescaped.clone(),
+            })
+        }),
+        DataType::Float64 => trimmed.parse::<f64>().map(Value::Float64).map_err(|_| {
+            anyhow::Error::from(SqlError::InvalidInputSyntax {
+                type_name: "double precision".into(),
+                value: unescaped.clone(),
+            })
+        }),
+        DataType::Timestamp => crate::sql::expr::parse_timestamp_string(trimmed).map_err(|_| {
+            anyhow::Error::from(SqlError::InvalidInputSyntax {
+                type_name: "timestamp".into(),
+                value: unescaped.clone(),
+            })
+        }),
+        DataType::TimestampTz => crate::sql::expr::parse_timestamp_string(trimmed).map_err(|_| {
+            anyhow::Error::from(SqlError::InvalidInputSyntax {
+                type_name: "timestamp with time zone".into(),
+                value: unescaped.clone(),
+            })
+        }),
+        DataType::Date => crate::model::date::parse_date_days(trimmed)
+            .map(Value::Date)
+            .map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "date".into(),
+                    value: unescaped.clone(),
+                })
+            }),
+        DataType::Uuid => uuid::Uuid::parse_str(trimmed)
+            .map(|u| Value::Uuid(*u.as_bytes()))
+            .map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "uuid".into(),
+                    value: unescaped.clone(),
+                })
+            }),
+        DataType::Bytes => {
+            if let Some(hex_str) = unescaped.strip_prefix("\\x") {
+                Ok(hex::decode(hex_str)
+                    .map(Value::Bytes)
+                    .unwrap_or(Value::Bytes(unescaped.into_bytes())))
+            } else {
+                Ok(Value::Bytes(unescaped.into_bytes()))
+            }
+        }
+        DataType::Time => crate::sql::types::cast::parse_time_string(trimmed)
+            .map(Value::Time)
+            .ok_or_else(|| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "time".into(),
+                    value: unescaped.clone(),
+                })
+            }),
+        DataType::Interval => crate::sql::expr::parse_interval_string(trimmed).map_err(|_| {
+            anyhow::Error::from(SqlError::InvalidInputSyntax {
+                type_name: "interval".into(),
+                value: unescaped.clone(),
+            })
+        }),
+        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::UserDefined(_) => {
+            Ok(Value::Text(unescaped))
+        }
+        DataType::Array(elem_type) => {
+            let elements = crate::sql::types::cast::parse_pg_array(trimmed).map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "array".into(),
+                    value: unescaped.clone(),
+                })
+            })?;
+            // Cast each element to the declared element type so that e.g.
+            // UUID strings become Value::Uuid, not Value::Text.
+            let mut typed = Vec::with_capacity(elements.len());
+            for v in elements {
+                if v == Value::Null {
+                    typed.push(Value::Null);
+                } else {
+                    typed.push(crate::sql::types::cast::cast(
+                        v,
+                        elem_type,
+                        crate::sql::types::CastContext::Assignment,
+                    )?);
+                }
+            }
+            Ok(Value::Array(typed))
+        }
+        DataType::Json => {
+            serde_json::from_str::<serde_json::Value>(&unescaped).map_err(|e| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "json".into(),
+                    value: e.to_string(),
+                }
+            })?;
+            Ok(Value::Json(unescaped))
+        }
+        DataType::Jsonb => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&unescaped).map_err(|e| SqlError::InvalidInputSyntax {
+                    type_name: "jsonb".into(),
+                    value: e.to_string(),
+                })?;
+            Ok(Value::Jsonb(parsed.to_string()))
+        }
+        DataType::Vector(_) => {
+            if unescaped.starts_with('[') && unescaped.ends_with(']') {
+                let inner = &unescaped[1..unescaped.len() - 1];
+                let elements: std::result::Result<Vec<f64>, _> =
+                    inner.split(',').map(|s| s.trim().parse::<f64>()).collect();
+                elements.map(Value::Vector).map_err(|_| {
+                    anyhow::Error::from(SqlError::InvalidInputSyntax {
+                        type_name: "vector".into(),
+                        value: unescaped.clone(),
+                    })
+                })
+            } else {
+                Err(SqlError::InvalidInputSyntax {
+                    type_name: "vector".into(),
+                    value: unescaped.clone(),
+                }
+                .into())
+            }
+        }
+        DataType::Numeric { scale, .. } => {
+            let mut d = Decimal::from_str(trimmed).map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "numeric".into(),
+                    value: unescaped.clone(),
+                })
+            })?;
+            if let Some(s) = scale {
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
+            }
+            Ok(Value::Numeric(d))
+        }
+        DataType::Tsvector => Ok(Value::Tsvector(unescaped)),
+        DataType::Tsquery => {
+            crate::sql::fts::validate_tsquery_syntax(&unescaped)?;
+            Ok(Value::Tsquery(unescaped))
+        }
+        DataType::Unknown => {
+            unreachable!("DataType::Unknown must be resolved before reaching COPY parsing")
+        }
+    }
+}
+
+fn unescape_copy_text(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            out.push(b'\\');
+            break;
+        }
+
+        match bytes[i] {
+            b'b' => {
+                out.push(0x08);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 1;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0b);
+                i += 1;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 1;
+            }
+            b'0'..=b'7' => {
+                let mut oct: u16 = (bytes[i] - b'0') as u16;
+                i += 1;
+                for _ in 0..2 {
+                    if i < bytes.len() && bytes[i].is_ascii_digit() && bytes[i] < b'8' {
+                        oct = (oct * 8).saturating_add((bytes[i] - b'0') as u16);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push((oct & 0xff) as u8);
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 #[cfg(test)]
@@ -1066,6 +1312,49 @@ mod tests {
             msg.contains("Parquet"),
             "error message should mention Parquet, got: {}",
             msg
+        );
+    }
+
+    // --- parse_value_for_copy tests (moved from value_coercion.rs) ---
+
+    #[test]
+    fn parse_value_for_copy_trims_common_scalars() {
+        assert_eq!(
+            parse_value_for_copy(" 1 ", &DataType::Int32).unwrap(),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            parse_value_for_copy(" true\t", &DataType::Boolean).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_rejects_invalid_timestamp_instead_of_falling_back_to_text() {
+        let err = parse_value_for_copy("abc", &DataType::Timestamp).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type timestamp"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_rejects_invalid_time_instead_of_falling_back_to_text() {
+        let err = parse_value_for_copy("25:00:00", &DataType::Time).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type time"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_parses_interval() {
+        use crate::model::IntervalValue;
+        assert_eq!(
+            parse_value_for_copy("1 day", &DataType::Interval).unwrap(),
+            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
         );
     }
 }

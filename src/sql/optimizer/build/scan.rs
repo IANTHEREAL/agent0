@@ -15,7 +15,7 @@ use crate::sql::operators::{
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::planner::hnsw_predicate::HnswQueryVector;
 use crate::sql::planner::{collect_typed_eq_predicates, ScanType};
-use crate::sql::value_coercion::coerce_value_for_column;
+use crate::sql::types::cast::coerce_value_for_column;
 
 pub(super) fn build_seq_scan_operator(
     ctx: &BuildContext,

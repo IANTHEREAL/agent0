@@ -379,9 +379,7 @@ impl Executor {
                                         .await?;
                                     let col = &schema.columns[*col_idx];
                                     updated_vals[*col_idx] =
-                                        crate::sql::value_coercion::coerce_value_for_column(
-                                            val, col,
-                                        )?;
+                                        crate::sql::types::cast::coerce_value_for_column(val, col)?;
                                 }
                                 let updated_row = Row::new(updated_vals);
 

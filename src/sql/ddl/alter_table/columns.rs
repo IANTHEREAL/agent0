@@ -14,7 +14,7 @@ use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
 use crate::sql::sequences;
-use crate::sql::value_coercion::coerce_value_for_column;
+use crate::sql::types::cast::coerce_value_for_column;
 use crate::storage::TikvStore;
 use crate::txn::txn_put;
 

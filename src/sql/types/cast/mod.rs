@@ -5,10 +5,11 @@
 //! - `Assignment`: INSERT/UPDATE column coercion — medium
 //! - `Implicit`: Comparison coercion — strictest
 
-use crate::model::{DataType, Value};
+use crate::model::{ColumnDef, DataType, Value};
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
+use sqlparser::ast::Expr;
 use std::str::FromStr;
 
 const MAX_RUNTIME_NUMERIC_SCALE: u32 = Decimal::MAX_SCALE;
@@ -393,14 +394,12 @@ fn cast_to_temporal(val: Value, target: &DataType) -> Result<Value> {
         }
         (Value::Text(s), DataType::Time) => {
             let trimmed = s.trim();
-            crate::sql::value_coercion::parse_time_string(trimmed)
-                .map(Value::Time)
-                .ok_or_else(|| {
-                    anyhow::Error::from(SqlError::InvalidInputSyntax {
-                        type_name: "time".into(),
-                        value: s,
-                    })
+            parse_time_string(trimmed).map(Value::Time).ok_or_else(|| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "time".into(),
+                    value: s,
                 })
+            })
         }
         (Value::Time(micros), DataType::Time) => Ok(Value::Time(micros)),
         (v, _) => cast_catchall(v, target, CastContext::Explicit),
@@ -543,7 +542,7 @@ fn cast_to_array(val: Value, target: &DataType, context: CastContext) -> Result<
     };
     match val {
         Value::Text(s) => {
-            let arr = crate::sql::value_coercion::parse_pg_array(&s).map_err(|_| {
+            let arr = parse_pg_array(&s).map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
                     type_name: "array".into(),
                     value: s,
@@ -724,6 +723,233 @@ pub(crate) fn coerce_text_to_numeric(v: Value) -> Result<Value> {
 /// internal short aliases to their canonical SQL display names.
 fn normalize_regtype(s: &str) -> String {
     crate::sql::pg_types::canonical_regtype_name(s)
+}
+
+/// Coerce a value to match the expected column type
+pub(crate) fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
+    cast(val, &col.data_type, super::CastContext::Assignment)
+}
+
+/// Parse a PostgreSQL array literal string into a Vec<Value>
+pub(crate) fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return Err(anyhow!("Invalid array format"));
+    }
+
+    let inner = &s[1..s.len() - 1];
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quoted_element = false;
+    let mut escape_next = false;
+
+    for c in inner.chars() {
+        if escape_next {
+            current.push(c);
+            escape_next = false;
+            continue;
+        }
+
+        match c {
+            '\\' => escape_next = true,
+            '"' => {
+                if !in_quotes && current.trim().is_empty() {
+                    quoted_element = true;
+                }
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                let val = parse_array_element(&current, quoted_element);
+                result.push(val);
+                current.clear();
+                quoted_element = false;
+            }
+            _ => current.push(c),
+        }
+    }
+
+    if !current.is_empty() || inner.ends_with(',') {
+        let val = parse_array_element(&current, quoted_element);
+        result.push(val);
+    }
+
+    Ok(result)
+}
+
+/// Parse a single array element string into a Value
+fn parse_array_element(s: &str, quoted: bool) -> Value {
+    let s = s.trim();
+    if !quoted && s.eq_ignore_ascii_case("NULL") {
+        return Value::Null;
+    }
+
+    if let Ok(i) = s.parse::<i32>() {
+        return Value::Int32(i);
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Value::Int64(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Value::Float64(f);
+    }
+    if s.eq_ignore_ascii_case("true") {
+        return Value::Boolean(true);
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return Value::Boolean(false);
+    }
+
+    Value::Text(s.to_string())
+}
+
+/// Infer the DataType from a Value
+pub(crate) fn infer_data_type(value: &Value) -> DataType {
+    match value {
+        Value::Int32(_) => DataType::Int32,
+        Value::Int64(_) => DataType::Int64,
+        Value::Float64(_) => DataType::Float64,
+        Value::Boolean(_) => DataType::Boolean,
+        Value::Text(_) => DataType::Text,
+        Value::Bytes(_) => DataType::Bytes,
+        Value::Timestamp(_) => DataType::Timestamp,
+        Value::Interval { .. } => DataType::Interval,
+        Value::Time(_) => DataType::Time,
+        Value::Date(_) => DataType::Date,
+        Value::Uuid(_) => DataType::Uuid,
+        Value::Vector(vec) => DataType::Vector(vec.len() as u32),
+        Value::Json(_) => DataType::Json,
+        Value::Jsonb(_) => DataType::Jsonb,
+        Value::Array(_) => DataType::Text,
+        Value::Null => DataType::Text,
+        Value::Numeric(_) => DataType::Numeric {
+            precision: None,
+            scale: None,
+        },
+        Value::Tsvector(_) => DataType::Tsvector,
+        Value::Tsquery(_) => DataType::Tsquery,
+    }
+}
+
+/// Parse a time string (HH:MM or HH:MM:SS or HH:MM:SS.ffffff) into microseconds since midnight
+pub(crate) fn parse_time_string(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+
+    let hours: i64 = parts[0].parse().ok()?;
+    let minutes: i64 = parts[1].parse().ok()?;
+
+    let (seconds, micros) = if parts.len() == 3 {
+        if let Some(dot_pos) = parts[2].find('.') {
+            let secs: i64 = parts[2][..dot_pos].parse().ok()?;
+            let frac_str = &parts[2][dot_pos + 1..];
+            let padded = format!("{:0<6}", frac_str);
+            let micros: i64 = padded[..6].parse().ok()?;
+            (secs, micros)
+        } else {
+            let secs: i64 = parts[2].parse().ok()?;
+            (secs, 0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+        return None;
+    }
+
+    Some(hours * 3_600_000_000 + minutes * 60_000_000 + seconds * 1_000_000 + micros)
+}
+
+/// Convert an internal `Value` to a SQL AST `Expr` for re-parsing
+pub(crate) fn value_to_sql_expr(v: &Value) -> Expr {
+    use sqlparser::ast::Value as SqlValue;
+    match v {
+        Value::Null => Expr::Value(SqlValue::Null),
+        Value::Boolean(b) => Expr::Value(SqlValue::Boolean(*b)),
+        Value::Int32(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
+        Value::Int64(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
+        Value::Float64(f) => Expr::Value(SqlValue::Number(format!("{:E}", f), false)),
+        Value::Text(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Bytes(b) => Expr::Value(SqlValue::SingleQuotedString(format!(
+            "\\x{}",
+            hex::encode(b)
+        ))),
+        Value::Timestamp(ts) => {
+            let seconds = ts.div_euclid(1000);
+            let millis = ts.rem_euclid(1000) as u32;
+            let nanos = millis * 1_000_000;
+            if chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos).is_some() {
+                let formatted = crate::model::timestamp::format_timestamp_millis(*ts, false)
+                    .unwrap_or_else(|_| ts.to_string());
+                Expr::TypedString {
+                    data_type: sqlparser::ast::DataType::Timestamp(
+                        None,
+                        sqlparser::ast::TimezoneInfo::None,
+                    ),
+                    value: formatted,
+                }
+            } else {
+                Expr::Value(SqlValue::Number(ts.to_string(), false))
+            }
+        }
+        Value::Interval(iv) => {
+            let mut parts = Vec::new();
+            if iv.months != 0 {
+                parts.push(format!("{} month", iv.months));
+            }
+            if iv.millis != 0 || parts.is_empty() {
+                parts.push(format!("{} millisecond", iv.millis));
+            }
+            Expr::TypedString {
+                data_type: sqlparser::ast::DataType::Interval,
+                value: parts.join(" "),
+            }
+        }
+        Value::Uuid(bytes) => {
+            let uuid = uuid::Uuid::from_bytes(*bytes);
+            Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
+        }
+        Value::Array(elems) => {
+            let elem_exprs: Vec<Expr> = elems.iter().map(value_to_sql_expr).collect();
+            Expr::Array(sqlparser::ast::Array {
+                elem: elem_exprs,
+                named: true,
+            })
+        }
+        Value::Vector(vec) => Expr::Value(SqlValue::SingleQuotedString(
+            crate::model::format_vector_pg_text(vec),
+        )),
+        Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Date(days) => match crate::model::date::format_date_days(*days) {
+            Ok(s) => Expr::TypedString {
+                data_type: sqlparser::ast::DataType::Date,
+                value: s,
+            },
+            Err(_) => Expr::Value(SqlValue::SingleQuotedString(days.to_string())),
+        },
+        Value::Time(micros) => {
+            let total_secs = micros / 1_000_000;
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            Expr::Value(SqlValue::SingleQuotedString(format!(
+                "{:02}:{:02}:{:02}",
+                hours, mins, secs
+            )))
+        }
+        Value::Numeric(d) => Expr::Value(SqlValue::Number(d.to_string(), false)),
+        Value::Tsvector(s) | Value::Tsquery(s) => {
+            Expr::Value(SqlValue::SingleQuotedString(s.clone()))
+        }
+    }
 }
 
 #[cfg(test)]

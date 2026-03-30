@@ -633,7 +633,7 @@ fn decode_text_value(
         }
         t if *t == Type::INTERVAL => crate::sql::expr::parse_interval_string(trimmed)
             .map_err(|_| err(format!("\"{}\"", trimmed))),
-        t if *t == Type::TIME => crate::sql::value_coercion::parse_time_string(trimmed)
+        t if *t == Type::TIME => crate::sql::types::cast::parse_time_string(trimmed)
             .map(Value::Time)
             .ok_or_else(|| err(format!("\"{}\"", trimmed))),
         t if *t == Type::NUMERIC => {
@@ -662,7 +662,7 @@ fn decode_text_value(
             || *t == Type::TIME_ARRAY
             || *t == Type::NUMERIC_ARRAY =>
         {
-            let elements = crate::sql::value_coercion::parse_pg_array(trimmed)
+            let elements = crate::sql::types::cast::parse_pg_array(trimmed)
                 .map_err(|_| err(format!("\"{}\"", trimmed)))?;
             // Re-decode each element through the scalar decode path for the
             // element type so that e.g. UUID strings become Value::Uuid, not

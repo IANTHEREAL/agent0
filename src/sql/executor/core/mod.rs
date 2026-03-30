@@ -66,7 +66,6 @@ use super::super::statement_time;
 use super::super::stats::TableStatsCache;
 use super::super::triggers::TriggerBodyCache;
 use super::super::udt;
-use super::super::value_coercion::parse_value_for_copy;
 use super::super::{
     extract_create_index_with_params, parse_sql, ExecuteResult, ExecuteResults, Session,
 };
@@ -75,6 +74,7 @@ use crate::auth::AuthManager;
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::observability::TenantObservability;
 use crate::pool::TenantMemoryAccountant;
+use crate::protocol::copy_format::parse_value_for_copy;
 use crate::session_context;
 use crate::sql::error::SqlError;
 use crate::sql::optimizer::statistics::TableStatistics;
