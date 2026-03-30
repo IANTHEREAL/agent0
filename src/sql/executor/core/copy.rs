@@ -47,10 +47,6 @@ impl CopyInsertBatchError {
 }
 
 impl Executor {
-    pub fn parse_value_for_copy(&self, val: &str, data_type: &DataType) -> Result<Value> {
-        parse_value_for_copy(val, data_type)
-    }
-
     pub(crate) async fn execute_copy_insert_batch(
         &self,
         session: &mut Session,

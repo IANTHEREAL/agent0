@@ -1,7 +1,6 @@
 //! Shared error/parse helpers for COPY protocol handling.
 
 use crate::model::{DataType, Value};
-use crate::sql::Executor;
 use pgwire::error::{PgWireError, PgWireResult};
 
 use super::super::super::errors::{sqlstate_for_executor_error, user_error};
@@ -59,7 +58,6 @@ pub(super) fn copy_value_parse_error(
 }
 
 pub(super) fn parse_copy_text_line(
-    executor: &Executor,
     resolved_table: &str,
     columns: &[String],
     column_types: &[Option<DataType>],
@@ -76,7 +74,6 @@ pub(super) fn parse_copy_text_line(
         })
         .collect::<Vec<_>>();
     parse_copy_values(
-        executor,
         resolved_table,
         columns,
         column_types,
@@ -93,7 +90,6 @@ struct CopyInputField {
 }
 
 fn parse_copy_values(
-    executor: &Executor,
     resolved_table: &str,
     columns: &[String],
     column_types: &[Option<DataType>],
@@ -129,8 +125,7 @@ fn parse_copy_values(
         let value = if !csv_quoted_non_null && val == copy_opts.null_string.as_str() {
             Value::Null
         } else if let Some(dt) = col_type.as_ref() {
-            executor
-                .parse_value_for_copy(val, dt)
+            crate::protocol::copy_format::parse_value_for_copy(val, dt)
                 .map_err(|e| copy_value_parse_error(resolved_table, line_no, col_name, val, &e))?
         } else {
             Value::Text(val.to_string())
@@ -220,7 +215,6 @@ fn parse_csv_quoted_flags(
 }
 
 fn parse_copy_csv_line(
-    executor: &Executor,
     resolved_table: &str,
     columns: &[String],
     column_types: &[Option<DataType>],
@@ -279,7 +273,6 @@ fn parse_copy_csv_line(
     };
 
     parse_copy_values(
-        executor,
         resolved_table,
         columns,
         column_types,
@@ -291,7 +284,6 @@ fn parse_copy_csv_line(
 }
 
 pub(super) fn parse_copy_input_line(
-    executor: &Executor,
     resolved_table: &str,
     columns: &[String],
     column_types: &[Option<DataType>],
@@ -301,7 +293,6 @@ pub(super) fn parse_copy_input_line(
 ) -> PgWireResult<Vec<(String, Value)>> {
     match copy_opts.format {
         crate::protocol::copy_format::CopyFormat::Text => parse_copy_text_line(
-            executor,
             resolved_table,
             columns,
             column_types,
@@ -310,7 +301,6 @@ pub(super) fn parse_copy_input_line(
             copy_opts,
         ),
         crate::protocol::copy_format::CopyFormat::Csv => parse_copy_csv_line(
-            executor,
             resolved_table,
             columns,
             column_types,
@@ -337,29 +327,9 @@ mod tests {
     use super::*;
     use crate::protocol::copy_format::{CopyFormat, CopyOptions};
     use pgwire::error::PgWireError;
-    use std::sync::Arc;
-
-    fn test_executor() -> Executor {
-        let store = crate::storage::TikvStore::new_stub();
-        let keyspace = "copy_helpers_csv_blank_row".to_string();
-        let observability = crate::observability::registry().tenant(&keyspace);
-        let trigger_cache = Arc::new(crate::sql::triggers::TriggerBodyCache::new());
-        let rls_policy_cache = Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
-        let stats_cache = Arc::new(crate::sql::stats::TableStatsCache::new());
-        Executor::new(
-            store,
-            keyspace,
-            observability,
-            crate::pool::TenantMemoryAccountant::unlimited("copy_helpers".to_string()),
-            trigger_cache,
-            rls_policy_cache,
-            stats_cache,
-        )
-    }
 
     #[test]
     fn csv_blank_row_reports_missing_second_column() {
-        let executor = test_executor();
         let copy_opts = CopyOptions {
             format: CopyFormat::Csv,
             delimiter: b',',
@@ -371,16 +341,9 @@ mod tests {
         let columns = vec!["a".to_string(), "b".to_string()];
         let column_types = vec![None, None];
 
-        let err = parse_copy_input_line(
-            &executor,
-            "public.t_copy",
-            &columns,
-            &column_types,
-            1,
-            b"",
-            &copy_opts,
-        )
-        .expect_err("blank CSV row with two columns should report missing column");
+        let err =
+            parse_copy_input_line("public.t_copy", &columns, &column_types, 1, b"", &copy_opts)
+                .expect_err("blank CSV row with two columns should report missing column");
 
         match err {
             PgWireError::UserError(info) => {
@@ -393,7 +356,6 @@ mod tests {
 
     #[test]
     fn csv_extra_column_reports_pg_extra_data_message() {
-        let executor = test_executor();
         let copy_opts = CopyOptions {
             format: CopyFormat::Csv,
             delimiter: b',',
@@ -406,7 +368,6 @@ mod tests {
         let column_types = vec![None, None];
 
         let err = parse_copy_input_line(
-            &executor,
             "public.t_copy",
             &columns,
             &column_types,

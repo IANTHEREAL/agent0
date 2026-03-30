@@ -144,7 +144,6 @@ impl CopyHandler for DynamicPgHandler {
                         .saturating_add(rows_to_insert.len())
                         .saturating_add(1);
                     let col_values = parse_copy_input_line(
-                        executor,
                         &ctx.table_name,
                         &ctx.columns,
                         &ctx.column_types,
@@ -426,7 +425,6 @@ impl CopyHandler for DynamicPgHandler {
                     } else if !ctx.reached_end_marker {
                         let line_no = ctx.row_count.saturating_add(1);
                         let col_values = match parse_copy_input_line(
-                            executor,
                             &ctx.table_name,
                             &ctx.columns,
                             &ctx.column_types,
