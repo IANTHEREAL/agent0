@@ -23,6 +23,21 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
+fn analyzed_target_to_conflict_target(
+    target: &Option<AnalyzedConflictTarget>,
+) -> Option<ConflictTarget> {
+    match target {
+        Some(AnalyzedConflictTarget::Columns(cols, predicate)) => Some(ConflictTarget::Columns(
+            cols.clone(),
+            predicate.clone(),
+        )),
+        Some(AnalyzedConflictTarget::Constraint(name)) => {
+            Some(ConflictTarget::Constraint(name.clone()))
+        }
+        None => None,
+    }
+}
+
 impl Executor {
     // ── INSERT (analyzed) ───────────────────────────────────
 
@@ -237,17 +252,12 @@ impl Executor {
             }
 
             let conflict_behavior = match &ins.on_conflict {
-                Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+                Some(AnalyzedOnConflict::DoNothing { target }) => {
+                    let target = analyzed_target_to_conflict_target(target);
+                    ConflictBehavior::DoNothing { target }
+                }
                 Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
-                    let target = match target {
-                        Some(AnalyzedConflictTarget::Columns(cols)) => {
-                            Some(ConflictTarget::Columns(cols.clone()))
-                        }
-                        Some(AnalyzedConflictTarget::Constraint(name)) => {
-                            Some(ConflictTarget::Constraint(name.clone()))
-                        }
-                        None => None,
-                    };
+                    let target = analyzed_target_to_conflict_target(target);
                     ConflictBehavior::DoUpdate { target }
                 }
                 None => ConflictBehavior::Error,
@@ -318,7 +328,7 @@ impl Executor {
                     // Handle ON CONFLICT DO UPDATE via analyzed expressions.
                     if let Some(ref oc) = ins.on_conflict {
                         match oc {
-                            AnalyzedOnConflict::DoNothing => continue,
+                            AnalyzedOnConflict::DoNothing { .. } => continue,
                             AnalyzedOnConflict::DoUpdate {
                                 assignments,
                                 where_clause: _,

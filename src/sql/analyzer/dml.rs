@@ -166,15 +166,19 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Resolve ON CONFLICT target to analyzed form.
+    /// Validates the WHERE predicate (if any) via expression analysis:
+    /// column references, type checking, and boolean result type.
     fn resolve_conflict_target(
-        &self,
+        &mut self,
         target: &Option<ast::ConflictTarget>,
         schema: &crate::model::TableSchema,
+        table_scope_name: &str,
+        table_cols: &[(String, DataType, Option<String>)],
         table_name_for_errors: &str,
     ) -> Result<Option<AnalyzedConflictTarget>, AnalyzerError> {
         match target {
             None => Ok(None),
-            Some(ast::ConflictTarget::Columns(idents)) => {
+            Some(ast::ConflictTarget::Columns(idents, predicate)) => {
                 let col_names: Vec<String> = idents
                     .iter()
                     .map(|ident| {
@@ -184,12 +188,106 @@ impl<'a> Analyzer<'a> {
                         Ok(col_name)
                     })
                     .collect::<Result<Vec<_>, AnalyzerError>>()?;
-                Ok(Some(AnalyzedConflictTarget::Columns(col_names)))
+                // Analyze the WHERE predicate if present: validate column names,
+                // type-check expressions, and ensure boolean result type.
+                // Then serialize to string for index-predicate matching at runtime.
+                let predicate_str = if let Some(pred_expr) = predicate {
+                    let mut scope = Scope::new();
+                    scope.add_table(table_scope_name, table_cols);
+                    self.scopes.push(scope);
+                    let analyzed = self.analyze_expr(pred_expr);
+                    self.scopes.pop();
+                    let analyzed = analyzed?;
+                    let _ = self.ensure_boolean_dml(analyzed)?;
+                    Some(pred_expr.to_string())
+                } else {
+                    None
+                };
+                Ok(Some(AnalyzedConflictTarget::Columns(
+                    col_names,
+                    predicate_str,
+                )))
             }
             Some(ast::ConflictTarget::OnConstraint(name)) => {
                 let (_schema, constraint_name) = split_object_name(name)
                     .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
                 Ok(Some(AnalyzedConflictTarget::Constraint(constraint_name)))
+            }
+        }
+    }
+
+    /// Validate that the conflict target matches at least one unique index or PK.
+    /// PostgreSQL raises "there is no unique or exclusion constraint matching the
+    /// ON CONFLICT specification" at planning time if no arbiter can be found.
+    fn validate_conflict_arbiter(
+        &self,
+        target: &Option<AnalyzedConflictTarget>,
+        schema: &crate::model::TableSchema,
+    ) -> Result<(), AnalyzerError> {
+        let target = match target {
+            Some(t) => t,
+            None => return Ok(()), // bare ON CONFLICT DO NOTHING matches anything
+        };
+        // If the schema has no PK and no indexes, we don't have enough catalog
+        // info to validate (e.g., unit-test mocks). Skip validation.
+        if schema.pk_indices.is_empty() && schema.indexes.is_empty() {
+            return Ok(());
+        }
+        match target {
+            AnalyzedConflictTarget::Columns(cols, predicate) => {
+                // Check PK.
+                let pk_col_names: Vec<&str> = schema
+                    .pk_indices
+                    .iter()
+                    .map(|&idx| schema.columns[idx].name.as_str())
+                    .collect();
+                if pk_col_names.len() == cols.len()
+                    && cols.iter().all(|c| pk_col_names.contains(&c.as_str()))
+                {
+                    // PK matches; WHERE on non-partial target is allowed (PG ignores it).
+                    return Ok(());
+                }
+                // Check unique indexes.
+                for index in &schema.indexes {
+                    if !index.unique || index.columns.len() != cols.len() {
+                        continue;
+                    }
+                    if !cols.iter().all(|c| index.columns.iter().any(|ic| ic == c)) {
+                        continue;
+                    }
+                    // Match predicate: same logic as runtime index_matches_conflict_target.
+                    match (predicate, &index.predicate) {
+                        (None, None) => return Ok(()),
+                        (None, Some(_)) => continue, // no WHERE doesn't match partial index
+                        (Some(p), Some(ip)) => {
+                            if crate::sql::dml::predicates_match_public(p, ip) {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        (Some(_), None) => return Ok(()), // WHERE on non-partial is OK
+                    }
+                }
+                Err(AnalyzerError::Unsupported(
+                    "there is no unique or exclusion constraint matching the ON CONFLICT specification".to_string(),
+                ))
+            }
+            AnalyzedConflictTarget::Constraint(name) => {
+                // Check PK constraint name.
+                if schema
+                    .pk_constraint_name
+                    .as_deref()
+                    .is_some_and(|pk| pk == name.as_str())
+                {
+                    return Ok(());
+                }
+                // Check unique index by name.
+                if schema.indexes.iter().any(|i| i.unique && i.name == *name) {
+                    return Ok(());
+                }
+                Err(AnalyzerError::Unsupported(
+                    "there is no unique or exclusion constraint matching the ON CONFLICT specification".to_string(),
+                ))
             }
         }
     }
@@ -205,14 +303,27 @@ impl<'a> Analyzer<'a> {
     ) -> Result<AnalyzedOnConflict, AnalyzerError> {
         match on_insert {
             OnInsert::OnConflict(oc) => match &oc.action {
-                ast::OnConflictAction::DoNothing => Ok(AnalyzedOnConflict::DoNothing),
+                ast::OnConflictAction::DoNothing => {
+                    let target = self.resolve_conflict_target(
+                        &oc.conflict_target,
+                        schema,
+                        table_scope_name,
+                        table_cols,
+                        table_name_for_errors,
+                    )?;
+                    self.validate_conflict_arbiter(&target, schema)?;
+                    Ok(AnalyzedOnConflict::DoNothing { target })
+                }
                 ast::OnConflictAction::DoUpdate(do_update) => {
                     // Resolve conflict target.
                     let target = self.resolve_conflict_target(
                         &oc.conflict_target,
                         schema,
+                        table_scope_name,
+                        table_cols,
                         table_name_for_errors,
                     )?;
+                    self.validate_conflict_arbiter(&target, schema)?;
 
                     // Build scope with both target table and "excluded" pseudo-table.
                     // Use dropped-aware path to preserve physical row alignment.

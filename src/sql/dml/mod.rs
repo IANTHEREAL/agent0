@@ -20,13 +20,15 @@ use std::collections::{HashMap, HashSet};
 
 use crate::model::{Row, Value};
 
+pub use insert::predicates_match_public;
+
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
 /// Resolved target selector for `ON CONFLICT DO UPDATE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictTarget {
-    /// `ON CONFLICT (col1, col2, ...)`
-    Columns(Vec<String>),
+    /// `ON CONFLICT (col1, col2, ...) [WHERE predicate]`
+    Columns(Vec<String>, Option<String>),
     /// `ON CONFLICT ON CONSTRAINT constraint_name`
     Constraint(String),
 }
@@ -40,7 +42,8 @@ pub enum ConflictBehavior {
     /// No ON CONFLICT -- unique violations produce an error.
     Error,
     /// ON CONFLICT DO NOTHING -- skip the conflicting row.
-    DoNothing,
+    /// Contains an optional conflict target to restrict which conflict triggers the skip.
+    DoNothing { target: Option<ConflictTarget> },
     /// ON CONFLICT DO UPDATE -- return the conflicting row for caller-side update.
     /// Contains an optional conflict target to restrict which conflict is matched.
     DoUpdate { target: Option<ConflictTarget> },

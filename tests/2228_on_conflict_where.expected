@@ -1,0 +1,22 @@
+val|status
+a|active
+(1 row)
+val|status
+a|active
+a|inactive
+(2 rows)
+val|status
+a|updated
+a|inactive
+(2 rows)
+id|val
+1|first
+(1 row)
+id|val
+1|a
+(1 row)
+psql:tests/2228_on_conflict_where.sql:42: ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+val|status
+x|active
+x|done
+(2 rows)

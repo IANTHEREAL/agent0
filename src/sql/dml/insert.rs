@@ -28,7 +28,7 @@ fn index_matches_conflict_target(
 ) -> bool {
     match target {
         None => true,
-        Some(ConflictTarget::Columns(targets)) => {
+        Some(ConflictTarget::Columns(targets, predicate)) => {
             if !index.unique {
                 return false;
             }
@@ -36,9 +36,259 @@ fn index_matches_conflict_target(
             if index.columns.len() != targets.len() {
                 return false;
             }
-            targets.iter().all(|t| index.columns.iter().any(|c| c == t))
+            if !targets.iter().all(|t| index.columns.iter().any(|c| c == t)) {
+                return false;
+            }
+            // Match the WHERE predicate against the index predicate.
+            // If ON CONFLICT specifies a WHERE, the index must have a matching predicate.
+            // If ON CONFLICT has no WHERE, match non-partial indexes (or any if no predicate).
+            match (predicate, &index.predicate) {
+                (None, None) => true,
+                (None, Some(_)) => false, // PG: ON CONFLICT (col) without WHERE does NOT match partial indexes
+                (Some(p), Some(ip)) => predicates_match(p, ip),
+                (Some(_), None) => true, // PG: WHERE on non-partial index is allowed (WHERE is ignored)
+            }
         }
         Some(ConflictTarget::Constraint(name)) => index.unique && index.name == *name,
+    }
+}
+
+/// Compare ON CONFLICT WHERE predicate against an index predicate.
+///
+/// Both strings come from `Expr::to_string()` (sqlparser Display).
+/// We parse them back to AST and compare normalized forms so that
+/// extra parentheses, operand reversal, and identifier quoting don't
+/// cause false negatives — while preserving case-sensitive string literals
+/// to avoid false positives.
+/// Public wrapper for predicate matching, used by the analyzer for arbiter validation.
+pub fn predicates_match_public(conflict_pred: &str, index_pred: &str) -> bool {
+    predicates_match(conflict_pred, index_pred)
+}
+
+fn predicates_match(conflict_pred: &str, index_pred: &str) -> bool {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    let parse = |s: &str| -> Option<sqlparser::ast::Expr> {
+        Parser::new(&dialect)
+            .try_with_sql(s)
+            .ok()
+            .and_then(|mut p| p.parse_expr().ok())
+    };
+    match (parse(conflict_pred), parse(index_pred)) {
+        (Some(a), Some(b)) => predicate_implies(&a, &b),
+        // Fall back to whitespace-normalized string comparison if parsing fails.
+        _ => {
+            let normalize = |s: &str| -> String {
+                s.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            normalize(conflict_pred) == normalize(index_pred)
+        }
+    }
+}
+
+/// Check if `conflict_pred` implies `index_pred`.
+/// PostgreSQL allows the ON CONFLICT predicate to be stronger than the index
+/// predicate: `WHERE A AND B` matches an index with `WHERE A` because
+/// every row satisfying `A AND B` also satisfies `A`.
+///
+/// Implementation: decompose both into AND conjuncts, then check that every
+/// conjunct of the index predicate has an equivalent conjunct in the conflict
+/// predicate (superset check).
+fn predicate_implies(conflict_pred: &sqlparser::ast::Expr, index_pred: &sqlparser::ast::Expr) -> bool {
+    let mut conflict_conjs = Vec::new();
+    collect_and_conjuncts(conflict_pred, &mut conflict_conjs);
+    let mut index_conjs = Vec::new();
+    collect_and_conjuncts(index_pred, &mut index_conjs);
+
+    // Every index conjunct must be matched by some conflict conjunct.
+    let mut used = vec![false; conflict_conjs.len()];
+    for ic in &index_conjs {
+        let mut found = false;
+        for (j, cc) in conflict_conjs.iter().enumerate() {
+            if !used[j] && exprs_equivalent(ic, cc) {
+                used[j] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recursively compare two AST expressions for semantic equivalence.
+/// - Strips `Nested` (parentheses) wrappers.
+/// - Normalizes identifiers to lowercase (SQL identifiers are case-insensitive).
+/// - Preserves string literal case (string values are case-sensitive).
+/// - For commutative binary ops (=, <>, AND, OR), compares operands in either order.
+/// - For AND, compares conjuncts as a set.
+fn exprs_equivalent(a: &sqlparser::ast::Expr, b: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::{BinaryOperator, Expr, Value as AstValue};
+
+    // Unwrap parentheses.
+    fn unwrap_nested(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
+        let mut cur = e;
+        while let sqlparser::ast::Expr::Nested(inner) = cur {
+            cur = inner;
+        }
+        cur
+    }
+    let a = unwrap_nested(a);
+    let b = unwrap_nested(b);
+
+    match (a, b) {
+        // AND: compare conjuncts as a set (order-independent).
+        (
+            Expr::BinaryOp {
+                op: BinaryOperator::And,
+                ..
+            },
+            _,
+        ) => {
+            let mut a_conjs = Vec::new();
+            collect_and_conjuncts(a, &mut a_conjs);
+            let mut b_conjs = Vec::new();
+            collect_and_conjuncts(b, &mut b_conjs);
+            if a_conjs.len() != b_conjs.len() {
+                return false;
+            }
+            let mut used = vec![false; b_conjs.len()];
+            'outer: for ac in &a_conjs {
+                for (i, bc) in b_conjs.iter().enumerate() {
+                    if !used[i] && exprs_equivalent(ac, bc) {
+                        used[i] = true;
+                        continue 'outer;
+                    }
+                }
+                return false;
+            }
+            true
+        }
+        // Commutative binary ops: try both operand orders.
+        (
+            Expr::BinaryOp {
+                left: al,
+                op: aop,
+                right: ar,
+            },
+            Expr::BinaryOp {
+                left: bl,
+                op: bop,
+                right: br,
+            },
+        ) => {
+            if aop != bop {
+                return false;
+            }
+            let direct = exprs_equivalent(al, bl) && exprs_equivalent(ar, br);
+            if direct {
+                return true;
+            }
+            // Try swapped for commutative operators.
+            if matches!(
+                aop,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::And
+                    | BinaryOperator::Or
+            ) {
+                exprs_equivalent(al, br) && exprs_equivalent(ar, bl)
+            } else {
+                false
+            }
+        }
+        // Identifiers: case-insensitive comparison.
+        (Expr::Identifier(ai), Expr::Identifier(bi)) => {
+            ai.value.eq_ignore_ascii_case(&bi.value)
+        }
+        // Compound identifiers (e.g., table.col): compare last part case-insensitive.
+        (Expr::CompoundIdentifier(ac), Expr::Identifier(bi)) => {
+            ac.last()
+                .is_some_and(|last| last.value.eq_ignore_ascii_case(&bi.value))
+        }
+        (Expr::Identifier(ai), Expr::CompoundIdentifier(bc)) => {
+            bc.last()
+                .is_some_and(|last| last.value.eq_ignore_ascii_case(&ai.value))
+        }
+        (Expr::CompoundIdentifier(ac), Expr::CompoundIdentifier(bc)) => {
+            // Compare from the right (column name), ignoring schema/table prefixes.
+            ac.last().zip(bc.last()).is_some_and(|(a, b)| {
+                a.value.eq_ignore_ascii_case(&b.value)
+            })
+        }
+        // String literals: case-SENSITIVE comparison.
+        (Expr::Value(AstValue::SingleQuotedString(a)), Expr::Value(AstValue::SingleQuotedString(b))) => a == b,
+        // Other values: use PartialEq.
+        (Expr::Value(av), Expr::Value(bv)) => av == bv,
+        // IS NULL / IS NOT NULL.
+        (Expr::IsNull(ae), Expr::IsNull(be)) => exprs_equivalent(ae, be),
+        (Expr::IsNotNull(ae), Expr::IsNotNull(be)) => exprs_equivalent(ae, be),
+        // Unary ops.
+        (
+            Expr::UnaryOp { op: aop, expr: ae },
+            Expr::UnaryOp { op: bop, expr: be },
+        ) => aop == bop && exprs_equivalent(ae, be),
+        // Function calls: compare name case-insensitively, then args recursively.
+        (Expr::Function(af), Expr::Function(bf)) => {
+            use sqlparser::ast::FunctionArgExpr;
+            // Compare function names case-insensitively.
+            if !af.name.to_string().eq_ignore_ascii_case(&bf.name.to_string()) {
+                return false;
+            }
+            // Compare argument lists recursively.
+            let a_args: Vec<_> = af.args.iter().collect();
+            let b_args: Vec<_> = bf.args.iter().collect();
+            if a_args.len() != b_args.len() {
+                return false;
+            }
+            a_args.iter().zip(b_args.iter()).all(|(aa, ba)| {
+                match (aa, ba) {
+                    (sqlparser::ast::FunctionArg::Unnamed(ae), sqlparser::ast::FunctionArg::Unnamed(be)) => {
+                        match (ae, be) {
+                            (FunctionArgExpr::Expr(ae), FunctionArgExpr::Expr(be)) => exprs_equivalent(ae, be),
+                            _ => aa == ba, // Wildcard, QualifiedWildcard
+                        }
+                    }
+                    _ => aa == ba, // Named args — fall back to PartialEq
+                }
+            })
+        }
+        // Fallback: Display comparison (whitespace-normalized, no lowercasing).
+        _ => {
+            let sa = a.to_string();
+            let sb = b.to_string();
+            let normalize = |s: &str| -> String {
+                s.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            normalize(&sa) == normalize(&sb)
+        }
+    }
+}
+
+/// Flatten AND expressions into a list of conjuncts.
+fn collect_and_conjuncts<'a>(expr: &'a sqlparser::ast::Expr, out: &mut Vec<&'a sqlparser::ast::Expr>) {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    let expr = {
+        let mut cur = expr;
+        while let Expr::Nested(inner) = cur {
+            cur = inner;
+        }
+        cur
+    };
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
+        collect_and_conjuncts(left, out);
+        collect_and_conjuncts(right, out);
+    } else {
+        out.push(expr);
     }
 }
 
@@ -47,7 +297,9 @@ fn index_matches_conflict_target(
 fn pk_matches_conflict_target(schema: &TableSchema, target: Option<&ConflictTarget>) -> bool {
     match target {
         None => true,
-        Some(ConflictTarget::Columns(targets)) => {
+        Some(ConflictTarget::Columns(targets, _predicate)) => {
+            // PG: WHERE predicate on a non-partial target (like PK) is allowed
+            // and effectively ignored for matching purposes.
             let pk_col_names: Vec<&str> = schema
                 .pk_indices
                 .iter()
@@ -79,7 +331,16 @@ fn unique_conflict_policy(
     schema: &TableSchema,
 ) -> UniqueConflictPolicy {
     match on_conflict {
-        ConflictBehavior::DoNothing => UniqueConflictPolicy::SkipRow,
+        ConflictBehavior::DoNothing { target } => {
+            if index_matches_conflict_target(index, schema, target.as_ref()) {
+                UniqueConflictPolicy::SkipRow
+            } else {
+                // Defer — the target index may still match later in the iteration.
+                // PG checks all indexes; DO NOTHING succeeds if the target matches
+                // any of the conflicting indexes, even if other indexes also conflict.
+                UniqueConflictPolicy::DeferUniqueViolation
+            }
+        }
         ConflictBehavior::DoUpdate { target } => {
             if index_matches_conflict_target(index, schema, target.as_ref()) {
                 UniqueConflictPolicy::Upsert
@@ -507,7 +768,11 @@ async fn execute_insert_row_inner(
             }
             let pk_values = schema.get_pk_values(&row);
             match &on_conflict {
-                ConflictBehavior::DoNothing => Ok(InsertRowResult::Skipped),
+                ConflictBehavior::DoNothing { target }
+                    if pk_matches_conflict_target(schema, target.as_ref()) =>
+                {
+                    Ok(InsertRowResult::Skipped)
+                }
                 ConflictBehavior::DoUpdate { target }
                     if pk_matches_conflict_target(schema, target.as_ref()) =>
                 {
@@ -530,7 +795,9 @@ async fn execute_insert_row_inner(
                         excluded_row: row,
                     })
                 }
-                ConflictBehavior::Error | ConflictBehavior::DoUpdate { .. } => Err(e),
+                ConflictBehavior::Error
+                | ConflictBehavior::DoUpdate { .. }
+                | ConflictBehavior::DoNothing { .. } => Err(e),
             }
         }
         Err(e) => Err(e),
@@ -657,7 +924,7 @@ mod tests {
     fn do_update_non_target_conflict_is_deferred_until_target_checked() {
         let schema = test_schema();
         let on_conflict = ConflictBehavior::DoUpdate {
-            target: Some(ConflictTarget::Columns(vec!["email".to_string()])),
+            target: Some(ConflictTarget::Columns(vec!["email".to_string()], None)),
         };
         let first = unique_index("uq_t_conflict_other", &["id"]);
         let second = unique_index("uq_t_conflict_email", &["email"]);
