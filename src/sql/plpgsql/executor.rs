@@ -46,9 +46,30 @@ pub fn execute_plpgsql_function<'a>(
 
         // SECURITY DEFINER: set the role override so all statements inside
         // this function execute with the owner's identity for RLS evaluation.
-        if func_def.security_definer {
+        // Also elevate the extension context if the owner is a superuser, so
+        // that permission-gated functions (fs9) respect SECURITY DEFINER.
+        let _security_definer_guard = if func_def.security_definer {
             ctx.security_definer_role = Some(func_def.owner.clone());
-        }
+
+            let owner_is_superuser = if let Some(exec) = executor {
+                exec.auth_manager()
+                    .get_user(txn, &func_def.owner)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|u| u.is_superuser)
+            } else {
+                false
+            };
+
+            if owner_is_superuser {
+                Some(crate::extensions::context::enter_security_definer_superuser())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         for (i, arg_type) in func_def.arg_types.iter().enumerate() {
             let parts: Vec<&str> = arg_type.split_whitespace().collect();
@@ -845,10 +866,24 @@ async fn execute_sql_function_via_executor(
     }
 
     let stmts = parse_sql(&sql)?;
-    let current_role = if func_def.security_definer {
-        Some(func_def.owner.as_str())
+    let (current_role, _security_definer_guard) = if func_def.security_definer {
+        let owner_is_superuser = executor
+            .auth_manager()
+            .get_user(txn, &func_def.owner)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|u| u.is_superuser);
+
+        let guard = if owner_is_superuser {
+            Some(crate::extensions::context::enter_security_definer_superuser())
+        } else {
+            None
+        };
+
+        (Some(func_def.owner.as_str()), guard)
     } else {
-        None
+        (None, None)
     };
 
     for stmt in &stmts {

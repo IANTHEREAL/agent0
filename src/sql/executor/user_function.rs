@@ -158,10 +158,26 @@ async fn execute_sql_table_function(
 
     // SECURITY DEFINER: execute using the function owner's role identity so that
     // RLS policies are evaluated against the definer, not the caller.
-    let current_role_override = if func_def.security_definer {
-        Some(func_def.owner.as_str())
+    // Also elevate the extension context if the owner is a superuser, so
+    // that permission-gated functions (fs9) respect SECURITY DEFINER.
+    let (current_role_override, _security_definer_guard) = if func_def.security_definer {
+        let owner_is_superuser = executor
+            .auth_manager()
+            .get_user(txn, &func_def.owner)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|u| u.is_superuser);
+
+        let guard = if owner_is_superuser {
+            Some(crate::extensions::context::enter_security_definer_superuser())
+        } else {
+            None
+        };
+
+        (Some(func_def.owner.as_str()), guard)
     } else {
-        None
+        (None, None)
     };
 
     let result = executor
