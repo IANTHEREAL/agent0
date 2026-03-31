@@ -308,6 +308,15 @@ pub(crate) async fn txn_batch_mutate_mixed(
         return Ok(());
     }
 
+    // Size guards must run before any TiKV I/O (including savepoint
+    // undo recording) so that oversized keys never hit the network.
+    for m in &mutations {
+        check_key_size(m.key())?;
+        if let BatchMutation::Put(k, v) = m {
+            check_value_size(k, v)?;
+        }
+    }
+
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
 
     // Record undo info for SAVEPOINT before acquiring locks
@@ -318,13 +327,6 @@ pub(crate) async fn txn_batch_mutate_mixed(
                 let prev = txn.get(key.to_vec()).await.map_err(|e| anyhow!(e))?;
                 sp.record_prev_value(key.to_vec(), prev).await?;
             }
-        }
-    }
-
-    // Value size check (only for Put mutations)
-    for m in &mutations {
-        if let BatchMutation::Put(k, v) = m {
-            check_value_size(k, v)?;
         }
     }
 
@@ -359,6 +361,8 @@ pub(crate) async fn txn_batch_mutate_mixed(
 /// TiKV `delete` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_delete(txn: &mut Transaction, key: Vec<u8>) -> Result<()> {
+    check_key_size(&key)?;
+
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
     let should_record = match savepoints.as_ref() {
         Some(sp) => sp.should_record_key(&key).await?,
