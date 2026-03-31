@@ -324,6 +324,41 @@ impl TikvStore {
         Ok(mutations)
     }
 
+    /// Encode an index deletion key without performing any IO.
+    /// Mirrors the key construction logic of [`delete_index_entry`].
+    pub fn encode_index_deletion_key(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+        pk_values: &[Value],
+        unique: bool,
+    ) -> Vec<u8> {
+        let enforce_unique = unique && !Self::index_key_has_null(values);
+        if enforce_unique {
+            self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None))
+        } else {
+            self.key(&encode_index_key_v2(db_id, table_id, index_id, values, Some(pk_values)))
+        }
+    }
+
+    /// Encode GIN index deletion keys without performing any IO.
+    pub fn encode_gin_index_deletion_keys(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hashes: &[u64],
+        pk_values: &[Value],
+    ) -> Vec<Vec<u8>> {
+        let pk_key = encode_pk_values(pk_values);
+        token_hashes
+            .iter()
+            .map(|&th| self.key(&encode_gin_index_key_v2(db_id, table_id, index_id, th, &pk_key)))
+            .collect()
+    }
+
     /// Delete an index entry
     pub async fn delete_index_entry(
         &self,

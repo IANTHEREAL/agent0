@@ -112,6 +112,34 @@ impl Executor {
             None
         };
 
+        // Sort rows by primary key to ensure deterministic lock acquisition
+        // order.  This prevents pessimistic lock deadlocks when concurrent
+        // UPDATE/DELETE statements touch overlapping rows via different index
+        // scans — both sessions will lock rows in the same PK order, making
+        // circular waits impossible.  See issue #2252.
+        //
+        // Pre-compute encoded PK keys (Schwartzian transform) to avoid
+        // O(N log N) clone+encode overhead in the sort comparator.
+        {
+            let pk_indices = &schema.pk_indices;
+            let mut keyed: Vec<(Vec<u8>, usize)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let pk: Vec<Value> =
+                        pk_indices.iter().map(|&idx| r.values[idx].clone()).collect();
+                    (crate::storage::encode_pk_values(&pk), i)
+                })
+                .collect();
+            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let sorted_indices: Vec<usize> = keyed.into_iter().map(|(_, i)| i).collect();
+            let mut sorted_rows = Vec::with_capacity(rows.len());
+            for i in sorted_indices {
+                sorted_rows.push(std::mem::replace(&mut rows[i], Row::new(vec![])));
+            }
+            rows = sorted_rows;
+        }
+
         for r in &rows {
             // Find the matching FROM row (if FROM clause exists) and check WHERE.
             // The matched FROM row is used for SET expression evaluation so that

@@ -392,7 +392,7 @@ impl Executor {
                                 attempt = attempt + 1,
                                 max_attempts,
                                 elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                "write conflict, retrying statement"
+                                "write conflict or deadlock, retrying statement"
                             );
                             self.observability
                                 .record_retry_attempt(extract_write_conflict_reason(&err));
@@ -404,7 +404,7 @@ impl Executor {
                                 attempt = attempt + 1,
                                 max_attempts,
                                 elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                "write conflict retry budget exhausted"
+                                "write conflict or deadlock retry budget exhausted"
                             );
                             self.observability.record_retry_budget_exhausted();
                         }
@@ -454,7 +454,7 @@ impl Executor {
                                 attempt = attempt + 1,
                                 max_attempts,
                                 elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                "write conflict, retrying statement"
+                                "write conflict or deadlock, retrying statement"
                             );
                             self.observability
                                 .record_retry_attempt(extract_write_conflict_reason(&err));
@@ -469,7 +469,7 @@ impl Executor {
                                 attempt = attempt + 1,
                                 max_attempts,
                                 elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                "write conflict retry budget exhausted"
+                                "write conflict or deadlock retry budget exhausted"
                             );
                             self.observability.record_retry_budget_exhausted();
                         }

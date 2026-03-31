@@ -276,6 +276,86 @@ pub(crate) async fn txn_batch_mutate(
         .map_err(|e| anyhow!(e))
 }
 
+/// A mutation that can be either a Put or a Delete, for use with
+/// [`txn_batch_mutate_mixed`].
+pub(crate) enum BatchMutation {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+impl BatchMutation {
+    fn key(&self) -> &[u8] {
+        match self {
+            BatchMutation::Put(k, _) => k,
+            BatchMutation::Delete(k) => k,
+        }
+    }
+}
+
+/// Batch mutate wrapper supporting mixed Put and Delete mutations.
+///
+/// Like [`txn_batch_mutate`] but accepts both Put and Delete operations,
+/// enabling batch DELETE and UPDATE to flush all key mutations in a single
+/// pessimistic lock RPC instead of one RPC per key.
+///
+/// Large batches are automatically chunked to stay within TiKV's
+/// `raft-entry-max-size` limit.
+pub(crate) async fn txn_batch_mutate_mixed(
+    txn: &mut Transaction,
+    mutations: Vec<BatchMutation>,
+) -> Result<()> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+
+    let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
+
+    // Record undo info for SAVEPOINT before acquiring locks
+    if let Some(ref sp) = savepoints {
+        for m in &mutations {
+            let key = m.key();
+            if sp.should_record_key(key).await? {
+                let prev = txn.get(key.to_vec()).await.map_err(|e| anyhow!(e))?;
+                sp.record_prev_value(key.to_vec(), prev).await?;
+            }
+        }
+    }
+
+    // Value size check (only for Put mutations)
+    for m in &mutations {
+        if let BatchMutation::Put(k, v) = m {
+            check_value_size(k, v)?;
+        }
+    }
+
+    // Chunk into batches to avoid exceeding raft-entry-max-size.
+    // Each PessimisticLockRequest carries the key data; 10K keys is a safe
+    // ceiling for a single request (well under 8 MiB even with large keys).
+    const CHUNK_SIZE: usize = 10_000;
+
+    let mut chunk: Vec<Mutation> = Vec::with_capacity(CHUNK_SIZE.min(mutations.len()));
+    for m in mutations {
+        let tikv_m = match m {
+            BatchMutation::Put(k, v) => Mutation::Put(k.into(), v),
+            BatchMutation::Delete(k) => Mutation::Delete(k.into()),
+        };
+        chunk.push(tikv_m);
+        if chunk.len() >= CHUNK_SIZE {
+            txn.batch_mutate(chunk)
+                .await
+                .map_err(|e| anyhow!(e))?;
+            chunk = Vec::with_capacity(CHUNK_SIZE);
+        }
+    }
+    if !chunk.is_empty() {
+        txn.batch_mutate(chunk)
+            .await
+            .map_err(|e| anyhow!(e))?;
+    }
+
+    Ok(())
+}
+
 /// TiKV `delete` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_delete(txn: &mut Transaction, key: Vec<u8>) -> Result<()> {
