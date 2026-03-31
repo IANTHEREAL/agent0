@@ -100,9 +100,11 @@ pub fn pg_column_size(args: Vec<Value>) -> Result<Value> {
         Value::Interval { .. } => 16,
         Value::Uuid(_) => 16,
         Value::Text(s) => s.len() + 4,
-        Value::Json(s) | Value::Jsonb(s) => s.len() + 4,
+        Value::Json(s) => s.len() + 4,
+        Value::Jsonb(s) => sizing::jsonb_datum_width(s),
         Value::Bytes(b) => b.len() + 4,
-        Value::Tsvector(s) | Value::Tsquery(s) => s.len() + 4,
+        Value::Tsvector(s) => sizing::tsvector_datum_width(s),
+        Value::Tsquery(s) => sizing::tsquery_datum_width(s),
         Value::Vector(v) => v.len() * 4 + 4,
         Value::Array(a) => sizing::array_datum_width(a),
     };

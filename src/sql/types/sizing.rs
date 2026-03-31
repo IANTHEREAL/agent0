@@ -1,13 +1,10 @@
 //! Shared datum-size helpers for width estimation.
 //!
-//! These functions estimate datum widths for numeric and array types,
-//! matching PostgreSQL's on-disk layout for those types.  They are used by:
+//! These functions estimate datum widths for numeric, array, jsonb,
+//! tsvector, and tsquery types, matching PostgreSQL's on-disk layout.
+//! They are used by:
 //! - `ANALYZE` (WIDTH_THRESHOLD gating)
-//! - `pg_column_size()` SQL function (numeric and array sizing)
-//!
-//! Note: jsonb, tsvector, and tsquery use text-length approximation
-//! (`s.len() + 4`) which does NOT match PG's binary storage format.
-//! Accurate binary format estimation for these types is tracked separately.
+//! - `pg_column_size()` SQL function
 
 use crate::model::Value;
 
@@ -87,6 +84,373 @@ pub(crate) fn trailing_zero_count(mut n: u128) -> usize {
         n /= 10;
     }
     count
+}
+
+// ── JSONB binary format estimation ─────────────────────────────────────
+
+/// Estimate PG binary format size for a jsonb datum.
+///
+/// PG stores jsonb as a binary tree of containers with 4-byte JEntry
+/// headers per key/value. Falls back to `s.len() + 4` on parse failure.
+///
+/// Verified against PG 17:
+///   null      → 12    true      → 12    42        → 20
+///   "hello"   → 17    {}        → 8     {"a":1}   → 28
+///   [1,2,3]   → 44    {"a":{"b":1}} → 44
+pub(crate) fn jsonb_datum_width(s: &str) -> usize {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(val) => {
+            let mut offset = 4usize; // varlena header
+            jsonb_emit_top(&val, &mut offset);
+            offset
+        }
+        Err(_) => s.len() + 4, // fallback
+    }
+}
+
+/// Emit a top-level JSON value.  Scalars are wrapped in a scalar-array
+/// container; arrays and objects emit their own container directly.
+fn jsonb_emit_top(val: &serde_json::Value, offset: &mut usize) {
+    match val {
+        serde_json::Value::Null | serde_json::Value::Bool(_) => {
+            // Scalar wrapper: container header + 1 JEntry + 0 data bytes
+            *offset += 4 + 4;
+        }
+        serde_json::Value::Number(n) => {
+            *offset += 4 + 4; // container header + JEntry
+            *offset = (*offset + 3) & !3; // INTALIGN before numeric
+            *offset += jsonb_numeric_size(n);
+        }
+        serde_json::Value::String(s) => {
+            *offset += 4 + 4; // container header + JEntry
+            *offset += s.len();
+        }
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            jsonb_emit_container(val, offset);
+        }
+    }
+}
+
+/// Emit an array or object container (not scalar-wrapped).
+fn jsonb_emit_container(val: &serde_json::Value, offset: &mut usize) {
+    match val {
+        serde_json::Value::Array(arr) => {
+            *offset += 4 + 4 * arr.len(); // container header + JEntries
+            for elem in arr {
+                jsonb_emit_element(elem, offset);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            let npairs = obj.len();
+            *offset += 4 + 8 * npairs; // container header + key + value JEntries
+
+            // PG sorts keys by length then lexicographic (lengthCompareJsonbStringValue)
+            let mut pairs: Vec<_> = obj.iter().collect();
+            pairs.sort_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+
+            for (key, _) in &pairs {
+                *offset += key.len(); // key data (strings, no alignment)
+            }
+            for (_, val) in &pairs {
+                jsonb_emit_element(val, offset); // value data
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit a value inside an array or object (no scalar wrapping).
+fn jsonb_emit_element(val: &serde_json::Value, offset: &mut usize) {
+    match val {
+        serde_json::Value::Null | serde_json::Value::Bool(_) => {
+            // 0 data bytes — type encoded in JEntry flags
+        }
+        serde_json::Value::Number(n) => {
+            *offset = (*offset + 3) & !3; // INTALIGN
+            *offset += jsonb_numeric_size(n);
+        }
+        serde_json::Value::String(s) => {
+            *offset += s.len(); // no alignment for strings
+        }
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            *offset = (*offset + 3) & !3; // INTALIGN for nested containers
+            jsonb_emit_container(val, offset);
+        }
+    }
+}
+
+/// Size of a PG numeric datum for a JSON number (including varlena header).
+fn jsonb_numeric_size(n: &serde_json::Number) -> usize {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let s = n.to_string();
+    if let Ok(d) = Decimal::from_str(&s) {
+        numeric_datum_width(&d)
+    } else {
+        8 // conservative minimum
+    }
+}
+
+// ── Tsvector binary format estimation ─────────────────────────────────
+
+/// Estimate PG binary format size for a tsvector datum.
+///
+/// PG stores tsvector as: [4B varlena][4B nlexemes][4B × n WordEntries]
+/// followed by per-lexeme data: [bytes][SHORTALIGN pad][2B npos][2B × npos].
+///
+/// Verified against PG 17:
+///   (empty)             → 8     'hello'             → 17
+///   'hello':1           → 22    'hello':1 'world':2 → 36
+///   'ab':1,2,3          → 22
+pub(crate) fn tsvector_datum_width(s: &str) -> usize {
+    if s.is_empty() {
+        return 8; // 4 varlena + 4 nlexemes
+    }
+
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    // Phase 1: Parse all lexemes into (decoded_bytes, npos) pairs.
+    // We need the decoded bytes for sorting — PG stores lexemes sorted by
+    // (length, lexicographic) per compareWordEntryPos in tsvector.h, and the
+    // cumulative data_offset (which drives SHORTALIGN padding) depends on
+    // this sorted order.
+    let mut lexemes: Vec<(Vec<u8>, usize)> = Vec::new();
+
+    while i < len {
+        // Skip whitespace
+        while i < len && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+
+        // Expect opening single quote
+        if bytes[i] != b'\'' {
+            return s.len() + 4; // malformed, fallback
+        }
+        i += 1;
+
+        // Read lexeme bytes until unescaped closing quote
+        let mut lexeme_bytes: Vec<u8> = Vec::new();
+        while i < len {
+            if bytes[i] == b'\'' {
+                i += 1;
+                if i < len && bytes[i] == b'\'' {
+                    i += 1; // escaped ''
+                    lexeme_bytes.push(b'\'');
+                } else {
+                    break; // closing quote
+                }
+            } else if bytes[i] == b'\\' {
+                i += 1;
+                if i < len {
+                    lexeme_bytes.push(bytes[i]);
+                    i += 1;
+                }
+            } else {
+                lexeme_bytes.push(bytes[i]);
+                i += 1;
+            }
+        }
+
+        // Count positions after ':'
+        let mut npos = 0usize;
+        if i < len && bytes[i] == b':' {
+            i += 1;
+            npos = 1;
+            while i < len {
+                if bytes[i] == b',' {
+                    npos += 1;
+                    i += 1;
+                } else if bytes[i] == b' ' {
+                    break;
+                } else {
+                    i += 1; // digits, weight letters (A/B/C/D)
+                }
+            }
+        }
+
+        lexemes.push((lexeme_bytes, npos));
+    }
+
+    // Phase 2: Sort lexemes lexicographically — matching PG's tsCompareString
+    // which does memcmp(a, b, min(lenA, lenB)) then compares lengths as tiebreaker.
+    // This is exactly Rust's default &[u8] Ord (lexicographic byte comparison).
+    lexemes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Phase 2.5: Merge adjacent duplicates — PG deduplicates identical lexemes
+    // and merges their position lists. E.g. 'hello' 'hello' → one entry;
+    // 'hello':1 'hello':2 → one entry with 2 positions.
+    // Also cap positions at MAXNUMPOS (256) per lexeme, matching PG.
+    const MAXNUMPOS: usize = 256;
+    let mut deduped: Vec<(Vec<u8>, usize)> = Vec::with_capacity(lexemes.len());
+    for (word, npos) in lexemes {
+        if let Some(last) = deduped.last_mut() {
+            if last.0 == word {
+                // Merge: sum position counts (capped at MAXNUMPOS)
+                last.1 = (last.1 + npos).min(MAXNUMPOS);
+                continue;
+            }
+        }
+        deduped.push((word, npos.min(MAXNUMPOS)));
+    }
+    let lexemes = deduped;
+
+    // Phase 3: Compute cumulative data_offset in sorted order.
+    // PG applies SHORTALIGN to the running offset, NOT to individual lengths.
+    let num_lexemes = lexemes.len();
+    let mut data_offset = 0usize;
+    for (word, npos) in &lexemes {
+        data_offset += word.len();
+
+        // PG only writes SHORTALIGN pad + npos + positions when haspos is true.
+        // SHORTALIGN rounds the cumulative data_offset up to the next even address.
+        if *npos > 0 {
+            data_offset = (data_offset + 1) & !1; // SHORTALIGN
+            data_offset += 2 + 2 * npos; // npos count + position entries
+        }
+    }
+
+    // Total: 8 (header) + 4*N (WordEntries) + data_offset
+    8 + 4 * num_lexemes + data_offset
+}
+
+// ── Tsquery binary format estimation ──────────────────────────────────
+
+/// Estimate PG binary format size for a tsquery datum.
+///
+/// PG stores tsquery as: [4B varlena][4B nitems][12B × nitems QueryItems]
+/// followed by null-terminated operand strings.
+///
+/// Verified against PG 17:
+///   (empty)               → 8     'cat'               → 24
+///   'hello' & 'world'     → 56    !'hello'            → 38
+///   'a' & 'b' & 'c' & 'd' → 100
+pub(crate) fn tsquery_datum_width(s: &str) -> usize {
+    if s.is_empty() {
+        return 8; // 4 varlena + 4 nitems
+    }
+
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut noperands = 0usize;
+    let mut noperators = 0usize;
+    let mut string_bytes = 0usize;
+
+    while i < len {
+        while i < len && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                let mut operand_len = 0usize;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < len && bytes[i] == b'\'' {
+                            i += 1;
+                            operand_len += 1;
+                        } else {
+                            break;
+                        }
+                    } else if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < len {
+                            operand_len += 1;
+                            i += 1;
+                        }
+                    } else {
+                        operand_len += 1;
+                        i += 1;
+                    }
+                }
+                noperands += 1;
+                string_bytes += operand_len + 1; // null-terminated
+
+                // Skip optional weight/prefix suffix :A :B :C :D :*
+                if i < len && bytes[i] == b':' {
+                    i += 1;
+                    while i < len
+                        && matches!(
+                            bytes[i],
+                            b'A' | b'B' | b'C' | b'D' | b'*' | b','
+                        )
+                    {
+                        i += 1;
+                    }
+                }
+            }
+            b'!' => {
+                noperators += 1;
+                i += 1;
+            }
+            b'&' | b'|' => {
+                noperators += 1;
+                i += 1;
+            }
+            b'<' => {
+                // <-> or <N>
+                i += 1;
+                while i < len && bytes[i] != b'>' {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                noperators += 1;
+            }
+            b'(' | b')' => {
+                i += 1; // grouping only, no item
+            }
+            _ => {
+                // Bare-word operand (unquoted), e.g. hello in `hello::tsquery`
+                // Stop at `:` — it begins the optional weight/prefix suffix,
+                // which controls flags in the QueryOperand header, not the
+                // operand string storage.
+                let start = i;
+                while i < len
+                    && !matches!(
+                        bytes[i],
+                        b' ' | b'&' | b'|' | b'!' | b'<' | b'(' | b')' | b'\'' | b':'
+                    )
+                {
+                    i += 1;
+                }
+                let operand_len = i - start;
+                // Skip optional weight/prefix suffix :A :B :C :D :*
+                if i < len && bytes[i] == b':' {
+                    i += 1; // skip ':'
+                    while i < len
+                        && matches!(
+                            bytes[i],
+                            b'A' | b'B' | b'C' | b'D' | b'*' | b','
+                        )
+                    {
+                        i += 1;
+                    }
+                }
+                noperands += 1;
+                string_bytes += operand_len + 1; // null-terminated
+            }
+        }
+    }
+
+    let nitems = noperands + noperators;
+    if nitems == 0 {
+        return 8;
+    }
+
+    8 + 12 * nitems + string_bytes
 }
 
 // ── Array sizing ───────────────────────────────────────────────────────
@@ -195,9 +559,11 @@ fn leaf_datum_width(value: &Value) -> usize {
         Value::Interval { .. } => 16,
         Value::Uuid(_) => 16,
         Value::Text(s) => s.len() + 4,
-        Value::Json(s) | Value::Jsonb(s) => s.len() + 4,
+        Value::Json(s) => s.len() + 4,
+        Value::Jsonb(s) => jsonb_datum_width(s),
         Value::Bytes(b) => b.len() + 4,
-        Value::Tsvector(s) | Value::Tsquery(s) => s.len() + 4,
+        Value::Tsvector(s) => tsvector_datum_width(s),
+        Value::Tsquery(s) => tsquery_datum_width(s),
         Value::Vector(v) => v.len() * 4 + 4,
         Value::Array(_) => unreachable!("leaf_datum_width called on Array"),
     }
@@ -255,9 +621,11 @@ pub(crate) mod tests {
             Value::Interval { .. } => 16,
             Value::Uuid(_) => 16,
             Value::Text(s) => s.len() + 4,
-            Value::Json(s) | Value::Jsonb(s) => s.len() + 4,
+            Value::Json(s) => s.len() + 4,
+            Value::Jsonb(s) => jsonb_datum_width(s),
             Value::Bytes(b) => b.len() + 4,
-            Value::Tsvector(s) | Value::Tsquery(s) => s.len() + 4,
+            Value::Tsvector(s) => tsvector_datum_width(s),
+            Value::Tsquery(s) => tsquery_datum_width(s),
             Value::Vector(v) => v.len() * 4 + 4,
             Value::Array(a) => array_datum_width(a),
         }
@@ -284,12 +652,11 @@ pub(crate) mod tests {
             11 // 7 + 4
         );
 
-        // Jsonb -- text-length approximation (NOT PG-accurate).
+        // Jsonb -- PG binary format estimation.
         // PG stores jsonb in binary format: pg_column_size('{"a":1}'::jsonb) = 28.
-        // Accurate binary format estimation is a follow-up task.
         assert_eq!(
             datum_width(&Value::Jsonb(r#"{"a":1}"#.to_string())),
-            11 // text approximation: 7 + 4 (PG binary = 28)
+            28
         );
     }
 
@@ -429,6 +796,172 @@ pub(crate) mod tests {
         let arr3 = Value::Array(vec![]);
         assert_eq!(datum_width(&arr3), 16, "empty array should be 16");
     }
+
+    // ── JSONB binary format tests ──
+
+    /// Verified against PG 17: jsonb binary format sizing.
+    #[test]
+    fn jsonb_datum_width_pg_parity() {
+        assert_eq!(jsonb_datum_width("null"), 12);
+        assert_eq!(jsonb_datum_width("true"), 12);
+        assert_eq!(jsonb_datum_width("42"), 20);
+        assert_eq!(jsonb_datum_width(r#""hello""#), 17);
+        assert_eq!(jsonb_datum_width("{}"), 8);
+        assert_eq!(jsonb_datum_width(r#"{"a":1}"#), 28);
+        assert_eq!(jsonb_datum_width(r#"{"key":"value"}"#), 24);
+        assert_eq!(jsonb_datum_width("[1,2,3]"), 44);
+        assert_eq!(jsonb_datum_width(r#"{"a":{"b":1}}"#), 44);
+    }
+
+    // ── Tsvector binary format tests ──
+
+    /// Verified against PG 17: tsvector binary format sizing.
+    #[test]
+    fn tsvector_datum_width_pg_parity() {
+        assert_eq!(tsvector_datum_width(""), 8);
+        // No positions: 4 varlena + 4 nlexemes + 4 WordEntry + 5 lexeme = 17
+        assert_eq!(tsvector_datum_width("'hello'"), 17);
+        assert_eq!(tsvector_datum_width("'hello':1"), 22);
+        assert_eq!(tsvector_datum_width("'hello':1 'world':2"), 36);
+        assert_eq!(tsvector_datum_width("'ab':1,2,3"), 22);
+        assert_eq!(
+            tsvector_datum_width("'a':1 'b':2 'c':3 'd':4 'e':5"),
+            58
+        );
+    }
+
+    /// QG P0 fix: SHORTALIGN must use cumulative data offset, not lexeme length.
+    /// Mixed positioned/unpositioned lexemes exercise the cumulative tracking.
+    /// Verified against PG 17.
+    #[test]
+    fn tsvector_datum_width_shortalign_cumulative_offset() {
+        // 'abc' 'de':1 → PG=26
+        // Sorted: abc(3) < de(2) lexicographically ('a' < 'd').
+        // data: abc(3) → offset=3; de(2) → offset=5, SHORTALIGN(5)=6 + 2+2 = 10
+        // Total: 8 + 8 + 10 = 26
+        assert_eq!(tsvector_datum_width("'abc' 'de':1"), 26);
+
+        // 'a' 'abc':1 → PG=24
+        // Header=8, WordEntries=8, data: a(1) + abc(3)=4 → SHORTALIGN(4)=4 + 4 = 8
+        // Total: 8 + 8 + 8 = 24
+        assert_eq!(tsvector_datum_width("'a' 'abc':1"), 24);
+
+        // 'hello' (no positions) → PG=17
+        assert_eq!(tsvector_datum_width("'hello'"), 17);
+
+        // 'hello':1 'world':2 → PG=36
+        assert_eq!(tsvector_datum_width("'hello':1 'world':2"), 36);
+    }
+
+    /// QG P0 fix (round 5): lexemes must be sorted lexicographically
+    /// (matching PG's tsCompareString: memcmp then length tiebreak) before
+    /// computing cumulative data_offset. Input order != storage order —
+    /// SHORTALIGN padding depends on sorted order.
+    /// All values verified against PG 17.
+    #[test]
+    fn tsvector_datum_width_unsorted_input() {
+        // 'world' 'hello':1 → PG=31
+        // Sorted: hello(5, pos), world(5, nopos) — 'h' < 'w'.
+        // data: hello(5) → SHORTALIGN(5)=6 + 2 + 2 = 10; world(5) → offset=15
+        // Total: 8 + 8 + 15 = 31
+        assert_eq!(tsvector_datum_width("'world' 'hello':1"), 31);
+
+        // 'zzz':1 'a' → PG=24
+        // Sorted: a(1, nopos), zzz(3, pos) — 'a' < 'z'.
+        // data: a(1) → offset=1; zzz(3) → offset=4, SHORTALIGN(4)=4 + 2 + 2 = 8
+        // Total: 8 + 8 + 8 = 24
+        assert_eq!(tsvector_datum_width("'zzz':1 'a'"), 24);
+
+        // Reverse of the above — same result regardless of input order
+        assert_eq!(tsvector_datum_width("'a' 'zzz':1"), 24);
+
+        // 'zz' 'aa':1 → sorted: aa(2, pos), zz(2, nopos) — 'a' < 'z'.
+        // data: aa(2) → SHORTALIGN(2)=2 + 2 + 2 = 6; zz(2) → offset=8
+        // Total: 8 + 8 + 8 = 24
+        assert_eq!(tsvector_datum_width("'zz' 'aa':1"), 24);
+        assert_eq!(tsvector_datum_width("'aa':1 'zz'"), 24);
+
+        // 'b':1 'a':2 → sorted: a(1, pos), b(1, pos) — 'a' < 'b'.
+        // data: a(1) → SHORTALIGN(1)=2 + 2 + 2 = 6; b(1) → offset=7, SHORTALIGN(7)=8 + 2+2=12
+        // Total: 8 + 8 + 12 = 28
+        assert_eq!(tsvector_datum_width("'b':1 'a':2"), 28);
+        assert_eq!(tsvector_datum_width("'a':2 'b':1"), 28);
+    }
+
+    /// QG P0 fix (round 6): duplicate lexemes must be merged — PG deduplicates
+    /// identical lexemes and combines their position lists into one entry.
+    /// Verified against PG 17.
+    #[test]
+    fn tsvector_datum_width_duplicate_lexeme_dedup() {
+        // 'hello' 'hello' → PG=17
+        // PG deduplicates to single 'hello' with no positions.
+        // 8 + 4 + 5 = 17
+        assert_eq!(tsvector_datum_width("'hello' 'hello'"), 17);
+
+        // 'hello':1 'hello':2 → PG=24
+        // PG merges to 'hello':1,2 — one entry with 2 positions.
+        // 8 + 4 + hello(5) → SHORTALIGN(5)=6 + 2 + 2*2 = 12
+        // Total: 8 + 4 + 12 = 24
+        assert_eq!(tsvector_datum_width("'hello':1 'hello':2"), 24);
+
+        // 'a':1 'a':2 'a':3 → PG=22
+        // PG merges to 'a':1,2,3 — one entry with 3 positions.
+        // data: a(1) → offset=1, SHORTALIGN(1)=2 + 2 + 2*3 = 10
+        // Total: 8 + 4 + 10 = 22
+        assert_eq!(tsvector_datum_width("'a':1 'a':2 'a':3"), 22);
+
+        // Mixed: 'a':1 'b':2 'a':3 → deduped to 'a':1,3 + 'b':2
+        // Sorted: a(npos=2), b(npos=1)
+        // data: a(1) → offset=1, SHORTALIGN(1)=2 + 2 + 2*2 = 8;
+        //       b(1) → offset=9, SHORTALIGN(9)=10 + 2 + 2*1 = 14
+        // Total: 8 + 8 + 14 = 30
+        assert_eq!(tsvector_datum_width("'a':1 'b':2 'a':3"), 30);
+    }
+
+    /// QG P1 fix (round 6): MAXNUMPOS (256) cap on positions per lexeme.
+    /// PG caps at 256 positions per lexeme.
+    #[test]
+    fn tsvector_datum_width_maxnumpos_cap() {
+        // Build a tsvector with 300 positions on one lexeme — PG caps at 256.
+        // 'w':1,2,3,...,300 → PG stores only 256 positions.
+        // 8 + 4 + w(1) → SHORTALIGN(1)=2 + 2 + 2*256 = 516
+        // Total: 8 + 4 + 516 = 528
+        let positions: Vec<String> = (1..=300).map(|i| i.to_string()).collect();
+        let input = format!("'w':{}", positions.join(","));
+        assert_eq!(tsvector_datum_width(&input), 528);
+    }
+
+    // ── Tsquery binary format tests ──
+
+    /// Verified against PG 17: tsquery binary format sizing.
+    #[test]
+    fn tsquery_datum_width_pg_parity() {
+        assert_eq!(tsquery_datum_width(""), 8);
+        assert_eq!(tsquery_datum_width("'cat'"), 24);
+        assert_eq!(tsquery_datum_width("'hello' & 'world'"), 56);
+        assert_eq!(tsquery_datum_width("!'hello'"), 38);
+        assert_eq!(tsquery_datum_width("'a' & 'b' & 'c' & 'd'"), 100);
+
+        // Bare-word (unquoted) tsquery values — verified against PG 17:
+        //   SELECT pg_column_size('hello'::tsquery);        → 26
+        //   SELECT pg_column_size('cat & dog'::tsquery);    → 52
+        assert_eq!(tsquery_datum_width("hello"), 26);
+        assert_eq!(tsquery_datum_width("cat & dog"), 52);
+
+        // Bare-word with weight/prefix suffixes — verified against PG 17:
+        //   SELECT pg_column_size('hello:*'::tsquery);      → 26
+        //   SELECT pg_column_size('hello:A'::tsquery);      → 26
+        //   SELECT pg_column_size('hello:*AB'::tsquery);    → 26
+        //   SELECT pg_column_size('cat:A & dog:B'::tsquery); → 52
+        // The `:...` suffix sets flags in the QueryOperand header but does
+        // NOT contribute to the operand string storage.
+        assert_eq!(tsquery_datum_width("hello:*"), 26);
+        assert_eq!(tsquery_datum_width("hello:A"), 26);
+        assert_eq!(tsquery_datum_width("hello:*AB"), 26);
+        assert_eq!(tsquery_datum_width("cat:A & dog:B"), 52);
+    }
+
+    // ── Array sizing tests (continued) ──
 
     /// Numeric array with trailing-zero values below threshold.
     #[test]
