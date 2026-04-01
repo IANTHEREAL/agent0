@@ -320,7 +320,7 @@ impl EmbeddedPageFs {
                 let mut txn = self.begin().await?;
                 let inode_id = self.alloc_inode_id().await?;
                 let key = self.object_key(inode_id)?;
-                let upload_id = match s3.create_multipart_upload(&key).await {
+                let upload_id = match s3.create_multipart_upload(&key, None).await {
                     Ok(id) => id,
                     Err(err) => {
                         let _ = txn.rollback().await;
@@ -434,7 +434,19 @@ impl EmbeddedPageFs {
         path: &str,
         expected_size: u64,
         mode: Option<u32>,
+        checksum_algorithm: Option<&str>,
     ) -> Result<FsCreateUpload> {
+        let checksum_algorithm = match checksum_algorithm {
+            Some(alg) if alg.eq_ignore_ascii_case("crc32c") => Some("crc32c"),
+            Some(alg) => {
+                return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
+                    "unsupported checksum algorithm: {}; only 'crc32c' is supported",
+                    alg
+                ))));
+            }
+            None => None,
+        };
+
         if expected_size == 0 {
             return Err(anyhow!(EmbeddedFsError::InvalidInput(
                 "create_upload requires a positive expected_size".to_string(),
@@ -484,7 +496,10 @@ impl EmbeddedPageFs {
             let expected_parent_inode = resolve_existing_parent(&mut txn, &normalized).await?;
             let inode_id = self.alloc_inode_id().await?;
             let object_key = self.object_key(inode_id)?;
-            let upload_id = match s3.create_multipart_upload(&object_key).await {
+            let upload_id = match s3
+                .create_multipart_upload(&object_key, checksum_algorithm)
+                .await
+            {
                 Ok(upload_id) => upload_id,
                 Err(err) => {
                     let _ = txn.rollback().await;
@@ -563,6 +578,7 @@ impl EmbeddedPageFs {
                         upload_id,
                         part_size,
                         expires_at,
+                        checksum_algorithm: checksum_algorithm.map(|s| s.to_string()),
                     });
                 }
                 Err(err) if attempt + 1 < attempts => {
@@ -590,6 +606,7 @@ impl EmbeddedPageFs {
         &self,
         upload_token: &str,
         part_number: i32,
+        checksum_crc32c: Option<&str>,
     ) -> Result<FsPresignedRequest> {
         if !(1..=10_000).contains(&part_number) {
             return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
@@ -624,7 +641,7 @@ impl EmbeddedPageFs {
             .s3_client()
             .await?
             .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
-        s3.presign_upload_part(&ctx.key, upload_id, part_number, ttl_secs)
+        s3.presign_upload_part(&ctx.key, upload_id, part_number, ttl_secs, checksum_crc32c)
             .await
     }
 
@@ -669,7 +686,13 @@ impl EmbeddedPageFs {
                 upload_id,
                 completed_parts
                     .iter()
-                    .map(|part| (part.part_number, part.etag.clone()))
+                    .map(|part| {
+                        (
+                            part.part_number,
+                            part.etag.clone(),
+                            part.checksum_crc32c.clone(),
+                        )
+                    })
                     .collect(),
             )
             .await?;

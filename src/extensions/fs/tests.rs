@@ -160,6 +160,7 @@ impl FsBackend for TestLocalBackend {
         _path: &str,
         _expected_size: u64,
         _mode: Option<u32>,
+        _checksum_algorithm: Option<&str>,
     ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
         anyhow::bail!("not implemented for test backend")
     }
@@ -167,6 +168,7 @@ impl FsBackend for TestLocalBackend {
         &self,
         _upload_token: &str,
         _part_number: i32,
+        _checksum_crc32c: Option<&str>,
     ) -> Result<crate::extensions::fs::backend::FsPresignedRequest> {
         anyhow::bail!("not implemented for test backend")
     }
@@ -309,6 +311,7 @@ impl FsBackend for RecursiveListBackend {
         _path: &str,
         _expected_size: u64,
         _mode: Option<u32>,
+        _checksum_algorithm: Option<&str>,
     ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
         unreachable!("create_upload is not used in this test");
     }
@@ -317,6 +320,7 @@ impl FsBackend for RecursiveListBackend {
         &self,
         _upload_token: &str,
         _part_number: i32,
+        _checksum_crc32c: Option<&str>,
     ) -> Result<crate::extensions::fs::backend::FsPresignedRequest> {
         unreachable!("presign_upload_part is not used in this test");
     }

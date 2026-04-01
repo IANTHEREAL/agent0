@@ -352,6 +352,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             _path: &str,
             _expected_size: u64,
             _mode: Option<u32>,
+            _checksum_algorithm: Option<&str>,
         ) -> AnyResult<crate::extensions::fs::backend::FsCreateUpload> {
             anyhow::bail!("not implemented for test backend")
         }
@@ -359,6 +360,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             &self,
             _upload_token: &str,
             _part_number: i32,
+            _checksum_crc32c: Option<&str>,
         ) -> AnyResult<crate::extensions::fs::backend::FsPresignedRequest> {
             anyhow::bail!("not implemented for test backend")
         }

@@ -2680,7 +2680,7 @@ async fn test_abort_upload_cleans_staging_state() {
 
     let path = &format!("{base}/object.bin");
     let upload = fs
-        .create_upload(path, fs9_config().object_min_bytes as u64, None)
+        .create_upload(path, fs9_config().object_min_bytes as u64, None, None)
         .await
         .unwrap();
     let claims = verify_upload_token(&upload.upload_token).unwrap();
@@ -3045,10 +3045,12 @@ fn test_normalize_completed_parts_sorts_and_rejects_duplicates() {
         FsMultipartCompletedPart {
             part_number: 2,
             etag: "etag-2".to_string(),
+            checksum_crc32c: None,
         },
         FsMultipartCompletedPart {
             part_number: 1,
             etag: "etag-1".to_string(),
+            checksum_crc32c: None,
         },
     ])
     .expect("parts should normalize");
@@ -3059,10 +3061,12 @@ fn test_normalize_completed_parts_sorts_and_rejects_duplicates() {
         FsMultipartCompletedPart {
             part_number: 1,
             etag: "etag-1".to_string(),
+            checksum_crc32c: None,
         },
         FsMultipartCompletedPart {
             part_number: 1,
             etag: "etag-1b".to_string(),
+            checksum_crc32c: None,
         },
     ])
     .expect_err("duplicate part numbers must fail");

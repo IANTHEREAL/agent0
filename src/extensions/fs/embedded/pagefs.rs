@@ -544,7 +544,14 @@ impl FsWriteStream for EmbeddedObjectWriteStream {
 
         if let Err(err) = self
             .s3
-            .complete_multipart_upload(&self.key, &self.upload_id, std::mem::take(&mut self.parts))
+            .complete_multipart_upload(
+                &self.key,
+                &self.upload_id,
+                std::mem::take(&mut self.parts)
+                    .into_iter()
+                    .map(|(pn, etag)| (pn, etag, None))
+                    .collect(),
+            )
             .await
         {
             self.abort_upload().await;
@@ -1909,7 +1916,7 @@ impl EmbeddedPageFs {
             .as_ref()
             .map(|c| c.multipart_part_bytes)
             .unwrap_or(WRITE_STREAM_FLUSH_BYTES);
-        let upload_id = s3.create_multipart_upload(&key).await?;
+        let upload_id = s3.create_multipart_upload(&key, None).await?;
         let mut offset = 0u64;
         let mut part_number = 1i32;
         let mut parts = Vec::new();
@@ -1957,7 +1964,17 @@ impl EmbeddedPageFs {
             })?;
         }
 
-        if let Err(err) = s3.complete_multipart_upload(&key, &upload_id, parts).await {
+        if let Err(err) = s3
+            .complete_multipart_upload(
+                &key,
+                &upload_id,
+                parts
+                    .into_iter()
+                    .map(|(pn, etag)| (pn, etag, None))
+                    .collect(),
+            )
+            .await
+        {
             let _ = s3.abort_multipart_upload(&key, &upload_id).await;
             let _ = s3.delete_object(&key).await;
             return Err(err);

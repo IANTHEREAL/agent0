@@ -134,12 +134,33 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             path,
             size,
             mode,
-        } => handle_create_upload(session, id, path, *size, *mode).await,
+            checksum_algorithm,
+        } => {
+            handle_create_upload(
+                session,
+                id,
+                path,
+                *size,
+                *mode,
+                checksum_algorithm.as_deref(),
+            )
+            .await
+        }
         WsRequest::PresignPart {
             id,
             upload_token,
             part_number,
-        } => handle_presign_part(session, id, upload_token, *part_number).await,
+            checksum_crc32c,
+        } => {
+            handle_presign_part(
+                session,
+                id,
+                upload_token,
+                *part_number,
+                checksum_crc32c.as_deref(),
+            )
+            .await
+        }
         WsRequest::CompleteUpload {
             id,
             upload_token,
@@ -577,6 +598,7 @@ async fn handle_create_upload(
     path: &str,
     size: u64,
     mode: Option<u32>,
+    checksum_algorithm: Option<&str>,
 ) -> WsResponse {
     if let Err((code, msg)) = validate_path(path) {
         return WsResponse::error(id, code, msg);
@@ -598,7 +620,7 @@ async fn handle_create_upload(
 
     match session
         .backend
-        .create_upload(path, size, mode.map(|m| m & 0o7777))
+        .create_upload(path, size, mode.map(|m| m & 0o7777), checksum_algorithm)
         .await
     {
         Ok(upload) => {
@@ -608,6 +630,7 @@ async fn handle_create_upload(
                 upload_id: upload.upload_id,
                 part_size: upload.part_size,
                 expires_at: format_mtime(upload.expires_at),
+                checksum_algorithm: upload.checksum_algorithm,
             }) {
                 Ok(value) => value,
                 Err(err) => {
@@ -634,10 +657,11 @@ async fn handle_presign_part(
     id: &str,
     upload_token: &str,
     part_number: i32,
+    checksum_crc32c: Option<&str>,
 ) -> WsResponse {
     match session
         .backend
-        .presign_upload_part(upload_token, part_number)
+        .presign_upload_part(upload_token, part_number, checksum_crc32c)
         .await
     {
         Ok(request) => WsResponse::success(
@@ -671,6 +695,7 @@ async fn handle_complete_upload(
         .map(|part| FsMultipartCompletedPart {
             part_number: part.part_number,
             etag: part.etag.clone(),
+            checksum_crc32c: part.checksum_crc32c.clone(),
         })
         .collect();
 
@@ -1894,6 +1919,7 @@ mod tests {
                 _path: &str,
                 _expected_size: u64,
                 _mode: Option<u32>,
+                _checksum_algorithm: Option<&str>,
             ) -> Result<FsCreateUpload> {
                 Err(anyhow!("not implemented"))
             }
@@ -1901,6 +1927,7 @@ mod tests {
                 &self,
                 _upload_token: &str,
                 _part_number: i32,
+                _checksum_crc32c: Option<&str>,
             ) -> Result<FsPresignedRequest> {
                 Err(anyhow!("not implemented"))
             }
