@@ -3067,9 +3067,7 @@ fn conflict_behavior_from_analyzed_on_conflict() {
     // None → Error
     let none: Option<AnalyzedOnConflict> = None;
     let behavior = match &none {
-        Some(AnalyzedOnConflict::DoNothing { .. }) => {
-            ConflictBehavior::DoNothing { target: None }
-        }
+        Some(AnalyzedOnConflict::DoNothing { .. }) => ConflictBehavior::DoNothing { target: None },
         Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate { target: None },
         None => ConflictBehavior::Error,
     };
@@ -3078,9 +3076,7 @@ fn conflict_behavior_from_analyzed_on_conflict() {
     // DoNothing → DoNothing
     let do_nothing = Some(AnalyzedOnConflict::DoNothing { target: None });
     let behavior = match &do_nothing {
-        Some(AnalyzedOnConflict::DoNothing { .. }) => {
-            ConflictBehavior::DoNothing { target: None }
-        }
+        Some(AnalyzedOnConflict::DoNothing { .. }) => ConflictBehavior::DoNothing { target: None },
         Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate { target: None },
         None => ConflictBehavior::Error,
     };

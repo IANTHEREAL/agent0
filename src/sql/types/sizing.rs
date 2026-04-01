@@ -380,12 +380,7 @@ pub(crate) fn tsquery_datum_width(s: &str) -> usize {
                 // Skip optional weight/prefix suffix :A :B :C :D :*
                 if i < len && bytes[i] == b':' {
                     i += 1;
-                    while i < len
-                        && matches!(
-                            bytes[i],
-                            b'A' | b'B' | b'C' | b'D' | b'*' | b','
-                        )
-                    {
+                    while i < len && matches!(bytes[i], b'A' | b'B' | b'C' | b'D' | b'*' | b',') {
                         i += 1;
                     }
                 }
@@ -430,12 +425,7 @@ pub(crate) fn tsquery_datum_width(s: &str) -> usize {
                 // Skip optional weight/prefix suffix :A :B :C :D :*
                 if i < len && bytes[i] == b':' {
                     i += 1; // skip ':'
-                    while i < len
-                        && matches!(
-                            bytes[i],
-                            b'A' | b'B' | b'C' | b'D' | b'*' | b','
-                        )
-                    {
+                    while i < len && matches!(bytes[i], b'A' | b'B' | b'C' | b'D' | b'*' | b',') {
                         i += 1;
                     }
                 }
@@ -654,10 +644,7 @@ pub(crate) mod tests {
 
         // Jsonb -- PG binary format estimation.
         // PG stores jsonb in binary format: pg_column_size('{"a":1}'::jsonb) = 28.
-        assert_eq!(
-            datum_width(&Value::Jsonb(r#"{"a":1}"#.to_string())),
-            28
-        );
+        assert_eq!(datum_width(&Value::Jsonb(r#"{"a":1}"#.to_string())), 28);
     }
 
     // ── Numeric sizing tests ──
@@ -824,10 +811,7 @@ pub(crate) mod tests {
         assert_eq!(tsvector_datum_width("'hello':1"), 22);
         assert_eq!(tsvector_datum_width("'hello':1 'world':2"), 36);
         assert_eq!(tsvector_datum_width("'ab':1,2,3"), 22);
-        assert_eq!(
-            tsvector_datum_width("'a':1 'b':2 'c':3 'd':4 'e':5"),
-            58
-        );
+        assert_eq!(tsvector_datum_width("'a':1 'b':2 'c':3 'd':4 'e':5"), 58);
     }
 
     /// QG P0 fix: SHORTALIGN must use cumulative data offset, not lexeme length.

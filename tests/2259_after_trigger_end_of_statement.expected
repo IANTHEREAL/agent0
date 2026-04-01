@@ -1,0 +1,15 @@
+fire_count|distinct_sums|observed
+3|1|60
+(1 row)
+fire_count|distinct_sums|observed
+3|1|63
+(1 row)
+fire_count|distinct_sums|observed
+3|1|66
+(1 row)
+fire_count|distinct_sums|observed
+3|1|0
+(1 row)
+fire_count|distinct_sums|observed
+3|1|603
+(1 row)

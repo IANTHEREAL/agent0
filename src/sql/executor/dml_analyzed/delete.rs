@@ -12,7 +12,7 @@ use super::{
 };
 use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::AnalyzedDelete;
-use crate::sql::dml::{FkStoreCtx, pk_to_hash_key};
+use crate::sql::dml::{pk_to_hash_key, FkStoreCtx};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::sql::rls::dml::RlsDmlContext;
@@ -208,14 +208,10 @@ impl Executor {
                     continue;
                 }
                 let pk_values = schema.get_pk_values(r);
-                let meta_key = crate::sql::hnsw::storage::hnsw_meta_key(
-                    db_id,
-                    schema.table_id,
-                    index.id,
-                );
+                let meta_key =
+                    crate::sql::hnsw::storage::hnsw_meta_key(db_id, schema.table_id, index.id);
                 if let Some(meta_bytes) = txn.get(meta_key).await? {
-                    let meta: crate::sql::hnsw::HnswMeta =
-                        serde_json::from_slice(&meta_bytes)?;
+                    let meta: crate::sql::hnsw::HnswMeta = serde_json::from_slice(&meta_bytes)?;
                     if meta.label_mode == crate::sql::hnsw::HnswLabelMode::Mapped {
                         let pk_bytes = crate::storage::encode_pk_values(&pk_values);
                         if let Some(rowid) = crate::sql::hnsw::storage::get_rowid_for_pk(

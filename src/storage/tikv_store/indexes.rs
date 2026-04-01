@@ -313,12 +313,10 @@ impl TikvStore {
                         // For batch UPDATE: if the conflicting key is being
                         // deleted in the same batch (e.g. two rows swapping
                         // unique values), this is not a real conflict.
-                        let being_deleted = old_keys_being_deleted
-                            .is_some_and(|s| s.contains(&ue.idx_key));
+                        let being_deleted =
+                            old_keys_being_deleted.is_some_and(|s| s.contains(&ue.idx_key));
                         if !being_deleted {
-                            return Err(
-                                Self::build_batch_unique_violation(&ue.entry).into()
-                            );
+                            return Err(Self::build_batch_unique_violation(&ue.entry).into());
                         }
                     }
                 }
@@ -352,9 +350,17 @@ impl TikvStore {
     ) -> Vec<u8> {
         let enforce_unique = unique && !Self::index_key_has_null(values);
         if enforce_unique {
-            self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None))
+            self.key(&encode_index_key_v2(
+                db_id, table_id, index_id, values, None,
+            ))
         } else {
-            self.key(&encode_index_key_v2(db_id, table_id, index_id, values, Some(pk_values)))
+            self.key(&encode_index_key_v2(
+                db_id,
+                table_id,
+                index_id,
+                values,
+                Some(pk_values),
+            ))
         }
     }
 
@@ -370,7 +376,11 @@ impl TikvStore {
         let pk_key = encode_pk_values(pk_values);
         token_hashes
             .iter()
-            .map(|&th| self.key(&encode_gin_index_key_v2(db_id, table_id, index_id, th, &pk_key)))
+            .map(|&th| {
+                self.key(&encode_gin_index_key_v2(
+                    db_id, table_id, index_id, th, &pk_key,
+                ))
+            })
             .collect()
     }
 

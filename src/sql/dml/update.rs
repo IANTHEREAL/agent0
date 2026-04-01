@@ -203,8 +203,7 @@ pub fn collect_update_old_keys(
 
         let old_matches = index_helpers::eval_index_predicate(index, schema, old_row)?;
         if old_matches {
-            let old_idx =
-                index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
+            let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
             keys.push(store.encode_index_deletion_key(
                 db_id,
                 schema.table_id,
@@ -259,8 +258,7 @@ pub fn collect_update_new_btree_entries(
 
         let new_matches = index_helpers::eval_index_predicate(index, schema, new_row)?;
         if new_matches {
-            let new_idx =
-                index_helpers::get_index_values_with_expressions(index, schema, new_row)?;
+            let new_idx = index_helpers::get_index_values_with_expressions(index, schema, new_row)?;
             entries.push(BatchIndexEntry {
                 index_id: index.id,
                 idx_values: new_idx,

@@ -343,16 +343,12 @@ pub(crate) async fn txn_batch_mutate_mixed(
         };
         chunk.push(tikv_m);
         if chunk.len() >= CHUNK_SIZE {
-            txn.batch_mutate(chunk)
-                .await
-                .map_err(|e| anyhow!(e))?;
+            txn.batch_mutate(chunk).await.map_err(|e| anyhow!(e))?;
             chunk = Vec::with_capacity(CHUNK_SIZE);
         }
     }
     if !chunk.is_empty() {
-        txn.batch_mutate(chunk)
-            .await
-            .map_err(|e| anyhow!(e))?;
+        txn.batch_mutate(chunk).await.map_err(|e| anyhow!(e))?;
     }
 
     Ok(())

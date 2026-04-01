@@ -90,6 +90,22 @@ impl Executor {
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let mut hnsw_changes: Vec<(Row, Row)> = Vec::new();
+
+        // Deferred AFTER triggers: collect (old_row, new_row) per-row,
+        // execute after ALL mutations + HNSW maintenance are flushed.
+        // Only allocate when AFTER UPDATE triggers exist.
+        struct DeferredAfterTrigger {
+            old_row: Row,
+            new_row: Row,
+        }
+        let has_after_triggers = trigger_defs.iter().any(|td| {
+            td.timing.eq_ignore_ascii_case("AFTER")
+                && td
+                    .events
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case("UPDATE"))
+        });
+        let mut deferred_triggers: Vec<DeferredAfterTrigger> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&upd.returning, &schema);
 
         // Handle FROM clause: scan ALL FROM tables and build cross-product rows.
@@ -131,8 +147,10 @@ impl Executor {
                 .iter()
                 .enumerate()
                 .map(|(i, r)| {
-                    let pk: Vec<Value> =
-                        pk_indices.iter().map(|&idx| r.values[idx].clone()).collect();
+                    let pk: Vec<Value> = pk_indices
+                        .iter()
+                        .map(|&idx| r.values[idx].clone())
+                        .collect();
                     (crate::storage::encode_pk_values(&pk), i)
                 })
                 .collect();
@@ -152,10 +170,7 @@ impl Executor {
         // batch_mutate RPC.
         let has_before_triggers = trigger_defs.iter().any(|td| {
             td.timing.eq_ignore_ascii_case("BEFORE")
-                && td
-                    .events
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case("UPDATE"))
+                && td.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
         });
 
         // Self-referential FK with ON UPDATE CASCADE: cascade ordering
@@ -288,8 +303,7 @@ impl Executor {
                 }
 
                 let updated_row = if has_hnsw {
-                    let old_row_snapshot =
-                        Row::new(r.values[..schema.columns.len()].to_vec());
+                    let old_row_snapshot = Row::new(r.values[..schema.columns.len()].to_vec());
                     let result = dml::execute_update_row_defer_hnsw(
                         &self.store(),
                         txn,
@@ -321,21 +335,12 @@ impl Executor {
                     .await?
                 };
 
-                trigger_worker::enqueue_after_triggers(
-                    txn,
-                    db_id,
-                    self.tenant_keyspace(),
-                    t,
-                    TriggerOp::Update,
-                    Some(r),
-                    Some(&updated_row),
-                    &trigger_defs,
-                    &self.store(),
-                    self,
-                    sequence_values,
-                    search_path,
-                )
-                .await?;
+                if has_after_triggers {
+                    deferred_triggers.push(DeferredAfterTrigger {
+                        old_row: Row::new(r.values[..schema.columns.len()].to_vec()),
+                        new_row: updated_row.clone(),
+                    });
+                }
 
                 if let Some(ref returning) = upd.returning {
                     let ret_row = eval_returning_typed(returning, &updated_row, &qctx)?;
@@ -519,8 +524,7 @@ impl Executor {
                     .await?;
                 }
 
-                let old_row_stripped =
-                    Row::new(r.values[..schema.columns.len()].to_vec());
+                let old_row_stripped = Row::new(r.values[..schema.columns.len()].to_vec());
                 let old_pks = schema.get_pk_values(&old_row_stripped);
                 let new_pks = schema.get_pk_values(&new_row);
                 let pk_changed = old_pks != new_pks;
@@ -533,8 +537,7 @@ impl Executor {
                 //     row in this batch → not a conflict (will be freed)
                 //  3. New PK exists in TiKV and is NOT being vacated → real collision
                 if pk_changed {
-                    let new_pk_key =
-                        crate::storage::encode_pk_values(&new_pks);
+                    let new_pk_key = crate::storage::encode_pk_values(&new_pks);
 
                     // Case 1: intra-batch duplicate new PK.
                     if !claimed_new_pks.insert(new_pk_key.clone()) {
@@ -543,20 +546,13 @@ impl Executor {
                             .iter()
                             .map(|&i| schema.columns[i].name.clone())
                             .collect();
-                        let pk_vals: Vec<_> =
-                            new_pks.iter().map(|v| format!("{}", v)).collect();
+                        let pk_vals: Vec<_> = new_pks.iter().map(|v| format!("{}", v)).collect();
                         let default_pk_name = format!(
                             "{}_pkey",
-                            schema
-                                .name
-                                .rsplit('.')
-                                .next()
-                                .unwrap_or(&schema.name)
+                            schema.name.rsplit('.').next().unwrap_or(&schema.name)
                         );
-                        let pk_constraint_name = schema
-                            .pk_constraint_name
-                            .clone()
-                            .unwrap_or(default_pk_name);
+                        let pk_constraint_name =
+                            schema.pk_constraint_name.clone().unwrap_or(default_pk_name);
                         return Err(SqlError::UniqueViolation {
                             constraint: pk_constraint_name.clone(),
                             message: format!(
@@ -593,16 +589,10 @@ impl Executor {
                                 new_pks.iter().map(|v| format!("{}", v)).collect();
                             let default_pk_name = format!(
                                 "{}_pkey",
-                                schema
-                                    .name
-                                    .rsplit('.')
-                                    .next()
-                                    .unwrap_or(&schema.name)
+                                schema.name.rsplit('.').next().unwrap_or(&schema.name)
                             );
-                            let pk_constraint_name = schema
-                                .pk_constraint_name
-                                .clone()
-                                .unwrap_or(default_pk_name);
+                            let pk_constraint_name =
+                                schema.pk_constraint_name.clone().unwrap_or(default_pk_name);
                             return Err(SqlError::UniqueViolation {
                                 constraint: pk_constraint_name.clone(),
                                 message: format!(
@@ -618,8 +608,7 @@ impl Executor {
                     }
 
                     // Track this row's old PK as vacated.
-                    let old_pk_key =
-                        crate::storage::encode_pk_values(&old_pks);
+                    let old_pk_key = crate::storage::encode_pk_values(&old_pks);
                     vacated_pks.insert(old_pk_key);
                 }
 
@@ -689,8 +678,7 @@ impl Executor {
             // email = 'a'` alongside another row doing the reverse).
             // On remaining conflicts, attempt resolve_unique_index_conflict
             // (handles stale entries), same as per-row path.
-            let old_delete_key_set: HashSet<Vec<u8>> =
-                all_delete_keys.iter().cloned().collect();
+            let old_delete_key_set: HashSet<Vec<u8>> = all_delete_keys.iter().cloned().collect();
             let mut index_kv_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             if !all_new_btree_entries.is_empty() {
                 let mut pending = all_new_btree_entries;
@@ -713,17 +701,16 @@ impl Executor {
                         Err(err) => {
                             // Try to resolve unique constraint conflict
                             // (stale/idempotent entry).
-                            let Some((conflict_constraint, conflict_row_offset)) =
-                                err.downcast_ref::<SqlError>().and_then(
-                                    |sql_err| match sql_err {
-                                        SqlError::UniqueViolation {
-                                            constraint,
-                                            row_offset: Some(ro),
-                                            ..
-                                        } => Some((constraint.clone(), *ro)),
-                                        _ => None,
-                                    },
-                                )
+                            let Some((conflict_constraint, conflict_row_offset)) = err
+                                .downcast_ref::<SqlError>()
+                                .and_then(|sql_err| match sql_err {
+                                    SqlError::UniqueViolation {
+                                        constraint,
+                                        row_offset: Some(ro),
+                                        ..
+                                    } => Some((constraint.clone(), *ro)),
+                                    _ => None,
+                                })
                             else {
                                 return Err(err);
                             };
@@ -761,10 +748,8 @@ impl Executor {
                                 UniqueConflictResolution::Idempotent
                                 | UniqueConflictResolution::StaleReplaced => {
                                     pending.retain(|e| {
-                                        !(e.constraint_name
-                                            == conflict_constraint
-                                            && e.row_offset
-                                                == conflict_row_offset)
+                                        !(e.constraint_name == conflict_constraint
+                                            && e.row_offset == conflict_row_offset)
                                     });
                                     if pending.is_empty() {
                                         break;
@@ -823,27 +808,17 @@ impl Executor {
                 .await?;
             }
 
-            // ── Phase 5: AFTER triggers + RETURNING ───────────────
+            // ── Phase 5: collect deferred AFTER triggers + RETURNING ──
             for info in &updated_rows {
-                trigger_worker::enqueue_after_triggers(
-                    txn,
-                    db_id,
-                    self.tenant_keyspace(),
-                    t,
-                    TriggerOp::Update,
-                    Some(&info.old_row),
-                    Some(&info.new_row),
-                    &trigger_defs,
-                    &self.store(),
-                    self,
-                    sequence_values,
-                    search_path,
-                )
-                .await?;
+                if has_after_triggers {
+                    deferred_triggers.push(DeferredAfterTrigger {
+                        old_row: info.old_row.clone(),
+                        new_row: info.new_row.clone(),
+                    });
+                }
 
                 if let Some(ref returning) = upd.returning {
-                    let ret_row =
-                        eval_returning_typed(returning, &info.new_row, &qctx)?;
+                    let ret_row = eval_returning_typed(returning, &info.new_row, &qctx)?;
                     ret_rows.push(ret_row);
                 }
             }
@@ -890,6 +865,28 @@ impl Executor {
                     index_id,
                 });
             }
+        }
+
+        // Execute deferred AFTER triggers now that all mutations
+        // (data rows + indexes + HNSW) are flushed.  Each trigger
+        // invocation sees the final post-statement table state,
+        // matching PostgreSQL semantics.
+        for dt in &deferred_triggers {
+            trigger_worker::enqueue_after_triggers(
+                txn,
+                db_id,
+                self.tenant_keyspace(),
+                t,
+                TriggerOp::Update,
+                Some(&dt.old_row),
+                Some(&dt.new_row),
+                &trigger_defs,
+                &self.store(),
+                self,
+                sequence_values,
+                search_path,
+            )
+            .await?;
         }
 
         // Bump mod_count for auto-ANALYZE tracking.

@@ -80,9 +80,8 @@ fn predicates_match(conflict_pred: &str, index_pred: &str) -> bool {
         (Some(a), Some(b)) => predicate_implies(&a, &b),
         // Fall back to whitespace-normalized string comparison if parsing fails.
         _ => {
-            let normalize = |s: &str| -> String {
-                s.split_whitespace().collect::<Vec<_>>().join(" ")
-            };
+            let normalize =
+                |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
             normalize(conflict_pred) == normalize(index_pred)
         }
     }
@@ -96,7 +95,10 @@ fn predicates_match(conflict_pred: &str, index_pred: &str) -> bool {
 /// Implementation: decompose both into AND conjuncts, then check that every
 /// conjunct of the index predicate has an equivalent conjunct in the conflict
 /// predicate (superset check).
-fn predicate_implies(conflict_pred: &sqlparser::ast::Expr, index_pred: &sqlparser::ast::Expr) -> bool {
+fn predicate_implies(
+    conflict_pred: &sqlparser::ast::Expr,
+    index_pred: &sqlparser::ast::Expr,
+) -> bool {
     let mut conflict_conjs = Vec::new();
     collect_and_conjuncts(conflict_pred, &mut conflict_conjs);
     let mut index_conjs = Vec::new();
@@ -202,41 +204,43 @@ fn exprs_equivalent(a: &sqlparser::ast::Expr, b: &sqlparser::ast::Expr) -> bool 
             }
         }
         // Identifiers: case-insensitive comparison.
-        (Expr::Identifier(ai), Expr::Identifier(bi)) => {
-            ai.value.eq_ignore_ascii_case(&bi.value)
-        }
+        (Expr::Identifier(ai), Expr::Identifier(bi)) => ai.value.eq_ignore_ascii_case(&bi.value),
         // Compound identifiers (e.g., table.col): compare last part case-insensitive.
-        (Expr::CompoundIdentifier(ac), Expr::Identifier(bi)) => {
-            ac.last()
-                .is_some_and(|last| last.value.eq_ignore_ascii_case(&bi.value))
-        }
-        (Expr::Identifier(ai), Expr::CompoundIdentifier(bc)) => {
-            bc.last()
-                .is_some_and(|last| last.value.eq_ignore_ascii_case(&ai.value))
-        }
+        (Expr::CompoundIdentifier(ac), Expr::Identifier(bi)) => ac
+            .last()
+            .is_some_and(|last| last.value.eq_ignore_ascii_case(&bi.value)),
+        (Expr::Identifier(ai), Expr::CompoundIdentifier(bc)) => bc
+            .last()
+            .is_some_and(|last| last.value.eq_ignore_ascii_case(&ai.value)),
         (Expr::CompoundIdentifier(ac), Expr::CompoundIdentifier(bc)) => {
             // Compare from the right (column name), ignoring schema/table prefixes.
-            ac.last().zip(bc.last()).is_some_and(|(a, b)| {
-                a.value.eq_ignore_ascii_case(&b.value)
-            })
+            ac.last()
+                .zip(bc.last())
+                .is_some_and(|(a, b)| a.value.eq_ignore_ascii_case(&b.value))
         }
         // String literals: case-SENSITIVE comparison.
-        (Expr::Value(AstValue::SingleQuotedString(a)), Expr::Value(AstValue::SingleQuotedString(b))) => a == b,
+        (
+            Expr::Value(AstValue::SingleQuotedString(a)),
+            Expr::Value(AstValue::SingleQuotedString(b)),
+        ) => a == b,
         // Other values: use PartialEq.
         (Expr::Value(av), Expr::Value(bv)) => av == bv,
         // IS NULL / IS NOT NULL.
         (Expr::IsNull(ae), Expr::IsNull(be)) => exprs_equivalent(ae, be),
         (Expr::IsNotNull(ae), Expr::IsNotNull(be)) => exprs_equivalent(ae, be),
         // Unary ops.
-        (
-            Expr::UnaryOp { op: aop, expr: ae },
-            Expr::UnaryOp { op: bop, expr: be },
-        ) => aop == bop && exprs_equivalent(ae, be),
+        (Expr::UnaryOp { op: aop, expr: ae }, Expr::UnaryOp { op: bop, expr: be }) => {
+            aop == bop && exprs_equivalent(ae, be)
+        }
         // Function calls: compare name case-insensitively, then args recursively.
         (Expr::Function(af), Expr::Function(bf)) => {
             use sqlparser::ast::FunctionArgExpr;
             // Compare function names case-insensitively.
-            if !af.name.to_string().eq_ignore_ascii_case(&bf.name.to_string()) {
+            if !af
+                .name
+                .to_string()
+                .eq_ignore_ascii_case(&bf.name.to_string())
+            {
                 return false;
             }
             // Compare argument lists recursively.
@@ -247,9 +251,14 @@ fn exprs_equivalent(a: &sqlparser::ast::Expr, b: &sqlparser::ast::Expr) -> bool 
             }
             a_args.iter().zip(b_args.iter()).all(|(aa, ba)| {
                 match (aa, ba) {
-                    (sqlparser::ast::FunctionArg::Unnamed(ae), sqlparser::ast::FunctionArg::Unnamed(be)) => {
+                    (
+                        sqlparser::ast::FunctionArg::Unnamed(ae),
+                        sqlparser::ast::FunctionArg::Unnamed(be),
+                    ) => {
                         match (ae, be) {
-                            (FunctionArgExpr::Expr(ae), FunctionArgExpr::Expr(be)) => exprs_equivalent(ae, be),
+                            (FunctionArgExpr::Expr(ae), FunctionArgExpr::Expr(be)) => {
+                                exprs_equivalent(ae, be)
+                            }
                             _ => aa == ba, // Wildcard, QualifiedWildcard
                         }
                     }
@@ -261,16 +270,18 @@ fn exprs_equivalent(a: &sqlparser::ast::Expr, b: &sqlparser::ast::Expr) -> bool 
         _ => {
             let sa = a.to_string();
             let sb = b.to_string();
-            let normalize = |s: &str| -> String {
-                s.split_whitespace().collect::<Vec<_>>().join(" ")
-            };
+            let normalize =
+                |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
             normalize(&sa) == normalize(&sb)
         }
     }
 }
 
 /// Flatten AND expressions into a list of conjuncts.
-fn collect_and_conjuncts<'a>(expr: &'a sqlparser::ast::Expr, out: &mut Vec<&'a sqlparser::ast::Expr>) {
+fn collect_and_conjuncts<'a>(
+    expr: &'a sqlparser::ast::Expr,
+    out: &mut Vec<&'a sqlparser::ast::Expr>,
+) {
     use sqlparser::ast::{BinaryOperator, Expr};
     let expr = {
         let mut cur = expr;
