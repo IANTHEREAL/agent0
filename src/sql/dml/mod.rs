@@ -65,7 +65,7 @@ pub use defaults::{
     coerce_row_values, coerce_row_values_allow_null, eval_column_default_or_null,
     fill_missing_columns,
 };
-pub use delete::{collect_deletion_keys, execute_delete_row};
+pub use delete::collect_deletion_keys;
 // foreign_keys functions are used internally by executor/dml_analyzed
 pub(crate) use foreign_keys::{
     build_fk_ref_schema_cache, collect_deferred_self_fk_checks, pk_to_hash_key,

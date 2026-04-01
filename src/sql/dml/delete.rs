@@ -1,6 +1,5 @@
 //! DELETE row execution: storage entry cleanup and index removal.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,34 +10,6 @@ use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
 use crate::worker::types::IndexState;
-
-use super::foreign_keys::{handle_foreign_key_on_delete, FkDeleteContext, FkStoreCtx};
-
-pub async fn execute_delete_row(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    table_name: &str,
-    schema: &TableSchema,
-    row: &Row,
-    stmt_deleting_pks: &HashSet<String>,
-    fk_ctx: &mut FkDeleteContext,
-) -> Result<()> {
-    let fk_store_ctx = FkStoreCtx { store, db_id };
-    handle_foreign_key_on_delete(
-        &fk_store_ctx,
-        txn,
-        table_name,
-        schema,
-        row,
-        stmt_deleting_pks,
-        fk_ctx,
-    )
-    .await?;
-
-    delete_row_storage_entries(store, txn, db_id, table_name, schema, row).await?;
-    Ok(())
-}
 
 /// Collect all TiKV keys that must be deleted for a single row,
 /// without performing any IO. Used by batch DELETE to gather all keys
