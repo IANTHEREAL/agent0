@@ -6,8 +6,8 @@
 --   38 bytes fixed (db prefix 11 + index header 20 + tags 3 + PK 4)
 --   + memcomparable string: 1 byte leading flag + ceil(N/8) * 9 chunk bytes
 -- Formula: encoded_key = 39 + ceil(N/8) * 9
--- Max N for encoded_key < 8192: N = 7240 (encoded = 8184)
--- N = 7241 produces encoded = 8193 which is rejected (>= limit).
+-- Effective limit: 8192 * 85% ≈ 6963 (15% margin for TiKV internal overhead:
+-- keyspace prefix, MVCC encoding, pessimistic lock metadata).
 
 -- ================================================================
 -- Setup
@@ -27,10 +27,11 @@ SELECT id, length(body) FROM iks_test WHERE id = 1;
 INSERT INTO iks_test VALUES (2, repeat('x', 10000));
 
 -- ================================================================
--- Test 3: Boundary value just under limit — INSERT succeeds
--- (7240-byte string encodes to 8183-byte key, under 8192 limit.)
+-- Test 3: Boundary value under limit — INSERT succeeds
+-- (6000-byte string encodes to ~6789-byte key, under effective limit
+--  of ~6963 = 8192 * 85% accounting for TiKV internal overhead.)
 -- ================================================================
-INSERT INTO iks_test VALUES (3, repeat('b', 7240));
+INSERT INTO iks_test VALUES (3, repeat('b', 6000));
 SELECT id, length(body) FROM iks_test WHERE id = 3;
 
 -- ================================================================

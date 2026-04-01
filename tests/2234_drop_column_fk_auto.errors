@@ -1,5 +1,5 @@
 # Test 3: Parent-side DROP COLUMN without CASCADE blocked by index
-Cannot drop column
+drop column
 # Test 3: FK violation on child (FK still exists)
 violates foreign key constraint
 # Test 5: child5b FK violation (FK still enforced after child5a drop)

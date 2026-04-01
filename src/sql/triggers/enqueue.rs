@@ -67,8 +67,17 @@ pub(crate) async fn enqueue_after_triggers(
             continue;
         };
 
-        if trigger_body_needs_async(&func.body) && crate::worker::get_system_store().is_some() {
-            if let Some(sql) = flatten_trigger_body_to_sql(&func.body, &schema, new_row, old_row) {
+        // Check async-ness on the original body BEFORE substitution, so that
+        // table names like "http_get_jobs" don't accidentally match async keywords.
+        let is_async =
+            trigger_body_needs_async(&func.body) && crate::worker::get_system_store().is_some();
+
+        // Substitute trigger context variables (TG_OP, TG_TABLE_NAME) before
+        // either execution path so both sync and async triggers resolve them.
+        let body = super::execute::substitute_trigger_variables(&func.body, Some(op_str), &schema);
+
+        if is_async {
+            if let Some(sql) = flatten_trigger_body_to_sql(&body, &schema, new_row, old_row) {
                 executor.push_pending_async_trigger(PendingAsyncTrigger {
                     keyspace: keyspace.to_string(),
                     db_id,
@@ -82,10 +91,11 @@ pub(crate) async fn enqueue_after_triggers(
                 db_id,
                 sequence_values,
                 &schema,
-                &func.body,
+                &body,
                 old_row,
                 new_row,
                 search_path,
+                None, // TG_OP already substituted above
             ))
             .await?;
         }

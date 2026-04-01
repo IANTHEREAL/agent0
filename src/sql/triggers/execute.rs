@@ -18,6 +18,7 @@ pub(crate) async fn execute_trigger_body_standalone(
     old_row: Option<&Row>,
     new_row: Option<&Row>,
     search_path: &[String],
+    trigger_op: Option<&str>,
 ) -> Result<()> {
     // This is intentionally a small subset of PL/pgSQL tailored for triggers:
     // - `NEW.col := <expr>` assignments
@@ -35,7 +36,10 @@ pub(crate) async fn execute_trigger_body_standalone(
         new_values.resize(schema.columns.len(), crate::model::Value::Null);
     }
 
-    let Some((begin_pos, end_pos)) = plpgsql_outer_block_range(body) else {
+    // Substitute PL/pgSQL trigger context variables (TG_OP, TG_TABLE_NAME, etc.)
+    let body = substitute_trigger_variables(body, trigger_op, schema);
+
+    let Some((begin_pos, end_pos)) = plpgsql_outer_block_range(&body) else {
         return Ok(());
     };
     let block = &body[begin_pos..end_pos];
@@ -200,6 +204,129 @@ pub(crate) async fn execute_trigger_statement_standalone(
     }
 
     Ok(false)
+}
+
+/// Replace PL/pgSQL trigger context variables (`TG_OP`, `TG_TABLE_NAME`) with
+/// their literal values so they resolve correctly in SQL statements.
+pub(crate) fn substitute_trigger_variables(
+    body: &str,
+    trigger_op: Option<&str>,
+    schema: &TableSchema,
+) -> String {
+    let mut result = body.to_string();
+    if let Some(op) = trigger_op {
+        // TG_OP values (INSERT/UPDATE/DELETE) are plain ASCII — safe to format directly.
+        let replacement = format!("'{}'", op);
+        result = replace_ident_ci(&result, "TG_OP", &replacement);
+    }
+    // TG_TABLE_NAME — unqualified table name (strip schema prefix if present).
+    // Use quote_literal to properly escape single quotes in table names
+    // (e.g., table "o'hare" → 'o''hare').
+    let table_name = schema
+        .name
+        .rsplit_once('.')
+        .map(|(_, t)| t)
+        .unwrap_or(&schema.name);
+    let tn_replacement = crate::sql::quoting::quote_literal(table_name);
+    result = replace_ident_ci(&result, "TG_TABLE_NAME", &tn_replacement);
+    result
+}
+
+/// Replace whole-word occurrences of `ident` (case-insensitive) with `replacement`,
+/// skipping string literals and comments.
+fn replace_ident_ci(input: &str, ident: &str, replacement: &str) -> String {
+    let bytes = input.as_bytes();
+    let ident_bytes = ident.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip single-quoted strings.
+        if bytes[i] == b'\'' {
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        out.push(bytes[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip double-quoted identifiers (e.g. "TG_OP" as a column name).
+        if bytes[i] == b'"' {
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        out.push(bytes[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip dollar-quoted strings ($$ ... $$ or $tag$ ... $tag$).
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let delim = &bytes[i..=j];
+                let delim_len = delim.len();
+                out.extend_from_slice(delim);
+                i = j + 1;
+                while i + delim_len <= bytes.len() {
+                    if &bytes[i..i + delim_len] == delim {
+                        out.extend_from_slice(delim);
+                        i += delim_len;
+                        break;
+                    }
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // Check for identifier match.
+        if i + ident_bytes.len() <= bytes.len()
+            && bytes[i..i + ident_bytes.len()].eq_ignore_ascii_case(ident_bytes)
+        {
+            // Ensure word boundary before (`.` connects qualified names, so
+            // `src.tg_op` must NOT match as a bare `TG_OP`).
+            let before_ok = i == 0 || {
+                let b = bytes[i - 1];
+                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.'
+            };
+            // Ensure word boundary after.
+            let after = i + ident_bytes.len();
+            let after_ok = after >= bytes.len() || {
+                let b = bytes[after];
+                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.'
+            };
+            if before_ok && after_ok {
+                out.extend_from_slice(replacement.as_bytes());
+                i = after;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
 }
 
 fn parse_new_assignment(stmt: &str) -> Option<(&str, &str)> {

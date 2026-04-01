@@ -258,8 +258,11 @@ pub async fn execute_alter_table(
                 .ok_or_else(|| anyhow!("Invalid table name"))?;
             let (schema_name, _) = names::parse_full_name(&t)?;
             let new_full = format!("{}.{}", schema_name, new_table);
-            // Unified namespace check: reserve the new name before renaming.
-            super::create_table::check_relation_name_available(
+            // Check that no live relation uses the target name.
+            // If the name is free but an orphaned reservation key remains
+            // (from a previous DROP that predates the reservation-cleanup fix),
+            // release it before attempting to reserve the new name.
+            match super::create_table::check_relation_name_available(
                 store,
                 txn,
                 db_id,
@@ -269,7 +272,44 @@ pub async fn execute_alter_table(
                 false,
                 None,
             )
-            .await?;
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    // If the only failure is the reservation key (DuplicateRelation)
+                    // and no actual table/view/sequence/type uses the name, it's an
+                    // orphaned key — release it and retry.
+                    let is_orphan =
+                        e.downcast_ref::<crate::sql::error::SqlError>()
+                            .is_some_and(|se| {
+                                matches!(se, crate::sql::error::SqlError::DuplicateRelation(_))
+                            })
+                            && !store.table_exists(txn, db_id, &new_full).await?
+                            && store.get_view(txn, db_id, &new_full).await?.is_none()
+                            && store
+                                .get_materialized_view(txn, db_id, &new_full)
+                                .await?
+                                .is_none()
+                            && store.get_sequence(txn, db_id, &new_full).await?.is_none()
+                            && store.get_type(txn, db_id, &new_full).await?.is_none();
+                    if is_orphan {
+                        store.release_relation_name(txn, db_id, &new_full).await?;
+                        super::create_table::check_relation_name_available(
+                            store,
+                            txn,
+                            db_id,
+                            &schema_name,
+                            &new_table,
+                            super::create_table::RelationKind::Table,
+                            false,
+                            None,
+                        )
+                        .await?;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
             store.rename_table_schema(txn, db_id, &t, &new_full).await?;
             store
                 .rename_table_metadata(txn, db_id, &t, &new_full)

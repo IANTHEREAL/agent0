@@ -100,10 +100,7 @@ impl Executor {
         }
         let has_after_triggers = trigger_defs.iter().any(|td| {
             td.timing.eq_ignore_ascii_case("AFTER")
-                && td
-                    .events
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case("UPDATE"))
+                && td.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
         });
         let mut deferred_triggers: Vec<DeferredAfterTrigger> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&upd.returning, &schema);

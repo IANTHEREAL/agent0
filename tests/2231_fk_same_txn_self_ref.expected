@@ -16,6 +16,8 @@ id|parent_id
 12|11
 13|12
 (7 rows)
+ERROR:  insert or update on table "fk_txn_tree" violates foreign key constraint "fk_txn_tree_parent_id_fkey"
+DETAIL:  Key (parent_id)=(999) is not present in table "fk_txn_tree".
 id|parent_id
 (0 rows)
 id|parent_id

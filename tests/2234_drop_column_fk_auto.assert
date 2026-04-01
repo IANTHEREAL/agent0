@@ -1,0 +1,38 @@
+-- Section 1: child-side single-column FK drop, column gone
+id
+1
+(1 row)
+
+-- Section 2: child-side multi-column FK drop, FK no longer enforced
+id|pb
+1|10
+2|999
+(2 rows)
+
+-- Section 4: self-referencing FK drop
+id
+1
+2
+(2 rows)
+
+-- Section 5: child5a FK dropped independently
+id
+(0 rows)
+
+-- Section 6: FK violation then drop, insert succeeds after drop
+id|extra
+1|ok
+3|no fk check
+(2 rows)
+
+-- Section 7: FK enforced after unrelated column drop, valid insert works
+id|pid
+1|1
+2|1
+(2 rows)
+
+-- Section 8: CASCADE drops parent column + child FK
+id|pcode
+1|A
+2|ANYTHING
+(2 rows)
