@@ -284,7 +284,7 @@ pub(crate) enum BatchMutation {
 }
 
 impl BatchMutation {
-    fn key(&self) -> &[u8] {
+    pub(crate) fn key(&self) -> &[u8] {
         match self {
             BatchMutation::Put(k, _) => k,
             BatchMutation::Delete(k) => k,

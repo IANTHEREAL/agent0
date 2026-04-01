@@ -139,6 +139,201 @@ async fn execute_update_row_by_pk_inner(
     Ok(new_row)
 }
 
+// ── Batch UPDATE helpers ──────────────────────────────────────────
+//
+// These pure (no TiKV I/O) functions mirror `update_row_indexes` and
+// `upsert` but collect `BatchMutation` keys/values instead of calling
+// TiKV directly.  Used by the no-trigger fast path in
+// `execute_analyzed_update` to flush all mutations in a single
+// `batch_mutate` RPC.
+
+use crate::storage::indexes::BatchIndexEntry;
+use crate::storage::serialize_row;
+
+/// Collect all old TiKV keys that must be deleted when updating a row.
+///
+/// Includes old data key (if PK changed) and old index entries for
+/// every B-tree and GIN index whose values changed.  Skips HNSW
+/// (handled by [`batch_maintain_hnsw_indexes`]).
+pub fn collect_update_old_keys(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+    old_pks: &[Value],
+    pk_changed: bool,
+) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+
+    // Data key: delete old row if PK changed.
+    if pk_changed {
+        keys.push(store.encode_data_key_for_row(db_id, schema.table_id, old_pks));
+    }
+
+    for index in &schema.indexes {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
+            continue;
+        }
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, new_row)? {
+            continue;
+        }
+        if index.is_hnsw() {
+            continue;
+        }
+
+        // GIN: collect old token hash deletion keys.
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
+        if !gin_hashes.is_empty() {
+            keys.extend(store.encode_gin_index_deletion_keys(
+                db_id,
+                schema.table_id,
+                index.id,
+                &gin_hashes,
+                old_pks,
+            ));
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        let old_matches = index_helpers::eval_index_predicate(index, schema, old_row)?;
+        if old_matches {
+            let old_idx =
+                index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
+            keys.push(store.encode_index_deletion_key(
+                db_id,
+                schema.table_id,
+                index.id,
+                &old_idx,
+                old_pks,
+                index.unique,
+            ));
+        }
+    }
+
+    Ok(keys)
+}
+
+/// Collect new B-tree index entries for batch unique constraint checking.
+///
+/// Returns [`BatchIndexEntry`] values for use with
+/// [`TikvStore::create_index_entries_batch`].  Skips HNSW and GIN
+/// (handled separately).
+pub fn collect_update_new_btree_entries(
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+    new_pks: &[Value],
+    pk_changed: bool,
+    row_offset: usize,
+) -> Result<Vec<BatchIndexEntry>> {
+    let mut entries = Vec::new();
+
+    for index in &schema.indexes {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
+            continue;
+        }
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, new_row)? {
+            continue;
+        }
+        if index.is_hnsw() {
+            continue;
+        }
+
+        // Skip GIN (handled by collect_update_new_gin_mutations).
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, new_row)?;
+        if !gin_hashes.is_empty() {
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        let new_matches = index_helpers::eval_index_predicate(index, schema, new_row)?;
+        if new_matches {
+            let new_idx =
+                index_helpers::get_index_values_with_expressions(index, schema, new_row)?;
+            entries.push(BatchIndexEntry {
+                index_id: index.id,
+                idx_values: new_idx,
+                pk_values: new_pks.to_vec(),
+                unique: index.unique,
+                row_offset,
+                constraint_name: index.name.clone(),
+                key_columns: index.columns.clone(),
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Collect new GIN index mutations for batch flush.
+///
+/// Returns `(key, value)` pairs for GIN insertion, using the same
+/// encoding as [`TikvStore::create_gin_index_entries`].
+pub fn collect_update_new_gin_mutations(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+    new_pks: &[Value],
+    pk_changed: bool,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut mutations = Vec::new();
+
+    for index in &schema.indexes {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
+            continue;
+        }
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, new_row)? {
+            continue;
+        }
+        if index.is_hnsw() {
+            continue;
+        }
+
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, new_row)?;
+        if !gin_hashes.is_empty() {
+            mutations.extend(store.encode_gin_index_mutations(
+                db_id,
+                schema.table_id,
+                index.id,
+                &gin_hashes,
+                new_pks,
+            ));
+        }
+    }
+
+    Ok(mutations)
+}
+
+/// Encode a data row mutation (Put) for batch flush.
+///
+/// Returns `(data_key, serialized_row)`.
+pub fn encode_data_row_mutation(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    schema: &TableSchema,
+    new_pks: &[Value],
+    new_row: &Row,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let data_key = store.encode_data_key_for_row(db_id, schema.table_id, new_pks);
+    let data_val = serialize_row(new_row)?;
+    Ok((data_key, data_val))
+}
+
 async fn update_row_indexes(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,

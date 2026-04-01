@@ -210,6 +210,11 @@ impl TikvStore {
     /// On unique violation returns an error; the caller can use `row_offset`
     /// from the returned error context to attribute the failure.
     ///
+    /// `old_keys_being_deleted`: when called from batch UPDATE, the set of
+    /// old index keys being deleted in the same batch.  A unique key that
+    /// exists in TiKV but is also in this set is not a real conflict (it
+    /// will be freed by the same batch flush).  Pass `None` for INSERT/COPY.
+    ///
     /// Returns the encoded `(key, value)` mutations — caller is responsible
     /// for flushing via `txn_batch_mutate`.
     pub async fn create_index_entries_batch(
@@ -218,6 +223,7 @@ impl TikvStore {
         db_id: u64,
         table_id: u64,
         entries: &[BatchIndexEntry],
+        old_keys_being_deleted: Option<&HashSet<Vec<u8>>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -304,7 +310,16 @@ impl TikvStore {
                     // Idempotent writes (same index key already points to the same PK)
                     // are not conflicts and should not fail COPY retry paths.
                     if existing_val.as_slice() != ue.idx_val.as_slice() {
-                        return Err(Self::build_batch_unique_violation(&ue.entry).into());
+                        // For batch UPDATE: if the conflicting key is being
+                        // deleted in the same batch (e.g. two rows swapping
+                        // unique values), this is not a real conflict.
+                        let being_deleted = old_keys_being_deleted
+                            .is_some_and(|s| s.contains(&ue.idx_key));
+                        if !being_deleted {
+                            return Err(
+                                Self::build_batch_unique_violation(&ue.entry).into()
+                            );
+                        }
                     }
                 }
                 if !seen_keys.insert(ue.idx_key.clone()) {
@@ -319,7 +334,7 @@ impl TikvStore {
             mutations.push((ue.idx_key, ue.idx_val));
         }
         for ne in non_unique_entries {
-            mutations.push((ne.idx_key, vec![]));
+            mutations.push((ne.idx_key, INDEX_SENTINEL_VALUE.to_vec()));
         }
         Ok(mutations)
     }
@@ -679,7 +694,7 @@ impl TikvStore {
                 let key = self.key(&encode_gin_index_key_v2(
                     db_id, table_id, index_id, token_hash, &pk_key,
                 ));
-                (key, Vec::new())
+                (key, INDEX_SENTINEL_VALUE.to_vec())
             })
             .collect()
     }

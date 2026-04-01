@@ -70,8 +70,8 @@ pub use delete::{collect_deletion_keys, execute_delete_row};
 pub(crate) use foreign_keys::{
     build_fk_ref_schema_cache, collect_deferred_self_fk_checks, pk_to_hash_key,
     resolve_fk_ref_lookup, self_ref_fk_keys, validate_deferred_self_fk_refs,
-    validate_foreign_keys_non_self_ref, ConstraintId, FkDeleteContext, FkLockCache, FkRefLookup,
-    FkRefSchemaCache, FkStoreCtx,
+    validate_foreign_keys_non_self_ref, validate_foreign_keys_with_cache, ConstraintId,
+    FkDeleteContext, FkLockCache, FkRefLookup, FkRefSchemaCache, FkStoreCtx,
 };
 #[allow(unused_imports)]
 pub use foreign_keys::{
@@ -79,8 +79,11 @@ pub use foreign_keys::{
 };
 pub use insert::execute_insert_row_defer_hnsw;
 pub use insert::{build_enum_label_cache, execute_insert_row};
+pub(crate) use insert::validate_enum_values;
 pub(crate) use update::execute_update_row_without_fk_update;
 pub use update::{
-    batch_maintain_hnsw_indexes, batch_maintain_hnsw_indexes_for_inserts, execute_update_row,
-    execute_update_row_by_pk, execute_update_row_by_pk_defer_hnsw, execute_update_row_defer_hnsw,
+    batch_maintain_hnsw_indexes, batch_maintain_hnsw_indexes_for_inserts,
+    collect_update_new_btree_entries, collect_update_new_gin_mutations, collect_update_old_keys,
+    encode_data_row_mutation, execute_update_row, execute_update_row_by_pk,
+    execute_update_row_by_pk_defer_hnsw, execute_update_row_defer_hnsw,
 };
