@@ -8,6 +8,7 @@ use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
 use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
+use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
@@ -163,14 +164,52 @@ impl PhysicalOperator for HashAggregateOperator {
 
             for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
                 if let Some(ref filter_expr) = agg_expr.filter {
-                    let filter_val = eval_typed_expr(filter_expr, row, ctx.query_ctx)?;
+                    let filter_val = if needs_async(filter_expr) {
+                        let mat = ctx
+                            .executor
+                            .materialize_expr_for_row(
+                                filter_expr,
+                                row,
+                                ctx.outer_row.as_ref(),
+                                Some(self.child.schema()),
+                                ctx.txn,
+                                ctx.db_id,
+                                ctx.sequence_values,
+                                ctx.search_path,
+                                ctx.cte_tables,
+                                ctx.query_ctx,
+                            )
+                            .await?;
+                        eval_typed_expr(&mat, row, ctx.query_ctx)?
+                    } else {
+                        eval_typed_expr(filter_expr, row, ctx.query_ctx)?
+                    };
                     if !matches!(filter_val, Value::Boolean(true)) {
                         continue;
                     }
                 }
 
                 let val = if let Some(arg) = &agg_expr.arg {
-                    eval_typed_expr(arg, row, ctx.query_ctx)?
+                    if needs_async(arg) {
+                        let mat = ctx
+                            .executor
+                            .materialize_expr_for_row(
+                                arg,
+                                row,
+                                ctx.outer_row.as_ref(),
+                                Some(self.child.schema()),
+                                ctx.txn,
+                                ctx.db_id,
+                                ctx.sequence_values,
+                                ctx.search_path,
+                                ctx.cte_tables,
+                                ctx.query_ctx,
+                            )
+                            .await?;
+                        eval_typed_expr(&mat, row, ctx.query_ctx)?
+                    } else {
+                        eval_typed_expr(arg, row, ctx.query_ctx)?
+                    }
                 } else {
                     Value::Int32(1)
                 };
@@ -191,7 +230,26 @@ impl PhysicalOperator for HashAggregateOperator {
                 // Evaluate per-row delimiter for string_agg.
                 let row_delimiter = if agg_expr.func_name == "STRING_AGG" {
                     if let Some(ref delim_expr) = agg_expr.delimiter {
-                        let dv = eval_typed_expr(delim_expr, row, ctx.query_ctx)?;
+                        let dv = if needs_async(delim_expr) {
+                            let mat = ctx
+                                .executor
+                                .materialize_expr_for_row(
+                                    delim_expr,
+                                    row,
+                                    ctx.outer_row.as_ref(),
+                                    Some(self.child.schema()),
+                                    ctx.txn,
+                                    ctx.db_id,
+                                    ctx.sequence_values,
+                                    ctx.search_path,
+                                    ctx.cte_tables,
+                                    ctx.query_ctx,
+                                )
+                                .await?;
+                            eval_typed_expr(&mat, row, ctx.query_ctx)?
+                        } else {
+                            eval_typed_expr(delim_expr, row, ctx.query_ctx)?
+                        };
                         match dv {
                             Value::Text(s) => s,
                             Value::Null => String::new(),
@@ -208,7 +266,26 @@ impl PhysicalOperator for HashAggregateOperator {
                 if let Some(buf) = state.ordered_agg_buffers[i].as_mut() {
                     let mut keys = Vec::with_capacity(agg_expr.order_by.len());
                     for o in &agg_expr.order_by {
-                        let key = eval_typed_expr(&o.expr, row, ctx.query_ctx)?;
+                        let key = if needs_async(&o.expr) {
+                            let mat = ctx
+                                .executor
+                                .materialize_expr_for_row(
+                                    &o.expr,
+                                    row,
+                                    ctx.outer_row.as_ref(),
+                                    Some(self.child.schema()),
+                                    ctx.txn,
+                                    ctx.db_id,
+                                    ctx.sequence_values,
+                                    ctx.search_path,
+                                    ctx.cte_tables,
+                                    ctx.query_ctx,
+                                )
+                                .await?;
+                            eval_typed_expr(&mat, row, ctx.query_ctx)?
+                        } else {
+                            eval_typed_expr(&o.expr, row, ctx.query_ctx)?
+                        };
                         keys.push(key);
                     }
                     let ordered_entry_bytes = std::mem::size_of::<(Vec<Value>, Value, String)>()

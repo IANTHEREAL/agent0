@@ -500,21 +500,52 @@ impl PhysicalOperator for InListScanOperator {
 
         let (index, pk_types) = self.base.resolve_index_meta()?;
 
+        // When the IN-list values cover fewer columns than the index has,
+        // we must use scan_index_prefix (which correctly skips over the
+        // remaining index-column bytes when extracting the PK) instead of
+        // scan_index (which assumes ALL index columns are provided and
+        // tries to decode the PK immediately after them, producing wrong
+        // PKs or decode errors such as "invalid sequence encoding").
+        let needs_prefix_scan = self
+            .column_values
+            .first()
+            .map_or(false, |v| v.len() < index.columns.len());
+        let index_column_types = if needs_prefix_scan {
+            self.base.resolve_index_column_types(index)?
+        } else {
+            Vec::new()
+        };
+
         let mut all_pks = Vec::new();
         for values in &self.column_values {
-            let pks = ctx
-                .store
-                .scan_index(
-                    ctx.txn,
-                    ctx.db_id,
-                    self.base.schema.table_id,
-                    self.base.index_id,
-                    values,
-                    index.unique,
-                    &pk_types,
-                    None,
-                )
-                .await?;
+            let pks = if needs_prefix_scan {
+                ctx.store
+                    .scan_index_prefix(
+                        ctx.txn,
+                        ctx.db_id,
+                        self.base.schema.table_id,
+                        self.base.index_id,
+                        values,
+                        index.unique,
+                        &index_column_types,
+                        &pk_types,
+                        None,
+                    )
+                    .await?
+            } else {
+                ctx.store
+                    .scan_index(
+                        ctx.txn,
+                        ctx.db_id,
+                        self.base.schema.table_id,
+                        self.base.index_id,
+                        values,
+                        index.unique,
+                        &pk_types,
+                        None,
+                    )
+                    .await?
+            };
             all_pks.extend(pks);
         }
 

@@ -1,0 +1,45 @@
+state|payload
+leased|task-4
+leased|task-5
+open|task-1
+open|task-2
+open|task-3
+(5 rows)
+state|payload
+open|task-1
+(1 row)
+state|payload
+stalled|task-6
+(1 row)
+state|payload
+leased|task-4
+open|task-1
+(2 rows)
+state|payload
+closed|d
+closed|e
+open|a
+open|b
+open|c
+(5 rows)
+state|payload
+open|a
+open|c
+(2 rows)
+state|data
+active|row-1
+active|row-2
+pending|row-5
+(3 rows)
+cnt
+3
+(1 row)
+code|region|val
+A|EU|20
+A|US|10
+C|US|50
+(3 rows)
+a|b|val
+x|p|1
+x|q|2
+(2 rows)
