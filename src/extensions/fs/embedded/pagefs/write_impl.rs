@@ -508,13 +508,13 @@ impl EmbeddedPageFs {
             };
 
             let now = current_unix_timestamp();
-            let expires_at = now
-                .checked_add(
-                    i64::try_from(fs9_config().presign_ttl_secs).map_err(|_| {
-                        anyhow!(EmbeddedFsError::internal("presign ttl exceeds i64"))
-                    })?,
-                )
-                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("presign expiry overflow")))?;
+            let expires_at =
+                now.checked_add(i64::try_from(fs9_config().upload_token_ttl_secs).map_err(
+                    |_| anyhow!(EmbeddedFsError::internal("upload token ttl exceeds i64")),
+                )?)
+                .ok_or_else(|| {
+                    anyhow!(EmbeddedFsError::internal("upload token expiry overflow"))
+                })?;
             let nonce = rand::thread_rng().gen_range(1..=u64::MAX);
             let path_hash = path_hash_bytes(&normalized);
             let reservation = UploadReservation {
@@ -636,7 +636,7 @@ impl EmbeddedPageFs {
                 "uploading state missing upload_id"
             ))
         })?;
-        let ttl_secs = presign_ttl_secs_from_claims(claims.expires_at)?;
+        let ttl_secs = presign_part_ttl_secs();
         let s3 = self
             .s3_client()
             .await?
@@ -652,7 +652,10 @@ impl EmbeddedPageFs {
         checksum: Option<[u8; 32]>,
     ) -> Result<usize> {
         let claims = verify_upload_token(upload_token)?;
-        let ctx = self.load_upload_context(&claims, false).await?;
+        // complete_upload is exempt from token expiry: the HMAC signature, nonce,
+        // and upload_id binding provide sufficient authentication. Rejecting a
+        // completion after hours of successful part uploads would waste all work.
+        let ctx = self.load_upload_context_skip_expiry(&claims).await?;
         if ctx.phase == UploadLifecyclePhase::Published {
             return usize::try_from(ctx.inode.size)
                 .map_err(|_| anyhow!(EmbeddedFsError::internal("published size exceeds usize")));
@@ -681,21 +684,36 @@ impl EmbeddedPageFs {
                     "uploading state missing upload_id"
                 ))
             })?;
-            s3.complete_multipart_upload(
-                &ctx.key,
-                upload_id,
-                completed_parts
-                    .iter()
-                    .map(|part| {
-                        (
-                            part.part_number,
-                            part.etag.clone(),
-                            part.checksum_crc32c.clone(),
-                        )
-                    })
-                    .collect(),
-            )
-            .await?;
+            if let Err(complete_err) = s3
+                .complete_multipart_upload(
+                    &ctx.key,
+                    upload_id,
+                    completed_parts
+                        .iter()
+                        .map(|part| {
+                            (
+                                part.part_number,
+                                part.etag.clone(),
+                                part.checksum_crc32c.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+                .await
+            {
+                // CompleteMultipartUpload can time out after S3 has already
+                // assembled the object. Fall through to HeadObject to check
+                // whether the object actually exists before giving up.
+                tracing::warn!(
+                    key = %ctx.key,
+                    upload_id = %upload_id,
+                    error = %complete_err,
+                    "fs9: CompleteMultipartUpload failed, checking HeadObject",
+                );
+                if head_object_with_retry(&s3, &ctx.key).await.is_err() {
+                    return Err(complete_err);
+                }
+            }
         }
 
         let head = head_object_with_retry(&s3, &ctx.key).await?;

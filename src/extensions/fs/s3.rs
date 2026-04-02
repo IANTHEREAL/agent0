@@ -2,6 +2,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::SdkError;
@@ -33,7 +35,14 @@ impl FsS3Client {
         }
         let shared = loader.load().await;
 
-        let mut builder = S3ConfigBuilder::from(&shared);
+        let timeout_config = TimeoutConfig::builder()
+            .operation_attempt_timeout(Duration::from_secs(600))
+            .build();
+        let retry_config = RetryConfig::standard().with_max_attempts(4);
+
+        let mut builder = S3ConfigBuilder::from(&shared)
+            .timeout_config(timeout_config)
+            .retry_config(retry_config);
         if let Some(endpoint) = binding.endpoint.as_deref() {
             builder = builder.endpoint_url(endpoint);
         }

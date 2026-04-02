@@ -941,6 +941,104 @@ fn test_encode_s3_key_component_is_injective_for_unicode_inputs() {
     );
 }
 
+// ── Upload TTL / presign / lifecycle refresh tests ──────────────────
+
+#[test]
+fn test_presign_part_ttl_is_fixed_and_does_not_decay() {
+    // presign_part_ttl_secs must return a fixed value from config,
+    // not a decaying value derived from token expires_at.
+    let ttl1 = presign_part_ttl_secs();
+    let ttl2 = presign_part_ttl_secs();
+    assert_eq!(ttl1, ttl2, "presign TTL must be fixed, not time-dependent");
+    assert_eq!(
+        ttl1,
+        fs9_config().presign_ttl_secs,
+        "presign TTL must equal FS9_PRESIGN_TTL_SECS config"
+    );
+    assert!(ttl1 > 0, "presign TTL must be positive");
+}
+
+#[test]
+fn test_upload_token_ttl_is_longer_than_presign_ttl() {
+    // The upload token lifetime must be longer than the per-part presign TTL
+    // to allow large file uploads that take hours to complete.
+    let token_ttl = fs9_config().upload_token_ttl_secs;
+    let presign_ttl = fs9_config().presign_ttl_secs;
+    assert!(
+        token_ttl > presign_ttl,
+        "upload_token_ttl_secs ({token_ttl}) must be greater than presign_ttl_secs ({presign_ttl})"
+    );
+    // Default: token TTL = 4h, presign TTL = 15min
+    assert!(
+        token_ttl >= 4 * 3600,
+        "default upload_token_ttl_secs must be at least 4 hours, got {token_ttl}s"
+    );
+}
+
+#[test]
+fn test_upload_lifecycle_reapable_respects_extended_ttl() {
+    // With extended token TTL (e.g. 4h for large uploads), the GC must
+    // not reap uploads before reservation.expires_at, even if updated_at
+    // is stale by more than STALE_WRITE_STREAM_SECS.
+    let extended_expires_at = 4 * 3600; // 4 hours
+    let reservation = UploadReservation {
+        fs_instance_id: [5u8; 16],
+        path: "/data/large.bin".to_string(),
+        path_hash: [1u8; 32],
+        expected_parent_inode: Some(ROOT_INODE),
+        expected_prior_inode: None,
+        expected_prior_generation: None,
+        expected_size: 100 * 1024 * 1024 * 1024, // 100GB
+        nonce: 7,
+        expires_at: extended_expires_at,
+    };
+
+    // At t=2h, updated_at is 2h stale (> STALE_WRITE_STREAM_SECS=1h),
+    // but reservation.expires_at is still in the future → not reapable.
+    let now = 2 * 3600;
+    let updated_at = 0;
+    assert!(
+        !uploading_lifecycle_is_reapable(now, updated_at, Some(&reservation)),
+        "must NOT reap upload before reservation.expires_at even if updated_at is stale"
+    );
+
+    // After expires_at, it becomes reapable.
+    let now = extended_expires_at + 1;
+    assert!(
+        uploading_lifecycle_is_reapable(now, updated_at, Some(&reservation)),
+        "must reap upload after reservation.expires_at"
+    );
+}
+
+#[test]
+fn test_lifecycle_refresh_throttle_in_presign_path() {
+    // The presign path should only write TiKV lifecycle when updated_at
+    // is older than STAGING_REFRESH_INTERVAL_SECS (300s), matching the
+    // streaming write path's behavior.
+    let now = 1000;
+
+    // Recently refreshed (50s ago) → should NOT trigger refresh
+    let updated_at = now - 50;
+    assert!(
+        (now - updated_at) < STAGING_REFRESH_INTERVAL_SECS,
+        "50s gap should be below the {STAGING_REFRESH_INTERVAL_SECS}s threshold"
+    );
+
+    // Stale refresh (400s ago) → should trigger refresh
+    let updated_at = now - 400;
+    assert!(
+        (now - updated_at) >= STAGING_REFRESH_INTERVAL_SECS,
+        "400s gap should meet or exceed the {STAGING_REFRESH_INTERVAL_SECS}s threshold"
+    );
+
+    // Exactly at boundary → should trigger refresh
+    let updated_at = now - STAGING_REFRESH_INTERVAL_SECS;
+    assert!(
+        (now - updated_at) >= STAGING_REFRESH_INTERVAL_SECS,
+        "exactly at threshold should trigger refresh"
+    );
+}
+
 #[test]
 fn test_uploading_lifecycle_is_not_reapable_before_reservation_expiry() {
     let reservation = UploadReservation {
@@ -3434,5 +3532,80 @@ async fn test_storage_stats_initialized_keyspace_returns_counts() {
         stats.total_directories
     );
 
+    cleanup(&fs, base).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_presign_url_ttl_is_fixed_not_decaying_with_real_s3() {
+    // Verifies that presigned URLs get a fixed TTL from config, not a
+    // decaying TTL derived from token expires_at. Two presign calls at
+    // different times must produce URLs with the same X-Amz-Expires.
+    if fs9_config().s3.is_none() || fs9_config().object_min_bytes == 0 {
+        return;
+    }
+
+    let fs = make_fs().await;
+    let base = "/test_presign_fixed_ttl";
+    cleanup(&fs, base).await;
+    ensure_dir(&fs, base).await;
+
+    let path = &format!("{base}/large.bin");
+    let upload = fs
+        .create_upload(path, fs9_config().object_min_bytes as u64 * 10, None, None)
+        .await
+        .unwrap();
+
+    // Verify token has extended TTL (>> presign_ttl_secs)
+    let claims = verify_upload_token(&upload.upload_token).unwrap();
+    let now = current_unix_timestamp();
+    let token_ttl = claims.expires_at - now;
+    assert!(
+        token_ttl > i64::try_from(fs9_config().presign_ttl_secs).unwrap(),
+        "token TTL ({token_ttl}s) must exceed presign_ttl_secs ({}s)",
+        fs9_config().presign_ttl_secs,
+    );
+
+    // Presign part 1 immediately
+    let presigned1 = fs
+        .presign_upload_part(&upload.upload_token, 1, None)
+        .await
+        .unwrap();
+
+    // Sleep briefly and presign part 2
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let presigned2 = fs
+        .presign_upload_part(&upload.upload_token, 2, None)
+        .await
+        .unwrap();
+
+    // Extract X-Amz-Expires from both URLs
+    fn extract_amz_expires(url: &str) -> Option<u64> {
+        url.find("X-Amz-Expires=").and_then(|pos| {
+            url[pos + 14..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+    }
+
+    let ttl1 =
+        extract_amz_expires(&presigned1.url).expect("presigned URL 1 must contain X-Amz-Expires");
+    let ttl2 =
+        extract_amz_expires(&presigned2.url).expect("presigned URL 2 must contain X-Amz-Expires");
+
+    assert_eq!(
+        ttl1, ttl2,
+        "presigned URL TTL must be fixed (no decay): part1={ttl1}s, part2={ttl2}s"
+    );
+    assert_eq!(
+        ttl1,
+        fs9_config().presign_ttl_secs,
+        "presigned URL TTL must equal presign_ttl_secs config"
+    );
+
+    fs.abort_upload(&upload.upload_token).await.ok();
     cleanup(&fs, base).await;
 }

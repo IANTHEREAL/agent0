@@ -863,6 +863,23 @@ impl EmbeddedPageFs {
         claims: &UploadTokenClaims,
         refresh_uploading_lifecycle: bool,
     ) -> Result<UploadContext> {
+        self.load_upload_context_inner(claims, refresh_uploading_lifecycle, true)
+            .await
+    }
+
+    async fn load_upload_context_skip_expiry(
+        &self,
+        claims: &UploadTokenClaims,
+    ) -> Result<UploadContext> {
+        self.load_upload_context_inner(claims, false, false).await
+    }
+
+    async fn load_upload_context_inner(
+        &self,
+        claims: &UploadTokenClaims,
+        refresh_uploading_lifecycle: bool,
+        enforce_expiry: bool,
+    ) -> Result<UploadContext> {
         let now = current_unix_timestamp();
         if claims.keyspace != self.keyspace {
             return Err(anyhow!(EmbeddedFsError::PermissionDenied(
@@ -874,7 +891,7 @@ impl EmbeddedPageFs {
                 "upload token filesystem instance mismatch".to_string(),
             )));
         }
-        if now > claims.expires_at {
+        if enforce_expiry && now > claims.expires_at {
             return Err(anyhow!(EmbeddedFsError::PermissionDenied(
                 "upload token has expired".to_string(),
             )));
@@ -903,11 +920,18 @@ impl EmbeddedPageFs {
             match lifecycle {
                 Some(FileLifecycle::Uploading {
                     upload_id,
+                    updated_at,
                     reservation: Some(reservation),
                     ..
                 }) => {
                     validate_upload_claims(claims, &reservation, upload_id.as_deref())?;
-                    if refresh_uploading_lifecycle {
+                    // Throttle lifecycle refresh: only write if the last refresh
+                    // was more than STAGING_REFRESH_INTERVAL_SECS ago, matching
+                    // the streaming write path's behavior and avoiding ~1600
+                    // unnecessary TiKV txns for a 100GB upload.
+                    let needs_refresh = refresh_uploading_lifecycle
+                        && (now - updated_at) >= STAGING_REFRESH_INTERVAL_SECS;
+                    if needs_refresh {
                         lifecycle::save_lifecycle(
                             &mut txn,
                             claims.staging_inode_id,
@@ -929,7 +953,7 @@ impl EmbeddedPageFs {
                             inode,
                             reservation,
                         },
-                        refresh_uploading_lifecycle,
+                        needs_refresh,
                     ))
                 }
                 Some(FileLifecycle::Committing {
@@ -4084,18 +4108,8 @@ fn max_presign_part_number(expected_size: u64) -> Result<i32> {
     })
 }
 
-fn presign_ttl_secs_from_claims(expires_at: i64) -> Result<u64> {
-    let now = current_unix_timestamp();
-    if now > expires_at {
-        return Err(anyhow!(EmbeddedFsError::PermissionDenied(
-            "upload token has expired".to_string(),
-        )));
-    }
-    let remaining = expires_at
-        .checked_sub(now)
-        .ok_or_else(|| anyhow!(EmbeddedFsError::internal("presign ttl underflow")))?;
-    u64::try_from(remaining.max(1))
-        .map_err(|_| anyhow!(EmbeddedFsError::internal("presign ttl exceeds u64")))
+fn presign_part_ttl_secs() -> u64 {
+    fs9_config().presign_ttl_secs
 }
 
 fn should_use_direct_object_stream(expected_size: Option<u64>, has_object_storage: bool) -> bool {
