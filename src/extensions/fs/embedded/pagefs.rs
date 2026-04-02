@@ -78,6 +78,12 @@ pub(crate) struct EmbeddedPageFs {
     inode_allocator: Arc<AsyncMutex<CachedIdRange>>,
     bundle_allocator: Arc<AsyncMutex<CachedIdRange>>,
     notify_ring: Arc<EventRing>,
+    /// Test-only barrier: when set, `load_upload_context_inner` waits here
+    /// right before committing a lifecycle refresh.  This lets tests force
+    /// two concurrent presign calls to both read the stale lifecycle before
+    /// either commits, guaranteeing a deterministic WriteConflict.
+    #[cfg(test)]
+    pub(crate) test_lifecycle_commit_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 const STREAM_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -664,6 +670,8 @@ impl EmbeddedPageFs {
             inode_allocator: Arc::new(AsyncMutex::new(CachedIdRange::default())),
             bundle_allocator: Arc::new(AsyncMutex::new(CachedIdRange::default())),
             notify_ring,
+            #[cfg(test)]
+            test_lifecycle_commit_barrier: None,
         }
     }
 
@@ -1007,6 +1015,10 @@ impl EmbeddedPageFs {
         match result {
             Ok((ctx, wrote_lifecycle)) => {
                 if wrote_lifecycle {
+                    #[cfg(test)]
+                    if let Some(barrier) = &self.test_lifecycle_commit_barrier {
+                        barrier.wait().await;
+                    }
                     txn.commit().await?;
                 } else {
                     let _ = txn.rollback().await;

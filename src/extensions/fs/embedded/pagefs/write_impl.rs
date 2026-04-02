@@ -616,7 +616,17 @@ impl EmbeddedPageFs {
         }
 
         let claims = verify_upload_token(upload_token)?;
-        let ctx = self.load_upload_context(&claims, true).await?;
+
+        // Retry lifecycle refresh WriteConflict: two concurrent presign
+        // requests (or a presign racing with complete/abort) may both try
+        // to write _fs_L{inode}.  Retrying gives a fresh snapshot so we
+        // see the true current state.
+        let ctx = retry_on_lifecycle_conflict(
+            fs9_config().tikv_commit_retry_attempts.max(1),
+            |_attempt| self.load_upload_context(&claims, true),
+        )
+        .await?;
+
         if ctx.phase != UploadLifecyclePhase::Uploading {
             return Err(anyhow!(EmbeddedFsError::conflict(
                 "upload is no longer in uploading state",
@@ -1094,6 +1104,32 @@ fn tikv_error_contains_write_conflict(err: &tikv_client::Error) -> bool {
     }
 }
 
+/// Retry an async operation that may hit a TiKV `WriteConflict` during the
+/// lifecycle refresh in `load_upload_context`.  Extracted as a named helper
+/// so both `presign_upload_part` and its regression tests share the exact
+/// same retry logic.
+///
+/// This mirrors `retry_subgroup_op` but uses `is_retryable_tikv_write_conflict`
+/// (the pagefs-level predicate) rather than the subgroup classifier.
+async fn retry_on_lifecycle_conflict<F, Fut, T>(max_attempts: u32, mut op: F) -> Result<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 0..max_attempts {
+        match op(attempt).await {
+            Ok(val) => return Ok(val),
+            Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < max_attempts => {
+                super::fs9_commit_backoff(attempt).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(anyhow!(EmbeddedFsError::internal(
+        "presign_upload_part lifecycle refresh retry exhausted"
+    )))
+}
+
 /// Classify a subgroup commit error into a stable `execution.*` category
 /// by downcasting the error chain (no string parsing).
 ///
@@ -1361,5 +1397,84 @@ mod classify_tests {
         assert_eq!(outcome.attempts_used, 1);
         assert!(!outcome.retried);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // --- retry_on_lifecycle_conflict unit tests ---
+    //
+    // These validate the helper in isolation.  The actual production path
+    // (presign_upload_part → load_upload_context under concurrent stale
+    // lifecycle) is covered by the #[ignore] integration test
+    // `test_presign_upload_part_concurrent_stale_lifecycle_retry` in
+    // pagefs/tests.rs, which requires real TiKV + S3.
+
+    fn make_lifecycle_write_conflict() -> anyhow::Error {
+        anyhow::anyhow!(tikv_client::Error::KeyError(Box::new(
+            tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }
+        )))
+    }
+
+    #[tokio::test]
+    async fn lifecycle_conflict_retry_then_success() {
+        // First call: WriteConflict (lifecycle refresh race).
+        // Second call: success (fresh read sees updated lifecycle).
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(5, |_attempt| {
+            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(make_lifecycle_write_conflict())
+                } else {
+                    Ok("ctx_placeholder")
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "ctx_placeholder");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "should succeed on second attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_conflict_exhausted() {
+        // All attempts: WriteConflict → retries exhaust
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(3, |_attempt| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<&str, _>(make_lifecycle_write_conflict()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "should exhaust all attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_non_retryable_error_not_retried() {
+        // Non-WriteConflict error → no retry, immediate failure.
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(5, |_attempt| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<&str, _>(anyhow::anyhow!("not a write conflict")) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "should fail on first attempt without retrying"
+        );
     }
 }

@@ -3609,3 +3609,92 @@ async fn test_presign_url_ttl_is_fixed_not_decaying_with_real_s3() {
     fs.abort_upload(&upload.upload_token).await.ok();
     cleanup(&fs, base).await;
 }
+
+/// Regression test for #2287: two concurrent presign_upload_part calls on a
+/// stale lifecycle must both succeed thanks to the WriteConflict retry loop.
+///
+/// Uses a `Barrier(2)` injected via `test_lifecycle_commit_barrier` to force
+/// both calls to read the stale lifecycle before either commits the refresh.
+/// This guarantees a deterministic WriteConflict — without the retry in
+/// `presign_upload_part`, one call would fail with EIO.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_presign_upload_part_concurrent_stale_lifecycle_retry() {
+    if fs9_config().s3.is_none() || fs9_config().object_min_bytes == 0 {
+        return;
+    }
+
+    let mut fs = make_fs().await;
+    let base = "/test_presign_stale_lifecycle";
+    cleanup(&fs, base).await;
+    ensure_dir(&fs, base).await;
+
+    let path = &format!("{base}/large.bin");
+    let upload = fs
+        .create_upload(path, fs9_config().object_min_bytes as u64 * 10, None, None)
+        .await
+        .unwrap();
+
+    // Backdate the lifecycle's updated_at so both presign calls see
+    // needs_refresh=true and race to write _fs_L{inode}.
+    let claims = verify_upload_token(&upload.upload_token).unwrap();
+    {
+        let mut txn = fs.begin_unchecked().await.unwrap();
+        let lc = lifecycle::load_lifecycle(&mut txn, claims.staging_inode_id)
+            .await
+            .unwrap()
+            .expect("lifecycle must exist after create_upload");
+        if let lifecycle::FileLifecycle::Uploading {
+            fs_instance_id,
+            upload_id,
+            reservation,
+            ..
+        } = lc
+        {
+            lifecycle::save_lifecycle(
+                &mut txn,
+                claims.staging_inode_id,
+                &lifecycle::FileLifecycle::Uploading {
+                    fs_instance_id,
+                    upload_id,
+                    // Set updated_at far in the past to trigger refresh on next presign
+                    updated_at: 0,
+                    reservation,
+                },
+            )
+            .await
+            .unwrap();
+        } else {
+            panic!("expected Uploading lifecycle after create_upload");
+        }
+        txn.commit().await.unwrap();
+    }
+
+    // Install a barrier so both presign calls pause after reading the stale
+    // lifecycle but before committing the refresh.  When both arrive at the
+    // barrier they proceed simultaneously, guaranteeing a WriteConflict.
+    fs.test_lifecycle_commit_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
+
+    // Fire two presign requests concurrently on a multi_thread runtime.
+    // Both read stale updated_at → both write refresh → barrier → both
+    // commit → one wins, one gets WriteConflict → retry → success.
+    let token = upload.upload_token.clone();
+    let (r1, r2) = tokio::join!(
+        fs.presign_upload_part(&token, 1, None),
+        fs.presign_upload_part(&token, 2, None),
+    );
+
+    assert!(
+        r1.is_ok(),
+        "presign part 1 must succeed (got: {:?})",
+        r1.err()
+    );
+    assert!(
+        r2.is_ok(),
+        "presign part 2 must succeed (got: {:?})",
+        r2.err()
+    );
+
+    fs.abort_upload(&upload.upload_token).await.ok();
+    cleanup(&fs, base).await;
+}
