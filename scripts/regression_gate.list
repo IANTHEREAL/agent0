@@ -13,6 +13,7 @@
 
 [sql]
 tests/pg_settings_issue2264.sql
+tests/pg_tableoid_system_column.sql
 tests/97_comment_on.sql
 tests/119_upsert_do_update_update_semantics_issue196.sql
 tests/125_pr285_compat_regressions.sql

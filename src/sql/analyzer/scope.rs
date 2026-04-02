@@ -209,6 +209,24 @@ impl Scope {
         })
     }
 
+    /// Return the source relation name for a table alias, if exactly one
+    /// binding exists.  Returns `None` when the alias is unknown, ambiguous,
+    /// or bound to an empty sentinel (derived table / subquery).
+    fn source_relation_for_alias(&self, table: &Ident) -> Option<String> {
+        for (alias, entries) in &self.table_source_relations {
+            if Self::ident_matches_name(alias, table) {
+                if entries.len() == 1 {
+                    let rel = &entries[0].0;
+                    if !rel.is_empty() {
+                        return Some(rel.clone());
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     /// Whether this scope contains any table alias matching `table`.
     fn has_matching_alias(&self, table: &Ident) -> bool {
         self.table_source_relations
@@ -746,6 +764,18 @@ impl ScopeStack {
             }
         }
         false
+    }
+
+    /// Resolve the source relation for a table alias in the nearest scope
+    /// that contains a matching alias.  Returns the fully-qualified relation
+    /// name (e.g. `"pg_catalog.pg_extension"`) or `None`.
+    pub fn resolve_table_source_relation(&self, table: &Ident) -> Option<String> {
+        for scope in self.scopes.iter().rev() {
+            if scope.has_matching_alias(table) {
+                return scope.source_relation_for_alias(table);
+            }
+        }
+        None
     }
 
     /// Resolve relation-backed synthetic unqualified columns at the nearest scope.

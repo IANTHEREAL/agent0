@@ -27,6 +27,27 @@ impl<'a> Analyzer<'a> {
             .table_ident_matches_relation(table, "pg_catalog.pg_namespace")
     }
 
+    fn ident_is_tableoid(ident: &ast::Ident) -> bool {
+        if ident.quote_style.is_some() {
+            ident.value == "tableoid"
+        } else {
+            ident.value.eq_ignore_ascii_case("tableoid")
+        }
+    }
+
+    /// Resolve the tableoid OID for a table alias.  Returns `Some(oid)` when
+    /// the alias is bound to a catalog relation that has a known OID.
+    fn resolve_tableoid_for_alias(&self, table: &ast::Ident) -> Option<i64> {
+        let relation = self.scopes.resolve_table_source_relation(table)?;
+        // Extract the table name from "pg_catalog.pg_extension" → "pg_extension"
+        let name = relation
+            .strip_prefix("pg_catalog.")
+            .or_else(|| relation.strip_prefix("information_schema."))
+            .unwrap_or(&relation);
+        crate::sql::catalog::catalog_relation_oid("pg_catalog", name)
+            .or_else(|| crate::sql::catalog::catalog_relation_oid("information_schema", name))
+    }
+
     fn maybe_pg_namespace_xmin_unqualified(
         &self,
         ident: &ast::Ident,
@@ -202,6 +223,17 @@ impl<'a> Analyzer<'a> {
                 TypedExprKind::Constant(Value::Int64(1)),
                 DataType::Int64,
             ));
+        }
+
+        // tableoid: resolve to the catalog relation OID as a constant.
+        // pg_dump SELECTs tableoid from nearly every catalog table.
+        if Self::ident_is_tableoid(column_ident) {
+            if let Some(oid) = self.resolve_tableoid_for_alias(table_ident) {
+                return Ok(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int64(oid)),
+                    DataType::Int64,
+                ));
+            }
         }
 
         let resolved = self
