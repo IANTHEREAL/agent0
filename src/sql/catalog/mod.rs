@@ -32,6 +32,7 @@ mod pg_publication_rel;
 mod pg_range;
 mod pg_roles;
 mod pg_sequence;
+mod pg_settings;
 mod pg_shdescription;
 mod pg_stat_user_tables;
 mod pg_statistic_ext;
@@ -121,6 +122,7 @@ impl CatalogRegistry {
         registry.register(Box::new(pg_roles::PgRoles));
         registry.register(Box::new(pg_user::PgUser));
         registry.register(Box::new(pg_sequence::PgSequence));
+        registry.register(Box::new(pg_settings::PgSettings));
         registry.register(Box::new(pg_shdescription::PgShdescription));
         registry.register(Box::new(pg_statistic_ext::PgStatisticExt));
         registry.register(Box::new(pg_stat_user_tables::PgStatUserTables));
