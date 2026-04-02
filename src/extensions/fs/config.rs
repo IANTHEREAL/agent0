@@ -25,6 +25,7 @@ const MAX_UPLOAD_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_PARTS_PER_UPLOAD: u32 = 10_000;
 const DEFAULT_WS_MAX_INFLIGHT_UPLOADS_PER_CONNECTION: usize = 16;
 const DEFAULT_WS_MAX_INFLIGHT_REQUESTS_PER_CONNECTION: usize = 32;
+const DEFAULT_BATCH_PRESIGN_MAX_PARTS: usize = 500;
 const DEFAULT_BATCH_STAT_MAX_FILES: usize = 256;
 const DEFAULT_BATCH_STAT_CONCURRENCY: usize = 16;
 const DEFAULT_BATCH_INLINE_READ_MAX_FILES: usize = 256;
@@ -59,6 +60,7 @@ pub(crate) struct Fs9Config {
     pub(crate) upload_token_secret: Option<String>,
     pub(crate) ws_max_inflight_uploads_per_connection: usize,
     pub(crate) ws_max_inflight_requests_per_connection: usize,
+    pub(crate) batch_presign_max_parts: usize,
     pub(crate) batch_stat_max_files: usize,
     pub(crate) batch_stat_concurrency: usize,
     pub(crate) batch_inline_read_max_files: usize,
@@ -187,6 +189,10 @@ impl Fs9Config {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_WS_MAX_INFLIGHT_REQUESTS_PER_CONNECTION),
+            batch_presign_max_parts: config::env_string("FS9_BATCH_PRESIGN_MAX_PARTS")
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_BATCH_PRESIGN_MAX_PARTS),
             batch_stat_max_files: config::env_string("FS9_BATCH_STAT_MAX_FILES")
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| *v > 0)

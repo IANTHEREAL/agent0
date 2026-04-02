@@ -180,6 +180,13 @@ pub(crate) enum WsRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         checksum_crc32c: Option<String>,
     },
+    /// Batch presign: return presigned URLs for multiple part numbers in one RPC.
+    #[serde(rename = "presign_parts")]
+    PresignParts {
+        id: String,
+        upload_token: String,
+        parts: Vec<PresignPartEntry>,
+    },
     #[serde(rename = "complete_upload")]
     CompleteUpload {
         id: String,
@@ -285,6 +292,7 @@ impl WsRequest {
             | Self::Rename { id, .. }
             | Self::CreateUpload { id, .. }
             | Self::PresignPart { id, .. }
+            | Self::PresignParts { id, .. }
             | Self::CompleteUpload { id, .. }
             | Self::AbortUpload { id, .. }
             | Self::PrepareDownload { id, .. }
@@ -414,6 +422,13 @@ pub(crate) struct StreamEnd {
     pub stream_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PresignPartEntry {
+    pub part_number: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32c: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -956,6 +971,38 @@ mod tests {
                 assert_eq!(checksum_crc32c.as_deref(), Some("aabbccdd"));
             }
             _ => panic!("expected presign_part request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_presign_parts_batch() {
+        let payload = r#"{
+            "id":"17",
+            "op":"presign_parts",
+            "upload_token":"tok-batch",
+            "parts":[
+                {"part_number":1},
+                {"part_number":2,"checksum_crc32c":"aabb"},
+                {"part_number":3}
+            ]
+        }"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("presign_parts should parse");
+        match req {
+            WsRequest::PresignParts {
+                id,
+                upload_token,
+                parts,
+            } => {
+                assert_eq!(id, "17");
+                assert_eq!(upload_token, "tok-batch");
+                assert_eq!(parts.len(), 3);
+                assert_eq!(parts[0].part_number, 1);
+                assert_eq!(parts[0].checksum_crc32c, None);
+                assert_eq!(parts[1].part_number, 2);
+                assert_eq!(parts[1].checksum_crc32c.as_deref(), Some("aabb"));
+                assert_eq!(parts[2].part_number, 3);
+            }
+            _ => panic!("expected presign_parts request"),
         }
     }
 
