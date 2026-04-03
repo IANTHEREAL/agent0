@@ -83,6 +83,8 @@ start_db9() {
     DB9_BOOTSTRAP_ADMIN_USER=admin \
     DB9_BOOTSTRAP_ADMIN_PASSWORD="$DB9_ADMIN_PASSWORD" \
     DB9_INSECURE=1 \
+    DB9_DEV=1 \
+    DB9_DEV_ADMIN_PASSWORD="$DB9_ADMIN_PASSWORD" \
     ./target/release/db9-server > /tmp/db9-dify.log 2>&1 &
     
     # Wait for startup

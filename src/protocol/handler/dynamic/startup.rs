@@ -18,6 +18,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -561,10 +562,14 @@ impl StartupHandler for DynamicPgHandler {
                     }
 
                     if !peer_ip.is_loopback() && (dev_mode || insecure_mode) {
-                        warn!(
-                            "Allowing non-TLS cleartext auth for non-loopback connection from {} (DB9_DEV={}, DB9_INSECURE={})",
-                            peer_ip, dev_mode, insecure_mode
-                        );
+                        static CLEARTEXT_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+                        let count = CLEARTEXT_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if count == 0 || count % 100 == 0 {
+                            warn!(
+                                "Allowing non-TLS cleartext auth for non-loopback connection from {} (DB9_DEV={}, DB9_INSECURE={}) [occurrence #{}]",
+                                peer_ip, dev_mode, insecure_mode, count + 1
+                            );
+                        }
                     }
                 }
                 client

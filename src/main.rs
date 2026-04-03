@@ -291,6 +291,13 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     }
 
     let listen_is_loopback = is_loopback_listen_addr(&pg_listen_addr);
+    if insecure_mode && !dev_mode && tls_acceptor.is_none() && !listen_is_loopback {
+        return Err(anyhow::anyhow!(
+            "DB9_INSECURE=1 without TLS on non-loopback address is rejected in non-dev mode. \
+             Either configure TLS (PG_TLS_CERT/PG_TLS_KEY), set DB9_DEV=1 to acknowledge dev posture, \
+             or listen on loopback only."
+        ));
+    }
     if !listen_is_loopback && tls_acceptor.is_none() && !(insecure_mode || dev_mode) {
         return Err(anyhow::anyhow!(
             "Refusing to start without TLS on non-loopback PG_LISTEN_ADDR={}. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (DB9_INSECURE=1 or DB9_DEV=1).",

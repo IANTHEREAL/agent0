@@ -92,7 +92,9 @@ services:
       PG_LISTEN_ADDR: 0.0.0.0
       PG_PORT: 5433
       DB9_INSECURE: "1"
+      DB9_DEV: "1"
       # Bootstrap the initial superuser with password "admin" for e2e smoke tests.
+      DB9_DEV_ADMIN_PASSWORD: admin
       DB9_BOOTSTRAP_ADMIN_PASSWORD: admin
       RUST_LOG: ${RUST_LOG:-info}
     ports:
