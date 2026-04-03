@@ -14,9 +14,9 @@ use crate::extensions::fs::ws::auth::{FsAccessMode, WsSession};
 use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, BatchInlineReadEntryResponse, BatchStatEntryResponse,
     BatchWriteEntryResponse, CreateUploadResponse, FileInfoResponse, HeaderPairResponse,
-    MultipartCompletedPartRequest, PrepareDownloadResponse, PresignedRequestResponse,
-    ReaddirRecursiveResponse, WsErrorCode, WsErrorDetail, WsRequest, WsResponse,
-    MAX_JSON_FRAME_BYTES,
+    MultipartCompletedPartRequest, PrepareDownloadResponse, PresignPartEntry,
+    PresignedRequestResponse, ReaddirRecursiveResponse, WsErrorCode, WsErrorDetail, WsRequest,
+    WsResponse, MAX_JSON_FRAME_BYTES,
 };
 use crate::extensions::fs::MAX_BYTES_PER_FILE;
 
@@ -36,6 +36,7 @@ fn is_write_operation(request: &WsRequest) -> bool {
             | WsRequest::Chmod { .. }
             | WsRequest::CreateUpload { .. }
             | WsRequest::PresignPart { .. }
+            | WsRequest::PresignParts { .. }
             | WsRequest::CompleteUpload { .. }
             | WsRequest::AbortUpload { .. }
             | WsRequest::BatchWrite { .. }
@@ -134,12 +135,38 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             path,
             size,
             mode,
-        } => handle_create_upload(session, id, path, *size, *mode).await,
+            checksum_algorithm,
+        } => {
+            handle_create_upload(
+                session,
+                id,
+                path,
+                *size,
+                *mode,
+                checksum_algorithm.as_deref(),
+            )
+            .await
+        }
         WsRequest::PresignPart {
             id,
             upload_token,
             part_number,
-        } => handle_presign_part(session, id, upload_token, *part_number).await,
+            checksum_crc32c,
+        } => {
+            handle_presign_part(
+                session,
+                id,
+                upload_token,
+                *part_number,
+                checksum_crc32c.as_deref(),
+            )
+            .await
+        }
+        WsRequest::PresignParts {
+            id,
+            upload_token,
+            parts,
+        } => handle_presign_parts(session, id, upload_token, parts).await,
         WsRequest::CompleteUpload {
             id,
             upload_token,
@@ -577,6 +604,7 @@ async fn handle_create_upload(
     path: &str,
     size: u64,
     mode: Option<u32>,
+    checksum_algorithm: Option<&str>,
 ) -> WsResponse {
     if let Err((code, msg)) = validate_path(path) {
         return WsResponse::error(id, code, msg);
@@ -598,7 +626,7 @@ async fn handle_create_upload(
 
     match session
         .backend
-        .create_upload(path, size, mode.map(|m| m & 0o7777))
+        .create_upload(path, size, mode.map(|m| m & 0o7777), checksum_algorithm)
         .await
     {
         Ok(upload) => {
@@ -608,6 +636,7 @@ async fn handle_create_upload(
                 upload_id: upload.upload_id,
                 part_size: upload.part_size,
                 expires_at: format_mtime(upload.expires_at),
+                checksum_algorithm: upload.checksum_algorithm,
             }) {
                 Ok(value) => value,
                 Err(err) => {
@@ -634,10 +663,11 @@ async fn handle_presign_part(
     id: &str,
     upload_token: &str,
     part_number: i32,
+    checksum_crc32c: Option<&str>,
 ) -> WsResponse {
     match session
         .backend
-        .presign_upload_part(upload_token, part_number)
+        .presign_upload_part(upload_token, part_number, checksum_crc32c)
         .await
     {
         Ok(request) => WsResponse::success(
@@ -649,6 +679,49 @@ async fn handle_presign_part(
             WsResponse::error(id, code, msg)
         }
     }
+}
+
+async fn handle_presign_parts(
+    session: &WsSession,
+    id: &str,
+    upload_token: &str,
+    parts: &[PresignPartEntry],
+) -> WsResponse {
+    let max_parts = fs9_config().batch_presign_max_parts;
+    if parts.len() > max_parts {
+        return WsResponse::error(
+            id,
+            WsErrorCode::Efbig,
+            format!(
+                "presign_parts supports at most {} parts per request",
+                max_parts
+            ),
+        );
+    }
+    let mut results = Vec::with_capacity(parts.len());
+    for entry in parts {
+        match session
+            .backend
+            .presign_upload_part(
+                upload_token,
+                entry.part_number,
+                entry.checksum_crc32c.as_deref(),
+            )
+            .await
+        {
+            Ok(request) => {
+                results.push(json!({
+                    "part_number": entry.part_number,
+                    "request": to_presigned_response(request),
+                }));
+            }
+            Err(err) => {
+                let (code, msg) = map_fs_error(&err);
+                return WsResponse::error(id, code, msg);
+            }
+        }
+    }
+    WsResponse::success(id, json!({ "presigned": results }))
 }
 
 async fn handle_complete_upload(
@@ -671,6 +744,7 @@ async fn handle_complete_upload(
         .map(|part| FsMultipartCompletedPart {
             part_number: part.part_number,
             etag: part.etag.clone(),
+            checksum_crc32c: part.checksum_crc32c.clone(),
         })
         .collect();
 
@@ -1894,6 +1968,7 @@ mod tests {
                 _path: &str,
                 _expected_size: u64,
                 _mode: Option<u32>,
+                _checksum_algorithm: Option<&str>,
             ) -> Result<FsCreateUpload> {
                 Err(anyhow!("not implemented"))
             }
@@ -1901,6 +1976,7 @@ mod tests {
                 &self,
                 _upload_token: &str,
                 _part_number: i32,
+                _checksum_crc32c: Option<&str>,
             ) -> Result<FsPresignedRequest> {
                 Err(anyhow!("not implemented"))
             }

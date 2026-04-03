@@ -362,6 +362,7 @@ mod tests {
             _path: &str,
             _expected_size: u64,
             _mode: Option<u32>,
+            _checksum_algorithm: Option<&str>,
         ) -> Result<crate::extensions::fs::backend::FsCreateUpload> {
             anyhow::bail!("not implemented for test backend")
         }
@@ -369,6 +370,7 @@ mod tests {
             &self,
             _upload_token: &str,
             _part_number: i32,
+            _checksum_crc32c: Option<&str>,
         ) -> Result<crate::extensions::fs::backend::FsPresignedRequest> {
             anyhow::bail!("not implemented for test backend")
         }

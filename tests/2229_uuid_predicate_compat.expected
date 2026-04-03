@@ -1,0 +1,42 @@
+id|name
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|alice
+(1 row)
+id|name
+c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33|NULL
+(1 row)
+id|name
+b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22|bob
+(1 row)
+id|name
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|alice
+b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22|bob
+(2 rows)
+id
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+(1 row)
+id
+b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22
+(1 row)
+id|name
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|alice
+(1 row)
+id|name
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|alice
+b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22|bob
+(2 rows)
+id|name
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|alice
+c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33|NULL
+(2 rows)
+id|name
+b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22|bob
+c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a33|NULL
+(2 rows)
+id
+(0 rows)
+id|name
+b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22|bob
+(1 row)
+id|name
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|alice
+(1 row)

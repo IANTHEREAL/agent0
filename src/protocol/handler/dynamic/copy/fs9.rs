@@ -337,20 +337,22 @@ impl DynamicPgHandler {
                         let value = if val == copy_opts.null_string {
                             Value::Null
                         } else if let Some(dt) = col_type.as_ref() {
-                            executor.parse_value_for_copy(val, dt).map_err(|e| {
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "22P02".to_string(),
-                                    format!(
-                                        "{}\nCONTEXT:  COPY {}, line {}, column {}: \"{}\"",
-                                        e,
-                                        short_table,
-                                        rec_idx + 1,
-                                        col_name,
-                                        val
-                                    ),
-                                )))
-                            })?
+                            crate::protocol::copy_format::parse_value_for_copy(val, dt).map_err(
+                                |e| {
+                                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                                        "ERROR".to_string(),
+                                        "22P02".to_string(),
+                                        format!(
+                                            "{}\nCONTEXT:  COPY {}, line {}, column {}: \"{}\"",
+                                            e,
+                                            short_table,
+                                            rec_idx + 1,
+                                            col_name,
+                                            val
+                                        ),
+                                    )))
+                                },
+                            )?
                         } else {
                             Value::Text(val.to_string())
                         };
@@ -373,7 +375,6 @@ impl DynamicPgHandler {
                 for (line_idx, line) in lines.iter().enumerate() {
                     let line_no = line_idx + 1;
                     let col_values = parse_copy_text_line(
-                        executor,
                         &resolved_table,
                         &column_names,
                         &column_types,

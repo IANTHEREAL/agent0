@@ -73,6 +73,12 @@ pub enum DataType {
     Tsquery,
     Name,
     Varchar(u64),
+    /// PostgreSQL OID type (OID 26).  Semantically distinct from INT8 on the
+    /// wire (INT8 is OID 20, OID is OID 26), but stored identically as a 64-bit
+    /// integer (`Value::Int64`).  OID alias types (regclass, regtype) remain as
+    /// `UserDefined`; this variant represents the base `oid` type that
+    /// unresolved parameters infer to when the context is an OID alias.
+    Oid,
     /// PostgreSQL's UNKNOWN type (OID 705).  Bare string literals and NULL
     /// start with this type; context (comparison, assignment, function call)
     /// resolves it to a concrete type.  **Invariant: Unknown must never escape
@@ -115,6 +121,7 @@ impl fmt::Display for DataType {
             DataType::Tsquery => write!(f, "TSQUERY"),
             DataType::Varchar(0) => write!(f, "VARCHAR"),
             DataType::Varchar(n) => write!(f, "VARCHAR({})", n),
+            DataType::Oid => write!(f, "OID"),
             DataType::Unknown => write!(f, "unknown"),
         }
     }
@@ -132,6 +139,7 @@ impl DataType {
             DataType::Int64 => "bigint".to_string(),
             DataType::Float64 => "double precision".to_string(),
             DataType::Numeric { .. } => "numeric".to_string(),
+            DataType::Oid => "oid".to_string(),
             DataType::Array(elem_type) => format!("{}[]", elem_type.pg_display_name()),
             DataType::Varchar(_) => "character varying".to_string(),
             _ => self.to_string().to_lowercase(),

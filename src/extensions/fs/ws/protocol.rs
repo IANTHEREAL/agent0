@@ -169,12 +169,23 @@ pub(crate) enum WsRequest {
         size: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         mode: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checksum_algorithm: Option<String>,
     },
     #[serde(rename = "presign_part")]
     PresignPart {
         id: String,
         upload_token: String,
         part_number: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checksum_crc32c: Option<String>,
+    },
+    /// Batch presign: return presigned URLs for multiple part numbers in one RPC.
+    #[serde(rename = "presign_parts")]
+    PresignParts {
+        id: String,
+        upload_token: String,
+        parts: Vec<PresignPartEntry>,
     },
     #[serde(rename = "complete_upload")]
     CompleteUpload {
@@ -281,6 +292,7 @@ impl WsRequest {
             | Self::Rename { id, .. }
             | Self::CreateUpload { id, .. }
             | Self::PresignPart { id, .. }
+            | Self::PresignParts { id, .. }
             | Self::CompleteUpload { id, .. }
             | Self::AbortUpload { id, .. }
             | Self::PrepareDownload { id, .. }
@@ -413,9 +425,18 @@ pub(crate) struct StreamEnd {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PresignPartEntry {
+    pub part_number: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32c: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MultipartCompletedPartRequest {
     pub part_number: i32,
     pub etag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32c: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +469,8 @@ pub(crate) struct CreateUploadResponse {
     pub upload_id: String,
     pub part_size: usize,
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_algorithm: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -860,11 +883,13 @@ mod tests {
                 path,
                 size,
                 mode,
+                checksum_algorithm,
             } => {
                 assert_eq!(id, "12");
                 assert_eq!(path, "/data/large.bin");
                 assert_eq!(size, 10 * 1024 * 1024);
                 assert_eq!(mode, None);
+                assert_eq!(checksum_algorithm, None);
             }
             _ => panic!("expected create_upload request"),
         }
@@ -900,6 +925,113 @@ mod tests {
                     checksum.as_deref(),
                     Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 );
+            }
+            _ => panic!("expected complete_upload request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_create_upload_with_checksum_algorithm() {
+        let payload = r#"{"id":"12","op":"create_upload","path":"/data/large.bin","size":10485760,"checksum_algorithm":"crc32c"}"#;
+        let req: WsRequest = serde_json::from_str(payload)
+            .expect("create_upload with checksum_algorithm should parse");
+        match req {
+            WsRequest::CreateUpload {
+                id,
+                path,
+                size,
+                mode,
+                checksum_algorithm,
+            } => {
+                assert_eq!(id, "12");
+                assert_eq!(path, "/data/large.bin");
+                assert_eq!(size, 10 * 1024 * 1024);
+                assert_eq!(mode, None);
+                assert_eq!(checksum_algorithm.as_deref(), Some("crc32c"));
+            }
+            _ => panic!("expected create_upload request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_presign_part_with_checksum() {
+        let payload = r#"{"id":"15","op":"presign_part","upload_token":"tok-1","part_number":3,"checksum_crc32c":"aabbccdd"}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("presign_part with checksum should parse");
+        match req {
+            WsRequest::PresignPart {
+                id,
+                upload_token,
+                part_number,
+                checksum_crc32c,
+            } => {
+                assert_eq!(id, "15");
+                assert_eq!(upload_token, "tok-1");
+                assert_eq!(part_number, 3);
+                assert_eq!(checksum_crc32c.as_deref(), Some("aabbccdd"));
+            }
+            _ => panic!("expected presign_part request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_presign_parts_batch() {
+        let payload = r#"{
+            "id":"17",
+            "op":"presign_parts",
+            "upload_token":"tok-batch",
+            "parts":[
+                {"part_number":1},
+                {"part_number":2,"checksum_crc32c":"aabb"},
+                {"part_number":3}
+            ]
+        }"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("presign_parts should parse");
+        match req {
+            WsRequest::PresignParts {
+                id,
+                upload_token,
+                parts,
+            } => {
+                assert_eq!(id, "17");
+                assert_eq!(upload_token, "tok-batch");
+                assert_eq!(parts.len(), 3);
+                assert_eq!(parts[0].part_number, 1);
+                assert_eq!(parts[0].checksum_crc32c, None);
+                assert_eq!(parts[1].part_number, 2);
+                assert_eq!(parts[1].checksum_crc32c.as_deref(), Some("aabb"));
+                assert_eq!(parts[2].part_number, 3);
+            }
+            _ => panic!("expected presign_parts request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_complete_upload_with_part_checksums() {
+        let payload = r#"{
+            "id":"16",
+            "op":"complete_upload",
+            "upload_token":"tok-2",
+            "parts":[
+                {"part_number":1,"etag":"etag-1","checksum_crc32c":"AAAA"},
+                {"part_number":2,"etag":"etag-2","checksum_crc32c":"BBBB"}
+            ]
+        }"#;
+        let req: WsRequest = serde_json::from_str(payload)
+            .expect("complete_upload with part checksums should parse");
+        match req {
+            WsRequest::CompleteUpload {
+                id,
+                upload_token,
+                parts,
+                checksum,
+            } => {
+                assert_eq!(id, "16");
+                assert_eq!(upload_token, "tok-2");
+                assert_eq!(parts.len(), 2);
+                assert_eq!(parts[0].checksum_crc32c.as_deref(), Some("AAAA"));
+                assert_eq!(parts[1].checksum_crc32c.as_deref(), Some("BBBB"));
+                assert_eq!(checksum, None);
             }
             _ => panic!("expected complete_upload request"),
         }

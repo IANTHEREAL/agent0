@@ -205,17 +205,21 @@ impl FsBackend for EmbeddedFsBackend {
         path: &str,
         expected_size: u64,
         mode: Option<u32>,
+        checksum_algorithm: Option<&str>,
     ) -> Result<FsCreateUpload> {
-        self.pagefs.create_upload(path, expected_size, mode).await
+        self.pagefs
+            .create_upload(path, expected_size, mode, checksum_algorithm)
+            .await
     }
 
     async fn presign_upload_part(
         &self,
         upload_token: &str,
         part_number: i32,
+        checksum_crc32c: Option<&str>,
     ) -> Result<FsPresignedRequest> {
         self.pagefs
-            .presign_upload_part(upload_token, part_number)
+            .presign_upload_part(upload_token, part_number, checksum_crc32c)
             .await
     }
 

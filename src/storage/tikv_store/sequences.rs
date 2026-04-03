@@ -535,7 +535,7 @@ impl TikvStore {
             if let Some(schema) = self.get_schema(txn, db_id, owned_table).await? {
                 if let Some(col) = schema.columns.iter().find(|c| c.name == *owned_col) {
                     def.max_value = match col.data_type {
-                        DataType::Int64 => i64::MAX,
+                        DataType::Int64 | DataType::Oid => i64::MAX,
                         _ => i32::MAX as i64,
                     };
                 }

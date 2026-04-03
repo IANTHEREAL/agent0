@@ -446,7 +446,7 @@ impl Executor {
             };
 
             row_vals[generated.column_idx] =
-                crate::sql::value_coercion::coerce_value_for_column(val, col)?;
+                crate::sql::types::cast::coerce_value_for_column(val, col)?;
         }
         dml::coerce_row_values(schema, row_vals)?;
         let row = Row::new(row_vals.to_vec());

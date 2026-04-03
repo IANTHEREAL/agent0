@@ -441,6 +441,18 @@ pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(
             crate::model::IntervalValue::from_millis(l - r),
         )),
+        (Value::Timestamp(ts), Value::Date(days)) => {
+            let date_ts = crate::model::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Interval(crate::model::IntervalValue::from_millis(
+                ts - date_ts,
+            )))
+        }
+        (Value::Date(days), Value::Timestamp(ts)) => {
+            let date_ts = crate::model::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Interval(crate::model::IntervalValue::from_millis(
+                date_ts - ts,
+            )))
+        }
         (Value::Timestamp(ts), Value::Interval(iv)) => {
             Ok(Value::Timestamp(sub_interval_from_timestamp(ts, &iv)?))
         }
@@ -1042,6 +1054,11 @@ fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
             Ok(l.len().cmp(&r.len()) as i8)
         }
         (Value::Jsonb(l), Value::Jsonb(r)) => compare_jsonb_pg(l, r),
+        (Value::Interval(l), Value::Interval(r)) => {
+            // PostgreSQL normalizes intervals to total duration for comparison
+            // using 30 days/month approximation.
+            Ok(l.to_millis_approx().cmp(&r.to_millis_approx()) as i8)
+        }
         _ => Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right)),
     }
 }

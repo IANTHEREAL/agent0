@@ -287,7 +287,12 @@ fn plpgsql_outer_block_scan(body: &str) -> Option<(usize, usize, bool)> {
         }
 
         if matches!(stack.last(), Some(BlockKind::Begin)) {
-            if j < bytes.len() && bytes[j] == b';' {
+            // `END;` — explicit semicolon terminator.
+            // `END` at EOF — body extracted from dollar-quoting has no trailing `;`.
+            // Both forms are valid for the outermost block.
+            let terminated =
+                (j < bytes.len() && bytes[j] == b';') || (j >= bytes.len() && stack.len() == 1);
+            if terminated {
                 stack.pop();
                 if stack.is_empty() {
                     return Some((block_start.unwrap_or(start), start, true));
@@ -300,7 +305,9 @@ fn plpgsql_outer_block_scan(body: &str) -> Option<(usize, usize, bool)> {
                 while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                     k += 1;
                 }
-                if k < bytes.len() && bytes[k] == b';' {
+                let terminated =
+                    (k < bytes.len() && bytes[k] == b';') || (k >= bytes.len() && stack.len() == 1);
+                if terminated {
                     stack.pop();
                     if stack.is_empty() {
                         return Some((block_start.unwrap_or(start), start, true));

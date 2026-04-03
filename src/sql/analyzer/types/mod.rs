@@ -1008,8 +1008,9 @@ pub enum AnalyzedInsertSource {
 /// Resolved conflict target for ON CONFLICT.
 #[derive(Debug, Clone)]
 pub enum AnalyzedConflictTarget {
-    /// ON CONFLICT (col1, col2, ...) — resolve to column names.
-    Columns(Vec<String>),
+    /// ON CONFLICT (col1, col2, ...) [WHERE predicate] — resolve to column names
+    /// with optional partial-index predicate.
+    Columns(Vec<String>, Option<String>),
     /// ON CONFLICT ON CONSTRAINT constraint_name.
     #[allow(dead_code)] // framework: constraint-targeted upsert
     Constraint(String),
@@ -1020,7 +1021,9 @@ pub enum AnalyzedConflictTarget {
 #[allow(clippy::large_enum_variant)]
 pub enum AnalyzedOnConflict {
     /// DO NOTHING — skip conflicting rows.
-    DoNothing,
+    DoNothing {
+        target: Option<AnalyzedConflictTarget>,
+    },
     /// DO UPDATE SET — update conflicting rows.
     DoUpdate {
         /// Resolved conflict target (columns or constraint name).

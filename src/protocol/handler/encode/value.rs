@@ -233,10 +233,14 @@ fn encode_value_binary(
                         FieldFormat::Binary,
                     )
                 }
-            } else if matches!(col_type, Some(DataType::Int32)) {
+            } else if matches!(col_type, Some(DataType::Int32) | Some(DataType::Oid)) {
                 encoder.encode_field_with_type_and_format(
                     &(*i as i32),
-                    &Type::INT4,
+                    if matches!(col_type, Some(DataType::Oid)) {
+                        &Type::OID
+                    } else {
+                        &Type::INT4
+                    },
                     FieldFormat::Binary,
                 )
             } else {

@@ -273,7 +273,18 @@ fn handle_list_sessions(req: &HttpRequest) -> (u16, String) {
         .map(|v| v == "true")
         .unwrap_or(false);
     let principal = params.get("principal").cloned();
-    let state = params.get("state").and_then(|s| parse_session_state(s));
+    let state = match params.get("state") {
+        Some(s) => match parse_session_state(s) {
+            Some(st) => Some(st),
+            None => {
+                return (
+                    400,
+                    error_json(400, &format!("invalid state filter: {}", s)),
+                )
+            }
+        },
+        None => None,
+    };
     let min_duration_ms = params.get("min_duration_ms").and_then(|v| v.parse().ok());
     let limit = params
         .get("limit")
@@ -316,7 +327,10 @@ fn handle_cancel(connection_id: i64, req: &HttpRequest) -> (u16, String) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let reason = extract_reason(&req.body);
+    let reason = match extract_reason(&req.body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let registry = super::global_session_registry();
     let svc = AdminControlService::new(registry);
 
@@ -338,7 +352,10 @@ fn handle_terminate(connection_id: i64, req: &HttpRequest) -> (u16, String) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let reason = extract_reason(&req.body);
+    let reason = match extract_reason(&req.body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let registry = super::global_session_registry();
     let svc = AdminControlService::new(registry);
 
@@ -360,7 +377,10 @@ fn handle_terminate_all(tenant_id: &str, req: &HttpRequest) -> (u16, String) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let reason = extract_reason(&req.body);
+    let reason = match extract_reason(&req.body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let registry = super::global_session_registry();
     let svc = AdminControlService::new(registry);
 
@@ -399,15 +419,16 @@ fn snapshot_to_json(s: &SessionSnapshot) -> serde_json::Value {
     })
 }
 
-fn extract_reason(body: &[u8]) -> Option<String> {
+fn extract_reason(body: &[u8]) -> Result<Option<String>, (u16, String)> {
     if body.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| (400, error_json(400, "invalid JSON body")))?;
+    Ok(value
         .get("reason")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string()))
 }
 
 fn parse_session_state(s: &str) -> Option<SessionState> {
@@ -751,12 +772,34 @@ mod tests {
     #[test]
     fn extract_reason_from_json() {
         let body = br#"{"reason": "runaway query"}"#;
-        assert_eq!(extract_reason(body), Some("runaway query".to_string()));
+        assert_eq!(
+            extract_reason(body).unwrap(),
+            Some("runaway query".to_string())
+        );
     }
 
     #[test]
     fn extract_reason_empty_body() {
-        assert_eq!(extract_reason(b""), None);
+        assert_eq!(extract_reason(b"").unwrap(), None);
+    }
+
+    #[test]
+    fn extract_reason_invalid_json() {
+        assert!(extract_reason(b"not json").is_err());
+    }
+
+    #[test]
+    fn route_list_sessions_invalid_state() {
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/internal/sessions".to_string(),
+            query_string: "tenant_id=test&state=bogus".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let (status, body) = route(&req);
+        assert_eq!(status, 400);
+        assert!(body.contains("invalid state filter"));
     }
 
     #[test]

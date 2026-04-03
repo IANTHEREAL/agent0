@@ -2819,7 +2819,7 @@ fn analyze_insert_on_conflict_do_nothing() {
         AnalyzedStatement::Insert(ins) => {
             assert!(matches!(
                 ins.on_conflict,
-                Some(AnalyzedOnConflict::DoNothing)
+                Some(AnalyzedOnConflict::DoNothing { .. })
             ));
         }
         _ => panic!("expected AnalyzedStatement::Insert"),
@@ -3067,20 +3067,20 @@ fn conflict_behavior_from_analyzed_on_conflict() {
     // None → Error
     let none: Option<AnalyzedOnConflict> = None;
     let behavior = match &none {
-        Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+        Some(AnalyzedOnConflict::DoNothing { .. }) => ConflictBehavior::DoNothing { target: None },
         Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate { target: None },
         None => ConflictBehavior::Error,
     };
     assert_eq!(behavior, ConflictBehavior::Error);
 
     // DoNothing → DoNothing
-    let do_nothing = Some(AnalyzedOnConflict::DoNothing);
+    let do_nothing = Some(AnalyzedOnConflict::DoNothing { target: None });
     let behavior = match &do_nothing {
-        Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+        Some(AnalyzedOnConflict::DoNothing { .. }) => ConflictBehavior::DoNothing { target: None },
         Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate { target: None },
         None => ConflictBehavior::Error,
     };
-    assert_eq!(behavior, ConflictBehavior::DoNothing);
+    assert_eq!(behavior, ConflictBehavior::DoNothing { target: None });
 
     let do_update = Some(AnalyzedOnConflict::DoUpdate {
         target: Some(AnalyzedConflictTarget::Constraint("users_pkey".to_string())),
@@ -3088,11 +3088,22 @@ fn conflict_behavior_from_analyzed_on_conflict() {
         where_clause: None,
     });
     let behavior = match &do_update {
-        Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+        Some(AnalyzedOnConflict::DoNothing { target }) => {
+            let target = match target {
+                Some(AnalyzedConflictTarget::Columns(cols, pred)) => {
+                    Some(ConflictTarget::Columns(cols.clone(), pred.clone()))
+                }
+                Some(AnalyzedConflictTarget::Constraint(name)) => {
+                    Some(ConflictTarget::Constraint(name.clone()))
+                }
+                None => None,
+            };
+            ConflictBehavior::DoNothing { target }
+        }
         Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
             let target = match target {
-                Some(AnalyzedConflictTarget::Columns(cols)) => {
-                    Some(ConflictTarget::Columns(cols.clone()))
+                Some(AnalyzedConflictTarget::Columns(cols, pred)) => {
+                    Some(ConflictTarget::Columns(cols.clone(), pred.clone()))
                 }
                 Some(AnalyzedConflictTarget::Constraint(name)) => {
                     Some(ConflictTarget::Constraint(name.clone()))

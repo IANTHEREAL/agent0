@@ -85,6 +85,7 @@ pub async fn execute_alter_role(
     session_user: Option<&str>,
     name: &Ident,
     operation: &AlterRoleOperation,
+    password_grace_seconds: u32,
 ) -> Result<ExecuteResult> {
     let role_name = name.value.clone();
     let mut user = auth_manager
@@ -164,7 +165,11 @@ pub async fn execute_alter_role(
                     sqlparser::ast::RoleOption::Password(SqlPassword::Password(Expr::Value(
                         SqlValue::SingleQuotedString(s),
                     ))) => {
-                        user.set_password(s);
+                        if password_grace_seconds > 0 {
+                            user.rotate_password(s, password_grace_seconds)?;
+                        } else {
+                            user.set_password(s);
+                        }
                     }
                     sqlparser::ast::RoleOption::BypassRLS(v) => user.bypass_rls = *v,
                     sqlparser::ast::RoleOption::ConnectionLimit(Expr::Value(SqlValue::Number(

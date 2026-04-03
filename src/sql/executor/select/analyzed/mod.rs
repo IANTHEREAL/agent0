@@ -15,6 +15,7 @@ use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::typed_eval::eval_limit_bound;
+use crate::sql::optimizer::logical_planner::nodes::expr_has_aggregate;
 use crate::sql::ExecuteResult;
 
 use anyhow::{anyhow, Result};
@@ -396,16 +397,28 @@ impl Executor {
             // row layout. Instead, replace each async projection expression with its
             // primary dependency (the ColumnRef argument), and defer the async
             // function evaluation to post-processing.
-            let has_group_by = match &analyzed.body {
-                AnalyzedQueryBody::Select(s) => !s.group_by.is_empty(),
+            let has_group_by_or_implicit_agg = match &analyzed.body {
+                AnalyzedQueryBody::Select(s) => {
+                    !s.group_by.is_empty()
+                        || s.projection.iter().any(|p| expr_has_aggregate(&p.expr))
+                        || s.having.is_some()
+                }
                 _ => false,
             };
             // (output_col_index, deferred_async_expr_with_output_col_ref)
             let mut deferred_async_cols: Vec<(usize, TypedExpr)> = Vec::new();
-            if has_group_by && has_async_projection {
+            if has_group_by_or_implicit_agg && has_async_projection {
                 if let AnalyzedQueryBody::Select(ref mut select) = analyzed.to_mut().body {
                     for (i, proj) in select.projection.iter_mut().enumerate() {
                         if needs_async(&proj.expr) {
+                            // Skip deferral for expressions containing AggregateCall
+                            // (e.g. SUM(COALESCE((SELECT ...), 0))). The aggregate
+                            // operator must see the real aggregate expression so it can
+                            // extract and accumulate it; the async arg will be
+                            // materialized per-row inside the aggregate operator.
+                            if expr_has_aggregate(&proj.expr) {
+                                continue;
+                            }
                             // Build a deferred expression that references output col `i`
                             // (the dependency value will be at this position after the
                             // optimizer evaluates the replacement expression).

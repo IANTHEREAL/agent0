@@ -320,7 +320,7 @@ impl EmbeddedPageFs {
                 let mut txn = self.begin().await?;
                 let inode_id = self.alloc_inode_id().await?;
                 let key = self.object_key(inode_id)?;
-                let upload_id = match s3.create_multipart_upload(&key).await {
+                let upload_id = match s3.create_multipart_upload(&key, None).await {
                     Ok(id) => id,
                     Err(err) => {
                         let _ = txn.rollback().await;
@@ -434,7 +434,19 @@ impl EmbeddedPageFs {
         path: &str,
         expected_size: u64,
         mode: Option<u32>,
+        checksum_algorithm: Option<&str>,
     ) -> Result<FsCreateUpload> {
+        let checksum_algorithm = match checksum_algorithm {
+            Some(alg) if alg.eq_ignore_ascii_case("crc32c") => Some("crc32c"),
+            Some(alg) => {
+                return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
+                    "unsupported checksum algorithm: {}; only 'crc32c' is supported",
+                    alg
+                ))));
+            }
+            None => None,
+        };
+
         if expected_size == 0 {
             return Err(anyhow!(EmbeddedFsError::InvalidInput(
                 "create_upload requires a positive expected_size".to_string(),
@@ -484,7 +496,10 @@ impl EmbeddedPageFs {
             let expected_parent_inode = resolve_existing_parent(&mut txn, &normalized).await?;
             let inode_id = self.alloc_inode_id().await?;
             let object_key = self.object_key(inode_id)?;
-            let upload_id = match s3.create_multipart_upload(&object_key).await {
+            let upload_id = match s3
+                .create_multipart_upload(&object_key, checksum_algorithm)
+                .await
+            {
                 Ok(upload_id) => upload_id,
                 Err(err) => {
                     let _ = txn.rollback().await;
@@ -493,13 +508,13 @@ impl EmbeddedPageFs {
             };
 
             let now = current_unix_timestamp();
-            let expires_at = now
-                .checked_add(
-                    i64::try_from(fs9_config().presign_ttl_secs).map_err(|_| {
-                        anyhow!(EmbeddedFsError::internal("presign ttl exceeds i64"))
-                    })?,
-                )
-                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("presign expiry overflow")))?;
+            let expires_at =
+                now.checked_add(i64::try_from(fs9_config().upload_token_ttl_secs).map_err(
+                    |_| anyhow!(EmbeddedFsError::internal("upload token ttl exceeds i64")),
+                )?)
+                .ok_or_else(|| {
+                    anyhow!(EmbeddedFsError::internal("upload token expiry overflow"))
+                })?;
             let nonce = rand::thread_rng().gen_range(1..=u64::MAX);
             let path_hash = path_hash_bytes(&normalized);
             let reservation = UploadReservation {
@@ -563,6 +578,7 @@ impl EmbeddedPageFs {
                         upload_id,
                         part_size,
                         expires_at,
+                        checksum_algorithm: checksum_algorithm.map(|s| s.to_string()),
                     });
                 }
                 Err(err) if attempt + 1 < attempts => {
@@ -590,6 +606,7 @@ impl EmbeddedPageFs {
         &self,
         upload_token: &str,
         part_number: i32,
+        checksum_crc32c: Option<&str>,
     ) -> Result<FsPresignedRequest> {
         if !(1..=10_000).contains(&part_number) {
             return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
@@ -599,7 +616,17 @@ impl EmbeddedPageFs {
         }
 
         let claims = verify_upload_token(upload_token)?;
-        let ctx = self.load_upload_context(&claims, true).await?;
+
+        // Retry lifecycle refresh WriteConflict: two concurrent presign
+        // requests (or a presign racing with complete/abort) may both try
+        // to write _fs_L{inode}.  Retrying gives a fresh snapshot so we
+        // see the true current state.
+        let ctx = retry_on_lifecycle_conflict(
+            fs9_config().tikv_commit_retry_attempts.max(1),
+            |_attempt| self.load_upload_context(&claims, true),
+        )
+        .await?;
+
         if ctx.phase != UploadLifecyclePhase::Uploading {
             return Err(anyhow!(EmbeddedFsError::conflict(
                 "upload is no longer in uploading state",
@@ -619,12 +646,12 @@ impl EmbeddedPageFs {
                 "uploading state missing upload_id"
             ))
         })?;
-        let ttl_secs = presign_ttl_secs_from_claims(claims.expires_at)?;
+        let ttl_secs = presign_part_ttl_secs();
         let s3 = self
             .s3_client()
             .await?
             .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
-        s3.presign_upload_part(&ctx.key, upload_id, part_number, ttl_secs)
+        s3.presign_upload_part(&ctx.key, upload_id, part_number, ttl_secs, checksum_crc32c)
             .await
     }
 
@@ -635,7 +662,10 @@ impl EmbeddedPageFs {
         checksum: Option<[u8; 32]>,
     ) -> Result<usize> {
         let claims = verify_upload_token(upload_token)?;
-        let ctx = self.load_upload_context(&claims, false).await?;
+        // complete_upload is exempt from token expiry: the HMAC signature, nonce,
+        // and upload_id binding provide sufficient authentication. Rejecting a
+        // completion after hours of successful part uploads would waste all work.
+        let ctx = self.load_upload_context_skip_expiry(&claims).await?;
         if ctx.phase == UploadLifecyclePhase::Published {
             return usize::try_from(ctx.inode.size)
                 .map_err(|_| anyhow!(EmbeddedFsError::internal("published size exceeds usize")));
@@ -664,15 +694,36 @@ impl EmbeddedPageFs {
                     "uploading state missing upload_id"
                 ))
             })?;
-            s3.complete_multipart_upload(
-                &ctx.key,
-                upload_id,
-                completed_parts
-                    .iter()
-                    .map(|part| (part.part_number, part.etag.clone()))
-                    .collect(),
-            )
-            .await?;
+            if let Err(complete_err) = s3
+                .complete_multipart_upload(
+                    &ctx.key,
+                    upload_id,
+                    completed_parts
+                        .iter()
+                        .map(|part| {
+                            (
+                                part.part_number,
+                                part.etag.clone(),
+                                part.checksum_crc32c.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+                .await
+            {
+                // CompleteMultipartUpload can time out after S3 has already
+                // assembled the object. Fall through to HeadObject to check
+                // whether the object actually exists before giving up.
+                tracing::warn!(
+                    key = %ctx.key,
+                    upload_id = %upload_id,
+                    error = %complete_err,
+                    "fs9: CompleteMultipartUpload failed, checking HeadObject",
+                );
+                if head_object_with_retry(&s3, &ctx.key).await.is_err() {
+                    return Err(complete_err);
+                }
+            }
         }
 
         let head = head_object_with_retry(&s3, &ctx.key).await?;
@@ -1053,6 +1104,32 @@ fn tikv_error_contains_write_conflict(err: &tikv_client::Error) -> bool {
     }
 }
 
+/// Retry an async operation that may hit a TiKV `WriteConflict` during the
+/// lifecycle refresh in `load_upload_context`.  Extracted as a named helper
+/// so both `presign_upload_part` and its regression tests share the exact
+/// same retry logic.
+///
+/// This mirrors `retry_subgroup_op` but uses `is_retryable_tikv_write_conflict`
+/// (the pagefs-level predicate) rather than the subgroup classifier.
+async fn retry_on_lifecycle_conflict<F, Fut, T>(max_attempts: u32, mut op: F) -> Result<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 0..max_attempts {
+        match op(attempt).await {
+            Ok(val) => return Ok(val),
+            Err(err) if is_retryable_tikv_write_conflict(&err) && attempt + 1 < max_attempts => {
+                super::fs9_commit_backoff(attempt).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(anyhow!(EmbeddedFsError::internal(
+        "presign_upload_part lifecycle refresh retry exhausted"
+    )))
+}
+
 /// Classify a subgroup commit error into a stable `execution.*` category
 /// by downcasting the error chain (no string parsing).
 ///
@@ -1320,5 +1397,84 @@ mod classify_tests {
         assert_eq!(outcome.attempts_used, 1);
         assert!(!outcome.retried);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // --- retry_on_lifecycle_conflict unit tests ---
+    //
+    // These validate the helper in isolation.  The actual production path
+    // (presign_upload_part → load_upload_context under concurrent stale
+    // lifecycle) is covered by the #[ignore] integration test
+    // `test_presign_upload_part_concurrent_stale_lifecycle_retry` in
+    // pagefs/tests.rs, which requires real TiKV + S3.
+
+    fn make_lifecycle_write_conflict() -> anyhow::Error {
+        anyhow::anyhow!(tikv_client::Error::KeyError(Box::new(
+            tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }
+        )))
+    }
+
+    #[tokio::test]
+    async fn lifecycle_conflict_retry_then_success() {
+        // First call: WriteConflict (lifecycle refresh race).
+        // Second call: success (fresh read sees updated lifecycle).
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(5, |_attempt| {
+            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(make_lifecycle_write_conflict())
+                } else {
+                    Ok("ctx_placeholder")
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "ctx_placeholder");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "should succeed on second attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_conflict_exhausted() {
+        // All attempts: WriteConflict → retries exhaust
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(3, |_attempt| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<&str, _>(make_lifecycle_write_conflict()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "should exhaust all attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_non_retryable_error_not_retried() {
+        // Non-WriteConflict error → no retry, immediate failure.
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(5, |_attempt| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<&str, _>(anyhow::anyhow!("not a write conflict")) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "should fail on first attempt without retrying"
+        );
     }
 }

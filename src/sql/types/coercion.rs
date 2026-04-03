@@ -32,6 +32,7 @@ pub fn type_precedence(dt: &DataType) -> i32 {
     match dt {
         DataType::Boolean => 10,
         DataType::Int32 => 20,
+        DataType::Oid => 25, // 4-byte OID promotes to Int64, not vice versa
         DataType::Int64 => 30,
         DataType::Float64 => 45,
         DataType::Numeric { .. } => 50,
@@ -59,7 +60,11 @@ pub fn type_precedence(dt: &DataType) -> i32 {
 pub fn is_numeric(dt: &DataType) -> bool {
     matches!(
         dt,
-        DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Numeric { .. }
+        DataType::Int32
+            | DataType::Int64
+            | DataType::Oid
+            | DataType::Float64
+            | DataType::Numeric { .. }
     )
 }
 
@@ -151,10 +156,10 @@ pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
     }
 
     match (a, b) {
-        (alias, DataType::Int32 | DataType::Int64) if is_oid_alias_type(alias) => {
+        (alias, DataType::Int32 | DataType::Int64 | DataType::Oid) if is_oid_alias_type(alias) => {
             Some(alias.clone())
         }
-        (DataType::Int32 | DataType::Int64, alias) if is_oid_alias_type(alias) => {
+        (DataType::Int32 | DataType::Int64 | DataType::Oid, alias) if is_oid_alias_type(alias) => {
             Some(alias.clone())
         }
         // Text-like vs typed side -> typed side wins.
@@ -254,8 +259,21 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 (DataType::Date, DataType::Int32) | (DataType::Int32, DataType::Date) => {
                     Some(DataType::Date)
                 }
+                (DataType::Date, DataType::Int64) => Some(DataType::Date),
+                (DataType::Int64, DataType::Date) if op == "Plus" || op == "+" => {
+                    Some(DataType::Date)
+                }
                 (DataType::Interval, DataType::Interval) => Some(DataType::Interval),
-                (DataType::Timestamp, DataType::Timestamp) if op == "Minus" || op == "-" => {
+                (DataType::Timestamp, DataType::Timestamp)
+                | (DataType::TimestampTz, DataType::TimestampTz)
+                | (DataType::Timestamp, DataType::TimestampTz)
+                | (DataType::TimestampTz, DataType::Timestamp)
+                | (DataType::Timestamp, DataType::Date)
+                | (DataType::Date, DataType::Timestamp)
+                | (DataType::TimestampTz, DataType::Date)
+                | (DataType::Date, DataType::TimestampTz)
+                    if op == "Minus" || op == "-" =>
+                {
                     Some(DataType::Interval)
                 }
                 (DataType::Date, DataType::Date) if op == "Minus" || op == "-" => {

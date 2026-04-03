@@ -113,6 +113,10 @@ pub(crate) struct ExtensionContext {
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     embedding_mode: Cell<EmbeddingExecutionMode>,
+    /// When `true`, the current execution is inside a SECURITY DEFINER function
+    /// whose owner is a superuser. This overrides `is_superuser` for permission
+    /// checks (e.g. fs9) so that SECURITY DEFINER semantics are respected.
+    security_definer_superuser: Cell<bool>,
     statement_state: Arc<ExtensionStatementState>,
     tikv_client: Option<Arc<TransactionClient>>,
 }
@@ -159,6 +163,7 @@ pub(crate) async fn with_context_opts<R>(
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
+        security_definer_superuser: Cell::new(false),
         statement_state: opts.statement_state,
         tikv_client: opts.tikv_client,
     };
@@ -176,7 +181,31 @@ pub(crate) async fn with_context_opts<R>(
 }
 
 pub(crate) fn is_superuser() -> bool {
-    CTX.try_with(|ctx| ctx.is_superuser).unwrap_or(false)
+    CTX.try_with(|ctx| ctx.is_superuser || ctx.security_definer_superuser.get())
+        .unwrap_or(false)
+}
+
+/// Temporarily elevate `is_superuser()` to `true` for SECURITY DEFINER
+/// functions whose owner is a superuser.  Returns a guard that restores the
+/// previous value on drop.
+pub(crate) fn enter_security_definer_superuser() -> SecurityDefinerGuard {
+    let prev = CTX
+        .try_with(|ctx| {
+            let old = ctx.security_definer_superuser.get();
+            ctx.security_definer_superuser.set(true);
+            old
+        })
+        .unwrap_or(false);
+    SecurityDefinerGuard(prev)
+}
+
+/// RAII guard that restores `security_definer_superuser` on drop.
+pub(crate) struct SecurityDefinerGuard(bool);
+
+impl Drop for SecurityDefinerGuard {
+    fn drop(&mut self) {
+        let _ = CTX.try_with(|ctx| ctx.security_definer_superuser.set(self.0));
+    }
 }
 
 pub(crate) fn bypass_rls() -> bool {

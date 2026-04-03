@@ -405,6 +405,13 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
                 .map_err(|_| err(format!("expected 8 bytes, got {}", bytes.len())))?;
             Ok(Value::Int64(i64::from_be_bytes(arr)))
         }
+        // OID is 4 bytes unsigned on the wire, stored as Int64 internally.
+        t if *t == Type::OID => {
+            let arr: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| err(format!("expected 4 bytes, got {}", bytes.len())))?;
+            Ok(Value::Int64(i32::from_be_bytes(arr) as i64))
+        }
         t if *t == Type::FLOAT4 => {
             let arr: [u8; 4] = bytes
                 .try_into()
@@ -594,6 +601,10 @@ fn decode_text_value(
             .parse::<i64>()
             .map(Value::Int64)
             .map_err(|e| err(e.to_string())),
+        t if *t == Type::OID => trimmed
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|e| err(e.to_string())),
         t if *t == Type::FLOAT4 => {
             let v = trimmed.parse::<f32>().map_err(|e| err(e.to_string()))?;
             Ok(Value::Float64(v as f64))
@@ -633,7 +644,7 @@ fn decode_text_value(
         }
         t if *t == Type::INTERVAL => crate::sql::expr::parse_interval_string(trimmed)
             .map_err(|_| err(format!("\"{}\"", trimmed))),
-        t if *t == Type::TIME => crate::sql::value_coercion::parse_time_string(trimmed)
+        t if *t == Type::TIME => crate::sql::types::cast::parse_time_string(trimmed)
             .map(Value::Time)
             .ok_or_else(|| err(format!("\"{}\"", trimmed))),
         t if *t == Type::NUMERIC => {
@@ -662,7 +673,17 @@ fn decode_text_value(
             || *t == Type::TIME_ARRAY
             || *t == Type::NUMERIC_ARRAY =>
         {
-            let elements = crate::sql::value_coercion::parse_pg_array(trimmed)
+            // postgres.js sends array parameters as bare comma-separated values
+            // (e.g. "admin,user") instead of PostgreSQL's standard array literal
+            // format ("{admin,user}"). Auto-wrap when braces are missing.
+            let array_input;
+            let array_str = if !trimmed.starts_with('{') {
+                array_input = format!("{{{}}}", trimmed);
+                &array_input
+            } else {
+                trimmed
+            };
+            let elements = crate::sql::types::cast::parse_pg_array(array_str)
                 .map_err(|_| err(format!("\"{}\"", trimmed)))?;
             // Re-decode each element through the scalar decode path for the
             // element type so that e.g. UUID strings become Value::Uuid, not
@@ -1019,5 +1040,55 @@ mod tests {
             }
             other => panic!("expected user error, got {other:?}"),
         }
+    }
+
+    // --- Tests for bare CSV array auto-wrapping (postgres.js compat, #1927) ---
+
+    #[test]
+    fn decode_text_bare_csv_text_array() {
+        // postgres.js sends "admin,user" with type _text instead of "{admin,user}"
+        let v = decode_text(b"admin,user", &Type::TEXT_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("admin".to_string()),
+                Value::Text("user".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn decode_text_bare_csv_int4_array() {
+        let v = decode_text(b"1,2,3", &Type::INT4_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
+        );
+    }
+
+    #[test]
+    fn decode_text_braced_text_array_still_works() {
+        // Ensure existing {}-wrapped format is not broken
+        let v = decode_text(b"{admin,user}", &Type::TEXT_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("admin".to_string()),
+                Value::Text("user".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn decode_text_bare_single_element_array() {
+        let v = decode_text(b"hello", &Type::TEXT_ARRAY, 0).unwrap();
+        assert_eq!(v, Value::Array(vec![Value::Text("hello".to_string())]));
+    }
+
+    #[test]
+    fn decode_text_bare_empty_string_array() {
+        // Empty string becomes an empty array (same as "{}")
+        let v = decode_text(b"", &Type::TEXT_ARRAY, 0).unwrap();
+        assert_eq!(v, Value::Array(vec![]));
     }
 }

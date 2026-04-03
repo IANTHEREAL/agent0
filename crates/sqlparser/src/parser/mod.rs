@@ -2244,11 +2244,11 @@ impl<'a> Parser<'a> {
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::UNKNOWN]) {
                         Ok(Expr::IsNotUnknown(Box::new(expr)))
                     } else if self.parse_keywords(&[Keyword::DISTINCT, Keyword::FROM]) {
-                        let expr2 = self.parse_expr()?;
+                        let expr2 = self.parse_subexpr(Self::IS_PREC)?;
                         Ok(Expr::IsDistinctFrom(Box::new(expr), Box::new(expr2)))
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::DISTINCT, Keyword::FROM])
                     {
-                        let expr2 = self.parse_expr()?;
+                        let expr2 = self.parse_subexpr(Self::IS_PREC)?;
                         Ok(Expr::IsNotDistinctFrom(Box::new(expr), Box::new(expr2)))
                     } else {
                         self.expected(
@@ -7370,9 +7370,13 @@ impl<'a> Parser<'a> {
                         if self.parse_keywords(&[Keyword::ON, Keyword::CONSTRAINT]) {
                             Some(ConflictTarget::OnConstraint(self.parse_object_name()?))
                         } else if self.peek_token() == Token::LParen {
-                            Some(ConflictTarget::Columns(
-                                self.parse_parenthesized_column_list(IsOptional::Mandatory, false)?,
-                            ))
+                            let cols = self.parse_parenthesized_column_list(IsOptional::Mandatory, false)?;
+                            let predicate = if self.parse_keyword(Keyword::WHERE) {
+                                Some(self.parse_expr()?)
+                            } else {
+                                None
+                            };
+                            Some(ConflictTarget::Columns(cols, predicate))
                         } else {
                             None
                         };

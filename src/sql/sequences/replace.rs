@@ -9,7 +9,7 @@ use crate::sql::names;
 use crate::sql::names::function_name_upper;
 use crate::sql::plpgsql;
 use crate::sql::query_context::QueryContext;
-use crate::sql::value_coercion::value_to_sql_expr;
+use crate::sql::types::cast::value_to_sql_expr;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};

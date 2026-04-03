@@ -168,7 +168,10 @@ async fn build_hnsw_index(
 
     // Determine label mode from PK type.
     let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
-    let label_mode = if matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
+    let label_mode = if matches!(
+        pk_col_type,
+        DataType::Int32 | DataType::Int64 | DataType::Oid
+    ) {
         crate::sql::hnsw::HnswLabelMode::Direct
     } else {
         crate::sql::hnsw::HnswLabelMode::Mapped

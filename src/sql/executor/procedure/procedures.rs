@@ -178,6 +178,7 @@ impl Executor {
                         with_params.as_deref(),
                         current_role.as_deref(),
                         session_user.as_deref(),
+                        0,
                     )
                     .await?;
                 }

@@ -1,6 +1,5 @@
 //! DELETE row execution: storage entry cleanup and index removal.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,32 +11,70 @@ use crate::sql::index_helpers;
 use crate::storage::TikvStore;
 use crate::worker::types::IndexState;
 
-use super::foreign_keys::{handle_foreign_key_on_delete, FkDeleteContext, FkStoreCtx};
-
-pub async fn execute_delete_row(
+/// Collect all TiKV keys that must be deleted for a single row,
+/// without performing any IO. Used by batch DELETE to gather all keys
+/// before flushing them in a single `batch_mutate` RPC.
+///
+/// Skips HNSW indexes (they use lazy deletion with IO-dependent rowid mapping).
+pub fn collect_deletion_keys(
     store: &Arc<TikvStore>,
-    txn: &mut Transaction,
     db_id: u64,
-    table_name: &str,
     schema: &TableSchema,
     row: &Row,
-    stmt_deleting_pks: &HashSet<String>,
-    fk_ctx: &mut FkDeleteContext,
-) -> Result<()> {
-    let fk_store_ctx = FkStoreCtx { store, db_id };
-    handle_foreign_key_on_delete(
-        &fk_store_ctx,
-        txn,
-        table_name,
-        schema,
-        row,
-        stmt_deleting_pks,
-        fk_ctx,
-    )
-    .await?;
+) -> Result<Vec<Vec<u8>>> {
+    let pk_values = schema.get_pk_values(row);
+    let mut keys = Vec::new();
 
-    delete_row_storage_entries(store, txn, db_id, table_name, schema, row).await?;
-    Ok(())
+    // Data row key
+    keys.push(store.encode_data_key_for_row(db_id, schema.table_id, &pk_values));
+
+    for index in &schema.indexes {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
+            continue;
+        }
+
+        // HNSW: lazy deletion, requires IO — handled separately per-row
+        if index.is_hnsw() {
+            continue;
+        }
+
+        // GIN index entries
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
+        if !gin_hashes.is_empty() {
+            let gin_keys = store.encode_gin_index_deletion_keys(
+                db_id,
+                schema.table_id,
+                index.id,
+                &gin_hashes,
+                &pk_values,
+            );
+            keys.extend(gin_keys);
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        if !index_helpers::eval_index_predicate(index, schema, row)? {
+            continue;
+        }
+
+        // B-tree index entry
+        let idx_values = index_helpers::get_index_values_with_expressions(index, schema, row)?;
+        keys.push(store.encode_index_deletion_key(
+            db_id,
+            schema.table_id,
+            index.id,
+            &idx_values,
+            &pk_values,
+            index.unique,
+        ));
+    }
+
+    Ok(keys)
 }
 
 pub(super) async fn delete_row_storage_entries(

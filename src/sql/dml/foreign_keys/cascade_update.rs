@@ -8,7 +8,7 @@ use tikv_client::Transaction;
 use crate::model::{ForeignKeyAction, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::projection::eval_default_expr;
-use crate::sql::value_coercion::coerce_value_for_column;
+use crate::sql::types::cast::coerce_value_for_column;
 
 use super::{
     fk_values_for_row, get_ref_values, pk_to_hash_key, ref_column_names, short_relation_name,

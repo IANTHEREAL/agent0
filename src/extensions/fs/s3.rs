@@ -2,12 +2,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::presigning::{PresignedRequest, PresigningConfig};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use tokio::io::AsyncRead;
 
@@ -33,7 +35,14 @@ impl FsS3Client {
         }
         let shared = loader.load().await;
 
-        let mut builder = S3ConfigBuilder::from(&shared);
+        let timeout_config = TimeoutConfig::builder()
+            .operation_attempt_timeout(Duration::from_secs(600))
+            .build();
+        let retry_config = RetryConfig::standard().with_max_attempts(4);
+
+        let mut builder = S3ConfigBuilder::from(&shared)
+            .timeout_config(timeout_config)
+            .retry_config(retry_config);
         if let Some(endpoint) = binding.endpoint.as_deref() {
             builder = builder.endpoint_url(endpoint);
         }
@@ -192,20 +201,27 @@ impl FsS3Client {
         Ok(())
     }
 
-    pub(crate) async fn create_multipart_upload(&self, key: &str) -> Result<String> {
-        let out = self
+    pub(crate) async fn create_multipart_upload(
+        &self,
+        key: &str,
+        checksum_algorithm: Option<&str>,
+    ) -> Result<String> {
+        let mut builder = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "fs9: CreateMultipartUpload failed for s3://{}/{}",
-                    self.bucket, key
-                )
-            })?;
+            .key(key);
+
+        if matches!(checksum_algorithm, Some(alg) if alg.eq_ignore_ascii_case("crc32c")) {
+            builder = builder.checksum_algorithm(ChecksumAlgorithm::Crc32C);
+        }
+
+        let out = builder.send().await.with_context(|| {
+            format!(
+                "fs9: CreateMultipartUpload failed for s3://{}/{}",
+                self.bucket, key
+            )
+        })?;
         out.upload_id()
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("fs9: missing upload_id from CreateMultipartUpload"))
@@ -243,16 +259,17 @@ impl FsS3Client {
         &self,
         key: &str,
         upload_id: &str,
-        parts: Vec<(i32, String)>,
+        parts: Vec<(i32, String, Option<String>)>,
     ) -> Result<()> {
         let mut completed = Vec::with_capacity(parts.len());
-        for (part_number, etag) in parts {
-            completed.push(
-                CompletedPart::builder()
-                    .part_number(part_number)
-                    .e_tag(etag)
-                    .build(),
-            );
+        for (part_number, etag, checksum_crc32c) in parts {
+            let mut builder = CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag);
+            if let Some(crc) = checksum_crc32c {
+                builder = builder.checksum_crc32_c(crc);
+            }
+            completed.push(builder.build());
         }
 
         self.client
@@ -306,6 +323,7 @@ impl FsS3Client {
         upload_id: &str,
         part_number: i32,
         expires_in_secs: u64,
+        checksum_crc32c: Option<&str>,
     ) -> Result<FsPresignedRequest> {
         let expires_in = Duration::from_secs(expires_in_secs);
         let expires_at = current_unix_timestamp()
@@ -314,21 +332,24 @@ impl FsS3Client {
             )
             .ok_or_else(|| anyhow!("fs9: presign expiry overflow"))?;
         let config = PresigningConfig::expires_in(expires_in)?;
-        let request = self
+        let mut builder = self
             .client
             .upload_part()
             .bucket(&self.bucket)
             .key(key)
             .upload_id(upload_id)
-            .part_number(part_number)
-            .presigned(config)
-            .await
-            .with_context(|| {
-                format!(
-                    "fs9: presign UploadPart failed for s3://{}/{} upload_id={} part={}",
-                    self.bucket, key, upload_id, part_number
-                )
-            })?;
+            .part_number(part_number);
+
+        if let Some(crc) = checksum_crc32c {
+            builder = builder.checksum_crc32_c(crc);
+        }
+
+        let request = builder.presigned(config).await.with_context(|| {
+            format!(
+                "fs9: presign UploadPart failed for s3://{}/{} upload_id={} part={}",
+                self.bucket, key, upload_id, part_number
+            )
+        })?;
         Ok(presigned_request_to_fs(request, expires_at))
     }
 

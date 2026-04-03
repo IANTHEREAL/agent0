@@ -1,0 +1,25 @@
+ has_settings
+--------------
+ t
+(1 row)
+
+ set_config
+------------
+(0 rows)
+
+      name      | setting | context  | vartype
+----------------+---------+----------+---------
+ server_version | 16.0    | internal | string
+(1 row)
+
+SET
+ setting
+---------
+ UTC
+(1 row)
+
+     name     | setting | unit
+--------------+---------+------
+ lock_timeout | 0       | ms
+(1 row)
+

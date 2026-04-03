@@ -102,6 +102,7 @@ impl SessionSettings {
             "db9.dml_table_scan_max_rows" => Some(self.dml_table_scan_max_rows.to_string()),
             "db9.hash_join_work_mem" => Some(self.hash_join_work_mem.to_string()),
             "db9.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
+            "db9.password_grace_seconds" => Some(self.password_grace_seconds.to_string()),
             "db9.prepared_plan_cache_size" => Some(self.prepared_plan_cache_size.to_string()),
             "db9.prepared_plan_cache_min_exec" => {
                 Some(self.prepared_plan_cache_min_exec.to_string())
@@ -421,6 +422,22 @@ impl SessionSettings {
             }
         }
         self.prepared_plan_cache_min_exec
+    }
+
+    pub(crate) fn password_grace_seconds(&self) -> u32 {
+        if let Some(v) = self.local_overrides.get("db9.password_grace_seconds") {
+            match v.parse::<u32>() {
+                Ok(seconds) => return seconds,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local db9.password_grace_seconds override"
+                    );
+                }
+            }
+        }
+        self.password_grace_seconds
     }
 
     /// Collect all current settings into a flat map.

@@ -1409,6 +1409,7 @@ dependencies = [
  "socket2 0.6.3",
  "sqlparser",
  "stacker",
+ "subtle",
  "thiserror 1.0.69",
  "tikv-client",
  "tikv-jemallocator",

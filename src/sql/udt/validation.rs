@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
 
 use crate::model::{ColumnDef, DataType, UserTypeKind, Value};
-use crate::sql::value_coercion::coerce_value_for_column;
+use crate::sql::types::cast::coerce_value_for_column;
 use crate::storage::TikvStore;
 
 #[derive(Debug, Clone)]

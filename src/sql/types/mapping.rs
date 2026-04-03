@@ -463,7 +463,7 @@ fn convert_custom_builtin(type_name: &str, modifiers: &[String]) -> Option<DataT
         "name" => Some(DataType::Name),
         "regclass" => Some(DataType::UserDefined("pg_catalog.regclass".to_string())),
         "regtype" => Some(DataType::UserDefined("pg_catalog.regtype".to_string())),
-        "oid" => Some(DataType::UserDefined("oid".to_string())),
+        "oid" => Some(DataType::Oid),
         "int2vector" => Some(DataType::UserDefined("int2vector".to_string())),
         "oidvector" => Some(DataType::UserDefined("oidvector".to_string())),
         "vector" => {
@@ -582,7 +582,7 @@ mod tests {
         let lower = ObjectName(vec![quoted_ident("oid")]);
         let (ty, is_serial) = resolve_custom_type(TypeResolutionContext::NonDdl, &lower, &[], None)
             .expect("quoted lowercase oid should map");
-        assert_eq!(ty, DataType::UserDefined("oid".to_string()));
+        assert_eq!(ty, DataType::Oid);
         assert!(!is_serial);
 
         let upper = ObjectName(vec![quoted_ident("OID")]);

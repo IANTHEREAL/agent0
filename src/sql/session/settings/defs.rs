@@ -91,6 +91,15 @@ pub(crate) const GUC_TABLE: &[GucDef] = &[
         validate_fn: None,
     },
     GucDef {
+        name: "db9.password_grace_seconds",
+        guc_type: GucType::Int,
+        context: GucContext::Userset,
+        description: "Grace period in seconds for the old password after ALTER ROLE WITH PASSWORD (0 = immediate replacement)",
+        boot_default: "0",
+        flags: 0,
+        validate_fn: Some(validate_db9_password_grace_seconds),
+    },
+    GucDef {
         name: "db9.prepared_plan_cache_min_exec",
         guc_type: GucType::Int,
         context: GucContext::Userset,

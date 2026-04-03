@@ -40,7 +40,7 @@ use super::names::normalize_ident;
 use super::sequences;
 use super::types::sql_datatype_to_internal_strict;
 use super::types::{resolve_custom_type_with_catalog, TypeResolutionContext};
-use super::value_coercion::coerce_value_for_column;
+use crate::sql::types::cast::coerce_value_for_column;
 
 use crate::model::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,

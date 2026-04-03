@@ -1,0 +1,5 @@
+-- Q2: SECURITY DEFINER (SQL) wrapper succeeds — returns the length of the file
+22
+
+-- Q4: SECURITY DEFINER (PL/pgSQL) wrapper also succeeds
+22

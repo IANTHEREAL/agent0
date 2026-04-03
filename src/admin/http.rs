@@ -20,13 +20,19 @@
 use super::control::{AdminControlService, ControlError};
 use super::session_registry::{SessionFilter, SessionState};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 const MAX_HEADER_SIZE: usize = 8192;
 const MAX_BODY_SIZE: usize = 4096;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_LIST_LIMIT: usize = 1000;
+/// Minimum length for BREAK_GLASS_SECRET to prevent trivially guessable secrets.
+pub const MIN_SECRET_LENGTH: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -34,13 +40,25 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run the break-glass admin HTTP accept loop. Call from `tokio::spawn`.
 pub async fn start_break_glass_server(listener: TcpListener, secret: String) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("break-glass connection limit reached, rejecting {}", peer);
+                        // Drop the stream immediately — no permit available.
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let s = secret.clone();
                 tokio::spawn(async move {
+                    let _permit = permit; // held until task completes
                     if let Err(e) =
-                        tokio::time::timeout(REQUEST_TIMEOUT, handle_connection(stream, &s)).await
+                        tokio::time::timeout(REQUEST_TIMEOUT, handle_connection(stream, &s, peer))
+                            .await
                     {
                         debug!("break-glass connection from {} timed out: {}", peer, e);
                     }
@@ -57,17 +75,25 @@ pub async fn start_break_glass_server(listener: TcpListener, secret: String) {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(mut stream: TcpStream, admin_secret: &str) {
+async fn handle_connection(mut stream: TcpStream, admin_secret: &str, peer: std::net::SocketAddr) {
     let req = match read_request(&mut stream).await {
         Ok(r) => r,
         Err(status) => {
-            let _ = write_response(&mut stream, status, &error_json(status, "bad request")).await;
+            let msg = match status {
+                413 => "payload too large",
+                _ => "bad request",
+            };
+            let _ = write_response(&mut stream, status, &error_json(status, msg)).await;
             return;
         }
     };
 
     // Auth check.
     if !check_auth(&req, admin_secret) {
+        warn!(
+            "break-glass auth failure from {} — {} {}",
+            peer, req.method, req.path
+        );
         let _ = write_response(&mut stream, 401, &error_json(401, "unauthorized")).await;
         return;
     }
@@ -196,18 +222,27 @@ fn check_auth(req: &HttpRequest, admin_secret: &str) -> bool {
     let Some(auth_header) = req.headers.get("authorization") else {
         return false;
     };
-    let Some(token) = auth_header.strip_prefix("Bearer ") else {
+    // RFC 7235: scheme comparison is case-insensitive.
+    let token = if let Some(t) = auth_header.strip_prefix("Bearer ") {
+        t
+    } else if let Some(t) = auth_header.strip_prefix("bearer ") {
+        t
+    } else if auth_header.len() > 7 && auth_header[..7].eq_ignore_ascii_case("bearer ") {
+        &auth_header[7..]
+    } else {
         return false;
     };
     constant_time_eq(token.as_bytes(), admin_secret.as_bytes())
 }
 
+/// Constant-time comparison that does not leak the length of `b` (the secret).
+/// Both inputs are padded to the same length before comparing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let max_len = a.len().max(b.len());
+    let mut diff = (a.len() != b.len()) as u8;
+    for i in 0..max_len {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
         diff |= x ^ y;
     }
     diff == 0
@@ -262,12 +297,27 @@ fn handle_list_sessions(req: &HttpRequest) -> (u16, String) {
         .map(|v| v == "true")
         .unwrap_or(false);
     let principal = params.get("principal").cloned();
-    let state = params.get("state").and_then(|s| parse_session_state(s));
+
+    // Reject unknown state filter values instead of silently ignoring them.
+    let state = match params.get("state") {
+        Some(s) => match parse_session_state(s) {
+            Some(st) => Some(st),
+            None => {
+                return (
+                    400,
+                    error_json(400, &format!("invalid state filter: '{s}'")),
+                );
+            }
+        },
+        None => None,
+    };
+
     let min_duration_ms = params.get("min_duration_ms").and_then(|v| v.parse().ok());
     let limit = params
         .get("limit")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100usize);
+        .unwrap_or(100usize)
+        .min(MAX_LIST_LIMIT);
     let offset = params
         .get("offset")
         .and_then(|v| v.parse().ok())
@@ -301,7 +351,10 @@ fn handle_list_sessions(req: &HttpRequest) -> (u16, String) {
 }
 
 fn handle_cancel(connection_id: i64, req: &HttpRequest) -> (u16, String) {
-    let reason = extract_reason(&req.body);
+    let reason = match extract_reason(&req.body) {
+        Ok(r) => r,
+        Err(msg) => return (400, error_json(400, &msg)),
+    };
     let registry = super::global_session_registry();
     let svc = AdminControlService::new(registry);
 
@@ -319,7 +372,10 @@ fn handle_cancel(connection_id: i64, req: &HttpRequest) -> (u16, String) {
 }
 
 fn handle_terminate(connection_id: i64, req: &HttpRequest) -> (u16, String) {
-    let reason = extract_reason(&req.body);
+    let reason = match extract_reason(&req.body) {
+        Ok(r) => r,
+        Err(msg) => return (400, error_json(400, &msg)),
+    };
     let registry = super::global_session_registry();
     let svc = AdminControlService::new(registry);
 
@@ -337,7 +393,10 @@ fn handle_terminate(connection_id: i64, req: &HttpRequest) -> (u16, String) {
 }
 
 fn handle_terminate_all(tenant_id: &str, req: &HttpRequest) -> (u16, String) {
-    let reason = extract_reason(&req.body);
+    let reason = match extract_reason(&req.body) {
+        Ok(r) => r,
+        Err(msg) => return (400, error_json(400, &msg)),
+    };
     let registry = super::global_session_registry();
     let svc = AdminControlService::new(registry);
 
@@ -376,15 +435,19 @@ fn snapshot_to_json(s: &super::session_registry::SessionSnapshot) -> serde_json:
     })
 }
 
-fn extract_reason(body: &[u8]) -> Option<String> {
+/// Parse optional `reason` from the request body.
+/// Returns `Ok(None)` for empty body, `Ok(Some(reason))` for valid JSON with reason,
+/// `Ok(None)` for valid JSON without reason field, `Err` for malformed JSON.
+fn extract_reason(body: &[u8]) -> Result<Option<String>, String> {
     if body.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    Ok(value
         .get("reason")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string()))
 }
 
 fn parse_session_state(s: &str) -> Option<SessionState> {
@@ -429,11 +492,13 @@ fn status_text(code: u16) -> &'static str {
 }
 
 async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT");
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nDate: {}\r\nConnection: close\r\n\r\n{}",
         status,
         status_text(status),
         body.len(),
+        date,
         body
     );
     stream.write_all(response.as_bytes()).await?;
@@ -453,7 +518,11 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"wrong!"));
         assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(!constant_time_eq(b"longer", b"short"));
         assert!(constant_time_eq(b"", b""));
+        // Different lengths should still compare all bytes (no length leak).
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
     }
 
     #[test]
@@ -502,18 +571,27 @@ mod tests {
     #[test]
     fn extract_reason_from_json() {
         let body = br#"{"reason": "slow query"}"#;
-        assert_eq!(extract_reason(body), Some("slow query".to_string()));
+        assert_eq!(
+            extract_reason(body).unwrap(),
+            Some("slow query".to_string())
+        );
     }
 
     #[test]
     fn extract_reason_empty_body() {
-        assert_eq!(extract_reason(b""), None);
+        assert_eq!(extract_reason(b"").unwrap(), None);
     }
 
     #[test]
     fn extract_reason_no_reason_field() {
         let body = br#"{"other": "value"}"#;
-        assert_eq!(extract_reason(body), None);
+        assert_eq!(extract_reason(body).unwrap(), None);
+    }
+
+    #[test]
+    fn extract_reason_malformed_json() {
+        let body = b"not json at all";
+        assert!(extract_reason(body).is_err());
     }
 
     #[test]
@@ -683,6 +761,66 @@ mod tests {
             body: Vec::new(),
         };
         assert!(!check_auth(&req, "my-secret"));
+    }
+
+    #[test]
+    fn check_auth_case_insensitive_bearer() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "bearer my-secret".to_string());
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers,
+            body: Vec::new(),
+        };
+        assert!(check_auth(&req, "my-secret"));
+    }
+
+    #[test]
+    fn check_auth_mixed_case_bearer() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "BEARER my-secret".to_string());
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers,
+            body: Vec::new(),
+        };
+        assert!(check_auth(&req, "my-secret"));
+    }
+
+    #[test]
+    fn route_invalid_state_filter() {
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/admin/sessions".to_string(),
+            query_string: "tenant_id=test&state=actve".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let (status, body) = route(&req);
+        assert_eq!(status, 400);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid state filter"));
+    }
+
+    #[test]
+    fn route_list_sessions_limit_capped() {
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/admin/sessions".to_string(),
+            query_string: "tenant_id=test&limit=999999999".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let (status, _body) = route(&req);
+        // Should succeed (limit silently capped to MAX_LIST_LIMIT), not error.
+        assert_eq!(status, 200);
     }
 
     #[test]

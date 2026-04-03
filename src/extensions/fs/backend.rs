@@ -114,12 +114,14 @@ pub(crate) struct FsCreateUpload {
     pub upload_id: String,
     pub part_size: usize,
     pub expires_at: i64,
+    pub checksum_algorithm: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FsMultipartCompletedPart {
     pub part_number: i32,
     pub etag: String,
+    pub checksum_crc32c: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,11 +367,13 @@ pub(crate) trait FsBackend: Send + Sync {
         path: &str,
         expected_size: u64,
         mode: Option<u32>,
+        checksum_algorithm: Option<&str>,
     ) -> Result<FsCreateUpload>;
     async fn presign_upload_part(
         &self,
         upload_token: &str,
         part_number: i32,
+        checksum_crc32c: Option<&str>,
     ) -> Result<FsPresignedRequest>;
     async fn complete_upload(
         &self,
@@ -546,6 +550,7 @@ mod tests {
             _path: &str,
             _expected_size: u64,
             _mode: Option<u32>,
+            _checksum_algorithm: Option<&str>,
         ) -> Result<FsCreateUpload> {
             unreachable!("create_upload is not used in these tests");
         }
@@ -554,6 +559,7 @@ mod tests {
             &self,
             _upload_token: &str,
             _part_number: i32,
+            _checksum_crc32c: Option<&str>,
         ) -> Result<FsPresignedRequest> {
             unreachable!("presign_upload_part is not used in these tests");
         }
@@ -663,6 +669,7 @@ mod tests {
             _path: &str,
             _expected_size: u64,
             _mode: Option<u32>,
+            _checksum_algorithm: Option<&str>,
         ) -> Result<FsCreateUpload> {
             unreachable!("create_upload is not used in these tests");
         }
@@ -671,6 +678,7 @@ mod tests {
             &self,
             _upload_token: &str,
             _part_number: i32,
+            _checksum_crc32c: Option<&str>,
         ) -> Result<FsPresignedRequest> {
             unreachable!("presign_upload_part is not used in these tests");
         }

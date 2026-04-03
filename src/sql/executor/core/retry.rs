@@ -1,11 +1,16 @@
 //! Retry helpers
 
 pub(super) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
-    fn contains_write_conflict(err: &tikv_client::Error) -> bool {
-        // Retry on ANY WriteConflict, not just PessimisticRetry.
-        // This emulates PostgreSQL's row-lock wait behavior: when concurrent
-        // transactions UPDATE the same row, the second should wait and retry
-        // rather than immediately failing.
+    fn contains_retryable_error(err: &tikv_client::Error) -> bool {
+        // Retry on WriteConflict AND Deadlock errors.
+        //
+        // WriteConflict: emulates PostgreSQL's row-lock wait behavior where
+        // concurrent UPDATEs on the same row succeed (second waits for first).
+        //
+        // Deadlock: TiKV's pessimistic locking can produce circular waits when
+        // concurrent DML touches overlapping rows via different index scans.
+        // PostgreSQL detects and resolves these automatically; we do the same
+        // by retrying the statement with exponential backoff.
         //
         // WriteConflict reasons (from kvrpcpb.proto):
         //   0 = Unknown
@@ -14,20 +19,18 @@ pub(super) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
         //   3 = SelfRolledBack (txn rolled back during prewrite)
         //   4 = RcCheckTs (RC isolation check failure)
         //   5 = LazyUniquenessCheck (pessimistic unique constraint)
-        //
-        // We retry all of these to maximize compatibility with PostgreSQL
-        // semantics where concurrent UPDATEs on the same row succeed
-        // (second waits for first to commit).
         match err {
             tikv_client::Error::PessimisticLockError { inner, .. } => {
-                contains_write_conflict(inner)
+                contains_retryable_error(inner)
             }
-            tikv_client::Error::UndeterminedError(inner) => contains_write_conflict(inner),
+            tikv_client::Error::UndeterminedError(inner) => contains_retryable_error(inner),
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => {
-                errors.iter().any(contains_write_conflict)
+                errors.iter().any(contains_retryable_error)
             }
-            tikv_client::Error::KeyError(key_error) => key_error.conflict.is_some(),
+            tikv_client::Error::KeyError(key_error) => {
+                key_error.conflict.is_some() || key_error.deadlock.is_some()
+            }
             _ => false,
         }
     }
@@ -35,7 +38,7 @@ pub(super) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<tikv_client::Error>()
-            .is_some_and(contains_write_conflict)
+            .is_some_and(contains_retryable_error)
     })
 }
 

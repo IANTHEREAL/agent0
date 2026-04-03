@@ -12,11 +12,12 @@ use super::{
 };
 use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::AnalyzedDelete;
-use crate::sql::dml::pk_to_hash_key;
+use crate::sql::dml::{pk_to_hash_key, FkStoreCtx};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::sql::rls::dml::RlsDmlContext;
 use crate::sql::sequences::SequenceSession;
+use crate::txn::BatchMutation;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
@@ -151,7 +152,29 @@ impl Executor {
             dml::FkDeleteContext::build(&self.store(), txn, db_id).await?
         };
 
-        // ── Phase 2: execute deletions ───────────────────────────
+        // ── Phase 2: execute deletions (batch path) ────────────
+        //
+        // Collect all TiKV keys for the main table, then flush in a
+        // single batch_mutate RPC.  This reduces N×(1+I) sequential
+        // pessimistic lock RPCs to 1 batch RPC.
+        //
+        // Deadlock prevention:
+        //  - DELETE vs DELETE: batch + sorted keys → same lock order → no deadlock
+        //  - UPDATE vs UPDATE: PK sort → same lock order → no deadlock
+        //  - DELETE vs UPDATE: different lock strategies (batch-sorted vs per-row)
+        //    so ordering alone cannot prevent deadlocks; handled by the
+        //    deadlock auto-retry in retry.rs (exponential backoff).
+        //
+        // FK cascade still runs per-row on child tables (different
+        // table, no lock ordering conflict with the main table).
+        // HNSW lazy deletion requires IO and runs per-row.
+
+        let fk_store_ctx = FkStoreCtx {
+            store: &self.store(),
+            db_id,
+        };
+        let mut all_delete_keys: Vec<Vec<u8>> = Vec::new();
+
         for r in &rows_to_delete {
             // Evaluate RETURNING before delete (row still exists).
             if let Some(ref returning) = del.returning {
@@ -159,10 +182,11 @@ impl Executor {
                 ret_rows.push(ret_row);
             }
 
-            dml::execute_delete_row(
-                &self.store(),
+            // FK cascade: handle RESTRICT/NO ACTION/CASCADE on child tables.
+            // Cascade deletes child rows per-key (different tables, safe).
+            dml::handle_foreign_key_on_delete(
+                &fk_store_ctx,
                 txn,
-                db_id,
                 t,
                 &schema,
                 r,
@@ -171,6 +195,71 @@ impl Executor {
             )
             .await?;
 
+            // HNSW lazy deletion: requires IO (meta read + rowid lookup).
+            // Runs per-row before batch flush since it needs txn access.
+            for index in &schema.indexes {
+                if !index.is_hnsw() {
+                    continue;
+                }
+                if matches!(index.state, crate::worker::types::IndexState::Invalid)
+                    || (matches!(index.state, crate::worker::types::IndexState::Building)
+                        && !index.unique)
+                {
+                    continue;
+                }
+                let pk_values = schema.get_pk_values(r);
+                let meta_key =
+                    crate::sql::hnsw::storage::hnsw_meta_key(db_id, schema.table_id, index.id);
+                if let Some(meta_bytes) = txn.get(meta_key).await? {
+                    let meta: crate::sql::hnsw::HnswMeta = serde_json::from_slice(&meta_bytes)?;
+                    if meta.label_mode == crate::sql::hnsw::HnswLabelMode::Mapped {
+                        let pk_bytes = crate::storage::encode_pk_values(&pk_values);
+                        if let Some(rowid) = crate::sql::hnsw::storage::get_rowid_for_pk(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            &pk_bytes,
+                        )
+                        .await?
+                        {
+                            crate::sql::hnsw::storage::delete_rowid_mapping(
+                                txn,
+                                db_id,
+                                schema.table_id,
+                                &pk_bytes,
+                                rowid,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+
+            // Collect non-HNSW deletion keys (data + indexes) for batch flush.
+            let keys = dml::collect_deletion_keys(&self.store(), db_id, &schema, r)?;
+            all_delete_keys.extend(keys);
+
+            cnt += 1;
+        }
+
+        // Batch flush: delete all collected keys in a single RPC.
+        // Sort by key bytes so that chunking (for >10K keys) preserves
+        // monotonic lock ordering across chunks. This prevents deadlocks
+        // between concurrent DELETEs. Cross-DML deadlocks (DELETE vs
+        // UPDATE) are handled by the deadlock retry in retry.rs, since
+        // UPDATE's per-row lock order differs from DELETE's global sort.
+        if !all_delete_keys.is_empty() {
+            all_delete_keys.sort();
+            let delete_mutations: Vec<BatchMutation> = all_delete_keys
+                .into_iter()
+                .map(BatchMutation::Delete)
+                .collect();
+            crate::txn::txn_batch_mutate_mixed(txn, delete_mutations).await?;
+        }
+
+        // Enqueue AFTER triggers after all mutations are flushed,
+        // so trigger SQL can see all deletions in the txn buffer.
+        for r in &rows_to_delete {
             trigger_worker::enqueue_after_triggers(
                 txn,
                 db_id,
@@ -186,8 +275,6 @@ impl Executor {
                 search_path,
             )
             .await?;
-
-            cnt += 1;
         }
 
         // Bump mod_count for auto-ANALYZE tracking.

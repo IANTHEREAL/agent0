@@ -141,6 +141,7 @@ impl Executor {
             None,
             current_role,
             session_user,
+            0,
         )
     }
 
@@ -154,6 +155,7 @@ impl Executor {
         create_index_with_params: Option<&'a str>,
         current_role: Option<&'a str>,
         session_user: Option<&'a str>,
+        password_grace_seconds: u32,
     ) -> super::BoxStmtFuture<'a> {
         Box::pin(async move {
             self.execute_statement_on_txn_impl(
@@ -165,6 +167,7 @@ impl Executor {
                 create_index_with_params,
                 current_role,
                 session_user,
+                password_grace_seconds,
             )
             .await
         })
@@ -180,6 +183,7 @@ impl Executor {
         create_index_with_params: Option<&str>,
         current_role: Option<&str>,
         session_user: Option<&str>,
+        password_grace_seconds: u32,
     ) -> Result<ExecuteResult> {
         match classify_statement(stmt) {
             StatementDispatchKind::Ddl => {
@@ -229,6 +233,7 @@ impl Executor {
                     stmt,
                     current_role,
                     session_user,
+                    password_grace_seconds,
                 ))
                 .await
             }

@@ -26,7 +26,7 @@ pub(crate) struct EvaluatedTableFunctionArg {
 fn bridge_function_args(args: &[EvaluatedTableFunctionArg]) -> Vec<FunctionArg> {
     args.iter()
         .map(|arg| {
-            let sql_expr = crate::sql::value_coercion::value_to_sql_expr(&arg.value);
+            let sql_expr = crate::sql::types::cast::value_to_sql_expr(&arg.value);
             match &arg.name {
                 None => FunctionArg::Unnamed(FunctionArgExpr::Expr(sql_expr)),
                 Some(name) => FunctionArg::Named {

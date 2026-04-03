@@ -800,6 +800,7 @@ mod tests {
             _path: &str,
             _expected_size: u64,
             _mode: Option<u32>,
+            _checksum_algorithm: Option<&str>,
         ) -> Result<FsCreateUpload> {
             anyhow::bail!("not implemented")
         }
@@ -808,6 +809,7 @@ mod tests {
             &self,
             _upload_token: &str,
             _part_number: i32,
+            _checksum_crc32c: Option<&str>,
         ) -> Result<FsPresignedRequest> {
             anyhow::bail!("not implemented")
         }

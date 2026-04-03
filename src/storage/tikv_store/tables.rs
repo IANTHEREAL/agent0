@@ -459,8 +459,9 @@ impl TikvStore {
                 txn_delete(txn, seq_key).await?;
             }
 
-            // Release relation-name reservation keys for indexes and PK
-            // so the names become available for reuse.
+            // Release relation-name reservation keys for the table itself,
+            // its indexes, and PK so the names become available for reuse.
+            self.release_relation_name(txn, db_id, table_name).await?;
             let schema_name = table_name.split('.').next().unwrap_or("public");
             for idx in &schema.indexes {
                 let idx_full = format!("{}.{}", schema_name, idx.name);
@@ -817,6 +818,18 @@ impl TikvStore {
         }
 
         Ok(matching_rows)
+    }
+
+    /// Encode the TiKV data key for a row without performing any IO.
+    /// Used by batch DELETE/UPDATE to collect keys before a single `batch_mutate`.
+    pub fn encode_data_key_for_row(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        pk_values: &[Value],
+    ) -> Vec<u8> {
+        let row_key = encode_pk_values(pk_values);
+        self.key(&encode_data_key_v2(db_id, table_id, &row_key))
     }
 
     /// Delete rows matching a simple condition

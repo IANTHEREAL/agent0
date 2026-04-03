@@ -1,0 +1,3 @@
+# Expected FK violations for non-existent parents
+violates foreign key constraint "fk_ryow_child_pid_fkey"
+violates foreign key constraint "fk_ryow_uniq_child_pcode_fkey"

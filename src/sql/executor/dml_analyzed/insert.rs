@@ -23,6 +23,20 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
+fn analyzed_target_to_conflict_target(
+    target: &Option<AnalyzedConflictTarget>,
+) -> Option<ConflictTarget> {
+    match target {
+        Some(AnalyzedConflictTarget::Columns(cols, predicate)) => {
+            Some(ConflictTarget::Columns(cols.clone(), predicate.clone()))
+        }
+        Some(AnalyzedConflictTarget::Constraint(name)) => {
+            Some(ConflictTarget::Constraint(name.clone()))
+        }
+        None => None,
+    }
+}
+
 impl Executor {
     // ── INSERT (analyzed) ───────────────────────────────────
 
@@ -77,6 +91,26 @@ impl Executor {
         let mut ret_rows = Vec::new();
         let mut hnsw_inserted_rows: Vec<Row> = Vec::new();
         let mut hnsw_conflict_updates: Vec<(Row, Row)> = Vec::new();
+
+        // Deferred AFTER triggers: collect (old_row, new_row, op) per-row,
+        // execute after ALL mutations + HNSW maintenance are flushed.
+        // This aligns with PostgreSQL semantics where AFTER row-level
+        // triggers see the final post-statement table state.
+        //
+        // Pre-check: only allocate the buffer when AFTER triggers exist.
+        struct DeferredAfterTrigger {
+            old_row: Option<Row>,
+            new_row: Option<Row>,
+            op: TriggerOp,
+        }
+        let has_after_triggers = trigger_defs.iter().any(|td| {
+            td.timing.eq_ignore_ascii_case("AFTER")
+                && td
+                    .events
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case("INSERT") || e.eq_ignore_ascii_case("UPDATE"))
+        });
+        let mut deferred_triggers: Vec<DeferredAfterTrigger> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&ins.returning, &schema);
 
         // Get source rows. Each entry is (values, default_positions) where
@@ -237,17 +271,12 @@ impl Executor {
             }
 
             let conflict_behavior = match &ins.on_conflict {
-                Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+                Some(AnalyzedOnConflict::DoNothing { target }) => {
+                    let target = analyzed_target_to_conflict_target(target);
+                    ConflictBehavior::DoNothing { target }
+                }
                 Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
-                    let target = match target {
-                        Some(AnalyzedConflictTarget::Columns(cols)) => {
-                            Some(ConflictTarget::Columns(cols.clone()))
-                        }
-                        Some(AnalyzedConflictTarget::Constraint(name)) => {
-                            Some(ConflictTarget::Constraint(name.clone()))
-                        }
-                        None => None,
-                    };
+                    let target = analyzed_target_to_conflict_target(target);
                     ConflictBehavior::DoUpdate { target }
                 }
                 None => ConflictBehavior::Error,
@@ -287,21 +316,13 @@ impl Executor {
                     if has_hnsw {
                         hnsw_inserted_rows.push(final_row.clone());
                     }
-                    trigger_worker::enqueue_after_triggers(
-                        txn,
-                        db_id,
-                        self.tenant_keyspace(),
-                        t,
-                        TriggerOp::Insert,
-                        None,
-                        Some(&final_row),
-                        &trigger_defs,
-                        &self.store(),
-                        self,
-                        sequence_values,
-                        search_path,
-                    )
-                    .await?;
+                    if has_after_triggers {
+                        deferred_triggers.push(DeferredAfterTrigger {
+                            old_row: None,
+                            new_row: Some(final_row.clone()),
+                            op: TriggerOp::Insert,
+                        });
+                    }
                     affected += 1;
                     inserted += 1;
                     if let Some(ref returning) = ins.returning {
@@ -318,7 +339,7 @@ impl Executor {
                     // Handle ON CONFLICT DO UPDATE via analyzed expressions.
                     if let Some(ref oc) = ins.on_conflict {
                         match oc {
-                            AnalyzedOnConflict::DoNothing => continue,
+                            AnalyzedOnConflict::DoNothing { .. } => continue,
                             AnalyzedOnConflict::DoUpdate {
                                 assignments,
                                 where_clause: _,
@@ -379,9 +400,7 @@ impl Executor {
                                         .await?;
                                     let col = &schema.columns[*col_idx];
                                     updated_vals[*col_idx] =
-                                        crate::sql::value_coercion::coerce_value_for_column(
-                                            val, col,
-                                        )?;
+                                        crate::sql::types::cast::coerce_value_for_column(val, col)?;
                                 }
                                 let updated_row = Row::new(updated_vals);
 
@@ -489,21 +508,13 @@ impl Executor {
                                     .await?
                                 };
 
-                                trigger_worker::enqueue_after_triggers(
-                                    txn,
-                                    db_id,
-                                    self.tenant_keyspace(),
-                                    t,
-                                    TriggerOp::Update,
-                                    Some(&existing_row),
-                                    Some(&updated_row),
-                                    &trigger_defs,
-                                    &self.store(),
-                                    self,
-                                    sequence_values,
-                                    search_path,
-                                )
-                                .await?;
+                                if has_after_triggers {
+                                    deferred_triggers.push(DeferredAfterTrigger {
+                                        old_row: Some(existing_row.clone()),
+                                        new_row: Some(updated_row.clone()),
+                                        op: TriggerOp::Update,
+                                    });
+                                }
 
                                 affected += 1;
                                 if let Some(ref returning) = ins.returning {
@@ -593,6 +604,28 @@ impl Executor {
                     index_id,
                 });
             }
+        }
+
+        // Execute deferred AFTER triggers now that all mutations
+        // (data rows + indexes + HNSW) are flushed.  Each trigger
+        // invocation sees the final post-statement table state,
+        // matching PostgreSQL semantics.
+        for dt in &deferred_triggers {
+            trigger_worker::enqueue_after_triggers(
+                txn,
+                db_id,
+                self.tenant_keyspace(),
+                t,
+                dt.op.clone(),
+                dt.old_row.as_ref(),
+                dt.new_row.as_ref(),
+                &trigger_defs,
+                &self.store(),
+                self,
+                sequence_values,
+                search_path,
+            )
+            .await?;
         }
 
         if inserted > 0 {

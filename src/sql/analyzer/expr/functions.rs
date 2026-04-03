@@ -34,9 +34,11 @@ fn is_implicitly_compatible(arg_type: &DataType, target: &DataType) -> bool {
         ),
         DataType::Float64 => matches!(
             arg_type,
-            DataType::Float64 | DataType::Int32 | DataType::Int64
+            DataType::Float64 | DataType::Int32 | DataType::Int64 | DataType::Oid
         ),
-        DataType::Int64 => matches!(arg_type, DataType::Int64 | DataType::Int32),
+        DataType::Int64 | DataType::Oid => {
+            matches!(arg_type, DataType::Int64 | DataType::Int32 | DataType::Oid)
+        }
         DataType::Jsonb => matches!(arg_type, DataType::Jsonb | DataType::Json),
         _ => false,
     }
@@ -1081,8 +1083,10 @@ impl<'a> Analyzer<'a> {
         arg: TypedExpr,
         arg_types: &[DataType],
     ) -> Result<TypedExpr, AnalyzerError> {
-        if !matches!(arg.data_type, DataType::Int32 | DataType::Int64)
-            && !self.is_unresolved_param(&arg)
+        if !matches!(
+            arg.data_type,
+            DataType::Int32 | DataType::Int64 | DataType::Oid
+        ) && !self.is_unresolved_param(&arg)
             && !arg.is_null_constant()
         {
             return Err(AnalyzerError::FunctionNotFound {
@@ -1343,8 +1347,10 @@ impl<'a> Analyzer<'a> {
                     coerced.push(self.coerce_if_needed(arg, &DataType::Text)?);
                 }
                 2 => {
-                    let arg_is_int_like =
-                        matches!(arg.data_type, DataType::Int32 | DataType::Int64);
+                    let arg_is_int_like = matches!(
+                        arg.data_type,
+                        DataType::Int32 | DataType::Int64 | DataType::Oid
+                    );
                     let arg_is_string_literal =
                         matches!(&arg.kind, TypedExprKind::Constant(Value::Text(_)));
                     if !arg_is_int_like

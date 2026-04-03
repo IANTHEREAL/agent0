@@ -66,7 +66,6 @@ use super::super::statement_time;
 use super::super::stats::TableStatsCache;
 use super::super::triggers::TriggerBodyCache;
 use super::super::udt;
-use super::super::value_coercion::parse_value_for_copy;
 use super::super::{
     extract_create_index_with_params, parse_sql, ExecuteResult, ExecuteResults, Session,
 };

@@ -1,6 +1,7 @@
 //! PostgreSQL COPY format encoding (text and CSV).
 
-use crate::model::Value;
+use crate::model::{DataType, Value};
+use anyhow::Result;
 use chrono::{TimeZone, Utc};
 
 const TAB: u8 = b'\t';
@@ -411,6 +412,86 @@ fn write_hex_byte(byte: u8, buf: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     buf.push(HEX[(byte >> 4) as usize]);
     buf.push(HEX[(byte & 0xf) as usize]);
+}
+
+/// Parse a text-format COPY field into a typed Value.
+///
+/// Unescapes COPY-specific backslash sequences, then delegates to the generic
+/// text→Value parser in `sql::types::cast`.
+pub(crate) fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
+    let unescaped = unescape_copy_text(val);
+    crate::sql::types::cast::parse_typed_value(&unescaped, data_type)
+}
+
+fn unescape_copy_text(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            out.push(b'\\');
+            break;
+        }
+
+        match bytes[i] {
+            b'b' => {
+                out.push(0x08);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 1;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0b);
+                i += 1;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 1;
+            }
+            b'0'..=b'7' => {
+                let mut oct: u16 = (bytes[i] - b'0') as u16;
+                i += 1;
+                for _ in 0..2 {
+                    if i < bytes.len() && bytes[i].is_ascii_digit() && bytes[i] < b'8' {
+                        oct = (oct * 8).saturating_add((bytes[i] - b'0') as u16);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push((oct & 0xff) as u8);
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 #[cfg(test)]
@@ -1066,6 +1147,49 @@ mod tests {
             msg.contains("Parquet"),
             "error message should mention Parquet, got: {}",
             msg
+        );
+    }
+
+    // --- parse_value_for_copy tests (moved from value_coercion.rs) ---
+
+    #[test]
+    fn parse_value_for_copy_trims_common_scalars() {
+        assert_eq!(
+            parse_value_for_copy(" 1 ", &DataType::Int32).unwrap(),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            parse_value_for_copy(" true\t", &DataType::Boolean).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_rejects_invalid_timestamp_instead_of_falling_back_to_text() {
+        let err = parse_value_for_copy("abc", &DataType::Timestamp).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type timestamp"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_rejects_invalid_time_instead_of_falling_back_to_text() {
+        let err = parse_value_for_copy("25:00:00", &DataType::Time).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type time"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_parses_interval() {
+        use crate::model::IntervalValue;
+        assert_eq!(
+            parse_value_for_copy("1 day", &DataType::Interval).unwrap(),
+            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
         );
     }
 }

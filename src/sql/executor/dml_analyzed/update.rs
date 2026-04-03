@@ -13,14 +13,19 @@ use super::{
 };
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedUpdate, TypedExpr, TypedExprKind};
+use crate::sql::dml::FkStoreCtx;
+use crate::sql::error::SqlError;
 use crate::sql::expr::typed_fold::fold_typed_expr;
+use crate::sql::index_consistency::{resolve_unique_index_conflict, UniqueConflictResolution};
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
 use crate::sql::rls::dml::RlsDmlContext;
 use crate::sql::sequences::SequenceSession;
+use crate::storage::indexes::BatchIndexEntry;
+use crate::txn::BatchMutation;
 use crate::worker::types::IndexState;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 
 impl Executor {
@@ -85,6 +90,19 @@ impl Executor {
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let mut hnsw_changes: Vec<(Row, Row)> = Vec::new();
+
+        // Deferred AFTER triggers: collect (old_row, new_row) per-row,
+        // execute after ALL mutations + HNSW maintenance are flushed.
+        // Only allocate when AFTER UPDATE triggers exist.
+        struct DeferredAfterTrigger {
+            old_row: Row,
+            new_row: Row,
+        }
+        let has_after_triggers = trigger_defs.iter().any(|td| {
+            td.timing.eq_ignore_ascii_case("AFTER")
+                && td.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
+        });
+        let mut deferred_triggers: Vec<DeferredAfterTrigger> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&upd.returning, &schema);
 
         // Handle FROM clause: scan ALL FROM tables and build cross-product rows.
@@ -112,17 +130,91 @@ impl Executor {
             None
         };
 
-        for r in &rows {
-            // Find the matching FROM row (if FROM clause exists) and check WHERE.
-            // The matched FROM row is used for SET expression evaluation so that
-            // column references from the FROM table resolve to the correct row.
-            let eval_row = if let Some(ref from_rows) = from_combined_rows {
-                if from_rows.is_empty() {
-                    continue;
-                } else if let Some(ref where_expr) = folded_where {
-                    let mut matched_from = None;
-                    for from_row in from_rows {
-                        let combined = combine_rows(r, from_row);
+        // Sort rows by primary key to ensure deterministic lock acquisition
+        // order.  This prevents pessimistic lock deadlocks when concurrent
+        // UPDATE/DELETE statements touch overlapping rows via different index
+        // scans — both sessions will lock rows in the same PK order, making
+        // circular waits impossible.  See issue #2252.
+        //
+        // Pre-compute encoded PK keys (Schwartzian transform) to avoid
+        // O(N log N) clone+encode overhead in the sort comparator.
+        {
+            let pk_indices = &schema.pk_indices;
+            let mut keyed: Vec<(Vec<u8>, usize)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let pk: Vec<Value> = pk_indices
+                        .iter()
+                        .map(|&idx| r.values[idx].clone())
+                        .collect();
+                    (crate::storage::encode_pk_values(&pk), i)
+                })
+                .collect();
+            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let sorted_indices: Vec<usize> = keyed.into_iter().map(|(_, i)| i).collect();
+            let mut sorted_rows = Vec::with_capacity(rows.len());
+            for i in sorted_indices {
+                sorted_rows.push(std::mem::replace(&mut rows[i], Row::new(vec![])));
+            }
+            rows = sorted_rows;
+        }
+
+        // Check whether BEFORE UPDATE triggers exist.  When they do,
+        // we must execute per-row (triggers can veto, mutate, or query
+        // intermediate txn state).  Without them, we use the batch fast
+        // path: collect all mutations, batch unique-check, single
+        // batch_mutate RPC.
+        let has_before_triggers = trigger_defs.iter().any(|td| {
+            td.timing.eq_ignore_ascii_case("BEFORE")
+                && td.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
+        });
+
+        // Self-referential FK with ON UPDATE CASCADE: cascade ordering
+        // semantics differ between per-row and batch paths, so we must
+        // fall back to per-row when the table references itself.
+        let has_self_ref_fk = schema.foreign_keys.iter().any(|fk| {
+            fk.ref_table == schema.name
+                || fk.ref_table == schema.name.rsplit('.').next().unwrap_or(&schema.name)
+        });
+
+        if has_before_triggers || has_self_ref_fk {
+            // ── Per-row path (unchanged): BEFORE triggers present ──
+            for r in &rows {
+                let eval_row = if let Some(ref from_rows) = from_combined_rows {
+                    if from_rows.is_empty() {
+                        continue;
+                    } else if let Some(ref where_expr) = folded_where {
+                        let mut matched_from = None;
+                        for from_row in from_rows {
+                            let combined = combine_rows(r, from_row);
+                            let val = self
+                                .eval_typed_expr_maybe_async(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    where_expr,
+                                    &combined,
+                                    None,
+                                    &empty_ctes,
+                                    &qctx,
+                                )
+                                .await?;
+                            if typed_value_to_bool(val)? {
+                                matched_from = Some(combined);
+                                break;
+                            }
+                        }
+                        match matched_from {
+                            Some(row) => row,
+                            None => continue,
+                        }
+                    } else {
+                        combine_rows(r, &from_rows[0])
+                    }
+                } else {
+                    if let Some(ref where_expr) = folded_where {
                         let val = self
                             .eval_typed_expr_maybe_async(
                                 txn,
@@ -130,180 +222,603 @@ impl Executor {
                                 sequence_values,
                                 search_path,
                                 where_expr,
-                                &combined,
-                                None,
+                                r,
+                                Some(&schema),
                                 &empty_ctes,
                                 &qctx,
                             )
                             .await?;
-                        if typed_value_to_bool(val)? {
-                            matched_from = Some(combined);
-                            break;
+                        if !typed_value_to_bool(val)? {
+                            continue;
                         }
                     }
-                    match matched_from {
-                        Some(row) => row,
-                        None => continue, // no FROM row matched WHERE
+                    r.clone()
+                };
+
+                if let Some(rls) = rls_ctx {
+                    if !rls.is_row_visible(r, &qctx)? {
+                        continue;
                     }
-                } else {
-                    // No WHERE -> use first FROM row.
-                    combine_rows(r, &from_rows[0])
                 }
-            } else {
-                // No FROM clause -- simple WHERE check.
-                if let Some(ref where_expr) = folded_where {
+
+                let mut new_vals = r.values[..schema.columns.len()].to_vec();
+                for (col_idx, ref typed_expr) in &upd.assignments {
                     let val = self
-                        .eval_typed_expr_maybe_async(
+                        .eval_assignment_value(
                             txn,
                             db_id,
                             sequence_values,
                             search_path,
-                            where_expr,
-                            r,
-                            Some(&schema),
-                            &empty_ctes,
+                            &schema,
+                            *col_idx,
+                            typed_expr,
+                            &eval_row,
                             &qctx,
                         )
                         .await?;
-                    if !typed_value_to_bool(val)? {
+                    let col = &schema.columns[*col_idx];
+                    new_vals[*col_idx] =
+                        crate::sql::types::cast::coerce_value_for_column(val, col)?;
+                }
+                let new_row = Row::new(new_vals);
+
+                let new_row = match triggers::apply_before_triggers_with_cache(
+                    self.trigger_cache(),
+                    &self.store(),
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &trigger_defs,
+                    &trigger_func_cache,
+                    &schema,
+                    "UPDATE",
+                    new_row,
+                    Some(r),
+                )
+                .await?
+                {
+                    Some(row) => row,
+                    None => continue,
+                };
+
+                let mut final_vals = new_row.values;
+                self.finalize_write_row(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &schema,
+                    &write_plan,
+                    &mut final_vals,
+                )
+                .await?;
+                let new_row = Row::new(final_vals);
+
+                if let Some(rls) = rls_ctx {
+                    rls.check_row(&schema, &new_row, &qctx)?;
+                }
+
+                let updated_row = if has_hnsw {
+                    let old_row_snapshot = Row::new(r.values[..schema.columns.len()].to_vec());
+                    let result = dml::execute_update_row_defer_hnsw(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        t,
+                        &schema,
+                        r,
+                        new_row,
+                        &enum_cache,
+                        None,
+                        fk_ref_cache.as_ref(),
+                    )
+                    .await?;
+                    hnsw_changes.push((old_row_snapshot, result.clone()));
+                    result
+                } else {
+                    dml::execute_update_row(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        t,
+                        &schema,
+                        r,
+                        new_row,
+                        &enum_cache,
+                        None,
+                        fk_ref_cache.as_ref(),
+                    )
+                    .await?
+                };
+
+                if has_after_triggers {
+                    deferred_triggers.push(DeferredAfterTrigger {
+                        old_row: Row::new(r.values[..schema.columns.len()].to_vec()),
+                        new_row: updated_row.clone(),
+                    });
+                }
+
+                if let Some(ref returning) = upd.returning {
+                    let ret_row = eval_returning_typed(returning, &updated_row, &qctx)?;
+                    ret_rows.push(ret_row);
+                }
+
+                cnt += 1;
+            }
+        } else {
+            // ── Batch fast path: no BEFORE triggers ───────────────
+            //
+            // Collect all mutations per-row (validating constraints
+            // inline), then flush in a single batch_mutate RPC.  This
+            // reduces N×(1+I) sequential pessimistic lock RPCs to 1
+            // batch RPC, matching the batch DELETE approach (#2254).
+            //
+            // Deadlock prevention: rows are already sorted by PK
+            // (Schwartzian transform above).  Batch mutations are
+            // sorted by key bytes before flushing to ensure
+            // deterministic lock ordering across chunks.
+
+            struct UpdatedRowInfo {
+                old_row: Row,
+                new_row: Row,
+            }
+            let mut updated_rows: Vec<UpdatedRowInfo> = Vec::new();
+            let mut all_delete_keys: Vec<Vec<u8>> = Vec::new();
+            let mut all_new_btree_entries: Vec<BatchIndexEntry> = Vec::new();
+            let mut all_new_gin_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut all_new_data_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+            // Track PK changes within the batch to handle PK-shifting
+            // UPDATEs (e.g. `UPDATE t SET id = id - 1`).  Without this,
+            // the batch_get_rows check would see the OLD row (not yet
+            // deleted) and falsely reject the new PK.
+            //
+            // vacated_pks: old PKs being freed by rows whose PK changed.
+            // claimed_new_pks: new PKs being claimed — catches two rows
+            //   targeting the same new PK (P1: silent data loss).
+            let mut vacated_pks: HashSet<Vec<u8>> = HashSet::new();
+            let mut claimed_new_pks: HashSet<Vec<u8>> = HashSet::new();
+
+            // ── Phase 1: validate + collect mutations per-row ─────
+            for (row_offset, r) in rows.iter().enumerate() {
+                // WHERE / FROM evaluation (same as trigger path).
+                let eval_row = if let Some(ref from_rows) = from_combined_rows {
+                    if from_rows.is_empty() {
+                        continue;
+                    } else if let Some(ref where_expr) = folded_where {
+                        let mut matched_from = None;
+                        for from_row in from_rows {
+                            let combined = combine_rows(r, from_row);
+                            let val = self
+                                .eval_typed_expr_maybe_async(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    where_expr,
+                                    &combined,
+                                    None,
+                                    &empty_ctes,
+                                    &qctx,
+                                )
+                                .await?;
+                            if typed_value_to_bool(val)? {
+                                matched_from = Some(combined);
+                                break;
+                            }
+                        }
+                        match matched_from {
+                            Some(row) => row,
+                            None => continue,
+                        }
+                    } else {
+                        combine_rows(r, &from_rows[0])
+                    }
+                } else {
+                    if let Some(ref where_expr) = folded_where {
+                        let val = self
+                            .eval_typed_expr_maybe_async(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                where_expr,
+                                r,
+                                Some(&schema),
+                                &empty_ctes,
+                                &qctx,
+                            )
+                            .await?;
+                        if !typed_value_to_bool(val)? {
+                            continue;
+                        }
+                    }
+                    r.clone()
+                };
+
+                // RLS USING check.
+                if let Some(rls) = rls_ctx {
+                    if !rls.is_row_visible(r, &qctx)? {
                         continue;
                     }
                 }
-                r.clone()
-            };
 
-            // RLS: check row visibility through USING policies.
-            // Invisible rows are silently skipped (PG semantics — USING acts
-            // as an invisible filter, not an error).
-            if let Some(rls) = rls_ctx {
-                if !rls.is_row_visible(r, &qctx)? {
-                    continue;
+                // Compute new row values (SET assignments + coercion).
+                let mut new_vals = r.values[..schema.columns.len()].to_vec();
+                for (col_idx, ref typed_expr) in &upd.assignments {
+                    let val = self
+                        .eval_assignment_value(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &schema,
+                            *col_idx,
+                            typed_expr,
+                            &eval_row,
+                            &qctx,
+                        )
+                        .await?;
+                    let col = &schema.columns[*col_idx];
+                    new_vals[*col_idx] =
+                        crate::sql::types::cast::coerce_value_for_column(val, col)?;
+                }
+
+                // Recompute generated columns (no BEFORE triggers to
+                // intercept, so this is deterministic).
+                self.finalize_write_row(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &schema,
+                    &write_plan,
+                    &mut new_vals,
+                )
+                .await?;
+                let new_row = Row::new(new_vals);
+
+                // Full row coercion + NOT NULL checks.
+                let mut coerced_vals = new_row.values.clone();
+                dml::coerce_row_values(&schema, &mut coerced_vals)?;
+                let new_row = Row::new(coerced_vals);
+
+                // Validate enum values.
+                dml::validate_enum_values(&schema, &new_row, &enum_cache)?;
+
+                // RLS WITH CHECK.
+                if let Some(rls) = rls_ctx {
+                    rls.check_row(&schema, &new_row, &qctx)?;
+                }
+
+                // FK validation (reads parent tables).
+                if !schema.foreign_keys.is_empty() {
+                    let owned_cache;
+                    let ref_cache = match fk_ref_cache.as_ref() {
+                        Some(c) => c,
+                        None => {
+                            owned_cache = dml::build_fk_ref_schema_cache(
+                                &self.store(),
+                                txn,
+                                db_id,
+                                &schema,
+                                false,
+                            )
+                            .await?;
+                            &owned_cache
+                        }
+                    };
+                    dml::validate_foreign_keys_with_cache(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        &schema,
+                        &new_row,
+                        ref_cache,
+                        None,
+                    )
+                    .await?;
+                }
+
+                let old_row_stripped = Row::new(r.values[..schema.columns.len()].to_vec());
+                let old_pks = schema.get_pk_values(&old_row_stripped);
+                let new_pks = schema.get_pk_values(&new_row);
+                let pk_changed = old_pks != new_pks;
+
+                // PK collision check with intra-batch tracking.
+                //
+                // Handles three cases:
+                //  1. Two rows target the same new PK → intra-batch dup → error
+                //  2. New PK exists in TiKV but is being vacated by another
+                //     row in this batch → not a conflict (will be freed)
+                //  3. New PK exists in TiKV and is NOT being vacated → real collision
+                if pk_changed {
+                    let new_pk_key = crate::storage::encode_pk_values(&new_pks);
+
+                    // Case 1: intra-batch duplicate new PK.
+                    if !claimed_new_pks.insert(new_pk_key.clone()) {
+                        let pk_cols: Vec<_> = schema
+                            .pk_indices
+                            .iter()
+                            .map(|&i| schema.columns[i].name.clone())
+                            .collect();
+                        let pk_vals: Vec<_> = new_pks.iter().map(|v| format!("{}", v)).collect();
+                        let default_pk_name = format!(
+                            "{}_pkey",
+                            schema.name.rsplit('.').next().unwrap_or(&schema.name)
+                        );
+                        let pk_constraint_name =
+                            schema.pk_constraint_name.clone().unwrap_or(default_pk_name);
+                        return Err(SqlError::UniqueViolation {
+                            constraint: pk_constraint_name.clone(),
+                            message: format!(
+                                "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                                pk_constraint_name,
+                                pk_cols.join(", "),
+                                pk_vals.join(", ")
+                            ),
+                            row_offset: None,
+                        }
+                        .into());
+                    }
+
+                    // Cases 2 & 3: check TiKV unless another row in the
+                    // batch is vacating this PK.
+                    if !vacated_pks.contains(&new_pk_key) {
+                        let existing = self
+                            .store()
+                            .batch_get_rows(
+                                txn,
+                                db_id,
+                                schema.table_id,
+                                vec![new_pks.clone()],
+                                &schema,
+                            )
+                            .await?;
+                        if !existing.is_empty() {
+                            let pk_cols: Vec<_> = schema
+                                .pk_indices
+                                .iter()
+                                .map(|&i| schema.columns[i].name.clone())
+                                .collect();
+                            let pk_vals: Vec<_> =
+                                new_pks.iter().map(|v| format!("{}", v)).collect();
+                            let default_pk_name = format!(
+                                "{}_pkey",
+                                schema.name.rsplit('.').next().unwrap_or(&schema.name)
+                            );
+                            let pk_constraint_name =
+                                schema.pk_constraint_name.clone().unwrap_or(default_pk_name);
+                            return Err(SqlError::UniqueViolation {
+                                constraint: pk_constraint_name.clone(),
+                                message: format!(
+                                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                                    pk_constraint_name,
+                                    pk_cols.join(", "),
+                                    pk_vals.join(", ")
+                                ),
+                                row_offset: None,
+                            }
+                            .into());
+                        }
+                    }
+
+                    // Track this row's old PK as vacated.
+                    let old_pk_key = crate::storage::encode_pk_values(&old_pks);
+                    vacated_pks.insert(old_pk_key);
+                }
+
+                // Collect old index deletion keys (pure key encoding).
+                let old_keys = dml::collect_update_old_keys(
+                    &self.store(),
+                    db_id,
+                    &schema,
+                    &old_row_stripped,
+                    &new_row,
+                    &old_pks,
+                    pk_changed,
+                )?;
+                all_delete_keys.extend(old_keys);
+
+                // Collect new B-tree index entries for batch unique check.
+                let btree_entries = dml::collect_update_new_btree_entries(
+                    &schema,
+                    &old_row_stripped,
+                    &new_row,
+                    &new_pks,
+                    pk_changed,
+                    row_offset,
+                )?;
+                all_new_btree_entries.extend(btree_entries);
+
+                // Collect new GIN mutations.
+                let gin_mutations = dml::collect_update_new_gin_mutations(
+                    &self.store(),
+                    db_id,
+                    &schema,
+                    &old_row_stripped,
+                    &new_row,
+                    &new_pks,
+                    pk_changed,
+                )?;
+                all_new_gin_mutations.extend(gin_mutations);
+
+                // Collect data row mutation.
+                let data_mutation = dml::encode_data_row_mutation(
+                    &self.store(),
+                    db_id,
+                    &schema,
+                    &new_pks,
+                    &new_row,
+                )?;
+                all_new_data_mutations.push(data_mutation);
+
+                // Track for HNSW, FK cascade, AFTER triggers, RETURNING.
+                if has_hnsw {
+                    hnsw_changes.push((old_row_stripped.clone(), new_row.clone()));
+                }
+                updated_rows.push(UpdatedRowInfo {
+                    old_row: old_row_stripped,
+                    new_row,
+                });
+                cnt += 1;
+            }
+
+            // ── Phase 2: batch unique constraint check ────────────
+            //
+            // Uses create_index_entries_batch which does a single
+            // batch_get for all unique keys + intra-batch dup check.
+            // Pass old_delete_key_set so that unique keys being freed
+            // by this batch are not treated as conflicts (handles
+            // value-swap UPDATEs like `UPDATE t SET email = 'b' WHERE
+            // email = 'a'` alongside another row doing the reverse).
+            // On remaining conflicts, attempt resolve_unique_index_conflict
+            // (handles stale entries), same as per-row path.
+            let old_delete_key_set: HashSet<Vec<u8>> = all_delete_keys.iter().cloned().collect();
+            let mut index_kv_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            if !all_new_btree_entries.is_empty() {
+                let mut pending = all_new_btree_entries;
+                loop {
+                    match self
+                        .store()
+                        .create_index_entries_batch(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            &pending,
+                            Some(&old_delete_key_set),
+                        )
+                        .await
+                    {
+                        Ok(mutations) => {
+                            index_kv_mutations = mutations;
+                            break;
+                        }
+                        Err(err) => {
+                            // Try to resolve unique constraint conflict
+                            // (stale/idempotent entry).
+                            let Some((conflict_constraint, conflict_row_offset)) = err
+                                .downcast_ref::<SqlError>()
+                                .and_then(|sql_err| match sql_err {
+                                    SqlError::UniqueViolation {
+                                        constraint,
+                                        row_offset: Some(ro),
+                                        ..
+                                    } => Some((constraint.clone(), *ro)),
+                                    _ => None,
+                                })
+                            else {
+                                return Err(err);
+                            };
+
+                            let Some(conflict_entry) = pending
+                                .iter()
+                                .find(|e| {
+                                    e.constraint_name == conflict_constraint
+                                        && e.row_offset == conflict_row_offset
+                                })
+                                .cloned()
+                            else {
+                                return Err(err);
+                            };
+
+                            let Some(index) = schema
+                                .indexes
+                                .iter()
+                                .find(|idx| idx.id == conflict_entry.index_id)
+                            else {
+                                return Err(err);
+                            };
+
+                            match resolve_unique_index_conflict(
+                                &self.store(),
+                                txn,
+                                db_id,
+                                &schema,
+                                index,
+                                &conflict_entry.idx_values,
+                                &conflict_entry.pk_values,
+                            )
+                            .await?
+                            {
+                                UniqueConflictResolution::Idempotent
+                                | UniqueConflictResolution::StaleReplaced => {
+                                    pending.retain(|e| {
+                                        !(e.constraint_name == conflict_constraint
+                                            && e.row_offset == conflict_row_offset)
+                                    });
+                                    if pending.is_empty() {
+                                        break;
+                                    }
+                                }
+                                UniqueConflictResolution::RealConflict => {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            // Truncate to schema column count to strip synthetic ctid appended
-            // by append_ctid_to_rows — ctid must never be persisted.
-            let mut new_vals = r.values[..schema.columns.len()].to_vec();
+            // ── Phase 3: batch flush all mutations ────────────────
+            let mut all_mutations: Vec<BatchMutation> = Vec::new();
 
-            for (col_idx, ref typed_expr) in &upd.assignments {
-                let val = self
-                    .eval_assignment_value(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        &schema,
-                        *col_idx,
-                        typed_expr,
-                        &eval_row,
-                        &qctx,
-                    )
-                    .await?;
-                let col = &schema.columns[*col_idx];
-                new_vals[*col_idx] = crate::sql::value_coercion::coerce_value_for_column(val, col)?;
+            for key in all_delete_keys {
+                all_mutations.push(BatchMutation::Delete(key));
+            }
+            for (key, value) in all_new_data_mutations {
+                all_mutations.push(BatchMutation::Put(key, value));
+            }
+            for (key, value) in index_kv_mutations {
+                all_mutations.push(BatchMutation::Put(key, value));
+            }
+            for (key, value) in all_new_gin_mutations {
+                all_mutations.push(BatchMutation::Put(key, value));
             }
 
-            let new_row = Row::new(new_vals);
+            if !all_mutations.is_empty() {
+                // Sort by key bytes for deterministic chunk ordering,
+                // preventing deadlocks between concurrent batch ops.
+                all_mutations.sort_by(|a, b| a.key().cmp(b.key()));
+                crate::txn::txn_batch_mutate_mixed(txn, all_mutations).await?;
+            }
 
-            // BEFORE triggers.
-            let new_row = match triggers::apply_before_triggers_with_cache(
-                self.trigger_cache(),
-                &self.store(),
-                txn,
+            // ── Phase 4: FK cascade per-row ───────────────────────
+            // FK cascade updates child tables (different table), safe
+            // to run after batch flush.  Main table mutations are
+            // visible in the txn buffer.
+            let fk_store_ctx = FkStoreCtx {
+                store: &self.store(),
                 db_id,
-                sequence_values,
-                search_path,
-                &trigger_defs,
-                &trigger_func_cache,
-                &schema,
-                "UPDATE",
-                new_row,
-                Some(r),
-            )
-            .await?
-            {
-                Some(row) => row,
-                None => continue,
             };
-
-            // Recompute generated columns after BEFORE triggers so that
-            // trigger mutations to source columns are reflected.
-            let mut final_vals = new_row.values;
-            self.finalize_write_row(
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                &schema,
-                &write_plan,
-                &mut final_vals,
-            )
-            .await?;
-            let new_row = Row::new(final_vals);
-
-            // RLS: validate post-update row against UPDATE WITH CHECK policies.
-            if let Some(rls) = rls_ctx {
-                rls.check_row(&schema, &new_row, &qctx)?;
-            }
-
-            // Persist (defer HNSW maintenance to batch after the loop).
-            let updated_row = if has_hnsw {
-                let old_row_snapshot = Row::new(r.values[..schema.columns.len()].to_vec());
-                let result = dml::execute_update_row_defer_hnsw(
-                    &self.store(),
+            for info in &updated_rows {
+                dml::handle_foreign_key_on_update(
+                    &fk_store_ctx,
                     txn,
-                    db_id,
                     t,
                     &schema,
-                    r,
-                    new_row,
-                    &enum_cache,
+                    &info.old_row,
+                    &info.new_row,
                     None,
-                    fk_ref_cache.as_ref(),
                 )
                 .await?;
-                hnsw_changes.push((old_row_snapshot, result.clone()));
-                result
-            } else {
-                dml::execute_update_row(
-                    &self.store(),
-                    txn,
-                    db_id,
-                    t,
-                    &schema,
-                    r,
-                    new_row,
-                    &enum_cache,
-                    None,
-                    fk_ref_cache.as_ref(),
-                )
-                .await?
-            };
-
-            // AFTER triggers.
-            trigger_worker::enqueue_after_triggers(
-                txn,
-                db_id,
-                self.tenant_keyspace(),
-                t,
-                TriggerOp::Update,
-                Some(r),
-                Some(&updated_row),
-                &trigger_defs,
-                &self.store(),
-                self,
-                sequence_values,
-                search_path,
-            )
-            .await?;
-
-            // RETURNING.
-            if let Some(ref returning) = upd.returning {
-                let ret_row = eval_returning_typed(returning, &updated_row, &qctx)?;
-                ret_rows.push(ret_row);
             }
 
-            cnt += 1;
+            // ── Phase 5: collect deferred AFTER triggers + RETURNING ──
+            for info in &updated_rows {
+                if has_after_triggers {
+                    deferred_triggers.push(DeferredAfterTrigger {
+                        old_row: info.old_row.clone(),
+                        new_row: info.new_row.clone(),
+                    });
+                }
+
+                if let Some(ref returning) = upd.returning {
+                    let ret_row = eval_returning_typed(returning, &info.new_row, &qctx)?;
+                    ret_rows.push(ret_row);
+                }
+            }
         }
 
         // Batch HNSW maintenance: load graph once, add all changed
@@ -347,6 +862,28 @@ impl Executor {
                     index_id,
                 });
             }
+        }
+
+        // Execute deferred AFTER triggers now that all mutations
+        // (data rows + indexes + HNSW) are flushed.  Each trigger
+        // invocation sees the final post-statement table state,
+        // matching PostgreSQL semantics.
+        for dt in &deferred_triggers {
+            trigger_worker::enqueue_after_triggers(
+                txn,
+                db_id,
+                self.tenant_keyspace(),
+                t,
+                TriggerOp::Update,
+                Some(&dt.old_row),
+                Some(&dt.new_row),
+                &trigger_defs,
+                &self.store(),
+                self,
+                sequence_values,
+                search_path,
+            )
+            .await?;
         }
 
         // Bump mod_count for auto-ANALYZE tracking.

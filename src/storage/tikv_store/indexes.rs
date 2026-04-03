@@ -7,20 +7,29 @@ const INDEX_SENTINEL_VALUE: &[u8] = &[0x01];
 
 /// Check an encoded index key against TiKV's `max-key-size` limit and return
 /// an actionable `IndexKeyTooLarge` error when it exceeds the threshold.
+///
+/// The check applies a safety margin because TiKV adds overhead beyond the
+/// raw key we build: keyspace prefix (4 bytes), MVCC timestamp encoding, and
+/// pessimistic lock metadata.  Empirically, TiKV's reported key size is ~13%
+/// larger than the raw encoded key.  We apply a 15% margin so the pre-check
+/// catches oversized keys before they reach TiKV as opaque `KeyTooLarge` errors.
 fn check_index_key_size(idx_key: &[u8]) -> Result<()> {
     let limit = configured_key_size_limit();
-    if limit == 0 || idx_key.len() < limit {
+    let effective_limit = limit * 85 / 100;
+    if limit == 0 || idx_key.len() < effective_limit {
         return Ok(());
     }
     Err(SqlError::IndexKeyTooLarge {
         message: format!(
-            "index row requires {} bytes, exceeds maximum {} bytes\n\
-             HINT: Values larger than {} bytes cannot be indexed with btree. \
+            "index row requires {} bytes, exceeds maximum {} bytes \
+             (TiKV limit {} minus internal encoding overhead)\n\
+             HINT: Values larger than ~{} bytes cannot be indexed with btree. \
              Consider an expression index on a prefix (e.g. CREATE INDEX ON t (left(col, 200))), \
              a GIN index for full-text search, or removing the btree index on this column.",
             idx_key.len(),
+            effective_limit,
             limit,
-            limit,
+            effective_limit,
         ),
     }
     .into())
@@ -210,6 +219,11 @@ impl TikvStore {
     /// On unique violation returns an error; the caller can use `row_offset`
     /// from the returned error context to attribute the failure.
     ///
+    /// `old_keys_being_deleted`: when called from batch UPDATE, the set of
+    /// old index keys being deleted in the same batch.  A unique key that
+    /// exists in TiKV but is also in this set is not a real conflict (it
+    /// will be freed by the same batch flush).  Pass `None` for INSERT/COPY.
+    ///
     /// Returns the encoded `(key, value)` mutations — caller is responsible
     /// for flushing via `txn_batch_mutate`.
     pub async fn create_index_entries_batch(
@@ -218,6 +232,7 @@ impl TikvStore {
         db_id: u64,
         table_id: u64,
         entries: &[BatchIndexEntry],
+        old_keys_being_deleted: Option<&HashSet<Vec<u8>>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -304,7 +319,14 @@ impl TikvStore {
                     // Idempotent writes (same index key already points to the same PK)
                     // are not conflicts and should not fail COPY retry paths.
                     if existing_val.as_slice() != ue.idx_val.as_slice() {
-                        return Err(Self::build_batch_unique_violation(&ue.entry).into());
+                        // For batch UPDATE: if the conflicting key is being
+                        // deleted in the same batch (e.g. two rows swapping
+                        // unique values), this is not a real conflict.
+                        let being_deleted =
+                            old_keys_being_deleted.is_some_and(|s| s.contains(&ue.idx_key));
+                        if !being_deleted {
+                            return Err(Self::build_batch_unique_violation(&ue.entry).into());
+                        }
                     }
                 }
                 if !seen_keys.insert(ue.idx_key.clone()) {
@@ -319,9 +341,56 @@ impl TikvStore {
             mutations.push((ue.idx_key, ue.idx_val));
         }
         for ne in non_unique_entries {
-            mutations.push((ne.idx_key, vec![]));
+            mutations.push((ne.idx_key, INDEX_SENTINEL_VALUE.to_vec()));
         }
         Ok(mutations)
+    }
+
+    /// Encode an index deletion key without performing any IO.
+    /// Mirrors the key construction logic of [`delete_index_entry`].
+    pub fn encode_index_deletion_key(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+        pk_values: &[Value],
+        unique: bool,
+    ) -> Vec<u8> {
+        let enforce_unique = unique && !Self::index_key_has_null(values);
+        if enforce_unique {
+            self.key(&encode_index_key_v2(
+                db_id, table_id, index_id, values, None,
+            ))
+        } else {
+            self.key(&encode_index_key_v2(
+                db_id,
+                table_id,
+                index_id,
+                values,
+                Some(pk_values),
+            ))
+        }
+    }
+
+    /// Encode GIN index deletion keys without performing any IO.
+    pub fn encode_gin_index_deletion_keys(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hashes: &[u64],
+        pk_values: &[Value],
+    ) -> Vec<Vec<u8>> {
+        let pk_key = encode_pk_values(pk_values);
+        token_hashes
+            .iter()
+            .map(|&th| {
+                self.key(&encode_gin_index_key_v2(
+                    db_id, table_id, index_id, th, &pk_key,
+                ))
+            })
+            .collect()
     }
 
     /// Delete an index entry
@@ -644,7 +713,7 @@ impl TikvStore {
                 let key = self.key(&encode_gin_index_key_v2(
                     db_id, table_id, index_id, token_hash, &pk_key,
                 ));
-                (key, Vec::new())
+                (key, INDEX_SENTINEL_VALUE.to_vec())
             })
             .collect()
     }

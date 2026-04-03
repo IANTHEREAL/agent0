@@ -78,6 +78,12 @@ pub(crate) struct EmbeddedPageFs {
     inode_allocator: Arc<AsyncMutex<CachedIdRange>>,
     bundle_allocator: Arc<AsyncMutex<CachedIdRange>>,
     notify_ring: Arc<EventRing>,
+    /// Test-only barrier: when set, `load_upload_context_inner` waits here
+    /// right before committing a lifecycle refresh.  This lets tests force
+    /// two concurrent presign calls to both read the stale lifecycle before
+    /// either commits, guaranteeing a deterministic WriteConflict.
+    #[cfg(test)]
+    pub(crate) test_lifecycle_commit_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 const STREAM_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -544,7 +550,14 @@ impl FsWriteStream for EmbeddedObjectWriteStream {
 
         if let Err(err) = self
             .s3
-            .complete_multipart_upload(&self.key, &self.upload_id, std::mem::take(&mut self.parts))
+            .complete_multipart_upload(
+                &self.key,
+                &self.upload_id,
+                std::mem::take(&mut self.parts)
+                    .into_iter()
+                    .map(|(pn, etag)| (pn, etag, None))
+                    .collect(),
+            )
             .await
         {
             self.abort_upload().await;
@@ -657,6 +670,8 @@ impl EmbeddedPageFs {
             inode_allocator: Arc::new(AsyncMutex::new(CachedIdRange::default())),
             bundle_allocator: Arc::new(AsyncMutex::new(CachedIdRange::default())),
             notify_ring,
+            #[cfg(test)]
+            test_lifecycle_commit_barrier: None,
         }
     }
 
@@ -856,6 +871,23 @@ impl EmbeddedPageFs {
         claims: &UploadTokenClaims,
         refresh_uploading_lifecycle: bool,
     ) -> Result<UploadContext> {
+        self.load_upload_context_inner(claims, refresh_uploading_lifecycle, true)
+            .await
+    }
+
+    async fn load_upload_context_skip_expiry(
+        &self,
+        claims: &UploadTokenClaims,
+    ) -> Result<UploadContext> {
+        self.load_upload_context_inner(claims, false, false).await
+    }
+
+    async fn load_upload_context_inner(
+        &self,
+        claims: &UploadTokenClaims,
+        refresh_uploading_lifecycle: bool,
+        enforce_expiry: bool,
+    ) -> Result<UploadContext> {
         let now = current_unix_timestamp();
         if claims.keyspace != self.keyspace {
             return Err(anyhow!(EmbeddedFsError::PermissionDenied(
@@ -867,7 +899,7 @@ impl EmbeddedPageFs {
                 "upload token filesystem instance mismatch".to_string(),
             )));
         }
-        if now > claims.expires_at {
+        if enforce_expiry && now > claims.expires_at {
             return Err(anyhow!(EmbeddedFsError::PermissionDenied(
                 "upload token has expired".to_string(),
             )));
@@ -896,11 +928,18 @@ impl EmbeddedPageFs {
             match lifecycle {
                 Some(FileLifecycle::Uploading {
                     upload_id,
+                    updated_at,
                     reservation: Some(reservation),
                     ..
                 }) => {
                     validate_upload_claims(claims, &reservation, upload_id.as_deref())?;
-                    if refresh_uploading_lifecycle {
+                    // Throttle lifecycle refresh: only write if the last refresh
+                    // was more than STAGING_REFRESH_INTERVAL_SECS ago, matching
+                    // the streaming write path's behavior and avoiding ~1600
+                    // unnecessary TiKV txns for a 100GB upload.
+                    let needs_refresh = refresh_uploading_lifecycle
+                        && (now - updated_at) >= STAGING_REFRESH_INTERVAL_SECS;
+                    if needs_refresh {
                         lifecycle::save_lifecycle(
                             &mut txn,
                             claims.staging_inode_id,
@@ -922,7 +961,7 @@ impl EmbeddedPageFs {
                             inode,
                             reservation,
                         },
-                        refresh_uploading_lifecycle,
+                        needs_refresh,
                     ))
                 }
                 Some(FileLifecycle::Committing {
@@ -976,6 +1015,10 @@ impl EmbeddedPageFs {
         match result {
             Ok((ctx, wrote_lifecycle)) => {
                 if wrote_lifecycle {
+                    #[cfg(test)]
+                    if let Some(barrier) = &self.test_lifecycle_commit_barrier {
+                        barrier.wait().await;
+                    }
                     txn.commit().await?;
                 } else {
                     let _ = txn.rollback().await;
@@ -1909,7 +1952,7 @@ impl EmbeddedPageFs {
             .as_ref()
             .map(|c| c.multipart_part_bytes)
             .unwrap_or(WRITE_STREAM_FLUSH_BYTES);
-        let upload_id = s3.create_multipart_upload(&key).await?;
+        let upload_id = s3.create_multipart_upload(&key, None).await?;
         let mut offset = 0u64;
         let mut part_number = 1i32;
         let mut parts = Vec::new();
@@ -1957,7 +2000,17 @@ impl EmbeddedPageFs {
             })?;
         }
 
-        if let Err(err) = s3.complete_multipart_upload(&key, &upload_id, parts).await {
+        if let Err(err) = s3
+            .complete_multipart_upload(
+                &key,
+                &upload_id,
+                parts
+                    .into_iter()
+                    .map(|(pn, etag)| (pn, etag, None))
+                    .collect(),
+            )
+            .await
+        {
             let _ = s3.abort_multipart_upload(&key, &upload_id).await;
             let _ = s3.delete_object(&key).await;
             return Err(err);
@@ -4067,18 +4120,8 @@ fn max_presign_part_number(expected_size: u64) -> Result<i32> {
     })
 }
 
-fn presign_ttl_secs_from_claims(expires_at: i64) -> Result<u64> {
-    let now = current_unix_timestamp();
-    if now > expires_at {
-        return Err(anyhow!(EmbeddedFsError::PermissionDenied(
-            "upload token has expired".to_string(),
-        )));
-    }
-    let remaining = expires_at
-        .checked_sub(now)
-        .ok_or_else(|| anyhow!(EmbeddedFsError::internal("presign ttl underflow")))?;
-    u64::try_from(remaining.max(1))
-        .map_err(|_| anyhow!(EmbeddedFsError::internal("presign ttl exceeds u64")))
+fn presign_part_ttl_secs() -> u64 {
+    fs9_config().presign_ttl_secs
 }
 
 fn should_use_direct_object_stream(expected_size: Option<u64>, has_object_storage: bool) -> bool {

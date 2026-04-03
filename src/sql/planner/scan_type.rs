@@ -169,7 +169,7 @@ pub(super) fn coerce_index_predicate_value(
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(col))
     {
-        crate::sql::value_coercion::coerce_value_for_column(value.clone(), col_def)
+        crate::sql::types::cast::coerce_value_for_column(value.clone(), col_def)
             .unwrap_or_else(|_| value.clone())
     } else {
         value.clone()

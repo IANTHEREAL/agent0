@@ -221,11 +221,10 @@ async fn execute_trigger_body_cached(
                                         crate::sql::expr::bridge::eval_const_ast_expr(&expr)?
                                     };
 
-                                    let coerced =
-                                        crate::sql::value_coercion::coerce_value_for_column(
-                                            value,
-                                            &schema.columns[idx],
-                                        )?;
+                                    let coerced = crate::sql::types::cast::coerce_value_for_column(
+                                        value,
+                                        &schema.columns[idx],
+                                    )?;
 
                                     modified_values[idx] = coerced;
                                     was_modified = true;

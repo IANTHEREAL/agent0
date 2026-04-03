@@ -134,7 +134,9 @@ pub(crate) fn expand_views_in_expr<'a>(
                 ))
                 .await?;
             }
-            Expr::BinaryOp { left, right, .. } => {
+            Expr::BinaryOp { left, right, .. }
+            | Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right) => {
                 Box::pin(expand_views_in_expr(
                     store,
                     txn,
@@ -644,7 +646,9 @@ pub(crate) fn expr_requires_view_expansion(expr: &Expr) -> bool {
             | Expr::IsNotUnknown(e)
             | Expr::UnaryOp { expr: e, .. } => stack.push(e.as_ref()),
 
-            Expr::BinaryOp { left, right, .. } => {
+            Expr::BinaryOp { left, right, .. }
+            | Expr::IsDistinctFrom(left, right)
+            | Expr::IsNotDistinctFrom(left, right) => {
                 stack.push(left.as_ref());
                 stack.push(right.as_ref());
             }
