@@ -313,7 +313,7 @@ impl<'a> Analyzer<'a> {
         // (cron.*, auth.* have schema-qualified entries in the registry).
         // For UDFs, the schema is passed separately to resolve_function().
         if let Some(ref schema) = func_schema {
-            if schema == "cron" || schema == "auth" {
+            if schema == "cron" || schema == "auth" || schema == "serverless_functions" {
                 func_name = format!("{}.{}", schema, func_name);
             }
         }

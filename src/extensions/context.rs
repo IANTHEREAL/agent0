@@ -25,6 +25,7 @@ pub enum EmbeddingExecutionMode {
 pub(crate) struct ExtensionStatementState {
     http_requests: AtomicU32,
     embedding_calls: AtomicU32,
+    invoke_depth: AtomicU32,
     embedding_cache: Mutex<HashMap<EmbeddingCacheKey, Vec<f64>>>,
     fs_backend: Mutex<Option<Arc<dyn SharedFsBackend>>>,
 }
@@ -34,6 +35,7 @@ impl Default for ExtensionStatementState {
         Self {
             http_requests: AtomicU32::new(0),
             embedding_calls: AtomicU32::new(0),
+            invoke_depth: AtomicU32::new(0),
             embedding_cache: Mutex::new(HashMap::new()),
             fs_backend: Mutex::new(None),
         }
@@ -43,6 +45,7 @@ impl Default for ExtensionStatementState {
 pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
     pub(crate) bypass_rls: bool,
+    pub(crate) is_in_transaction: bool,
     pub(crate) tenant_keyspace: String,
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
@@ -54,6 +57,7 @@ impl ExtensionContextOpts {
         Self {
             is_superuser,
             bypass_rls,
+            is_in_transaction: false,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
@@ -65,11 +69,17 @@ impl ExtensionContextOpts {
         Self {
             is_superuser: true,
             bypass_rls: true, // Cron runs as superuser, implicitly bypasses RLS
+            is_in_transaction: false,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
         }
+    }
+
+    pub(crate) fn with_in_transaction(mut self, in_txn: bool) -> Self {
+        self.is_in_transaction = in_txn;
+        self
     }
 
     pub(crate) fn with_tikv_client(mut self, client: Option<Arc<TransactionClient>>) -> Self {
@@ -90,6 +100,7 @@ impl ExtensionContextOpts {
 pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,
     pub(crate) bypass_rls: bool,
+    is_in_transaction: bool,
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     embedding_mode: Cell<EmbeddingExecutionMode>,
@@ -134,6 +145,7 @@ pub(crate) async fn with_context_opts<R>(
     let ctx = ExtensionContext {
         is_superuser: opts.is_superuser,
         bypass_rls: opts.bypass_rls,
+        is_in_transaction: opts.is_in_transaction,
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
@@ -168,6 +180,44 @@ pub(crate) fn tenant_keyspace() -> Option<String> {
 pub(crate) fn execution_kind() -> ExecutionKind {
     CTX.try_with(|ctx| ctx.execution_kind)
         .unwrap_or(ExecutionKind::Interactive)
+}
+
+pub(crate) fn is_in_transaction() -> bool {
+    CTX.try_with(|ctx| ctx.is_in_transaction).unwrap_or(false)
+}
+
+pub(crate) fn current_invoke_depth() -> u32 {
+    CTX.try_with(|ctx| ctx.statement_state.invoke_depth.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+pub(crate) fn try_enter_invoke(max_depth: u32) -> Result<()> {
+    CTX.try_with(|ctx| loop {
+        let depth = ctx.statement_state.invoke_depth.load(Ordering::Relaxed);
+        if depth >= max_depth {
+            return Err(anyhow!(
+                "serverless_functions.invoke: max recursion depth ({}) exceeded",
+                max_depth
+            ));
+        }
+        if ctx
+            .statement_state
+            .invoke_depth
+            .compare_exchange_weak(depth, depth + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(());
+        }
+    })
+    .map_err(|_| anyhow!("serverless_functions.invoke: extension context not available"))?
+}
+
+pub(crate) fn leave_invoke() {
+    let _ = CTX.try_with(|ctx| {
+        ctx.statement_state
+            .invoke_depth
+            .fetch_sub(1, Ordering::Relaxed);
+    });
 }
 
 pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {

@@ -15,6 +15,7 @@ pub mod math;
 pub mod misc;
 pub mod pg_compat;
 pub mod regex;
+pub mod serverless_functions;
 pub mod string;
 pub mod uuid;
 pub mod vector;
@@ -38,6 +39,7 @@ fn init_registry() -> HashMap<&'static str, SqlFn> {
     misc::register(&mut map);
     pg_compat::register(&mut map);
     regex::register(&mut map);
+    serverless_functions::register(&mut map);
     string::register(&mut map);
     uuid::register(&mut map);
     vector::register(&mut map);
