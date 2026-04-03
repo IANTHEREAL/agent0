@@ -294,3 +294,70 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
         Some(other) => Ok(Value::Jsonb(other.to_string())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extensions::context::{self, ExtensionContextOpts};
+
+    static INIT_ENV: std::sync::Once = std::sync::Once::new();
+
+    /// Ensure env vars are set before any test that passes the config check.
+    /// OnceLock in backend_url()/internal_secret() is lazy, so this must run
+    /// before the first invoke() call that reaches step 2.
+    fn ensure_env() {
+        INIT_ENV.call_once(|| {
+            unsafe {
+                std::env::set_var("DB9_FUNCTIONS_BACKEND_URL", "http://localhost:19999");
+                std::env::set_var("INTERNAL_CONTROL_SECRET", "test-secret");
+            }
+        });
+    }
+
+    fn sample_args() -> Vec<Value> {
+        vec![Value::Text("my_function".into()), Value::Null]
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_non_superuser() {
+        let err = context::with_context(false, "test_ks", async { invoke(sample_args()) })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("permission denied for extension"),
+            "expected PermissionDenied, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_inside_transaction() {
+        ensure_env();
+        let opts = ExtensionContextOpts::statement(true, false, "test_ks")
+            .with_in_transaction(true);
+        let err = context::with_context_opts(opts, async { invoke(sample_args()) })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be called inside a transaction"),
+            "expected transaction rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_nested_invocation() {
+        ensure_env();
+        let err = context::with_context(true, "test_ks", async {
+            // Pre-set depth to 1 so invoke() sees depth >= MAX_INVOKE_NESTING (1)
+            context::try_enter_invoke(100).unwrap();
+            invoke(sample_args())
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("max recursion depth"),
+            "expected recursion depth error, got: {err}"
+        );
+    }
+}
