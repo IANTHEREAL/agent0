@@ -17,13 +17,13 @@ use crate::worker::now_epoch_ms;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
 pub(crate) use helpers::HNSW_GRAPH_MAX_BYTES;
-pub(crate) use helpers::{
-    is_retryable_region_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
-};
 use helpers::{
     background_statement_extension_context, execute_hnsw_merge, parse_backfill_index_command,
     parse_hnsw_merge_command, repair_incomplete_cic_states, should_skip_frozen_merge,
     should_start_cic_backfill,
+};
+pub(crate) use helpers::{
+    is_retryable_region_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
 };
 use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};

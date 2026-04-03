@@ -35,8 +35,8 @@ use tracing::{debug, error, warn};
 use super::super::encode::pgtype_to_datatype;
 use super::super::encode::{datatype_to_pgtype, effective_result_format, result_to_response};
 use super::super::errors::{
-    ambiguous_column_error_with_position, in_failed_sql_transaction_pgwire_error,
-    pg_error_message, sqlstate_for_executor_error,
+    ambiguous_column_error_with_position, in_failed_sql_transaction_pgwire_error, pg_error_message,
+    sqlstate_for_executor_error,
 };
 use super::super::params::{count_sql_parameters, decode_parameters};
 use super::super::portal::{
@@ -980,11 +980,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 let pg_msg = pg_error_message(&e, sqlstate);
                 error!(sqlstate, "Query execution error: {}", pg_msg);
                 debug!("Query execution error detail: {}", e);
-                let mut error_info = ErrorInfo::new(
-                    "ERROR".to_string(),
-                    sqlstate.to_string(),
-                    pg_msg,
-                );
+                let mut error_info =
+                    ErrorInfo::new("ERROR".to_string(), sqlstate.to_string(), pg_msg);
                 if let Some((_col, pos)) =
                     ambiguous_column_error_with_position(query, &error_info.message)
                 {
