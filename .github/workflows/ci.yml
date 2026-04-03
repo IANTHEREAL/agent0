@@ -33,6 +33,7 @@ jobs:
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-git-
       - run: cargo build --release
+      - run: sccache --show-stats
       - uses: actions/upload-artifact@v4
         with:
           name: db9-release-binary
