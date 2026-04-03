@@ -67,7 +67,7 @@ fn default_is_ident_char(b: u8) -> bool {
 }
 
 fn is_ident_char_or_dollar(b: u8) -> bool {
-    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') || b == b'$'
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') || b == b'$' || b >= 0x80
 }
 
 /// Count the maximum positional parameter index (`$1`, `$2`, ...) referenced

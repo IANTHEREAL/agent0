@@ -309,13 +309,13 @@ fn replace_ident_ci(input: &str, ident: &str, replacement: &str) -> String {
             // `src.tg_op` must NOT match as a bare `TG_OP`).
             let before_ok = i == 0 || {
                 let b = bytes[i - 1];
-                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.'
+                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.' && b < 0x80
             };
             // Ensure word boundary after.
             let after = i + ident_bytes.len();
             let after_ok = after >= bytes.len() || {
                 let b = bytes[after];
-                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.'
+                !b.is_ascii_alphanumeric() && b != b'_' && b != b'.' && b < 0x80
             };
             if before_ok && after_ok {
                 out.extend_from_slice(replacement.as_bytes());

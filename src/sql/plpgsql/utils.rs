@@ -185,7 +185,7 @@ pub(crate) fn replace_identifier(s: &str, name: &str, replacement: &str) -> Stri
 }
 
 fn is_ident_char(b: u8) -> bool {
-    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') || b >= 0x80
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

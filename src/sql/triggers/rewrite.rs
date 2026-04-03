@@ -193,7 +193,7 @@ fn is_ident_start(b: u8) -> bool {
 }
 
 fn is_ident_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
 }
 
 pub(crate) fn value_to_sql_literal(value: &Value) -> String {

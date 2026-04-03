@@ -54,7 +54,9 @@ pub(super) fn split_sql_statements(sql: &str) -> Vec<&str> {
         if b.is_ascii_alphabetic() {
             let token_start = ctx.pos;
             let mut j = ctx.pos + 1;
-            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] >= 0x80)
+            {
                 j += 1;
             }
             word_end = j;

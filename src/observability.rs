@@ -663,13 +663,15 @@ fn parse_bool(v: &str) -> Option<bool> {
 
 fn redact_sensitive_sql(s: &str) -> String {
     let upper = s.to_ascii_uppercase();
-    let bytes = s.as_bytes();
     let ubytes = upper.as_bytes();
+    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
+    let mut flush_start = 0;
 
     while i < bytes.len() {
         if i + 8 <= ubytes.len() && &ubytes[i..i + 8] == b"PASSWORD" {
+            out.push_str(&s[flush_start..i]);
             out.push_str(&s[i..i + 8]);
             i += 8;
             while i < bytes.len() && bytes[i] == b' ' {
@@ -686,11 +688,12 @@ fn redact_sensitive_sql(s: &str) -> String {
                     i += 1; // skip closing quote
                 }
             }
+            flush_start = i;
         } else {
-            out.push(bytes[i] as char);
             i += 1;
         }
     }
+    out.push_str(&s[flush_start..]);
     out
 }
 
@@ -854,6 +857,24 @@ mod tests {
             redact_sensitive_sql(sql),
             "CREATE ROLE foo WITH LOGIN password '***' SUPERUSER"
         );
+    }
+
+    #[test]
+    fn test_redact_multibyte_utf8_preserved() {
+        // #2306 Bug 3: bytes[i] as char corrupted multibyte UTF-8 into mojibake.
+        let sql = "CREATE ROLE 用户 WITH LOGIN PASSWORD '密码测试' SUPERUSER";
+        let redacted = redact_sensitive_sql(sql);
+        assert!(redacted.contains("用户"));
+        assert!(redacted.contains("'***'"));
+        assert!(!redacted.contains("密码测试"));
+        assert!(redacted.contains("SUPERUSER"));
+    }
+
+    #[test]
+    fn test_redact_no_password_multibyte_passthrough() {
+        // Multibyte SQL without PASSWORD keyword should pass through unchanged.
+        let sql = "SELECT '日本語テスト' AS label FROM 表名";
+        assert_eq!(redact_sensitive_sql(sql), sql);
     }
 
     #[test]

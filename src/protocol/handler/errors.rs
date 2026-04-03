@@ -3,7 +3,7 @@ use crate::sql::executor::core::timeout::StatementTimeoutError;
 use pgwire::error::{ErrorInfo, PgWireError};
 
 fn is_ident_char(b: u8) -> bool {
-    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') || b >= 0x80
 }
 
 /// Check if a TiKV error contains a write conflict (KeyError with `conflict` field set).

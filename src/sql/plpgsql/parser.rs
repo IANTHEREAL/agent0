@@ -468,7 +468,9 @@ fn split_into_targets(text: &str, declared_vars: &HashSet<String>) -> (Vec<Strin
         }
 
         let word_start = pos;
-        while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+        while pos < len
+            && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] >= 0x80)
+        {
             pos += 1;
         }
         let word = &text[word_start..pos];

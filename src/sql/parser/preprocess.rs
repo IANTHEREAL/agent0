@@ -428,8 +428,8 @@ fn preprocess_update_from_comma(sql: &str) -> Option<String> {
 /// Find the byte offset of a keyword at parenthesis depth 0.
 fn find_keyword_at_depth0(s: &str, keyword: &str) -> Option<usize> {
     let mut depth: i32 = 0;
-    let upper = s.to_uppercase();
     let kw_len = keyword.len();
+    let kw_bytes = keyword.as_bytes();
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -468,11 +468,16 @@ fn find_keyword_at_depth0(s: &str, keyword: &str) -> Option<usize> {
             }
             _ => {
                 if depth == 0
-                    && i + kw_len <= upper.len()
-                    && upper[i..i + kw_len].eq_ignore_ascii_case(keyword)
-                    && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_')
+                    && i + kw_len <= bytes.len()
+                    && bytes[i..i + kw_len].eq_ignore_ascii_case(kw_bytes)
+                    && (i == 0
+                        || !(bytes[i - 1].is_ascii_alphanumeric()
+                            || bytes[i - 1] == b'_'
+                            || bytes[i - 1] >= 0x80))
                     && (i + kw_len >= bytes.len()
-                        || !bytes[i + kw_len].is_ascii_alphanumeric() && bytes[i + kw_len] != b'_')
+                        || !(bytes[i + kw_len].is_ascii_alphanumeric()
+                            || bytes[i + kw_len] == b'_'
+                            || bytes[i + kw_len] >= 0x80))
                 {
                     return Some(i);
                 }
@@ -537,28 +542,25 @@ fn replace_commas_at_depth0(s: &str) -> String {
     let mut depth: i32 = 0;
     let bytes = s.as_bytes();
     let mut i = 0;
+    // `flush_start` tracks the beginning of a span that should be copied verbatim.
+    let mut flush_start = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'(' => {
                 depth += 1;
-                result.push('(');
                 i += 1;
             }
             b')' => {
                 depth -= 1;
-                result.push(')');
                 i += 1;
             }
             b'\'' => {
-                result.push('\'');
                 i += 1;
                 while i < bytes.len() {
-                    result.push(bytes[i] as char);
                     if bytes[i] == b'\'' {
                         i += 1;
                         if i < bytes.len() && bytes[i] == b'\'' {
-                            result.push('\'');
-                            i += 1;
+                            i += 1; // escaped quote
                         } else {
                             break;
                         }
@@ -568,27 +570,26 @@ fn replace_commas_at_depth0(s: &str) -> String {
                 }
             }
             b'"' => {
-                result.push('"');
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'"' {
-                    result.push(bytes[i] as char);
                     i += 1;
                 }
                 if i < bytes.len() {
-                    result.push('"');
                     i += 1;
                 }
             }
             b',' if depth == 0 => {
+                result.push_str(&s[flush_start..i]);
                 result.push_str(" CROSS JOIN ");
                 i += 1;
+                flush_start = i;
             }
             _ => {
-                result.push(bytes[i] as char);
                 i += 1;
             }
         }
     }
+    result.push_str(&s[flush_start..]);
     result
 }
 
@@ -1215,6 +1216,31 @@ mod tests {
         // Commas inside subquery parens should not be rewritten
         let input = r#"UPDATE t SET x = 1 FROM (SELECT a, b FROM s) sub WHERE t.id = sub.a"#;
         assert!(preprocess_update_from_comma(input).is_none());
+    }
+
+    #[test]
+    fn preprocess_update_from_comma_multibyte_no_panic() {
+        // #2306 Bug 1: find_keyword_at_depth0 used to_uppercase() + str slicing,
+        // panicking on non-char-boundary. Unquoted multibyte identifiers force the
+        // `_` catch-all branch (quoted ones are skipped by b'\'' / b'"' branches).
+        let input = "UPDATE 表 SET 列 = 1 FROM 甲, 乙 WHERE 表.id = 甲.id";
+        let result = preprocess_update_from_comma(input).unwrap();
+        assert!(result.contains("CROSS JOIN"));
+        assert!(result.contains("表"));
+        assert!(result.contains("甲"));
+        assert!(result.contains("乙"));
+    }
+
+    #[test]
+    fn preprocess_update_from_comma_multibyte_preserves_text() {
+        // #2306 Bug 2: replace_commas_at_depth0 used bytes[i] as char, corrupting
+        // multibyte UTF-8 into garbage Latin-1 characters. Uses unquoted multibyte
+        // identifiers in FROM clause so they go through the `_` fallback path.
+        let input = "UPDATE t SET x = 1 FROM テーブル a, 表名 b WHERE a.id = b.id";
+        let result = preprocess_update_from_comma(input).unwrap();
+        assert!(result.contains("CROSS JOIN"));
+        assert!(result.contains("テーブル"));
+        assert!(result.contains("表名"));
     }
 
     #[test]

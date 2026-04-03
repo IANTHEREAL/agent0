@@ -49,7 +49,7 @@ pub(crate) fn strip_leading_sql_comments(sql: &str) -> &str {
 }
 
 fn is_ident_char(b: u8) -> bool {
-    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_') || b >= 0x80
 }
 
 fn find_keyword_outside_quotes_and_dollar(haystack: &str, keyword: &str) -> Option<usize> {
