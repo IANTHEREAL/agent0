@@ -475,9 +475,42 @@ impl<'a> Parser<'a> {
                 Keyword::DESCRIBE => Ok(self.parse_explain(true)?),
                 Keyword::EXPLAIN => Ok(self.parse_explain(false)?),
                 Keyword::ANALYZE => Ok(self.parse_analyze()?),
-                Keyword::SELECT | Keyword::WITH | Keyword::VALUES => {
+                Keyword::SELECT | Keyword::VALUES => {
                     self.prev_token();
                     Ok(Statement::Query(Box::new(self.parse_query()?)))
+                }
+                Keyword::WITH => {
+                    // Parse the WITH clause, then dispatch based on the
+                    // next keyword.  DML statements (INSERT/UPDATE/DELETE)
+                    // carry the CTE directly — mirroring PostgreSQL's AST
+                    // where each DML node owns its own `withClause`.
+                    let with = With {
+                        recursive: self.parse_keyword(Keyword::RECURSIVE),
+                        cte_tables: self.parse_comma_separated(Parser::parse_cte)?,
+                    };
+                    if self.parse_keyword(Keyword::INSERT) {
+                        let mut stmt = self.parse_insert()?;
+                        if let Statement::Insert { with: ref mut w, .. } = stmt {
+                            *w = Some(with);
+                        }
+                        Ok(stmt)
+                    } else if self.parse_keyword(Keyword::UPDATE) {
+                        let mut stmt = self.parse_update()?;
+                        if let Statement::Update { with: ref mut w, .. } = stmt {
+                            *w = Some(with);
+                        }
+                        Ok(stmt)
+                    } else if self.parse_keyword(Keyword::DELETE) {
+                        let mut stmt = self.parse_delete()?;
+                        if let Statement::Delete { with: ref mut w, .. } = stmt {
+                            *w = Some(with);
+                        }
+                        Ok(stmt)
+                    } else {
+                        // SELECT / VALUES / set operations — build a Query
+                        // with the pre-parsed WITH clause.
+                        Ok(Statement::Query(Box::new(self.parse_query_with(Some(with))?)))
+                    }
                 }
                 Keyword::TRUNCATE => Ok(self.parse_truncate()?),
                 Keyword::ATTACH => Ok(self.parse_attach_database()?),
@@ -5863,6 +5896,7 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Statement::Delete {
+            with: None,
             tables,
             from,
             using,
@@ -5942,107 +5976,84 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        self.parse_query_with(with)
+    }
 
-        if self.parse_keyword(Keyword::INSERT) {
-            let insert = self.parse_insert()?;
+    /// Inner query parser that accepts a pre-parsed WITH clause.
+    /// Called directly from `parse_statement()` when WITH+DML routing
+    /// has already consumed the WITH clause.
+    fn parse_query_with(&mut self, with: Option<With>) -> Result<Query, ParserError> {
+        let body = Box::new(self.parse_query_body(0)?);
 
-            Ok(Query {
-                with,
-                body: Box::new(SetExpr::Insert(insert)),
-                limit: None,
-                limit_by: vec![],
-                order_by: vec![],
-                offset: None,
-                fetch: None,
-                locks: vec![],
-                for_clause: None,
-            })
-        } else if self.parse_keyword(Keyword::UPDATE) {
-            let update = self.parse_update()?;
-            Ok(Query {
-                with,
-                body: Box::new(SetExpr::Update(update)),
-                limit: None,
-                limit_by: vec![],
-                order_by: vec![],
-                offset: None,
-                fetch: None,
-                locks: vec![],
-                for_clause: None,
-            })
+        let order_by = if self.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
+            self.parse_comma_separated(Parser::parse_order_by_expr)?
         } else {
-            let body = Box::new(self.parse_query_body(0)?);
+            vec![]
+        };
 
-            let order_by = if self.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
-                self.parse_comma_separated(Parser::parse_order_by_expr)?
-            } else {
-                vec![]
-            };
+        let mut limit = None;
+        let mut offset = None;
 
-            let mut limit = None;
-            let mut offset = None;
-
-            for _x in 0..2 {
-                if limit.is_none() && self.parse_keyword(Keyword::LIMIT) {
-                    limit = self.parse_limit()?
-                }
-
-                if offset.is_none() && self.parse_keyword(Keyword::OFFSET) {
-                    offset = Some(self.parse_offset()?)
-                }
-
-                if dialect_of!(self is GenericDialect | MySqlDialect | ClickHouseDialect)
-                    && limit.is_some()
-                    && offset.is_none()
-                    && self.consume_token(&Token::Comma)
-                {
-                    // MySQL style LIMIT x,y => LIMIT y OFFSET x.
-                    // Check <https://dev.mysql.com/doc/refman/8.0/en/select.html> for more details.
-                    offset = Some(Offset {
-                        value: limit.unwrap(),
-                        rows: OffsetRows::None,
-                    });
-                    limit = Some(self.parse_expr()?);
-                }
+        for _x in 0..2 {
+            if limit.is_none() && self.parse_keyword(Keyword::LIMIT) {
+                limit = self.parse_limit()?
             }
 
-            let limit_by = if dialect_of!(self is ClickHouseDialect | GenericDialect)
-                && self.parse_keyword(Keyword::BY)
+            if offset.is_none() && self.parse_keyword(Keyword::OFFSET) {
+                offset = Some(self.parse_offset()?)
+            }
+
+            if dialect_of!(self is GenericDialect | MySqlDialect | ClickHouseDialect)
+                && limit.is_some()
+                && offset.is_none()
+                && self.consume_token(&Token::Comma)
             {
-                self.parse_comma_separated(Parser::parse_expr)?
-            } else {
-                vec![]
-            };
-
-            let fetch = if self.parse_keyword(Keyword::FETCH) {
-                Some(self.parse_fetch()?)
-            } else {
-                None
-            };
-
-            let mut for_clause = None;
-            let mut locks = Vec::new();
-            while self.parse_keyword(Keyword::FOR) {
-                if let Some(parsed_for_clause) = self.parse_for_clause()? {
-                    for_clause = Some(parsed_for_clause);
-                    break;
-                } else {
-                    locks.push(self.parse_lock()?);
-                }
+                // MySQL style LIMIT x,y => LIMIT y OFFSET x.
+                // Check <https://dev.mysql.com/doc/refman/8.0/en/select.html> for more details.
+                offset = Some(Offset {
+                    value: limit.unwrap(),
+                    rows: OffsetRows::None,
+                });
+                limit = Some(self.parse_expr()?);
             }
-
-            Ok(Query {
-                with,
-                body,
-                order_by,
-                limit,
-                limit_by,
-                offset,
-                fetch,
-                locks,
-                for_clause,
-            })
         }
+
+        let limit_by = if dialect_of!(self is ClickHouseDialect | GenericDialect)
+            && self.parse_keyword(Keyword::BY)
+        {
+            self.parse_comma_separated(Parser::parse_expr)?
+        } else {
+            vec![]
+        };
+
+        let fetch = if self.parse_keyword(Keyword::FETCH) {
+            Some(self.parse_fetch()?)
+        } else {
+            None
+        };
+
+        let mut for_clause = None;
+        let mut locks = Vec::new();
+        while self.parse_keyword(Keyword::FOR) {
+            if let Some(parsed_for_clause) = self.parse_for_clause()? {
+                for_clause = Some(parsed_for_clause);
+                break;
+            } else {
+                locks.push(self.parse_lock()?);
+            }
+        }
+
+        Ok(Query {
+            with,
+            body,
+            order_by,
+            limit,
+            limit_by,
+            offset,
+            fetch,
+            locks,
+            for_clause,
+        })
     }
 
     /// Parse a mssql `FOR [XML | JSON | BROWSE]` clause
@@ -7422,6 +7433,7 @@ impl<'a> Parser<'a> {
             };
 
             Ok(Statement::Insert {
+                with: None,
                 or,
                 table_name,
                 ignore,
@@ -7471,6 +7483,7 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Statement::Update {
+            with: None,
             table,
             assignments,
             from,

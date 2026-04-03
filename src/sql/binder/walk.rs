@@ -94,8 +94,6 @@ impl Binder {
                     }
                 }
             }
-            SetExpr::Insert(stmt) => self.walk_statement(stmt),
-            SetExpr::Update(stmt) => self.walk_statement(stmt),
             SetExpr::Table(_) => {}
         }
     }

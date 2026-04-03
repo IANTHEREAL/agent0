@@ -1226,7 +1226,7 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
                     expr_depends_on_column(expr, &[], target_full, target_bare, col_lower)
                 })
             }
-            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => false,
+            SetExpr::Table(_) => false,
         }
     }
 

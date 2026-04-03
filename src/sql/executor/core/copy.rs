@@ -159,6 +159,7 @@ impl Executor {
                 )
                 .await
                 .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
+                let empty_ctes = std::collections::HashMap::new();
                 self.finalize_write_row(
                     txn,
                     db_id,
@@ -167,6 +168,7 @@ impl Executor {
                     &schema,
                     &write_plan,
                     &mut row_values,
+                    &empty_ctes,
                 )
                 .await
                 .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
@@ -672,6 +674,7 @@ impl Executor {
                 )
                 .await?;
 
+                let empty_ctes = std::collections::HashMap::new();
                 self.finalize_write_row(
                     txn,
                     db_id,
@@ -680,6 +683,7 @@ impl Executor {
                     &table_schema,
                     &write_plan,
                     &mut row_values,
+                    &empty_ctes,
                 )
                 .await
                 .map_err(|e| {

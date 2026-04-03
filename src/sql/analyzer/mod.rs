@@ -168,6 +168,7 @@ impl<'a> Analyzer<'a> {
                 Ok(AnalyzedStatement::Query(analyzed))
             }
             Statement::Insert {
+                with,
                 table_name,
                 columns,
                 source,
@@ -175,10 +176,22 @@ impl<'a> Analyzer<'a> {
                 on,
                 ..
             } => {
+                // Register CTEs in scope so CTE table refs resolve during DML analysis.
+                let _ctes = if with.is_some() {
+                    self.scopes.push(Scope::new());
+                    let cte_result = self.analyze_cte_definitions(with.as_ref())?;
+                    cte_result
+                } else {
+                    Vec::new()
+                };
                 let analyzed = self.analyze_insert(table_name, columns, source, returning, on)?;
+                if with.is_some() {
+                    self.scopes.pop();
+                }
                 Ok(AnalyzedStatement::Insert(analyzed))
             }
             Statement::Update {
+                with,
                 table,
                 assignments,
                 from,
@@ -186,19 +199,38 @@ impl<'a> Analyzer<'a> {
                 returning,
                 ..
             } => {
+                let _ctes = if with.is_some() {
+                    self.scopes.push(Scope::new());
+                    self.analyze_cte_definitions(with.as_ref())?
+                } else {
+                    Vec::new()
+                };
                 let analyzed =
                     self.analyze_update(table, assignments, from, selection, returning)?;
+                if with.is_some() {
+                    self.scopes.pop();
+                }
                 Ok(AnalyzedStatement::Update(analyzed))
             }
             Statement::Delete {
+                with,
                 from,
                 using,
                 selection,
                 returning,
                 ..
             } => {
+                let _ctes = if with.is_some() {
+                    self.scopes.push(Scope::new());
+                    self.analyze_cte_definitions(with.as_ref())?
+                } else {
+                    Vec::new()
+                };
                 let using_slice = using.as_deref().unwrap_or(&[]);
                 let analyzed = self.analyze_delete(from, using_slice, selection, returning)?;
+                if with.is_some() {
+                    self.scopes.pop();
+                }
                 Ok(AnalyzedStatement::Delete(analyzed))
             }
             _ => Err(AnalyzerError::Unsupported(format!(

@@ -68,11 +68,19 @@ pub(crate) async fn build_catalog_snapshot_for_statement(
     search_path: &[String],
     tenant_keyspace: &str,
     stmt: &Statement,
+    ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
 ) -> Result<CatalogSnapshot> {
     let table_names = extract_dml_table_names(stmt);
-    let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
 
     let mut snapshot = CatalogSnapshot::new(search_path.to_vec(), db_id);
+
+    // NOTE: CTEs are NOT injected into the DML catalog snapshot.
+    // DML target resolution (INSERT INTO / UPDATE / DELETE FROM) must always
+    // bind to real base tables, never CTEs.  CTE table references in
+    // FROM/WHERE subqueries are resolved by the analyzer's scope-based
+    // CTE lookup (from_clause.rs:resolve_cte), which is independent of
+    // the catalog.  Injecting CTEs here would shadow base tables with
+    // matching names, violating PostgreSQL semantics.
 
     for raw_name in &table_names {
         let lower = raw_name.to_lowercase();
@@ -120,16 +128,9 @@ pub(crate) async fn build_catalog_snapshot_for_statement(
         ..
     } = stmt
     {
-        let sub_snapshot = build_catalog_snapshot(
-            store,
-            txn,
-            db_id,
-            search_path,
-            tenant_keyspace,
-            query,
-            &empty_ctes,
-        )
-        .await?;
+        let sub_snapshot =
+            build_catalog_snapshot(store, txn, db_id, search_path, tenant_keyspace, query, ctes)
+                .await?;
         snapshot.merge_from(&sub_snapshot);
     }
 

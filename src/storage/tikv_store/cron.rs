@@ -116,6 +116,17 @@ impl TikvStore {
         }
     }
 
+    pub async fn delete_cron_run(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        run_id: i64,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_run_key_v2(db_id, run_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
     pub async fn list_all_cron_runs(
         &self,
         txn: &mut Transaction,

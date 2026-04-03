@@ -27,6 +27,12 @@ pub enum PreparedExec {
     AnalyzedDml {
         analyzed: AnalyzedStatement,
         required_privileges: Vec<(String, Privilege)>,
+        /// When true, the original statement has a WITH clause whose CTEs
+        /// must be materialized at execution time.  The analyzed DML IR
+        /// does not carry CTE data, so Execute falls back to the text path
+        /// which goes through `execute_dml_statement` and materializes CTEs
+        /// from the parsed AST.
+        has_with_cte: bool,
     },
     /// DDL / utility / non-analyzable statement. No params.
     #[default]

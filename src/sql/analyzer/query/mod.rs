@@ -626,7 +626,7 @@ impl<'a> Analyzer<'a> {
     /// Registers each CTE in the current scope so it can be resolved as a table
     /// in FROM clauses. Each CTE can reference previously-defined CTEs in the
     /// same WITH clause (non-recursive).
-    fn analyze_cte_definitions(
+    pub(crate) fn analyze_cte_definitions(
         &mut self,
         with: Option<&ast::With>,
     ) -> Result<Vec<AnalyzedCte>, AnalyzerError> {

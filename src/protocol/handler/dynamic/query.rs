@@ -1158,6 +1158,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                     param_types,
                                     table_versions,
                                     rls_sensitive,
+                                    has_with_cte,
                                 } => {
                                     let required_privileges =
                                         PreparedStatement::compute_privileges(&analyzed, &[]);
@@ -1170,6 +1171,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                         exec: PreparedExec::AnalyzedDml {
                                             analyzed,
                                             required_privileges,
+                                            has_with_cte,
                                         },
                                         output_schema,
                                         param_data_types: param_types,

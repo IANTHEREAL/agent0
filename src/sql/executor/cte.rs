@@ -50,18 +50,23 @@ fn merge_recursive_rows(
 }
 
 impl Executor {
-    pub(crate) async fn build_cte_context_with_base(
+    /// Materialize a WITH clause into a map of CTE name → (schema, rows).
+    ///
+    /// Shared by both the Query path (`build_cte_context_with_base`) and
+    /// the DML path (WITH ... INSERT/UPDATE/DELETE).
+    pub(crate) async fn materialize_with_clause(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         sequence_values: &mut SequenceSession,
         search_path: &[String],
-        query: &Query,
+        with: &sqlparser::ast::With,
         base_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         current_role: Option<&str>,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
-        if let Some(with) = &query.with {
+        {
+            let with = with; // rebind for consistency with original code
             for cte in &with.cte_tables {
                 let cte_name = normalize_ident(&cte.alias.name);
 
@@ -131,6 +136,32 @@ impl Executor {
             }
         }
         Ok(ctes)
+    }
+
+    pub(crate) async fn build_cte_context_with_base(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut SequenceSession,
+        search_path: &[String],
+        query: &Query,
+        base_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&str>,
+    ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
+        if let Some(with) = &query.with {
+            self.materialize_with_clause(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                with,
+                base_ctes,
+                current_role,
+            )
+            .await
+        } else {
+            Ok(base_ctes.clone())
+        }
     }
 
     pub(crate) async fn build_cte_context(

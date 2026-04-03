@@ -43,6 +43,14 @@ fn prepared_text_fallback_reason(exec: &PreparedExec, rls_sensitive: bool) -> Op
         }
     ) {
         Some("prepared recursive CTE")
+    } else if matches!(
+        exec,
+        PreparedExec::AnalyzedDml {
+            has_with_cte: true,
+            ..
+        }
+    ) {
+        Some("prepared DML with CTE")
     } else {
         None
     }
@@ -844,6 +852,7 @@ impl Executor {
             PreparedExec::AnalyzedDml {
                 analyzed,
                 required_privileges,
+                ..
             } => {
                 for (table_name, privilege) in required_privileges {
                     self.require_table_privilege(
@@ -858,6 +867,7 @@ impl Executor {
                     crate::sql::analyzer::types::AnalyzedStatement::Insert(ref ins) => {
                         // RLS: intentionally None — when rls_sensitive, text fallback
                         // re-enters normal DML path where RLS is enforced.
+                        let empty_ctes = std::collections::HashMap::new();
                         self.execute_analyzed_insert(
                             txn,
                             db_id,
@@ -865,12 +875,14 @@ impl Executor {
                             search_path,
                             ins,
                             None,
+                            &empty_ctes,
                         )
                         .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Update(ref upd) => {
                         // RLS: intentionally None — when rls_sensitive, text fallback
                         // re-enters normal DML path where RLS is enforced.
+                        let empty_ctes = std::collections::HashMap::new();
                         self.execute_analyzed_update(
                             txn,
                             db_id,
@@ -878,12 +890,14 @@ impl Executor {
                             search_path,
                             upd,
                             None,
+                            &empty_ctes,
                         )
                         .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Delete(ref del) => {
                         // RLS: intentionally None — when rls_sensitive, text fallback
                         // re-enters normal DML path where RLS is enforced.
+                        let empty_ctes = std::collections::HashMap::new();
                         self.execute_analyzed_delete(
                             txn,
                             db_id,
@@ -891,6 +905,7 @@ impl Executor {
                             search_path,
                             del,
                             None,
+                            &empty_ctes,
                         )
                         .await
                     }
@@ -996,6 +1011,7 @@ impl Executor {
                     param_types,
                     table_versions,
                     rls_sensitive,
+                    has_with_cte,
                 } => {
                     let required_privileges = PreparedStatement::compute_privileges(&analyzed, &[]);
                     PreparedStatement {
@@ -1003,6 +1019,7 @@ impl Executor {
                         exec: PreparedExec::AnalyzedDml {
                             analyzed,
                             required_privileges,
+                            has_with_cte,
                         },
                         output_schema,
                         param_data_types: param_types,
@@ -1242,6 +1259,7 @@ mod tests {
         let dml = PreparedExec::AnalyzedDml {
             analyzed: crate::sql::analyzer::types::AnalyzedStatement::Query(values_query()),
             required_privileges: vec![],
+            has_with_cte: false,
         };
         assert!(!is_plan_cache_eligible(&dml, false));
         assert!(!is_plan_cache_eligible(&PreparedExec::RawSqlUtility, false));

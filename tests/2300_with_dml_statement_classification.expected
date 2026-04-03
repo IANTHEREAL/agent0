@@ -1,0 +1,61 @@
+id|val
+1|a
+2|b
+(2 rows)
+id|val
+1|a
+2|b
+(2 rows)
+id|val
+1|A
+(1 row)
+id|val
+1|A
+2|b
+(2 rows)
+id|val
+2|b
+(1 row)
+id|val
+1|A
+(1 row)
+id|val
+1|row1
+2|row2
+3|row3
+(3 rows)
+id|val
+1|row1
+2|row2
+3|row3
+(3 rows)
+id|val
+1|A
+2|B
+(2 rows)
+id|val
+1|A
+2|B
+(2 rows)
+id|val
+1|updated
+2|updated
+(2 rows)
+id|val
+1|updated
+2|updated
+(2 rows)
+id|val
+1|updated
+2|updated
+(2 rows)
+count
+0
+(1 row)
+id|val
+1|updated
+(1 row)
+id|val
+1|a
+2|b
+(2 rows)

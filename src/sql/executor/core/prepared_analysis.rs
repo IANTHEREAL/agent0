@@ -34,6 +34,8 @@ pub enum PreparedAnalysis {
         param_types: Vec<DataType>,
         table_versions: Vec<(String, u64, u64)>,
         rls_sensitive: bool,
+        /// True when the original statement carries a WITH clause.
+        has_with_cte: bool,
     },
     /// DDL / utility / non-analyzable statement.
     Utility,
@@ -177,7 +179,18 @@ impl Executor {
             }
 
             Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
-                // Pipeline matches stmt_dml.rs
+                // Pipeline matches stmt_dml.rs.
+                // CTE schemas are inferred at analysis time, but CTE rows are
+                // NOT materialized here.  When has_with_cte is true, Execute
+                // falls back to the text path so stmt_dml.rs can materialize
+                // CTEs at runtime.
+                let has_with_cte = matches!(
+                    stmt,
+                    Statement::Insert { with: Some(_), .. }
+                        | Statement::Update { with: Some(_), .. }
+                        | Statement::Delete { with: Some(_), .. }
+                );
+                let empty_ctes = std::collections::HashMap::new();
                 let catalog = build_catalog_snapshot_for_statement(
                     self.store().as_ref(),
                     txn,
@@ -185,6 +198,7 @@ impl Executor {
                     search_path,
                     self.tenant_keyspace(),
                     stmt,
+                    &empty_ctes,
                 )
                 .await?;
 
@@ -211,6 +225,7 @@ impl Executor {
                     param_types,
                     table_versions,
                     rls_sensitive,
+                    has_with_cte,
                 })
             }
 

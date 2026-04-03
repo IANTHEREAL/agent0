@@ -1404,6 +1404,8 @@ pub enum Statement {
     Query(Box<Query>),
     /// INSERT
     Insert {
+        /// WITH (common table expressions)
+        with: Option<With>,
         /// Only for Sqlite
         or: Option<SqliteOnConflict>,
         /// Only for mysql
@@ -1478,6 +1480,8 @@ pub enum Statement {
     },
     /// UPDATE
     Update {
+        /// WITH (common table expressions)
+        with: Option<With>,
         /// TABLE
         table: TableWithJoins,
         /// Column assignments
@@ -1491,6 +1495,8 @@ pub enum Statement {
     },
     /// DELETE
     Delete {
+        /// WITH (common table expressions)
+        with: Option<With>,
         /// Multi tables delete are supported in mysql
         tables: Vec<ObjectName>,
         /// FROM
@@ -2246,6 +2252,7 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Statement::Insert {
+                with,
                 or,
                 ignore,
                 into,
@@ -2259,6 +2266,9 @@ impl fmt::Display for Statement {
                 on,
                 returning,
             } => {
+                if let Some(with) = with {
+                    write!(f, "{with} ")?;
+                }
                 if let Some(action) = or {
                     write!(f, "INSERT OR {action} INTO {table_name} ")?;
                 } else {
@@ -2348,12 +2358,16 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Statement::Update {
+                with,
                 table,
                 assignments,
                 from,
                 selection,
                 returning,
             } => {
+                if let Some(with) = with {
+                    write!(f, "{with} ")?;
+                }
                 write!(f, "UPDATE {table}")?;
                 if !assignments.is_empty() {
                     write!(f, " SET {}", display_comma_separated(assignments))?;
@@ -2370,6 +2384,7 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Statement::Delete {
+                with,
                 tables,
                 from,
                 using,
@@ -2378,6 +2393,9 @@ impl fmt::Display for Statement {
                 order_by,
                 limit,
             } => {
+                if let Some(with) = with {
+                    write!(f, "{with} ")?;
+                }
                 write!(f, "DELETE ")?;
                 if !tables.is_empty() {
                     write!(f, "{} ", display_comma_separated(tables))?;

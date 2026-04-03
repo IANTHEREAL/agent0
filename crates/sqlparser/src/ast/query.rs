@@ -103,8 +103,6 @@ pub enum SetExpr {
         right: Box<SetExpr>,
     },
     Values(Values),
-    Insert(Statement),
-    Update(Statement),
     Table(Box<Table>),
 }
 
@@ -114,8 +112,6 @@ impl fmt::Display for SetExpr {
             SetExpr::Select(s) => write!(f, "{s}"),
             SetExpr::Query(q) => write!(f, "({q})"),
             SetExpr::Values(v) => write!(f, "{v}"),
-            SetExpr::Insert(v) => write!(f, "{v}"),
-            SetExpr::Update(v) => write!(f, "{v}"),
             SetExpr::Table(t) => write!(f, "{t}"),
             SetExpr::SetOperation {
                 left,

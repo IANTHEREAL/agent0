@@ -103,6 +103,30 @@ impl Executor {
         stmt: &Statement,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
+        // Materialize CTEs from the WITH clause (if present) before analysis.
+        // This mirrors the SELECT path's `build_cte_context()`.
+        let with_clause = match stmt {
+            Statement::Insert { with, .. }
+            | Statement::Update { with, .. }
+            | Statement::Delete { with, .. } => with.as_ref(),
+            _ => None,
+        };
+        let ctes = if let Some(with) = with_clause {
+            let base = std::collections::HashMap::new();
+            self.materialize_with_clause(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                with,
+                &base,
+                current_role,
+            )
+            .await?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         match stmt {
             Statement::Insert { .. } => {
                 // All INSERT variants (VALUES, DEFAULT VALUES, SELECT) use the
@@ -114,6 +138,7 @@ impl Executor {
                     search_path,
                     self.tenant_keyspace(),
                     stmt,
+                    &ctes,
                 )
                 .await?;
                 let mut analyzer = make_analyzer(&catalog);
@@ -156,6 +181,7 @@ impl Executor {
                             search_path,
                             &ins,
                             rls_ctx.as_ref(),
+                            &ctes,
                         )
                         .await
                     }
@@ -170,6 +196,7 @@ impl Executor {
                     search_path,
                     self.tenant_keyspace(),
                     stmt,
+                    &ctes,
                 )
                 .await?;
                 let mut analyzer = make_analyzer(&catalog);
@@ -201,6 +228,7 @@ impl Executor {
                             search_path,
                             &del,
                             rls_ctx.as_ref(),
+                            &ctes,
                         )
                         .await
                     }
@@ -215,6 +243,7 @@ impl Executor {
                     search_path,
                     self.tenant_keyspace(),
                     stmt,
+                    &ctes,
                 )
                 .await?;
                 let mut analyzer = make_analyzer(&catalog);
@@ -246,6 +275,7 @@ impl Executor {
                             search_path,
                             &upd,
                             rls_ctx.as_ref(),
+                            &ctes,
                         )
                         .await
                     }

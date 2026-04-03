@@ -39,6 +39,7 @@ impl Executor {
         search_path: &[String],
         upd: &AnalyzedUpdate,
         rls_ctx: Option<&RlsDmlContext>,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         let t = &upd.table_name;
         let schema = self
@@ -64,7 +65,6 @@ impl Executor {
 
         let qctx = QueryContext::from_task_locals();
         let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
-        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let write_plan = self.compile_write_row_plan(&schema, &qctx)?;
         // Fast path: when WHERE targets a PK or unique key, use point-get
         // instead of a full table scan.  Falls back to scan_and_fill for all
@@ -110,7 +110,7 @@ impl Executor {
             let mut all_table_rows: Vec<Vec<Row>> = Vec::new();
             for from_ref in &upd.from {
                 let (_name, _schema, rows) = self
-                    .resolve_and_scan_table_ref(txn, db_id, search_path, from_ref)
+                    .resolve_and_scan_table_ref(txn, db_id, search_path, from_ref, ctes)
                     .await?;
                 all_table_rows.push(rows);
             }
@@ -197,7 +197,7 @@ impl Executor {
                                     where_expr,
                                     &combined,
                                     None,
-                                    &empty_ctes,
+                                    ctes,
                                     &qctx,
                                 )
                                 .await?;
@@ -224,7 +224,7 @@ impl Executor {
                                 where_expr,
                                 r,
                                 Some(&schema),
-                                &empty_ctes,
+                                ctes,
                                 &qctx,
                             )
                             .await?;
@@ -254,6 +254,7 @@ impl Executor {
                             typed_expr,
                             &eval_row,
                             &qctx,
+                            ctes,
                         )
                         .await?;
                     let col = &schema.columns[*col_idx];
@@ -291,6 +292,7 @@ impl Executor {
                     &schema,
                     &write_plan,
                     &mut final_vals,
+                    ctes,
                 )
                 .await?;
                 let new_row = Row::new(final_vals);
@@ -399,7 +401,7 @@ impl Executor {
                                     where_expr,
                                     &combined,
                                     None,
-                                    &empty_ctes,
+                                    ctes,
                                     &qctx,
                                 )
                                 .await?;
@@ -426,7 +428,7 @@ impl Executor {
                                 where_expr,
                                 r,
                                 Some(&schema),
-                                &empty_ctes,
+                                ctes,
                                 &qctx,
                             )
                             .await?;
@@ -458,6 +460,7 @@ impl Executor {
                             typed_expr,
                             &eval_row,
                             &qctx,
+                            ctes,
                         )
                         .await?;
                     let col = &schema.columns[*col_idx];
@@ -475,6 +478,7 @@ impl Executor {
                     &schema,
                     &write_plan,
                     &mut new_vals,
+                    ctes,
                 )
                 .await?;
                 let new_row = Row::new(new_vals);

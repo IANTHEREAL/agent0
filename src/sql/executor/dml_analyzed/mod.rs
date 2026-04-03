@@ -44,6 +44,7 @@ impl Executor {
         db_id: u64,
         search_path: &'a [String],
         table_ref: &'a crate::sql::analyzer::types::AnalyzedTableRef,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
     > {
@@ -51,6 +52,19 @@ impl Executor {
             use crate::sql::analyzer::types::AnalyzedTableRefKind;
             match &table_ref.kind {
                 AnalyzedTableRefKind::Table { name, .. } => {
+                    // Check materialized CTEs first — CTE "tables" don't
+                    // exist in TiKV storage but their data is available in
+                    // the CTE map produced by `materialize_with_clause`.
+                    let name_lower = name.to_lowercase();
+                    if let Some((cte_schema, cte_rows)) =
+                        ctes.get(name).or_else(|| ctes.get(&name_lower))
+                    {
+                        // CTE rows are read-only auxiliary data — the
+                        // analyzer resolves them via add_table_without_system_columns
+                        // (no ctid), so don't append ctid here either.
+                        return Ok((name.clone(), cte_schema.clone(), cte_rows.clone()));
+                    }
+
                     let schema = self
                         .store()
                         .get_schema(txn, db_id, name)
@@ -82,20 +96,12 @@ impl Executor {
                         .clone()
                         .unwrap_or_else(|| "__subquery".to_string());
                     let mut seq_vals = SequenceSession::new();
-                    let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
                     let max_rows = dml_table_scan_max_rows_from_settings();
                     let row_cap = dml_table_scan_row_cap(max_rows);
                     let cap_scope = row_cap.unwrap_or(0);
                     let result = crate::session_context::with_dml_limit_cap(cap_scope, {
                         let txn = &mut *txn;
-                        self.execute_subquery(
-                            txn,
-                            db_id,
-                            &mut seq_vals,
-                            search_path,
-                            query,
-                            &empty_ctes,
-                        )
+                        self.execute_subquery(txn, db_id, &mut seq_vals, search_path, query, ctes)
                     })
                     .await?;
                     match result {
@@ -132,10 +138,10 @@ impl Executor {
                         .clone()
                         .unwrap_or_else(|| "__join".to_string());
                     let (_l_name, l_schema, l_rows) = self
-                        .resolve_and_scan_table_ref(txn, db_id, search_path, left)
+                        .resolve_and_scan_table_ref(txn, db_id, search_path, left, ctes)
                         .await?;
                     let (_r_name, r_schema, r_rows) = self
-                        .resolve_and_scan_table_ref(txn, db_id, search_path, right)
+                        .resolve_and_scan_table_ref(txn, db_id, search_path, right, ctes)
                         .await?;
 
                     let qctx = QueryContext::from_task_locals();
@@ -409,12 +415,12 @@ impl Executor {
         schema: &TableSchema,
         plan: &CompiledWriteRowPlan,
         row_vals: &mut [Value],
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<()> {
         let qctx = QueryContext::from_task_locals();
         for generated in &plan.generated_columns {
             let col = &schema.columns[generated.column_idx];
             let eval_row = Row::new(row_vals.to_vec());
-            let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
             let val = if generated.embedding_authorized {
                 crate::extensions::context::with_embedding_authorized(
                     self.eval_typed_expr_maybe_async(
@@ -425,7 +431,7 @@ impl Executor {
                         &generated.expr,
                         &eval_row,
                         Some(schema),
-                        &empty_ctes,
+                        ctes,
                         &qctx,
                     ),
                 )
@@ -439,7 +445,7 @@ impl Executor {
                     &generated.expr,
                     &eval_row,
                     Some(schema),
-                    &empty_ctes,
+                    ctes,
                     &qctx,
                 )
                 .await?
@@ -470,6 +476,7 @@ impl Executor {
         typed_expr: &TypedExpr,
         eval_row: &Row,
         qctx: &QueryContext,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Value> {
         let folded_expr = fold_typed_expr(typed_expr, qctx);
         if is_default_typed_expr(&folded_expr) {
@@ -485,7 +492,6 @@ impl Executor {
             .await;
         }
 
-        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         self.eval_typed_expr_maybe_async(
             txn,
             db_id,
@@ -494,7 +500,7 @@ impl Executor {
             &folded_expr,
             eval_row,
             Some(schema),
-            &empty_ctes,
+            ctes,
             qctx,
         )
         .await

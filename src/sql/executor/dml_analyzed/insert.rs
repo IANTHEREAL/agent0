@@ -48,6 +48,7 @@ impl Executor {
         search_path: &[String],
         ins: &AnalyzedInsert,
         rls_ctx: Option<&RlsDmlContext>,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         let t = &ins.table_name;
         let schema = self
@@ -77,7 +78,6 @@ impl Executor {
         .await?;
 
         let qctx = QueryContext::from_task_locals();
-        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let folded_on_conflict_where = match &ins.on_conflict {
             Some(AnalyzedOnConflict::DoUpdate { where_clause, .. }) => {
                 where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx))
@@ -143,7 +143,7 @@ impl Executor {
                                     &folded_expr,
                                     &empty_row,
                                     None,
-                                    &empty_ctes,
+                                    ctes,
                                     &qctx,
                                 )
                                 .await?;
@@ -156,7 +156,6 @@ impl Executor {
             }
             AnalyzedInsertSource::Query(ref analyzed_query) => {
                 // Execute the analyzed subquery to get result rows.
-                let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
                 let row_cap = super::dml_table_scan_row_cap_from_settings().unwrap_or(0);
                 let result = crate::session_context::with_dml_limit_cap(row_cap, {
                     self.execute_subquery(
@@ -165,7 +164,7 @@ impl Executor {
                         sequence_values,
                         search_path,
                         analyzed_query,
-                        &empty_ctes,
+                        ctes,
                     )
                 })
                 .await?;
@@ -261,6 +260,7 @@ impl Executor {
                 &schema,
                 &write_plan,
                 &mut final_vals,
+                ctes,
             )
             .await?;
             let row = Row::new(final_vals);
@@ -373,7 +373,7 @@ impl Executor {
                                             where_expr,
                                             &combined,
                                             Some(&schema),
-                                            &empty_ctes,
+                                            ctes,
                                             &qctx,
                                         )
                                         .await?;
@@ -396,6 +396,7 @@ impl Executor {
                                             typed_expr,
                                             &combined,
                                             &qctx,
+                                            ctes,
                                         )
                                         .await?;
                                     let col = &schema.columns[*col_idx];
@@ -434,6 +435,7 @@ impl Executor {
                                     &schema,
                                     &write_plan,
                                     &mut final_vals,
+                                    ctes,
                                 )
                                 .await?;
                                 let updated_row = Row::new(final_vals);

@@ -33,6 +33,7 @@ impl Executor {
         search_path: &[String],
         del: &AnalyzedDelete,
         rls_ctx: Option<&RlsDmlContext>,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         let t = &del.table_name;
         let schema = self
@@ -48,7 +49,6 @@ impl Executor {
 
         let qctx = QueryContext::from_task_locals();
         let folded_where = del.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
-        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let mut rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         append_ctid_to_rows(&mut rows);
         let mut cnt = 0;
@@ -60,7 +60,7 @@ impl Executor {
             let mut all_table_rows: Vec<Vec<Row>> = Vec::new();
             for using_ref in &del.using {
                 let (_name, _schema, rows) = self
-                    .resolve_and_scan_table_ref(txn, db_id, search_path, using_ref)
+                    .resolve_and_scan_table_ref(txn, db_id, search_path, using_ref, ctes)
                     .await?;
                 all_table_rows.push(rows);
             }
@@ -90,7 +90,7 @@ impl Executor {
                                 where_expr,
                                 &combined,
                                 None,
-                                &empty_ctes,
+                                ctes,
                                 &qctx,
                             )
                             .await?;
@@ -110,7 +110,7 @@ impl Executor {
                             where_expr,
                             r,
                             Some(&schema),
-                            &empty_ctes,
+                            ctes,
                             &qctx,
                         )
                         .await?;
