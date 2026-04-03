@@ -104,7 +104,14 @@ async fn handle_connection(
         let tls_stream = match acceptor.accept(stream).await {
             Ok(s) => s,
             Err(err) => {
-                warn!("fs9 ws TLS handshake failed for {peer_addr}: {err}");
+                match err.kind() {
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset => {
+                        debug!("fs9 ws TLS handshake closed early for {peer_addr}: {err}");
+                    }
+                    _ => {
+                        warn!("fs9 ws TLS handshake failed for {peer_addr}: {err}");
+                    }
+                }
                 return Ok(());
             }
         };
