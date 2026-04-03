@@ -49,6 +49,8 @@ pub(crate) struct StatementRuntimeContext {
     pub settings: RuntimeSettings,
     pub tenant_keyspace: Arc<str>,
     pub database_id: u64,
+    pub is_in_transaction: bool,
+    pub caller_sub: Option<String>,
     pub txn_snapshot_ts_version: Option<u64>,
     pub session_txn_tracker: Option<Arc<crate::session_context::SessionTxnTracker>>,
     pub tikv_client: Option<Arc<TransactionClient>>,
@@ -66,6 +68,8 @@ impl StatementRuntimeContext {
             settings: RuntimeSettings::from_session(session),
             tenant_keyspace: Arc::from(tenant_keyspace),
             database_id: session.current_database_id(),
+            is_in_transaction: session.is_in_transaction(),
+            caller_sub: session.current_user().map(|s| s.to_string()),
             txn_snapshot_ts_version: session.active_txn_start_ts_version(),
             session_txn_tracker: session.session_txn_tracker(),
             tikv_client,
@@ -95,44 +99,54 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
     let extension_txn_delta = runtime.extension_txn_delta.clone();
     let extension_statement_state = runtime.extension_statement_state.clone();
 
-    Box::pin(crate::session_context::with_timezone(
-        settings.timezone,
-        crate::session_context::with_max_sort_bytes(
-            settings.max_sort_bytes,
-            crate::session_context::with_hash_join_work_mem(
-            settings.hash_join_work_mem,
-            crate::session_context::with_search_path(
-                settings.search_path,
-                crate::session_context::with_text_search_config(
-                    settings.text_search_config,
-                    crate::session_context::with_keyspace(
-                        tenant_keyspace.clone(),
-                        crate::session_context::with_database_id(
-                            database_id,
-                            crate::session_context::with_txn_snapshot_ts_version(
-                                txn_snapshot_ts_version,
-                                crate::session_context::with_session_txn_tracker(
-                                    session_txn_tracker,
-                                    crate::session_context::with_extension_txn_delta(
-                                        extension_txn_delta,
-                                        crate::extensions::context::with_context_opts(
-                                            crate::extensions::context::ExtensionContextOpts::statement(
-                                                settings.is_superuser,
-                                                settings.bypass_rls,
-                                                tenant_keyspace.as_ref(),
-                                            )
-                                            .with_statement_state(extension_statement_state)
-                                            .with_tikv_client(tikv_client),
-                                            fut,
-                                        ),
-                                    ),
-                                ),
+    // Box::pin the inner half of the nesting to cap the compiler-generated
+    // future size.  Without this, debug-mode builds accumulate all 11
+    // task_local::scope layers into one stack frame, which overflows the
+    // default 2 MiB tokio test stack.
+    let inner = Box::pin(
+        crate::session_context::with_keyspace(
+            tenant_keyspace.clone(),
+            crate::session_context::with_database_id(
+                database_id,
+                crate::session_context::with_txn_snapshot_ts_version(
+                    txn_snapshot_ts_version,
+                    crate::session_context::with_session_txn_tracker(
+                        session_txn_tracker,
+                        crate::session_context::with_extension_txn_delta(
+                            extension_txn_delta,
+                            crate::extensions::context::with_context_opts(
+                                crate::extensions::context::ExtensionContextOpts::statement(
+                                    settings.is_superuser,
+                                    settings.bypass_rls,
+                                    tenant_keyspace.as_ref(),
+                                )
+                                .with_in_transaction(runtime.is_in_transaction)
+                                .with_caller_sub(runtime.caller_sub.clone())
+                                .with_statement_state(extension_statement_state)
+                                .with_tikv_client(tikv_client),
+                                fut,
                             ),
                         ),
                     ),
                 ),
             ),
         ),
+    );
+
+    Box::pin(crate::session_context::with_timezone(
+        settings.timezone,
+        crate::session_context::with_max_sort_bytes(
+            settings.max_sort_bytes,
+            crate::session_context::with_hash_join_work_mem(
+                settings.hash_join_work_mem,
+                crate::session_context::with_search_path(
+                    settings.search_path,
+                    crate::session_context::with_text_search_config(
+                        settings.text_search_config,
+                        inner,
+                    ),
+                ),
+            ),
         ),
     ))
 }
@@ -299,6 +313,8 @@ mod tests {
             },
             tenant_keyspace: Arc::from("tenant_a"),
             database_id: 42,
+            is_in_transaction: false,
+            caller_sub: None,
             txn_snapshot_ts_version: Some(999),
             session_txn_tracker: None,
             tikv_client: None,
@@ -372,6 +388,8 @@ mod tests {
             },
             tenant_keyspace: Arc::from("tenant_a"),
             database_id: 42,
+            is_in_transaction: false,
+            caller_sub: None,
             txn_snapshot_ts_version: Some(999),
             session_txn_tracker: None,
             tikv_client: None,
@@ -413,6 +431,8 @@ mod tests {
             },
             tenant_keyspace: Arc::from("tenant_a"),
             database_id: 42,
+            is_in_transaction: false,
+            caller_sub: None,
             txn_snapshot_ts_version: Some(999),
             session_txn_tracker: None,
             tikv_client: None,
