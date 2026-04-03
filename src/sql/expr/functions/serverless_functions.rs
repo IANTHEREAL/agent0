@@ -37,8 +37,11 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 fn get_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            // Generous HTTP timeout — the real cap is the SQL statement_timeout.
+            // Serverless functions may run up to 300s; this just prevents leaked
+            // connections if the backend becomes unresponsive.
+            .timeout(Duration::from_secs(310))
             .build()
             .expect("failed to build reqwest client for serverless_functions")
     })
@@ -162,22 +165,17 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
     );
 
     // 8. Build request
+    let caller_sub = context::caller_sub();
     let url = format!("{}/internal/v1/functions/invoke", base_url);
     let body = serde_json::json!({
         "tenant_id": tenant_id,
         "function_name": function_name,
         "input_json": input_json,
-        // v1: caller_sub is null — SQL invoke runs as superuser and the backend
-        // does not use caller identity for authorization. Future versions may
-        // propagate the session principal here.
-        "caller_sub": null,
+        "caller_sub": caller_sub,
         "invoke_depth": invoke_depth,
-        "idempotency_key": format!(
-            "sql:{}:{}:{}",
-            tenant_id,
-            function_name,
-            uuid::Uuid::new_v4()
-        ),
+        // v1: no idempotency_key — each SQL statement execution is unique and
+        // there is no retry mechanism at the SQL layer. The backend handles
+        // null idempotency_key gracefully (skips dedup).
     });
 
     // 9. Execute HTTP request (single block_in_place for both send + body read)
@@ -249,7 +247,7 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    if resp_status != "completed" {
+    if resp_status != "succeeded" {
         let error_msg = resp
             .get("error_message")
             .and_then(|v| v.as_str())

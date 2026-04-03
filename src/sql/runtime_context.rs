@@ -50,6 +50,7 @@ pub(crate) struct StatementRuntimeContext {
     pub tenant_keyspace: Arc<str>,
     pub database_id: u64,
     pub is_in_transaction: bool,
+    pub caller_sub: Option<String>,
     pub txn_snapshot_ts_version: Option<u64>,
     pub session_txn_tracker: Option<Arc<crate::session_context::SessionTxnTracker>>,
     pub tikv_client: Option<Arc<TransactionClient>>,
@@ -68,6 +69,7 @@ impl StatementRuntimeContext {
             tenant_keyspace: Arc::from(tenant_keyspace),
             database_id: session.current_database_id(),
             is_in_transaction: session.is_in_transaction(),
+            caller_sub: session.current_user().map(|s| s.to_string()),
             txn_snapshot_ts_version: session.active_txn_start_ts_version(),
             session_txn_tracker: session.session_txn_tracker(),
             tikv_client,
@@ -124,6 +126,7 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                                                 tenant_keyspace.as_ref(),
                                             )
                                             .with_in_transaction(runtime.is_in_transaction)
+                                            .with_caller_sub(runtime.caller_sub.clone())
                                             .with_statement_state(extension_statement_state)
                                             .with_tikv_client(tikv_client),
                                             fut,

@@ -46,6 +46,7 @@ pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
     pub(crate) bypass_rls: bool,
     pub(crate) is_in_transaction: bool,
+    pub(crate) caller_sub: Option<String>,
     pub(crate) tenant_keyspace: String,
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
@@ -58,6 +59,7 @@ impl ExtensionContextOpts {
             is_superuser,
             bypass_rls,
             is_in_transaction: false,
+            caller_sub: None,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
@@ -70,6 +72,7 @@ impl ExtensionContextOpts {
             is_superuser: true,
             bypass_rls: true, // Cron runs as superuser, implicitly bypasses RLS
             is_in_transaction: false,
+            caller_sub: None,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
@@ -79,6 +82,11 @@ impl ExtensionContextOpts {
 
     pub(crate) fn with_in_transaction(mut self, in_txn: bool) -> Self {
         self.is_in_transaction = in_txn;
+        self
+    }
+
+    pub(crate) fn with_caller_sub(mut self, sub: Option<String>) -> Self {
+        self.caller_sub = sub;
         self
     }
 
@@ -101,6 +109,7 @@ pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,
     pub(crate) bypass_rls: bool,
     is_in_transaction: bool,
+    caller_sub: Option<String>,
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     embedding_mode: Cell<EmbeddingExecutionMode>,
@@ -146,6 +155,7 @@ pub(crate) async fn with_context_opts<R>(
         is_superuser: opts.is_superuser,
         bypass_rls: opts.bypass_rls,
         is_in_transaction: opts.is_in_transaction,
+        caller_sub: opts.caller_sub,
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
@@ -184,6 +194,10 @@ pub(crate) fn execution_kind() -> ExecutionKind {
 
 pub(crate) fn is_in_transaction() -> bool {
     CTX.try_with(|ctx| ctx.is_in_transaction).unwrap_or(false)
+}
+
+pub(crate) fn caller_sub() -> Option<String> {
+    CTX.try_with(|ctx| ctx.caller_sub.clone()).ok().flatten()
 }
 
 pub(crate) fn current_invoke_depth() -> u32 {
