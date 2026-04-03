@@ -1,0 +1,47 @@
+  label   
+----------
+ 中文测试
+(1 row)
+
+ 列名 
+------
+    1
+(1 row)
+
+ two_byte | three_byte | four_byte 
+----------+------------+-----------
+ café     | 中文       | 🎉
+(1 row)
+
+ comment_test 
+--------------
+            1
+(1 row)
+
+ block_comment_test 
+--------------------
+                  2
+(1 row)
+
+ dollar_test  
+--------------
+ 日本語テスト
+(1 row)
+
+ id | name 
+----+------
+  1 | 太郎
+  2 | 花子
+(2 rows)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ name 
+------
+ 太郎
+ 花子
+(2 rows)
+

@@ -1454,10 +1454,7 @@ fn regression_2271_retries_exhausted_still_fails() {
     }
 
     // After REGION_ERROR_MAX_RETRIES+1 failures, we give up (no infinite loop).
-    assert!(
-        result.is_err(),
-        "Should fail when retries exhausted"
-    );
+    assert!(result.is_err(), "Should fail when retries exhausted");
 }
 
 /// Verify fix: non-retryable errors (server_is_busy) are NOT retried.

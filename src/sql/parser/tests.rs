@@ -5,6 +5,7 @@ use operator_rewrite::{
     rewrite_jsonb_exists_ops, rewrite_table_shorthand, rewrite_vector_distance_ops,
 };
 use preprocess::{preprocess_create_sequence, preprocess_sql};
+use tokenizer::{tokenize_sql_for_rewrite, TokenKind};
 
 #[test]
 fn test_parse_select() {
@@ -847,4 +848,232 @@ fn test_table_shorthand_explain_options_via_preprocess() {
         preprocess_sql("EXPLAIN (FORMAT TEXT) TABLE t").unwrap(),
         "EXPLAIN FORMAT TEXT SELECT * FROM t"
     );
+}
+
+// ---------------------------------------------------------------------------
+// UTF-8 / multibyte safety tests for tokenizer and parse_sql
+// ---------------------------------------------------------------------------
+
+// --- Tokenizer-level: tokenize_sql_for_rewrite must not panic on multibyte ---
+
+#[test]
+fn test_tokenizer_chinese_characters_no_panic() {
+    // Bare Chinese text outside quotes — must tokenize without panic
+    let tokens = tokenize_sql_for_rewrite("SELECT 模型能力总结 FROM t");
+    assert!(!tokens.is_empty());
+}
+
+#[test]
+fn test_tokenizer_japanese_characters_no_panic() {
+    let tokens = tokenize_sql_for_rewrite("SELECT テスト FROM t");
+    assert!(!tokens.is_empty());
+}
+
+#[test]
+fn test_tokenizer_korean_characters_no_panic() {
+    let tokens = tokenize_sql_for_rewrite("SELECT 테스트 FROM t");
+    assert!(!tokens.is_empty());
+}
+
+#[test]
+fn test_tokenizer_emoji_no_panic() {
+    let tokens = tokenize_sql_for_rewrite("SELECT 🚀 FROM t");
+    assert!(!tokens.is_empty());
+}
+
+#[test]
+fn test_tokenizer_mixed_ascii_and_multibyte() {
+    // Multibyte chars adjacent to ASCII keywords/operators
+    let tokens = tokenize_sql_for_rewrite("SELECT id, 名前 FROM users WHERE name = '日本語'");
+    assert!(!tokens.is_empty());
+    // 'SELECT' should be a Word token
+    let first_word = tokens.iter().find(|t| t.kind == TokenKind::Word).unwrap();
+    assert_eq!(first_word.text, "SELECT");
+}
+
+#[test]
+fn test_tokenizer_multibyte_as_word_tokens() {
+    // After the fix, multibyte chars should be consumed as Word tokens (PG/TiDB behavior)
+    let tokens = tokenize_sql_for_rewrite("表名");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].kind, TokenKind::Word);
+    assert_eq!(tokens[0].text, "表名");
+}
+
+#[test]
+fn test_tokenizer_multibyte_between_ascii_words() {
+    let tokens = tokenize_sql_for_rewrite("SELECT 名前 FROM t");
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::Word)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(words, vec!["SELECT", "名前", "FROM", "t"]);
+}
+
+#[test]
+fn test_tokenizer_multibyte_adjacent_to_ascii_ident() {
+    // e.g. "abc中文def" — all bytes form one contiguous Word token
+    let tokens = tokenize_sql_for_rewrite("abc中文def");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].kind, TokenKind::Word);
+    assert_eq!(tokens[0].text, "abc中文def");
+}
+
+#[test]
+fn test_tokenizer_multibyte_in_string_literal() {
+    let tokens = tokenize_sql_for_rewrite("SELECT '日本語テスト'");
+    let strings: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::StringLiteral)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(strings, vec!["'日本語テスト'"]);
+}
+
+#[test]
+fn test_tokenizer_multibyte_in_double_quoted_ident() {
+    let tokens = tokenize_sql_for_rewrite(r#"SELECT "列名" FROM t"#);
+    let quoted: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::QuotedIdent)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(quoted, vec![r#""列名""#]);
+}
+
+#[test]
+fn test_tokenizer_multibyte_in_dollar_string() {
+    let tokens = tokenize_sql_for_rewrite("$$日本語テスト$$");
+    let dollar: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::DollarString)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(dollar, vec!["$$日本語テスト$$"]);
+}
+
+#[test]
+fn test_tokenizer_multibyte_in_line_comment() {
+    let tokens = tokenize_sql_for_rewrite("-- 这是注释\nSELECT 1");
+    assert_eq!(tokens[0].kind, TokenKind::Comment);
+    assert!(tokens[0].text.contains("这是注释"));
+}
+
+#[test]
+fn test_tokenizer_multibyte_in_block_comment() {
+    let tokens = tokenize_sql_for_rewrite("/* コメント */ SELECT 1");
+    assert_eq!(tokens[0].kind, TokenKind::Comment);
+    assert!(tokens[0].text.contains("コメント"));
+}
+
+#[test]
+fn test_tokenizer_two_byte_utf8() {
+    // Latin extended: é is 2-byte UTF-8 (0xC3 0xA9)
+    let tokens = tokenize_sql_for_rewrite("SELECT café FROM t");
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::Word)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert_eq!(words, vec!["SELECT", "café", "FROM", "t"]);
+}
+
+#[test]
+fn test_tokenizer_four_byte_utf8() {
+    // Emoji: 🎉 is 4-byte UTF-8
+    let tokens = tokenize_sql_for_rewrite("SELECT 🎉 FROM t");
+    assert!(!tokens.is_empty());
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::Word)
+        .map(|t| t.text.as_str())
+        .collect();
+    assert!(words.contains(&"SELECT"));
+    assert!(words.contains(&"FROM"));
+}
+
+#[test]
+fn test_tokenizer_byte_offsets_correct_with_multibyte() {
+    let sql = "SELECT 名前 FROM t";
+    let tokens = tokenize_sql_for_rewrite(sql);
+    // Every token's start..end must slice back to token text
+    for tok in &tokens {
+        assert_eq!(
+            &sql[tok.start..tok.end],
+            tok.text,
+            "offset mismatch for {:?}",
+            tok
+        );
+    }
+}
+
+#[test]
+fn test_tokenizer_issue_2299_repro() {
+    // Exact reproduction case from issue #2299: bare Chinese text in invalid SQL
+    let sql = "SELECT id, message FROM agent_discussion WHERE id > gemma4:26b 模型能力总结";
+    let tokens = tokenize_sql_for_rewrite(sql);
+    assert!(!tokens.is_empty());
+    // Verify all token offsets are valid UTF-8 boundaries
+    for tok in &tokens {
+        assert_eq!(
+            &sql[tok.start..tok.end],
+            tok.text,
+            "offset mismatch for {:?}",
+            tok
+        );
+    }
+}
+
+// --- parse_sql()-level: multibyte in invalid SQL must return Err, not panic ---
+
+#[test]
+fn test_parse_sql_bare_chinese_is_valid_identifier() {
+    // Bare Chinese text is a valid identifier in PostgreSQL (same as PG/TiDB behavior).
+    // It parses successfully — semantic errors (column not found) happen later in analysis.
+    let result = parse_sql("SELECT id FROM t WHERE x > 模型能力总结");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_parse_sql_issue_2299_full_repro() {
+    let result =
+        parse_sql("SELECT id, message FROM agent_discussion WHERE id > gemma4:26b 模型能力总结：Gemma4在多项基准测试中展现出色的多模态理解能力");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_parse_sql_chinese_in_string_literal_ok() {
+    // Valid SQL with Chinese inside a string literal — must parse successfully
+    let result = parse_sql("SELECT '中文测试' AS label");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_parse_sql_chinese_in_double_quoted_ident_ok() {
+    // Valid SQL with Chinese inside double-quoted identifier
+    let result = parse_sql(r#"SELECT "列名" FROM t"#);
+    assert!(result.is_ok());
+}
+
+// --- Rewrite-level: rewrite functions must not panic on multibyte input ---
+
+#[test]
+fn test_rewrite_all_any_with_multibyte_no_panic() {
+    use operator_rewrite::rewrite_all_any_subquery_parse_compat;
+    let result =
+        rewrite_all_any_subquery_parse_compat("SELECT * FROM t WHERE 模型 = ANY(ARRAY[1])");
+    assert!(result.contains("ANY"));
+}
+
+#[test]
+fn test_rewrite_jsonb_exists_with_multibyte_no_panic() {
+    let result = rewrite_jsonb_exists_ops("SELECT * FROM t WHERE data ? '模型'");
+    assert!(!result.is_empty());
+}
+
+#[test]
+fn test_rewrite_vector_distance_with_multibyte_no_panic() {
+    let result = rewrite_vector_distance_ops("SELECT 名前 FROM t ORDER BY embedding <-> '[1,2,3]'");
+    assert!(!result.is_empty());
 }
