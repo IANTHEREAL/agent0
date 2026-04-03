@@ -4,7 +4,7 @@ use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::SqlFn;
 
@@ -49,9 +49,9 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
-/// Maximum invoke recursion depth. 1 means the initial SQL invoke is allowed,
-/// but the invoked function cannot call invoke() again.
-const MAX_INVOKE_DEPTH: u32 = 1;
+/// Maximum allowed nesting level. 0 = only the initial SQL invoke is allowed;
+/// a function invoked via SQL cannot call invoke() again.
+const MAX_INVOKE_NESTING: u32 = 1;
 
 /// RAII guard that decrements invoke depth on drop, ensuring correct cleanup
 /// even on panic or early return.
@@ -102,7 +102,7 @@ fn invoke(args: Vec<Value>) -> Result<Value> {
     }
 
     // 4. Recursion depth check (RAII guard ensures leave_invoke on all exit paths)
-    context::try_enter_invoke(MAX_INVOKE_DEPTH)?;
+    context::try_enter_invoke(MAX_INVOKE_NESTING)?;
     let _guard = InvokeDepthGuard;
     invoke_inner(args, base_url, secret)
 }
@@ -153,12 +153,23 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
         .unwrap_or(&tenant_keyspace);
     let invoke_depth = context::current_invoke_depth().saturating_sub(1); // current depth (already incremented)
 
+    tracing::info!(
+        tenant_id = %tenant_id,
+        function_name = %function_name,
+        invoke_depth = invoke_depth,
+        has_input = input_json.is_some(),
+        "sql_invoke: request"
+    );
+
     // 8. Build request
     let url = format!("{}/internal/v1/functions/invoke", base_url);
     let body = serde_json::json!({
         "tenant_id": tenant_id,
         "function_name": function_name,
         "input_json": input_json,
+        // v1: caller_sub is null — SQL invoke runs as superuser and the backend
+        // does not use caller identity for authorization. Future versions may
+        // propagate the session principal here.
         "caller_sub": null,
         "invoke_depth": invoke_depth,
         "idempotency_key": format!(
@@ -169,21 +180,25 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
         ),
     });
 
-    // 9. Execute HTTP request
-    let response = run_async(async {
-        get_client()
+    // 9. Execute HTTP request (single block_in_place for both send + body read)
+    let start = Instant::now();
+    let (status, response_text) = run_async(async {
+        let resp = get_client()
             .post(&url)
             .header("Content-Type", "application/json")
             .header("X-Internal-Secret", secret)
             .json(&body)
             .send()
             .await
-    })
-    .map_err(|e| anyhow!("serverless_functions.invoke: request failed: {e}"))?;
-
-    let status = response.status();
-    let response_text = run_async(response.text())
-        .map_err(|e| anyhow!("serverless_functions.invoke: failed to read response: {e}"))?;
+            .map_err(|e| anyhow!("serverless_functions.invoke: request failed: {e}"))?;
+        let st = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow!("serverless_functions.invoke: failed to read response: {e}"))?;
+        Ok::<_, anyhow::Error>((st, text))
+    })?;
+    let elapsed_ms = start.elapsed().as_millis();
 
     // 10. Parse response
     if !status.is_success() {
@@ -198,12 +213,27 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
                 .or_else(|| err_json.get("error_message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                function_name = %function_name,
+                http_status = status.as_u16(),
+                error_code = %code,
+                elapsed_ms = elapsed_ms,
+                "sql_invoke: backend error"
+            );
             return Err(anyhow!(
                 "serverless_functions.invoke: {} ({})",
                 msg,
                 code
             ));
         }
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            function_name = %function_name,
+            http_status = status.as_u16(),
+            elapsed_ms = elapsed_ms,
+            "sql_invoke: backend HTTP error"
+        );
         return Err(anyhow!(
             "serverless_functions.invoke: HTTP {} — {}",
             status,
@@ -228,6 +258,14 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
             .get("error_code")
             .and_then(|v| v.as_str())
             .unwrap_or("invoke_failed");
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            function_name = %function_name,
+            status = %resp_status,
+            error_code = %error_code,
+            elapsed_ms = elapsed_ms,
+            "sql_invoke: function did not complete"
+        );
         return Err(anyhow!(
             "serverless_functions.invoke: {} ({}: {})",
             error_msg,
@@ -235,6 +273,13 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
             resp_status
         ));
     }
+
+    tracing::info!(
+        tenant_id = %tenant_id,
+        function_name = %function_name,
+        elapsed_ms = elapsed_ms,
+        "sql_invoke: completed"
+    );
 
     // 11. Return result_json as JSONB, or NULL if absent
     match resp.get("result_json") {

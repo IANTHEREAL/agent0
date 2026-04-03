@@ -214,9 +214,11 @@ pub(crate) fn try_enter_invoke(max_depth: u32) -> Result<()> {
 
 pub(crate) fn leave_invoke() {
     let _ = CTX.try_with(|ctx| {
-        ctx.statement_state
+        let prev = ctx
+            .statement_state
             .invoke_depth
             .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "invoke_depth underflow");
     });
 }
 
