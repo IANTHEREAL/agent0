@@ -1,5 +1,53 @@
 use super::*;
 
+/// Maximum retries for TiKV region errors (RegionNotFound, EpochNotMatch, etc.)
+/// that can occur after region split/merge operations.
+pub(super) const REGION_ERROR_MAX_RETRIES: u32 = 3;
+
+/// Returns `true` if the error originated from a TiKV region routing issue
+/// (split, merge, leader transfer) that is expected to resolve on retry with
+/// a fresh transaction whose region cache has been refreshed.
+///
+/// Excludes non-routing `RegionError` variants that tikv-client surfaces
+/// without internal retry: `server_is_busy` (handled by AIMD backpressure),
+/// `raft_entry_too_large` (deterministic, won't resolve on retry),
+/// `max_timestamp_not_synced`, and `disk_full`.
+pub(super) fn is_retryable_region_error(err: &anyhow::Error) -> bool {
+    fn is_retryable_region(err: &tikv_client::Error) -> bool {
+        match err {
+            tikv_client::Error::RegionError(re) => {
+                // tikv-client internally retries most routing errors
+                // (not_leader, epoch_not_match, region_not_found, stale_command).
+                // It only surfaces these non-routing errors as RegionError:
+                re.server_is_busy.is_none()
+                    && re.raft_entry_too_large.is_none()
+                    && re.max_timestamp_not_synced.is_none()
+                    && re.disk_full.is_none()
+            }
+            tikv_client::Error::UndeterminedError(inner) => is_retryable_region(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => {
+                // all(): if ANY error in the batch is non-retryable (e.g. DiskFull),
+                // do not retry. Matches TiKV's own aggregate error predicate semantics.
+                !errors.is_empty() && errors.iter().all(is_retryable_region)
+            }
+            _ => false,
+        }
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(is_retryable_region)
+    })
+}
+
+/// Backoff sleep for region error retries: 500ms, 1s, 2s, ...
+pub(super) async fn region_error_backoff(attempt: u32) {
+    let ms = 500u64 * (1u64 << attempt.min(4));
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 pub(super) fn should_start_cic_backfill(state: IndexState) -> bool {
     matches!(state, IndexState::Building)
 }
@@ -145,100 +193,109 @@ pub(super) async fn execute_hnsw_merge(
         pre_txn.rollback().await.ok();
     }
 
+    let mut region_retries = 0u32;
     loop {
-        let mut txn = store.begin().await?;
-        let mut txn_guard = crate::worker::active_txn_registry::global_registry()
-            .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
+        // Each iteration processes one batch inside a fresh transaction.
+        // Wrap in an async block so region errors can be caught and retried
+        // with a new transaction (fresh region cache) instead of propagating
+        // permanently — fixes #2271.
+        let batch_result: Result<Option<usize>> = async {
+            let mut txn = store.begin().await?;
+            let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+                .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
-        // 1. Read meta with pessimistic lock.
-        // get_for_update is the last line of defense against duplicate merge
-        // execution. Worker claims are now bound to the exact queue entry, but
-        // manual requeue / operator mistakes must still not let two merges
-        // compute the same next graph_version from a stale snapshot.
-        let meta_key = hnsw_meta_key(db_id, table_id, index_id);
-        let Some(meta_bytes) = txn.get_for_update(meta_key.clone()).await? else {
-            // Index metadata missing — index was dropped. Abort silently.
-            if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() {
-                    g.quarantine();
+            // 1. Read meta with pessimistic lock.
+            // get_for_update is the last line of defense against duplicate merge
+            // execution. Worker claims are now bound to the exact queue entry, but
+            // manual requeue / operator mistakes must still not let two merges
+            // compute the same next graph_version from a stale snapshot.
+            let meta_key = hnsw_meta_key(db_id, table_id, index_id);
+            let Some(meta_bytes) = txn.get_for_update(meta_key.clone()).await? else {
+                // Index metadata missing — index was dropped. Abort silently.
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
                 }
-            }
-            break;
-        };
-        let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
-        if should_skip_frozen_merge(&meta) {
-            if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() {
-                    g.quarantine();
+                return Ok(None);
+            };
+            let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
+            if should_skip_frozen_merge(&meta) {
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
                 }
+                info!(table_id, index_id, "HNSW merge skipped: index is frozen");
+                return Ok(None);
             }
-            info!(table_id, index_id, "HNSW merge skipped: index is frozen");
-            return Ok(());
-        }
-        if meta.storage_version != 1 && meta.storage_version != 2 {
-            if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() {
-                    g.quarantine();
+            if meta.storage_version != 1 && meta.storage_version != 2 {
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
                 }
-            }
-            return Err(anyhow!(
-                "HNSW index has unsupported storage_version={}; only v1/v2 supported",
-                meta.storage_version
-            ));
-        }
-
-        // 2. Scan up to MERGE_BATCH_SIZE delta keys.
-        let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
-        let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
-        let mut batch_keys: Vec<Vec<u8>> = Vec::new();
-        let mut batch_deltas: Vec<HnswDelta> = Vec::new();
-        let mut scan_start = prefix.clone();
-
-        while batch_deltas.len() < MERGE_BATCH_SIZE {
-            let remaining = (MERGE_BATCH_SIZE - batch_deltas.len()) as u32;
-            let scan_limit = remaining.min(1024);
-            let range: BoundRange = (scan_start.clone()..end.clone()).into();
-            let pairs: Vec<tikv_client::KvPair> = txn.scan(range, scan_limit).await?.collect();
-            let page_count = pairs.len();
-            if page_count == 0 {
-                break;
+                return Err(anyhow!(
+                    "HNSW index has unsupported storage_version={}; only v1/v2 supported",
+                    meta.storage_version
+                ));
             }
 
-            for pair in pairs {
-                let k: &[u8] = pair.key().as_ref().into();
-                let key: Vec<u8> = k.to_vec();
-                if !key.starts_with(&prefix) {
+            // 2. Scan up to MERGE_BATCH_SIZE delta keys.
+            let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+            let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+            let mut batch_keys: Vec<Vec<u8>> = Vec::new();
+            let mut batch_deltas: Vec<HnswDelta> = Vec::new();
+            let mut scan_start = prefix.clone();
+
+            while batch_deltas.len() < MERGE_BATCH_SIZE {
+                let remaining = (MERGE_BATCH_SIZE - batch_deltas.len()) as u32;
+                let scan_limit = remaining.min(1024);
+                let range: BoundRange = (scan_start.clone()..end.clone()).into();
+                let pairs: Vec<tikv_client::KvPair> = txn.scan(range, scan_limit).await?.collect();
+                let page_count = pairs.len();
+                if page_count == 0 {
                     break;
                 }
-                let delta: HnswDelta = bincode::deserialize(pair.value())?;
-                scan_start = key.clone();
-                scan_start.push(0x00);
-                batch_keys.push(key);
-                batch_deltas.push(delta);
-                if batch_deltas.len() >= MERGE_BATCH_SIZE {
+
+                for pair in pairs {
+                    let k: &[u8] = pair.key().as_ref().into();
+                    let key: Vec<u8> = k.to_vec();
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    let delta: HnswDelta = bincode::deserialize(pair.value())?;
+                    scan_start = key.clone();
+                    scan_start.push(0x00);
+                    batch_keys.push(key);
+                    batch_deltas.push(delta);
+                    if batch_deltas.len() >= MERGE_BATCH_SIZE {
+                        break;
+                    }
+                }
+                if (page_count as u32) < scan_limit {
                     break;
                 }
             }
-            if (page_count as u32) < scan_limit {
-                break;
-            }
-        }
 
-        if batch_deltas.is_empty() {
-            if txn.rollback().await.is_err() {
-                if let Some(g) = txn_guard.as_mut() {
-                    g.quarantine();
+            if batch_deltas.is_empty() {
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
                 }
+                return Ok(None); // No more deltas — merge complete.
             }
-            break; // No more deltas — merge complete.
-        }
 
-        let batch_count = batch_deltas.len();
+            let batch_count = batch_deltas.len();
 
-        // 3. Load base graph (or create empty if none exists yet).
-        let keyspace = store.keyspace().unwrap_or("default");
-        let (index, _): (crate::sql::hnsw::HnswIndexHandle, _) =
-            match load_base_graph(&mut txn, db_id, table_id, index_id, &meta, keyspace).await? {
+            // 3. Load base graph (or create empty if none exists yet).
+            let keyspace = store.keyspace().unwrap_or("default");
+            let (index, _): (crate::sql::hnsw::HnswIndexHandle, _) = match load_base_graph(
+                &mut txn, db_id, table_id, index_id, &meta, keyspace,
+            )
+            .await?
+            {
                 Some(pair) => pair,
                 None => create_empty_hnsw_index(
                     meta.dimensions,
@@ -248,122 +305,146 @@ pub(super) async fn execute_hnsw_merge(
                 )?,
             };
 
-        // 4. Reserve capacity + apply deltas.
-        let needed = index.size() as u64 + batch_count as u64;
-        if needed > index.capacity() as u64 {
-            let next_cap = needed.saturating_mul(2).max(1);
-            index
-                .reserve(next_cap as usize)
-                .map_err(|e| anyhow!("HNSW reserve failed: {}", e))?;
-        }
-        for delta in &batch_deltas {
-            index
-                .add(delta.label, &delta.vector)
-                .map_err(|e| anyhow!("HNSW add failed: {}", e))?;
-        }
-
-        // 5. Serialize new base graph.
-        let mut updated_meta = meta.clone();
-        updated_meta.count = index.size() as u64;
-        updated_meta.capacity = index.capacity() as u64;
-        let (graph_bytes, _meta_bytes_tikv) =
-            serialize_hnsw_snapshot(db_id, table_id, index_id, index.deref(), &updated_meta)?;
-
-        // 5a. S3 vs TiKV write path for the graph blob.
-        if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
-            // S3 path: upload graph to S3, increment graph_version.
-            let previous_version = updated_meta.graph_version;
-            let new_version = updated_meta.graph_version + 1;
-            s3.put_graph(
-                keyspace,
-                db_id,
-                table_id,
-                index_id,
-                new_version,
-                bytes::Bytes::from(graph_bytes),
-            )
-            .await
-            .map_err(|e| anyhow!("HNSW S3 put_graph failed: {}", e))?;
-            updated_meta.graph_version = new_version;
-            // First S3 write: upgrade storage_version to 2.
-            if updated_meta.storage_version == 1 {
-                updated_meta.storage_version = 2;
+            // 4. Reserve capacity + apply deltas.
+            let needed = index.size() as u64 + batch_count as u64;
+            if needed > index.capacity() as u64 {
+                let next_cap = needed.saturating_mul(2).max(1);
+                index
+                    .reserve(next_cap as usize)
+                    .map_err(|e| anyhow!("HNSW reserve failed: {}", e))?;
             }
-            // Unfreeze if previously frozen (S3 has no size limit concern).
-            updated_meta.frozen = false;
-            // Re-serialize meta with updated graph_version/storage_version.
-            let meta_bytes_s3 = serde_json::to_vec(&updated_meta)?;
-            txn_put(&mut txn, meta_key, meta_bytes_s3).await?;
-            if previous_version > 0 {
-                let marker = HnswS3RetiredVersionGc {
-                    delete_after_safepoint: None,
-                };
+            for delta in &batch_deltas {
+                index
+                    .add(delta.label, &delta.vector)
+                    .map_err(|e| anyhow!("HNSW add failed: {}", e))?;
+            }
+
+            // 5. Serialize new base graph.
+            let mut updated_meta = meta.clone();
+            updated_meta.count = index.size() as u64;
+            updated_meta.capacity = index.capacity() as u64;
+            let (graph_bytes, _meta_bytes_tikv) =
+                serialize_hnsw_snapshot(db_id, table_id, index_id, index.deref(), &updated_meta)?;
+
+            // 5a. S3 vs TiKV write path for the graph blob.
+            if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+                // S3 path: upload graph to S3, increment graph_version.
+                let previous_version = updated_meta.graph_version;
+                let new_version = updated_meta.graph_version + 1;
+                s3.put_graph(
+                    keyspace,
+                    db_id,
+                    table_id,
+                    index_id,
+                    new_version,
+                    bytes::Bytes::from(graph_bytes),
+                )
+                .await
+                .map_err(|e| anyhow!("HNSW S3 put_graph failed: {}", e))?;
+                updated_meta.graph_version = new_version;
+                // First S3 write: upgrade storage_version to 2.
+                if updated_meta.storage_version == 1 {
+                    updated_meta.storage_version = 2;
+                }
+                // Unfreeze if previously frozen (S3 has no size limit concern).
+                updated_meta.frozen = false;
+                // Re-serialize meta with updated graph_version/storage_version.
+                let meta_bytes_s3 = serde_json::to_vec(&updated_meta)?;
+                txn_put(&mut txn, meta_key, meta_bytes_s3).await?;
+                if previous_version > 0 {
+                    let marker = HnswS3RetiredVersionGc {
+                        delete_after_safepoint: None,
+                    };
+                    txn_put(
+                        &mut txn,
+                        hnsw_s3_retired_version_key(db_id, table_id, index_id, previous_version),
+                        serde_json::to_vec(&marker)?,
+                    )
+                    .await?;
+                }
+                // On first migration (old graph was in TiKV), delete the stale
+                // TiKV graph blob. Safe: concurrent queries at older snapshots
+                // still see it via MVCC; no future query will read it since
+                // graph_version > 0 routes to S3.
+                if new_version == 1 {
+                    let graph_key =
+                        crate::sql::hnsw::storage::hnsw_graph_key(db_id, table_id, index_id);
+                    crate::txn::txn_delete(&mut txn, graph_key).await?;
+                }
+                // Skip TiKV graph write and oversize check — graph is in S3.
+            } else {
+                // TiKV path: check oversize freeze, then write graph to TiKV.
+                if let Some(frozen_meta_bytes) =
+                    check_graph_oversize_freeze(graph_bytes.len(), &updated_meta)
+                {
+                    warn!(
+                        table_id,
+                        index_id,
+                        graph_bytes = graph_bytes.len(),
+                        limit = HNSW_GRAPH_MAX_BYTES,
+                        "HNSW graph exceeds size limit — freezing index"
+                    );
+                    txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
+                    txn.commit().await?;
+                    return Ok(None);
+                }
+
+                // 6. Atomic write: new base graph + update meta.
                 txn_put(
                     &mut txn,
-                    hnsw_s3_retired_version_key(db_id, table_id, index_id, previous_version),
-                    serde_json::to_vec(&marker)?,
+                    hnsw_graph_key(db_id, table_id, index_id),
+                    graph_bytes,
                 )
                 .await?;
+                let meta_bytes_new = serde_json::to_vec(&updated_meta)?;
+                txn_put(&mut txn, meta_key, meta_bytes_new).await?;
             }
-            // On first migration (old graph was in TiKV), delete the stale
-            // TiKV graph blob. Safe: concurrent queries at older snapshots
-            // still see it via MVCC; no future query will read it since
-            // graph_version > 0 routes to S3.
-            if new_version == 1 {
-                let graph_key =
-                    crate::sql::hnsw::storage::hnsw_graph_key(db_id, table_id, index_id);
-                crate::txn::txn_delete(&mut txn, graph_key).await?;
+            delete_delta_keys(&mut txn, &batch_keys).await?;
+
+            // 7. Commit.
+            if let Err(e) = txn.commit().await {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
+                }
+                return Err(e.into());
             }
-            // Skip TiKV graph write and oversize check — graph is in S3.
-        } else {
-            // TiKV path: check oversize freeze, then write graph to TiKV.
-            if let Some(frozen_meta_bytes) =
-                check_graph_oversize_freeze(graph_bytes.len(), &updated_meta)
+
+            info!(
+                table_id,
+                index_id,
+                batch_count,
+                graph_size = index.size(),
+                "HNSW merge batch committed"
+            );
+
+            Ok(Some(batch_count))
+        }
+        .await;
+
+        match batch_result {
+            Ok(Some(batch_count)) => {
+                region_retries = 0;
+                total_deltas_merged += batch_count;
+                // If we got fewer than MERGE_BATCH_SIZE deltas, no more remain.
+                if batch_count < MERGE_BATCH_SIZE {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e)
+                if is_retryable_region_error(&e) && region_retries < REGION_ERROR_MAX_RETRIES =>
             {
+                region_retries += 1;
                 warn!(
                     table_id,
                     index_id,
-                    graph_bytes = graph_bytes.len(),
-                    limit = HNSW_GRAPH_MAX_BYTES,
-                    "HNSW graph exceeds size limit — freezing index"
+                    attempt = region_retries,
+                    max_retries = REGION_ERROR_MAX_RETRIES,
+                    "HNSW merge: region error, retrying with fresh transaction: {e}"
                 );
-                txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
-                txn.commit().await?;
-                return Ok(());
+                region_error_backoff(region_retries - 1).await;
             }
-
-            // 6. Atomic write: new base graph + update meta.
-            txn_put(
-                &mut txn,
-                hnsw_graph_key(db_id, table_id, index_id),
-                graph_bytes,
-            )
-            .await?;
-            let meta_bytes_new = serde_json::to_vec(&updated_meta)?;
-            txn_put(&mut txn, meta_key, meta_bytes_new).await?;
-        }
-        delete_delta_keys(&mut txn, &batch_keys).await?;
-
-        // 7. Commit.
-        if let Err(e) = txn.commit().await {
-            if let Some(g) = txn_guard.as_mut() {
-                g.quarantine();
-            }
-            return Err(e.into());
-        }
-        total_deltas_merged += batch_count;
-
-        info!(
-            table_id,
-            index_id,
-            batch_count,
-            graph_size = index.size(),
-            "HNSW merge batch committed"
-        );
-
-        // If we got fewer than MERGE_BATCH_SIZE deltas, no more remain.
-        if batch_count < MERGE_BATCH_SIZE {
-            break;
+            Err(e) => return Err(e),
         }
     }
 

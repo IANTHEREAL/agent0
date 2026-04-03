@@ -227,11 +227,7 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
                 elapsed_ms = elapsed_ms,
                 "sql_invoke: backend error"
             );
-            return Err(anyhow!(
-                "serverless_functions.invoke: {} ({})",
-                msg,
-                code
-            ));
+            return Err(anyhow!("serverless_functions.invoke: {} ({})", msg, code));
         }
         tracing::warn!(
             tenant_id = %tenant_id,
@@ -306,11 +302,9 @@ mod tests {
     /// OnceLock in backend_url()/internal_secret() is lazy, so this must run
     /// before the first invoke() call that reaches step 2.
     fn ensure_env() {
-        INIT_ENV.call_once(|| {
-            unsafe {
-                std::env::set_var("DB9_FUNCTIONS_BACKEND_URL", "http://localhost:19999");
-                std::env::set_var("INTERNAL_CONTROL_SECRET", "test-secret");
-            }
+        INIT_ENV.call_once(|| unsafe {
+            std::env::set_var("DB9_FUNCTIONS_BACKEND_URL", "http://localhost:19999");
+            std::env::set_var("INTERNAL_CONTROL_SECRET", "test-secret");
         });
     }
 
@@ -324,8 +318,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("permission denied for extension"),
+            err.to_string().contains("permission denied for extension"),
             "expected PermissionDenied, got: {err}"
         );
     }
@@ -333,8 +326,8 @@ mod tests {
     #[tokio::test]
     async fn invoke_rejects_inside_transaction() {
         ensure_env();
-        let opts = ExtensionContextOpts::statement(true, false, "test_ks")
-            .with_in_transaction(true);
+        let opts =
+            ExtensionContextOpts::statement(true, false, "test_ks").with_in_transaction(true);
         let err = context::with_context_opts(opts, async { invoke(sample_args()) })
             .await
             .unwrap_err();

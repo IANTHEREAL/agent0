@@ -103,35 +103,33 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
     // future size.  Without this, debug-mode builds accumulate all 11
     // task_local::scope layers into one stack frame, which overflows the
     // default 2 MiB tokio test stack.
-    let inner = Box::pin(
-        crate::session_context::with_keyspace(
-            tenant_keyspace.clone(),
-            crate::session_context::with_database_id(
-                database_id,
-                crate::session_context::with_txn_snapshot_ts_version(
-                    txn_snapshot_ts_version,
-                    crate::session_context::with_session_txn_tracker(
-                        session_txn_tracker,
-                        crate::session_context::with_extension_txn_delta(
-                            extension_txn_delta,
-                            crate::extensions::context::with_context_opts(
-                                crate::extensions::context::ExtensionContextOpts::statement(
-                                    settings.is_superuser,
-                                    settings.bypass_rls,
-                                    tenant_keyspace.as_ref(),
-                                )
-                                .with_in_transaction(runtime.is_in_transaction)
-                                .with_caller_sub(runtime.caller_sub.clone())
-                                .with_statement_state(extension_statement_state)
-                                .with_tikv_client(tikv_client),
-                                fut,
-                            ),
+    let inner = Box::pin(crate::session_context::with_keyspace(
+        tenant_keyspace.clone(),
+        crate::session_context::with_database_id(
+            database_id,
+            crate::session_context::with_txn_snapshot_ts_version(
+                txn_snapshot_ts_version,
+                crate::session_context::with_session_txn_tracker(
+                    session_txn_tracker,
+                    crate::session_context::with_extension_txn_delta(
+                        extension_txn_delta,
+                        crate::extensions::context::with_context_opts(
+                            crate::extensions::context::ExtensionContextOpts::statement(
+                                settings.is_superuser,
+                                settings.bypass_rls,
+                                tenant_keyspace.as_ref(),
+                            )
+                            .with_in_transaction(runtime.is_in_transaction)
+                            .with_caller_sub(runtime.caller_sub.clone())
+                            .with_statement_state(extension_statement_state)
+                            .with_tikv_client(tikv_client),
+                            fut,
                         ),
                     ),
                 ),
             ),
         ),
-    );
+    ));
 
     Box::pin(crate::session_context::with_timezone(
         settings.timezone,

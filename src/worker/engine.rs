@@ -18,9 +18,10 @@ use crate::worker::types::*;
 use anyhow::{anyhow, Result};
 pub(crate) use helpers::HNSW_GRAPH_MAX_BYTES;
 use helpers::{
-    background_statement_extension_context, execute_hnsw_merge, parse_backfill_index_command,
-    parse_hnsw_merge_command, repair_incomplete_cic_states, should_skip_frozen_merge,
-    should_start_cic_backfill,
+    background_statement_extension_context, execute_hnsw_merge, is_retryable_region_error,
+    parse_backfill_index_command, parse_hnsw_merge_command, region_error_backoff,
+    repair_incomplete_cic_states, should_skip_frozen_merge, should_start_cic_backfill,
+    REGION_ERROR_MAX_RETRIES,
 };
 use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
@@ -1208,104 +1209,132 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
 
     let handle = pool.acquire(Some(keyspace.to_string())).await?;
     let store = handle.store().clone();
-    let mut txn = store.begin().await?;
-    // This read-only snapshot scans all tables, schemas, and per-index delta
-    // prefixes — proportional to tenant size.  Register with the GC safepoint
-    // so GC does not advance past this snapshot while the sweep runs.
-    let mut txn_guard = crate::worker::active_txn_registry::global_registry()
-        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
-    let table_names = store.list_tables(&mut txn, db_id).await?;
-    let mut observed = 0u32;
-    let mut enqueued = 0u32;
-    let mut enqueue_errors = 0u32;
+    // Retry the entire scan+enqueue with a fresh transaction on region errors
+    // (RegionNotFound, EpochNotMatch, etc.) that occur after TiKV region
+    // split/merge. Each retry starts a new snapshot so the tikv-client region
+    // cache is refreshed. Fixes #2271.
+    for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+        let result: Result<HnswSweepResult> = async {
+            let mut txn = store.begin().await?;
+            // This read-only snapshot scans all tables, schemas, and per-index delta
+            // prefixes — proportional to tenant size.  Register with the GC safepoint
+            // so GC does not advance past this snapshot while the sweep runs.
+            let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+                .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
-    for table_name in table_names {
-        let Some(schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
-            continue;
-        };
-        for index in &schema.indexes {
-            if !index.is_hnsw() {
-                continue;
-            }
+            let table_names = store.list_tables(&mut txn, db_id).await?;
+            let mut observed = 0u32;
+            let mut enqueued = 0u32;
+            let mut enqueue_errors = 0u32;
 
-            // Check if index is frozen — skip enqueue entirely.
-            let mk = hnsw_meta_key(db_id, schema.table_id, index.id);
-            if let Some(meta_bytes) = txn.get(mk).await? {
-                if let Ok(meta) = serde_json::from_slice::<HnswMeta>(&meta_bytes) {
-                    if should_skip_frozen_merge(&meta) {
+            for table_name in table_names {
+                let Some(schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
+                    continue;
+                };
+                for index in &schema.indexes {
+                    if !index.is_hnsw() {
                         continue;
+                    }
+
+                    // Check if index is frozen — skip enqueue entirely.
+                    let mk = hnsw_meta_key(db_id, schema.table_id, index.id);
+                    if let Some(meta_bytes) = txn.get(mk).await? {
+                        if let Ok(meta) = serde_json::from_slice::<HnswMeta>(&meta_bytes) {
+                            if should_skip_frozen_merge(&meta) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Probe for pending deltas (limit=1, just checking existence)
+                    let prefix = hnsw_delta_prefix(db_id, schema.table_id, index.id);
+                    let end = hnsw_delta_prefix_end(db_id, schema.table_id, index.id);
+                    let range: BoundRange = (prefix..end).into();
+                    let pairs: Vec<_> = txn.scan(range, 1).await?.collect();
+                    if pairs.is_empty() {
+                        continue;
+                    }
+
+                    observed += 1;
+
+                    // Deltas found → enqueue merge task
+                    let task_id = match hnsw_merge_task_id(schema.table_id, index.id) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!(
+                                "HNSW sweep: task_id overflow for table_id={} index_id={}: {}",
+                                schema.table_id, index.id, e
+                            );
+                            enqueue_errors += 1;
+                            continue;
+                        }
+                    };
+                    let mut entry = TaskQueueEntry::new(
+                        keyspace.to_string(),
+                        db_id,
+                        task_id,
+                        TaskType::HnswMerge,
+                        format!("__hnsw_merge {} {}", schema.table_id, index.id),
+                        "system".to_string(),
+                        192,
+                    );
+                    entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
+
+                    let enqueue_result: Result<()> = async {
+                        let mut sys_txn = system_store.begin().await?;
+                        system_store
+                            .put_worker_queue_entry(&mut sys_txn, &entry, 0)
+                            .await?;
+                        sys_txn.commit().await?;
+                        Ok(())
+                    }
+                    .await;
+
+                    match enqueue_result {
+                        Ok(()) => enqueued += 1,
+                        Err(e) => {
+                            enqueue_errors += 1;
+                            warn!(
+                                "HNSW sweep: failed to enqueue merge for table_id={} index_id={}: {}",
+                                schema.table_id, index.id, e
+                            );
+                        }
                     }
                 }
             }
 
-            // Probe for pending deltas (limit=1, just checking existence)
-            let prefix = hnsw_delta_prefix(db_id, schema.table_id, index.id);
-            let end = hnsw_delta_prefix_end(db_id, schema.table_id, index.id);
-            let range: BoundRange = (prefix..end).into();
-            let pairs: Vec<_> = txn.scan(range, 1).await?.collect();
-            if pairs.is_empty() {
-                continue;
-            }
-
-            observed += 1;
-
-            // Deltas found → enqueue merge task
-            let task_id = match hnsw_merge_task_id(schema.table_id, index.id) {
-                Ok(id) => id,
-                Err(e) => {
-                    warn!(
-                        "HNSW sweep: task_id overflow for table_id={} index_id={}: {}",
-                        schema.table_id, index.id, e
-                    );
-                    enqueue_errors += 1;
-                    continue;
-                }
-            };
-            let mut entry = TaskQueueEntry::new(
-                keyspace.to_string(),
-                db_id,
-                task_id,
-                TaskType::HnswMerge,
-                format!("__hnsw_merge {} {}", schema.table_id, index.id),
-                "system".to_string(),
-                192,
-            );
-            entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
-
-            let enqueue_result: Result<()> = async {
-                let mut sys_txn = system_store.begin().await?;
-                system_store
-                    .put_worker_queue_entry(&mut sys_txn, &entry, 0)
-                    .await?;
-                sys_txn.commit().await?;
-                Ok(())
-            }
-            .await;
-
-            match enqueue_result {
-                Ok(()) => enqueued += 1,
-                Err(e) => {
-                    enqueue_errors += 1;
-                    warn!(
-                        "HNSW sweep: failed to enqueue merge for table_id={} index_id={}: {}",
-                        schema.table_id, index.id, e
-                    );
+            if txn.rollback().await.is_err() {
+                if let Some(g) = txn_guard.as_mut() {
+                    g.quarantine();
                 }
             }
+            Ok(HnswSweepResult {
+                observed,
+                enqueued,
+                enqueue_errors,
+            })
+        }
+        .await;
+
+        match result {
+            Ok(r) => return Ok(r),
+            Err(e) if is_retryable_region_error(&e) && attempt < REGION_ERROR_MAX_RETRIES => {
+                warn!(
+                    keyspace,
+                    db_id,
+                    attempt = attempt + 1,
+                    max_retries = REGION_ERROR_MAX_RETRIES,
+                    "HNSW sweep: region error, retrying with fresh transaction: {e}"
+                );
+                region_error_backoff(attempt).await;
+            }
+            Err(e) => return Err(e),
         }
     }
 
-    if txn.rollback().await.is_err() {
-        if let Some(g) = txn_guard.as_mut() {
-            g.quarantine();
-        }
-    }
-    Ok(HnswSweepResult {
-        observed,
-        enqueued,
-        enqueue_errors,
-    })
+    // Unreachable: the loop either returns Ok or Err on the last attempt.
+    unreachable!()
 }
 
 async fn run_with_guards<F, T>(

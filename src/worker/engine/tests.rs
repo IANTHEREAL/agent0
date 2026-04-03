@@ -1195,3 +1195,307 @@ fn recovery_unfreeze_then_skip_check_returns_false() {
     let meta2: HnswMeta = serde_json::from_str(unfrozen_json).unwrap();
     assert!(!super::should_skip_frozen_merge(&meta2));
 }
+
+// ── is_retryable_region_error tests ────────────────────────────────────────
+
+/// Helper: wrap a tikv_client::Error in anyhow so is_retryable_region_error can inspect it.
+fn anyhow_tikv(err: tikv_client::Error) -> anyhow::Error {
+    anyhow::Error::new(err)
+}
+
+#[test]
+fn retryable_region_error_matches_region_not_found() {
+    let re = tikv_client::proto::errorpb::Error {
+        region_not_found: Some(tikv_client::proto::errorpb::RegionNotFound::default()),
+        ..Default::default()
+    };
+    let err = anyhow_tikv(tikv_client::Error::RegionError(Box::new(re)));
+    assert!(super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_matches_epoch_not_match() {
+    let re = tikv_client::proto::errorpb::Error {
+        epoch_not_match: Some(tikv_client::proto::errorpb::EpochNotMatch::default()),
+        ..Default::default()
+    };
+    let err = anyhow_tikv(tikv_client::Error::RegionError(Box::new(re)));
+    assert!(super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_matches_not_leader() {
+    let re = tikv_client::proto::errorpb::Error {
+        not_leader: Some(tikv_client::proto::errorpb::NotLeader::default()),
+        ..Default::default()
+    };
+    let err = anyhow_tikv(tikv_client::Error::RegionError(Box::new(re)));
+    assert!(super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_rejects_server_is_busy() {
+    let re = tikv_client::proto::errorpb::Error {
+        server_is_busy: Some(tikv_client::proto::errorpb::ServerIsBusy::default()),
+        ..Default::default()
+    };
+    let err = anyhow_tikv(tikv_client::Error::RegionError(Box::new(re)));
+    assert!(!super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_rejects_raft_entry_too_large() {
+    let re = tikv_client::proto::errorpb::Error {
+        raft_entry_too_large: Some(tikv_client::proto::errorpb::RaftEntryTooLarge::default()),
+        ..Default::default()
+    };
+    let err = anyhow_tikv(tikv_client::Error::RegionError(Box::new(re)));
+    assert!(!super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_rejects_disk_full() {
+    let re = tikv_client::proto::errorpb::Error {
+        disk_full: Some(tikv_client::proto::errorpb::DiskFull::default()),
+        ..Default::default()
+    };
+    let err = anyhow_tikv(tikv_client::Error::RegionError(Box::new(re)));
+    assert!(!super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_rejects_non_region_error() {
+    let err = anyhow_tikv(tikv_client::Error::StringError("not a region error".into()));
+    assert!(!super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_unwraps_undetermined() {
+    let re = tikv_client::proto::errorpb::Error {
+        region_not_found: Some(tikv_client::proto::errorpb::RegionNotFound::default()),
+        ..Default::default()
+    };
+    let inner = tikv_client::Error::RegionError(Box::new(re));
+    let err = anyhow_tikv(tikv_client::Error::UndeterminedError(Box::new(inner)));
+    assert!(super::is_retryable_region_error(&err));
+}
+
+#[test]
+fn retryable_region_error_rejects_mixed_batch_with_non_retryable() {
+    // A batch containing [RegionNotFound, DiskFull] must NOT be retried —
+    // the DiskFull error is non-retryable and won't resolve on retry.
+    let retryable = tikv_client::Error::RegionError(Box::new(tikv_client::proto::errorpb::Error {
+        region_not_found: Some(tikv_client::proto::errorpb::RegionNotFound::default()),
+        ..Default::default()
+    }));
+    let non_retryable =
+        tikv_client::Error::RegionError(Box::new(tikv_client::proto::errorpb::Error {
+            disk_full: Some(tikv_client::proto::errorpb::DiskFull::default()),
+            ..Default::default()
+        }));
+    let err = anyhow_tikv(tikv_client::Error::ExtractedErrors(vec![
+        retryable,
+        non_retryable,
+    ]));
+    assert!(
+        !super::is_retryable_region_error(&err),
+        "Mixed batch with DiskFull should NOT be retryable"
+    );
+}
+
+#[test]
+fn retryable_region_error_accepts_batch_all_retryable() {
+    let err1 = tikv_client::Error::RegionError(Box::new(tikv_client::proto::errorpb::Error {
+        region_not_found: Some(tikv_client::proto::errorpb::RegionNotFound::default()),
+        ..Default::default()
+    }));
+    let err2 = tikv_client::Error::RegionError(Box::new(tikv_client::proto::errorpb::Error {
+        not_leader: Some(tikv_client::proto::errorpb::NotLeader::default()),
+        ..Default::default()
+    }));
+    let err = anyhow_tikv(tikv_client::Error::ExtractedErrors(vec![err1, err2]));
+    assert!(
+        super::is_retryable_region_error(&err),
+        "Batch of all-retryable errors should be retryable"
+    );
+}
+
+// ── Regression test: reproduce #2271 and verify fix ────────────────────────
+//
+// Simulates the exact production scenario: a TiKV scan returns RegionNotFound
+// (region 32451 was split/merged) on the first N attempts, then succeeds on a
+// fresh transaction.
+//
+// Part 1 (old_pattern): no retry → permanent failure after first region error.
+// Part 2 (new_pattern): retry with fresh txn → recovers after transient errors.
+
+/// Simulate a TiKV scan that fails with RegionNotFound for the first
+/// `failures` calls, then returns Ok on subsequent calls.
+struct RegionErrorSimulator {
+    failures_remaining: std::sync::atomic::AtomicU32,
+}
+
+impl RegionErrorSimulator {
+    fn new(failures: u32) -> Self {
+        Self {
+            failures_remaining: std::sync::atomic::AtomicU32::new(failures),
+        }
+    }
+
+    /// Simulate a TiKV scan. Each call represents a fresh transaction attempt.
+    fn scan(&self) -> anyhow::Result<Vec<u8>> {
+        let remaining = self
+            .failures_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |v| if v > 0 { Some(v - 1) } else { Some(0) },
+            )
+            .unwrap();
+        if remaining > 0 {
+            // Reproduce the exact error from production logs:
+            // "region 32451 is missing"
+            let re = tikv_client::proto::errorpb::Error {
+                message: "region 32451 is missing".to_string(),
+                region_not_found: Some(tikv_client::proto::errorpb::RegionNotFound {
+                    region_id: 32451,
+                }),
+                ..Default::default()
+            };
+            Err(anyhow::Error::new(tikv_client::Error::RegionError(
+                Box::new(re),
+            )))
+        } else {
+            Ok(vec![1, 2, 3]) // simulated delta data
+        }
+    }
+}
+
+/// Reproduce #2271: old code pattern — single attempt, no retry.
+/// A single RegionNotFound causes permanent failure.
+#[test]
+fn regression_2271_old_pattern_fails_permanently() {
+    // Simulate: region error on first attempt, would succeed on second.
+    let sim = RegionErrorSimulator::new(1);
+
+    // Old code pattern: call scan once, propagate error via `?`.
+    let result: anyhow::Result<Vec<u8>> = sim.scan();
+
+    // OLD BEHAVIOR: error propagates, sweep aborts for this tenant.
+    // Next sweep (600s later) would hit the same error.
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        super::is_retryable_region_error(&err),
+        "Error should be a retryable region error but was: {err}"
+    );
+
+    // The scan WOULD succeed now (region cache refreshed), but old code
+    // never retries — it already returned Err to the caller.
+    assert!(
+        sim.scan().is_ok(),
+        "Second attempt would succeed, but old code never tries it"
+    );
+}
+
+/// Verify fix: new code pattern — retry loop with fresh transaction.
+/// Transient RegionNotFound errors recover after retry.
+#[test]
+fn regression_2271_new_pattern_retries_and_recovers() {
+    // Simulate: 2 region errors, then success on 3rd attempt.
+    let sim = RegionErrorSimulator::new(2);
+
+    // New code pattern: mirrors the retry loop in enqueue_pending_hnsw_merges.
+    let mut result: anyhow::Result<Vec<u8>> = Err(anyhow::anyhow!("not started"));
+    for attempt in 0..=super::REGION_ERROR_MAX_RETRIES {
+        // Each iteration = fresh transaction (fresh region cache).
+        result = sim.scan();
+        match &result {
+            Ok(_) => break,
+            Err(e)
+                if super::is_retryable_region_error(e)
+                    && attempt < super::REGION_ERROR_MAX_RETRIES =>
+            {
+                // In production: region_error_backoff(attempt).await
+                // In test: no sleep needed, just retry.
+                continue;
+            }
+            Err(_) => break, // non-retryable or retries exhausted
+        }
+    }
+
+    // NEW BEHAVIOR: recovered after 2 failures + 1 success.
+    assert!(
+        result.is_ok(),
+        "Should recover after transient region errors, got: {}",
+        result.unwrap_err()
+    );
+}
+
+/// Verify fix: retries exhausted → still fails (no infinite retry).
+#[test]
+fn regression_2271_retries_exhausted_still_fails() {
+    // Simulate: more failures than retries allowed.
+    let sim = RegionErrorSimulator::new(super::REGION_ERROR_MAX_RETRIES + 1);
+
+    let mut result: anyhow::Result<Vec<u8>> = Err(anyhow::anyhow!("not started"));
+    for attempt in 0..=super::REGION_ERROR_MAX_RETRIES {
+        result = sim.scan();
+        match &result {
+            Ok(_) => break,
+            Err(e)
+                if super::is_retryable_region_error(e)
+                    && attempt < super::REGION_ERROR_MAX_RETRIES =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // After REGION_ERROR_MAX_RETRIES+1 failures, we give up (no infinite loop).
+    assert!(
+        result.is_err(),
+        "Should fail when retries exhausted"
+    );
+}
+
+/// Verify fix: non-retryable errors (server_is_busy) are NOT retried.
+#[test]
+fn regression_2271_non_retryable_region_error_not_retried() {
+    let call_count = std::sync::atomic::AtomicU32::new(0);
+
+    let do_scan = || -> anyhow::Result<Vec<u8>> {
+        call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let re = tikv_client::proto::errorpb::Error {
+            server_is_busy: Some(tikv_client::proto::errorpb::ServerIsBusy::default()),
+            ..Default::default()
+        };
+        Err(anyhow::Error::new(tikv_client::Error::RegionError(
+            Box::new(re),
+        )))
+    };
+
+    let mut result: anyhow::Result<Vec<u8>> = Err(anyhow::anyhow!("not started"));
+    for attempt in 0..=super::REGION_ERROR_MAX_RETRIES {
+        result = do_scan();
+        match &result {
+            Ok(_) => break,
+            Err(e)
+                if super::is_retryable_region_error(e)
+                    && attempt < super::REGION_ERROR_MAX_RETRIES =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+
+    assert!(result.is_err());
+    // server_is_busy is NOT retryable, so only 1 call should have been made.
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "server_is_busy should NOT trigger retry — must fail on first attempt"
+    );
+}
