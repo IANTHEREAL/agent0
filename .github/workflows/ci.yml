@@ -17,12 +17,21 @@ env:
 jobs:
   # -- Build (single release build, shared via artifact) --------------------
   build-release:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-2xl
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-git-
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
@@ -32,31 +41,49 @@ jobs:
 
   # -- Lint (independent, debug build, no release artifact) -----------------
   lint:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-xl
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-git-
       - run: cargo fmt -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # -- Unit Tests (independent, debug build, no release artifact) -----------
   unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-xl
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-git-
       - run: cargo test
 
   # -- Regression Gate (download binary, no Rust needed) --------------------
   regression-gate:
     needs: build-release
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-2xl
     timeout-minutes: 30
     services:
       redis:
@@ -80,8 +107,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: orm-tests/package-lock.json
 
       - name: Install PostgreSQL client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
@@ -105,7 +130,7 @@ jobs:
   # -- Integration + ORM Tests (download binary) ---------------------------
   integration-tests:
     needs: build-release
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-2xl
     timeout-minutes: 25
     services:
       redis:
@@ -120,7 +145,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+      - uses: runs-on/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-git-
 
       - uses: actions/download-artifact@v4
         with:
@@ -131,8 +165,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: orm-tests/package-lock.json
 
       - uses: ./.github/actions/setup-tiup
       - uses: ./.github/actions/start-tikv
@@ -222,7 +254,7 @@ jobs:
   # -- GORM Smoke (download binary) ----------------------------------------
   gorm-smoke:
     needs: build-release
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-2xl
     timeout-minutes: 20
     services:
       redis:
@@ -246,8 +278,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
-          cache: true
-          cache-dependency-path: e2e/gorm_smoke/go.sum
 
       - name: Install PostgreSQL client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
@@ -298,7 +328,7 @@ jobs:
   # -- SQLAlchemy Smoke (download binary) -----------------------------------
   sqlalchemy-smoke:
     needs: build-release
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-amd64-c6i-2xl
     timeout-minutes: 30
     services:
       redis:
@@ -324,8 +354,6 @@ jobs:
           python-version: '3.12'
 
       - uses: astral-sh/setup-uv@v2
-        with:
-          enable-cache: true
 
       - name: Install PostgreSQL client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
