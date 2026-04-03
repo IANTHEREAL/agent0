@@ -409,8 +409,13 @@ pub(super) fn eval_function_call(
     }
 
     // Standard registry lookup.
+    // Try fully-qualified name first (e.g. "SERVERLESS_FUNCTIONS.INVOKE"),
+    // then fall back to unqualified (e.g. "UPPER").
     let registry = crate::sql::expr::functions::get_registry();
-    match registry.get(unqualified_name) {
+    match registry
+        .get(func_name_upper.as_str())
+        .or_else(|| registry.get(unqualified_name))
+    {
         Some(f) => f(args),
         None => Err(SqlError::Unsupported(format!("unknown function: {}", name)).into()),
     }
