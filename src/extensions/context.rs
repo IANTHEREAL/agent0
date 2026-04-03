@@ -192,6 +192,11 @@ pub(crate) fn execution_kind() -> ExecutionKind {
         .unwrap_or(ExecutionKind::Interactive)
 }
 
+pub(crate) fn http_request_ordinal() -> u32 {
+    CTX.try_with(|ctx| ctx.statement_state.http_requests.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 pub(crate) fn is_in_transaction() -> bool {
     CTX.try_with(|ctx| ctx.is_in_transaction).unwrap_or(false)
 }

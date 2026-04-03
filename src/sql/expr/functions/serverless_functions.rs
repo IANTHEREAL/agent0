@@ -166,6 +166,16 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
 
     // 8. Build request
     let caller_sub = context::caller_sub();
+    // Deterministic transport-level idempotency key: protects against HTTP-level
+    // retries/replays on the internal boundary. Components: tenant, function,
+    // statement timestamp (stable within a statement), and the HTTP request
+    // ordinal within this statement (from the shared quota counter).
+    let stmt_ts = crate::sql::statement_time::statement_timestamp_millis_or_now();
+    let call_ordinal = context::http_request_ordinal(); // Nth HTTP call in this statement
+    let idempotency_key = format!(
+        "sql:{}:{}:{}:{}",
+        tenant_id, function_name, stmt_ts, call_ordinal
+    );
     let url = format!("{}/internal/v1/functions/invoke", base_url);
     let body = serde_json::json!({
         "tenant_id": tenant_id,
@@ -173,9 +183,7 @@ fn invoke_inner(args: Vec<Value>, base_url: &str, secret: &str) -> Result<Value>
         "input_json": input_json,
         "caller_sub": caller_sub,
         "invoke_depth": invoke_depth,
-        // v1: no idempotency_key — each SQL statement execution is unique and
-        // there is no retry mechanism at the SQL layer. The backend handles
-        // null idempotency_key gracefully (skips dedup).
+        "idempotency_key": idempotency_key,
     });
 
     // 9. Execute HTTP request (single block_in_place for both send + body read)
