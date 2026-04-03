@@ -36,7 +36,7 @@ use super::super::encode::pgtype_to_datatype;
 use super::super::encode::{datatype_to_pgtype, effective_result_format, result_to_response};
 use super::super::errors::{
     ambiguous_column_error_with_position, in_failed_sql_transaction_pgwire_error,
-    sqlstate_for_executor_error,
+    pg_error_message, sqlstate_for_executor_error,
 };
 use super::super::params::{count_sql_parameters, decode_parameters};
 use super::super::portal::{
@@ -138,10 +138,11 @@ pub(in crate::protocol::handler) fn reject_unanalyzed_if_needed(
             context: "utility statements do not support parameters".into(),
         }
         .into();
+        let sqlstate = sqlstate_for_executor_error(&err);
         Some(PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),
-            sqlstate_for_executor_error(&err).to_string(),
-            err.to_string(),
+            sqlstate.to_string(),
+            pg_error_message(&err, sqlstate),
         ))))
     } else {
         None // genuine utility, no params -- safe as RawSqlUtility
@@ -717,10 +718,11 @@ impl DynamicPgHandler {
 
             if let Err(e) = privilege_result {
                 rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                let sqlstate = sqlstate_for_executor_error(&e);
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),
-                    sqlstate_for_executor_error(&e).to_string(),
-                    e.to_string(),
+                    sqlstate.to_string(),
+                    pg_error_message(&e, sqlstate),
                 ))));
             }
 
@@ -974,11 +976,14 @@ impl SimpleQueryHandler for DynamicPgHandler {
                             .await?;
                     }
                 }
-                error!("Query execution error: {}", e);
+                let sqlstate = sqlstate_for_executor_error(&e);
+                let pg_msg = pg_error_message(&e, sqlstate);
+                error!(sqlstate, "Query execution error: {}", pg_msg);
+                debug!("Query execution error detail: {}", e);
                 let mut error_info = ErrorInfo::new(
                     "ERROR".to_string(),
-                    sqlstate_for_executor_error(&e).to_string(),
-                    e.to_string(),
+                    sqlstate.to_string(),
+                    pg_msg,
                 );
                 if let Some((_col, pos)) =
                     ambiguous_column_error_with_position(query, &error_info.message)
@@ -1058,10 +1063,11 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 context: "utility statements do not support parameters".into(),
             }
             .into();
+            let sqlstate = sqlstate_for_executor_error(&err);
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
-                sqlstate_for_executor_error(&err).to_string(),
-                err.to_string(),
+                sqlstate.to_string(),
+                pg_error_message(&err, sqlstate),
             ))));
         }
 
@@ -1182,10 +1188,11 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                         Err(e) if param_count > 0 || is_data_statement_stmts(stmts) => {
                             // Data statements and parameterized statements must be analyzed.
                             let _ = txn.rollback().await;
+                            let sqlstate = sqlstate_for_executor_error(&e);
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_string(),
-                                sqlstate_for_executor_error(&e).to_string(),
-                                e.to_string(),
+                                sqlstate.to_string(),
+                                pg_error_message(&e, sqlstate),
                             ))));
                         }
                         Err(_) => {
@@ -1212,10 +1219,11 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                             context: "utility statements do not support parameters".into(),
                         }
                         .into();
+                        let sqlstate = sqlstate_for_executor_error(&err);
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
-                            sqlstate_for_executor_error(&err).to_string(),
-                            err.to_string(),
+                            sqlstate.to_string(),
+                            pg_error_message(&err, sqlstate),
                         ))));
                     }
                     // Utility, no params -- keep RawSqlUtility
@@ -1535,11 +1543,14 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                             .await?;
                     }
                 }
-                error!("Extended query execution error: {}", e);
+                let sqlstate = sqlstate_for_executor_error(&e);
+                let pg_msg = pg_error_message(&e, sqlstate);
+                error!(sqlstate, "Extended query execution error: {}", pg_msg);
+                debug!("Extended query execution error detail: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),
-                    sqlstate_for_executor_error(&e).to_string(),
-                    e.to_string(),
+                    sqlstate.to_string(),
+                    pg_msg,
                 ))))
             }
         }

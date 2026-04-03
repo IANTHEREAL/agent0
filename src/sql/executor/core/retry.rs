@@ -1,6 +1,6 @@
 //! Retry helpers
 
-pub(super) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     fn contains_retryable_error(err: &tikv_client::Error) -> bool {
         // Retry on WriteConflict AND Deadlock errors.
         //

@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::encode::encode_value;
-use super::errors::sqlstate_for_executor_error;
+use super::errors::{pg_error_message, sqlstate_for_executor_error};
 use super::params::{count_sql_parameters, decode_parameters};
 use super::portal::{
     max_suspended_portal_buffer_rows, max_suspended_portals, on_execute_with_tx_status_fix,
@@ -386,6 +386,44 @@ fn test_sqlstate_for_executor_error() {
             expected_code
         );
     }
+}
+
+#[test]
+fn test_pg_error_message_sanitizes_tikv_errors() {
+    // WriteConflict → PG-standard message, not raw TiKV proto text.
+    let write_conflict_ke = tikv_client::proto::kvrpcpb::KeyError {
+        conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+        ..Default::default()
+    };
+    let tikv_wc = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(write_conflict_ke)));
+    assert_eq!(
+        pg_error_message(&tikv_wc, "40001"),
+        "could not serialize access due to concurrent update"
+    );
+
+    // Deadlock → PG-standard message.
+    let deadlock_ke = tikv_client::proto::kvrpcpb::KeyError {
+        deadlock: Some(tikv_client::proto::kvrpcpb::Deadlock::default()),
+        ..Default::default()
+    };
+    let tikv_dl = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(deadlock_ke)));
+    assert_eq!(pg_error_message(&tikv_dl, "40P01"), "deadlock detected");
+
+    // ResolveLockError → PG-standard message (same as WriteConflict).
+    let tikv_lock = anyhow::Error::new(tikv_client::Error::ResolveLockError(Vec::new()));
+    assert_eq!(
+        pg_error_message(&tikv_lock, "40001"),
+        "could not serialize access due to concurrent update"
+    );
+
+    // SqlError → preserves original message (not sanitized).
+    let sql_err: anyhow::Error = SqlError::DivisionByZero.into();
+    let msg = pg_error_message(&sql_err, "22012");
+    assert_eq!(msg, "division by zero");
+
+    // Generic anyhow error → preserves original message.
+    let other = anyhow::anyhow!("something broke");
+    assert_eq!(pg_error_message(&other, "XX000"), "something broke");
 }
 
 #[test]

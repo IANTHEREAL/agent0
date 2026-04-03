@@ -1005,7 +1005,11 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         // [finalize] Single key delete for HNSW meta; immediate commit.
         "delete_hnsw_meta",
         // ── cron/worker.rs ──
-        // (gc_database IS long-lived and MUST have track_worker_txn — not in allowlist)
+        // [pre-check] gc_database uses two short-lived read-only txns (cron_enabled
+        // check + job metadata load) with immediate rollback. The actual batch
+        // processing happens in gc_database_batch_inner which has track_worker_txn.
+        "gc_database",
+        // (gc_database_batch_inner IS long-lived and MUST have track_worker_txn — not in allowlist)
 
         // ── sql/ddl/create_index.rs ──
 

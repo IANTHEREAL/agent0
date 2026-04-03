@@ -93,6 +93,25 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     "XX000"
 }
 
+/// Produce a PostgreSQL-compatible error message for executor errors.
+///
+/// TiKV transaction errors are replaced with standard PostgreSQL messages
+/// (e.g. "could not serialize access due to concurrent update") to avoid
+/// leaking internal implementation details to clients. Non-TiKV errors
+/// preserve their original message text.
+pub(super) fn pg_error_message(err: &anyhow::Error, sqlstate: &str) -> String {
+    match sqlstate {
+        "40001" => {
+            if is_tikv_write_conflict(err) || is_tikv_lock_resolution_failure(err) {
+                return "could not serialize access due to concurrent update".to_string();
+            }
+            err.to_string()
+        }
+        "40P01" => "deadlock detected".to_string(),
+        _ => err.to_string(),
+    }
+}
+
 fn find_unqualified_identifier_position(query: &str, ident: &str) -> Option<usize> {
     if ident.is_empty() {
         return None;

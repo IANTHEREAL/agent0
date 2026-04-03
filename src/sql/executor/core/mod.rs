@@ -14,7 +14,7 @@ pub(crate) mod plan_cache;
 pub(crate) mod prepared_analysis;
 pub(crate) mod prepared_stmt;
 mod query_exec;
-mod retry;
+pub(crate) mod retry;
 mod scan;
 mod settings_tableless;
 mod statement;

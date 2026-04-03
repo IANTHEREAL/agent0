@@ -142,6 +142,59 @@ impl TikvStore {
         Ok(runs)
     }
 
+    /// Paginated scan of cron runs. Returns `(runs, raw_keys)` where
+    /// `raw_keys[i]` is the TiKV key for `runs[i]`, used for point-deletes.
+    /// Pass the last element of `raw_keys` as `start_after` for the next page.
+    pub async fn list_cron_runs_batch(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<CronRun>, Vec<Vec<u8>>)> {
+        let prefix = encode_cron_run_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+
+        let range_start = match start_after {
+            Some(last_key) => {
+                // Start just past the last key: append 0x00 byte.
+                let mut next = last_key.to_vec();
+                next.push(0x00);
+                next
+            }
+            None => prefix.clone(),
+        };
+
+        let range: BoundRange = (range_start..end).into();
+        let scan_limit = scan_limit_to_u32(Some(limit));
+        let pairs = tikv_op!(txn.scan(range, scan_limit).await)?;
+
+        let mut runs = Vec::new();
+        let mut keys = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let run: CronRun =
+                bincode::deserialize(pair.value()).context("Failed to deserialize cron run")?;
+            keys.push(key.to_vec());
+            runs.push(run);
+        }
+        Ok((runs, keys))
+    }
+
+    /// Delete a single cron run by its raw TiKV key.
+    pub async fn delete_cron_run_by_key(
+        &self,
+        txn: &mut Transaction,
+        raw_key: Vec<u8>,
+    ) -> Result<()> {
+        txn_delete(txn, raw_key).await?;
+        Ok(())
+    }
+
     pub async fn try_claim_cron_run(
         &self,
         txn: &mut Transaction,

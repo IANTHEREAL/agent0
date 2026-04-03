@@ -1,11 +1,23 @@
 use crate::cron::config::CronConfig;
 use crate::cron::types::CronRunStatus;
+use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::storage::TikvStore;
+use crate::worker::engine::{
+    is_retryable_region_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::TimestampExt;
-use tracing::info;
+use tracing::{info, warn};
+
+/// GC batch size — number of cron runs to process per transaction.
+/// Keeps pessimistic lock hold time bounded regardless of total run count.
+const GC_BATCH_SIZE: usize = 500;
+
+/// Maximum retries per batch for transient TiKV errors (region routing +
+/// write conflict / deadlock).
+const GC_BATCH_MAX_RETRIES: u32 = REGION_ERROR_MAX_RETRIES;
 
 pub(crate) async fn gc_database(
     store: &Arc<TikvStore>,
@@ -26,97 +38,214 @@ pub(crate) async fn gc_database(
         .unwrap_or(i64::MAX),
     );
 
+    // Pre-check: if cron is disabled for this database, skip immediately.
+    {
+        let mut check_txn = store.begin().await?;
+        let enabled = store.is_cron_enabled(&mut check_txn, db_id).await?;
+        check_txn.rollback().await.ok();
+        if !enabled {
+            return Ok(());
+        }
+    }
+
+    // Load per-job max_runtime_ms overrides once (read-only, separate txn).
+    let job_max_runtime: HashMap<i64, Option<u64>> = {
+        let mut jobs_txn = store.begin().await?;
+        let jobs = store.list_cron_jobs(&mut jobs_txn, db_id).await?;
+        jobs_txn.rollback().await.ok();
+        jobs.into_iter()
+            .map(|j| (j.job_id, j.max_runtime_ms))
+            .collect()
+    };
+
+    let mut total_recovered = 0usize;
+    let mut total_deleted = 0usize;
+    let mut cursor: Option<Vec<u8>> = None;
+
+    loop {
+        let batch_result = gc_database_batch(
+            store,
+            db_id,
+            now,
+            global_orphan_timeout_ms,
+            retention_cutoff,
+            &job_max_runtime,
+            cursor.as_deref(),
+        )
+        .await;
+
+        match batch_result {
+            Ok(batch) => {
+                total_recovered = total_recovered.saturating_add(batch.recovered);
+                total_deleted = total_deleted.saturating_add(batch.deleted);
+                if batch.is_final {
+                    break;
+                }
+                cursor = batch.last_key;
+            }
+            Err(e) => {
+                // Non-retryable error — propagate.
+                return Err(e);
+            }
+        }
+    }
+
+    if total_recovered > 0 || total_deleted > 0 {
+        info!(
+            db_id,
+            recovered_orphans = total_recovered,
+            deleted_runs = total_deleted,
+            "cron GC complete"
+        );
+    }
+    Ok(())
+}
+
+struct GcBatchResult {
+    recovered: usize,
+    deleted: usize,
+    last_key: Option<Vec<u8>>,
+    is_final: bool,
+}
+
+/// Process one batch of cron runs with retry on transient TiKV errors.
+async fn gc_database_batch(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    now: i64,
+    global_orphan_timeout_ms: i64,
+    retention_cutoff: i64,
+    job_max_runtime: &HashMap<i64, Option<u64>>,
+    start_after: Option<&[u8]>,
+) -> Result<GcBatchResult> {
+    for attempt in 0..=GC_BATCH_MAX_RETRIES {
+        let result = gc_database_batch_inner(
+            store,
+            db_id,
+            now,
+            global_orphan_timeout_ms,
+            retention_cutoff,
+            job_max_runtime,
+            start_after,
+        )
+        .await;
+
+        match result {
+            Ok(batch) => return Ok(batch),
+            Err(e)
+                if attempt < GC_BATCH_MAX_RETRIES
+                    && (is_retryable_region_error(&e) || is_retryable_tikv_error(&e)) =>
+            {
+                warn!(
+                    db_id,
+                    attempt = attempt + 1,
+                    max_retries = GC_BATCH_MAX_RETRIES,
+                    "cron GC batch: transient error, retrying with fresh txn"
+                );
+                tracing::debug!(db_id, "cron GC batch error detail: {e}");
+                region_error_backoff(attempt).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// Inner batch logic: scan one page, point-delete expired runs, update
+/// orphan-recovered runs. Uses a single short-lived pessimistic transaction.
+async fn gc_database_batch_inner(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    now: i64,
+    global_orphan_timeout_ms: i64,
+    retention_cutoff: i64,
+    job_max_runtime: &HashMap<i64, Option<u64>>,
+    start_after: Option<&[u8]>,
+) -> Result<GcBatchResult> {
     let mut txn = store.begin().await?;
-    // This transaction scans all cron runs (usize::MAX) and may perform
-    // bulk delete + re-insert — duration is proportional to run history.
-    // Register with GC safepoint so GC does not advance past this snapshot.
     let mut txn_guard = crate::worker::active_txn_registry::global_registry()
         .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
-    let gc_result = async {
-        if !store.is_cron_enabled(&mut txn, db_id).await? {
-            return Ok((0usize, 0usize));
-        }
 
-        let runs = store
-            .list_all_cron_runs(&mut txn, db_id, usize::MAX)
+    let batch_result = async {
+        let (runs, raw_keys) = store
+            .list_cron_runs_batch(&mut txn, db_id, start_after, GC_BATCH_SIZE)
             .await?;
+
         if runs.is_empty() {
-            return Ok((0usize, 0usize));
+            return Ok(GcBatchResult {
+                recovered: 0,
+                deleted: 0,
+                last_key: None,
+                is_final: true,
+            });
         }
 
-        // Load per-job max_runtime_ms overrides so we don't orphan
-        // legitimately long-running jobs whose timeout exceeds the global default.
-        let jobs = store.list_cron_jobs(&mut txn, db_id).await?;
-        let job_max_runtime: HashMap<i64, Option<u64>> = jobs
-            .into_iter()
-            .map(|j| (j.job_id, j.max_runtime_ms))
-            .collect();
+        let is_final = runs.len() < GC_BATCH_SIZE;
+        let last_key = raw_keys.last().cloned();
 
         let mut recovered = 0usize;
         let mut deleted = 0usize;
-        let mut job_ids = HashSet::new();
-        let mut keep_by_job: HashMap<i64, Vec<crate::cron::types::CronRun>> = HashMap::new();
 
-        for mut run in runs {
-            job_ids.insert(run.job_id);
+        for (run, raw_key) in runs.into_iter().zip(raw_keys.into_iter()) {
+            let mut needs_update = false;
+            let mut should_delete = false;
+            let mut updated_run = run;
 
-            if run.status == CronRunStatus::Running {
-                if let Some(start_ms) = run.start_time {
-                    // Per-job cutoff: if the job has max_runtime_ms that exceeds the
-                    // global orphan timeout, use the job's value so we don't mark a
-                    // legitimately long-running job as orphaned.
-                    let job_runtime_ms = job_max_runtime.get(&run.job_id).copied().flatten();
+            // Orphan recovery: Running → Failed
+            if updated_run.status == CronRunStatus::Running {
+                if let Some(start_ms) = updated_run.start_time {
+                    let job_runtime_ms =
+                        job_max_runtime.get(&updated_run.job_id).copied().flatten();
                     let effective_cutoff =
                         orphan_cutoff_for_run(now, global_orphan_timeout_ms, job_runtime_ms);
                     if start_ms < effective_cutoff {
-                        run.status = CronRunStatus::Failed;
-                        run.return_message =
+                        updated_run.status = CronRunStatus::Failed;
+                        updated_run.return_message =
                             Some("orphan recovery: execution timed out".to_string());
-                        run.end_time = Some(now);
+                        updated_run.end_time = Some(now);
                         recovered = recovered.saturating_add(1);
+                        needs_update = true;
                     }
                 }
             }
 
-            let record_ts = run.end_time.or(run.start_time).unwrap_or(i64::MAX);
+            // Retention check
+            let record_ts = updated_run
+                .end_time
+                .or(updated_run.start_time)
+                .unwrap_or(i64::MAX);
             if record_ts < retention_cutoff {
+                should_delete = true;
                 deleted = deleted.saturating_add(1);
-                continue;
             }
 
-            keep_by_job.entry(run.job_id).or_default().push(run);
-        }
-
-        if recovered == 0 && deleted == 0 {
-            return Ok((0usize, 0usize));
-        }
-
-        for job_id in job_ids {
-            store
-                .delete_cron_runs_for_job(&mut txn, db_id, job_id)
-                .await?;
-        }
-
-        for kept_runs in keep_by_job.into_values() {
-            for run in kept_runs {
-                store.put_cron_run(&mut txn, db_id, &run).await?;
+            // Apply mutations: point-delete expired, update orphan-recovered.
+            if should_delete {
+                store.delete_cron_run_by_key(&mut txn, raw_key).await?;
+            } else if needs_update {
+                store.put_cron_run(&mut txn, db_id, &updated_run).await?;
             }
+            // Runs that are neither expired nor orphan-recovered are untouched —
+            // no lock acquired on them.
         }
 
-        Ok((recovered, deleted))
+        Ok(GcBatchResult {
+            recovered,
+            deleted,
+            last_key,
+            is_final,
+        })
     }
     .await;
 
-    match gc_result {
-        Ok((recovered, deleted)) => {
-            txn.commit().await?;
-            if recovered > 0 || deleted > 0 {
-                info!(
-                    "cron GC db_id={} recovered_orphans={} deleted_runs={}",
-                    db_id, recovered, deleted
-                );
+    match batch_result {
+        Ok(batch) => {
+            if batch.recovered > 0 || batch.deleted > 0 {
+                txn.commit().await?;
+            } else {
+                txn.rollback().await.ok();
             }
-            Ok(())
+            Ok(batch)
         }
         Err(e) => {
             if txn.rollback().await.is_err() {
@@ -224,21 +353,47 @@ mod tests {
     }
 
     #[test]
-    fn gc_database_tracks_its_unbounded_scan_transaction() {
+    fn gc_database_batch_tracks_its_transaction() {
         let source = include_str!("worker.rs");
         let prod_source = source
             .split("#[cfg(test)]")
             .next()
             .expect("cron/worker.rs must contain #[cfg(test)]");
-        let gc_fn = prod_source
-            .split("pub(crate) async fn gc_database(")
+        let batch_fn = prod_source
+            .split("async fn gc_database_batch_inner(")
             .nth(1)
-            .expect("gc_database must exist");
+            .expect("gc_database_batch_inner must exist");
 
         assert!(
-            gc_fn.contains("track_worker_txn(txn.start_timestamp().version())"),
-            "gc_database scans usize::MAX cron runs in a single txn — it must \
-             register with the GC safepoint to prevent GC overrun on large histories"
+            batch_fn.contains("track_worker_txn(txn.start_timestamp().version())"),
+            "gc_database_batch_inner must register with the GC safepoint to \
+             prevent GC overrun while the batch transaction is active"
+        );
+    }
+
+    #[test]
+    fn gc_uses_point_deletes_not_delete_all_reinsert() {
+        // Guard: gc_database_batch_inner must use point-delete (delete_cron_run_by_key)
+        // and NOT the old delete-all-reinsert pattern (delete_cron_runs_for_job).
+        let source = include_str!("worker.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("cron/worker.rs must contain #[cfg(test)]");
+        let batch_fn = prod_source
+            .split("async fn gc_database_batch_inner(")
+            .nth(1)
+            .expect("gc_database_batch_inner must exist");
+
+        assert!(
+            batch_fn.contains("delete_cron_run_by_key"),
+            "gc_database_batch_inner must use point-deletes (delete_cron_run_by_key) \
+             to minimize pessimistic lock acquisitions"
+        );
+        assert!(
+            !batch_fn.contains("delete_cron_runs_for_job"),
+            "gc_database_batch_inner must NOT use delete_cron_runs_for_job — \
+             that pattern locks all keys including unchanged survivors"
         );
     }
 }

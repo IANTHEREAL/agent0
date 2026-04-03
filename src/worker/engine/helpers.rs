@@ -2,7 +2,7 @@ use super::*;
 
 /// Maximum retries for TiKV region errors (RegionNotFound, EpochNotMatch, etc.)
 /// that can occur after region split/merge operations.
-pub(super) const REGION_ERROR_MAX_RETRIES: u32 = 3;
+pub(crate) const REGION_ERROR_MAX_RETRIES: u32 = 3;
 
 /// Returns `true` if the error originated from a TiKV region routing issue
 /// (split, merge, leader transfer) that is expected to resolve on retry with
@@ -12,7 +12,7 @@ pub(super) const REGION_ERROR_MAX_RETRIES: u32 = 3;
 /// without internal retry: `server_is_busy` (handled by AIMD backpressure),
 /// `raft_entry_too_large` (deterministic, won't resolve on retry),
 /// `max_timestamp_not_synced`, and `disk_full`.
-pub(super) fn is_retryable_region_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_retryable_region_error(err: &anyhow::Error) -> bool {
     fn is_retryable_region(err: &tikv_client::Error) -> bool {
         match err {
             tikv_client::Error::RegionError(re) => {
@@ -43,7 +43,7 @@ pub(super) fn is_retryable_region_error(err: &anyhow::Error) -> bool {
 }
 
 /// Backoff sleep for region error retries: 500ms, 1s, 2s, ...
-pub(super) async fn region_error_backoff(attempt: u32) {
+pub(crate) async fn region_error_backoff(attempt: u32) {
     let ms = 500u64 * (1u64 << attempt.min(4));
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
