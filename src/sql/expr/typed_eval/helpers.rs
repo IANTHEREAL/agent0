@@ -517,3 +517,49 @@ pub(super) fn to_sqlparser_json_op(op: &JsonAccessOp) -> sqlparser::ast::JsonOpe
         JsonAccessOp::HashMinus => sqlparser::ast::JsonOperator::HashMinus,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for #2294: schema-qualified builtins must resolve via
+    /// qualified key in the function registry. Before the fix,
+    /// `eval_function_call("serverless_functions.invoke", ...)` looked up
+    /// only `INVOKE` (unqualified), missing `SERVERLESS_FUNCTIONS.INVOKE`.
+    #[tokio::test]
+    async fn schema_qualified_builtin_resolves_via_registry() {
+        // Set up extension context (non-superuser) so the function is
+        // dispatched but rejected at the permission check — proving the
+        // qualified registry lookup succeeded.
+        let err = crate::extensions::context::with_context(false, "test_ks", async {
+            let qctx = QueryContext::for_tests();
+            eval_function_call(
+                "serverless_functions.invoke",
+                vec![Value::Text("test_fn".into()), Value::Null],
+                &qctx,
+            )
+        })
+        .await
+        .unwrap_err();
+
+        // If the qualified lookup failed, we'd get "unknown function".
+        // Instead we should get "permission denied" — the function was found
+        // but the non-superuser guard rejected it.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("permission denied"),
+            "expected PermissionDenied (function resolved), got: {msg}"
+        );
+    }
+
+    /// Verify that unqualified function lookup still works (no regression
+    /// from the qualified-first change).
+    #[test]
+    fn unqualified_builtin_still_resolves() {
+        let registry = crate::sql::expr::functions::get_registry();
+        assert!(
+            registry.contains_key("UPPER"),
+            "unqualified builtin UPPER must be in registry"
+        );
+    }
+}
