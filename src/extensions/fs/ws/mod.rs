@@ -296,7 +296,10 @@ where
         // replies.  The server sends Ping every 60s; a client that
         // responds with Pong is alive and should keep its session.
         // Only Ping (client-initiated, rare) and Close are excluded.
-        if matches!(msg, Message::Text(_) | Message::Binary(_) | Message::Pong(_)) {
+        if matches!(
+            msg,
+            Message::Text(_) | Message::Binary(_) | Message::Pong(_)
+        ) {
             idle_deadline
                 .as_mut()
                 .reset(tokio::time::Instant::now() + Duration::from_secs(IDLE_TIMEOUT_SECS));
@@ -1123,7 +1126,10 @@ mod tests {
             };
 
             // Mirror production logic: Text/Binary/Pong reset idle deadline
-            if matches!(msg, Message::Text(_) | Message::Binary(_) | Message::Pong(_)) {
+            if matches!(
+                msg,
+                Message::Text(_) | Message::Binary(_) | Message::Pong(_)
+            ) {
                 idle_deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + Duration::from_secs(idle_timeout_secs));
@@ -1158,15 +1164,17 @@ mod tests {
         });
 
         // Connect but never read — no auto-pong because nobody polls next()
-        let (_client, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+        let (_client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
 
         tokio::time::advance(Duration::from_secs(305)).await;
 
         let reason = server.await.unwrap();
-        assert_eq!(reason, "idle_timeout", "silent client should hit idle timeout");
+        assert_eq!(
+            reason, "idle_timeout",
+            "silent client should hit idle timeout"
+        );
     }
 
     /// Active client (sends Text periodically) → deadline keeps resetting,
@@ -1257,5 +1265,4 @@ mod tests {
             "pong-replying client should NOT hit idle timeout, got: {reason}"
         );
     }
-
 }

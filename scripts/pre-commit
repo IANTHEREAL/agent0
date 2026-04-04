@@ -1,0 +1,9 @@
+#!/bin/sh
+# Auto-format Rust code before commit to prevent CI lint failures
+cargo fmt -- --check 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "Running cargo fmt to fix formatting..."
+    cargo fmt
+    echo "Files reformatted. Please re-stage and commit again."
+    exit 1
+fi
