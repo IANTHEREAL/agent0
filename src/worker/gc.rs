@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tikv_client::{Timestamp, TimestampExt};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -88,11 +88,12 @@ impl WorkerGc {
         let jitter = rand_jitter_secs(60);
         tokio::time::sleep(Duration::from_secs(jitter)).await;
 
+        let mut backoff_state: HashMap<(String, u64), SweepBackoff> = HashMap::new();
         let mut interval =
             tokio::time::interval(Duration::from_secs(self.config.hnsw_sweep_interval_sec));
         loop {
             interval.tick().await;
-            if let Err(e) = self.sweep_hnsw_delta_backlogs().await {
+            if let Err(e) = self.sweep_hnsw_delta_backlogs(&mut backoff_state).await {
                 warn!("HNSW sweep error: {}", e);
             }
             // S3 orphan sweep: only run if S3 offload is configured.
@@ -102,6 +103,48 @@ impl WorkerGc {
                 }
             }
         }
+    }
+}
+
+// ── HNSW sweep circuit breaker ──────────────────────────────────────────────
+
+/// Per-(keyspace, db_id) backoff state for the HNSW sweep loop.
+/// Prevents permanent failures from generating unbounded WARN log spam.
+struct SweepBackoff {
+    /// Number of consecutive sweep failures.
+    consecutive_failures: u32,
+    /// Earliest time at which this entry should be retried.
+    retry_after: Instant,
+}
+
+/// Base delay for sweep backoff: 1 sweep interval (multiplied by 2^failures).
+/// After 1 failure: skip 1 interval (~10 min at default 600s).
+/// After 2: skip 2 intervals. After 3: skip 4. Capped at 32 intervals (~5.3h).
+const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
+/// Maximum consecutive failures before the backoff multiplier is capped.
+const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5; // 2^5 = 32 intervals
+
+impl SweepBackoff {
+    fn new_failed(interval_sec: u64) -> Self {
+        Self {
+            consecutive_failures: 1,
+            retry_after: Instant::now()
+                + Duration::from_secs(interval_sec * SWEEP_BACKOFF_BASE_INTERVALS as u64),
+        }
+    }
+
+    fn record_failure(&mut self, interval_sec: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let shift = self
+            .consecutive_failures
+            .saturating_sub(1)
+            .min(SWEEP_BACKOFF_MAX_SHIFT);
+        let multiplier = SWEEP_BACKOFF_BASE_INTERVALS as u64 * (1u64 << shift);
+        self.retry_after = Instant::now() + Duration::from_secs(interval_sec * multiplier);
+    }
+
+    fn should_skip(&self) -> bool {
+        Instant::now() < self.retry_after
     }
 }
 
@@ -425,7 +468,14 @@ impl WorkerGc {
     /// Periodic sweep: discover HNSW indexes with pending deltas and enqueue
     /// merge tasks. Uses the same shared helper as startup reconciliation.
     /// Configurable via `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` (default 600s).
-    async fn sweep_hnsw_delta_backlogs(&self) -> Result<()> {
+    ///
+    /// `backoff_state` tracks per-(keyspace, db_id) consecutive failures to
+    /// prevent unbounded retries against permanently broken entries. On success
+    /// the entry is removed; on failure the backoff escalates exponentially.
+    async fn sweep_hnsw_delta_backlogs(
+        &self,
+        backoff_state: &mut HashMap<(String, u64), SweepBackoff>,
+    ) -> Result<()> {
         let mut txn = self.system_store.begin().await?;
         let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
         txn.commit().await?;
@@ -433,9 +483,26 @@ impl WorkerGc {
         let mut total_observed = 0u32;
         let mut total_enqueued = 0u32;
         let mut total_enqueue_errors = 0u32;
+        let mut total_skipped = 0u32;
         // Iterate ALL registry entries — discovery does NOT depend on any
         // task-type bit. The shared helper inspects schemas + probes deltas.
         for entry in &all_entries {
+            let key = (entry.keyspace.clone(), entry.db_id);
+
+            // Circuit breaker: skip entries that are in backoff.
+            if let Some(backoff) = backoff_state.get(&key) {
+                if backoff.should_skip() {
+                    total_skipped += 1;
+                    debug!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        consecutive_failures = backoff.consecutive_failures,
+                        "HNSW sweep: skipping (in backoff)"
+                    );
+                    continue;
+                }
+            }
+
             match crate::worker::engine::enqueue_pending_hnsw_merges(
                 &self.system_store,
                 &self.pool,
@@ -448,13 +515,40 @@ impl WorkerGc {
                     total_observed += r.observed;
                     total_enqueued += r.enqueued;
                     total_enqueue_errors += r.enqueue_errors;
+                    // Success: clear any backoff for this entry.
+                    backoff_state.remove(&key);
                 }
-                Err(e) => warn!(
-                    "HNSW sweep error for keyspace={} db_id={}: {}",
-                    entry.keyspace, entry.db_id, e
-                ),
+                Err(e) => {
+                    let interval = self.config.hnsw_sweep_interval_sec;
+                    match backoff_state.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            o.get_mut().record_failure(interval);
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(SweepBackoff::new_failed(interval));
+                        }
+                    }
+                    let backoff = backoff_state
+                        .get(&(entry.keyspace.clone(), entry.db_id))
+                        .unwrap();
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        consecutive_failures = backoff.consecutive_failures,
+                        "HNSW sweep error (will backoff): {}",
+                        e
+                    );
+                }
             }
         }
+
+        // Prune backoff entries for (keyspace, db_id) pairs no longer in the registry.
+        let active_keys: std::collections::HashSet<(String, u64)> = all_entries
+            .iter()
+            .map(|e| (e.keyspace.clone(), e.db_id))
+            .collect();
+        backoff_state.retain(|k, _| active_keys.contains(k));
+
         // Gauge: overwrite with total observed across all DBs this sweep.
         self.metrics
             .hnsw_pending_indexes_observed
@@ -471,10 +565,10 @@ impl WorkerGc {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        if total_observed > 0 {
+        if total_observed > 0 || total_skipped > 0 {
             info!(
                 total_observed,
-                total_enqueued, total_enqueue_errors, "HNSW periodic sweep complete"
+                total_enqueued, total_enqueue_errors, total_skipped, "HNSW periodic sweep complete"
             );
         }
         Ok(())

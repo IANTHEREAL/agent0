@@ -642,7 +642,6 @@ where
             Message::Close(_) => break,
             Message::Frame(_) => {}
         }
-
     }
 
     if let Some(state) = streaming_write.take() {
@@ -1159,18 +1158,18 @@ mod tests {
         });
 
         // Client connects but sends nothing
-        let (mut client, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
 
         // Drain incoming messages (server pings → auto-pong by tungstenite)
-        let drain = tokio::spawn(async move {
-            while let Some(Ok(_msg)) = client.next().await {}
-        });
+        let drain = tokio::spawn(async move { while let Some(Ok(_msg)) = client.next().await {} });
 
         let reason = server.await.unwrap();
-        assert_eq!(reason, "idle_timeout", "silent client should hit idle timeout");
+        assert_eq!(
+            reason, "idle_timeout",
+            "silent client should hit idle timeout"
+        );
         drain.abort();
     }
 
@@ -1186,10 +1185,9 @@ mod tests {
             run_test_ws_loop(stream, 300, 60).await
         });
 
-        let (mut client, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
 
         // Send a Text frame every 200s — should keep resetting the 300s deadline
         for _ in 0..3 {
@@ -1227,14 +1225,13 @@ mod tests {
             run_test_ws_loop(stream, 300, 60).await
         });
 
-        let (mut client, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}"))
-                .await
-                .unwrap();
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
 
         // Send Pong frames every 50s.  The server should still disconnect
         // at 300s because Pong does not reset the idle deadline.
-        for i in 0..8 {
+        for _i in 0..8 {
             tokio::time::advance(Duration::from_secs(50)).await;
             // After 300s the server may have already closed, so ignore send errors
             if client.send(Message::Pong(vec![])).await.is_err() {

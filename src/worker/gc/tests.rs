@@ -1052,3 +1052,57 @@ fn heartbeat_timeout_exceeds_publish_interval() {
         config.gc_safepoint_interval_sec,
     );
 }
+
+// --- SweepBackoff tests ---
+
+#[test]
+fn sweep_backoff_new_failed_sets_retry_in_future() {
+    let b = SweepBackoff::new_failed(600);
+    assert_eq!(b.consecutive_failures, 1);
+    assert!(
+        b.should_skip(),
+        "should skip immediately after first failure"
+    );
+}
+
+#[test]
+fn sweep_backoff_escalates_exponentially() {
+    let mut b = SweepBackoff::new_failed(10); // 10s interval for fast test
+                                              // After 1st failure: skip 1 interval (10s)
+    assert_eq!(b.consecutive_failures, 1);
+
+    b.record_failure(10);
+    assert_eq!(b.consecutive_failures, 2);
+    // After 2nd: skip 2 intervals (20s)
+
+    b.record_failure(10);
+    assert_eq!(b.consecutive_failures, 3);
+    // After 3rd: skip 4 intervals (40s)
+
+    b.record_failure(10);
+    assert_eq!(b.consecutive_failures, 4);
+    // After 4th: skip 8 intervals (80s)
+}
+
+#[test]
+fn sweep_backoff_caps_at_max_shift() {
+    let mut b = SweepBackoff::new_failed(10);
+    for _ in 0..20 {
+        b.record_failure(10);
+    }
+    assert_eq!(b.consecutive_failures, 21);
+    // Even after 21 failures, backoff is capped at 2^5 = 32 intervals
+    assert!(b.should_skip());
+}
+
+#[test]
+fn sweep_backoff_should_skip_returns_false_after_delay() {
+    let b = SweepBackoff {
+        consecutive_failures: 1,
+        retry_after: Instant::now() - Duration::from_secs(1), // already past
+    };
+    assert!(
+        !b.should_skip(),
+        "should not skip when retry_after is in the past"
+    );
+}
