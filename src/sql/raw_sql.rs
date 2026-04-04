@@ -75,6 +75,12 @@ pub(crate) enum RawSqlKind {
     ExportSnapshotRelease,
     /// `EXPORT SNAPSHOT LIST`
     ExportSnapshotList,
+    /// `LISTEN <channel>` — stub no-op (async notifications not implemented).
+    Listen,
+    /// `NOTIFY <channel> [, 'payload']` — stub no-op.
+    Notify,
+    /// `UNLISTEN { <channel> | * }` — stub no-op.
+    Unlisten,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
@@ -452,6 +458,35 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("ROW LEVEL SECURITY") {
         return Some(RawSqlKind::AlterTableRls);
     }
+    // LISTEN / NOTIFY / UNLISTEN — stub no-ops for driver compatibility.
+    if sql_upper.starts_with("LISTEN")
+        && (sql_upper.len() == 6
+            || sql_upper.as_bytes()[6].is_ascii_whitespace()
+            || sql_upper.as_bytes()[6] == b';'
+            || sql_upper[6..].starts_with("/*")
+            || sql_upper[6..].starts_with("--"))
+    {
+        return Some(RawSqlKind::Listen);
+    }
+    if sql_upper.starts_with("NOTIFY")
+        && (sql_upper.len() == 6
+            || sql_upper.as_bytes()[6].is_ascii_whitespace()
+            || sql_upper.as_bytes()[6] == b';'
+            || sql_upper[6..].starts_with("/*")
+            || sql_upper[6..].starts_with("--"))
+    {
+        return Some(RawSqlKind::Notify);
+    }
+    if sql_upper.starts_with("UNLISTEN")
+        && (sql_upper.len() == 8
+            || sql_upper.as_bytes()[8].is_ascii_whitespace()
+            || sql_upper.as_bytes()[8] == b';'
+            || sql_upper[8..].starts_with("/*")
+            || sql_upper[8..].starts_with("--"))
+    {
+        return Some(RawSqlKind::Unlisten);
+    }
+
     if sql_upper.starts_with("EXPORT SNAPSHOT BEGIN") {
         return Some(RawSqlKind::ExportSnapshotBegin);
     }

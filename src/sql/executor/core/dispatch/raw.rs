@@ -16,6 +16,97 @@ use super::super::*;
 use super::scaffold::DispatchContext;
 use crate::sql::raw_sql::RawSqlKind;
 
+/// Strip all leading SQL comments (`/* ... */` and `-- ...\n`) from a string,
+/// returning the remaining trimmed slice. Used by the LISTEN/NOTIFY/UNLISTEN
+/// stub validators so that comments between the keyword and identifier are
+/// accepted (PostgreSQL permits this).
+fn strip_sql_comments(s: &str) -> &str {
+    let mut s = s.trim();
+    loop {
+        if s.starts_with("/*") {
+            match s.find("*/") {
+                Some(end) => {
+                    s = s[end + 2..].trim();
+                    continue;
+                }
+                None => break, // unclosed comment
+            }
+        } else if s.starts_with("--") {
+            match s.find('\n') {
+                Some(end) => {
+                    s = s[end + 1..].trim();
+                    continue;
+                }
+                None => {
+                    s = "";
+                    break;
+                } // comment to end of string
+            }
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// Consume a single-quoted string body (after the opening `'`).
+/// Returns `Some(remainder)` with the slice after the closing quote,
+/// or `None` if the string is unterminated. Handles `''` escapes.
+/// When `escape_backslash` is true (E-strings), `\` followed by any
+/// character is treated as an escape sequence.
+fn consume_single_quoted(s: &str, escape_backslash: bool) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if escape_backslash && bytes[i] == b'\\' {
+            i += 2; // backslash escape: skip \ and the following char
+        } else if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2; // escaped quote ''
+            } else {
+                return Some(&s[i + 1..]);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None // unterminated
+}
+
+/// Consume a complete PostgreSQL string literal starting at the beginning of
+/// `s` (after trimming whitespace). Returns `Some(remainder)` with the slice
+/// after the closing delimiter, or `None` if the literal is unterminated or
+/// not a recognised form.
+///
+/// Supported forms: `'...'`, `E'...'`/`e'...'`, `B'...'`/`b'...'`,
+/// `X'...'`/`x'...'`, `U&'...'`/`u&'...'`, `$$...$$`, `$tag$...$tag$`.
+fn consume_pg_string_literal(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix('\'') {
+        consume_single_quoted(inner, false)
+    } else if let Some(inner) = s.strip_prefix("E'").or_else(|| s.strip_prefix("e'")) {
+        consume_single_quoted(inner, true)
+    } else if let Some(inner) = s
+        .strip_prefix("B'")
+        .or_else(|| s.strip_prefix("b'"))
+        .or_else(|| s.strip_prefix("X'"))
+        .or_else(|| s.strip_prefix("x'"))
+    {
+        consume_single_quoted(inner, false)
+    } else if let Some(inner) = s.strip_prefix("U&'").or_else(|| s.strip_prefix("u&'")) {
+        consume_single_quoted(inner, false)
+    } else if let Some(after_dollar) = s.strip_prefix('$') {
+        // Dollar-quoted: find the delimiter tag
+        let tag_end = after_dollar.find('$')?;
+        let delimiter = &s[..tag_end + 2]; // e.g., "$$" or "$tag$"
+        let body = &s[delimiter.len()..];
+        let close_pos = body.find(delimiter)?;
+        Some(&body[close_pos + delimiter.len()..])
+    } else {
+        None
+    }
+}
+
 impl Executor {
     /// Attempt to dispatch the statement through instrumented raw-SQL paths.
     ///
@@ -131,6 +222,186 @@ impl Executor {
             RawSqlKind::AlterTableRls => {
                 let start = Instant::now();
                 let res = self.execute_alter_table_rls_cmd(session, sql).await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::Listen => {
+                let start = Instant::now();
+                // LISTEN requires a channel name: at least one non-whitespace
+                // token after the keyword.
+                let rest = ctx.sql_trimmed.get(6..).unwrap_or("").trim();
+                let rest = rest.trim_end_matches(';').trim();
+                // Strip all leading comments (block and line)
+                let rest = strip_sql_comments(rest);
+                // Consume one identifier token and reject trailing junk
+                let first_token_end = if let Some(inner) = rest.strip_prefix('"') {
+                    // Quoted identifier — find closing quote, handling "" escapes
+                    let mut i = 0;
+                    let bytes = inner.as_bytes();
+                    loop {
+                        if i >= bytes.len() {
+                            break 0; // unclosed quote
+                        }
+                        if bytes[i] == b'"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                i += 2; // skip escaped ""
+                            } else {
+                                break i + 2; // include both quotes
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else {
+                    // Unquoted — alphanumeric + underscore + $
+                    rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+                        .unwrap_or(rest.len())
+                };
+                let after_token =
+                    strip_sql_comments(rest[first_token_end..].trim().trim_end_matches(';').trim());
+                let is_valid = first_token_end > 0
+                    && rest.chars().next().is_some_and(|c| {
+                        c.is_ascii_alphabetic() || c == '_' || c == '"' || c == '$'
+                    })
+                    && after_token.is_empty();
+                let res: Result<ExecuteResult> = if !is_valid {
+                    Err(crate::sql::error::SqlError::Syntax(
+                        "syntax error at or near \"LISTEN\"".to_string(),
+                    )
+                    .into())
+                } else {
+                    Ok(ExecuteResult::CommandComplete { tag: "LISTEN" })
+                };
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::Notify => {
+                let start = Instant::now();
+                // NOTIFY requires a channel name: at least one non-whitespace
+                // token after the keyword (optional payload is allowed).
+                let rest = ctx.sql_trimmed.get(6..).unwrap_or("").trim();
+                let rest = rest.trim_end_matches(';').trim();
+                // Strip all leading comments (block and line)
+                let rest = strip_sql_comments(rest);
+                // Consume one identifier token and reject trailing junk
+                // (optional `, 'payload'` is allowed after the channel)
+                let first_token_end = if let Some(inner) = rest.strip_prefix('"') {
+                    // Quoted identifier — find closing quote, handling "" escapes
+                    let mut i = 0;
+                    let bytes = inner.as_bytes();
+                    loop {
+                        if i >= bytes.len() {
+                            break 0; // unclosed quote
+                        }
+                        if bytes[i] == b'"' {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                i += 2; // skip escaped ""
+                            } else {
+                                break i + 2; // include both quotes
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else {
+                    // Unquoted — alphanumeric + underscore + $
+                    rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+                        .unwrap_or(rest.len())
+                };
+                let after_token =
+                    strip_sql_comments(rest[first_token_end..].trim().trim_end_matches(';').trim());
+                let first_char_valid = rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '"' || c == '$');
+                let is_valid = first_token_end > 0
+                    && first_char_valid
+                    && if after_token.is_empty() {
+                        true // NOTIFY channel; — valid
+                    } else if let Some(after_comma_raw) = after_token.strip_prefix(',') {
+                        // After the comma, consume a complete PG string literal
+                        // and verify it is properly terminated.
+                        let after_comma = strip_sql_comments(after_comma_raw.trim());
+                        match consume_pg_string_literal(after_comma) {
+                            Some(rest) => {
+                                let rest =
+                                    strip_sql_comments(rest.trim().trim_end_matches(';').trim());
+                                rest.is_empty()
+                            }
+                            None => false, // unterminated or missing payload
+                        }
+                    } else {
+                        false // trailing junk
+                    };
+                let res: Result<ExecuteResult> = if !is_valid {
+                    Err(crate::sql::error::SqlError::Syntax(
+                        "syntax error at or near \"NOTIFY\"".to_string(),
+                    )
+                    .into())
+                } else {
+                    Ok(ExecuteResult::CommandComplete { tag: "NOTIFY" })
+                };
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::Unlisten => {
+                let start = Instant::now();
+                // UNLISTEN requires a channel name or `*`: at least one
+                // non-whitespace token after the keyword.
+                let rest = ctx.sql_trimmed.get(8..).unwrap_or("").trim();
+                let rest = rest.trim_end_matches(';').trim();
+                // Strip all leading comments (block and line)
+                let rest = strip_sql_comments(rest);
+                // UNLISTEN accepts either * or an identifier, reject trailing junk
+                let (is_valid, _) = if let Some(after_star_raw) = rest.strip_prefix('*') {
+                    let after_star =
+                        strip_sql_comments(after_star_raw.trim().trim_end_matches(';').trim());
+                    (after_star.is_empty(), 1usize)
+                } else {
+                    let first_token_end = if let Some(inner) = rest.strip_prefix('"') {
+                        // Quoted identifier — find closing quote, handling "" escapes
+                        let mut i = 0;
+                        let bytes = inner.as_bytes();
+                        loop {
+                            if i >= bytes.len() {
+                                break 0; // unclosed quote
+                            }
+                            if bytes[i] == b'"' {
+                                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                                    i += 2; // skip escaped ""
+                                } else {
+                                    break i + 2; // include both quotes
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    } else {
+                        // Unquoted — alphanumeric + underscore + $
+                        rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+                            .unwrap_or(rest.len())
+                    };
+                    let after_token = strip_sql_comments(
+                        rest[first_token_end..].trim().trim_end_matches(';').trim(),
+                    );
+                    (
+                        first_token_end > 0
+                            && rest.chars().next().is_some_and(|c| {
+                                c.is_ascii_alphabetic()
+                                    || c == '_'
+                                    || c == '"'
+                                    || c == '*'
+                                    || c == '$'
+                            })
+                            && after_token.is_empty(),
+                        first_token_end,
+                    )
+                };
+                let res: Result<ExecuteResult> = if !is_valid {
+                    Err(crate::sql::error::SqlError::Syntax(
+                        "syntax error at or near \"UNLISTEN\"".to_string(),
+                    )
+                    .into())
+                } else {
+                    Ok(ExecuteResult::CommandComplete { tag: "UNLISTEN" })
+                };
                 Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
             }
             RawSqlKind::ExportSnapshotBegin => {

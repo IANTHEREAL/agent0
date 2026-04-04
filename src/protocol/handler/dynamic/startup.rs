@@ -564,7 +564,7 @@ impl StartupHandler for DynamicPgHandler {
                     if !peer_ip.is_loopback() && (dev_mode || insecure_mode) {
                         static CLEARTEXT_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
                         let count = CLEARTEXT_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if count == 0 || count % 100 == 0 {
+                        if count == 0 || count.is_multiple_of(100) {
                             warn!(
                                 "Allowing non-TLS cleartext auth for non-loopback connection from {} (DB9_DEV={}, DB9_INSECURE={}) [occurrence #{}]",
                                 peer_ip, dev_mode, insecure_mode, count + 1

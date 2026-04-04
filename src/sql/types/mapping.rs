@@ -466,6 +466,16 @@ fn convert_custom_builtin(type_name: &str, modifiers: &[String]) -> Option<DataT
         "oid" => Some(DataType::Oid),
         "int2vector" => Some(DataType::UserDefined("int2vector".to_string())),
         "oidvector" => Some(DataType::UserDefined("oidvector".to_string())),
+        "bit" => {
+            // BIT(1) → Boolean (common ORM pattern), BIT(n>1) → Bytes.
+            // PostgreSQL treats bare `bit` (no modifier) as `bit(1)`.
+            let len = modifiers.first().and_then(|m| m.parse::<u32>().ok());
+            match len {
+                Some(1) | None => Some(DataType::Boolean),
+                Some(_) => Some(DataType::Bytes),
+            }
+        }
+        "varbit" | "bit varying" => Some(DataType::Bytes),
         "vector" => {
             // 0 means "any dimension" (bare `vector` without `(N)` modifier).
             // DDL CREATE TABLE with bare `vector` and explicit CAST both use 0;

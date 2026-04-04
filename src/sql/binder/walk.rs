@@ -13,6 +13,7 @@ use crate::sql::names;
 impl Binder {
     // ── Statement ──────────────────────────────────────────────────────
 
+    #[allow(dead_code)]
     pub(super) fn walk_statement(&mut self, stmt: &Statement) {
         match stmt {
             Statement::Query(query) => self.walk_query(query),

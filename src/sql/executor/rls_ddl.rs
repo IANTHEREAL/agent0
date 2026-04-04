@@ -30,8 +30,12 @@ fn object_name_from_str(s: &str) -> Result<ObjectName> {
     let idents: Vec<sqlparser::ast::Ident> = parts
         .iter()
         .map(|p| {
-            let p = p.trim().trim_matches('"');
-            sqlparser::ast::Ident::new(p)
+            let p = p.trim();
+            if p.starts_with('"') && p.ends_with('"') && p.len() > 1 {
+                sqlparser::ast::Ident::with_quote('"', &p[1..p.len() - 1])
+            } else {
+                sqlparser::ast::Ident::new(p)
+            }
         })
         .collect();
     if idents.is_empty() || idents.iter().any(|i| i.value.is_empty()) {
@@ -78,28 +82,84 @@ fn consume_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     }
 }
 
-/// Consume a SQL identifier (possibly quoted) at the start of `s`.
-/// Returns (ident, remainder).
+/// Consume a SQL identifier (possibly quoted, possibly schema-qualified) at the start of `s`.
+/// Returns (ident, remainder).  Handles `"schema"."table"` patterns by consuming
+/// successive `.`+quoted-ident segments.
 fn consume_ident(s: &str) -> Option<(String, &str)> {
     let s = s.trim_start();
     if s.is_empty() {
         return None;
     }
     if let Some(rest) = s.strip_prefix('"') {
-        // Quoted identifier
+        // Quoted identifier — consume first segment
         let end = rest.find('"')?;
-        let ident = rest[..end].to_string();
-        Some((ident, rest[end + 1..].trim_start()))
+        let mut ident = format!("\"{}\"", &rest[..end]);
+        let mut remainder = &rest[end + 1..];
+        // Consume successive `."segment"` parts for schema-qualified names
+        while remainder.starts_with('.') {
+            let after_dot = &remainder[1..];
+            if let Some(inner) = after_dot.strip_prefix('"') {
+                if let Some(end2) = inner.find('"') {
+                    ident.push('.');
+                    ident.push('"');
+                    ident.push_str(&inner[..end2]);
+                    ident.push('"');
+                    remainder = &inner[end2 + 1..];
+                } else {
+                    break;
+                }
+            } else {
+                // dot followed by unquoted ident
+                let end2 = after_dot
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(after_dot.len());
+                if end2 == 0 {
+                    break;
+                }
+                ident.push('.');
+                ident.push_str(&after_dot[..end2]);
+                remainder = &after_dot[end2..];
+            }
+        }
+        Some((ident, remainder.trim_start()))
     } else {
-        // Unquoted identifier: alphanumeric + underscore
+        // Unquoted identifier: alphanumeric + underscore (no dot — dot is segment separator)
         let end = s
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .unwrap_or(s.len());
         if end == 0 {
             return None;
         }
-        let ident = s[..end].to_string();
-        Some((ident, s[end..].trim_start()))
+        let mut ident = s[..end].to_string();
+        let mut remainder = &s[end..];
+        // Consume successive `.segment` parts for schema-qualified names
+        while remainder.starts_with('.') {
+            let after_dot = &remainder[1..];
+            if let Some(inner) = after_dot.strip_prefix('"') {
+                // dot followed by quoted ident
+                if let Some(end2) = inner.find('"') {
+                    ident.push('.');
+                    ident.push('"');
+                    ident.push_str(&inner[..end2]);
+                    ident.push('"');
+                    remainder = &inner[end2 + 1..];
+                } else {
+                    break;
+                }
+            } else {
+                // dot followed by unquoted ident
+                let end2 = after_dot
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(after_dot.len());
+                if end2 == 0 {
+                    break;
+                }
+                ident.push('.');
+                ident.push_str(&after_dot[..end2]);
+                remainder = &after_dot[end2..];
+            }
+        }
+        Some((ident, remainder.trim_start()))
     }
 }
 
@@ -158,8 +218,9 @@ fn parse_create_policy_sql(sql: &str) -> Result<CreatePolicyParsed> {
     let rest = consume_keyword(rest, "POLICY").ok_or_else(|| anyhow!("Expected CREATE POLICY"))?;
 
     // Policy name
-    let (name, rest) =
+    let (raw_name, rest) =
         consume_ident(rest).ok_or_else(|| anyhow!("Expected policy name after CREATE POLICY"))?;
+    let name = names::normalize_ident_str(&raw_name);
 
     // ON table_name
     let rest =
@@ -231,7 +292,7 @@ fn parse_create_policy_sql(sql: &str) -> Result<CreatePolicyParsed> {
             loop {
                 let (role, r2) =
                     consume_ident(r).ok_or_else(|| anyhow!("Expected role name after TO"))?;
-                roles.push(role.to_lowercase());
+                roles.push(names::normalize_ident_str(&role));
                 r = r2;
                 if r.starts_with(',') {
                     r = r[1..].trim_start();
@@ -317,8 +378,9 @@ fn parse_drop_policy_sql(sql: &str) -> Result<DropPolicyParsed> {
         (false, rest)
     };
 
-    let (name, rest) =
+    let (raw_name, rest) =
         consume_ident(rest).ok_or_else(|| anyhow!("Expected policy name after DROP POLICY"))?;
+    let name = names::normalize_ident_str(&raw_name);
 
     let rest =
         consume_keyword(rest, "ON").ok_or_else(|| anyhow!("Expected ON after policy name"))?;
@@ -353,8 +415,9 @@ fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
     let rest = consume_keyword(rest, "POLICY").ok_or_else(|| anyhow!("Expected ALTER POLICY"))?;
 
     // Policy name
-    let (name, rest) =
+    let (raw_name, rest) =
         consume_ident(rest).ok_or_else(|| anyhow!("Expected policy name after ALTER POLICY"))?;
+    let name = names::normalize_ident_str(&raw_name);
 
     // ON table_name
     let rest =
@@ -378,7 +441,7 @@ fn parse_alter_policy_sql(sql: &str) -> Result<AlterPolicyParsed> {
             loop {
                 let (role, r2) =
                     consume_ident(r).ok_or_else(|| anyhow!("Expected role name after TO"))?;
-                role_list.push(role.to_lowercase());
+                role_list.push(names::normalize_ident_str(&role));
                 r = r2;
                 if r.starts_with(',') {
                     r = r[1..].trim_start();
@@ -447,6 +510,13 @@ fn parse_alter_table_rls_sql(sql: &str) -> Result<AlterTableRlsParsed> {
     let sql = strip_leading_sql_comments(sql);
     let rest = consume_keyword(sql, "ALTER").ok_or_else(|| anyhow!("Expected ALTER TABLE"))?;
     let rest = consume_keyword(rest, "TABLE").ok_or_else(|| anyhow!("Expected ALTER TABLE"))?;
+
+    // Handle optional IF EXISTS (same pattern as parse_drop_policy_sql).
+    let rest = if let Some(r) = consume_keyword(rest, "IF") {
+        consume_keyword(r, "EXISTS").ok_or_else(|| anyhow!("Expected EXISTS after IF"))?
+    } else {
+        rest
+    };
 
     let (table, rest) =
         consume_ident(rest).ok_or_else(|| anyhow!("Expected table name after ALTER TABLE"))?;
@@ -933,7 +1003,7 @@ mod tests {
         let sql = r#"ALTER POLICY "my policy" ON "my table" USING (x > 0)"#;
         let p = parse_alter_policy_sql(sql).unwrap();
         assert_eq!(p.name, "my policy");
-        assert_eq!(p.table, "my table");
+        assert_eq!(p.table, r#""my table""#);
     }
 
     #[test]

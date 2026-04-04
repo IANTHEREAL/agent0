@@ -116,6 +116,7 @@ impl TikvStore {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn delete_cron_run(
         &self,
         txn: &mut Transaction,

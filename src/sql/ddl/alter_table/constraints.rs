@@ -469,12 +469,6 @@ pub(super) async fn alter_table_drop_constraint(
     name: &sqlparser::ast::Ident,
     cascade: bool,
 ) -> Result<Option<ExecuteResult>> {
-    if cascade {
-        return Err(
-            SqlError::Unsupported("DROP CONSTRAINT ... CASCADE is not supported".into()).into(),
-        );
-    }
-
     let constraint_name = normalize_ident(name);
     if !schema.pk_indices.is_empty() {
         let default_pk_name;
@@ -495,6 +489,102 @@ pub(super) async fn alter_table_drop_constraint(
                     "cannot drop primary key constraint on table \"{}\" because foreign key \"{}\" requires CASCADE/SET NULL/SET DEFAULT",
                     table_object_name, fk.name
                 ));
+            }
+
+            // Check for inbound FK dependencies from other tables referencing
+            // this table's PK.
+            {
+                // Collect the PK column names being dropped so we only cascade
+                // FKs whose ref_columns actually point at this PK.
+                let pk_col_names: Vec<String> = schema
+                    .pk_indices
+                    .iter()
+                    .map(|&idx| schema.columns[idx].name.clone())
+                    .collect();
+                let all_tables = store.list_tables(txn, db_id).await?;
+                let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                let mut inbound_deps: Vec<(String, String)> = Vec::new();
+                for table_name in &all_tables {
+                    // For self-referencing FKs, scan the in-memory schema
+                    // directly so we don't miss deps on the same table.
+                    let fks = if *table_name == schema.name {
+                        &schema.foreign_keys
+                    } else {
+                        // Borrow from a temporary; handled below via `other`.
+                        match store.get_schema(txn, db_id, table_name).await? {
+                            Some(s) => {
+                                for fk in &s.foreign_keys {
+                                    if fk.ref_table == schema.name
+                                        && (fk.ref_columns.is_empty()
+                                            || fk.ref_columns == pk_col_names)
+                                    {
+                                        inbound_deps.push((table_name.clone(), fk.name.clone()));
+                                    }
+                                }
+                                continue;
+                            }
+                            None => continue,
+                        }
+                    };
+                    for fk in fks {
+                        if fk.ref_table == schema.name
+                            && (fk.ref_columns.is_empty() || fk.ref_columns == pk_col_names)
+                        {
+                            inbound_deps.push((table_name.clone(), fk.name.clone()));
+                        }
+                    }
+                }
+                if !inbound_deps.is_empty() {
+                    if !cascade {
+                        let detail = inbound_deps
+                            .iter()
+                            .map(|(child, name)| {
+                                let child_short = child.rsplit('.').next().unwrap_or(child);
+                                format!(
+                                    "constraint {} on table {} depends on table {}",
+                                    name, child_short, short_table
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(SqlError::DependentObjectsStillExist {
+                            message: format!(
+                                "cannot drop constraint \"{}\" on table \"{}\" because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                                constraint_name, short_table, detail
+                            ),
+                        }
+                        .into());
+                    }
+                    // CASCADE: remove only FK constraints whose ref_columns
+                    // match the PK columns being dropped.
+                    for (child_table_name, _fk_name) in &inbound_deps {
+                        if *child_table_name == schema.name {
+                            // Self-referencing FK: mutate the in-memory
+                            // schema directly so the later update_schema
+                            // call persists the removal.
+                            schema.foreign_keys.retain(|fk| {
+                                !(fk.ref_table == schema.name
+                                    && (fk.ref_columns.is_empty()
+                                        || fk.ref_columns == pk_col_names))
+                            });
+                            continue;
+                        }
+                        let mut other = match store.get_schema(txn, db_id, child_table_name).await?
+                        {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let before = other.foreign_keys.len();
+                        other.foreign_keys.retain(|fk| {
+                            !(fk.ref_table == schema.name
+                                && (fk.ref_columns.is_empty() || fk.ref_columns == pk_col_names))
+                        });
+                        if other.foreign_keys.len() != before {
+                            other.version += 1;
+                            store.update_schema(txn, db_id, other).await?;
+                        }
+                    }
+                }
             }
 
             let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
@@ -544,6 +634,103 @@ pub(super) async fn alter_table_drop_constraint(
 
     if let Some(pos) = find_unique_constraint_index(schema, &constraint_name) {
         let index = schema.indexes[pos].clone();
+
+        // Check for inbound FK dependencies from other tables referencing
+        // this unique constraint's columns.
+        {
+            let unique_cols = &index.columns;
+
+            // If the table's PK covers the same columns, FKs referencing these columns
+            // are backed by the PK (PostgreSQL resolves FKs to PK first), so dropping
+            // this UNIQUE constraint does not affect them.
+            let pk_col_names: Vec<String> = schema
+                .pk_indices
+                .iter()
+                .map(|&idx| schema.columns[idx].name.clone())
+                .collect();
+            let pk_covers_same_cols = !pk_col_names.is_empty() && pk_col_names == *unique_cols;
+
+            let all_tables = store.list_tables(txn, db_id).await?;
+            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+            let mut inbound_deps: Vec<(String, String)> = Vec::new();
+            for table_name in &all_tables {
+                // For self-referencing FKs, scan the in-memory schema
+                // directly so we don't miss deps on the same table.
+                let fks = if *table_name == schema.name {
+                    &schema.foreign_keys
+                } else {
+                    match store.get_schema(txn, db_id, table_name).await? {
+                        Some(s) => {
+                            for fk in &s.foreign_keys {
+                                if fk.ref_table == schema.name
+                                    && fk.ref_columns == *unique_cols
+                                    && !pk_covers_same_cols
+                                {
+                                    inbound_deps.push((table_name.clone(), fk.name.clone()));
+                                }
+                            }
+                            continue;
+                        }
+                        None => continue,
+                    }
+                };
+                for fk in fks {
+                    if fk.ref_table == schema.name
+                        && fk.ref_columns == *unique_cols
+                        && !pk_covers_same_cols
+                    {
+                        inbound_deps.push((table_name.clone(), fk.name.clone()));
+                    }
+                }
+            }
+            if !inbound_deps.is_empty() {
+                if !cascade {
+                    let detail = inbound_deps
+                        .iter()
+                        .map(|(child, name)| {
+                            let child_short = child.rsplit('.').next().unwrap_or(child);
+                            format!(
+                                "constraint {} on table {} depends on table {}",
+                                name, child_short, short_table
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(SqlError::DependentObjectsStillExist {
+                        message: format!(
+                            "cannot drop constraint \"{}\" on table \"{}\" because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                            constraint_name, short_table, detail
+                        ),
+                    }
+                    .into());
+                }
+                // CASCADE: remove only FK constraints whose ref_columns
+                // match the unique constraint's columns being dropped.
+                for (child_table_name, _fk_name) in &inbound_deps {
+                    if *child_table_name == schema.name {
+                        // Self-referencing FK: mutate the in-memory
+                        // schema directly so the later update_schema
+                        // call persists the removal.
+                        schema.foreign_keys.retain(|fk| {
+                            !(fk.ref_table == schema.name && fk.ref_columns == *unique_cols)
+                        });
+                        continue;
+                    }
+                    let mut other = match store.get_schema(txn, db_id, child_table_name).await? {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let before = other.foreign_keys.len();
+                    other.foreign_keys.retain(|fk| {
+                        !(fk.ref_table == schema.name && fk.ref_columns == *unique_cols)
+                    });
+                    if other.foreign_keys.len() != before {
+                        other.version += 1;
+                        store.update_schema(txn, db_id, other).await?;
+                    }
+                }
+            }
+        }
 
         let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
         delete_range(txn, start, end).await?;

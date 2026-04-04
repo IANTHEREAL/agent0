@@ -66,7 +66,6 @@ impl Executor {
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
         {
-            let with = with; // rebind for consistency with original code
             for cte in &with.cte_tables {
                 let cte_name = normalize_ident(&cte.alias.name);
 
