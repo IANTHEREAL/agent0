@@ -565,6 +565,10 @@ impl WorkerGc {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        if total_skipped > 0 {
+            metrics::counter!("db9_server_hnsw_sweep_skipped_total")
+                .increment(total_skipped as u64);
+        }
         if total_observed > 0 || total_skipped > 0 {
             info!(
                 total_observed,

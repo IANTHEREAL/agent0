@@ -91,6 +91,15 @@ impl WorkerMetrics {
 
     /// Record a task execution result (success or error) by task type.
     pub fn record_task_result(&self, task_type: TaskType, success: bool) {
+        let result_label = if success { "ok" } else { "err" };
+        let type_label = task_type.as_str();
+        metrics::counter!(
+            "db9_server_worker_tasks_total",
+            "task_type" => type_label,
+            "result" => result_label,
+        )
+        .increment(1);
+
         if success {
             self.tasks_executed_ok.fetch_add(1, Ordering::Relaxed);
             match task_type {
@@ -134,6 +143,8 @@ impl WorkerMetrics {
 
     /// Sample queue depth and active jobs on each tick.
     pub fn sample_tick(&self, queue_depth: u64, active_jobs: u32) {
+        metrics::gauge!("db9_server_worker_queue_depth").set(queue_depth as f64);
+        metrics::gauge!("db9_server_worker_active_jobs").set(active_jobs as f64);
         self.last_tick_queue_depth
             .store(queue_depth, Ordering::Relaxed);
         self.last_tick_active_jobs

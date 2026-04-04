@@ -46,6 +46,10 @@ memcomparable = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Prometheus metrics (same crates as db9-backend)
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
 # Utils
 bytes = "1.5"
 socket2 = { version = "0.6", features = ["all"] }

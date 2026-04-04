@@ -21,6 +21,7 @@ mod config;
 mod cron;
 mod export;
 mod extensions;
+pub(crate) mod metrics;
 mod model;
 mod observability;
 mod pool;
@@ -188,6 +189,15 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
+
+    // Install Prometheus metrics recorder (global, must be before any metrics! calls).
+    let prometheus_handle = metrics::install_recorder();
+    ::metrics::gauge!(
+        "db9_server_build_info",
+        "version" => env!("CARGO_PKG_VERSION"),
+        "git_hash" => env!("BUILD_GIT_HASH"),
+    )
+    .set(1.0);
 
     let pd_endpoints = cli_args.pd_endpoints.unwrap_or_else(|| {
         env::var("PD_ENDPOINTS").unwrap_or_else(|_| DEFAULT_PD_ENDPOINTS.to_string())
@@ -599,6 +609,18 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         }
     }
 
+    // Prometheus metrics endpoint
+    {
+        let metrics_port: u16 = env::var("DB9_METRICS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let prom_handle = prometheus_handle.clone();
+        tokio::spawn(async move {
+            metrics::start_metrics_server(metrics_port, prom_handle).await;
+        });
+    }
+
     // fs9 WebSocket server
     {
         let fs9_cfg = extensions::fs::config::fs9_config();
@@ -734,6 +756,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                     "Connection limit reached (max {}), rejecting {}",
                     max_connections, peer_addr
                 );
+                ::metrics::counter!("db9_server_connections_rejected_total").increment(1);
                 tokio::spawn(async move {
                     reject_over_limit(socket).await;
                 });
@@ -744,6 +767,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                 break Ok(());
             }
         };
+
+        // Metrics: only count connections that acquired a permit (not rejected ones).
+        ::metrics::counter!("db9_server_connections_accepted_total").increment(1);
+        let conn_gauge = metrics::GaugeGuard::increment("db9_server_connections_active");
 
         let tls_acceptor = tls_acceptor.clone();
         let client_pool = client_pool.clone();
@@ -758,8 +785,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
         connection_tasks.spawn(cancel_token.clone(), async move {
             let _permit = permit; // held for connection lifetime
+            let _conn_gauge = conn_gauge; // decrements on drop (RAII)
             if let Err(e) = process_socket(socket, tls_acceptor, factory, Some(cancel_token)).await
             {
+                ::metrics::counter!("db9_server_connection_errors_total").increment(1);
                 tracing::error!("Connection error: {}", e);
             }
         });

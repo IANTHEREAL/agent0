@@ -29,6 +29,19 @@ pub enum TaskType {
 }
 
 impl TaskType {
+    /// Static string label for Prometheus metrics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskType::Cron => "cron",
+            TaskType::AsyncTrigger => "async_trigger",
+            TaskType::AutoAnalyze => "auto_analyze",
+            TaskType::BgDdl => "bg_ddl",
+            TaskType::BgSql => "bg_sql",
+            TaskType::HnswMerge => "hnsw_merge",
+            TaskType::StorageSizeScan => "storage_size_scan",
+        }
+    }
+
     /// Convert TaskType to its bitmask value
     #[allow(dead_code)] // forward-compat: bitmask API for task type serialization
     pub fn to_bitmask(self) -> u8 {

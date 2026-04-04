@@ -233,6 +233,7 @@ impl TenantObservability {
     /// `conflict_reason` is the `kvrpcpb::write_conflict::Reason` value (0..=5),
     /// or `None` if the reason could not be extracted from the error.
     pub fn record_retry_attempt(&self, conflict_reason: Option<i32>) {
+        metrics::counter!("db9_server_write_conflict_retries_total").increment(1);
         self.retry_attempts.fetch_add(1, Ordering::Relaxed);
         if let Some(r) = conflict_reason {
             let idx = r.clamp(0, 5) as usize;
@@ -271,6 +272,16 @@ impl TenantObservability {
     where
         F: FnOnce() -> String,
     {
+        // Prometheus metrics: always emitted regardless of DB9_OBS_ENABLED.
+        // DB9_OBS_ENABLED controls the in-memory per-tenant sampling/windowing
+        // (virtual tables), not infrastructure-level Prometheus counters.
+        // When no Prometheus recorder is installed these are no-ops.
+        metrics::histogram!("db9_server_query_duration_seconds").record(latency.as_secs_f64());
+        metrics::counter!("db9_server_statements_total").increment(1);
+        if !ok {
+            metrics::counter!("db9_server_query_errors_total").increment(1);
+        }
+
         let latency_us = duration_to_us(latency);
         self.record_statement_us(latency_us, ok, sql_supplier);
     }
