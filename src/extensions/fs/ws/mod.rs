@@ -291,18 +291,16 @@ where
             }
         };
 
-        // Reset the idle deadline on real client data frames (Text/Binary)
-        // BEFORE dispatch — some Text branches `continue` early, and we
-        // must still credit the client for sending data.  Control frames
-        // (Ping/Pong/Close) are auto-generated and do NOT reset.
-        if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+        // Reset the idle deadline on any frame that proves the client
+        // process is still alive: data frames (Text/Binary) AND Pong
+        // replies.  The server sends Ping every 60s; a client that
+        // responds with Pong is alive and should keep its session.
+        // Only Ping (client-initiated, rare) and Close are excluded.
+        if matches!(msg, Message::Text(_) | Message::Binary(_) | Message::Pong(_)) {
             idle_deadline
                 .as_mut()
                 .reset(tokio::time::Instant::now() + Duration::from_secs(IDLE_TIMEOUT_SECS));
         } else if idle_deadline.is_elapsed() {
-            // Control frame arrived but idle deadline already expired.
-            // The `biased` select may have picked ws_source over the
-            // expired deadline — enforce the timeout now.
             debug!("fs9 ws idle timeout for {peer_addr}");
             break;
         }
@@ -1124,7 +1122,8 @@ mod tests {
                 }
             };
 
-            if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+            // Mirror production logic: Text/Binary/Pong reset idle deadline
+            if matches!(msg, Message::Text(_) | Message::Binary(_) | Message::Pong(_)) {
                 idle_deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + Duration::from_secs(idle_timeout_secs));
@@ -1145,8 +1144,9 @@ mod tests {
         reason
     }
 
-    /// Silent client (sends nothing after connect) → server disconnects
-    /// after idle timeout, despite server pings being sent.
+    /// Client that connects but never reads from the WebSocket (simulates
+    /// the interactive shell blocked on readline). Server pings go
+    /// unanswered → no Pong → idle timeout fires.
     #[tokio::test(start_paused = true)]
     async fn test_silent_client_gets_idle_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1157,20 +1157,16 @@ mod tests {
             run_test_ws_loop(stream, 300, 60).await
         });
 
-        // Client connects but sends nothing
-        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-            .await
-            .unwrap();
+        // Connect but never read — no auto-pong because nobody polls next()
+        let (_client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
 
-        // Drain incoming messages (server pings → auto-pong by tungstenite)
-        let drain = tokio::spawn(async move { while let Some(Ok(_msg)) = client.next().await {} });
+        tokio::time::advance(Duration::from_secs(305)).await;
 
         let reason = server.await.unwrap();
-        assert_eq!(
-            reason, "idle_timeout",
-            "silent client should hit idle timeout"
-        );
-        drain.abort();
+        assert_eq!(reason, "idle_timeout", "silent client should hit idle timeout");
     }
 
     /// Active client (sends Text periodically) → deadline keeps resetting,
@@ -1213,10 +1209,16 @@ mod tests {
         );
     }
 
-    /// Client that sends only Pong frames (simulating auto-reply to server
-    /// pings) should still be disconnected after idle timeout.
+    /// Client that sends Pong replies (as tungstenite does automatically
+    /// when reading server Pings) should keep the connection alive past
+    /// the idle timeout.
+    ///
+    /// Note: We send Pong frames explicitly rather than relying on
+    /// tungstenite's auto-pong because paused-time tests cannot drive
+    /// real I/O interleaving.  In production, tungstenite's `next()`
+    /// handles Ping→auto-Pong transparently.
     #[tokio::test(start_paused = true)]
-    async fn test_pong_only_client_still_times_out() {
+    async fn test_pong_client_stays_alive() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1229,20 +1231,31 @@ mod tests {
             .await
             .unwrap();
 
-        // Send Pong frames every 50s.  The server should still disconnect
-        // at 300s because Pong does not reset the idle deadline.
-        for _i in 0..8 {
+        // Send Pong every 50s for 400s — simulates the auto-pong that
+        // tungstenite produces when it reads server Pings via next().
+        // The server resets its idle deadline on Pong, so the connection
+        // should survive well past the 300s idle timeout.
+        for _ in 0..8 {
             tokio::time::advance(Duration::from_secs(50)).await;
-            // After 300s the server may have already closed, so ignore send errors
             if client.send(Message::Pong(vec![])).await.is_err() {
-                break;
+                panic!("connection died while sending Pong — Pong should keep it alive");
             }
         }
 
+        // Close cleanly after 400s
+        client
+            .send(Message::Close(Some(CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                reason: "done".into(),
+            })))
+            .await
+            .ok();
+
         let reason = server.await.unwrap();
-        assert!(
-            reason == "idle_timeout" || reason == "idle_timeout_control_frame",
-            "pong-only client should hit idle timeout, got: {reason}"
+        assert_eq!(
+            reason, "client_close",
+            "pong-replying client should NOT hit idle timeout, got: {reason}"
         );
     }
+
 }
