@@ -13,7 +13,7 @@ resolver = "3"
 tikv-jemallocator = "0.6"
 
 # Async runtime
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.36", features = ["full", "test-util"] }
 tokio-tungstenite = "0.24"
 futures = "0.3"
 async-trait = "0.1"

@@ -12,6 +12,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -40,6 +41,7 @@ pub(crate) async fn start_ws_server(
     pool: Arc<TikvClientPool>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     default_keyspace: Option<String>,
+    tcp_keepalive_idle_ms: u64,
 ) {
     let tracker = Arc::new(WsConnectionTracker::new(DEFAULT_MAX_CONNECTIONS_PER_TENANT));
 
@@ -51,6 +53,15 @@ pub(crate) async fn start_ws_server(
                 continue;
             }
         };
+
+        // Enable TCP keepalive so NLBs and firewalls do not silently kill idle
+        // connections.  Uses the same DB9_TCP_KEEPALIVE_IDLE_MS config as pgwire;
+        // 0 disables keepalive.
+        if tcp_keepalive_idle_ms > 0 {
+            if let Err(e) = configure_ws_tcp_keepalive(&stream, tcp_keepalive_idle_ms) {
+                warn!("fs9 ws: failed to set TCP keepalive for {peer_addr}: {e}");
+            }
+        }
 
         let pool = pool.clone();
         let tls_acceptor = tls_acceptor.clone();
@@ -71,6 +82,12 @@ pub(crate) async fn start_ws_server(
             }
         });
     }
+}
+
+fn configure_ws_tcp_keepalive(stream: &TcpStream, idle_ms: u64) -> std::io::Result<()> {
+    let sock_ref = SockRef::from(stream);
+    let keepalive = TcpKeepalive::new().with_time(Duration::from_millis(idle_ms));
+    sock_ref.set_tcp_keepalive(&keepalive)
 }
 
 struct StreamingWriteState {
@@ -231,23 +248,64 @@ where
     });
 
     let mut streaming_write: Option<StreamingWriteState> = None;
+    // Server-initiated ping keeps the connection alive through NLBs/firewalls
+    // that track idle connections (e.g. AWS NLB default 350s timeout).
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(60));
+    ping_interval.reset(); // don't fire immediately
+
+    // Idle deadline is independent of the ping interval — only reset when the
+    // *client* sends a real message (text/binary).  Server-originated pings do
+    // NOT extend the idle deadline, so silent clients still get disconnected
+    // after IDLE_TIMEOUT_SECS even though pings keep the transport alive.
+    let idle_deadline = tokio::time::sleep(Duration::from_secs(IDLE_TIMEOUT_SECS));
+    tokio::pin!(idle_deadline);
+
     loop {
-        let msg = match timeout(Duration::from_secs(IDLE_TIMEOUT_SECS), ws_source.next()).await {
-            Ok(Some(Ok(msg))) => msg,
-            Ok(Some(Err(err))) => {
-                // Abort any in-flight streaming write before propagating WS error
-                if let Some(state) = streaming_write.take() {
-                    abort_streaming_write(state).await;
+        let msg = tokio::select! {
+            biased; // prefer real messages over pings
+            result = ws_source.next() => {
+                match result {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(err)) => {
+                        // Abort any in-flight streaming write before propagating WS error
+                        if let Some(state) = streaming_write.take() {
+                            abort_streaming_write(state).await;
+                        }
+                        writer.abort();
+                        return Err(err);
+                    }
+                    None => break,
                 }
-                writer.abort();
-                return Err(err);
             }
-            Ok(None) => break,
-            Err(_) => {
+            _ = &mut idle_deadline => {
                 debug!("fs9 ws idle timeout for {peer_addr}");
                 break;
             }
+            _ = ping_interval.tick() => {
+                // Send a WebSocket Ping to keep the transport alive through
+                // NLBs without resetting the idle deadline.  Use try_send to
+                // avoid blocking the main loop if the outbound queue is full
+                // (a slow/non-reading client should not prevent idle timeout).
+                let _ = out_tx.try_send(Message::Ping(vec![]));
+                continue;
+            }
         };
+
+        // Reset the idle deadline on real client data frames (Text/Binary)
+        // BEFORE dispatch — some Text branches `continue` early, and we
+        // must still credit the client for sending data.  Control frames
+        // (Ping/Pong/Close) are auto-generated and do NOT reset.
+        if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+            idle_deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_secs(IDLE_TIMEOUT_SECS));
+        } else if idle_deadline.is_elapsed() {
+            // Control frame arrived but idle deadline already expired.
+            // The `biased` select may have picked ws_source over the
+            // expired deadline — enforce the timeout now.
+            debug!("fs9 ws idle timeout for {peer_addr}");
+            break;
+        }
 
         match msg {
             Message::Text(text) => {
@@ -584,6 +642,7 @@ where
             Message::Close(_) => break,
             Message::Frame(_) => {}
         }
+
     }
 
     if let Some(state) = streaming_write.take() {
@@ -995,5 +1054,198 @@ mod tests {
     fn test_should_stream_read_for_large_file() {
         assert!(should_stream_read(false, STREAMING_THRESHOLD as u64));
         assert!(!should_stream_read(false, (STREAMING_THRESHOLD - 1) as u64));
+    }
+
+    #[tokio::test]
+    async fn test_configure_ws_tcp_keepalive_applies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _conn = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+        configure_ws_tcp_keepalive(&server_stream, 60_000).expect("set keepalive");
+        let sock = SockRef::from(&server_stream);
+        assert!(sock.keepalive().unwrap(), "keepalive should be enabled");
+    }
+
+    // ── Integration tests for the ping / idle-deadline select loop ──
+    //
+    // These tests drive a real WebSocket connection and verify the core
+    // contract introduced by this PR:
+    //   - Server-initiated pings are emitted periodically
+    //   - Pings / Pongs do NOT extend the idle deadline
+    //   - Client Text frames DO extend the idle deadline
+    //   - A silent client is disconnected after IDLE_TIMEOUT_SECS
+    //
+    // We use tokio paused time to avoid waiting 300 real seconds.
+
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    /// Helper: spin up a minimal WebSocket "server loop" that mirrors the
+    /// production select! logic (ping interval + idle deadline + try_send)
+    /// without needing auth or TiKV.  Returns when the loop ends.
+    async fn run_test_ws_loop(
+        stream: tokio::net::TcpStream,
+        idle_timeout_secs: u64,
+        ping_interval_secs: u64,
+    ) -> &'static str {
+        let ws = accept_async(stream).await.expect("ws handshake");
+        let (mut ws_sink, mut ws_source) = ws.split();
+
+        let (out_tx, mut out_rx) = mpsc::channel::<Message>(64);
+        let writer = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if ws_sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(ping_interval_secs));
+        ping_interval.reset();
+
+        let idle_deadline = tokio::time::sleep(Duration::from_secs(idle_timeout_secs));
+        tokio::pin!(idle_deadline);
+
+        let reason = loop {
+            let msg = tokio::select! {
+                biased;
+                result = ws_source.next() => {
+                    match result {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(_)) => break "ws_error",
+                        None => break "stream_ended",
+                    }
+                }
+                _ = &mut idle_deadline => {
+                    break "idle_timeout";
+                }
+                _ = ping_interval.tick() => {
+                    let _ = out_tx.try_send(Message::Ping(vec![]));
+                    continue;
+                }
+            };
+
+            if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+                idle_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(idle_timeout_secs));
+            } else if idle_deadline.is_elapsed() {
+                break "idle_timeout_control_frame";
+            }
+
+            // Echo text back so the client can verify round-trips
+            if let Message::Text(ref t) = msg {
+                let _ = out_tx.send(Message::Text(t.clone())).await;
+            }
+            if let Message::Close(_) = msg {
+                break "client_close";
+            }
+        };
+
+        writer.abort();
+        reason
+    }
+
+    /// Silent client (sends nothing after connect) → server disconnects
+    /// after idle timeout, despite server pings being sent.
+    #[tokio::test(start_paused = true)]
+    async fn test_silent_client_gets_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_test_ws_loop(stream, 300, 60).await
+        });
+
+        // Client connects but sends nothing
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
+
+        // Drain incoming messages (server pings → auto-pong by tungstenite)
+        let drain = tokio::spawn(async move {
+            while let Some(Ok(_msg)) = client.next().await {}
+        });
+
+        let reason = server.await.unwrap();
+        assert_eq!(reason, "idle_timeout", "silent client should hit idle timeout");
+        drain.abort();
+    }
+
+    /// Active client (sends Text periodically) → deadline keeps resetting,
+    /// connection survives past the original idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_active_client_resets_idle_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_test_ws_loop(stream, 300, 60).await
+        });
+
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
+
+        // Send a Text frame every 200s — should keep resetting the 300s deadline
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(200)).await;
+            client.send(Message::Text("ping".into())).await.unwrap();
+            // Read echo
+            let _ = client.next().await;
+        }
+        // We've now been "alive" for 600s (3×200), well past the 300s idle timeout.
+        // Close cleanly.
+        client
+            .send(Message::Close(Some(CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                reason: "done".into(),
+            })))
+            .await
+            .unwrap();
+
+        let reason = server.await.unwrap();
+        assert_eq!(
+            reason, "client_close",
+            "active client should NOT hit idle timeout"
+        );
+    }
+
+    /// Client that sends only Pong frames (simulating auto-reply to server
+    /// pings) should still be disconnected after idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_pong_only_client_still_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            run_test_ws_loop(stream, 300, 60).await
+        });
+
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}"))
+                .await
+                .unwrap();
+
+        // Send Pong frames every 50s.  The server should still disconnect
+        // at 300s because Pong does not reset the idle deadline.
+        for i in 0..8 {
+            tokio::time::advance(Duration::from_secs(50)).await;
+            // After 300s the server may have already closed, so ignore send errors
+            if client.send(Message::Pong(vec![])).await.is_err() {
+                break;
+            }
+        }
+
+        let reason = server.await.unwrap();
+        assert!(
+            reason == "idle_timeout" || reason == "idle_timeout_control_frame",
+            "pong-only client should hit idle timeout, got: {reason}"
+        );
     }
 }

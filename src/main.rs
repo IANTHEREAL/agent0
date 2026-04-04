@@ -659,12 +659,14 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                         info!("fs9 WebSocket listening on {}:{}", ws_listen_addr, ws_port);
                         let pool = client_pool.clone();
                         let ws_default_keyspace = default_keyspace.clone();
+                        let ws_keepalive_ms = initial_server_config.tcp_keepalive_idle_ms;
                         tokio::spawn(async move {
                             extensions::fs::ws::start_ws_server(
                                 ws_listener,
                                 pool,
                                 ws_tls,
                                 ws_default_keyspace,
+                                ws_keepalive_ms,
                             )
                             .await;
                         });
