@@ -243,6 +243,8 @@ pub async fn run_gc_advancer_loop(
             metrics
                 .gc_safepoint_advance_err
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::counter!("db9_server_gc_safepoint_advance_total", "result" => "err")
+                .increment(1);
         }
     }
 }
@@ -437,6 +439,9 @@ async fn advance_gc_safepoint(
                 metrics
                     .gc_safepoint_advance_ok
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics::gauge!("db9_server_gc_safepoint_version").set(safepoint_version as f64);
+                metrics::counter!("db9_server_gc_safepoint_advance_total", "result" => "ok")
+                    .increment(1);
                 info!(
                     safepoint_version,
                     life_time_sec = config.gc_life_time_sec,
@@ -558,12 +563,16 @@ impl WorkerGc {
             self.metrics
                 .hnsw_sweep_enqueued
                 .fetch_add(total_enqueued as u64, std::sync::atomic::Ordering::Relaxed);
+            metrics::counter!("db9_server_hnsw_sweep_enqueued_total")
+                .increment(total_enqueued as u64);
         }
         if total_enqueue_errors > 0 {
             self.metrics.hnsw_sweep_enqueue_errors.fetch_add(
                 total_enqueue_errors as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            metrics::counter!("db9_server_hnsw_sweep_enqueue_errors_total")
+                .increment(total_enqueue_errors as u64);
         }
         if total_skipped > 0 {
             metrics::counter!("db9_server_hnsw_sweep_skipped_total")

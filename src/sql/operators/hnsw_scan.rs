@@ -309,6 +309,8 @@ impl PhysicalOperator for HnswScanOperator {
                 m.hnsw_scan_deltas_applied
                     .fetch_add(delta_count as u64, std::sync::atomic::Ordering::Relaxed);
             }
+            metrics::counter!("db9_server_hnsw_scan_deltas_applied_total")
+                .increment(delta_count as u64);
         }
 
         // Resolve the indexed vector column so we can filter out NULL-vector

@@ -136,8 +136,10 @@ impl WorkerMetrics {
     /// Record a claim attempt and whether it succeeded.
     pub fn record_claim(&self, success: bool) {
         self.claim_attempts.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("db9_server_worker_claim_attempts_total").increment(1);
         if success {
             self.claim_successes.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("db9_server_worker_claim_successes_total").increment(1);
         }
     }
 
@@ -149,6 +151,10 @@ impl WorkerMetrics {
             .store(queue_depth, Ordering::Relaxed);
         self.last_tick_active_jobs
             .store(active_jobs as u64, Ordering::Relaxed);
+
+        // HNSW pending indexes gauge (true gauge — overwritten each sweep)
+        metrics::gauge!("db9_server_hnsw_pending_indexes")
+            .set(self.hnsw_pending_indexes_observed.load(Ordering::Relaxed) as f64);
     }
 }
 
@@ -212,6 +218,143 @@ mod tests {
         m.sample_tick(42, 5);
         assert_eq!(m.last_tick_queue_depth.load(Ordering::Relaxed), 42);
         assert_eq!(m.last_tick_active_jobs.load(Ordering::Relaxed), 5);
+    }
+
+    /// Create a local recorder + handle for isolated Prometheus assertions.
+    fn test_recorder() -> (
+        metrics_exporter_prometheus::PrometheusRecorder,
+        metrics_exporter_prometheus::PrometheusHandle,
+    ) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        (recorder, handle)
+    }
+
+    #[test]
+    fn test_record_claim_exports_prometheus_counters() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let m = WorkerMetrics::new();
+        m.record_claim(true);
+        m.record_claim(false);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("# TYPE db9_server_worker_claim_attempts_total counter"),
+            "claim attempts should be counter type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_worker_claim_attempts_total 2"),
+            "claim attempts should be 2: {rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE db9_server_worker_claim_successes_total counter"),
+            "claim successes should be counter type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_worker_claim_successes_total 1"),
+            "claim successes should be 1: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_sample_tick_exports_hnsw_pending_gauge() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let m = WorkerMetrics::new();
+        m.hnsw_pending_indexes_observed.store(7, Ordering::Relaxed);
+        m.sample_tick(10, 2);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("# TYPE db9_server_hnsw_pending_indexes gauge"),
+            "hnsw pending indexes should be gauge type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_hnsw_pending_indexes 7"),
+            "hnsw pending indexes should be 7: {rendered}"
+        );
+
+        // Verify overwrite (gauge) semantics: second tick overwrites, not accumulates
+        m.hnsw_pending_indexes_observed.store(3, Ordering::Relaxed);
+        m.sample_tick(10, 2);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("db9_server_hnsw_pending_indexes 3"),
+            "hnsw pending indexes should overwrite to 3: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_gc_safepoint_prometheus_counters() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Simulate what gc.rs does at point of update
+        metrics::gauge!("db9_server_gc_safepoint_version").set(12345.0);
+        metrics::counter!("db9_server_gc_safepoint_advance_total", "result" => "ok").increment(1);
+        metrics::counter!("db9_server_gc_safepoint_advance_total", "result" => "err").increment(2);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("# TYPE db9_server_gc_safepoint_version gauge"),
+            "gc safepoint version should be gauge type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_gc_safepoint_version 12345"),
+            "gc safepoint version: {rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE db9_server_gc_safepoint_advance_total counter"),
+            "gc advance should be counter type: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"db9_server_gc_safepoint_advance_total{result="ok"} 1"#),
+            "gc advance ok: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"db9_server_gc_safepoint_advance_total{result="err"} 2"#),
+            "gc advance err: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_counter_prometheus_exports() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Simulate what gc.rs and hnsw_scan.rs do at point of increment
+        metrics::counter!("db9_server_hnsw_sweep_enqueued_total").increment(3);
+        metrics::counter!("db9_server_hnsw_sweep_enqueue_errors_total").increment(1);
+        metrics::counter!("db9_server_hnsw_scan_deltas_applied_total").increment(5);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("# TYPE db9_server_hnsw_sweep_enqueued_total counter"),
+            "hnsw sweep enqueued should be counter type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_hnsw_sweep_enqueued_total 3"),
+            "hnsw sweep enqueued: {rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE db9_server_hnsw_sweep_enqueue_errors_total counter"),
+            "hnsw sweep errors should be counter type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_hnsw_sweep_enqueue_errors_total 1"),
+            "hnsw sweep errors: {rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE db9_server_hnsw_scan_deltas_applied_total counter"),
+            "hnsw scan deltas should be counter type: {rendered}"
+        );
+        assert!(
+            rendered.contains("db9_server_hnsw_scan_deltas_applied_total 5"),
+            "hnsw scan deltas: {rendered}"
+        );
     }
 
     #[test]
