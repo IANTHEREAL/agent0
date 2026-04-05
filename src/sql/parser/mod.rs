@@ -54,7 +54,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 }
                 return Ok(stmts);
             }
-            Err(anyhow!("SQL parse error: {}", e))
+            let hint = fullwidth_character_hint(sql);
+            match hint {
+                Some(h) => Err(anyhow!("SQL parse error: {}\nHINT: {}", e, h)),
+                None => Err(anyhow!("SQL parse error: {}", e)),
+            }
         }
     }
 }
@@ -204,4 +208,150 @@ fn parse_insert_returning_wildcard_fallback(
         }
         _ => None,
     }
+}
+
+/// Check if a SQL string contains fullwidth ASCII characters (U+FF01..U+FF5E)
+/// outside of string literals, and return a hint message if so.
+/// Check if a Unicode codepoint is in the fullwidth ASCII range (U+FF01..U+FF5E).
+///
+/// With the PG-compatible tokenizer, all fullwidth characters are now valid
+/// identifier characters. This function is used for the parse-error hint:
+/// if a query fails to parse and contains fullwidth characters, the hint
+/// alerts the user about potential encoding issues.
+fn is_fullwidth_ascii(code: u32) -> bool {
+    (0xFF01..=0xFF5E).contains(&code)
+}
+
+fn fullwidth_character_hint(sql: &str) -> Option<String> {
+    let mut found = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // Line comment: skip to end of line
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Block comment (with nesting): skip to matching */
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                let mut depth = 1u32;
+                while i < bytes.len() && depth > 0 {
+                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // Single-quoted string literal (with '' escape, and \' in E-strings)
+            b'\'' => {
+                // Check if preceded by E/e (escape string constant)
+                let is_escape_string = i > 0
+                    && matches!(bytes[i - 1], b'E' | b'e')
+                    && (i < 2 || !bytes[i - 2].is_ascii_alphanumeric());
+                i += 1;
+                while i < bytes.len() {
+                    if is_escape_string && bytes[i] == b'\\' {
+                        i += 2; // skip backslash + next char
+                    } else if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1; // escaped ''
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // Double-quoted identifier
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'"' {
+                            i += 1; // escaped ""
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // Dollar-quoted string: $tag$...$tag$
+            b'$' => {
+                let tag_start = i;
+                i += 1;
+                // Find the end of the opening tag
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'$' {
+                    let tag = &bytes[tag_start..=i];
+                    i += 1;
+                    // Scan for matching closing tag
+                    while i + tag.len() <= bytes.len() {
+                        if &bytes[i..i + tag.len()] == tag {
+                            i += tag.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // If tag didn't close or wasn't a valid dollar-quote, we just
+                // advanced past the $ chars — safe to continue scanning.
+            }
+            _ => {
+                // After byte-level scanning (comments, strings, dollar-quotes),
+                // i may land mid-UTF-8 sequence. Re-align to a char boundary.
+                if !sql.is_char_boundary(i) {
+                    i += 1;
+                    continue;
+                }
+                // Decode a single UTF-8 character at position i
+                let rest = &sql[i..];
+                if let Some(c) = rest.chars().next() {
+                    let code = c as u32;
+                    if is_fullwidth_ascii(code) {
+                        let ascii_equiv = char::from_u32(code - 0xFF01 + 0x21).unwrap();
+                        if !found.iter().any(|&(fw, _)| fw == c) {
+                            found.push((c, ascii_equiv));
+                        }
+                    }
+                    i += c.len_utf8();
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+    }
+
+    if found.is_empty() {
+        return None;
+    }
+
+    let examples: Vec<String> = found
+        .iter()
+        .take(3)
+        .map(|(fw, ascii)| format!("{fw} (U+{:04X}) → {ascii}", *fw as u32))
+        .collect();
+
+    Some(format!(
+        "Your query contains fullwidth Unicode characters that look like ASCII characters \
+         but are different: {}. Check your client application's character encoding settings.",
+        examples.join(", ")
+    ))
 }

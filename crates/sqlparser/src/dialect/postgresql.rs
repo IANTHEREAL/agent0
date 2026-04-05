@@ -22,14 +22,16 @@ pub struct PostgreSqlDialect {}
 
 impl Dialect for PostgreSqlDialect {
     fn is_identifier_start(&self, ch: char) -> bool {
-        // See https://www.postgresql.org/docs/11/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
-        // We don't yet support identifiers beginning with "letters with
-        // diacritical marks"
-        ch.is_alphabetic() || ch == '_'
+        // Match PostgreSQL scan.l: ident_start = [A-Za-z\200-\377_]
+        // PG's flex scanner operates in 8-bit mode where any byte >= 0x80
+        // is a valid identifier start. In UTF-8, any character with codepoint
+        // >= 0x80 encodes to multi-byte sequences where all bytes are >= 0x80.
+        ch.is_ascii_alphabetic() || ch == '_' || ch as u32 >= 0x80
     }
 
     fn is_identifier_part(&self, ch: char) -> bool {
-        ch.is_alphabetic() || ch.is_ascii_digit() || ch == '$' || ch == '_'
+        // Match PostgreSQL scan.l: ident_cont = [A-Za-z\200-\377_0-9$]
+        ch.is_ascii_alphabetic() || ch.is_ascii_digit() || ch == '$' || ch == '_' || ch as u32 >= 0x80
     }
 
     fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {

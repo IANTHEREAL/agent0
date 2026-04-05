@@ -1077,3 +1077,173 @@ fn test_rewrite_vector_distance_with_multibyte_no_panic() {
     let result = rewrite_vector_distance_ops("SELECT 名前 FROM t ORDER BY embedding <-> '[1,2,3]'");
     assert!(!result.is_empty());
 }
+
+// --- Issue #2323: fullwidth character hint ---
+
+#[test]
+fn test_fullwidth_question_mark_parsed_as_identifier() {
+    // With PG-compatible tokenizer, fullwidth ？ (U+FF1F) is treated as an
+    // identifier (PG scan.l: ident_start includes bytes >= 0x80).
+    // `SELECT * FROM users WHERE id = ？` parses as `id = <ident "？">`.
+    let result = parse_sql("SELECT * FROM users WHERE id = \u{FF1F}");
+    assert!(
+        result.is_ok(),
+        "fullwidth ？ should parse as identifier: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn test_fullwidth_operator_still_gives_hint() {
+    // Fullwidth ＝ between two identifiers creates a syntax error because
+    // the parser sees three consecutive identifiers (x, ＝, 1).
+    let result = parse_sql("SELECT * FROM t WHERE x ＝ 1");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("HINT:"),
+        "should have HINT for fullwidth operator: {err}"
+    );
+}
+
+#[test]
+fn test_fullwidth_letter_as_identifier_pg_compat() {
+    // PG-compatible: fullwidth letters are valid identifier chars.
+    // SELECT 1 AS Ａ should parse successfully.
+    let result = parse_sql("SELECT 1 AS \u{FF21}");
+    assert!(
+        result.is_ok(),
+        "fullwidth letter should be valid identifier: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn test_fullwidth_digit_as_identifier_pg_compat() {
+    // PG-compatible: fullwidth digits are valid identifier chars (bytes >= 0x80).
+    // SELECT ０ parses as selecting column ０.
+    let result = parse_sql("SELECT \u{FF10}");
+    assert!(
+        result.is_ok(),
+        "fullwidth digit should be valid identifier: {:?}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
+fn test_fullwidth_multiple_chars_gives_hint() {
+    // Multiple fullwidth chars: ？ and ＝
+    let result = parse_sql("SELECT * FROM t WHERE x ＝ \u{FF1F}");
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("HINT:"), "should have hint: {err}");
+    assert!(
+        err.contains("U+FF1F") && err.contains("U+FF1D"),
+        "hint should mention both fullwidth chars: {err}"
+    );
+}
+
+#[test]
+fn test_fullwidth_in_string_literal_no_hint() {
+    // Fullwidth chars inside string literals are valid data — no hint
+    let result = parse_sql("SELECT '？' AS val");
+    assert!(
+        result.is_ok(),
+        "fullwidth in string literal should parse OK"
+    );
+}
+
+#[test]
+fn test_ascii_question_mark_no_hint() {
+    // Normal ASCII ? — should parse OK, no hint needed
+    let result = parse_sql("SELECT * FROM users WHERE id = ?");
+    assert!(result.is_ok(), "ASCII ? should parse as placeholder");
+}
+
+#[test]
+fn test_normal_parse_error_no_hint() {
+    // Regular parse error without fullwidth chars — no hint
+    let result = parse_sql("SELECT * FROM WHERE =");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SQL parse error"),
+        "should have parse error: {err}"
+    );
+    assert!(
+        !err.contains("HINT:"),
+        "should NOT have fullwidth hint for normal error: {err}"
+    );
+}
+
+#[test]
+fn test_fullwidth_hint_function_directly() {
+    // Test the hint function directly
+    assert!(fullwidth_character_hint("SELECT 1").is_none());
+    assert!(fullwidth_character_hint("SELECT '？'").is_none());
+
+    let hint = fullwidth_character_hint("SELECT ？").unwrap();
+    assert!(hint.contains("U+FF1F"));
+    assert!(hint.contains("→ ?"));
+
+    let hint = fullwidth_character_hint("x ＝ ？").unwrap();
+    assert!(hint.contains("ASCII characters"));
+}
+
+#[test]
+fn test_fullwidth_all_detected_by_hint_function() {
+    // With PG-compatible tokenizer, all fullwidth chars are identifiers.
+    // The hint function detects ALL fullwidth ASCII chars (U+FF01..U+FF5E).
+    let hint = fullwidth_character_hint("SELECT Ａ ＝ 1").unwrap();
+    assert!(hint.contains("U+FF21")); // Ａ
+    assert!(hint.contains("U+FF1D")); // ＝
+
+    let hint = fullwidth_character_hint("SELECT ０").unwrap();
+    assert!(hint.contains("U+FF10")); // ０
+}
+
+#[test]
+fn test_fullwidth_in_dollar_quoted_string_no_hint() {
+    // Fullwidth chars inside dollar-quoted strings should be ignored
+    assert!(fullwidth_character_hint("SELECT $$？$$").is_none());
+    assert!(fullwidth_character_hint("SELECT $tag$？＝$tag$").is_none());
+}
+
+#[test]
+fn test_fullwidth_in_line_comment_no_hint() {
+    // Fullwidth chars inside line comments should be ignored
+    assert!(fullwidth_character_hint("SELECT 1 -- ？ comment").is_none());
+}
+
+#[test]
+fn test_fullwidth_in_block_comment_no_hint() {
+    // Fullwidth chars inside block comments should be ignored
+    assert!(fullwidth_character_hint("SELECT 1 /* ？ */").is_none());
+    // Nested block comments
+    assert!(fullwidth_character_hint("SELECT 1 /* outer /* ？ */ */").is_none());
+}
+
+#[test]
+fn test_fullwidth_in_unclosed_dollar_quote_no_panic() {
+    // Malformed input: unclosed dollar-quote with multibyte chars.
+    // Must not panic even if byte scanning lands mid-UTF-8.
+    let _ = fullwidth_character_hint("SELECT $$？");
+    let _ = fullwidth_character_hint("SELECT $tag$？ test");
+    // Fullwidth char after a properly closed dollar-quote should be detected
+    let hint = fullwidth_character_hint("SELECT $$ok$$ ？").unwrap();
+    assert!(hint.contains("U+FF1F"));
+}
+
+#[test]
+fn test_fullwidth_in_escape_string_no_hint() {
+    // Fullwidth chars inside E'...' escape strings with backslash escapes
+    assert!(fullwidth_character_hint(r"SELECT E'it\'s ？ ok'").is_none());
+    assert!(fullwidth_character_hint(r"SELECT e'test\' ？'").is_none());
+}
+
+#[test]
+fn test_fullwidth_outside_comment_with_comment_present() {
+    // Fullwidth char outside comment should still be detected
+    let hint = fullwidth_character_hint("SELECT -- ok comment\n？").unwrap();
+    assert!(hint.contains("U+FF1F"));
+
+    let hint = fullwidth_character_hint("SELECT /* ok */ ？").unwrap();
+    assert!(hint.contains("U+FF1F"));
+}
