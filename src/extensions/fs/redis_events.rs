@@ -607,10 +607,17 @@ fn parse_stream_entry(value: &redis::Value) -> Option<RedisStreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Guard to serialize tests that mutate the global EVENT_QUEUE_DEPTH counter.
+    /// cargo test runs tests in parallel within the same process, so concurrent
+    /// fetch_add/fetch_sub on the shared atomic causes flaky assertions.
+    static DEPTH_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_event_queue_depth_counter() {
-        // Use fetch_add / fetch_sub deltas — net zero so parallel tests unaffected.
+        let _guard = DEPTH_LOCK.lock().unwrap();
+
         let before = event_queue_depth();
 
         EVENT_QUEUE_DEPTH.fetch_add(5, Ordering::Relaxed);
@@ -668,6 +675,8 @@ mod tests {
     /// (increment-before-send).
     #[test]
     fn test_enqueue_with_accounting_concurrent_drain() {
+        let _guard = DEPTH_LOCK.lock().unwrap();
+
         let (tx, mut rx) = mpsc::unbounded_channel::<RedisEvent>();
         let n = 500usize;
         let builders = make_builders(n);
@@ -716,6 +725,8 @@ mod tests {
     /// (closed channel). Exercises the real implementation, not a simulation.
     #[test]
     fn test_enqueue_with_accounting_closed_channel_rollback() {
+        let _guard = DEPTH_LOCK.lock().unwrap();
+
         let (tx, rx) = mpsc::unbounded_channel::<RedisEvent>();
         // Drop receiver immediately — all sends will fail.
         drop(rx);
