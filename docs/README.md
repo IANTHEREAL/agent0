@@ -7,10 +7,12 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 - [Quick Start](./quickstart.md)
 - [Testing Manual](./testing.md)
 - [SQL Reference](./sql-reference.md)
+- [List of Expressions for Pushdown](./sql/functions/list-of-expressions-for-pushdown.md)
 - [Extensions](./extensions.md)
 - [Multi-Tenancy](./multi-tenancy.md)
 - [Authentication & RBAC](./authentication.md)
 - [Configuration](./configuration.md)
+- [Performance Optimization Parameters](./performance-optimization-parameters.md)
 - [Architecture](./ARCHITECTURE.md)
 - [PRFAQ: Testing Hardening](./prfaq/testing-hardening.md)
 
