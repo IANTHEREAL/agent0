@@ -135,7 +135,8 @@ async fn run_with_guards_timeout_and_cancel_returns_timeout_error() {
         Ok::<(), anyhow::Error>(())
     };
 
-    let err = run_with_guards(fut, Some(Duration::from_millis(5)), Some(&cancel), None)
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let err = run_with_guards(fut, Some(deadline), Some(&cancel), None)
         .await
         .expect_err("expected timeout");
     assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
@@ -148,7 +149,8 @@ async fn run_with_guards_timeout_without_cancel_returns_timeout_error() {
         Ok::<(), anyhow::Error>(())
     };
 
-    let err = run_with_guards(fut, Some(Duration::from_millis(5)), None, None)
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let err = run_with_guards(fut, Some(deadline), None, None)
         .await
         .expect_err("expected timeout");
     assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
@@ -211,8 +213,8 @@ fn execute_task_applies_timeout_to_whole_worker_transaction() {
     let execute_task_source = &prod_source[execute_task_start..execute_bg_ddl_start];
 
     assert!(
-        execute_task_source.contains("let task_timeout ="),
-        "execute_task must compute a task-scoped timeout"
+        execute_task_source.contains("let task_deadline ="),
+        "execute_task must compute a task-scoped deadline"
     );
     assert!(
         execute_task_source.contains("let _ = fut.await?;"),
@@ -220,7 +222,7 @@ fn execute_task_applies_timeout_to_whole_worker_transaction() {
     );
     assert!(
         execute_task_source.contains("run_with_guards(")
-            && execute_task_source.contains("task_timeout,")
+            && execute_task_source.contains("task_deadline,")
             && execute_task_source.contains("cancel_signal.as_ref(),")
             && execute_task_source.contains("shutdown_signal.as_ref(),"),
         "execute_task must wrap the whole task future in run_with_guards"
@@ -228,6 +230,51 @@ fn execute_task_applies_timeout_to_whole_worker_transaction() {
     assert!(
         !execute_task_source.contains("run_with_guards(fut, stmt_timeout"),
         "execute_task must not apply timeout per statement"
+    );
+}
+
+#[test]
+fn cron_timeout_uses_absolute_deadline_through_to_run_with_guards() {
+    // The cron deadline (Instant) must flow from the caller all the way
+    // into run_with_guards, which uses timeout_at (absolute) instead of
+    // timeout (relative Duration).  This ensures:
+    //  1. The timeout fires at the correct wall-clock instant regardless
+    //     of preamble duration (pool.acquire, DB lookup, store.begin).
+    //  2. There is no outer timeout_at that could race and drop the future
+    //     before the inner rollback path runs.
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+
+    // execute_task must accept a deadline (Instant), not a Duration
+    assert!(
+        prod_source.contains("cron_deadline: Option<tokio::time::Instant>"),
+        "execute_task must accept cron_deadline as Option<tokio::time::Instant>"
+    );
+
+    // run_with_guards must accept a deadline (Instant) and use timeout_at
+    assert!(
+        prod_source.contains("deadline: Option<tokio::time::Instant>"),
+        "run_with_guards must accept deadline as Option<tokio::time::Instant>"
+    );
+    assert!(
+        prod_source.contains("tokio::time::timeout_at(dl, fut)"),
+        "run_with_guards must use timeout_at (absolute), not timeout (relative)"
+    );
+
+    // No outer timeout_at wrapping execute_task — that would race and
+    // drop the future before rollback can run
+    let claim_fn = prod_source
+        .split("claim_and_execute_core")
+        .nth(2) // skip the call site, get the definition body
+        .and_then(|rest| rest.split("async fn claim_and_record_cron_run(").next())
+        .expect("claim_and_execute_core must exist");
+    assert!(
+        !claim_fn.contains("timeout_at("),
+        "claim_and_execute_core must NOT wrap execute_task in timeout_at — \
+         the deadline flows into run_with_guards which handles timeout + rollback"
     );
 }
 
@@ -250,7 +297,7 @@ fn worker_engine_shutdown_is_wired_into_run_loop_and_task_guards() {
     );
     assert!(
         prod_source.contains("Some(shutdown_signal.clone())")
-            && prod_source.contains("Some(shutdown_signal)).await"),
+            && prod_source.contains("Some(shutdown_signal),"),
         "worker task execution must propagate shutdown cancellation to running tasks"
     );
 }

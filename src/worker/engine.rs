@@ -519,7 +519,7 @@ impl WorkerEngine {
 
         let exec_result = if entry.task_type == TaskType::Cron && cron_run.is_none() {
             Ok(0usize)
-        } else if let Some((_, cron_db_id, ref run, _, max_runtime_ms)) = cron_run {
+        } else if let Some((_, cron_db_id, ref run, _started_at, max_runtime_ms)) = cron_run {
             let cancel_signal = get_process_list().register(RunningCronJob {
                 run_id: run.run_id,
                 job_id: entry.task_id,
@@ -531,31 +531,26 @@ impl WorkerEngine {
             });
 
             let timeout_ms = max_runtime_ms.unwrap_or(config.cron_job_timeout_ms);
-            let timeout_dur = if timeout_ms > 0 {
-                Some(Duration::from_millis(timeout_ms))
+            let deadline = if timeout_ms > 0 {
+                Some(tokio::time::Instant::now() + Duration::from_millis(timeout_ms))
             } else {
                 None
             };
 
-            let task_fut = Self::execute_task(
+            let result = Self::execute_task(
                 pool,
                 config,
                 &entry,
                 Some(cancel_signal),
                 Some(shutdown_signal.clone()),
-            );
-            let result = match timeout_dur {
-                Some(dur) => match tokio::time::timeout(dur, task_fut).await {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow!("cron job timed out after {}ms", timeout_ms)),
-                },
-                None => task_fut.await,
-            };
+                deadline,
+            )
+            .await;
 
             get_process_list().deregister(run.run_id);
             result
         } else {
-            Self::execute_task(pool, config, &entry, None, Some(shutdown_signal)).await
+            Self::execute_task(pool, config, &entry, None, Some(shutdown_signal), None).await
         };
 
         // Capture finalize result instead of propagating with `?` — cleanup
@@ -872,6 +867,7 @@ impl WorkerEngine {
         entry: &TaskQueueEntry,
         cancel_signal: Option<Arc<Notify>>,
         shutdown_signal: Option<CancellationToken>,
+        cron_deadline: Option<tokio::time::Instant>,
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
@@ -928,10 +924,18 @@ impl WorkerEngine {
         }
 
         let is_cron = entry.task_type == TaskType::Cron;
-        let task_timeout = if !is_cron && config.statement_timeout_ms > 0 {
-            Some(std::time::Duration::from_millis(
-                config.statement_timeout_ms,
-            ))
+        // Absolute deadline for run_with_guards.  Using timeout_at (not
+        // relative Duration) ensures the timeout fires at the correct
+        // wall-clock instant regardless of how long the preamble took,
+        // and avoids a race where an outer timeout could drop the future
+        // before the inner rollback path runs.
+        let task_deadline = if is_cron {
+            cron_deadline
+        } else if config.statement_timeout_ms > 0 {
+            Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(config.statement_timeout_ms),
+            )
         } else {
             None
         };
@@ -1003,7 +1007,7 @@ impl WorkerEngine {
 
         let result = run_with_guards(
             task_fut,
-            task_timeout,
+            task_deadline,
             cancel_signal.as_ref(),
             shutdown_signal.as_ref(),
         )
@@ -1341,7 +1345,7 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
 
 async fn run_with_guards<F, T>(
     fut: F,
-    timeout: Option<Duration>,
+    deadline: Option<tokio::time::Instant>,
     cancel: Option<&Arc<Notify>>,
     shutdown: Option<&CancellationToken>,
 ) -> Result<T>
@@ -1349,8 +1353,8 @@ where
     F: Future<Output = Result<T>>,
 {
     let timed_fut = async move {
-        match timeout {
-            Some(dur) => tokio::time::timeout(dur, fut)
+        match deadline {
+            Some(dl) => tokio::time::timeout_at(dl, fut)
                 .await
                 .map_err(|_| anyhow!(STATEMENT_TIMEOUT_ERROR))?,
             None => fut.await,
