@@ -53,14 +53,14 @@ Each document may include:
 
 ## Performance Optimization
 
+- `docs/design/db9_optimization.md`: next-step execution plan and agent-team backlog for performance optimization milestones `M0` to `M7`
+- `docs/design/performance-optimization-design-template.md`: template for `M1` to `M7` optimization workstreams
 - `docs/design/18_hash_join.md`: Hash Join implementation (equi-join optimization)
   - Design overview: [18_hash_join.md](./18_hash_join.md)
   - Detailed implementation plan: [hash_join_implementation_plan.md](./hash_join_implementation_plan.md)
 
 ## Vector Search
 
-- `docs/design/31_hnsw_s3_graph_offload.md`: active S3-offload architecture for HNSW graphs
-  - versioned S3 objects, MVCC-safe tombstone cleanup, explicit runtime operating envelope
 - `docs/design/27_hnsw_vector_index.md`: HNSW vector index (approximate nearest neighbor search)
   - historical original implementation design; current architecture no longer uses the process-level cache described there
   - PR: [#1241](https://github.com/c4pt0r/db9-server/pull/1241), Issue: [#1220](https://github.com/c4pt0r/db9-server/issues/1220)
