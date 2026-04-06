@@ -58,6 +58,14 @@ pub fn unregister_user_tsc(keyspace: &str, db_id: u64, config_name: &str) {
     }
 }
 
+/// Remove all cached text search configurations for a keyspace.
+///
+/// Called when a tenant is evicted from the connection pool to prevent
+/// unbounded accumulation of stale entries.
+pub fn evict_user_tsc_keyspace(keyspace: &str) {
+    user_cache().write().remove(keyspace);
+}
+
 /// Resolve a user-defined TSC to a tokenizer function.
 ///
 /// Returns `None` if the config is not in the user cache or the cached
@@ -559,5 +567,19 @@ mod tests {
         // zhparser and chinese should be the same
         let tokens_zhparser = get_tokenizer("zhparser").unwrap()(text_cn);
         assert_eq!(tokens_cn, tokens_zhparser);
+    }
+
+    #[test]
+    fn evict_user_tsc_keyspace_removes_all_entries() {
+        let ks = "test_evict_ks";
+        register_user_tsc(ks, 1, "my_config", "english");
+        register_user_tsc(ks, 2, "other_config", "chinese");
+        assert!(resolve_user_tsc(ks, 1, "my_config").is_some());
+        assert!(resolve_user_tsc(ks, 2, "other_config").is_some());
+
+        evict_user_tsc_keyspace(ks);
+
+        assert!(resolve_user_tsc(ks, 1, "my_config").is_none());
+        assert!(resolve_user_tsc(ks, 2, "other_config").is_none());
     }
 }

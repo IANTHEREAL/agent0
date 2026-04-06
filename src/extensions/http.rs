@@ -131,6 +131,17 @@ fn limiters() -> &'static TenantLimiters {
     })
 }
 
+/// Remove the cached HTTP quota for a keyspace.
+///
+/// Called when a tenant is evicted from the connection pool to prevent
+/// unbounded accumulation of stale entries.
+pub(crate) fn evict_http_limiter(keyspace: &str) {
+    if let Some(l) = LIMITERS.get() {
+        let mut guard = l.by_tenant.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(keyspace);
+    }
+}
+
 fn http_response_schema(name: &str) -> TableSchema {
     TableSchema::virtual_table(
         name,

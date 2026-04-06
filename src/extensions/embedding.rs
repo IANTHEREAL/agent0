@@ -34,6 +34,14 @@ struct TenantSemaphore {
 
 static TENANT_SEMAPHORES: LazyLock<DashMap<String, TenantSemaphore>> = LazyLock::new(DashMap::new);
 
+/// Remove the cached semaphore for a keyspace.
+///
+/// Called when a tenant is evicted from the connection pool to prevent
+/// unbounded accumulation of stale entries.
+pub(crate) fn evict_embedding_semaphore(keyspace: &str) {
+    TENANT_SEMAPHORES.remove(keyspace);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedEmbeddingConfig {
     pub(crate) provider: EmbeddingProvider,

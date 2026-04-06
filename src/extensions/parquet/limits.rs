@@ -36,6 +36,17 @@ fn limiters() -> &'static TenantParquetLimiters {
     })
 }
 
+/// Remove the cached Parquet semaphore for a keyspace.
+///
+/// Called when a tenant is evicted from the connection pool to prevent
+/// unbounded accumulation of stale entries.
+pub(crate) fn evict_parquet_limiter(keyspace: &str) {
+    if let Some(l) = PARQUET_LIMITERS.get() {
+        let mut guard = l.by_tenant.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(keyspace);
+    }
+}
+
 pub(crate) fn acquire_import_permit(
     tenant: &str,
 ) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {

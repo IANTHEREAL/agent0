@@ -18,6 +18,9 @@ const DEFAULT_AUDIENCE: &str = "db9-server";
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
 const JWKS_UNKNOWN_KID_COOLDOWN: Duration = Duration::from_secs(10);
 const JWKS_MISSING_SELECTOR_CACHE_LIMIT: usize = 64;
+/// Safety cap: reject JWKS responses with more keys than this.
+/// Legitimate JWKS endpoints typically expose fewer than 10 keys.
+const JWKS_MAX_KEYS: usize = 128;
 const DEFAULT_JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +310,13 @@ struct JwksCacheState {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+/// Global JWKS cache shared across all tenants.
+///
+/// **Known limitation (TODO #2345):** this is a single-entry cross-tenant cache.
+/// A slow or malicious JWKS endpoint for one tenant can block the shared refresh
+/// future, delaying authentication for all tenants.  A per-tenant circuit breaker
+/// (separate cache entries + rate limiting per tenant) is tracked as a follow-up
+/// to avoid scope-creeping this cache-bounding PR.
 static JWKS_CACHE: OnceLock<Mutex<JwksCacheState>> = OnceLock::new();
 
 fn http_client() -> &'static reqwest::Client {
@@ -764,6 +774,15 @@ async fn fetch_and_parse_jwks(
         reason: err.to_string(),
     })?;
 
+    if jwks.keys.len() > JWKS_MAX_KEYS {
+        return Err(Db9AuthError::JwksParseFailed {
+            reason: format!(
+                "JWKS response contains {} keys, exceeding limit of {JWKS_MAX_KEYS}",
+                jwks.keys.len()
+            ),
+        });
+    }
+
     let mut keys_by_kid = HashMap::new();
     let mut singleton_candidate: Option<Arc<DecodingKey>> = None;
     let mut usable_key_count: usize = 0;
@@ -874,6 +893,7 @@ fn jwt_algorithms_from_env() -> Vec<Algorithm> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1966,5 +1986,31 @@ JwIDAQAB
         );
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn jwks_rejects_oversized_key_set() {
+        let _guard = test_lock().lock().unwrap();
+        clear_jwks_cache().await;
+
+        // Build a JWKS response with more than JWKS_MAX_KEYS keys.
+        let keys: Vec<String> = (0..JWKS_MAX_KEYS + 1)
+            .map(|i| {
+                let x = URL_SAFE_NO_PAD.encode(format!("key-material-{i:04}").as_bytes());
+                format!(r#"{{"kty":"OKP","kid":"k{i}","x":"{x}"}}"#)
+            })
+            .collect();
+        let jwks_body = format!(r#"{{"keys":[{}]}}"#, keys.join(","));
+        let (jwks_url, server_task) = start_jwks_server(jwks_body).await;
+
+        let result = fetch_and_parse_jwks(&jwks_url).await;
+        assert!(
+            matches!(result, Err(Db9AuthError::JwksParseFailed { .. })),
+            "should reject JWKS with {} keys (limit {})",
+            JWKS_MAX_KEYS + 1,
+            JWKS_MAX_KEYS
+        );
+
+        server_task.await.unwrap();
     }
 }

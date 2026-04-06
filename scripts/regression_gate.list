@@ -322,6 +322,10 @@ tests/safety_copy_selfref_fk.py
 # S3 HNSW (requires HNSW_S3_BUCKET + S3/MinIO, ~60s):
 #   python3 tests/stress_hnsw_s3_live.py --dsn ...
 #   HNSW_S3_TEST=1 python3 tests/safety_hnsw_s3_offload.py --dsn ...
+# #2345 – schema cache LRU eviction (unit test: schema_deser_cache_prevents_reparse)
+# No SQL regression test — internal cache behavior, not observable via SQL.
+# Regression coverage: unit-tests job (cargo test schema_deser_cache_prevents_reparse,
+# jwks_rejects_oversized_key_set, evict_user_tsc_keyspace_removes_all_entries)
 [orm]
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts

@@ -209,6 +209,7 @@ pub(crate) fn strip_fs9_scheme(url: &str) -> &str {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use crate::extensions::context;

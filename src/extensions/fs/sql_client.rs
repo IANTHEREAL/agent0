@@ -126,6 +126,7 @@ fn decode_utf8(bytes: Vec<u8>, fn_name: &str, binary_fn_name: &str) -> Result<St
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use crate::extensions::context;

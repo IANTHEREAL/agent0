@@ -605,6 +605,7 @@ fn parse_stream_entry(value: &redis::Value) -> Option<RedisStreamEvent> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;

@@ -12,7 +12,7 @@
 
 use crate::model::{default_owner, FunctionDef, MatViewDef, Row, TableSchema, ViewDef};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
+use quick_cache::sync::Cache;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -28,11 +28,13 @@ const SCHEMA_MAGIC_V1: &[u8] = b"DB9_SCHEMA_V1\0"; // CI-ALLOWED: kept for error
 /// (keyed by raw bytes), so DDL mutations that produce different serialized bytes
 /// automatically miss and re-populate.
 ///
-/// Bounded to MAX_SCHEMA_CACHE_ENTRIES; cleared entirely on overflow (rare —
-/// entry count equals the number of distinct table schema blobs ever seen).
+/// Bounded to MAX_SCHEMA_CACHE_ENTRIES with approximate LRU eviction
+/// (Clock-PRO) — when full, cold entries are evicted incrementally
+/// (not all entries at once).
 const MAX_SCHEMA_CACHE_ENTRIES: usize = 4096;
 
-static SCHEMA_DESER_CACHE: LazyLock<DashMap<Vec<u8>, TableSchema>> = LazyLock::new(DashMap::new);
+static SCHEMA_DESER_CACHE: LazyLock<Cache<Vec<u8>, TableSchema>> =
+    LazyLock::new(|| Cache::new(MAX_SCHEMA_CACHE_ENTRIES));
 
 pub fn serialize_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     let payload =
@@ -48,7 +50,7 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     // This avoids the SQL parser cost in hydrate_runtime_caches() on repeated reads
     // of the same schema across queries (get_schema() re-reads from TiKV each call).
     if let Some(cached) = SCHEMA_DESER_CACHE.get(data) {
-        return Ok(cached.clone());
+        return Ok(cached);
     }
 
     let payload = if let Some(p) = data.strip_prefix(SCHEMA_MAGIC_V2) {
@@ -64,10 +66,7 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     let mut schema = deserialize_v2_msgpack(payload)?;
     schema.hydrate_runtime_caches();
 
-    // Populate cache. Clear if too large to bound memory usage.
-    if SCHEMA_DESER_CACHE.len() >= MAX_SCHEMA_CACHE_ENTRIES {
-        SCHEMA_DESER_CACHE.clear();
-    }
+    // Populate cache. quick_cache handles LRU eviction automatically at capacity.
     SCHEMA_DESER_CACHE.insert(data.to_vec(), schema.clone());
 
     Ok(schema)
@@ -659,20 +658,21 @@ mod tests {
 
     #[test]
     fn schema_deser_cache_prevents_reparse() {
-        SCHEMA_DESER_CACHE.clear();
         let data = serialize_schema(&sample_schema()).unwrap();
 
         // First call: cache miss → full parse + hydrate + insert.
         let first = deserialize_schema(&data).unwrap();
         assert_eq!(first.name, "public.users");
         assert!(
-            SCHEMA_DESER_CACHE.contains_key(&data),
+            SCHEMA_DESER_CACHE.get(data.as_slice()).is_some(),
             "entry must be cached after first deserialize"
         );
 
-        // Mutate the cached entry so we can distinguish a cache hit from
-        // a fresh parse (fresh parse would return "public.users").
-        SCHEMA_DESER_CACHE.get_mut(&data).unwrap().name = "CACHE_HIT".to_string();
+        // Overwrite the cached entry with a mutated clone so we can
+        // distinguish a cache hit from a fresh parse.
+        let mut mutated = first.clone();
+        mutated.name = "CACHE_HIT".to_string();
+        SCHEMA_DESER_CACHE.insert(data.clone(), mutated);
 
         // Second call: same bytes → must return the mutated cached entry.
         let second = deserialize_schema(&data).unwrap();
@@ -681,7 +681,46 @@ mod tests {
             "second call must return cached entry, not re-parse"
         );
 
-        SCHEMA_DESER_CACHE.clear();
+        // Restore original to avoid polluting other tests.
+        SCHEMA_DESER_CACHE.insert(data, first);
+    }
+
+    /// Prove that `quick_cache` evicts incrementally (Clock-PRO), not cliff-style.
+    ///
+    /// We use a small standalone cache (capacity 8) instead of the global
+    /// SCHEMA_DESER_CACHE (capacity 4096) to keep the test fast and isolated.
+    /// The eviction algorithm is the same — `quick_cache::sync::Cache::new(n)`.
+    #[test]
+    fn schema_cache_evicts_incrementally_not_cliff() {
+        use quick_cache::sync::Cache;
+
+        let cap = 8usize;
+        let cache: Cache<u32, u32> = Cache::new(cap);
+
+        // Fill the cache to capacity.
+        for i in 0..cap as u32 {
+            cache.insert(i, i);
+        }
+
+        // Insert one more — should trigger incremental eviction, not clear all.
+        cache.insert(cap as u32, cap as u32);
+
+        // Count how many of the original entries survive.
+        let survivors: usize = (0..cap as u32).filter(|i| cache.get(i).is_some()).count();
+
+        // Incremental eviction: most entries survive (at most a few evicted).
+        // Cliff eviction would leave 0 survivors.
+        assert!(
+            survivors >= cap - 2,
+            "incremental eviction should keep most entries; only {survivors}/{cap} survived \
+             (cliff eviction would have 0)"
+        );
+
+        // The newly inserted entry must be present.
+        assert!(
+            cache.get(&(cap as u32)).is_some(),
+            "newly inserted entry must survive"
+        );
     }
 
     #[test]

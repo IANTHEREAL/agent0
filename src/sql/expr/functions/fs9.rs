@@ -506,6 +506,7 @@ pub fn fs9_truncate(args: Vec<Value>) -> Result<Value> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use crate::extensions::context;

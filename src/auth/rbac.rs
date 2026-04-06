@@ -20,6 +20,18 @@ pub fn invalidate_initialized(keyspace: &str) {
     INITIALIZED_KEYSPACES.remove(keyspace);
 }
 
+/// Insert `keyspace` into the initialized cache (test helper).
+#[cfg(test)]
+pub fn mark_initialized(keyspace: &str) {
+    INITIALIZED_KEYSPACES.insert(keyspace.to_string());
+}
+
+/// Check if `keyspace` is in the initialized cache without TiKV (test helper).
+#[cfg(test)]
+pub fn is_initialized_cached(keyspace: &str) -> bool {
+    INITIALIZED_KEYSPACES.contains(keyspace)
+}
+
 const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
 const BOOTSTRAP_USER_KEY: &[u8] = b"_sys_bootstrap_user";
@@ -941,6 +953,7 @@ impl AuthManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;

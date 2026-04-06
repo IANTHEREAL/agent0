@@ -18,7 +18,7 @@ use tracing::{debug, info};
 ///
 /// Used by `evict_idle()` to find eviction candidates in O(k) time where k
 /// is the number of candidates due for eviction, rather than scanning all tenants.
-/// Protected by `std::sync::Mutex` (not tokio) so it can be updated from
+/// Protected by `parking_lot::Mutex` (not tokio) so it can be updated from
 /// `TenantHandle::Drop` without requiring an async runtime.
 type IdleIndex = StdMutex<BTreeSet<(u64, String)>>;
 
@@ -506,6 +506,11 @@ impl AdmissionBudgetRegistry {
         map.entry(params.owner_id.clone())
             .or_insert_with(|| Arc::new(TokenBucket::new_with_burst(params.rps, params.burst)))
             .clone()
+    }
+
+    /// Remove the admission budget for `owner_id` when the tenant is evicted.
+    pub(crate) fn evict(&self, owner_id: &str) {
+        self.buckets.lock().remove(owner_id);
     }
 }
 
@@ -1133,11 +1138,17 @@ impl TikvClientPool {
             }
         }
 
-        // Also clean up creation locks for evicted keyspaces.
+        // Clean up creation locks and per-keyspace caches for evicted keyspaces.
         if !evicted.is_empty() {
             let mut locks = self.creation_locks.write().await;
             for ks in &evicted {
                 locks.remove(ks);
+                crate::auth::invalidate_initialized(ks);
+                crate::sql::fts_tokenizers::evict_user_tsc_keyspace(ks);
+                crate::extensions::embedding::evict_embedding_semaphore(ks);
+                crate::extensions::http::evict_http_limiter(ks);
+                crate::extensions::parquet::limits::evict_parquet_limiter(ks);
+                admission_budget_registry().evict(ks);
             }
         }
 
@@ -1911,6 +1922,58 @@ mod tests {
         );
         assert_eq!(b1.rate(), 100);
         assert_eq!(b2.rate(), 50);
+    }
+
+    /// Verify that `evict_idle()` calls per-keyspace cache cleanup hooks.
+    ///
+    /// Populates `INITIALIZED_KEYSPACES`, `USER_TSC_CACHE`, and the
+    /// `AdmissionBudgetRegistry` for a tenant, then evicts the tenant
+    /// and confirms all caches are cleaned.
+    #[tokio::test]
+    async fn test_evict_idle_cleans_per_keyspace_caches() {
+        let ks = "hook_cleanup_ks";
+
+        // Pre-populate per-keyspace caches.
+        crate::auth::mark_initialized(ks);
+        crate::sql::fts_tokenizers::register_user_tsc(ks, 1, "my_config", "simple");
+        let budget_params = AdmissionBudgetParams {
+            owner_id: ks.to_string(),
+            rps: 10,
+            burst: 10,
+        };
+        admission_budget_registry().get_or_create(&budget_params);
+
+        // Confirm caches are populated.
+        assert!(
+            crate::auth::is_initialized_cached(ks),
+            "INITIALIZED_KEYSPACES should contain the keyspace before eviction"
+        );
+        assert!(
+            crate::sql::fts_tokenizers::resolve_user_tsc(ks, 1, "my_config").is_some(),
+            "USER_TSC_CACHE should contain the keyspace before eviction"
+        );
+
+        // Inject tenant and evict it.
+        let pool = TikvClientPool::new_with_timeouts(
+            vec![],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let entry = pool.inject_entry(ks).await;
+        mark_idle(&entry, &pool);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let evicted = pool.evict_idle().await;
+        assert_eq!(evicted, vec![ks.to_string()]);
+
+        // Verify cleanup hooks were called.
+        assert!(
+            !crate::auth::is_initialized_cached(ks),
+            "INITIALIZED_KEYSPACES must be cleaned after eviction"
+        );
+        assert!(
+            crate::sql::fts_tokenizers::resolve_user_tsc(ks, 1, "my_config").is_none(),
+            "USER_TSC_CACHE must be cleaned after eviction"
+        );
     }
 
     #[test]

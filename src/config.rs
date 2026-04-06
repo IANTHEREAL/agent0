@@ -261,6 +261,7 @@ impl ServerConfig {
 pub type SharedServerConfig = Arc<RwLock<ServerConfig>>;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
