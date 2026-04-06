@@ -651,7 +651,7 @@ impl Executor {
             .ok_or_else(|| anyhow!("server configuration not available"))?;
 
         {
-            let mut cfg = server_config.write().unwrap();
+            let mut cfg = server_config.write();
             match name_lower.as_str() {
                 "statement_timeout" => cfg.statement_timeout_ms = ms,
                 "idle_in_transaction_session_timeout" => {
@@ -829,7 +829,7 @@ mod tests {
             .unwrap();
         assert_command_tag(r2, "ALTER SYSTEM");
 
-        let cfg = session.server_config().unwrap().read().unwrap().clone();
+        let cfg = session.server_config().unwrap().read().clone();
         assert_eq!(cfg.statement_timeout_ms, 1500);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 2000);
     }

@@ -1,3 +1,6 @@
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
+
 use crate::extensions::fs::backend::{
     batch_inline_read_entry_too_large_error, batch_inline_read_payload_too_large_error,
     FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult, FsCreateUpload,

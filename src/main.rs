@@ -221,7 +221,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let dev_mode = config::env_bool("DB9_DEV");
     let insecure_mode = config::env_bool("DB9_INSECURE");
     let server_config = ServerConfig::from_env().shared();
-    let initial_server_config = server_config.read().unwrap().clone();
+    let initial_server_config = server_config.read().clone();
     config::init_embedding_config();
 
     // Initialize HNSW S3 offload client.
@@ -718,7 +718,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         connect_host, pg_port
     );
 
-    let max_connections = server_config.read().unwrap().max_connections;
+    let max_connections = server_config.read().max_connections;
     let conn_semaphore = Arc::new(Semaphore::new(max_connections as usize));
     let mut connection_tasks = ConnectionTaskRegistry::new();
     info!("Max connections: {}", max_connections);
@@ -743,7 +743,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                 }
             }
         };
-        let accept_config = server_config.read().unwrap().clone();
+        let accept_config = server_config.read().clone();
 
         if let Err(e) = configure_pgwire_socket_keepalive(&socket, &accept_config) {
             warn!("Failed to configure TCP keepalive for {}: {}", peer_addr, e);

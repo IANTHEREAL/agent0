@@ -1,3 +1,6 @@
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
+
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -1,3 +1,6 @@
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
+
 use super::{
     AcquireError, AdvisoryLockMode, AdvisoryLockScope, BulkReleaseKind, LockKey, LockState,
     ManagerState,

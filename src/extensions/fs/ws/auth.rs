@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
@@ -327,13 +329,7 @@ impl WsConnectionTracker {
 
     pub(crate) fn try_acquire(&self, keyspace: &str) -> Result<WsConnectionGuard, WsResponse> {
         let counter = {
-            let mut counts = self.counts.write().map_err(|_| {
-                WsResponse::error(
-                    "",
-                    WsErrorCode::Eio,
-                    "fs9: connection tracker lock poisoned",
-                )
-            })?;
+            let mut counts = self.counts.write();
             counts
                 .entry(keyspace.to_string())
                 .or_insert_with(|| Arc::new(AtomicU32::new(0)))
@@ -397,10 +393,7 @@ mod tests {
     use super::*;
 
     fn active_count(tracker: &WsConnectionTracker, keyspace: &str) -> u32 {
-        let counts = tracker
-            .counts
-            .read()
-            .expect("connection tracker lock should not be poisoned");
+        let counts = tracker.counts.read();
         counts
             .get(keyspace)
             .map(|counter| counter.load(Ordering::Relaxed))

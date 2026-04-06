@@ -10,7 +10,9 @@
 //! - `chinese_ngram` / `zhparser_ngram`: jieba + bigram overlay
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+
+use parking_lot::RwLock;
 
 use super::fts_stopwords::is_english_stopword;
 /// Tokenizer function type: takes text and returns a vector of tokens.
@@ -37,7 +39,7 @@ fn user_cache() -> &'static RwLock<UserTscCacheMap> {
 ///
 /// Called by the executor after successfully persisting to TiKV.
 pub fn register_user_tsc(keyspace: &str, db_id: u64, config_name: &str, tokenizer_name: &str) {
-    let mut cache = user_cache().write().unwrap();
+    let mut cache = user_cache().write();
     cache
         .entry(keyspace.to_string())
         .or_default()
@@ -48,7 +50,7 @@ pub fn register_user_tsc(keyspace: &str, db_id: u64, config_name: &str, tokenize
 
 /// Remove a user-defined text search configuration from the in-process cache.
 pub fn unregister_user_tsc(keyspace: &str, db_id: u64, config_name: &str) {
-    let mut cache = user_cache().write().unwrap();
+    let mut cache = user_cache().write();
     if let Some(by_db) = cache.get_mut(keyspace) {
         if let Some(by_cfg) = by_db.get_mut(&db_id) {
             by_cfg.remove(config_name);
@@ -61,7 +63,7 @@ pub fn unregister_user_tsc(keyspace: &str, db_id: u64, config_name: &str) {
 /// Returns `None` if the config is not in the user cache or the cached
 /// tokenizer name doesn't exist in the static registry.
 pub fn resolve_user_tsc(keyspace: &str, db_id: u64, config: &str) -> Option<TokenizerFn> {
-    let cache = user_cache().read().unwrap();
+    let cache = user_cache().read();
     let tokenizer_name = cache.get(keyspace)?.get(&db_id)?.get(config)?;
     get_tokenizer(tokenizer_name)
 }

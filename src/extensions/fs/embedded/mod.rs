@@ -1,3 +1,6 @@
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
+
 pub(crate) mod blob;
 pub(crate) mod bundle;
 pub(crate) mod keys;

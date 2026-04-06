@@ -1,10 +1,11 @@
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
+use parking_lot::Mutex;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tikv_client::TransactionClient;
 
 use crate::config::EmbeddingProvider;
@@ -275,23 +276,14 @@ pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
 }
 
 pub(crate) fn cached_fs_backend() -> Option<Arc<dyn SharedFsBackend>> {
-    CTX.try_with(|ctx| {
-        ctx.statement_state
-            .fs_backend
-            .lock()
-            .expect("fs backend mutex poisoned")
-            .clone()
-    })
-    .ok()
-    .flatten()
+    CTX.try_with(|ctx| ctx.statement_state.fs_backend.lock().clone())
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn cache_fs_backend(backend: Arc<dyn SharedFsBackend>) -> Result<()> {
     CTX.try_with(|ctx| {
-        *ctx.statement_state
-            .fs_backend
-            .lock()
-            .expect("fs backend mutex poisoned") = Some(backend);
+        *ctx.statement_state.fs_backend.lock() = Some(backend);
     })
     .map_err(|_| anyhow!("fs9: extension context not available"))?;
     Ok(())
@@ -375,15 +367,8 @@ pub(crate) async fn with_embedding_authorized<R>(future: impl Future<Output = R>
 }
 
 pub(crate) fn cached_embedding(key: &EmbeddingCacheKey) -> Result<Option<Vec<f64>>> {
-    CTX.try_with(|ctx| {
-        ctx.statement_state
-            .embedding_cache
-            .lock()
-            .expect("embedding cache mutex poisoned")
-            .get(key)
-            .cloned()
-    })
-    .map_err(|_| anyhow!("embedding: extension context not available"))
+    CTX.try_with(|ctx| ctx.statement_state.embedding_cache.lock().get(key).cloned())
+        .map_err(|_| anyhow!("embedding: extension context not available"))
 }
 
 pub(crate) fn cache_embedding(key: EmbeddingCacheKey, vector: Vec<f64>) -> Result<()> {
@@ -391,7 +376,6 @@ pub(crate) fn cache_embedding(key: EmbeddingCacheKey, vector: Vec<f64>) -> Resul
         ctx.statement_state
             .embedding_cache
             .lock()
-            .expect("embedding cache mutex poisoned")
             .insert(key, vector);
     })
     .map_err(|_| anyhow!("embedding: extension context not available"))?;

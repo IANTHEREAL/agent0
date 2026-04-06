@@ -1,6 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -324,7 +324,7 @@ impl BundleSliceCache {
             offset,
             len,
         };
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let stamp = inner.next_stamp;
         inner.next_stamp = inner.next_stamp.wrapping_add(1);
         let data = {
@@ -347,7 +347,7 @@ impl BundleSliceCache {
             offset,
             len: data.len(),
         };
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let stamp = inner.next_stamp;
         inner.next_stamp = inner.next_stamp.wrapping_add(1);
 
@@ -975,7 +975,7 @@ mod tests {
             assert!(cache.get(1, offset, 3).is_some());
         }
 
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.lock();
         let limit = inner.map.len() * BundleSliceCache::ORDER_COMPACT_FACTOR
             + BundleSliceCache::ORDER_COMPACT_MIN;
         assert!(inner.order.len() <= limit);

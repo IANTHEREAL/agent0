@@ -10,7 +10,8 @@
 //! register after DROP has checked the count.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 /// Global per-database connection registry.
 static DB_CONNECTIONS: std::sync::OnceLock<DbConnectionRegistry> = std::sync::OnceLock::new();
@@ -46,7 +47,7 @@ impl DbConnectionRegistry {
         db_id: u64,
     ) -> Result<DbConnectionGuard, &'static str> {
         let key = (keyspace.to_string(), db_id);
-        let mut map = self.entries.lock().unwrap();
+        let mut map = self.entries.lock();
         let entry = map.entry(key.clone()).or_insert(DbEntry {
             count: 0,
             dropping: false,
@@ -66,7 +67,7 @@ impl DbConnectionRegistry {
     /// The guard clears the dropping flag on drop (if DROP fails/rolls back).
     pub fn try_mark_dropping(&self, keyspace: &str, db_id: u64) -> Result<DroppingGuard, usize> {
         let key = (keyspace.to_string(), db_id);
-        let mut map = self.entries.lock().unwrap();
+        let mut map = self.entries.lock();
         let entry = map.entry(key.clone()).or_insert(DbEntry {
             count: 0,
             dropping: false,
@@ -99,7 +100,7 @@ impl Drop for DbConnectionGuard {
     fn drop(&mut self) {
         let key = (self.keyspace.clone(), self.db_id);
         let registry = db_connection_registry();
-        let mut map = registry.entries.lock().unwrap();
+        let mut map = registry.entries.lock();
         if let Some(entry) = map.get_mut(&key) {
             entry.count = entry.count.saturating_sub(1);
             if entry.count == 0 && !entry.dropping {
@@ -125,7 +126,7 @@ impl DroppingGuard {
     pub fn commit(&mut self) {
         let key = (self.keyspace.clone(), self.db_id);
         let registry = db_connection_registry();
-        let mut map = registry.entries.lock().unwrap();
+        let mut map = registry.entries.lock();
         map.remove(&key);
         self.committed = true;
     }
@@ -137,7 +138,7 @@ impl Drop for DroppingGuard {
             // DROP failed or was rolled back — allow connections again.
             let key = (self.keyspace.clone(), self.db_id);
             let registry = db_connection_registry();
-            let mut map = registry.entries.lock().unwrap();
+            let mut map = registry.entries.lock();
             if let Some(entry) = map.get_mut(&key) {
                 entry.dropping = false;
                 if entry.count == 0 {

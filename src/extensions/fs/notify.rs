@@ -1,6 +1,7 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
@@ -192,7 +193,7 @@ impl EventRing {
     }
 
     fn push_inner(&self, builder: FsEventBuilder, timestamp: i64) -> Result<u64, PushError> {
-        let mut events = self.events.write().map_err(|_| PushError::LockPoisoned)?;
+        let mut events = self.events.write();
 
         let seq = events.back().map(|e| e.seq + 1).unwrap_or(1);
         let event = builder.into_event(seq, timestamp);
@@ -226,7 +227,7 @@ impl EventRing {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let mut events = self.events.write().map_err(|_| PushError::LockPoisoned)?;
+        let mut events = self.events.write();
 
         let mut seq = events.back().map(|e| e.seq + 1).unwrap_or(1);
         let first_seq = seq;
@@ -269,7 +270,7 @@ impl EventRing {
 
     /// Current ring size.
     pub fn len(&self) -> usize {
-        self.events.read().expect("lock poisoned").len()
+        self.events.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -278,7 +279,7 @@ impl EventRing {
 
     /// Query events with `seq > since_seq`, optional path prefix filter, and limit.
     pub fn query(&self, since_seq: u64, path_prefix: Option<&str>, limit: usize) -> QueryResult {
-        let events = self.events.read().expect("lock poisoned");
+        let events = self.events.read();
 
         let oldest_seq = events.front().map(|e| e.seq).unwrap_or(0);
         let newest_seq = events.back().map(|e| e.seq).unwrap_or(0);
@@ -339,6 +340,8 @@ impl EventRing {
 
 #[derive(Debug)]
 pub enum PushError {
+    /// Retained for API compatibility; unreachable with parking_lot.
+    #[allow(dead_code)]
     LockPoisoned,
 }
 
@@ -365,7 +368,7 @@ fn ring_registry() -> &'static RingRegistry {
 
 /// Get or create the EventRing for a given keyspace.
 pub fn get_or_create_event_ring(keyspace: &str) -> Arc<EventRing> {
-    let mut registry = ring_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut registry = ring_registry().lock();
     registry
         .entry(keyspace.to_string())
         .or_insert_with(|| Arc::new(EventRing::from_env()))
@@ -440,7 +443,7 @@ fn metrics_registry() -> &'static MetricsRegistry {
 
 /// Get or create NotifyMetrics for a given keyspace.
 pub fn notify_metrics_for_keyspace(keyspace: &str) -> Arc<NotifyMetrics> {
-    let mut registry = metrics_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut registry = metrics_registry().lock();
     registry
         .entry(keyspace.to_string())
         .or_insert_with(|| Arc::new(NotifyMetrics::new()))

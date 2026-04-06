@@ -5,6 +5,8 @@
 //! - A global in-memory cache for fast reads.
 //! - Versioned binary serialization for TiKV persistence.
 //! - Key classification helpers for the background scanner.
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

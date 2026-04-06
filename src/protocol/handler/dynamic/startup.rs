@@ -219,7 +219,7 @@ impl DynamicPgHandler {
         };
         let database_name = database_name.to_ascii_lowercase();
         let (default_stmt_timeout, default_idle_txn_timeout, hard_cap_ms) = {
-            let cfg = self.server_config.read().unwrap();
+            let cfg = self.server_config.read();
             (
                 cfg.statement_timeout_ms,
                 cfg.idle_in_transaction_session_timeout_ms,
@@ -725,10 +725,7 @@ impl StartupHandler for DynamicPgHandler {
                                 let watchdog = tokio::spawn(async move {
                                     idle_in_transaction_watchdog(session_lock, cancel).await;
                                 });
-                                let mut guard = self
-                                    .idle_watchdog_handle
-                                    .lock()
-                                    .expect("idle_watchdog_handle poisoned");
+                                let mut guard = self.idle_watchdog_handle.lock();
                                 if let Some(previous) = guard.replace(watchdog) {
                                     previous.abort();
                                 }

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
@@ -42,25 +44,24 @@ impl CronProcessList {
             info,
             cancel_signal: signal.clone(),
         };
-        self.running.write().unwrap().insert(run_id, entry);
+        self.running.write().insert(run_id, entry);
         signal
     }
 
     pub fn deregister(&self, run_id: i64) {
-        self.running.write().unwrap().remove(&run_id);
+        self.running.write().remove(&run_id);
     }
 
     pub fn list(&self) -> Vec<RunningCronJob> {
         self.running
             .read()
-            .unwrap()
             .values()
             .map(|e| e.info.clone())
             .collect()
     }
 
     pub fn cancel_by_job_id(&self, job_id: i64) -> bool {
-        let guard = self.running.read().unwrap();
+        let guard = self.running.read();
         for entry in guard.values() {
             if entry.info.job_id == job_id {
                 entry.cancel_signal.notify_waiters();

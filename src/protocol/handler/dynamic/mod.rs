@@ -27,12 +27,12 @@ use super::{CopyContext, CONNECTION_ID_COUNTER};
 use crate::config::SharedServerConfig;
 use crate::pool::TikvClientPool;
 use crate::sql::{Executor, Session};
+use parking_lot::Mutex as StdMutex;
 use pgwire::api::{NoopErrorHandler, PgWireServerHandlers};
 use pgwire::tokio::CancellationToken;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 
@@ -129,12 +129,7 @@ impl DynamicPgHandler {
 impl Drop for DynamicPgHandler {
     fn drop(&mut self) {
         self.cancel_token.cancel(); // stop idle-in-transaction watchdog
-        if let Some(watchdog) = self
-            .idle_watchdog_handle
-            .lock()
-            .expect("idle_watchdog_handle poisoned")
-            .take()
-        {
+        if let Some(watchdog) = self.idle_watchdog_handle.lock().take() {
             watchdog.abort();
         }
         crate::admin::global_session_registry().unregister(self.connection_id);

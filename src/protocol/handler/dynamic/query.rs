@@ -362,10 +362,7 @@ impl DynamicPgHandler {
     pub(in crate::protocol::handler) fn begin_query_tracking(&self, query: &str) {
         if let Some(info) = self.session_info.get() {
             let child = info.begin_query(query);
-            *self
-                .active_query_cancel
-                .lock()
-                .expect("active_query_cancel poisoned") = Some(child);
+            *self.active_query_cancel.lock() = Some(child);
         }
     }
 
@@ -386,10 +383,7 @@ impl DynamicPgHandler {
         in_transaction: bool,
         in_failed_transaction: bool,
     ) {
-        *self
-            .active_query_cancel
-            .lock()
-            .expect("active_query_cancel poisoned") = None;
+        *self.active_query_cancel.lock() = None;
         if let Some(info) = self.session_info.get() {
             let state = if in_failed_transaction {
                 crate::admin::SessionState::IdleInFailedTransaction
@@ -404,10 +398,7 @@ impl DynamicPgHandler {
 
     /// Return a clone of the active query-level cancellation token, if any.
     pub(in crate::protocol::handler) fn query_cancel_token(&self) -> Option<CancellationToken> {
-        self.active_query_cancel
-            .lock()
-            .expect("active_query_cancel poisoned")
-            .clone()
+        self.active_query_cancel.lock().clone()
     }
 
     /// Return the principal identity string used as the concurrency bucket key.

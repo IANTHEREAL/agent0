@@ -1,6 +1,7 @@
 use std::env;
-use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 60_000;
 // Hard cap is intentionally lower than the default timeout.
@@ -550,19 +551,19 @@ mod tests {
         let shared = cfg.shared();
 
         {
-            let read_cfg = shared.read().unwrap();
+            let read_cfg = shared.read();
             assert_eq!(read_cfg.statement_timeout_ms, 30_000);
             assert_eq!(read_cfg.idle_in_transaction_session_timeout_ms, 45_000);
             assert_eq!(read_cfg.tcp_keepalive_idle_ms, 20_000);
         }
 
         {
-            let mut write_cfg = shared.write().unwrap();
+            let mut write_cfg = shared.write();
             write_cfg.statement_timeout_ms = 20_000;
         }
 
         {
-            let read_cfg = shared.read().unwrap();
+            let read_cfg = shared.read();
             assert_eq!(read_cfg.statement_timeout_ms, 20_000);
             assert_eq!(read_cfg.tcp_keepalive_idle_ms, 20_000);
         }

@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -160,7 +162,7 @@ impl HnswGraphCache {
         expected_version: u64,
     ) -> Option<PathBuf> {
         let key = (keyspace.to_string(), db_id, table_id, index_id);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
 
         match entries.get_mut(&key) {
             Some(entry) if entry.graph_version == expected_version => {
@@ -241,7 +243,7 @@ impl HnswGraphCache {
             last_access: Instant::now(),
         };
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
 
         // If there was a prior entry for this key, remove its file.
         if let Some(old) = entries.insert(key, entry) {
@@ -286,7 +288,7 @@ impl HnswGraphCache {
     /// Prevents stale cache hits when index_id is reused after DROP + CREATE.
     pub(crate) fn evict(&self, keyspace: &str, db_id: u64, table_id: u64, index_id: u64) {
         let key = (keyspace.to_string(), db_id, table_id, index_id);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         if let Some(old) = entries.remove(&key) {
             // Delay file deletion: an in-flight index.load() may still
             // have the file open. 30s is generous (load takes ~15ms).
@@ -419,7 +421,7 @@ impl HnswIndexCache {
             index_id,
             graph_version,
         );
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(&key) {
             entry.last_access = Instant::now();
             debug!(
@@ -475,7 +477,7 @@ impl HnswIndexCache {
             graph_version,
         );
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
 
         // Evict older versions of the same index (different graph_version).
         let same_index_keys: Vec<IndexCacheKey> = entries
@@ -564,7 +566,7 @@ impl HnswIndexCache {
     /// Evict all entries for a specific index (e.g., on DROP INDEX).
     #[allow(dead_code)] // wired by DROP INDEX path
     pub(crate) fn evict(&self, keyspace: &str, db_id: u64, table_id: u64, index_id: u64) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         let keys_to_remove: Vec<IndexCacheKey> = entries
             .keys()
             .filter(|(ks, did, tid, iid, _)| {

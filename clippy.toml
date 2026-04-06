@@ -5,3 +5,8 @@ too-many-arguments-threshold = 14
 disallowed-methods = [
     { path = "tikv_client::transaction::transaction::Transaction::put", reason = "Use crate::txn::txn_put() for value size guard and savepoint tracking. Raw txn.put() is allowed only in session/transaction.rs for savepoint rollback and in txn/mod.rs for the wrapper itself." },
 ]
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "Use parking_lot::Mutex instead — std::sync::Mutex poisons on panic, causing cascading failures. Exception: StatementMemoryScope in pool.rs (needs Send guard for task_local!)." },
+    { path = "std::sync::RwLock", reason = "Use parking_lot::RwLock instead — std::sync::RwLock poisons on panic, causing cascading failures." },
+]

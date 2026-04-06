@@ -10,6 +10,8 @@
 //! - Cache miss returns None — **never** falls back to live scan.
 //! - Two strict paths: inspect reads cache (O(1)); TVF does live scan.
 //! - Worker period is configurable via `FS9_STATS_REFRESH_INTERVAL_SECS`.
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
 
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;

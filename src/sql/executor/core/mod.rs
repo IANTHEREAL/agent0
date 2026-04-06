@@ -1,4 +1,6 @@
 //! SQL executor core
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
 
 mod alter;
 mod analyze;

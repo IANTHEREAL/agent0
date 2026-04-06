@@ -7,9 +7,10 @@
 //! This module provides the **process-local** tracking. Cross-instance
 //! coordination is handled by `GcRegistryPublisher` + `GcSafepointAdvancer`.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 static GLOBAL_REGISTRY: OnceLock<Arc<ActiveTxnRegistry>> = OnceLock::new();
@@ -113,7 +114,6 @@ impl ActiveTxnRegistry {
     pub fn register_connection(&self, connection_id: i64, start_ts_version: u64) {
         self.inner
             .lock()
-            .expect("ActiveTxnRegistry poisoned")
             .insert(ActiveTxnKey::Connection(connection_id), start_ts_version);
     }
 
@@ -126,7 +126,6 @@ impl ActiveTxnRegistry {
     pub fn unregister_connection(&self, connection_id: i64) {
         self.inner
             .lock()
-            .expect("ActiveTxnRegistry poisoned")
             .remove(&ActiveTxnKey::Connection(connection_id));
     }
 
@@ -142,16 +141,9 @@ impl ActiveTxnRegistry {
         let key = ActiveTxnKey::Connection(connection_id);
         // Only quarantine if the entry actually exists (session may have
         // already been cleanly committed/rolled back).
-        let exists = self
-            .inner
-            .lock()
-            .expect("ActiveTxnRegistry poisoned")
-            .contains_key(&key);
+        let exists = self.inner.lock().contains_key(&key);
         if exists {
-            self.quarantined
-                .lock()
-                .expect("ActiveTxnRegistry poisoned")
-                .push((key, Instant::now()));
+            self.quarantined.lock().push((key, Instant::now()));
         }
     }
 
@@ -161,7 +153,6 @@ impl ActiveTxnRegistry {
         let handle_id = self.next_worker_handle.fetch_add(1, Ordering::Relaxed);
         self.inner
             .lock()
-            .expect("ActiveTxnRegistry poisoned")
             .insert(ActiveTxnKey::Worker(handle_id), start_ts_version);
         ActiveTxnGuard {
             registry: Arc::clone(self),
@@ -172,10 +163,7 @@ impl ActiveTxnRegistry {
 
     #[inline]
     fn unregister_worker(&self, handle_id: u64) {
-        self.inner
-            .lock()
-            .expect("ActiveTxnRegistry poisoned")
-            .remove(&ActiveTxnKey::Worker(handle_id));
+        self.inner.lock().remove(&ActiveTxnKey::Worker(handle_id));
     }
 
     /// Move a worker entry into the quarantine list. The entry stays in
@@ -183,7 +171,6 @@ impl ActiveTxnRegistry {
     fn quarantine_worker(&self, handle_id: u64) {
         self.quarantined
             .lock()
-            .expect("ActiveTxnRegistry poisoned")
             .push((ActiveTxnKey::Worker(handle_id), Instant::now()));
     }
 
@@ -195,11 +182,11 @@ impl ActiveTxnRegistry {
     }
 
     pub(crate) fn reap_quarantined_with_ttl(&self, ttl: Duration) -> usize {
-        let mut quarantined = self.quarantined.lock().expect("ActiveTxnRegistry poisoned");
+        let mut quarantined = self.quarantined.lock();
         if quarantined.is_empty() {
             return 0;
         }
-        let mut inner = self.inner.lock().expect("ActiveTxnRegistry poisoned");
+        let mut inner = self.inner.lock();
         let now = Instant::now();
         let before = quarantined.len();
         quarantined.retain(|&(key, quarantined_at)| {
@@ -215,27 +202,19 @@ impl ActiveTxnRegistry {
 
     /// Minimum start_ts across all active transactions, or None if empty.
     pub fn min_start_ts(&self) -> Option<u64> {
-        self.inner
-            .lock()
-            .expect("ActiveTxnRegistry poisoned")
-            .values()
-            .copied()
-            .min()
+        self.inner.lock().values().copied().min()
     }
 
     /// Number of tracked transactions (including quarantined).
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("ActiveTxnRegistry poisoned").len()
+        self.inner.lock().len()
     }
 
     /// Number of entries currently in quarantine.
     #[cfg(test)]
     pub fn quarantined_len(&self) -> usize {
-        self.quarantined
-            .lock()
-            .expect("ActiveTxnRegistry poisoned")
-            .len()
+        self.quarantined.lock().len()
     }
 }
 

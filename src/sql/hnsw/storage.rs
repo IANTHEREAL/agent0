@@ -12,7 +12,9 @@ use std::fs;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
+
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -865,7 +867,7 @@ pub async fn get_shared_base_graph(
         }
 
         let role = {
-            let mut inflight = INFLIGHT_LOADS.lock().unwrap();
+            let mut inflight = INFLIGHT_LOADS.lock();
 
             // Re-check cache under inflight lock to close the race window.
             if let Some(shared) = cache.lookup(keyspace, db_id, table_id, index_id, cache_version) {
@@ -891,7 +893,7 @@ pub async fn get_shared_base_graph(
                     // the next loop iteration can become the new Loader.
                     // This is idempotent: remove() is a no-op if the key
                     // was already cleaned up by the normal error path.
-                    INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                    INFLIGHT_LOADS.lock().remove(&inflight_key);
                 }
             }
             Role::Loader(tx) => {
@@ -905,7 +907,7 @@ pub async fn get_shared_base_graph(
                 impl<'a> Drop for InflightCleanup<'a> {
                     fn drop(&mut self) {
                         if !self.defused {
-                            INFLIGHT_LOADS.lock().unwrap().remove(self.key);
+                            INFLIGHT_LOADS.lock().remove(self.key);
                         }
                     }
                 }
@@ -938,17 +940,17 @@ pub async fn get_shared_base_graph(
                             handle,
                             estimated_bytes,
                         );
-                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        INFLIGHT_LOADS.lock().remove(&inflight_key);
                         let _ = tx.send(true);
                         return Ok(Some(shared));
                     }
                     Ok(None) => {
-                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        INFLIGHT_LOADS.lock().remove(&inflight_key);
                         drop(tx);
                         return Ok(None);
                     }
                     Err(e) => {
-                        INFLIGHT_LOADS.lock().unwrap().remove(&inflight_key);
+                        INFLIGHT_LOADS.lock().remove(&inflight_key);
                         drop(tx);
                         return Err(e);
                     }

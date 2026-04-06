@@ -1,10 +1,10 @@
 use super::errors::syntax_error_pgwire_error;
 use super::prepared::{PreparedExec, PreparedStatement};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 use sqlparser::ast::Statement;
-use std::sync::Mutex;
 
 /// Query parser for the extended-query protocol.
 ///
@@ -34,7 +34,7 @@ impl Db9QueryParser {
     /// This is a destructive read — calling it twice returns `None` the second
     /// time.
     pub(super) fn take_parsed_statements(&self) -> Option<Vec<Statement>> {
-        self.last_parsed.lock().unwrap().take()
+        self.last_parsed.lock().take()
     }
 }
 
@@ -45,7 +45,7 @@ impl pgwire::api::stmt::QueryParser for Db9QueryParser {
     async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
         // Match libpq behavior for empty queries (handled later by executor/protocol).
         if sql.trim().is_empty() {
-            *self.last_parsed.lock().unwrap() = None;
+            *self.last_parsed.lock() = None;
             return Ok(PreparedStatement {
                 sql: sql.to_owned(),
                 exec: PreparedExec::RawSqlUtility,
@@ -58,7 +58,7 @@ impl pgwire::api::stmt::QueryParser for Db9QueryParser {
 
         let parse_err = match crate::sql::parse_sql(sql) {
             Ok(stmts) => {
-                *self.last_parsed.lock().unwrap() = Some(stmts);
+                *self.last_parsed.lock() = Some(stmts);
                 return Ok(PreparedStatement {
                     sql: sql.to_owned(),
                     exec: PreparedExec::RawSqlUtility,
@@ -72,7 +72,7 @@ impl pgwire::api::stmt::QueryParser for Db9QueryParser {
         };
 
         // Parse failed — clear cache before attempting fallback.
-        *self.last_parsed.lock().unwrap() = None;
+        *self.last_parsed.lock() = None;
 
         let Some(sql_no_comments) = strip_leading_whitespace_and_comments(sql) else {
             return Err(syntax_error_pgwire_error(parse_err.to_string()));

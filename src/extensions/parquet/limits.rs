@@ -1,6 +1,8 @@
 //! Resource limits for Parquet imports.
 //!
 //! Per-tenant concurrency limit (4) prevents resource exhaustion.
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

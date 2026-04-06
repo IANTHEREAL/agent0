@@ -5,8 +5,9 @@
 //! adjusts via Additive-Increase / Multiplicative-Decrease based on rolling
 //! P99 latency of TiKV operations.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 // ─── Global singleton ────────────────────────────────────────────────────────
@@ -362,7 +363,7 @@ impl LatencyTracker {
     }
 
     fn record(&self, latency_us: u64) {
-        let mut inner = self.inner.lock().expect("latency tracker lock");
+        let mut inner = self.inner.lock();
         let cursor = inner.cursor;
         inner.samples[cursor] = latency_us;
         inner.cursor = (cursor + 1) % inner.capacity;
@@ -374,7 +375,7 @@ impl LatencyTracker {
     /// Compute P99 in microseconds.  Returns 0 when no samples recorded.
     fn p99_us(&self) -> u64 {
         let snapshot = {
-            let inner = self.inner.lock().expect("latency tracker lock");
+            let inner = self.inner.lock();
             if inner.count == 0 {
                 return 0;
             }

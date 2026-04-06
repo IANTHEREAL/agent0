@@ -3,6 +3,8 @@
 //! Replaces: `CONNECTION_ID`, `CURRENT_DATABASE_NAME`,
 //! `STATEMENT_TIMESTAMP_MILLIS` (statement_time.rs), `TIMEZONE` (session_context.rs).
 //! Legacy paths still read task-locals; eval functions require explicit context threading.
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
 
 use std::collections::HashMap;
 use std::future::Future;

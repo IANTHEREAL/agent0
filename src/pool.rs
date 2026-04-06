@@ -1,11 +1,15 @@
+// TODO(#2335): migrate to parking_lot — phase 2/3
+#![allow(clippy::disallowed_types)]
+
 use crate::sql::rls::cache::RlsPolicyCache;
 use crate::sql::stats::TableStatsCache;
 use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
+use parking_lot::Mutex as StdMutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tracing::{debug, info};
@@ -321,14 +325,14 @@ pub(crate) struct ConcurrencyRejection {
 /// counter reaches 0, the entry is removed to avoid unbounded growth.
 #[derive(Debug)]
 pub(crate) struct PrincipalConcurrencyTracker {
-    counters: std::sync::Mutex<HashMap<String, u32>>,
+    counters: StdMutex<HashMap<String, u32>>,
     limit: u32,
 }
 
 impl PrincipalConcurrencyTracker {
     fn new(limit: u32) -> Self {
         Self {
-            counters: std::sync::Mutex::new(HashMap::new()),
+            counters: StdMutex::new(HashMap::new()),
             limit,
         }
     }
@@ -365,7 +369,7 @@ impl PrincipalConcurrencyTracker {
             });
         }
 
-        let mut map = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.counters.lock();
         let count = map.entry(principal.to_string()).or_insert(0);
         if *count >= effective_limit {
             return Err(ConcurrencyRejection {
@@ -382,7 +386,7 @@ impl PrincipalConcurrencyTracker {
     /// Current in-flight count for a principal (for tests/diagnostics).
     #[cfg(test)]
     pub(crate) fn current_count(&self, principal: &str) -> u32 {
-        let map = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self.counters.lock();
         map.get(principal).copied().unwrap_or(0)
     }
 }
@@ -396,11 +400,7 @@ pub(crate) struct ConcurrencyGuard {
 
 impl Drop for ConcurrencyGuard {
     fn drop(&mut self) {
-        let mut map = self
-            .tracker
-            .counters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.tracker.counters.lock();
         if let Some(count) = map.get_mut(&self.principal) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -415,7 +415,7 @@ impl Drop for ConcurrencyGuard {
 /// Allows up to `rate` requests per second. Burst capacity defaults to `rate`
 /// but can be set independently via `new_with_burst`.
 pub(crate) struct TokenBucket {
-    state: std::sync::Mutex<TokenBucketState>,
+    state: StdMutex<TokenBucketState>,
     rate: u64,
     burst: u64,
 }
@@ -432,7 +432,7 @@ impl TokenBucket {
 
     pub(crate) fn new_with_burst(rate: u64, burst: u64) -> Self {
         Self {
-            state: std::sync::Mutex::new(TokenBucketState {
+            state: StdMutex::new(TokenBucketState {
                 tokens: burst as f64,
                 last_refill: std::time::Instant::now(),
             }),
@@ -443,7 +443,7 @@ impl TokenBucket {
 
     /// Try to consume one token. Returns `true` if the request is allowed.
     pub(crate) fn try_acquire(&self) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock();
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
         let refill_rate = self.rate as f64;
@@ -466,7 +466,7 @@ impl TokenBucket {
     /// Drain all tokens so the next `try_acquire` returns false.
     #[cfg(test)]
     pub(crate) fn drain(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock();
         state.tokens = 0.0;
         state.last_refill = std::time::Instant::now();
     }
@@ -502,7 +502,7 @@ impl AdmissionBudgetRegistry {
     /// first session's budget params win). This is correct because all tokens
     /// for the same tenant carry identical budget claims.
     pub(crate) fn get_or_create(&self, params: &AdmissionBudgetParams) -> Arc<TokenBucket> {
-        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.buckets.lock();
         map.entry(params.owner_id.clone())
             .or_insert_with(|| Arc::new(TokenBucket::new_with_burst(params.rps, params.burst)))
             .clone()
@@ -535,7 +535,7 @@ pub(crate) struct TenantEntry {
     /// Per-principal concurrent query limiter.
     concurrency_tracker: Arc<PrincipalConcurrencyTracker>,
     /// Per-user active connection counts for `rolconnlimit` enforcement.
-    user_connections: std::sync::Mutex<HashMap<String, u32>>,
+    user_connections: StdMutex<HashMap<String, u32>>,
     /// Back-reference to the pool-level idle index for Drop-time updates.
     /// `None` only in test entries created outside a pool.
     idle_index: Option<Arc<IdleIndex>>,
@@ -565,7 +565,7 @@ impl TenantEntry {
             },
             concurrency_tracker: Arc::new(PrincipalConcurrencyTracker::new(concurrency_limit)),
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace, memory_quota),
-            user_connections: std::sync::Mutex::new(HashMap::new()),
+            user_connections: StdMutex::new(HashMap::new()),
             idle_index: Some(idle_index),
         }
     }
@@ -574,10 +574,7 @@ impl TenantEntry {
     /// `limit < 0` means unlimited (PostgreSQL `rolconnlimit = -1`).
     /// Returns `true` if the slot was acquired, `false` if the limit is reached.
     fn try_acquire_user_slot(&self, username: &str, limit: i32) -> bool {
-        let mut map = self
-            .user_connections
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.user_connections.lock();
         let count = map.entry(username.to_string()).or_insert(0);
         if limit >= 0 && (*count as i32) >= limit {
             return false;
@@ -588,10 +585,7 @@ impl TenantEntry {
 
     /// Release a per-user connection slot.
     fn release_user_slot(&self, username: &str) {
-        let mut map = self
-            .user_connections
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.user_connections.lock();
         if let Some(count) = map.get_mut(username) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -613,10 +607,7 @@ impl TenantEntry {
     /// Per-user connection count snapshot (for tests).
     #[allow(dead_code)] // test: used in pool tests
     pub(crate) fn user_connections_for(&self, username: &str) -> u32 {
-        let map = self
-            .user_connections
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = self.user_connections.lock();
         map.get(username).copied().unwrap_or(0)
     }
 
@@ -732,7 +723,7 @@ impl TenantHandle {
                 "test_ks".to_string(),
                 memory_quota_bytes,
             ),
-            user_connections: std::sync::Mutex::new(HashMap::new()),
+            user_connections: StdMutex::new(HashMap::new()),
             idle_index: None,
         });
         Self {
@@ -752,7 +743,8 @@ impl Clone for TenantHandle {
         // If transitioning from idle to active, remove from idle index.
         if prev == 0 && prev_idle_at != 0 {
             if let Some(ref idx) = self.entry.idle_index {
-                if let Ok(mut set) = idx.lock() {
+                {
+                    let mut set = idx.lock();
                     set.remove(&(prev_idle_at, self.entry.keyspace.clone()));
                 }
             }
@@ -781,7 +773,8 @@ impl Drop for TenantHandle {
             self.entry.last_idle_at.store(idle_at, Ordering::Relaxed);
             // Register as idle candidate in the pool-level index.
             if let Some(ref idx) = self.entry.idle_index {
-                if let Ok(mut set) = idx.lock() {
+                {
+                    let mut set = idx.lock();
                     set.insert((idle_at, self.entry.keyspace.clone()));
                 }
             }
@@ -858,7 +851,8 @@ impl TikvClientPool {
                 let prev_idle_at = entry.last_idle_at.swap(0, Ordering::Relaxed);
                 // Transitioning from idle to active — remove from idle index.
                 if prev == 0 && prev_idle_at != 0 {
-                    if let Ok(mut set) = self.idle_index.lock() {
+                    {
+                        let mut set = self.idle_index.lock();
                         set.remove(&(prev_idle_at, key.clone()));
                     }
                 }
@@ -889,7 +883,8 @@ impl TikvClientPool {
                 let prev = entry.active_connections.fetch_add(1, Ordering::Relaxed);
                 let prev_idle_at = entry.last_idle_at.swap(0, Ordering::Relaxed);
                 if prev == 0 && prev_idle_at != 0 {
-                    if let Ok(mut set) = self.idle_index.lock() {
+                    {
+                        let mut set = self.idle_index.lock();
                         set.remove(&(prev_idle_at, key.clone()));
                     }
                 }
@@ -997,7 +992,8 @@ impl TikvClientPool {
         // Mark as idle immediately since no handle is held.
         let idle_at = now_epoch_ms();
         entry.last_idle_at.store(idle_at, Ordering::Relaxed);
-        if let Ok(mut set) = self.idle_index.lock() {
+        {
+            let mut set = self.idle_index.lock();
             set.insert((idle_at, key.clone()));
         }
 
@@ -1097,7 +1093,7 @@ impl TikvClientPool {
         // The index is ordered by (idle_at, keyspace), so we take all entries
         // with idle_at <= deadline.
         let candidates: Vec<(u64, String)> = {
-            let mut idx = self.idle_index.lock().expect("idle_index lock");
+            let mut idx = self.idle_index.lock();
             let mut due = Vec::new();
             // BTreeSet iteration in ascending order — stop at first entry past deadline.
             while let Some(first) = idx.iter().next().cloned() {
@@ -1183,7 +1179,7 @@ mod tests {
             rate_limiter: None,
             concurrency_tracker: Arc::new(PrincipalConcurrencyTracker::new(0)),
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace.to_string(), 0),
-            user_connections: std::sync::Mutex::new(HashMap::new()),
+            user_connections: StdMutex::new(HashMap::new()),
             idle_index,
         })
     }
@@ -1274,7 +1270,8 @@ mod tests {
     fn mark_idle(entry: &Arc<TenantEntry>, pool: &TikvClientPool) {
         let idle_at = now_epoch_ms();
         entry.last_idle_at.store(idle_at, Ordering::Relaxed);
-        if let Ok(mut set) = pool.idle_index.lock() {
+        {
+            let mut set = pool.idle_index.lock();
             set.insert((idle_at, entry.keyspace.clone()));
         }
     }
@@ -1282,7 +1279,8 @@ mod tests {
     /// Helper: mark a test entry as idle at a specific timestamp.
     fn mark_idle_at(entry: &Arc<TenantEntry>, pool: &TikvClientPool, idle_at: u64) {
         entry.last_idle_at.store(idle_at, Ordering::Relaxed);
-        if let Ok(mut set) = pool.idle_index.lock() {
+        {
+            let mut set = pool.idle_index.lock();
             set.insert((idle_at, entry.keyspace.clone()));
         }
     }
@@ -1356,7 +1354,8 @@ mod tests {
         let prev_idle_at = entry.last_idle_at.swap(0, Ordering::Relaxed);
         entry.active_connections.fetch_add(1, Ordering::Relaxed);
         if prev_idle_at != 0 {
-            if let Ok(mut set) = pool.idle_index.lock() {
+            {
+                let mut set = pool.idle_index.lock();
                 set.remove(&(prev_idle_at, entry.keyspace.clone()));
             }
         }
@@ -1656,7 +1655,8 @@ mod tests {
         let prev_idle = entry.last_idle_at.swap(0, Ordering::Relaxed);
         entry.active_connections.fetch_add(1, Ordering::Relaxed);
         if prev_idle != 0 {
-            if let Ok(mut set) = pool.idle_index.lock() {
+            {
+                let mut set = pool.idle_index.lock();
                 set.remove(&(prev_idle, entry.keyspace.clone()));
             }
         }
@@ -1670,7 +1670,7 @@ mod tests {
         assert_eq!(pool.tenant_count().await, 1);
 
         // Verify the old candidate is gone from the index.
-        let idx_len = pool.idle_index.lock().unwrap().len();
+        let idx_len = pool.idle_index.lock().len();
         assert_eq!(idx_len, 0);
 
         // Make sure the old idle_at was indeed removed (not left dangling).
@@ -1766,13 +1766,13 @@ mod tests {
         let handle = make_handle(&entry);
 
         assert_eq!(entry.active_connections(), 1);
-        assert!(pool.idle_index.lock().unwrap().is_empty());
+        assert!(pool.idle_index.lock().is_empty());
 
         drop(handle);
 
         assert_eq!(entry.active_connections(), 0);
         assert_ne!(entry.last_idle_at.load(Ordering::Relaxed), 0);
-        let idx = pool.idle_index.lock().unwrap();
+        let idx = pool.idle_index.lock();
         assert_eq!(idx.len(), 1);
         let (_, ks) = idx.iter().next().unwrap();
         assert_eq!(ks, "drop_ks");
@@ -1848,7 +1848,7 @@ mod tests {
         drop(g1);
         assert_eq!(tracker.current_count("dave"), 0);
         // Verify the entry is actually removed from the map.
-        let map = tracker.counters.lock().unwrap();
+        let map = tracker.counters.lock();
         assert!(!map.contains_key("dave"));
     }
 

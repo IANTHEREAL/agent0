@@ -9,7 +9,9 @@
 use dashmap::{DashMap, DashSet};
 use pgwire::tokio::CancellationToken;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+
+use parking_lot::RwLock;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -136,7 +138,8 @@ impl SessionInfo {
         } else {
             query
         };
-        if let Ok(mut q) = self.current_query.write() {
+        {
+            let mut q = self.current_query.write();
             q.clear();
             q.push_str(truncated);
         }
@@ -148,22 +151,16 @@ impl SessionInfo {
         self.state.store(SessionState::Active);
 
         let child = self.cancel_token.child_token();
-        if let Ok(mut qc) = self.query_cancel.write() {
-            *qc = Some(child.clone());
-        }
+        *self.query_cancel.write() = Some(child.clone());
         child
     }
 
     /// Clear the current query text and query cancel token.
     pub fn end_query(&self, next_state: SessionState) {
-        if let Ok(mut q) = self.current_query.write() {
-            q.clear();
-        }
+        self.current_query.write().clear();
         self.query_start.store(0, Ordering::Relaxed);
         self.state.store(next_state);
-        if let Ok(mut qc) = self.query_cancel.write() {
-            *qc = None;
-        }
+        *self.query_cancel.write() = None;
     }
 
     /// Update session state without changing query info.
@@ -184,11 +181,7 @@ impl SessionInfo {
         } else {
             None
         };
-        let current_query = self
-            .current_query
-            .read()
-            .map(|q| q.clone())
-            .unwrap_or_default();
+        let current_query = self.current_query.read().clone();
 
         SessionSnapshot {
             connection_id: self.connection_id,
@@ -433,10 +426,7 @@ impl SessionRegistry {
             .get(&connection_id)
             .ok_or(CancelError::NotFound)?;
         let info = entry.value();
-        let qc = info
-            .query_cancel
-            .read()
-            .map_err(|_| CancelError::NoActiveQuery)?;
+        let qc = info.query_cancel.read();
         match qc.as_ref() {
             Some(token) => {
                 token.cancel();
@@ -869,7 +859,7 @@ mod tests {
         assert!(info.query_start.load(Ordering::Relaxed) > 0);
         assert!(!child.is_cancelled());
         {
-            let q = info.current_query.read().unwrap();
+            let q = info.current_query.read();
             assert_eq!(*q, "SELECT * FROM big_table WHERE id > 100");
         }
 
@@ -877,7 +867,7 @@ mod tests {
         assert_eq!(info.state.load(), SessionState::Idle);
         assert_eq!(info.query_start.load(Ordering::Relaxed), 0);
         {
-            let q = info.current_query.read().unwrap();
+            let q = info.current_query.read();
             assert!(q.is_empty());
         }
     }
@@ -888,7 +878,7 @@ mod tests {
         let long_query = "x".repeat(2000);
         let _child = info.begin_query(&long_query);
 
-        let q = info.current_query.read().unwrap();
+        let q = info.current_query.read();
         assert_eq!(q.len(), MAX_QUERY_LEN);
     }
 
@@ -902,7 +892,7 @@ mod tests {
         // This must not panic.
         let _child = info.begin_query(&multibyte_query);
 
-        let q = info.current_query.read().unwrap();
+        let q = info.current_query.read();
         assert!(q.len() <= MAX_QUERY_LEN);
         // Must be valid UTF-8 (would fail to read if not).
         assert!(std::str::from_utf8(q.as_bytes()).is_ok());
