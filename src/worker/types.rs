@@ -12,6 +12,7 @@ pub const TASK_TYPE_BG_DDL: u8 = 0x08;
 pub const TASK_TYPE_BG_SQL: u8 = 0x10;
 pub const TASK_TYPE_HNSW_MERGE: u8 = 0x20;
 pub const TASK_TYPE_STORAGE_SIZE_SCAN: u8 = 0x40;
+pub const TASK_TYPE_DDL_JOURNAL: u8 = 0x80;
 
 // ============================================================================
 // TaskType Enum
@@ -26,6 +27,7 @@ pub enum TaskType {
     BgSql,
     HnswMerge,
     StorageSizeScan,
+    DdlJournal,
 }
 
 impl TaskType {
@@ -39,6 +41,7 @@ impl TaskType {
             TaskType::BgSql => "bg_sql",
             TaskType::HnswMerge => "hnsw_merge",
             TaskType::StorageSizeScan => "storage_size_scan",
+            TaskType::DdlJournal => "ddl_journal",
         }
     }
 
@@ -53,6 +56,7 @@ impl TaskType {
             TaskType::BgSql => TASK_TYPE_BG_SQL,
             TaskType::HnswMerge => TASK_TYPE_HNSW_MERGE,
             TaskType::StorageSizeScan => TASK_TYPE_STORAGE_SIZE_SCAN,
+            TaskType::DdlJournal => TASK_TYPE_DDL_JOURNAL,
         }
     }
 
@@ -73,6 +77,8 @@ impl TaskType {
             Some(TaskType::HnswMerge)
         } else if mask & TASK_TYPE_STORAGE_SIZE_SCAN != 0 {
             Some(TaskType::StorageSizeScan)
+        } else if mask & TASK_TYPE_DDL_JOURNAL != 0 {
+            Some(TaskType::DdlJournal)
         } else {
             None
         }

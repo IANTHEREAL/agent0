@@ -135,9 +135,9 @@ mod tests {
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
     use tokio::io::{AsyncBufRead, BufReader};
 
     struct MockWriteStream;
@@ -178,7 +178,7 @@ mod tests {
         }
 
         fn insert_file(&self, path: &str, bytes: Vec<u8>, sealed: bool) {
-            self.files.lock().unwrap().insert(
+            self.files.lock().insert(
                 path.to_string(),
                 MockFile {
                     bytes,
@@ -192,7 +192,7 @@ mod tests {
     #[async_trait]
     impl FsBackend for MockBackend {
         async fn stat(&self, path: &str) -> Result<FsFileInfo> {
-            let files = self.files.lock().unwrap();
+            let files = self.files.lock();
             let file = files.get(path).ok_or_else(|| {
                 anyhow!(
                     crate::extensions::fs::embedded::types::EmbeddedFsError::NotFound(
@@ -224,19 +224,13 @@ mod tests {
         }
 
         async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-            let file = self
-                .files
-                .lock()
-                .unwrap()
-                .get(path)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow!(
-                        crate::extensions::fs::embedded::types::EmbeddedFsError::NotFound(
-                            path.to_string()
-                        )
+            let file = self.files.lock().get(path).cloned().ok_or_else(|| {
+                anyhow!(
+                    crate::extensions::fs::embedded::types::EmbeddedFsError::NotFound(
+                        path.to_string()
                     )
-                })?;
+                )
+            })?;
             if file.bytes.len() > max_bytes {
                 anyhow::bail!("too large")
             }
@@ -264,7 +258,7 @@ mod tests {
         }
 
         async fn write_file(&self, path: &str, data: &[u8], _mode: Option<u32>) -> Result<usize> {
-            self.files.lock().unwrap().insert(
+            self.files.lock().insert(
                 path.to_string(),
                 MockFile {
                     bytes: data.to_vec(),
@@ -285,19 +279,13 @@ mod tests {
 
         async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
             self.last_read_at_len.store(length, Ordering::Relaxed);
-            let file = self
-                .files
-                .lock()
-                .unwrap()
-                .get(path)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow!(
-                        crate::extensions::fs::embedded::types::EmbeddedFsError::NotFound(
-                            path.to_string()
-                        )
+            let file = self.files.lock().get(path).cloned().ok_or_else(|| {
+                anyhow!(
+                    crate::extensions::fs::embedded::types::EmbeddedFsError::NotFound(
+                        path.to_string()
                     )
-                })?;
+                )
+            })?;
             let start = usize::try_from(offset).unwrap_or(usize::MAX);
             if start >= file.bytes.len() || length == 0 {
                 return Ok(Vec::new());
@@ -307,7 +295,7 @@ mod tests {
         }
 
         async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let file = files.entry(path.to_string()).or_insert(MockFile {
                 bytes: Vec::new(),
                 sealed: false,
@@ -328,7 +316,7 @@ mod tests {
         }
 
         async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let file = files.entry(path.to_string()).or_insert(MockFile {
                 bytes: Vec::new(),
                 sealed: false,
@@ -342,7 +330,7 @@ mod tests {
         }
 
         async fn truncate(&self, path: &str, size: u64) -> Result<()> {
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let file = files.get_mut(path).ok_or_else(|| {
                 anyhow!(
                     crate::extensions::fs::embedded::types::EmbeddedFsError::NotFound(

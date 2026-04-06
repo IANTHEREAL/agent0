@@ -25,7 +25,7 @@ use crate::sql::index_helpers;
 use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
-use crate::storage::TikvStore;
+use crate::storage::{DdlJournalEntry, DdlOperation, TikvStore};
 use crate::txn::{txn_delete, txn_put};
 use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DDL};
 
@@ -862,6 +862,47 @@ pub async fn execute_create_index(
     let mut has_committed_batches = false;
     let mut txn_guard = None;
 
+    // --- DDL journal: record intent before multi-batch backfill ---
+    // Only needed for non-HNSW indexes (HNSW builds in a single transaction).
+    let ddl_journal_id = if !new_index.is_hnsw() {
+        let id = rand::thread_rng().gen::<u64>();
+        let (idx_range_start, idx_range_end) = index_prefix_range(db_id, schema.table_id, index_id);
+        let idx_full_name_for_journal = format!("{}.{}", owning_schema, idx_name_str);
+        let entry = DdlJournalEntry {
+            id,
+            db_id,
+            operation: DdlOperation::CreateIndex {
+                table_id: schema.table_id,
+                index_id,
+                index_name: idx_full_name_for_journal,
+                index_range_start: idx_range_start,
+                index_range_end: idx_range_end,
+            },
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        store.write_ddl_journal(txn, db_id, &entry).await?;
+        // Ensure the (keyspace, db_id) pair is discoverable by startup recovery
+        // even if no other worker task type is registered for this database.
+        if let Some(ss) = crate::worker::get_system_store() {
+            let mut sys_txn = ss.begin().await?;
+            ss.update_registry_task_types(
+                &mut sys_txn,
+                keyspace,
+                db_id,
+                crate::worker::types::TASK_TYPE_DDL_JOURNAL,
+                0,
+            )
+            .await?;
+            sys_txn.commit().await?;
+        }
+        Some(id)
+    } else {
+        None
+    };
+
     let create_result: Result<()> = async {
         if new_index.is_hnsw() {
             build_hnsw_index(
@@ -908,6 +949,18 @@ pub async fn execute_create_index(
         // Bump schema version so plan-cache drift detection catches index changes.
         schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
+        // --- DDL journal: operation succeeded, remove journal entry ---
+        if let Some(jid) = ddl_journal_id {
+            store.delete_ddl_journal(txn, db_id, jid).await?;
+            // Note: the TASK_TYPE_DDL_JOURNAL registry bit is intentionally NOT
+            // cleared here.  The journal delete is staged in the outer DDL txn
+            // which commits later (by the executor).  Clearing the discovery bit
+            // in a separate transaction would race: a crash between the two
+            // leaves an orphaned journal entry with no way to discover it.
+            // The startup reconciliation path clears the bit after confirming
+            // no journal entries remain, so the only cost is one cheap empty
+            // scan on the next startup.
+        }
         Ok(())
     }
     .await;
@@ -936,6 +989,12 @@ pub async fn execute_create_index(
                 store
                     .release_relation_name(&mut cleanup_txn, db_id, &idx_full_name)
                     .await?;
+                // --- DDL journal: cleanup after failed backfill ---
+                if let Some(jid) = ddl_journal_id {
+                    store
+                        .delete_ddl_journal(&mut cleanup_txn, db_id, jid)
+                        .await?;
+                }
                 cleanup_txn.commit().await?;
                 Ok(())
             }

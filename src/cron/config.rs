@@ -98,7 +98,8 @@ impl CronConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
 
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -107,7 +108,7 @@ mod tests {
 
     #[test]
     fn from_env_uses_defaults_when_vars_not_set() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let keys = [
             "DB9_CRON_ENABLED",

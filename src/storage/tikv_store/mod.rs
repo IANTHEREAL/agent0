@@ -20,6 +20,7 @@ use tracing::{debug, info};
 mod collations;
 pub mod cron;
 mod database;
+pub(crate) mod ddl_journal;
 mod extensions;
 mod functions;
 pub(crate) mod indexes;
@@ -36,6 +37,7 @@ mod types;
 mod views;
 pub mod worker;
 pub use cron::CronRunClaimStatus;
+pub use ddl_journal::{DdlJournalEntry, DdlOperation};
 
 // Import helper functions for tests
 #[cfg(test)]

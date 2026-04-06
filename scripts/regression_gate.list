@@ -275,6 +275,8 @@ tests/2140_statement_timeout_sqlstate.sql
 tests/plan_a_capability_matrix.sql
 # #2184 – PL/pgSQL function_name.param_name qualified parameter binding
 tests/2184_plpgsql_qualified_param.sql
+# #2348 – DDL journal crash recovery (CREATE INDEX backfill + CTAS)
+tests/2348_ddl_journal_smoke.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

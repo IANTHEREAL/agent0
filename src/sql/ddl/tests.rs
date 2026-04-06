@@ -596,10 +596,16 @@ fn was_cascade_dropped_resolves_qualified_and_search_path_names() {
 }
 
 #[test]
-fn prefix_end_increments_last_non_ff_byte() {
-    assert_eq!(prefix_end(vec![0x01, 0x02]), vec![0x01, 0x03]);
-    assert_eq!(prefix_end(vec![0x01, 0xFF]), vec![0x02]);
-    assert_eq!(prefix_end(vec![0x00, 0x10, 0xFF, 0xFF]), vec![0x00, 0x11]);
+fn encode_prefix_end_increments_last_non_ff_byte() {
+    use crate::storage::encode_prefix_end;
+    assert_eq!(encode_prefix_end(&[0x01, 0x02]), vec![0x01, 0x03]);
+    assert_eq!(encode_prefix_end(&[0x01, 0xFF]), vec![0x02]);
+    assert_eq!(
+        encode_prefix_end(&[0x00, 0x10, 0xFF, 0xFF]),
+        vec![0x00, 0x11]
+    );
+    // All-0xFF gracefully appends rather than panicking
+    assert_eq!(encode_prefix_end(&[0xFF, 0xFF]), vec![0xFF, 0xFF, 0xFF]);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! CREATE TABLE, CREATE TABLE AS (CTAS), SELECT INTO, and relation-name
 //! availability checking.
 
+use rand::Rng;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use crate::sql::names::normalize_ident;
 use crate::sql::types::cast::infer_data_type;
 use crate::sql::types::sql_datatype_to_internal_strict;
 use crate::sql::ExecuteResult;
-use crate::storage::TikvStore;
+use crate::storage::{DdlJournalEntry, DdlOperation, TikvStore};
 use crate::worker::types::IndexState;
 
 use super::{
@@ -727,6 +728,38 @@ pub async fn create_table_from_stream(
     let excl = schema.name.clone();
     create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
 
+    // --- DDL journal: record intent before multi-batch streaming ---
+    let ddl_journal_id = rand::thread_rng().gen::<u64>();
+    let ddl_journal_entry = DdlJournalEntry {
+        id: ddl_journal_id,
+        db_id,
+        operation: DdlOperation::CreateTableAsSelect {
+            table_id: schema.table_id,
+            table_name: table_name.to_string(),
+        },
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    store
+        .write_ddl_journal(txn, db_id, &ddl_journal_entry)
+        .await?;
+    // Ensure the (keyspace, db_id) pair is discoverable by startup recovery.
+    if let Some(ss) = crate::worker::get_system_store() {
+        let ks = store.keyspace().unwrap_or("default");
+        let mut sys_txn = ss.begin().await?;
+        ss.update_registry_task_types(
+            &mut sys_txn,
+            ks,
+            db_id,
+            crate::worker::types::TASK_TYPE_DDL_JOURNAL,
+            0,
+        )
+        .await?;
+        sys_txn.commit().await?;
+    }
+
     use futures::StreamExt;
     let mut row_stream = stream.0;
     let mut row_count: usize = 0;
@@ -754,6 +787,11 @@ pub async fn create_table_from_stream(
     }
 
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
+
+    // --- DDL journal: streaming completed successfully, remove journal entry ---
+    store.delete_ddl_journal(txn, db_id, ddl_journal_id).await?;
+    // Note: the TASK_TYPE_DDL_JOURNAL registry bit is intentionally NOT
+    // cleared here — see comment in create_index.rs for rationale.
 
     Ok(ExecuteResult::CreateTable)
 }

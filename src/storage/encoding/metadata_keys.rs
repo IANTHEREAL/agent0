@@ -45,6 +45,7 @@ const DB_SYS_CRON_RUN_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_run_id";
 const DB_SYS_CRON_ENABLED_PREFIX_V2: &[u8] = b"sys_cron_enabled";
 const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
 const DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2: &[u8] = b"sys_cron_running_guard_";
+const DB_SYS_DDL_JOURNAL_PREFIX: &[u8] = b"sys_ddl_journal_";
 
 // Worker system prefixes (global, not per-database)
 pub(super) const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
@@ -484,6 +485,22 @@ pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
     serde::Deserialize::deserialize(&mut deserializer).ok()
 }
 
+// ============================================================================
+// DDL journal keys
+// ============================================================================
+
+pub fn encode_ddl_journal_key(db_id: u64, journal_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_DDL_JOURNAL_PREFIX);
+    key.extend_from_slice(&journal_id.to_be_bytes());
+    key
+}
+
+pub fn encode_ddl_journal_prefix(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_DDL_JOURNAL_PREFIX);
+    key
+}
 /// Decode task_type from a worker queue key.
 #[cfg(test)]
 pub fn decode_worker_queue_task_type(key: &[u8]) -> Option<u8> {

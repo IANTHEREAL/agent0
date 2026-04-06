@@ -943,8 +943,9 @@ impl AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::env;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1376,7 +1377,7 @@ mod tests {
             "DB9_BOOTSTRAP_ADMIN_PASSWORD",
         ];
         let result = {
-            let _guard = env_lock().lock().unwrap();
+            let _guard = env_lock().lock();
             let saved = save_env_vars(&env_keys);
             unsafe {
                 env::set_var("DB9_DEV", "1");

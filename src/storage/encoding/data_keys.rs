@@ -69,7 +69,7 @@ fn encode_index_prefix_v2(
     key
 }
 
-fn encode_prefix_end(prefix: &[u8]) -> Vec<u8> {
+pub fn encode_prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     for idx in (0..end.len()).rev() {
         if end[idx] != 0xFF {

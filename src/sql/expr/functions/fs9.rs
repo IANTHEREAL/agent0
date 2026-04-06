@@ -515,8 +515,9 @@ mod tests {
     };
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tokio::io::{AsyncBufRead, BufReader};
 
     struct MockWriteStream;
@@ -556,7 +557,6 @@ mod tests {
         fn insert_file(&self, path: &str, bytes: Vec<u8>, sealed: bool) {
             self.files
                 .lock()
-                .unwrap()
                 .insert(normalize_mock_path(path), MockFile { bytes, sealed });
         }
     }
@@ -582,7 +582,6 @@ mod tests {
             let file = self
                 .files
                 .lock()
-                .unwrap()
                 .get(&normalized)
                 .cloned()
                 .ok_or_else(|| mock_not_found(path))?;
@@ -611,7 +610,7 @@ mod tests {
                 format!("{normalized}/")
             };
 
-            let files = self.files.lock().unwrap();
+            let files = self.files.lock();
             let mut children = BTreeMap::new();
             for (file_path, file) in files.iter() {
                 if !file_path.starts_with(&prefix) {
@@ -656,7 +655,6 @@ mod tests {
             let file = self
                 .files
                 .lock()
-                .unwrap()
                 .get(&normalized)
                 .cloned()
                 .ok_or_else(|| mock_not_found(path))?;
@@ -678,7 +676,6 @@ mod tests {
             let normalized = normalize_mock_path(path);
             self.files
                 .lock()
-                .unwrap()
                 .remove(&normalized)
                 .ok_or_else(|| mock_not_found(path))?;
             Ok(())
@@ -691,7 +688,7 @@ mod tests {
             } else {
                 format!("{normalized}/")
             };
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let before = files.len();
             files
                 .retain(|file_path, _| file_path != &normalized && !file_path.starts_with(&prefix));
@@ -703,7 +700,7 @@ mod tests {
         }
 
         async fn write_file(&self, path: &str, data: &[u8], _mode: Option<u32>) -> Result<usize> {
-            self.files.lock().unwrap().insert(
+            self.files.lock().insert(
                 normalize_mock_path(path),
                 MockFile {
                     bytes: data.to_vec(),
@@ -726,7 +723,6 @@ mod tests {
             let file = self
                 .files
                 .lock()
-                .unwrap()
                 .get(&normalized)
                 .cloned()
                 .ok_or_else(|| mock_not_found(path))?;
@@ -740,7 +736,7 @@ mod tests {
 
         async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
             let normalized = normalize_mock_path(path);
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let file = files.entry(normalized).or_insert(MockFile {
                 bytes: Vec::new(),
                 sealed: false,
@@ -761,7 +757,7 @@ mod tests {
 
         async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
             let normalized = normalize_mock_path(path);
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let file = files.entry(normalized).or_insert(MockFile {
                 bytes: Vec::new(),
                 sealed: false,
@@ -775,7 +771,7 @@ mod tests {
 
         async fn truncate(&self, path: &str, size: u64) -> Result<()> {
             let normalized = normalize_mock_path(path);
-            let mut files = self.files.lock().unwrap();
+            let mut files = self.files.lock();
             let file = files
                 .get_mut(&normalized)
                 .ok_or_else(|| mock_not_found(path))?;

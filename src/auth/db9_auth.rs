@@ -879,10 +879,10 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use parking_lot::Mutex as StdMutex;
     use serde::Serialize;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
     use std::sync::OnceLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1026,7 +1026,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_happy_path() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
         let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
         let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
@@ -1096,7 +1096,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_role_mismatch() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
 
         let exp = (chrono::Utc::now().timestamp() + 60) as usize;
@@ -1127,7 +1127,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_compound_usr_claim() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
         let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
         let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
@@ -1167,7 +1167,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_compound_usr_wrong_tenant() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
         let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
         let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
@@ -1204,7 +1204,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_jwt_connect_token_skips_null_claim_settings_but_keeps_claims_blob() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
         let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
         let _k3 = set_env("DB9_AUTH_AUDIENCE", "db9-server");
@@ -1247,7 +1247,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_no_kid_multi_key_is_rejected() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1439,7 +1439,7 @@ JwIDAQAB
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = socket.read(&mut buf).await;
-                    let body = body.lock().unwrap().clone();
+                    let body = body.lock().clone();
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -1472,11 +1472,8 @@ JwIDAQAB
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     let _ = socket.read(&mut buf).await;
-                    let (status, body) = responses
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or((500, String::new()));
+                    let (status, body) =
+                        responses.lock().pop_front().unwrap_or((500, String::new()));
                     let status_line = if status == 200 {
                         "200 OK".to_string()
                     } else {
@@ -1535,7 +1532,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_repeated_unknown_kid_is_throttled_per_selector() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         // JWKS with one key whose kid is "known-kid".
@@ -1589,7 +1586,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_prior_unknown_miss_does_not_block_rotated_kid() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1620,8 +1617,7 @@ JwIDAQAB
         ));
         assert_eq!(counter.load(Ordering::SeqCst), 2);
 
-        *body.lock().unwrap() =
-            format!(r#"{{"keys":[{{"kty":"OKP","kid":"rotated-kid","x":"{x2}"}}]}}"#);
+        *body.lock() = format!(r#"{{"keys":[{{"kty":"OKP","kid":"rotated-kid","x":"{x2}"}}]}}"#);
 
         let mut rotated_header = Header::new(Algorithm::RS256);
         rotated_header.kid = Some("rotated-kid".to_string());
@@ -1648,7 +1644,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_repeated_missing_kid_is_throttled_per_selector() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1684,7 +1680,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_new_kid_after_recent_fetch_triggers_refresh() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x1 = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1710,8 +1706,7 @@ JwIDAQAB
             "initial lookup should fetch once"
         );
 
-        *body.lock().unwrap() =
-            format!(r#"{{"keys":[{{"kty":"OKP","kid":"rotated-kid","x":"{x2}"}}]}}"#);
+        *body.lock() = format!(r#"{{"keys":[{{"kty":"OKP","kid":"rotated-kid","x":"{x2}"}}]}}"#);
 
         let mut h2 = Header::new(Algorithm::RS256);
         h2.kid = Some("rotated-kid".to_string());
@@ -1733,7 +1728,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_fetch_failure_does_not_block_retry_after_recovery() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1776,7 +1771,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_missing_selector_cache_is_bounded() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         let mut entry = JwksCacheEntry {
             jwks_url: "http://jwks.example/test".to_string(),
             fetched_at: Instant::now(),
@@ -1802,7 +1797,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_concurrent_distinct_unknown_kids_share_one_refresh() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1861,7 +1856,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_concurrent_waiters_share_one_refresh() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x = URL_SAFE_NO_PAD.encode([1u8; 32]);
@@ -1918,7 +1913,7 @@ JwIDAQAB
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn jwks_refresh_survives_request_cancellation() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         let x = URL_SAFE_NO_PAD.encode([1u8; 32]);

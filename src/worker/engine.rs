@@ -114,6 +114,9 @@ impl WorkerEngine {
                 e
             );
         }
+        if let Err(e) = self.reconcile_ddl_journal().await {
+            warn!("DDL journal recovery failed (engine will continue): {}", e);
+        }
         if let Err(e) = self.reconcile_hnsw_merges().await {
             warn!(
                 "HNSW merge reconciliation failed (engine will continue): {}",
@@ -447,6 +450,181 @@ impl WorkerEngine {
         }
     }
 
+    /// Recover from incomplete DDL operations by scanning the DDL journal.
+    ///
+    /// For each journal entry left behind by a crash:
+    /// - `CreateIndex`: delete the orphaned index key range, then remove the journal entry.
+    /// - `CreateTableAsSelect`: drop the partially-created table, then remove the journal entry.
+    ///
+    /// DDL journal writes register `TASK_TYPE_DDL_JOURNAL` in the worker
+    /// registry, so the standard registry enumeration discovers all databases
+    /// that may have journal entries.
+    async fn reconcile_ddl_journal(&self) -> Result<()> {
+        let mut sys_txn = self.system_store.begin().await?;
+        let registry_entries = self.system_store.list_worker_registry(&mut sys_txn).await?;
+        sys_txn.commit().await?;
+
+        for entry in registry_entries {
+            if let Err(e) = self
+                .reconcile_ddl_journal_for_db(&entry.keyspace, entry.db_id)
+                .await
+            {
+                warn!(
+                    "DDL journal recovery error for keyspace={} db_id={}: {}",
+                    entry.keyspace, entry.db_id, e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_ddl_journal_for_db(&self, keyspace: &str, db_id: u64) -> Result<()> {
+        use crate::storage::DdlOperation;
+
+        let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
+        let store = handle.store().clone();
+
+        // Scan journal entries in a read transaction.
+        let mut scan_txn = store.begin().await?;
+        let journal_entries = store.scan_ddl_journal(&mut scan_txn, db_id).await?;
+        scan_txn.commit().await?;
+
+        if journal_entries.is_empty() {
+            // The TASK_TYPE_DDL_JOURNAL bit may be stale (set by a prior
+            // successful DDL whose producer intentionally did not clear it).
+            // We intentionally do NOT clear it here: the journal scan and
+            // registry update are on different stores (data vs system) with
+            // no cross-store atomicity, so a concurrent DDL producer could
+            // set the bit + write a journal entry between our scan and our
+            // clear, leaving the new entry undiscoverable after a crash.
+            // The cost of the stale bit is one cheap empty journal scan per
+            // startup per affected database — acceptable.
+            return Ok(());
+        }
+
+        // Process each entry in its own transaction to avoid exceeding TiKV
+        // transaction size limits when multiple large orphans exist.
+        for jentry in &journal_entries {
+            let mut txn = store.begin().await?;
+            match &jentry.operation {
+                DdlOperation::CreateIndex {
+                    table_id,
+                    index_id,
+                    index_name,
+                    index_range_start,
+                    index_range_end,
+                } => {
+                    // Delete orphaned index keys in batches, rotating the
+                    // transaction between batches to stay within TiKV limits.
+                    let mut cursor = index_range_start.clone();
+                    loop {
+                        let next = store
+                            .delete_key_range_batch(&mut txn, cursor, index_range_end)
+                            .await?;
+                        match next {
+                            Some(next_cursor) => {
+                                txn.commit().await?;
+                                txn = store.begin().await?;
+                                cursor = next_cursor;
+                            }
+                            None => break,
+                        }
+                    }
+                    // Release the index name reservation so the name can be reused.
+                    // Note: txn_delete is a no-op for missing keys, so this only
+                    // fails on real TiKV errors — propagate to preserve the
+                    // journal entry for retry rather than leaving an orphaned
+                    // sys_relname_ key.
+                    store
+                        .release_relation_name(&mut txn, db_id, index_name)
+                        .await?;
+                    store.delete_ddl_journal(&mut txn, db_id, jentry.id).await?;
+                    txn.commit().await?;
+                    info!(
+                        "DDL journal: cleaned up orphaned index data (table_id={}, index_id={}, name={}) in db_id={}",
+                        table_id, index_id, index_name, db_id
+                    );
+                }
+                DdlOperation::CreateTableAsSelect {
+                    table_id,
+                    table_name,
+                } => {
+                    // Delete data rows in batches with transaction rotation to
+                    // stay within TiKV mutation limits (CTAS can produce
+                    // arbitrarily many committed rows before crash).
+                    use crate::storage::encode_table_data_range_v2;
+                    let (data_start, data_end) = encode_table_data_range_v2(db_id, *table_id);
+                    let mut cursor = data_start;
+                    loop {
+                        let next = store
+                            .delete_key_range_batch(&mut txn, cursor, &data_end)
+                            .await?;
+                        match next {
+                            Some(next_cursor) => {
+                                txn.commit().await?;
+                                txn = store.begin().await?;
+                                cursor = next_cursor;
+                            }
+                            None => break,
+                        }
+                    }
+                    // Drop owned sequences (e.g. _rowid_seq) before dropping
+                    // the table — drop_table() does not clean these up.
+                    // Errors propagate so the journal is preserved for retry.
+                    let seqs = store.list_sequences(&mut txn, db_id).await?;
+                    for def in seqs {
+                        if let Some((owned_table, _)) = &def.owned_by {
+                            if owned_table == table_name {
+                                let seq_name = def.full_name();
+                                store.drop_sequence(&mut txn, db_id, &seq_name).await?;
+                                store.release_relation_name(&mut txn, db_id, &seq_name).await?;
+                            }
+                        }
+                    }
+                    // Clean up table metadata (schema, relation name, etc.)
+                    // in a final small transaction.  This uses drop_table which
+                    // handles schema deletion, index cleanup, relname release,
+                    // comments, and statistics.  With all data rows already
+                    // deleted above, the remaining metadata fits in one txn.
+                    if let Err(e) = store.drop_table(&mut txn, db_id, table_name).await {
+                        warn!(
+                            "DDL journal: failed to drop CTAS table metadata '{}' in db_id={}: {}. \
+                             Journal entry preserved for retry on next startup.",
+                            table_name, db_id, e
+                        );
+                        txn.rollback().await.ok();
+                        continue;
+                    }
+                    store.delete_ddl_journal(&mut txn, db_id, jentry.id).await?;
+                    txn.commit().await?;
+                    info!(
+                        "DDL journal: cleaned up orphaned CTAS table '{}' in db_id={}",
+                        table_name, db_id
+                    );
+                }
+            }
+        }
+
+        // Note: we intentionally do NOT clear the TASK_TYPE_DDL_JOURNAL
+        // registry bit here.  The journal (data store) and registry (system
+        // store) are in different transactional domains — there is no way to
+        // atomically verify the journal is empty and clear the bit.  A
+        // concurrent DDL producer could set the bit and write a new journal
+        // entry between our last journal delete and our registry update,
+        // leaving the new entry undiscoverable after a crash.
+        //
+        // The stale bit causes only a cheap empty journal scan per startup.
+        // If any entries failed cleanup (!all_cleaned), the bit must stay
+        // set regardless so the next startup retries those entries.
+
+        info!(
+            "DDL journal: recovered {} incomplete operations in keyspace={} db_id={}",
+            journal_entries.len(),
+            keyspace,
+            db_id
+        );
+        Ok(())
+    }
     async fn claim_and_execute(
         system_store: &Arc<TikvStore>,
         pool: &Arc<TikvClientPool>,

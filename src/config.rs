@@ -263,7 +263,7 @@ pub type SharedServerConfig = Arc<RwLock<ServerConfig>>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use std::sync::OnceLock;
 
     fn test_lock() -> &'static Mutex<()> {
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_from_env_uses_defaults_when_vars_not_set() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let keys = [
             "DB9_STATEMENT_TIMEOUT_MS",
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_statement_timeout_env_override() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_STATEMENT_TIMEOUT_MS";
         let saved = env::var(key).ok();
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_idle_in_transaction_timeout_env_override() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS";
         let saved = env::var(key).ok();
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_zero_timeout_allowed() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_STATEMENT_TIMEOUT_MS";
         let saved = env::var(key).ok();
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_tcp_keepalive_idle_env_override() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_TCP_KEEPALIVE_IDLE_MS";
         let saved = env::var(key).ok();
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_tcp_keepalive_idle_zero_disables_keepalive() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_TCP_KEEPALIVE_IDLE_MS";
         let saved = env::var(key).ok();
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_invalid_env_var_falls_back_to_default() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_STATEMENT_TIMEOUT_MS";
         let saved = env::var(key).ok();
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_max_connections_env_override() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_MAX_CONNECTIONS";
         let saved = env::var(key).ok();
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_max_connections_zero_falls_back_to_default() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_MAX_CONNECTIONS";
         let saved = env::var(key).ok();
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_max_connections_invalid_falls_back_to_default() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_MAX_CONNECTIONS";
         let saved = env::var(key).ok();
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_max_concurrent_queries_per_principal_env_override() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL";
         let saved = env::var(key).ok();
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_max_concurrent_queries_per_principal_zero_disables() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_MAX_CONCURRENT_QUERIES_PER_PRINCIPAL";
         let saved = env::var(key).ok();

@@ -940,18 +940,6 @@ pub(super) fn rewrite_check_expr_column(
 
 // ── KV range utilities ──────────────────────────────────────────────────────
 
-pub(super) fn prefix_end(mut key: Vec<u8>) -> Vec<u8> {
-    for i in (0..key.len()).rev() {
-        if key[i] != 0xFF {
-            key[i] = key[i].wrapping_add(1);
-            key.truncate(i + 1);
-            return key;
-        }
-    }
-
-    unreachable!("prefix_end called with all-0xFF prefix")
-}
-
 pub(super) fn index_prefix_range(db_id: u64, table_id: u64, index_id: u64) -> (Vec<u8>, Vec<u8>) {
     // Compute the end bound by incrementing the fixed-length (table_id, index_id) prefix,
     // so the range is independent of memcomparable-encoded index values.
@@ -966,7 +954,7 @@ pub(super) fn index_prefix_range(db_id: u64, table_id: u64, index_id: u64) -> (V
 
     let mut start = prefix.clone();
     start.push(b'_');
-    let end = prefix_end(prefix);
+    let end = crate::storage::encode_prefix_end(&prefix);
 
     (start, end)
 }

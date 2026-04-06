@@ -217,10 +217,10 @@ mod tests {
         FsPresignedRequest, FsStorage, FsWriteStream, FsWriteStreamOptions,
     };
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Arc;
-    use std::sync::Mutex;
 
     use futures::future::BoxFuture;
     use futures::FutureExt;
@@ -342,14 +342,14 @@ mod tests {
         }
 
         fn insert_file(&self, path: &str, data: Bytes) {
-            self.files.lock().unwrap().insert(path.to_string(), data);
+            self.files.lock().insert(path.to_string(), data);
         }
     }
 
     #[async_trait]
     impl FsBackend for MockFsBackend {
         async fn stat(&self, path: &str) -> Result<FsFileInfo> {
-            let files = self.files.lock().unwrap();
+            let files = self.files.lock();
             let data = files
                 .get(path)
                 .ok_or_else(|| anyhow!("missing test file: {path}"))?;
@@ -371,7 +371,7 @@ mod tests {
         }
 
         async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-            let files = self.files.lock().unwrap();
+            let files = self.files.lock();
             let data = files
                 .get(path)
                 .ok_or_else(|| anyhow!("missing test file: {path}"))?;

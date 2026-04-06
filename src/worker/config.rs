@@ -330,7 +330,8 @@ impl WorkerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
 
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -339,7 +340,7 @@ mod tests {
 
     #[test]
     fn from_env_uses_defaults_when_vars_not_set() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let keys = [
             "DB9_WORKER_ENABLED",
@@ -398,7 +399,7 @@ mod tests {
 
     #[test]
     fn from_env_clamps_gc_batch_size_to_u32_max() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_GC_BATCH_SIZE";
         let saved = env::var(key).ok();
@@ -418,7 +419,7 @@ mod tests {
 
     #[test]
     fn from_env_applies_poll_ms_when_at_least_minimum() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_POLL_MS";
         let saved = env::var(key).ok();
@@ -438,7 +439,7 @@ mod tests {
 
     #[test]
     fn from_env_keeps_default_poll_ms_when_below_minimum() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_POLL_MS";
         let saved = env::var(key).ok();
@@ -458,7 +459,7 @@ mod tests {
 
     #[test]
     fn from_env_ignores_non_integer_poll_ms() {
-        let _lock = test_lock().lock().unwrap();
+        let _lock = test_lock().lock();
         unsafe { env::set_var("DB9_WORKER_POLL_MS", "not_a_number") };
         let cfg = WorkerConfig::from_env();
         unsafe { env::remove_var("DB9_WORKER_POLL_MS") };
@@ -515,7 +516,7 @@ mod tests {
 
     #[test]
     fn from_env_applies_hnsw_sweep_interval_when_at_least_minimum() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
         let saved = env::var(key).ok();
@@ -535,7 +536,7 @@ mod tests {
 
     #[test]
     fn from_env_keeps_default_hnsw_sweep_interval_when_below_minimum() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
         let saved = env::var(key).ok();
@@ -555,7 +556,7 @@ mod tests {
 
     #[test]
     fn from_env_ignores_non_integer_hnsw_sweep_interval() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
         let saved = env::var(key).ok();
@@ -578,7 +579,7 @@ mod tests {
 
     #[test]
     fn from_env_applies_gc_interval_when_at_least_minimum() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_GC_INTERVAL_SEC";
         let saved = env::var(key).ok();
@@ -598,7 +599,7 @@ mod tests {
 
     #[test]
     fn from_env_keeps_default_gc_interval_when_below_minimum() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let key = "DB9_WORKER_GC_INTERVAL_SEC";
         let saved = env::var(key).ok();
@@ -618,7 +619,7 @@ mod tests {
 
     #[test]
     fn gc_and_hnsw_sweep_intervals_are_independent() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let gc_key = "DB9_WORKER_GC_INTERVAL_SEC";
         let hnsw_key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
@@ -646,7 +647,7 @@ mod tests {
 
     #[test]
     fn from_env_preserves_zero_worker_timeouts() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
 
         let stmt_key = "DB9_WORKER_STATEMENT_TIMEOUT_MS";
         let cron_key = "DB9_CRON_JOB_TIMEOUT_MS";

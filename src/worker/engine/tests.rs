@@ -1013,6 +1013,10 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         // (The long-lived scan txn in execute_storage_size_scan IS tracked; this is
         // just the final persist_txn that writes the result.)
         "execute_storage_size_scan",
+        // [reconcile] Reads DDL journal entries (small metadata) + immediate commit.
+        "reconcile_ddl_journal",
+        // [reconcile] Scans DDL journal + cleans orphaned data in batches with txn rotation.
+        "reconcile_ddl_journal_for_db",
         // ── worker/gc.rs ──
 
         // [lookup] Neutralize GC instance state: single key write + commit.
