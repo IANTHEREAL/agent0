@@ -89,14 +89,7 @@ impl TaskType {
 // IndexState Enum
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum IndexState {
-    #[default]
-    Ready,
-    Building,
-    Invalid,
-    WriteOnly,
-}
+pub use crate::model::IndexState;
 
 // ============================================================================
 // TaskRegistryEntry

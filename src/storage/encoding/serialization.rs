@@ -64,7 +64,7 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
         anyhow::bail!("Schema data missing magic header (expected DB9_SCHEMA_V2)")
     };
     let mut schema = deserialize_v2_msgpack(payload)?;
-    schema.hydrate_runtime_caches();
+    crate::model::hydrate_runtime_caches(&mut schema);
 
     // Populate cache. quick_cache handles LRU eviction automatically at capacity.
     SCHEMA_DESER_CACHE.insert(data.to_vec(), schema.clone());

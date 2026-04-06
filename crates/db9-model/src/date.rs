@@ -1,4 +1,3 @@
-use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use chrono::{Duration, NaiveDate, TimeZone, Utc};
 
@@ -18,12 +17,8 @@ pub fn date_days_to_naive_date(days: i32) -> Result<NaiveDate> {
 }
 
 pub fn parse_date_days(s: &str) -> Result<i32> {
-    let date = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| {
-        SqlError::InvalidInputSyntax {
-            type_name: "date".into(),
-            value: s.to_string(),
-        }
-    })?;
+    let date = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|_| anyhow!("invalid input syntax for type date: \"{}\"", s))?;
     naive_date_to_days(date)
 }
 

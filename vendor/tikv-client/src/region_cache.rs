@@ -357,6 +357,15 @@ mod test {
             todo!()
         }
 
+        async fn update_service_safepoint(
+            self: Arc<Self>,
+            _service_id: &str,
+            _ttl_secs: i64,
+            _safe_point: u64,
+        ) -> Result<u64> {
+            todo!()
+        }
+
         async fn load_keyspace(&self, _keyspace: &str) -> Result<keyspacepb::KeyspaceMeta> {
             unimplemented!()
         }

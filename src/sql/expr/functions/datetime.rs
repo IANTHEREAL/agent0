@@ -195,7 +195,15 @@ fn eval_date(args: Vec<Value>) -> Result<Value> {
         Some(Value::Timestamp(ts)) => {
             crate::model::date::timestamp_millis_to_date_days(ts).map(Value::Date)
         }
-        Some(Value::Text(s)) => crate::model::date::parse_date_days(&s).map(Value::Date),
+        Some(Value::Text(s)) => crate::model::date::parse_date_days(&s)
+            .map(Value::Date)
+            .map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "date".into(),
+                    value: s,
+                }
+                .into()
+            }),
         Some(Value::Null) | None => Ok(Value::Null),
         Some(other) => Err(anyhow!("DATE() cannot convert {:?} to date", other)),
     }

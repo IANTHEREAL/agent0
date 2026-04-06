@@ -169,7 +169,7 @@ fn cast_to_varchar(val: &Value, max_len: u64, context: CastContext) -> Result<Va
 fn cast_to_text(val: Value) -> Result<Value> {
     match val {
         Value::Timestamp(ts) => {
-            let formatted = crate::model::timestamp::format_timestamp_millis(ts, false)
+            let formatted = crate::model::timestamp::format_timestamp_millis(ts, false, "UTC")
                 .unwrap_or_else(|_| ts.to_string());
             Ok(Value::Text(formatted))
         }
@@ -367,9 +367,14 @@ fn cast_to_temporal(val: Value, target: &DataType) -> Result<Value> {
                     value: s,
                 })
             }),
-        (Value::Text(s), DataType::Date) => {
-            crate::model::date::parse_date_days(&s).map(Value::Date)
-        }
+        (Value::Text(s), DataType::Date) => crate::model::date::parse_date_days(&s)
+            .map(Value::Date)
+            .map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "date".into(),
+                    value: s,
+                })
+            }),
         (Value::Timestamp(ts), DataType::Date) => {
             crate::model::date::timestamp_millis_to_date_days(ts).map(Value::Date)
         }
@@ -886,7 +891,7 @@ pub(crate) fn value_to_sql_expr(v: &Value) -> Expr {
             let millis = ts.rem_euclid(1000) as u32;
             let nanos = millis * 1_000_000;
             if chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos).is_some() {
-                let formatted = crate::model::timestamp::format_timestamp_millis(*ts, false)
+                let formatted = crate::model::timestamp::format_timestamp_millis(*ts, false, "UTC")
                     .unwrap_or_else(|_| ts.to_string());
                 Expr::TypedString {
                     data_type: sqlparser::ast::DataType::Timestamp(

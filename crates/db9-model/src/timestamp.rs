@@ -35,7 +35,11 @@ pub fn truncate_timestamp_millis(ts_millis: i64, precision: u32) -> i64 {
 /// - When `is_timestamptz` is `false`, formats as `YYYY-MM-DD HH:MM:SS[.ffffff]` in UTC.
 /// - When `is_timestamptz` is `true`, formats in the session `TimeZone` (default UTC)
 ///   and appends the numeric UTC offset (matching pgwire text encoding behavior).
-pub fn format_timestamp_millis(ts_millis: i64, is_timestamptz: bool) -> Result<String> {
+pub fn format_timestamp_millis(
+    ts_millis: i64,
+    is_timestamptz: bool,
+    timezone: &str,
+) -> Result<String> {
     let seconds = ts_millis.div_euclid(1000);
     let millis = ts_millis.rem_euclid(1000) as u32;
     let nanos = millis * 1_000_000;
@@ -46,8 +50,7 @@ pub fn format_timestamp_millis(ts_millis: i64, is_timestamptz: bool) -> Result<S
     };
 
     if is_timestamptz {
-        let timezone = crate::session_context::current_timezone();
-        let tz = TimeZoneSpec::parse(timezone.as_ref());
+        let tz = TimeZoneSpec::parse(timezone);
         Ok(tz.format_timestamptz(dt, micros))
     } else if micros == 0 {
         Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -57,13 +60,13 @@ pub fn format_timestamp_millis(ts_millis: i64, is_timestamptz: bool) -> Result<S
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum TimeZoneSpec {
+pub enum TimeZoneSpec {
     Fixed(FixedOffset),
     Named(chrono_tz::Tz),
 }
 
 impl TimeZoneSpec {
-    pub(crate) fn try_parse(setting: &str) -> Result<Self> {
+    pub fn try_parse(setting: &str) -> Result<Self> {
         let setting = setting.trim();
         if setting.is_empty() {
             return Ok(Self::Named(chrono_tz::UTC));
@@ -89,21 +92,18 @@ impl TimeZoneSpec {
             .map_err(|_| anyhow::anyhow!("time zone \"{}\" not recognized", setting))
     }
 
-    pub(crate) fn parse(setting: &str) -> Self {
+    pub fn parse(setting: &str) -> Self {
         Self::try_parse(setting).unwrap_or(Self::Named(chrono_tz::UTC))
     }
 
-    pub(crate) fn format_timestamptz(self, dt_utc: DateTime<Utc>, micros: u32) -> String {
+    pub fn format_timestamptz(self, dt_utc: DateTime<Utc>, micros: u32) -> String {
         match self {
             TimeZoneSpec::Fixed(offset) => format_timestamptz_in_zone(dt_utc, micros, &offset),
             TimeZoneSpec::Named(tz) => format_timestamptz_in_zone(dt_utc, micros, &tz),
         }
     }
 
-    pub(crate) fn timestamp_millis_from_local_datetime(
-        self,
-        naive: chrono::NaiveDateTime,
-    ) -> Result<i64> {
+    pub fn timestamp_millis_from_local_datetime(self, naive: chrono::NaiveDateTime) -> Result<i64> {
         match self {
             TimeZoneSpec::Fixed(offset) => Ok(offset
                 .from_local_datetime(&naive)
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn formats_epoch_zero_without_fraction() {
-        let s = format_timestamp_millis(0, false).unwrap();
+        let s = format_timestamp_millis(0, false, "UTC").unwrap();
         assert_eq!(s, "1970-01-01 00:00:00");
     }
 

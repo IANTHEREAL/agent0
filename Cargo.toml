@@ -1,12 +1,18 @@
+[workspace]
+members = [".", "crates/db9-model", "vendor/tikv-client", "vendor/tikv-client/proto-build"]
+default-members = [".", "crates/db9-model"]
+resolver = "3"
+
 [package]
 name = "db9-server"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 
-resolver = "3"
-
 [dependencies]
+# Workspace crates
+db9-model = { path = "crates/db9-model" }
+
 # Memory allocator — jemalloc replaces glibc malloc to prevent arena
 # fragmentation that inflates RSS 5-10× in multi-tenant deployments.
 # TiKV itself uses jemalloc for the same reason.

@@ -59,8 +59,8 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-git-
-      - run: cargo fmt -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt -p db9-server -p db9-model -- --check
+      - run: cargo clippy --all-targets --no-deps -- -D warnings
 
   # -- Unit Tests (independent, debug build, no release artifact) -----------
   unit-tests:
