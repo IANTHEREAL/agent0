@@ -1990,7 +1990,7 @@ JwIDAQAB
 
     #[tokio::test]
     async fn jwks_rejects_oversized_key_set() {
-        let _guard = test_lock().lock().unwrap();
+        let _guard = test_lock().lock();
         clear_jwks_cache().await;
 
         // Build a JWKS response with more than JWKS_MAX_KEYS keys.

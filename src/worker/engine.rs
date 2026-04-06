@@ -577,7 +577,9 @@ impl WorkerEngine {
                             if owned_table == table_name {
                                 let seq_name = def.full_name();
                                 store.drop_sequence(&mut txn, db_id, &seq_name).await?;
-                                store.release_relation_name(&mut txn, db_id, &seq_name).await?;
+                                store
+                                    .release_relation_name(&mut txn, db_id, &seq_name)
+                                    .await?;
                             }
                         }
                     }
