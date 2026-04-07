@@ -323,9 +323,7 @@ mod tests {
                 sealed: false,
                 is_dir: false,
             });
-            if file.sealed {
-                anyhow::bail!("append is not supported for sealed files");
-            }
+            // Object-backed (sealed) files support append via delta blocks.
             file.bytes.extend_from_slice(data);
             Ok(data.len())
         }
@@ -488,20 +486,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_file_preserves_sealed_mutation_boundary() {
+    async fn append_file_works_on_sealed_files() {
         let backend = Arc::new(MockBackend::new());
         backend.insert_file("/sealed.bin", b"abcdef".to_vec(), true);
-        let client = SqlFsClient { backend };
+        let client = SqlFsClient {
+            backend: backend.clone(),
+        };
 
-        let err = client
+        let written = client
             .append_file("/sealed.bin", b"Z")
             .await
-            .expect_err("sealed append must be rejected");
-        assert!(
-            err.to_string()
-                .contains("append is not supported for sealed files"),
-            "unexpected error: {err}"
-        );
+            .expect("append on sealed file should succeed via delta blocks");
+        assert_eq!(written, 1);
+        let files = backend.files.lock();
+        assert_eq!(files["/sealed.bin"].bytes, b"abcdefZ");
     }
 
     #[tokio::test]

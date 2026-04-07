@@ -3,9 +3,9 @@ use super::*;
 impl EmbeddedPageFs {
     pub(crate) async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload> {
         let normalized = normalize_path(path);
-        let (key, storage, size) = {
+        let (inode_id, key, size, has_deltas) = {
             let mut txn = self.begin_read().await?;
-            let (_inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
+            let (inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
             if inode.is_directory() {
                 return Err(anyhow!(EmbeddedFsError::is_directory(&normalized)));
             }
@@ -16,29 +16,121 @@ impl EmbeddedPageFs {
                 )));
             }
 
-            let (key, storage) = match &inode.data {
-                DataRef::Object { key, .. } => (key.clone(), FsStorage::Object),
+            let key = match &inode.data {
+                DataRef::Object { key, .. } => key.clone(),
                 _ => {
                     return Err(anyhow!(EmbeddedFsError::InvalidInput(
                         "prepare_download is only supported for object-backed files".to_string(),
                     )))
                 }
             };
-            (key, storage, inode.size)
+            let has_deltas = count_append_deltas(&mut txn, inode.id, 1).await? > 0;
+            (inode_id, key, inode.size, has_deltas)
         };
 
-        let ttl_secs = fs9_config().presign_ttl_secs.max(1);
         let s3 = self
             .s3_client()
             .await?
             .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
-        let request = s3.presign_get_object(&key, ttl_secs).await?;
+
+        // Presigned S3 URL only covers the base object. If append deltas
+        // exist, compact them first: download base, merge deltas, upload
+        // new object, delete delta keys. After compaction the presigned
+        // URL covers the full file content.
+        let final_key = if has_deltas {
+            self.compact_append_deltas(inode_id, &key, &s3).await?
+        } else {
+            key
+        };
+
+        let ttl_secs = fs9_config().presign_ttl_secs.max(1);
+        let request = s3.presign_get_object(&final_key, ttl_secs).await?;
         Ok(FsPreparedDownload {
             request,
             size,
-            storage,
+            storage: FsStorage::Object,
             range_supported: true,
         })
+    }
+
+    /// Compact append deltas into the base S3 object. Downloads the base,
+    /// concatenates all TiKV deltas, uploads a new S3 object, atomically
+    /// updates the inode DataRef and deletes the delta keys.
+    async fn compact_append_deltas(
+        &self,
+        inode_id: u64,
+        old_key: &str,
+        s3: &FsS3Client,
+    ) -> Result<String> {
+        // 1. Download base object from S3
+        let base_bytes = s3.get_object_bytes(old_key).await?;
+
+        // 2. Read all deltas from TiKV
+        let deltas = {
+            let mut txn = self.begin_read().await?;
+            read_append_deltas(&mut txn, inode_id).await?
+        };
+        if deltas.is_empty() {
+            return Ok(old_key.to_string());
+        }
+
+        // 3. Merge: base + deltas
+        let mut merged = base_bytes.to_vec();
+        merged.extend_from_slice(&deltas);
+
+        // 4. Upload new S3 object
+        let new_key = self.object_key(inode_id)?;
+        s3.put_object(&new_key, bytes::Bytes::from(merged)).await?;
+
+        // 5. Atomically update inode and delete deltas in one TiKV txn
+        let mut txn = self.begin().await?;
+        let mut inode = load_inode(&mut txn, inode_id)
+            .await?
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("inode disappeared during compaction")))?;
+
+        // Re-check: another concurrent compaction may have already cleaned up
+        let remaining = count_append_deltas(&mut txn, inode_id, 1).await?;
+        if remaining == 0 {
+            // Already compacted by another request — use current inode key
+            let _ = txn.rollback().await;
+            // Clean up the object we just uploaded (it's a duplicate)
+            let _ = s3.delete_object(&new_key).await;
+            return match &inode.data {
+                DataRef::Object { key, .. } => Ok(key.clone()),
+                _ => Ok(new_key),
+            };
+        }
+
+        // Retire old S3 object via lifecycle (if key changed)
+        if old_key != new_key {
+            let fs_instance_id = self.runtime_state().fs_instance_id;
+            retire_inode_data_ref(&mut txn, inode_id, &inode.data, fs_instance_id).await?;
+        }
+
+        // Update inode to point to new compacted object
+        inode.data = DataRef::Object {
+            key: new_key.clone(),
+            version: 0,
+            checksum: [0u8; 32],
+        };
+        bump_inode_generation(&mut inode)?;
+        inode.touch_mtime();
+        save_inode(&mut txn, &inode).await?;
+
+        // Delete all delta keys
+        delete_append_deltas(&mut txn, inode_id).await?;
+
+        txn.commit().await?;
+
+        tracing::info!(
+            inode_id,
+            old_key,
+            new_key = %new_key,
+            delta_bytes = deltas.len(),
+            "fs9: compacted append deltas into new S3 object"
+        );
+
+        Ok(new_key)
     }
 
     pub(crate) async fn write_file_at(
@@ -104,19 +196,77 @@ impl EmbeddedPageFs {
             parent_inode,
             is_new,
         } = prepared;
-        let offset = inode.size;
-        apply_inline_write_at(
-            &mut txn,
-            inode_id,
-            &mut inode,
-            offset,
-            data,
-            "append_file",
-            "append is not supported for sealed files",
-            "append is only supported for inline files up to",
-        )
-        .await?;
-        txn.commit().await?;
+
+        if matches!(inode.data, DataRef::Object { .. }) {
+            // Append delta block: each append creates one immutable TiKV key.
+            // No read-modify-write, no compaction in the hot path.
+            // When delta count exceeds the threshold, reject so the caller
+            // falls back to write_file (which cleans up all deltas).
+
+            // Guard: reject oversized appends that would violate TiKV's
+            // raft-entry-max-size (8 MB). Delta blocks are meant for small
+            // incremental appends, not bulk writes.
+            let inline_max = fs9_config().inline_max_bytes;
+            if data.len() > inline_max {
+                return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
+                    "append data ({} bytes) exceeds maximum delta size ({} bytes); use write_file",
+                    data.len(),
+                    inline_max,
+                ))));
+            }
+
+            // Lazy format version bump: ensure this keyspace declares append
+            // delta support so older binaries reject it rather than silently
+            // serving truncated content.
+            let sb = load_current_superblock_if_present(&mut txn)
+                .await?
+                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("superblock missing")))?;
+            if sb.format_version < FS9_FORMAT_VERSION_APPEND_DELTA {
+                let mut bumped = sb;
+                bumped.format_version = FS9_FORMAT_VERSION_APPEND_DELTA;
+                save_superblock(&mut txn, &bumped).await?;
+                tracing::info!(
+                    keyspace = %self.keyspace,
+                    "fs9: superblock format version bumped to v{} for append delta support",
+                    FS9_FORMAT_VERSION_APPEND_DELTA,
+                );
+            }
+
+            // Cap: at most 1024 deltas, and total accumulated bytes ≈ inline_max_bytes.
+            let max_deltas = (inline_max / data.len().max(1)).clamp(1, MAX_APPEND_DELTAS);
+            let delta_count = count_append_deltas(&mut txn, inode_id, max_deltas).await?;
+            if delta_count >= max_deltas {
+                return Err(anyhow!(EmbeddedFsError::InvalidInput(
+                    "append limit reached for object file; use write_file to flush".to_string(),
+                )));
+            }
+            let write_len = u64::try_from(data.len())
+                .map_err(|_| anyhow!(EmbeddedFsError::internal("write length exceeds u64")))?;
+            bump_inode_generation(&mut inode)?;
+            let delta_key = keys::append_delta_key(inode_id, inode.generation);
+            txn_put(&mut txn, delta_key, data.to_vec()).await?;
+            inode.size = inode
+                .size
+                .checked_add(write_len)
+                .ok_or_else(|| anyhow!(EmbeddedFsError::internal("file size overflow")))?;
+            inode.touch_mtime();
+            save_inode(&mut txn, &inode).await?;
+            txn.commit().await?;
+        } else {
+            let offset = inode.size;
+            apply_inline_write_at(
+                &mut txn,
+                inode_id,
+                &mut inode,
+                offset,
+                data,
+                "append_file",
+                "append is not supported for sealed files",
+                "append is only supported for inline files up to",
+            )
+            .await?;
+            txn.commit().await?;
+        }
 
         let normalized = normalize_path(path);
         self.emit_event(FsEventBuilder {
@@ -502,7 +652,17 @@ impl EmbeddedPageFs {
         inode: Inode,
     ) -> Result<StreamReadPlan> {
         match &inode.data {
-            DataRef::Object { key, .. } => Ok(StreamReadPlan::Object { key: key.clone() }),
+            DataRef::Object { key, .. } => {
+                let deltas = read_append_deltas(&mut txn, inode_id).await?;
+                Ok(StreamReadPlan::Object {
+                    key: key.clone(),
+                    deltas: if deltas.is_empty() {
+                        None
+                    } else {
+                        Some(deltas)
+                    },
+                })
+            }
             DataRef::PackEntry {
                 bundle_id,
                 offset,
@@ -535,7 +695,7 @@ impl EmbeddedPageFs {
         sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
     ) -> Result<()> {
         match plan {
-            StreamReadPlan::Object { key } => {
+            StreamReadPlan::Object { key, deltas } => {
                 let s3 = self
                     .s3_client()
                     .await?
@@ -548,7 +708,13 @@ impl EmbeddedPageFs {
                         break;
                     }
                     if sender.send(Ok(buf[..n].to_vec())).await.is_err() {
-                        break;
+                        return Ok(());
+                    }
+                }
+                // Stream any append deltas after the S3 base.
+                if let Some(delta_bytes) = deltas.filter(|d| !d.is_empty()) {
+                    if sender.send(Ok(delta_bytes)).await.is_err() {
+                        return Ok(());
                     }
                 }
                 Ok(())
