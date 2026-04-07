@@ -46,11 +46,11 @@ fn consume_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
         return None;
     }
 
-    let (head, rest) = input.split_at(keyword.len());
-    if !head.eq_ignore_ascii_case(keyword) {
+    if !input.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes()) {
         return None;
     }
 
+    let rest = &input[keyword.len()..];
     if rest.is_empty() {
         return Some(rest);
     }

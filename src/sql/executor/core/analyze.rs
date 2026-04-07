@@ -51,7 +51,7 @@ pub(crate) fn parse_analyze_table_name(sql: &str) -> Result<Option<sqlparser::as
 
     // Skip optional VERBOSE keyword.
     let after_verbose = if rest.len() >= 7
-        && rest[..7].eq_ignore_ascii_case("VERBOSE")
+        && rest.as_bytes()[..7].eq_ignore_ascii_case(b"VERBOSE")
         && (rest.len() == 7 || rest.as_bytes()[7].is_ascii_whitespace())
     {
         let v_rest = crate::sql::raw_sql::skip_ws_and_comments(rest.get(7..).unwrap_or(""))

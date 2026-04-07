@@ -28,7 +28,9 @@ fn is_ident_char(ch: char) -> bool {
 fn consume_keyword(input: &str, idx: &mut usize, keyword: &str) -> bool {
     skip_ws(input, idx);
     let rest = &input[*idx..];
-    if rest.len() < keyword.len() || !rest[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    if rest.len() < keyword.len()
+        || !rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+    {
         return false;
     }
     let next = rest[keyword.len()..].chars().next();

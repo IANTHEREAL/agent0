@@ -24,10 +24,10 @@ fn consume_kw<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
     if input.len() < keyword.len() {
         return None;
     }
-    let (head, rest) = input.split_at(keyword.len());
-    if !head.eq_ignore_ascii_case(keyword) {
+    if !input.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes()) {
         return None;
     }
+    let rest = &input[keyword.len()..];
     // Ensure word boundary (next char is whitespace, punctuation, or end).
     if let Some(c) = rest.chars().next() {
         if c.is_ascii_alphanumeric() || c == '_' {

@@ -173,7 +173,9 @@ fn parse_arg_types(args: &str) -> Vec<String> {
 }
 
 fn consume_keyword_token_ci<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
-    if s.len() < keyword.len() || !s[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    if s.len() < keyword.len()
+        || !s.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+    {
         return None;
     }
     let next = s[keyword.len()..].chars().next();

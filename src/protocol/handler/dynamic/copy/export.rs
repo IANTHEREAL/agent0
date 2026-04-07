@@ -34,14 +34,12 @@ impl DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // Quick prefix check (case-insensitive).
-        let trimmed = query.trim();
-        if trimmed.len() < 22 || !trimmed[..22].eq_ignore_ascii_case("EXPORT SNAPSHOT COPY '") {
-            return Ok(None);
-        }
+        let rest = match strip_export_copy_prefix(query) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
 
         // Parse: EXPORT SNAPSHOT COPY '<table_name>' '<snapshot_id>'
-        let rest = &trimmed[20..].trim(); // after "EXPORT SNAPSHOT COPY"
         let (table_name, snapshot_id) = parse_export_copy_args(rest).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
@@ -264,6 +262,26 @@ impl DynamicPgHandler {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix matching (extracted so unit tests can exercise the production path)
+// ---------------------------------------------------------------------------
+
+const EXPORT_COPY_PREFIX: &str = "EXPORT SNAPSHOT COPY ";
+
+/// If `query` starts with `EXPORT SNAPSHOT COPY ` (case-insensitive, after
+/// trimming), return the remainder. Uses byte-level comparison to avoid
+/// panicking on multi-byte UTF-8 input (see #2357).
+fn strip_export_copy_prefix(query: &str) -> Option<&str> {
+    let trimmed = query.trim();
+    if trimmed.len() < EXPORT_COPY_PREFIX.len()
+        || !trimmed.as_bytes()[..EXPORT_COPY_PREFIX.len()]
+            .eq_ignore_ascii_case(EXPORT_COPY_PREFIX.as_bytes())
+    {
+        return None;
+    }
+    Some(trimmed[EXPORT_COPY_PREFIX.len()..].trim())
+}
+
+// ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
 
@@ -354,5 +372,42 @@ mod tests {
         let (table, snap) = parse_export_copy_args("'my''table' 'snap''id'").unwrap();
         assert_eq!(table, "my'table");
         assert_eq!(snap, "snap'id");
+    }
+
+    /// Regression test for #2357: `strip_export_copy_prefix` (the production
+    /// prefix check used by `try_handle_export_snapshot_copy`) must not panic
+    /// when the query contains multi-byte UTF-8 characters.
+    #[test]
+    fn strip_export_copy_prefix_does_not_panic_on_multibyte_utf8() {
+        // "SELECT * FROM 日本語テスト" — byte 21 (EXPORT_COPY_PREFIX.len())
+        // lands inside the 3-byte CJK char 語. Old str[..21] would panic.
+        assert_eq!(strip_export_copy_prefix("SELECT * FROM 日本語テスト"), None);
+
+        // Pure CJK, short, empty — must not panic, must return None.
+        assert_eq!(strip_export_copy_prefix("你好世界"), None);
+        assert_eq!(strip_export_copy_prefix("EXPORT SNAPSHOT 测试"), None);
+        assert_eq!(strip_export_copy_prefix(""), None);
+        assert_eq!(strip_export_copy_prefix("E"), None);
+
+        // Valid prefix — must return the remainder.
+        assert_eq!(
+            strip_export_copy_prefix("EXPORT SNAPSHOT COPY 'tbl' 'snap'"),
+            Some("'tbl' 'snap'")
+        );
+        // Case-insensitive.
+        assert_eq!(
+            strip_export_copy_prefix("export snapshot copy 'tbl' 'snap'"),
+            Some("'tbl' 'snap'")
+        );
+        // Leading/trailing whitespace.
+        assert_eq!(
+            strip_export_copy_prefix("  Export Snapshot Copy  'tbl' 'snap'  "),
+            Some("'tbl' 'snap'")
+        );
+        // Multi-byte AFTER the prefix — must still work.
+        assert_eq!(
+            strip_export_copy_prefix("EXPORT SNAPSHOT COPY '日本語テーブル' 'snap'"),
+            Some("'日本語テーブル' 'snap'")
+        );
     }
 }

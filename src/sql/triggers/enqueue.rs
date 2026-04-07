@@ -195,12 +195,10 @@ fn strip_prefix_ignore_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'
     if input.len() < prefix.len() {
         return None;
     }
-    let (head, tail) = input.split_at(prefix.len());
-    if head.eq_ignore_ascii_case(prefix) {
-        Some(tail)
-    } else {
-        None
+    if !input.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+        return None;
     }
+    Some(&input[prefix.len()..])
 }
 
 fn parse_new_assignment(stmt: &str) -> Option<(&str, &str)> {

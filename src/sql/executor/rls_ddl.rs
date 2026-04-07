@@ -68,7 +68,7 @@ fn consume_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     if s.len() < kw.len() {
         return None;
     }
-    if !s[..kw.len()].eq_ignore_ascii_case(kw) {
+    if !s.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes()) {
         return None;
     }
     let rest = &s[kw.len()..];

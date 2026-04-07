@@ -227,7 +227,8 @@ fn check_auth(req: &HttpRequest, admin_secret: &str) -> bool {
         t
     } else if let Some(t) = auth_header.strip_prefix("bearer ") {
         t
-    } else if auth_header.len() > 7 && auth_header[..7].eq_ignore_ascii_case("bearer ") {
+    } else if auth_header.len() > 7 && auth_header.as_bytes()[..7].eq_ignore_ascii_case(b"bearer ")
+    {
         &auth_header[7..]
     } else {
         return false;

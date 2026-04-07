@@ -106,7 +106,8 @@ impl Executor {
         let prefix_len = "EXPORT SNAPSHOT RELEASE".len();
         let sql_trimmed = sql.trim();
         if sql_trimmed.len() < prefix_len
-            || !sql_trimmed[..prefix_len].eq_ignore_ascii_case("EXPORT SNAPSHOT RELEASE")
+            || !sql_trimmed.as_bytes()[..prefix_len]
+                .eq_ignore_ascii_case(b"EXPORT SNAPSHOT RELEASE")
         {
             return Err(anyhow!("invalid EXPORT SNAPSHOT RELEASE syntax"));
         }

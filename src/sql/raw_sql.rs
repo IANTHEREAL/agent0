@@ -578,7 +578,7 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     // (which is rewritten in the parser). Double-quoted ROLE is treated as a
     // regular GUC name, not the keyword.
     if sql_upper.len() > 5
-        && sql_upper[..5].eq_ignore_ascii_case("RESET")
+        && sql_upper.starts_with("RESET")
         && sql_upper.as_bytes()[5].is_ascii_whitespace()
     {
         if let Some(rn) = extract_reset_name(&sql_upper[5..]) {
@@ -1053,5 +1053,16 @@ mod tests {
             Some("CREATE DOMAIN not supported")
         );
         assert_eq!(unsupported_reason("SELECT 1"), None);
+    }
+
+    #[test]
+    fn classify_does_not_panic_on_multibyte_utf8() {
+        // Regression test for #2357: multi-byte UTF-8 characters must not
+        // cause a panic when byte indices land inside a code point.
+        assert_eq!(classify("SELECT embedding('测试embedding功能')"), None);
+        assert_eq!(classify("你好世界"), None);
+        assert_eq!(classify("RÉSÉT TIMEZONE"), None); // 'É' is 2 bytes
+        assert_eq!(classify(""), None);
+        assert_eq!(classify("R"), None);
     }
 }

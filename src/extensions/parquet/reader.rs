@@ -201,7 +201,7 @@ pub(crate) fn is_fs9_url(url: &str) -> bool {
 /// "fs9:///absolute/path" → "/absolute/path"
 /// "fs9://relative/path" → "relative/path"
 pub(crate) fn strip_fs9_scheme(url: &str) -> &str {
-    if url.len() >= 6 && url[..6].eq_ignore_ascii_case("fs9://") {
+    if url.len() >= 6 && url.as_bytes()[..6].eq_ignore_ascii_case(b"fs9://") {
         &url[6..]
     } else {
         url
