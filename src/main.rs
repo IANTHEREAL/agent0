@@ -140,6 +140,12 @@ impl ConnectionTaskRegistry {
 }
 
 fn main() -> Result<()> {
+    // rustls 0.23 requires an explicit CryptoProvider before any TLS operation.
+    // Install the aws-lc-rs provider as the process-wide default.
+    tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     // Record process start time before anything else.
     sql::expr::typed_eval::init_postmaster_start_time();
 

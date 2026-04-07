@@ -396,7 +396,10 @@ mod test {
             count += 1;
         }
         assert!(total_ms <= 20_000, "total {total_ms}ms exceeds budget");
-        assert!(total_ms >= 19_000, "total {total_ms}ms too far below budget");
+        assert!(
+            total_ms >= 19_000,
+            "total {total_ms}ms too far below budget"
+        );
         assert!(count > 10, "should use more than 10 attempts, got {count}");
     }
 
