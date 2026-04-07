@@ -632,11 +632,9 @@ impl EmbeddedPageFs {
                     }
                 }
                 // Stream any append deltas after the S3 base.
-                if let Some(delta_bytes) = deltas {
-                    if !delta_bytes.is_empty() {
-                        if sender.send(Ok(delta_bytes)).await.is_err() {
-                            return Ok(());
-                        }
+                if let Some(delta_bytes) = deltas.filter(|d| !d.is_empty()) {
+                    if sender.send(Ok(delta_bytes)).await.is_err() {
+                        return Ok(());
                     }
                 }
                 Ok(())

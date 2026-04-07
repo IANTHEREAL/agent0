@@ -1872,6 +1872,14 @@ async fn test_write_file_behavioral_replaces_existing_object_file() {
     );
     // DataRef stays Object (delta is stored separately, not in the inode).
     assert!(matches!(after_append.data, DataRef::Object { .. }));
+    // Verify read_file returns correct merged content (S3 base + delta).
+    let mut expected = original.clone();
+    expected.push(b'!');
+    assert_eq!(
+        fs.read_file(path).await.unwrap(),
+        expected,
+        "read_file must merge S3 base object with TiKV append deltas"
+    );
 
     let replacement = b"replacement-inline".to_vec();
     fs.write_file(path, &replacement, None).await.unwrap();
