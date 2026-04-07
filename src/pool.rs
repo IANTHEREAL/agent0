@@ -823,6 +823,11 @@ impl TikvClientPool {
         self
     }
 
+    /// PD endpoints used by this pool (needed for PD HTTP API calls).
+    pub fn pd_endpoints(&self) -> &[String] {
+        &self.pd_endpoints
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_timeouts(
         pd_endpoints: Vec<String>,

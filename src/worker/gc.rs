@@ -123,6 +123,9 @@ struct SweepBackoff {
 const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
 /// Maximum consecutive failures before the backoff multiplier is capped.
 const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5; // 2^5 = 32 intervals
+/// After this many consecutive failures, check PD whether the keyspace is
+/// DISABLED and, if so, remove it from the worker registry.
+const DISABLED_CHECK_THRESHOLD: u32 = 5;
 
 impl SweepBackoff {
     fn new_failed(interval_sec: u64) -> Self {
@@ -497,6 +500,49 @@ impl WorkerGc {
             // Circuit breaker: skip entries that are in backoff.
             if let Some(backoff) = backoff_state.get(&key) {
                 if backoff.should_skip() {
+                    // If failures have accumulated past the threshold, probe PD
+                    // to see if this keyspace has been disabled.  If so, remove
+                    // the registry entry so we never retry it again.
+                    if backoff.consecutive_failures >= DISABLED_CHECK_THRESHOLD {
+                        let state = crate::worker::check_keyspace_state(
+                            self.pool.pd_endpoints(),
+                            &entry.keyspace,
+                        )
+                        .await;
+                        if state.as_deref() == Some("DISABLED") {
+                            info!(
+                                keyspace = %entry.keyspace,
+                                db_id = entry.db_id,
+                                "Keyspace is DISABLED in PD; removing from worker registry"
+                            );
+                            let del_result: Result<()> = async {
+                                let mut txn = self.system_store.begin().await?;
+                                self.system_store
+                                    .delete_worker_registry(&mut txn, &entry.keyspace, entry.db_id)
+                                    .await?;
+                                txn.commit().await?;
+                                Ok(())
+                            }
+                            .await;
+                            match del_result {
+                                Ok(()) => {
+                                    backoff_state.remove(&key);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        keyspace = %entry.keyspace,
+                                        db_id = entry.db_id,
+                                        "Failed to remove DISABLED keyspace from registry: {}",
+                                        e
+                                    );
+                                    // Leave backoff in place so the DISABLED check
+                                    // retries on the next eligible sweep tick.
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     total_skipped += 1;
                     debug!(
                         keyspace = %entry.keyspace,

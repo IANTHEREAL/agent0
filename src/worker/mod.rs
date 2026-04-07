@@ -11,7 +11,7 @@ use config::WorkerConfig;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Worker engine system store — set only when DB9_WORKER_ENABLED=true.
 /// Used by: triggers, cron, HNSW, DDL, BgSql feature gates.
@@ -63,6 +63,86 @@ pub fn set_worker_metrics(m: Arc<metrics::WorkerMetrics>) {
 
 pub fn get_worker_metrics() -> Option<&'static Arc<metrics::WorkerMetrics>> {
     WORKER_METRICS.get()
+}
+
+/// Build an HTTP client for PD API calls, with mutual TLS if configured.
+fn build_pd_client() -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+
+    if let (Ok(ca), Ok(cert_path), Ok(key_path)) = (
+        std::env::var("TIKV_CA_PATH"),
+        std::env::var("TIKV_CERT_PATH"),
+        std::env::var("TIKV_KEY_PATH"),
+    ) {
+        let ca_pem =
+            std::fs::read(&ca).with_context(|| format!("failed to read PD CA cert: {}", ca))?;
+        let ca_cert =
+            reqwest::tls::Certificate::from_pem(&ca_pem).context("failed to parse PD CA cert")?;
+
+        let cert_pem = std::fs::read(&cert_path)
+            .with_context(|| format!("failed to read PD client cert: {}", cert_path))?;
+        let key_pem = std::fs::read(&key_path)
+            .with_context(|| format!("failed to read PD client key: {}", key_path))?;
+        let mut identity_pem = cert_pem;
+        identity_pem.extend_from_slice(&key_pem);
+        let identity = reqwest::tls::Identity::from_pem(&identity_pem)
+            .context("failed to parse PD client identity")?;
+
+        builder = builder
+            .add_root_certificate(ca_cert)
+            .identity(identity)
+            .danger_accept_invalid_certs(false);
+    }
+
+    builder.build().context("failed to build PD HTTP client")
+}
+
+/// PD API base URL (HTTPS when TLS is configured, HTTP otherwise).
+fn pd_base_url(pd_endpoint: &str) -> String {
+    if std::env::var("TIKV_CA_PATH").is_ok() {
+        format!("https://{}", pd_endpoint)
+    } else {
+        format!("http://{}", pd_endpoint)
+    }
+}
+
+/// Query PD for the state of a keyspace.
+///
+/// Returns the state string (e.g. "ENABLED", "DISABLED") or None if the
+/// keyspace does not exist or the query fails.
+pub async fn check_keyspace_state(pd_endpoints: &[String], keyspace: &str) -> Option<String> {
+    let pd_primary = pd_endpoints.first()?;
+    let url = format!(
+        "{}/pd/api/v2/keyspaces/{}",
+        pd_base_url(pd_primary),
+        keyspace
+    );
+
+    let client = match build_pd_client() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to build PD client for keyspace state check: {}", e);
+            return None;
+        }
+    };
+
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.ok()?;
+            body.get("state")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            debug!("PD keyspace query for '{}' returned {}", keyspace, status);
+            None
+        }
+        Err(e) => {
+            debug!("PD keyspace query for '{}' failed: {}", keyspace, e);
+            None
+        }
+    }
 }
 
 /// Ensure the system keyspace exists in PD before initializing worker store.
