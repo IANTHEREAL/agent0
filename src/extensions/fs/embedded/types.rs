@@ -6,7 +6,7 @@ pub(crate) const ROOT_INODE: u64 = 1;
 /// Oldest storage format version this binary can read.
 pub(crate) const FS9_FORMAT_VERSION_MIN: u32 = 4;
 /// Newest storage format version this binary can read.
-pub(crate) const FS9_FORMAT_VERSION_MAX: u32 = 6;
+pub(crate) const FS9_FORMAT_VERSION_MAX: u32 = 5;
 /// Format version stamped on newly created keyspaces.
 pub(crate) const FS9_FORMAT_VERSION_DEFAULT: u32 = 4;
 /// Format version used for local pack spool directory layout.
@@ -14,10 +14,6 @@ pub(crate) const FS9_FORMAT_VERSION_DEFAULT: u32 = 4;
 pub(crate) const FS9_SPOOL_LAYOUT_VERSION: u32 = 4;
 /// Minimum format version required for symlink inode support.
 pub(crate) const FS9_FORMAT_VERSION_SYMLINK: u32 = 5;
-/// Minimum format version required for append delta blocks on Object files.
-/// Older binaries that don't recognize `_fs_AD` keys would silently serve
-/// truncated content (base S3 object without appended deltas).
-pub(crate) const FS9_FORMAT_VERSION_APPEND_DELTA: u32 = 6;
 pub(crate) const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
