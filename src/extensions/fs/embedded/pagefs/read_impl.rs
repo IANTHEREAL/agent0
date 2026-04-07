@@ -155,6 +155,7 @@ impl EmbeddedPageFs {
                 }),
                 DataRef::Object { key, .. } => object_reads.push(PendingBatchInlineReadObject {
                     result_idx: idx,
+                    inode_id: inode.id,
                     key: key.clone(),
                     len: file_len,
                 }),
@@ -212,6 +213,17 @@ impl EmbeddedPageFs {
                 Err(err) => Err(err),
             };
             manifests_by_bundle.insert(window.bundle_id, manifest_result);
+        }
+
+        // Pre-fetch append deltas from TiKV for all Object reads (before
+        // dropping the TiKV snapshot).
+        let mut object_deltas: std::collections::HashMap<usize, Vec<u8>> =
+            std::collections::HashMap::new();
+        for pending in &object_reads {
+            let deltas = read_append_deltas(&mut txn, pending.inode_id).await?;
+            if !deltas.is_empty() {
+                object_deltas.insert(pending.result_idx, deltas);
+            }
         }
 
         drop(txn);
@@ -289,10 +301,14 @@ impl EmbeddedPageFs {
                     .await
                     .expect("batch_inline_read semaphore must not be closed");
                 let s3 = s3.clone();
+                let deltas = object_deltas.remove(&pending.result_idx);
                 external_tasks.spawn(async move {
                     let _permit = permit;
                     let result = s3.get_object_bytes(&pending.key).await.map(|bytes| {
                         let mut data = bytes.to_vec();
+                        if let Some(delta_bytes) = deltas {
+                            data.extend_from_slice(&delta_bytes);
+                        }
                         if data.len() > pending.len {
                             data.truncate(pending.len);
                         }
@@ -484,10 +500,14 @@ impl EmbeddedPageFs {
         }
 
         match &inode.data {
-            DataRef::Object { key, .. } => Ok(ResolvedFileReadPlan::Object {
-                key: key.clone(),
-                len: file_len,
-            }),
+            DataRef::Object { key, .. } => {
+                let deltas = read_append_deltas(txn, inode.id).await?;
+                Ok(ResolvedFileReadPlan::Object {
+                    key: key.clone(),
+                    len: file_len,
+                    deltas,
+                })
+            }
             DataRef::PackEntry {
                 bundle_id,
                 offset,
@@ -516,13 +536,16 @@ impl EmbeddedPageFs {
     async fn execute_resolved_file_read_plan(&self, plan: ResolvedFileReadPlan) -> Result<Vec<u8>> {
         match plan {
             ResolvedFileReadPlan::Ready(data) => Ok(data),
-            ResolvedFileReadPlan::Object { key, len } => {
+            ResolvedFileReadPlan::Object { key, len, deltas } => {
                 let s3 = self
                     .s3_client()
                     .await?
                     .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
                 let bytes = s3.get_object_bytes(&key).await?;
                 let mut data = bytes.to_vec();
+                if !deltas.is_empty() {
+                    data.extend_from_slice(&deltas);
+                }
                 if data.len() > len {
                     data.truncate(len);
                 }
@@ -569,10 +592,19 @@ impl EmbeddedPageFs {
                         "read length exceeds addressable memory"
                     ))
                 })?;
+                let delta_bytes = read_append_deltas(txn, inode.id).await?;
+                let deltas = if delta_bytes.is_empty() {
+                    None
+                } else {
+                    let delta_len = u64::try_from(delta_bytes.len()).unwrap_or(0);
+                    let base_size = inode.size.saturating_sub(delta_len);
+                    Some((delta_bytes, base_size))
+                };
                 Ok(FileRangeReadPlan::Object {
                     key: key.clone(),
                     offset,
                     len,
+                    deltas,
                 })
             }
             DataRef::PackEntry {
@@ -608,15 +640,58 @@ impl EmbeddedPageFs {
     async fn execute_file_range_read_plan(&self, plan: FileRangeReadPlan) -> Result<Vec<u8>> {
         match plan {
             FileRangeReadPlan::Ready(data) => Ok(data),
-            FileRangeReadPlan::Object { key, offset, len } => {
+            FileRangeReadPlan::Object {
+                key,
+                offset,
+                len,
+                deltas,
+            } => {
                 if len == 0 {
                     return Ok(Vec::new());
                 }
-                let s3 = self
-                    .s3_client()
-                    .await?
-                    .ok_or_else(|| anyhow!(EmbeddedFsError::internal("S3 is not configured")))?;
-                Ok(s3.get_object_range_bytes(&key, offset, len).await?.to_vec())
+                match deltas {
+                    None => {
+                        // No deltas — pure S3 range read.
+                        let s3 = self.s3_client().await?.ok_or_else(|| {
+                            anyhow!(EmbeddedFsError::internal("S3 is not configured"))
+                        })?;
+                        Ok(s3.get_object_range_bytes(&key, offset, len).await?.to_vec())
+                    }
+                    Some((delta_bytes, base_size)) => {
+                        let read_end = offset + len as u64;
+                        let mut result = Vec::with_capacity(len);
+
+                        // Portion from S3 base object.
+                        if offset < base_size {
+                            let s3 = self.s3_client().await?.ok_or_else(|| {
+                                anyhow!(EmbeddedFsError::internal("S3 is not configured"))
+                            })?;
+                            let s3_len =
+                                usize::try_from((base_size - offset).min(len as u64)).unwrap_or(0);
+                            let base_bytes =
+                                s3.get_object_range_bytes(&key, offset, s3_len).await?;
+                            result.extend_from_slice(&base_bytes);
+                        }
+
+                        // Portion from TiKV deltas.
+                        if read_end > base_size {
+                            let delta_start = if offset > base_size {
+                                usize::try_from(offset - base_size).unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let delta_end = delta_bytes
+                                .len()
+                                .min(usize::try_from(read_end - base_size).unwrap_or(usize::MAX));
+                            if delta_start < delta_end && delta_start < delta_bytes.len() {
+                                result.extend_from_slice(&delta_bytes[delta_start..delta_end]);
+                            }
+                        }
+
+                        result.truncate(len);
+                        Ok(result)
+                    }
+                }
             }
             FileRangeReadPlan::Pack {
                 manifest,

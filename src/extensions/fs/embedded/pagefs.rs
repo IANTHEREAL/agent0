@@ -99,6 +99,10 @@ const BUNDLE_ALLOC_BLOCK_SIZE: u64 = 128;
 const INODE_BATCH_GET_CHUNK_SIZE: usize = 256;
 const PACK_BATCH_INLINE_READ_MERGE_GAP_BYTES: u64 = 4 * 1024;
 const PACK_SPOOL_HEARTBEAT_FILE: &str = ".heartbeat";
+/// Hard cap on the number of append delta blocks per Object-backed file.
+/// Prevents degenerate cases (e.g., 65K deltas from 1-byte appends) that
+/// would make prefix scans expensive on every read.
+const MAX_APPEND_DELTAS: usize = 1024;
 const INSTANCE_PROBE_INTERVAL_SECS: u64 = 5;
 
 static FS9_MAINTENANCE_STARTED: SyncOnceLock<Mutex<HashSet<FsInstanceIdentity>>> =
@@ -218,6 +222,7 @@ struct PlannedBatchInlineReadPackWindow {
 #[derive(Debug, Clone)]
 struct PendingBatchInlineReadObject {
     result_idx: usize,
+    inode_id: u64,
     key: String,
     len: usize,
 }
@@ -230,6 +235,8 @@ enum ResolvedFileReadPlan {
     Object {
         key: String,
         len: usize,
+        /// Concatenated append delta bytes (empty if no deltas).
+        deltas: Vec<u8>,
     },
     Pack {
         manifest: BundleManifest,
@@ -245,6 +252,8 @@ enum FileRangeReadPlan {
         key: String,
         offset: u64,
         len: usize,
+        /// Append delta bytes and the size of the S3 base object.
+        deltas: Option<(Vec<u8>, u64)>,
     },
     Pack {
         manifest: BundleManifest,
@@ -263,6 +272,7 @@ enum StreamReadPlan {
     },
     Object {
         key: String,
+        deltas: Option<Vec<u8>>,
     },
     Pack {
         manifest: BundleManifest,
@@ -2109,6 +2119,46 @@ struct PreparedFile {
     is_new: bool,
 }
 
+/// Count append delta blocks for an inode.
+/// Scans up to `limit + 1` keys and returns the actual count (which may
+/// be `limit + 1` if more exist). Callers use `>= limit` to check threshold.
+async fn count_append_deltas(txn: &mut Transaction, inode_id: u64, limit: usize) -> Result<usize> {
+    let prefix = keys::append_delta_prefix(inode_id);
+    let end = keys::scan_end_key(&prefix);
+    let scan_limit = u32::try_from(limit.saturating_add(1)).unwrap_or(u32::MAX);
+    let pairs = txn.scan(prefix..end, scan_limit).await?;
+    Ok(pairs.count())
+}
+
+/// Read all append delta blocks for an inode, concatenated in sequence order.
+/// Scan is bounded by `MAX_APPEND_DELTAS` to prevent runaway reads.
+async fn read_append_deltas(txn: &mut Transaction, inode_id: u64) -> Result<Vec<u8>> {
+    let prefix = keys::append_delta_prefix(inode_id);
+    let end = keys::scan_end_key(&prefix);
+    let scan_limit = (MAX_APPEND_DELTAS as u32).saturating_add(1);
+    let pairs = txn.scan(prefix..end, scan_limit).await?;
+    let mut data = Vec::new();
+    for pair in pairs {
+        let tikv_client::KvPair(_key, value) = pair;
+        data.extend_from_slice(&value);
+    }
+    Ok(data)
+}
+
+/// Delete all append delta blocks for an inode.
+/// Scan is bounded by `MAX_APPEND_DELTAS + margin` to handle any residual keys.
+async fn delete_append_deltas(txn: &mut Transaction, inode_id: u64) -> Result<()> {
+    let prefix = keys::append_delta_prefix(inode_id);
+    let end = keys::scan_end_key(&prefix);
+    let scan_limit = (MAX_APPEND_DELTAS as u32).saturating_add(64);
+    let pairs = txn.scan(prefix..end, scan_limit).await?;
+    for pair in pairs {
+        let tikv_client::KvPair(key, _value) = pair;
+        txn.delete(key).await?;
+    }
+    Ok(())
+}
+
 async fn prepare_replace_file_txn(
     fs: &EmbeddedPageFs,
     txn: &mut Transaction,
@@ -3552,6 +3602,8 @@ async fn retire_inode_data_ref(
                 },
             )
             .await?;
+            // Clean up any append delta blocks for this object.
+            delete_append_deltas(txn, inode_id).await?;
         }
         DataRef::StagingPages => {
             return Err(anyhow!(EmbeddedFsError::internal(

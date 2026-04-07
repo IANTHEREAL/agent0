@@ -17,6 +17,8 @@
 //! - Page prefix: `_fs_P` + inode_id (big-endian u64) + `:`
 //! - Staging write marker: `_fs_T` + inode_id (big-endian u64)
 //! - Orphan cleanup marker: `_fs_O` + inode_id (big-endian u64)
+//! - Append delta: `_fs_AD` + inode_id (big-endian u64) + `:` + sequence (big-endian u64)
+//! - Append delta prefix: `_fs_AD` + inode_id (big-endian u64) + `:`
 
 pub(crate) const FS_NAMESPACE_PREFIX: &[u8] = b"_fs_";
 
@@ -176,6 +178,29 @@ pub(crate) fn orphan_inode_key(inode_id: u64) -> Vec<u8> {
 /// Prefix for scanning orphan cleanup markers.
 pub(crate) fn orphan_inode_prefix() -> Vec<u8> {
     b"_fs_O".to_vec()
+}
+
+/// Append delta key: `_fs_AD` + inode_id (big-endian u64) + `:` + sequence (big-endian u64)
+///
+/// Each append to an Object-backed file creates one immutable delta block.
+/// Reads merge the S3 base object with all deltas in sequence order.
+/// Sequence numbers are inode generations at the time of the append.
+pub(crate) fn append_delta_key(inode_id: u64, sequence: u64) -> Vec<u8> {
+    let mut key = b"_fs_AD".to_vec();
+    key.extend_from_slice(&inode_id.to_be_bytes());
+    key.push(b':');
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
+}
+
+/// Append delta prefix: `_fs_AD` + inode_id (big-endian u64) + `:`
+///
+/// Used for range scans to retrieve all append deltas for an inode.
+pub(crate) fn append_delta_prefix(inode_id: u64) -> Vec<u8> {
+    let mut key = b"_fs_AD".to_vec();
+    key.extend_from_slice(&inode_id.to_be_bytes());
+    key.push(b':');
+    key
 }
 
 #[cfg(test)]

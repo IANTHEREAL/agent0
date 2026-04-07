@@ -763,9 +763,7 @@ mod tests {
                 bytes: Vec::new(),
                 sealed: false,
             });
-            if file.sealed {
-                anyhow::bail!("append is not supported for sealed files");
-            }
+            // Object-backed (sealed) files support append via delta blocks.
             file.bytes.extend_from_slice(data);
             Ok(data.len())
         }
@@ -1000,23 +998,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn fs9_append_preserves_sealed_file_contract() {
+    async fn fs9_append_works_on_sealed_files() {
         let backend = Arc::new(MockBackend::new());
         backend.insert_file("/sealed.bin", b"abcdef".to_vec(), true);
         context::with_context(true, "tenant_a", async {
             let shared_backend: Arc<dyn FsBackend> = backend.clone();
             context::cache_fs_backend(shared_backend).expect("cache backend");
 
-            let err = fs9_append(vec![
+            let result = fs9_append(vec![
                 Value::Text("/sealed.bin".to_string()),
                 Value::Text("Z".to_string()),
             ])
-            .expect_err("sealed append must be rejected");
-            assert!(
-                err.to_string()
-                    .contains("append is not supported for sealed files"),
-                "unexpected error: {err}"
-            );
+            .expect("append on sealed file should succeed via delta blocks");
+            assert_eq!(result, Value::Int64(1));
         })
         .await;
     }

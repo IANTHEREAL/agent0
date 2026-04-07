@@ -694,13 +694,23 @@ fn test_validate_superblock_format_accepts_v5() {
 }
 
 #[test]
-fn test_validate_superblock_format_rejects_v6_with_upgrade_message() {
+fn test_validate_superblock_format_accepts_v6() {
     let sb = Superblock {
         format_version: 6,
         fs_instance_id: [1u8; 16],
         object_store: None,
     };
-    let err = validate_superblock_format(&sb).expect_err("v6 must be rejected");
+    validate_superblock_format(&sb).expect("v6 must be accepted (append delta support)");
+}
+
+#[test]
+fn test_validate_superblock_format_rejects_future_version_with_upgrade_message() {
+    let sb = Superblock {
+        format_version: 7,
+        fs_instance_id: [1u8; 16],
+        object_store: None,
+    };
+    let err = validate_superblock_format(&sb).expect_err("v7 must be rejected");
     assert!(
         err.to_string().contains("Upgrade db9-server"),
         "unexpected error: {err}"
@@ -1851,16 +1861,17 @@ async fn test_write_file_behavioral_replaces_existing_object_file() {
     );
     let original_data_ref = original_inode.data.clone();
 
-    let append_err = fs
-        .append_file(path, b"!")
-        .await
-        .expect_err("partial mutation on an object-backed file must stay sealed");
-    assert!(
-        append_err
-            .to_string()
-            .contains("append is not supported for sealed files"),
-        "unexpected append error: {append_err}"
+    // Append on Object-backed files creates an immutable delta block in TiKV.
+    let appended = fs.append_file(path, b"!").await.unwrap();
+    assert_eq!(appended, 1);
+    let after_append = fs.stat(path).await.unwrap();
+    assert_eq!(
+        after_append.size,
+        original_inode.size + 1,
+        "append should increase file size by the appended bytes"
     );
+    // DataRef stays Object (delta is stored separately, not in the inode).
+    assert!(matches!(after_append.data, DataRef::Object { .. }));
 
     let replacement = b"replacement-inline".to_vec();
     fs.write_file(path, &replacement, None).await.unwrap();
@@ -1884,6 +1895,70 @@ async fn test_write_file_behavioral_replaces_existing_object_file() {
             data_ref: original_data_ref,
         }),
         "full replace of an object-backed file must retire the old object via lifecycle cleanup"
+    );
+    let _ = txn.rollback().await;
+
+    cleanup(&fs, base).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_prepare_download_rejects_object_with_pending_deltas() {
+    let fs = make_fs().await;
+    let base = "/test_prepare_download_rejects_object_with_pending_deltas";
+    cleanup(&fs, base).await;
+    ensure_dir(&fs, base).await;
+
+    let path = &format!("{base}/large.bin");
+    let data = vec![0xABu8; fs9_config().inline_max_bytes.saturating_add(1)];
+    fs.write_file(path, &data, None).await.unwrap();
+    let inode = fs.stat(path).await.unwrap();
+    assert!(matches!(inode.data, DataRef::Object { .. }));
+
+    // Without deltas, prepare_download should succeed.
+    fs.prepare_download(path).await.unwrap();
+
+    // After appending, prepare_download must reject (delta bytes are not
+    // served by the presigned S3 URL).
+    fs.append_file(path, b"delta").await.unwrap();
+    let err = fs
+        .prepare_download(path)
+        .await
+        .expect_err("prepare_download must reject tailed object files");
+    assert!(
+        err.to_string().contains("pending append deltas"),
+        "unexpected error: {err}"
+    );
+
+    cleanup(&fs, base).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_first_object_append_bumps_superblock_to_v6() {
+    let fs = make_fs().await;
+    let base = "/test_first_object_append_bumps_superblock_to_v6";
+    cleanup(&fs, base).await;
+    ensure_dir(&fs, base).await;
+
+    let path = &format!("{base}/versioned.bin");
+    let data = vec![0xCDu8; fs9_config().inline_max_bytes.saturating_add(1)];
+    fs.write_file(path, &data, None).await.unwrap();
+    let inode = fs.stat(path).await.unwrap();
+    assert!(matches!(inode.data, DataRef::Object { .. }));
+
+    // Superblock must be bumped to v6 after the first Object append.
+    fs.append_file(path, b"v6").await.unwrap();
+    let mut txn = fs.begin_internal().await.unwrap();
+    let sb = load_current_superblock_if_present(&mut txn)
+        .await
+        .unwrap()
+        .expect("superblock must exist");
+    assert!(
+        sb.format_version >= FS9_FORMAT_VERSION_APPEND_DELTA,
+        "superblock format version must be >= {} after first object append, got {}",
+        FS9_FORMAT_VERSION_APPEND_DELTA,
+        sb.format_version,
     );
     let _ = txn.rollback().await;
 
@@ -2690,7 +2765,8 @@ async fn test_begin_write_stream_without_size_routes_large_files_after_spool() {
     let inode = fs.stat(path).await.unwrap();
     assert!(matches!(inode.data, DataRef::Object { .. }));
     assert_eq!(fs.read_file(path).await.unwrap(), data);
-    assert!(fs.append_file(path, b"!").await.is_err());
+    // Append on Object-backed files creates an immutable delta block.
+    assert_eq!(fs.append_file(path, b"!").await.unwrap(), 1);
 
     cleanup(&fs, base).await;
 }
