@@ -1,8 +1,7 @@
 use crate::extensions::context;
 use crate::extensions::embedding::{
     call_embedding_api, check_embedding_installed, current_embedding_runtime_setting,
-    embedding_function_not_found, record_embedding_tokens, resolve_embedding_config,
-    ResolvedEmbeddingConfig,
+    record_embedding_tokens, resolve_embedding_config, ResolvedEmbeddingConfig,
 };
 use crate::model::Value;
 use crate::session_context::current_database_id;
@@ -22,29 +21,21 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
-fn ensure_embedding_installed_gate(function_signature: &str) -> Result<()> {
+fn ensure_embedding_installed_gate() -> Result<()> {
     match crate::session_context::extension_txn_status("embedding") {
         Some(true) => Ok(()),
-        Some(false) => Err(embedding_function_not_found(function_signature)),
+        Some(false) => Err(crate::extensions::ext_disabled("embedding")),
         None => {
             let client = context::tikv_client()
                 .ok_or_else(|| anyhow!("embedding: tikv client not available"))?;
             let db_id = current_database_id();
-            run_async(check_embedding_installed(
-                &client,
-                db_id,
-                function_signature,
-            ))
+            run_async(check_embedding_installed(&client, db_id))
         }
     }
 }
 
-fn embedding_permission_denied(function_name: &str) -> anyhow::Error {
-    SqlError::PermissionDenied {
-        object_type: "function".into(),
-        object_name: function_name.to_string(),
-    }
-    .into()
+fn embedding_permission_denied(_function_name: &str) -> anyhow::Error {
+    crate::extensions::ext_permission_denied("embedding")
 }
 
 pub(crate) fn require_direct_embedding_superuser(function_name: &str) -> Result<()> {
@@ -105,11 +96,10 @@ fn execute_embedding_call(
 
 pub(crate) fn embedding_call_internal(
     function_name: &str,
-    function_signature: &str,
     text: &str,
     config: &ResolvedEmbeddingConfig,
 ) -> Result<Vec<f64>> {
-    ensure_embedding_installed_gate(function_signature)?;
+    ensure_embedding_installed_gate()?;
     require_embedding_execution_privilege(function_name)?;
     execute_embedding_call(function_name, text, config)
 }
@@ -148,7 +138,6 @@ fn parse_dimensions_arg(value: &Value) -> Result<u32> {
 
 pub(crate) fn embed_query_text_with_cache(
     function_name: &str,
-    function_signature: &str,
     text: &str,
     dimensions: u32,
 ) -> Result<Vec<f64>> {
@@ -158,7 +147,7 @@ pub(crate) fn embed_query_text_with_cache(
     if let Some(cached) = context::cached_embedding(&cache_key)? {
         return Ok(cached);
     }
-    let vector = embedding_call_internal(function_name, function_signature, text, &config)?;
+    let vector = embedding_call_internal(function_name, text, &config)?;
     context::cache_embedding(cache_key, vector.clone())?;
     Ok(vector)
 }
@@ -175,7 +164,7 @@ fn embedding_fn(args: Vec<Value>) -> Result<Value> {
         .into());
     }
 
-    ensure_embedding_installed_gate("embedding(text)")?;
+    ensure_embedding_installed_gate()?;
     require_direct_embedding_superuser("embedding")?;
 
     let text = match &args[0] {
@@ -301,7 +290,7 @@ fn embed_text_fn(args: Vec<Value>) -> Result<Value> {
     };
 
     let config = resolve_embedding_config(Some(&model), dimensions)?;
-    let vector = embedding_call_internal("embed_text", "embed_text(text, text)", &text, &config)?;
+    let vector = embedding_call_internal("embed_text", &text, &config)?;
     Ok(Value::Vector(vector))
 }
 
@@ -384,10 +373,10 @@ mod tests {
             .unwrap_err();
 
         let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
-        assert_eq!(sql_err.sqlstate(), "42883");
+        assert_eq!(sql_err.sqlstate(), "0A000");
         assert!(sql_err
             .to_string()
-            .contains("function embedding(text) does not exist"));
+            .contains("extension \"embedding\" is disabled"));
     }
 
     #[test]

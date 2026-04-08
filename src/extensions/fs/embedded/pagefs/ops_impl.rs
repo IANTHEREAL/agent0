@@ -84,9 +84,11 @@ impl EmbeddedPageFs {
 
         // 5. Atomically update inode and delete deltas in one TiKV txn
         let mut txn = self.begin().await?;
-        let mut inode = load_inode(&mut txn, inode_id)
-            .await?
-            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("inode disappeared during compaction")))?;
+        let mut inode = load_inode(&mut txn, inode_id).await?.ok_or_else(|| {
+            anyhow!(EmbeddedFsError::internal(
+                "inode disappeared during compaction"
+            ))
+        })?;
 
         // Re-check: another concurrent compaction may have already cleaned up
         let remaining = count_append_deltas(&mut txn, inode_id, 1).await?;

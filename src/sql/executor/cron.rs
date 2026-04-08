@@ -90,10 +90,10 @@ async fn execute_schedule(
 ) -> Result<Value> {
     let installed = store.get_extension(txn, db_id, "pg_cron").await?;
     let Some(installed) = installed else {
-        return Err(anyhow!("extension pg_cron is not installed"));
+        return Err(crate::extensions::ext_not_installed("pg_cron"));
     };
     if !installed.enabled {
-        return Err(anyhow!("extension pg_cron is disabled"));
+        return Err(crate::extensions::ext_disabled("pg_cron"));
     }
     if get_system_store().is_none() {
         return Err(anyhow!(
@@ -169,10 +169,10 @@ async fn execute_unschedule(
 ) -> Result<Value> {
     let installed = store.get_extension(txn, db_id, "pg_cron").await?;
     let Some(installed) = installed else {
-        return Err(anyhow!("extension pg_cron is not installed"));
+        return Err(crate::extensions::ext_not_installed("pg_cron"));
     };
     if !installed.enabled {
-        return Err(anyhow!("extension pg_cron is disabled"));
+        return Err(crate::extensions::ext_disabled("pg_cron"));
     }
 
     if args.len() != 1 {
@@ -227,10 +227,10 @@ async fn execute_alter_job(
 ) -> Result<Value> {
     let installed = store.get_extension(txn, db_id, "pg_cron").await?;
     let Some(installed) = installed else {
-        return Err(anyhow!("extension pg_cron is not installed"));
+        return Err(crate::extensions::ext_not_installed("pg_cron"));
     };
     if !installed.enabled {
-        return Err(anyhow!("extension pg_cron is disabled"));
+        return Err(crate::extensions::ext_disabled("pg_cron"));
     }
     if get_system_store().is_none() {
         return Err(anyhow!(

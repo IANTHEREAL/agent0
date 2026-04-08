@@ -144,17 +144,11 @@ pub(super) fn build_index_scan_operator(
             let query_vector = match query_vector {
                 HnswQueryVector::Constant(values) => values.clone(),
                 HnswQueryVector::PendingEmbedding { text, dimensions } => {
-                    let (function_name, function_signature) =
-                        distance_metric.deferred_embedding_function();
-                    embed_query_text_with_cache(
-                        function_name,
-                        function_signature,
-                        text,
-                        *dimensions,
-                    )?
-                    .into_iter()
-                    .map(Value::Float64)
-                    .collect()
+                    let (function_name, _) = distance_metric.deferred_embedding_function();
+                    embed_query_text_with_cache(function_name, text, *dimensions)?
+                        .into_iter()
+                        .map(Value::Float64)
+                        .collect()
                 }
             };
             Ok(Box::new(HnswScanOperator::new(

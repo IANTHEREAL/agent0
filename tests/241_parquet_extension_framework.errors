@@ -1,1 +1,1 @@
-extension parquet is not installed
+extension "parquet" is not installed. Run: CREATE EXTENSION parquet

@@ -207,13 +207,7 @@ fn embed_text_to_vector(
     target_dimensions: u32,
     text: &str,
 ) -> Result<Vec<f64>> {
-    let function_signature = match function_name {
-        "vec_embed_cosine_distance" => "vec_embed_cosine_distance(vector, text)",
-        "vec_embed_l2_distance" => "vec_embed_l2_distance(vector, text)",
-        "vec_embed_inner_product" => "vec_embed_inner_product(vector, text)",
-        _ => "vec_embed_*(vector, text)",
-    };
-    embed_query_text_with_cache(function_name, function_signature, text, target_dimensions)
+    embed_query_text_with_cache(function_name, text, target_dimensions)
 }
 
 pub fn vec_embed_cosine_distance_fn(args: Vec<Value>) -> Result<Value> {

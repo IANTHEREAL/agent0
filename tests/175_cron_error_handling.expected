@@ -1,6 +1,6 @@
-ERROR:  extension pg_cron is not installed
-ERROR:  extension pg_cron is not installed
-ERROR:  extension pg_cron is not installed
+ERROR:  extension "pg_cron" is not installed. Run: CREATE EXTENSION pg_cron
+ERROR:  extension "pg_cron" is not installed. Run: CREATE EXTENSION pg_cron
+ERROR:  extension "pg_cron" is not installed. Run: CREATE EXTENSION pg_cron
 unschedule
 f
 (1 row)

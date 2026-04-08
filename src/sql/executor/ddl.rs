@@ -135,9 +135,7 @@ async fn try_streaming_ctas_for_read_parquet(
     match installed {
         Some(ext) if ext.enabled => {}
         _ => {
-            return Err(anyhow!(
-                "extension parquet is not installed. Run: CREATE EXTENSION parquet"
-            ));
+            return Err(crate::extensions::ext_not_installed("parquet"));
         }
     }
 

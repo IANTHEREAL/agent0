@@ -132,6 +132,34 @@ const EMBEDDING_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: EXTENSIONS_SCHEMA,
 };
 
+// ── Standardized extension error constructors ────────────────────────
+// All extension check sites should use these instead of ad-hoc `anyhow!()` strings.
+// SQLSTATE 0A000 (feature_not_supported) for not-installed/disabled,
+// SQLSTATE 42501 (insufficient_privilege) for permission denied.
+
+/// Extension is not installed. Includes actionable hint.
+pub fn ext_not_installed(name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::Unsupported(format!(
+        "extension \"{}\" is not installed. Run: CREATE EXTENSION {}",
+        name, name
+    ))
+    .into()
+}
+
+/// Extension is installed but disabled.
+pub fn ext_disabled(name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::Unsupported(format!("extension \"{}\" is disabled", name)).into()
+}
+
+/// Permission denied for an extension (non-superuser).
+pub fn ext_permission_denied(name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::PermissionDenied {
+        object_type: "extension".into(),
+        object_name: format!("\"{}\"", name),
+    }
+    .into()
+}
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {

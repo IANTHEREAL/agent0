@@ -634,6 +634,8 @@ impl DynamicPgHandler {
                             "0A000",
                             "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet",
                         ));
+                        // NOTE: this site uses PgWireError (protocol layer), not SqlError.
+                        // Message format matches extensions::ext_not_installed("parquet").
                     }
                 }
             }

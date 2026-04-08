@@ -352,19 +352,14 @@ fn parse_embedding_array(arr: &[serde_json::Value]) -> Result<Vec<f64>> {
         .collect::<Result<Vec<f64>>>()
 }
 
-pub(crate) fn embedding_function_not_found(function_signature: &str) -> anyhow::Error {
-    SqlError::FunctionNotFound(function_signature.to_string()).into()
-}
-
 pub(crate) async fn check_embedding_installed(
     client: &TransactionClient,
     db_id: u64,
-    function_signature: &str,
 ) -> Result<()> {
     match session_context::extension_txn_status("embedding") {
         Some(true) => return Ok(()),
         Some(false) => {
-            return Err(embedding_function_not_found(function_signature));
+            return Err(super::ext_disabled("embedding"));
         }
         None => {}
     }
@@ -383,11 +378,11 @@ pub(crate) async fn check_embedding_installed(
     let bytes = snap
         .get(key)
         .await?
-        .ok_or_else(|| embedding_function_not_found(function_signature))?;
+        .ok_or_else(|| super::ext_not_installed("embedding"))?;
     let ext: InstalledExtension = bincode::deserialize(&bytes)
         .map_err(|_| anyhow!("embedding: corrupt extension metadata"))?;
     if !ext.enabled {
-        return Err(embedding_function_not_found(function_signature));
+        return Err(super::ext_disabled("embedding"));
     }
     Ok(())
 }
@@ -499,14 +494,13 @@ mod tests {
     }
 
     #[test]
-    fn embedding_function_not_found_maps_to_42883() {
-        let err = embedding_function_not_found("embedding(text)");
+    fn embedding_not_installed_maps_to_0a000() {
+        let err = crate::extensions::ext_not_installed("embedding");
         let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
-        assert_eq!(sql_err.sqlstate(), "42883");
-        assert_eq!(
-            sql_err.to_string(),
-            "function embedding(text) does not exist"
-        );
+        assert_eq!(sql_err.sqlstate(), "0A000");
+        assert!(sql_err
+            .to_string()
+            .contains("extension \"embedding\" is not installed"));
     }
 
     #[test]

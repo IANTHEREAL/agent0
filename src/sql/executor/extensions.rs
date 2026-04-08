@@ -70,11 +70,7 @@ fn embedding_usage_args_error(args_len: usize) -> anyhow::Error {
 }
 
 fn embedding_usage_permission_error() -> anyhow::Error {
-    SqlError::PermissionDenied {
-        object_type: "function".into(),
-        object_name: "embedding_usage".into(),
-    }
-    .into()
+    crate::extensions::ext_permission_denied("embedding")
 }
 
 use super::core::starts_with_ignore_ascii_case;
@@ -230,12 +226,7 @@ impl Executor {
                 .ok_or_else(|| anyhow!("embedding_usage: tikv client not available"))?;
             let db_id = crate::session_context::current_database_id();
 
-            crate::extensions::embedding::check_embedding_installed(
-                &client,
-                db_id,
-                "extensions.embedding_usage()",
-            )
-            .await?;
+            crate::extensions::embedding::check_embedding_installed(&client, db_id).await?;
 
             if !crate::extensions::context::is_superuser() {
                 return Err(embedding_usage_permission_error());
@@ -400,17 +391,13 @@ impl Executor {
         if let Some(call) = http_call {
             let installed = self.store().get_extension(txn, db_id, "http").await?;
             let Some(installed) = installed else {
-                return Err(anyhow!("extension \"http\" is not installed"));
+                return Err(crate::extensions::ext_not_installed("http"));
             };
             if !installed.enabled {
-                return Err(anyhow!("extension \"http\" is disabled"));
+                return Err(crate::extensions::ext_disabled("http"));
             }
             if !crate::extensions::context::is_superuser() {
-                return Err(crate::sql::error::SqlError::PermissionDenied {
-                    object_type: "extension".into(),
-                    object_name: "\"http\"".into(),
-                }
-                .into());
+                return Err(crate::extensions::ext_permission_denied("http"));
             }
 
             let (mut schema, rows) =
@@ -533,10 +520,10 @@ impl Executor {
 
             let installed = self.store().get_extension(txn, db_id, "fs9").await?;
             let Some(installed) = installed else {
-                return Err(anyhow!("extension \"fs9\" is not installed"));
+                return Err(crate::extensions::ext_not_installed("fs9"));
             };
             if !installed.enabled {
-                return Err(anyhow!("extension \"fs9\" is disabled"));
+                return Err(crate::extensions::ext_disabled("fs9"));
             }
 
             if let Fs9Mode::File {
@@ -636,10 +623,10 @@ impl Executor {
             // Check fs9 extension is installed
             let installed = self.store().get_extension(txn, db_id, "fs9").await?;
             let Some(installed) = installed else {
-                return Err(anyhow!("extension \"fs9\" is not installed"));
+                return Err(crate::extensions::ext_not_installed("fs9"));
             };
             if !installed.enabled {
-                return Err(anyhow!("extension \"fs9\" is disabled"));
+                return Err(crate::extensions::ext_disabled("fs9"));
             }
 
             let tenant = self.tenant_keyspace();
@@ -831,9 +818,7 @@ impl Executor {
             match installed {
                 Some(ext) if ext.enabled => {}
                 _ => {
-                    return Err(anyhow!(
-                        "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet"
-                    ));
+                    return Err(crate::extensions::ext_not_installed("parquet"));
                 }
             }
             let url_arg = args.first().ok_or_else(|| {
@@ -1145,7 +1130,7 @@ mod tests {
         assert_eq!(sql_err.sqlstate(), "42501");
         assert_eq!(
             sql_err.to_string(),
-            "permission denied for function embedding_usage"
+            "permission denied for extension \"embedding\""
         );
     }
 

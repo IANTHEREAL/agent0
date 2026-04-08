@@ -545,7 +545,7 @@ pub(crate) async fn check_extension_installed() -> Result<()> {
     // Phase 1: in-transaction DDL delta override.
     match session_context::extension_txn_status("http") {
         Some(true) => return Ok(()),
-        Some(false) => return Err(anyhow!("extension \"http\" is not installed")),
+        Some(false) => return Err(super::ext_not_installed("http")),
         None => {}
     }
 
@@ -555,8 +555,7 @@ pub(crate) async fn check_extension_installed() -> Result<()> {
         return Ok(());
     }
 
-    let client =
-        context::tikv_client().ok_or_else(|| anyhow!("extension \"http\" is not installed"))?;
+    let client = context::tikv_client().ok_or_else(|| super::ext_not_installed("http"))?;
     let snapshot_ts = session_context::current_txn_snapshot_ts_version()
         .map(tikv_client::Timestamp::from_version)
         .unwrap_or(client.current_timestamp().await?);
@@ -569,11 +568,11 @@ pub(crate) async fn check_extension_installed() -> Result<()> {
         Some(data) => {
             let ext: InstalledExtension = bincode::deserialize(&data)?;
             if !ext.enabled {
-                return Err(anyhow!("extension \"http\" is disabled"));
+                return Err(super::ext_disabled("http"));
             }
             Ok(())
         }
-        None => Err(anyhow!("extension \"http\" is not installed")),
+        None => Err(super::ext_not_installed("http")),
     }
 }
 

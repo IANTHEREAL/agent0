@@ -490,9 +490,7 @@ pub(super) async fn validate_generated_column_expr(
         .await?
         .is_none()
     {
-        return Err(crate::extensions::embedding::embedding_function_not_found(
-            "embed_text(text, text)",
-        ));
+        return Err(crate::extensions::ext_not_installed("embedding"));
     }
 
     if !crate::extensions::context::is_superuser() {
