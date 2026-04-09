@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use tokio::time::{timeout, Duration};
 
 use crate::extensions::fs::backend::{
-    FsBatchWriteFile, FsMultipartCompletedPart, FsRecursiveReaddirOptions, FsRecursiveReaddirResult,
+    FsBatchWriteFile, FsMultipartCompletedPart, FsReaddirResult, FsRecursiveReaddirOptions,
+    FsRecursiveReaddirResult,
 };
 use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
@@ -15,8 +16,8 @@ use crate::extensions::fs::ws::protocol::{
     map_fs_error, validate_path, BatchInlineReadEntryResponse, BatchStatEntryResponse,
     BatchWriteEntryResponse, CreateUploadResponse, FileInfoResponse, HeaderPairResponse,
     MultipartCompletedPartRequest, PrepareDownloadResponse, PresignPartEntry,
-    PresignedRequestResponse, ReaddirRecursiveResponse, WsErrorCode, WsErrorDetail, WsRequest,
-    WsResponse, MAX_JSON_FRAME_BYTES,
+    PresignedRequestResponse, ReaddirRecursiveResponse, ReaddirResponse, WsErrorCode,
+    WsErrorDetail, WsRequest, WsResponse, MAX_JSON_FRAME_BYTES,
 };
 use crate::extensions::fs::MAX_BYTES_PER_FILE;
 
@@ -221,18 +222,35 @@ async fn handle_readdir(session: &WsSession, id: &str, path: &str) -> WsResponse
         return WsResponse::error(id, code, msg);
     }
 
-    let result = session.backend.readdir(path).await;
+    let result = session.backend.readdir_with_meta(path).await;
     match result {
-        Ok(entries) => {
-            let entries: Vec<FileInfoResponse> =
-                entries.into_iter().map(FileInfoResponse::from).collect();
-            WsResponse::success(id, json!({ "entries": entries }))
-        }
+        Ok(result) => readdir_response(id, result),
         Err(err) => {
             let (code, msg) = map_fs_error(&err);
             WsResponse::error(id, code, msg)
         }
     }
+}
+
+fn readdir_response(id: &str, result: FsReaddirResult) -> WsResponse {
+    let payload = match serde_json::to_value(ReaddirResponse {
+        entries: result
+            .entries
+            .into_iter()
+            .map(FileInfoResponse::from)
+            .collect(),
+        dir_version: result.dir_version,
+    }) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("failed to serialize readdir response: {err}"),
+            );
+        }
+    };
+    WsResponse::success(id, payload)
 }
 
 async fn handle_readdir_recursive(
@@ -1355,9 +1373,10 @@ fn format_mtime(epoch_seconds: i64) -> String {
 mod tests {
     use super::{
         batch_inline_read_response, batch_stat_response, decode_base64_content,
-        map_batch_inline_read_error, parse_sha256_checksum, recursive_readdir_response,
+        map_batch_inline_read_error, parse_sha256_checksum, readdir_response,
+        recursive_readdir_response,
     };
-    use crate::extensions::fs::backend::{FsFileInfo, FsRecursiveReaddirResult};
+    use crate::extensions::fs::backend::{FsFileInfo, FsReaddirResult, FsRecursiveReaddirResult};
     use crate::extensions::fs::ws::protocol::WsErrorCode;
     use anyhow::anyhow;
     use serde_json::Value;
@@ -1644,6 +1663,36 @@ mod tests {
     }
 
     #[test]
+    fn test_readdir_response_serializes_dir_version() {
+        let resp = readdir_response(
+            "req-9a",
+            FsReaddirResult {
+                entries: vec![FsFileInfo {
+                    path: "/root/a.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 5,
+                    mode: 0o644,
+                    generation: 1,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }],
+                dir_version: Some(42),
+            },
+        );
+
+        assert!(resp.ok);
+        let data = resp.data.expect("readdir success must include data");
+        assert_eq!(data["dir_version"], Value::from(42u64));
+        let entries = data["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["path"], Value::String("/root/a.txt".to_string()));
+    }
+
+    #[test]
     fn test_recursive_readdir_response_serializes_payload() {
         let resp = recursive_readdir_response(
             "req-10",
@@ -1829,6 +1878,8 @@ mod tests {
             atomic_supported: bool,
             /// Parent dirs that should fail in batch_write_grouped.
             fail_dirs: std::collections::HashSet<String>,
+            /// Optional readdir result for readdir_with_meta testing.
+            readdir_result: Option<FsReaddirResult>,
         }
 
         #[async_trait]
@@ -1837,6 +1888,15 @@ mod tests {
                 Err(anyhow!("not implemented"))
             }
             async fn readdir(&self, _path: &str) -> Result<Vec<FsFileInfo>> {
+                if let Some(ref result) = self.readdir_result {
+                    return Ok(result.entries.clone());
+                }
+                Err(anyhow!("not implemented"))
+            }
+            async fn readdir_with_meta(&self, _path: &str) -> Result<FsReaddirResult> {
+                if let Some(ref result) = self.readdir_result {
+                    return Ok(result.clone());
+                }
                 Err(anyhow!("not implemented"))
             }
             async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
@@ -2009,6 +2069,7 @@ mod tests {
             WsSession::new_for_test(Arc::new(MockFsBackend {
                 atomic_supported,
                 fail_dirs: std::collections::HashSet::new(),
+                readdir_result: None,
             }))
         }
 
@@ -2016,7 +2077,73 @@ mod tests {
             WsSession::new_for_test(Arc::new(MockFsBackend {
                 atomic_supported: true,
                 fail_dirs: fail_dirs.into_iter().map(String::from).collect(),
+                readdir_result: None,
             }))
+        }
+
+        fn mock_session_with_readdir(result: FsReaddirResult) -> WsSession {
+            WsSession::new_for_test(Arc::new(MockFsBackend {
+                atomic_supported: false,
+                fail_dirs: std::collections::HashSet::new(),
+                readdir_result: Some(result),
+            }))
+        }
+
+        #[tokio::test]
+        async fn handle_readdir_serializes_dir_version_from_backend_meta() {
+            let session = mock_session_with_readdir(FsReaddirResult {
+                entries: vec![FsFileInfo {
+                    path: "/dir/a.txt".to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 7,
+                    mode: 0o644,
+                    generation: 3,
+                    mtime: 0,
+                    storage: None,
+                    sealed: None,
+                }],
+                dir_version: Some(77),
+            });
+
+            let resp = super::super::handle_readdir(&session, "req-rd", "/dir").await;
+
+            assert!(resp.ok);
+            let data = resp.data.expect("readdir success must include data");
+            assert_eq!(data["dir_version"], Value::from(77u64));
+            let entries = data["entries"]
+                .as_array()
+                .expect("entries must be an array");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["path"], Value::String("/dir/a.txt".to_string()));
+        }
+
+        #[test]
+        fn test_readdir_response_omits_dir_version_when_absent() {
+            let resp = readdir_response(
+                "req-none",
+                FsReaddirResult {
+                    entries: vec![FsFileInfo {
+                        path: "/root/b.txt".to_string(),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: 10,
+                        mode: 0o644,
+                        generation: 1,
+                        mtime: 0,
+                        storage: None,
+                        sealed: None,
+                    }],
+                    dir_version: None,
+                },
+            );
+
+            assert!(resp.ok);
+            let data = resp.data.expect("readdir success must include data");
+            assert!(
+                data.get("dir_version").is_none(),
+                "dir_version should be omitted from JSON when None, not serialized as null"
+            );
         }
 
         #[tokio::test]
@@ -2205,6 +2332,7 @@ mod tests {
             let backend = Arc::new(MockFsBackend {
                 atomic_supported: true,
                 fail_dirs: std::collections::HashSet::new(),
+                readdir_result: None,
             });
             let subgroup_size =
                 crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
@@ -2242,6 +2370,7 @@ mod tests {
             let backend = Arc::new(MockFsBackend {
                 atomic_supported: true,
                 fail_dirs: std::collections::HashSet::new(),
+                readdir_result: None,
             });
             let subgroup_size =
                 crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
@@ -2291,6 +2420,7 @@ mod tests {
                 Arc::new(MockFsBackend {
                     atomic_supported: false,
                     fail_dirs: std::collections::HashSet::new(),
+                    readdir_result: None,
                 }),
                 FsAccessMode::ReadOnly,
             )

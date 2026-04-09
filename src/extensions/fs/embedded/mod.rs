@@ -10,7 +10,7 @@ pub(crate) mod types;
 
 use crate::extensions::fs::backend::{
     FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult, FsCreateUpload,
-    FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest,
+    FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest, FsReaddirResult,
     FsRecursiveReaddirOptions, FsRecursiveReaddirResult, FsStorage, FsWriteStream,
     FsWriteStreamOptions,
 };
@@ -84,19 +84,26 @@ impl FsBackend for EmbeddedFsBackend {
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
-        let entries = self.pagefs.readdir(path).await?;
+        Ok(self.readdir_with_meta(path).await?.entries)
+    }
+
+    async fn readdir_with_meta(&self, path: &str) -> Result<FsReaddirResult> {
+        let (dir_generation, entries) = self.pagefs.readdir_with_generation(path).await?;
         let normalized = normalize_dir_path(path);
-        Ok(entries
-            .into_iter()
-            .map(|(name, inode)| {
-                let child_path = if normalized == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{normalized}/{name}")
-                };
-                inode_to_file_info(&child_path, &inode)
-            })
-            .collect::<Result<Vec<_>>>()?)
+        Ok(FsReaddirResult {
+            entries: entries
+                .into_iter()
+                .map(|(name, inode)| {
+                    let child_path = if normalized == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{normalized}/{name}")
+                    };
+                    inode_to_file_info(&child_path, &inode)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            dir_version: Some(dir_generation),
+        })
     }
 
     async fn batch_readdir(&self, paths: &[String]) -> Result<Vec<Result<Vec<FsFileInfo>>>> {

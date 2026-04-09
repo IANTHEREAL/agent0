@@ -339,15 +339,24 @@ impl EmbeddedPageFs {
             .collect())
     }
 
-    pub(crate) async fn readdir(&self, path: &str) -> Result<Vec<(String, Inode)>> {
+    pub(crate) async fn readdir_with_generation(
+        &self,
+        path: &str,
+    ) -> Result<(u64, Vec<(String, Inode)>)> {
         let mut txn = self.begin_read().await?;
         let (inode_id, inode) = resolve_path(&mut txn, path).await?;
         if !inode.is_directory() {
             return Err(anyhow!(EmbeddedFsError::not_directory(path)));
         }
 
+        let dir_generation = inode.generation;
         let mut entries = load_directory_entries_batch(&mut txn, &[inode_id]).await?;
-        Ok(entries.pop().unwrap_or_default())
+        Ok((dir_generation, entries.pop().unwrap_or_default()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn readdir(&self, path: &str) -> Result<Vec<(String, Inode)>> {
+        Ok(self.readdir_with_generation(path).await?.1)
     }
 
     pub(crate) async fn readdir_recursive(

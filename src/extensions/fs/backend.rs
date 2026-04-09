@@ -74,6 +74,12 @@ pub(crate) struct FsRecursiveReaddirResult {
     pub total_dirs_scanned: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct FsReaddirResult {
+    pub entries: Vec<FsFileInfo>,
+    pub dir_version: Option<u64>,
+}
+
 pub(crate) fn batch_inline_read_entry_too_large_error(
     size: u64,
     max_file_bytes: usize,
@@ -150,6 +156,12 @@ pub(crate) trait FsBackend: Send + Sync {
         Ok(entries)
     }
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>>;
+    async fn readdir_with_meta(&self, path: &str) -> Result<FsReaddirResult> {
+        Ok(FsReaddirResult {
+            entries: self.readdir(path).await?,
+            dir_version: None,
+        })
+    }
     async fn batch_readdir(&self, paths: &[String]) -> Result<Vec<Result<Vec<FsFileInfo>>>> {
         let mut entries = Vec::with_capacity(paths.len());
         for path in paths {
@@ -983,6 +995,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("NotFound"));
+    }
+
+    #[tokio::test]
+    async fn default_readdir_with_meta_returns_none_dir_version() {
+        let backend = RecursiveReaddirTestBackend::new(HashMap::from([(
+            "/".to_string(),
+            Ok(vec![FsFileInfo {
+                path: "/root.txt".to_string(),
+                is_dir: false,
+                is_symlink: false,
+                size: 4,
+                mode: 0o644,
+                generation: 1,
+                mtime: 0,
+                storage: Some(FsStorage::Inline),
+                sealed: Some(false),
+            }]),
+        )]));
+
+        let result = backend
+            .readdir_with_meta("/")
+            .await
+            .expect("readdir_with_meta should succeed");
+
+        assert_eq!(result.dir_version, None);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, "/root.txt");
     }
 
     #[tokio::test]

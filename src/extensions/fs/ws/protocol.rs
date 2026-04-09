@@ -372,6 +372,13 @@ pub(crate) struct ReaddirRecursiveResponse {
     pub total_dirs_scanned: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReaddirResponse {
+    pub entries: Vec<FileInfoResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir_version: Option<u64>,
+}
+
 fn format_mtime_rfc3339(epoch_seconds: u64) -> String {
     i64::try_from(epoch_seconds)
         .ok()
