@@ -37,11 +37,13 @@
 - Every `Architect` and `CI` task must follow the target repository `AGENTS.md` and any child `AGENTS.md` in the touched subtree.
 - PostgreSQL is the semantic oracle for SQL behavior.
 - No hidden fallback, no runtime `try-new-then-old`, and no test-layer masking.
+- Performance optimization features should avoid `cloud-storage-engine` changes whenever reasonably possible. The default implementation target is a `db9-server`-only solution.
 - All cross-repo protocol changes must be capability-gated and backward-aware.
 - Every milestone must ship observability before enablement.
 - Every milestone must define explicit rollback knobs or disable flags.
 - `cloud-storage-engine` CI must not run multiple `cargo` commands concurrently.
 - Any change in `cloud-storage-engine` must not affect, regress, or alter any existing TiDB to TiKV functionality, protocol contract, compatibility surface, or interface behavior outside the explicitly scoped DB9 extension path.
+- If a milestone still needs `cloud-storage-engine` changes, the design doc must explain why a `db9-server`-only approach is insufficient and why the chosen `cloud-storage-engine` change is the smallest viable scope.
 - Before any commit or PR is marked ready, the owner must ensure DCO requirements pass.
 - Before any Rust change is submitted, the owner must run the repository-required formatting and lint steps and ensure they pass.
 - For `cloud-storage-engine`, `make format` and `make clippy` are mandatory before submission for Rust-related changes.
@@ -65,6 +67,7 @@
 - Repository discipline checks pass, including `AGENTS.md` compliance, DCO, formatting, and lint requirements.
 - All newly introduced optimization parameters are documented with scope, meaning, default, and usage method.
 - `cloud-storage-engine` changes are proven not to change existing TiDB or TiKV behavior outside the DB9-scoped path.
+- Any `cloud-storage-engine` change is justified as strictly necessary, and the evidence bundle explains why a `db9-server`-only implementation was not enough.
 - Compatibility regression checks pass for all already-supported pushdown functions, expressions, and operators.
 - Real scenario benchmark gate passes on production-like data volume.
 - Performance evidence includes before and after numbers plus workload description.
@@ -156,6 +159,7 @@ Use the following card structure for every assigned task:
 - add or standardize metrics for scanned rows, decoded rows, fetched base rows, first-row latency, peak statement memory, sort memory, aggregate memory, spill bytes, plan-cache hit or miss, remote reject reasons, and DB9 streaming mode
 - add feature flags or guarded planner switches for every later milestone
 - document rollback rules and compatibility matrix for `old db9/new cse`, `new db9/old cse`, and `new/new`
+- define a `db9-server`-first decision rule: each milestone must first attempt a `db9-server`-only design, and only escalate to `cloud-storage-engine` after documenting why the local-only design cannot meet correctness or target payoff
 - freeze benchmark corpus and dataset shapes for small, medium, and large workloads
 - define one real scenario benchmark template for each milestone and the common output format for `db9 before`, `db9 after`, and local `PostgreSQL 18.3`
 - `Deliverables`:
@@ -210,7 +214,7 @@ Use the following card structure for every assigned task:
 - PR2: refactor `db9-server` table scan storage path from full `Vec<Row>` return to cursor or batch stream interface
 - PR3: refactor `TableScanOperator` and root executor to pull and forward rows incrementally
 - PR4: refactor pgwire result encoding to support incremental row emission
-- PR5: implement CSE DB9 streaming or paged response path for safe table-scan requests
+- PR5: only if `db9-server`-only streaming cannot meet the milestone target, implement the smallest `cloud-storage-engine` DB9 streaming or paged response change needed for safe table-scan requests
 - PR6: propagate downstream stop conditions so scan, executor, protocol, and remote cop all stop promptly when `LIMIT` is satisfied or the client closes early
 - PR7: keep unsupported request shapes explicitly rejected until later milestones cover them
 - `Deliverables`:
@@ -275,6 +279,7 @@ Use the following card structure for every assigned task:
 - PR5: if needed, separately design `INCLUDE` or payload support in index metadata and storage encoding; keep it behind a new capability
 - PR6: explicitly document which index types, predicate shapes, projection forms, and sort shapes are eligible for composite-index ordered traversal
 - PR7: if covering-index payload is exposed in DDL, prefer PostgreSQL-compatible `INCLUDE (...)` syntax and document any intentional divergence explicitly
+- PR8: keep the preferred implementation path inside `db9-server`; only touch `cloud-storage-engine` if planner or payload reduction goals cannot be met with local late-materialization and ordered-scan logic alone
 - `Deliverables`:
 - planner rule changes
 - operator chain for late fetch
@@ -330,7 +335,7 @@ Use the following card structure for every assigned task:
 - PR3: propagate ordering property through planner and builder, reusing composite-index rules from `M2`
 - PR4: extend operator pushdown to `Filter`, `Project`, `Limit`, and `TopN` where semantics are provably safe
 - PR5: implement ordered `OFFSET + LIMIT` behavior so scanning stops after `offset + limit` qualifying index entries, and defer full-row fetch until after skip whenever possible
-- PR6: enable remote ordered path only for safe request shapes and negotiated capability
+- PR6: enable remote ordered path only for safe request shapes and negotiated capability, and only after proving the milestone target cannot be met well enough with a `db9-server`-only ordered path
 - PR7: preserve PostgreSQL ordering semantics for `ASC/DESC`, `NULLS FIRST/LAST`, collation-sensitive cases, and non-deterministic unordered `LIMIT/OFFSET` behavior
 - `Deliverables`:
 - TopN operator
