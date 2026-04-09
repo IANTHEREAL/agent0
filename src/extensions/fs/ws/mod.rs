@@ -16,6 +16,7 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::{Error as WsIoError, Message};
@@ -24,12 +25,13 @@ use tracing::{debug, info, warn};
 
 use crate::extensions::fs::backend::{FsWriteStream, FsWriteStreamOptions};
 use crate::extensions::fs::config::fs9_config;
+use crate::extensions::fs::notify::get_or_create_event_ring;
 use crate::extensions::fs::ws::auth::{FsAccessMode, WsConnectionTracker, WsSession};
 use crate::extensions::fs::ws::protocol::{
-    map_fs_error, validate_path, StreamEnd, StreamStartResponse, StreamWriteReady, WsErrorCode,
-    WsRequest, WsResponse, AUTH_TIMEOUT_SECS, DEFAULT_CHUNK_SIZE,
-    DEFAULT_MAX_CONNECTIONS_PER_TENANT, IDLE_TIMEOUT_SECS, MAX_JSON_FRAME_BYTES,
-    STREAMING_THRESHOLD,
+    map_fs_error, validate_path, StreamEnd, StreamStartResponse, StreamWriteReady, WatchEventData,
+    WatchGapData, WatchSubscribeResponse, WsErrorCode, WsPushMessage, WsRequest, WsResponse,
+    AUTH_TIMEOUT_SECS, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_CONNECTIONS_PER_TENANT, IDLE_TIMEOUT_SECS,
+    MAX_JSON_FRAME_BYTES, STREAMING_THRESHOLD,
 };
 use crate::extensions::fs::MAX_BYTES_PER_FILE;
 use crate::pool::TikvClientPool;
@@ -260,6 +262,11 @@ where
     let idle_deadline = tokio::time::sleep(Duration::from_secs(IDLE_TIMEOUT_SECS));
     tokio::pin!(idle_deadline);
 
+    // Watch subscription state (local to connection, not in WsSession)
+    let mut watch_task: Option<JoinHandle<()>> = None;
+    let mut _active_subscription_id: Option<String> = None;
+    let event_ring = get_or_create_event_ring(&session.keyspace);
+
     loop {
         let msg = tokio::select! {
             biased; // prefer real messages over pings
@@ -270,6 +277,9 @@ where
                         // Abort any in-flight streaming write before propagating WS error
                         if let Some(state) = streaming_write.take() {
                             abort_streaming_write(state).await;
+                        }
+                        if let Some(task) = watch_task.take() {
+                            task.abort();
                         }
                         writer.abort();
                         return Err(err);
@@ -555,6 +565,267 @@ where
                             writer,
                         });
                     }
+                    WsRequest::WatchSubscribe {
+                        id,
+                        path,
+                        since_seq,
+                    } => {
+                        if let Err((code, msg)) = validate_path(&path) {
+                            let _ =
+                                send_response_tx(&out_tx, &WsResponse::error(&id, code, msg)).await;
+                            continue;
+                        }
+
+                        // Cancel any existing subscription
+                        if let Some(task) = watch_task.take() {
+                            task.abort();
+                        }
+                        _active_subscription_id = None;
+
+                        let sub_id = format!(
+                            "sub-{}",
+                            uuid::Uuid::new_v4()
+                                .to_string()
+                                .split('-')
+                                .next()
+                                .unwrap_or("0")
+                        );
+                        let since = since_seq.unwrap_or(0);
+                        let ring = event_ring.clone();
+
+                        // Subscribe FIRST to close TOCTOU gap: any events pushed
+                        // after this point are buffered in the broadcast receiver,
+                        // even across .await yield points below.
+                        let watch_rx = ring.subscribe();
+
+                        // Query ring for overflow detection
+                        let qr = ring.query(since, None, 0);
+
+                        let resp = WsResponse::success(
+                            &id,
+                            serde_json::to_value(WatchSubscribeResponse {
+                                subscription_id: sub_id.clone(),
+                                head_seq: qr.newest_seq,
+                                overflow: if since == 0 { false } else { qr.overflow },
+                            })
+                            .unwrap_or_default(),
+                        );
+                        if send_response_tx(&out_tx, &resp).await.is_err() {
+                            break;
+                        }
+
+                        let push_tx = out_tx.clone();
+                        let sub_id_clone = sub_id.clone();
+                        let path_clone = path.clone();
+
+                        if qr.overflow && since > 0 {
+                            // Send gap — client must snapshot-refresh then re-subscribe
+                            let gap = WsPushMessage {
+                                push: "watch_gap".to_string(),
+                                subscription_id: sub_id.clone(),
+                                data: serde_json::to_value(WatchGapData {
+                                    reason: "overflow".to_string(),
+                                    oldest_available_seq: if qr.oldest_seq > 0 {
+                                        Some(qr.oldest_seq)
+                                    } else {
+                                        None
+                                    },
+                                })
+                                .unwrap_or_default(),
+                            };
+                            let gap_json = serde_json::to_string(&gap).unwrap_or_default();
+                            let _ = out_tx.try_send(Message::Text(gap_json));
+                            // Do NOT spawn watch task — client must re-subscribe
+                            _active_subscription_id = Some(sub_id);
+                            continue;
+                        }
+
+                        // When since=0 (no cursor), start from ring head (live-only).
+                        // When since>0, deliver backlog then continue from cursor.
+                        let mut backlog_cursor = if since == 0 { qr.newest_seq } else { since };
+                        let mut backlog_aborted = false;
+
+                        if since > 0 {
+                            // Deliver backlog events in pages of 500
+                            'backlog: loop {
+                                let backlog = ring.query(backlog_cursor, Some(&path), 500);
+                                // Re-check overflow: ring may have advanced between
+                                // the initial check and this query.
+                                if backlog.overflow {
+                                    let gap = WsPushMessage {
+                                        push: "watch_gap".to_string(),
+                                        subscription_id: sub_id.clone(),
+                                        data: serde_json::to_value(WatchGapData {
+                                            reason: "overflow".to_string(),
+                                            oldest_available_seq: if backlog.oldest_seq > 0 {
+                                                Some(backlog.oldest_seq)
+                                            } else {
+                                                None
+                                            },
+                                        })
+                                        .unwrap_or_default(),
+                                    };
+                                    let gap_json = serde_json::to_string(&gap).unwrap_or_default();
+                                    let _ = out_tx.try_send(Message::Text(gap_json));
+                                    backlog_aborted = true;
+                                    break 'backlog;
+                                }
+                                if backlog.events.is_empty() {
+                                    break 'backlog;
+                                }
+                                let page_len = backlog.events.len();
+                                for event in &backlog.events {
+                                    let push = WsPushMessage {
+                                        push: "watch_event".to_string(),
+                                        subscription_id: sub_id.clone(),
+                                        data: serde_json::to_value(WatchEventData {
+                                            seq: event.seq,
+                                            timestamp: event.timestamp,
+                                            event_type: event.event_type.as_str().to_string(),
+                                            path: event.path.clone(),
+                                            old_path: event.old_path.clone(),
+                                            inode: event.inode,
+                                            generation: event.generation,
+                                            is_dir: event.is_dir,
+                                            size: event.size,
+                                        })
+                                        .unwrap_or_default(),
+                                    };
+                                    let json = serde_json::to_string(&push).unwrap_or_default();
+                                    if out_tx.try_send(Message::Text(json)).is_err() {
+                                        let gap = WsPushMessage {
+                                            push: "watch_gap".to_string(),
+                                            subscription_id: sub_id.clone(),
+                                            data: serde_json::to_value(WatchGapData {
+                                                reason: "backpressure".to_string(),
+                                                oldest_available_seq: None,
+                                            })
+                                            .unwrap_or_default(),
+                                        };
+                                        let gap_json =
+                                            serde_json::to_string(&gap).unwrap_or_default();
+                                        let _ = out_tx.try_send(Message::Text(gap_json));
+                                        backlog_aborted = true;
+                                        break 'backlog;
+                                    }
+                                    backlog_cursor = event.seq;
+                                }
+                                // If we got a full page, there may be more
+                                if page_len < 500 {
+                                    break 'backlog;
+                                }
+                            }
+                        }
+
+                        if backlog_aborted {
+                            // Do NOT spawn watch task — client got a gap
+                            _active_subscription_id = Some(sub_id);
+                            continue;
+                        }
+
+                        // Spawn ongoing watch task with cursor advanced past backlog
+                        let task = tokio::spawn(async move {
+                            let mut rx = watch_rx;
+                            let mut last_seen = backlog_cursor;
+                            let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+                            heartbeat.reset();
+
+                            loop {
+                                tokio::select! {
+                                    result = rx.recv() => {
+                                        match result {
+                                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                                // Drain all pending events, re-querying
+                                                // if we got a full page (>= 500).
+                                                loop {
+                                                    let qr = ring.query(last_seen, Some(&path_clone), 500);
+                                                    if qr.overflow {
+                                                        let gap = WsPushMessage {
+                                                            push: "watch_gap".to_string(),
+                                                            subscription_id: sub_id_clone.clone(),
+                                                            data: serde_json::to_value(WatchGapData {
+                                                                reason: "overflow".to_string(),
+                                                                oldest_available_seq: if qr.oldest_seq > 0 { Some(qr.oldest_seq) } else { None },
+                                                            })
+                                                            .unwrap_or_default(),
+                                                        };
+                                                        let json = serde_json::to_string(&gap).unwrap_or_default();
+                                                        let _ = push_tx.try_send(Message::Text(json));
+                                                        return; // Abort — client must re-subscribe
+                                                    }
+                                                    if qr.events.is_empty() {
+                                                        break;
+                                                    }
+                                                    let page_len = qr.events.len();
+                                                    for event in &qr.events {
+                                                        let push = WsPushMessage {
+                                                            push: "watch_event".to_string(),
+                                                            subscription_id: sub_id_clone.clone(),
+                                                            data: serde_json::to_value(WatchEventData {
+                                                                seq: event.seq,
+                                                                timestamp: event.timestamp,
+                                                                event_type: event.event_type.as_str().to_string(),
+                                                                path: event.path.clone(),
+                                                                old_path: event.old_path.clone(),
+                                                                inode: event.inode,
+                                                                generation: event.generation,
+                                                                is_dir: event.is_dir,
+                                                                size: event.size,
+                                                            })
+                                                            .unwrap_or_default(),
+                                                        };
+                                                        let json = serde_json::to_string(&push).unwrap_or_default();
+                                                        if push_tx.try_send(Message::Text(json)).is_err() {
+                                                            // Backpressure — send gap and abort
+                                                            let gap = WsPushMessage {
+                                                                push: "watch_gap".to_string(),
+                                                                subscription_id: sub_id_clone.clone(),
+                                                                data: serde_json::to_value(WatchGapData {
+                                                                    reason: "backpressure".to_string(),
+                                                                    oldest_available_seq: None,
+                                                                })
+                                                                .unwrap_or_default(),
+                                                            };
+                                                            let json = serde_json::to_string(&gap).unwrap_or_default();
+                                                            let _ = push_tx.try_send(Message::Text(json));
+                                                            return;
+                                                        }
+                                                        last_seen = event.seq;
+                                                    }
+                                                    if page_len < 500 {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                        }
+                                    }
+                                    _ = heartbeat.tick() => {
+                                        let hb = WsPushMessage {
+                                            push: "watch_heartbeat".to_string(),
+                                            subscription_id: sub_id_clone.clone(),
+                                            data: serde_json::json!({ "seq": ring.head_seq() }),
+                                        };
+                                        let json = serde_json::to_string(&hb).unwrap_or_default();
+                                        if push_tx.try_send(Message::Text(json)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        watch_task = Some(task);
+                        _active_subscription_id = Some(sub_id);
+                    }
+                    WsRequest::WatchUnsubscribe { id } => {
+                        if let Some(task) = watch_task.take() {
+                            task.abort();
+                        }
+                        _active_subscription_id = None;
+                        let resp = WsResponse::success_empty(&id);
+                        let _ = send_response_tx(&out_tx, &resp).await;
+                    }
                     request => {
                         let permit = request_slots
                             .clone()
@@ -647,6 +918,9 @@ where
 
     if let Some(state) = streaming_write.take() {
         abort_streaming_write(state).await;
+    }
+    if let Some(task) = watch_task.take() {
+        task.abort();
     }
 
     writer.abort();

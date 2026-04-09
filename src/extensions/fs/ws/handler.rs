@@ -189,6 +189,13 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
         WsRequest::BatchWriteAtomic { id, files } => {
             handle_batch_write_atomic(session, id, files).await
         }
+        WsRequest::WatchSubscribe { id, .. } | WsRequest::WatchUnsubscribe { id, .. } => {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eproto,
+                "watch operations must be handled at connection level",
+            )
+        }
     }
 }
 
@@ -2248,12 +2255,18 @@ mod tests {
             let caps = auth_data["capabilities"]
                 .as_array()
                 .expect("capabilities must be an array");
-            assert_eq!(caps.len(), 1);
-            assert_eq!(caps[0], "batch_write_atomic");
+            assert!(
+                caps.contains(&serde_json::json!("watch")),
+                "watch capability must be present"
+            );
+            assert!(
+                caps.contains(&serde_json::json!("batch_write_atomic")),
+                "batch_write_atomic capability must be present"
+            );
         }
 
         #[test]
-        fn auth_response_has_empty_capabilities_on_unsupported_backend() {
+        fn auth_response_has_watch_capability_on_unsupported_backend() {
             let session = mock_session(false);
             let auth_data = session.build_auth_success_data();
 
@@ -2263,10 +2276,12 @@ mod tests {
             let caps = auth_data["capabilities"]
                 .as_array()
                 .expect("capabilities must be an array");
-            assert!(
-                caps.is_empty(),
-                "unsupported backend must have empty capabilities"
+            assert_eq!(
+                caps.len(),
+                1,
+                "unsupported backend should only have watch capability"
             );
+            assert_eq!(caps[0], "watch");
         }
 
         /// Pins the partial-success boundary: one directory subgroup fails

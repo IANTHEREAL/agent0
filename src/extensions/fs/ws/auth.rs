@@ -78,7 +78,7 @@ impl WsSession {
     /// truth for the auth response JSON shape — used by both the WebSocket
     /// handler and contract tests.
     pub(crate) fn build_auth_success_data(&self) -> serde_json::Value {
-        let mut capabilities: Vec<&str> = Vec::new();
+        let mut capabilities: Vec<&str> = vec!["watch"];
         if self.backend.supports_batch_write_atomic() {
             capabilities.push("batch_write_atomic");
         }

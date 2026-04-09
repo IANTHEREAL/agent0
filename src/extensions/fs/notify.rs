@@ -113,11 +113,10 @@ pub const DEFAULT_RING_CAPACITY: usize = 10_000;
 pub const RING_CAPACITY_ENV: &str = "FS9_NOTIFY_RING_CAPACITY";
 
 /// Result of a `query` call, including ring metadata for overflow detection.
-#[cfg(test)]
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct QueryResult {
     /// Ring epoch (process incarnation). Consumer compares against cached epoch.
-    #[allow(dead_code)]
     pub epoch: u64,
     /// Oldest seq still in the ring (0 if empty).
     pub oldest_seq: u64,
@@ -126,7 +125,6 @@ pub struct QueryResult {
     /// Whether this query is in overflow state.
     pub overflow: bool,
     /// Configured ring capacity.
-    #[allow(dead_code)]
     pub capacity: usize,
     /// Matching events (may be empty even when ring is non-empty, due to filters).
     pub events: Vec<FsEvent>,
@@ -141,7 +139,6 @@ pub struct EventRing {
     capacity: usize,
     /// Process incarnation nonce — set once at construction. Consumers use this
     /// to detect process restarts.
-    #[cfg_attr(not(test), allow(dead_code))]
     epoch: u64,
     /// Broadcast sender for wake-up notifications. Sends the latest seq.
     notify_tx: broadcast::Sender<u64>,
@@ -256,25 +253,12 @@ impl EventRing {
     }
 }
 
-#[cfg(test)]
+// -- query / subscribe (production) -----------------------------------------
+
 impl EventRing {
-    /// Returns the configured capacity.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Returns the total number of evicted events.
-    pub fn evicted_count(&self) -> u64 {
-        self.evicted.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Current ring size.
-    pub fn len(&self) -> usize {
-        self.events.read().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Returns the newest seq in the ring (0 if empty).
+    pub fn head_seq(&self) -> u64 {
+        self.events.read().back().map(|e| e.seq).unwrap_or(0)
     }
 
     /// Query events with `seq > since_seq`, optional path prefix filter, and limit.
@@ -331,6 +315,28 @@ impl EventRing {
     /// Subscribe to push notifications.
     pub fn subscribe(&self) -> broadcast::Receiver<u64> {
         self.notify_tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+impl EventRing {
+    /// Returns the configured capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns the total number of evicted events.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current ring size.
+    pub fn len(&self) -> usize {
+        self.events.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -769,6 +775,34 @@ mod tests {
         assert!(result.is_ok());
         let err = PushError::LockPoisoned;
         assert_eq!(format!("{}", err), "EventRing lock poisoned");
+    }
+
+    #[test]
+    fn test_head_seq_empty_ring() {
+        let ring = EventRing::with_epoch(100, 42);
+        assert_eq!(ring.head_seq(), 0);
+    }
+
+    #[test]
+    fn test_head_seq_tracks_latest() {
+        let ring = EventRing::with_epoch(100, 42);
+        ring.push(make_builder(FsEventType::Create, "/a.txt"))
+            .unwrap();
+        assert_eq!(ring.head_seq(), 1);
+        ring.push(make_builder(FsEventType::Write, "/b.txt"))
+            .unwrap();
+        assert_eq!(ring.head_seq(), 2);
+    }
+
+    #[test]
+    fn test_head_seq_survives_eviction() {
+        let ring = EventRing::with_epoch(3, 42);
+        for i in 0..10 {
+            ring.push(make_builder(FsEventType::Write, &format!("/f{}.txt", i)))
+                .unwrap();
+        }
+        assert_eq!(ring.head_seq(), 10);
+        assert_eq!(ring.len(), 3);
     }
 
     #[test]

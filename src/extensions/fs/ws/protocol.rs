@@ -272,6 +272,17 @@ pub(crate) enum WsRequest {
         id: String,
         files: Vec<BatchWriteFileRequest>,
     },
+    #[serde(rename = "watch_subscribe")]
+    WatchSubscribe {
+        id: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since_seq: Option<u64>,
+    },
+    #[serde(rename = "watch_unsubscribe")]
+    WatchUnsubscribe {
+        id: String,
+    },
 }
 
 impl WsRequest {
@@ -302,7 +313,9 @@ impl WsRequest {
             | Self::BatchStat { id, .. }
             | Self::BatchInlineRead { id, .. }
             | Self::BatchWrite { id, .. }
-            | Self::BatchWriteAtomic { id, .. } => id,
+            | Self::BatchWriteAtomic { id, .. }
+            | Self::WatchSubscribe { id, .. }
+            | Self::WatchUnsubscribe { id, .. } => id,
         }
     }
 }
@@ -348,6 +361,52 @@ impl WsResponse {
     pub(crate) fn success_empty(id: &str) -> Self {
         Self::success(id, json!({}))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server-push messages (watch protocol)
+// ---------------------------------------------------------------------------
+
+/// Server-initiated push message. Distinguished from `WsResponse` by the
+/// presence of a `push` field instead of `id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WsPushMessage {
+    /// Push type: "watch_event", "watch_gap", "watch_heartbeat".
+    pub push: String,
+    pub subscription_id: String,
+    #[serde(flatten)]
+    pub data: Value,
+}
+
+/// Response data for a successful `watch_subscribe` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WatchSubscribeResponse {
+    pub subscription_id: String,
+    pub head_seq: u64,
+    pub overflow: bool,
+}
+
+/// Data payload for a `watch_event` push.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WatchEventData {
+    pub seq: u64,
+    pub timestamp: i64,
+    pub event_type: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub inode: u64,
+    pub generation: u64,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Data payload for a `watch_gap` push.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WatchGapData {
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_available_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1215,5 +1274,113 @@ mod tests {
         assert_eq!(dst.file_type, "symlink");
         assert_eq!(dst.size, 15);
         assert_eq!(dst.generation, 1);
+    }
+
+    #[test]
+    fn test_request_deserialize_watch_subscribe() {
+        let payload = r#"{"id":"w1","op":"watch_subscribe","path":"/data","since_seq":42}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("watch_subscribe request should parse");
+        match req {
+            WsRequest::WatchSubscribe {
+                id,
+                path,
+                since_seq,
+            } => {
+                assert_eq!(id, "w1");
+                assert_eq!(path, "/data");
+                assert_eq!(since_seq, Some(42));
+            }
+            _ => panic!("expected watch_subscribe request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_watch_subscribe_no_since() {
+        let payload = r#"{"id":"w2","op":"watch_subscribe","path":"/"}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("watch_subscribe request should parse");
+        match req {
+            WsRequest::WatchSubscribe {
+                id,
+                path,
+                since_seq,
+            } => {
+                assert_eq!(id, "w2");
+                assert_eq!(path, "/");
+                assert_eq!(since_seq, None);
+            }
+            _ => panic!("expected watch_subscribe request"),
+        }
+    }
+
+    #[test]
+    fn test_request_deserialize_watch_unsubscribe() {
+        let payload = r#"{"id":"w3","op":"watch_unsubscribe"}"#;
+        let req: WsRequest =
+            serde_json::from_str(payload).expect("watch_unsubscribe request should parse");
+        match req {
+            WsRequest::WatchUnsubscribe { id } => {
+                assert_eq!(id, "w3");
+            }
+            _ => panic!("expected watch_unsubscribe request"),
+        }
+    }
+
+    #[test]
+    fn test_watch_subscribe_response_serialization() {
+        let resp = WatchSubscribeResponse {
+            subscription_id: "sub-abc".to_string(),
+            head_seq: 42,
+            overflow: false,
+        };
+        let json: Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["subscription_id"], "sub-abc");
+        assert_eq!(json["head_seq"], 42);
+        assert_eq!(json["overflow"], false);
+    }
+
+    #[test]
+    fn test_push_message_serialization() {
+        let push = WsPushMessage {
+            push: "watch_event".to_string(),
+            subscription_id: "sub-abc".to_string(),
+            data: json!({"seq": 43, "event_type": "CREATE", "path": "/foo.txt"}),
+        };
+        let json: Value = serde_json::to_value(&push).unwrap();
+        assert_eq!(json["push"], "watch_event");
+        assert_eq!(json["subscription_id"], "sub-abc");
+        assert_eq!(json["seq"], 43);
+        assert_eq!(json["event_type"], "CREATE");
+        assert_eq!(json["path"], "/foo.txt");
+    }
+
+    #[test]
+    fn test_watch_gap_data_serialization() {
+        let gap = WatchGapData {
+            reason: "overflow".to_string(),
+            oldest_available_seq: Some(100),
+        };
+        let json: Value = serde_json::to_value(&gap).unwrap();
+        assert_eq!(json["reason"], "overflow");
+        assert_eq!(json["oldest_available_seq"], 100);
+    }
+
+    #[test]
+    fn test_push_message_has_no_id_field() {
+        let push = WsPushMessage {
+            push: "watch_heartbeat".to_string(),
+            subscription_id: "sub-abc".to_string(),
+            data: json!({"seq": 42}),
+        };
+        let json: Value = serde_json::to_value(&push).unwrap();
+        assert!(
+            json.get("id").is_none(),
+            "push messages must not have an id field"
+        );
+        assert!(
+            json.get("push").is_some(),
+            "push messages must have a push field"
+        );
     }
 }
