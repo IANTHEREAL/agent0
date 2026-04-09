@@ -2,8 +2,8 @@
 
 **Status**: Draft  
 **Author**: AI Assistant  
-**Date**: 2026-04-06  
-**Scope**: Next-step development plan for performance optimization milestones `M0` to `M7`
+**Date**: 2026-04-09  
+**Scope**: Next-step development plan for performance optimization milestones `M0` to `M8`
 
 > **Draft / non-SoT note**
 >
@@ -23,14 +23,15 @@
 
 ## Serial Execution Order
 
-1. `M0` Baseline, observability, protocol and rollback contract
-2. `M1` End-to-end streaming execution
-3. `M2` Covering or index-only scan plus late materialization
-4. `M3` Ordered execution path, real TopN, and broader operator pushdown
-5. `M4` Real StreamAggregate
-6. `M5` Shared and generic plan cache
-7. `M6` Parallel and distributed execution
-8. `M7` Spill-to-disk and external execution
+1. `M0` Builtin/function and operator pushdown wave, batch 1 in progress and batch 2 pending
+2. `M1` Baseline, observability, protocol and rollback contract
+3. `M2` End-to-end streaming execution
+4. `M3` Covering or index-only scan plus late materialization
+5. `M4` Ordered execution path, real TopN, and broader operator pushdown
+6. `M5` Real StreamAggregate
+7. `M6` Shared and generic plan cache
+8. `M7` Parallel and distributed execution
+9. `M8` Spill-to-disk and external execution
 
 ## Hard Rules
 
@@ -53,7 +54,8 @@
 - Any optimization-introduced parameter, flag, GUC, environment variable, DDL option, or `cloud-storage-engine` runtime knob must be documented in `docs/performance-optimization-parameters.md` in the same milestone.
 - If the new parameter is an operator-facing runtime input for `db9-server`, the same change must also update `docs/sot/ops-config.md` as the authoritative registry.
 - Every optimization milestone must prove compatibility with all functions, expressions, and operators that are already supported for DB9 Cop pushdown. The baseline user-facing reference is `docs/sql/functions/list-of-expressions-for-pushdown.md`, and the planner or runtime implementation remains the final source of truth for what is supported.
-- Every optimization milestone from `M1` to `M7` must include at least one real scenario benchmark gate against local PostgreSQL 18.3.
+- Baseline milestone `M1` defines the benchmark harness and observability baseline rather than shipping a standalone optimization feature.
+- Every feature milestone `M0` and `M2` to `M8` must include at least one real scenario benchmark gate against local PostgreSQL 18.3.
 - A milestone is not done until both `Architect-*` and `CI-*` backlogs are closed.
 
 ## Common Exit Gate For Every Milestone
@@ -91,35 +93,37 @@
 - TiDB or TiKV non-regression evidence for any `cloud-storage-engine` change
 - Final go or no-go recommendation for enabling by default
 
-## M1-M3 Optimization Objectives
+## M2-M4 Optimization Objectives
 
-- `M1` must make streaming execution deliver real early-stop behavior. Once `LIMIT` is satisfied or the client stops consuming, `db9-server` and `cloud-storage-engine` should stop producing more rows as early as correctness allows.
-- `M2` and `M3` must use composite indexes to serve filtering and preserve `ORDER BY` order at the same time whenever possible, so eligible queries avoid an explicit `Sort` operator.
-- `M3` must make `ORDER BY ... LIMIT n OFFSET m` exploit ordered input for early stop. The target is to stop after `offset + limit` qualifying index entries, and to defer base-row fetch so that fetched full rows are as close to `limit` as possible.
-- The common optimization purpose across `M1` to `M3` is to reduce the payload size between `db9-server` and `cloud-storage-engine`, reduce KV request count, reduce full-row decoding, and reduce unnecessary memory materialization.
+- `M2` must make streaming execution deliver real early-stop behavior. Once `LIMIT` is satisfied or the client stops consuming, `db9-server` and `cloud-storage-engine` should stop producing more rows as early as correctness allows.
+- `M3` and `M4` must use composite indexes to serve filtering and preserve `ORDER BY` order at the same time whenever possible, so eligible queries avoid an explicit `Sort` operator.
+- `M4` must make `ORDER BY ... LIMIT n OFFSET m` exploit ordered input for early stop. The target is to stop after `offset + limit` qualifying index entries, and to defer base-row fetch so that fetched full rows are as close to `limit` as possible.
+- The common optimization purpose across `M2` to `M4` is to reduce the payload size between `db9-server` and `cloud-storage-engine`, reduce KV request count, reduce full-row decoding, and reduce unnecessary memory materialization.
 
 ## PostgreSQL Compatibility Work By Milestone
 
-- `M1 Streaming Execution`: compatibility work is required at the pgwire and executor boundary. Streaming must preserve PostgreSQL-visible row order, portal suspension behavior, cancel behavior, statement timeout behavior, and final command completion sequencing. No new PostgreSQL-style tuning parameter is required by default; this milestone is mainly about preserving PostgreSQL protocol and visible execution semantics while changing internals.
-- `M2 Late Materialization And Index-Only`: compatibility work is required if covering-index capability extends DDL or planner behavior. If db9 adds stored payload columns for covering indexes, it should prefer PostgreSQL-compatible `CREATE INDEX ... INCLUDE (...)` syntax instead of inventing a DB9-only index-payload syntax. Any index-only or late-fetch path must preserve PostgreSQL-visible MVCC and row-visibility semantics even if the internal storage strategy differs from PostgreSQL heap plus visibility map.
-- `M3 Ordered Path And TopN`: compatibility work is required for `ORDER BY`, `LIMIT`, and `OFFSET` semantics. Ordered execution must preserve PostgreSQL behavior for `ASC/DESC`, `NULLS FIRST/LAST`, collation-sensitive order, and the rule that `LIMIT/OFFSET` without `ORDER BY` does not guarantee deterministic row order. If planner debug controls are introduced for ordered-path testing, prefer PostgreSQL-style names and semantics such as `enable_sort` or related planner toggles before inventing DB9-only controls.
-- `M4 StreamAggregate`: compatibility work is required for aggregate semantics, especially `GROUP BY`, `DISTINCT`, null handling, and finalization behavior. Internal stream aggregation is allowed to differ physically, but visible results must match PostgreSQL. If any planner-path debugging control is added, prefer PostgreSQL-compatible behavior modeled after existing planner toggles such as `enable_hashagg`.
-- `M5 Shared Plan Cache`: compatibility work is mandatory. Reuse PostgreSQL-compatible `plan_cache_mode=auto|force_custom_plan|force_generic_plan` semantics for generic-versus-custom control. Keep `db9.shared_plan_cache_max_bytes` as a clearly DB9-specific resource-governance parameter rather than a PostgreSQL compatibility surface.
-- `M6 Parallel And Distributed Execution`: compatibility work is required if user-visible parallel controls or observability are added. Prefer PostgreSQL-compatible controls and vocabulary where applicable, such as `max_parallel_workers_per_gather`, `parallel_setup_cost`, and `parallel_tuple_cost`, for local parallel planning behavior. Any DB9-specific distributed controls must use `db9.`-prefixed names. Result ordering must remain PostgreSQL-compatible, meaning unordered parallel paths still provide no order guarantee unless an explicit `ORDER BY` is present.
-- `M7 Spill And External Execution`: compatibility work is required for memory and temp-file governance. Prefer PostgreSQL-compatible semantics and naming around `work_mem`, `hash_mem_multiplier`, and `temp_file_limit` where the behavior is analogous, and only add DB9-specific parameters when PostgreSQL has no matching control surface. Spill must not change visible SQL results; it only changes resource usage and execution strategy.
+- `M0 Builtin/Function And Operator Pushdown`: compatibility work is mandatory. Pushdown must preserve PostgreSQL-visible function semantics, SQLSTATE surfaces, null handling, type coercion outcomes, and operator behavior. Only provably safe signatures and operator forms may be pushed, and unsupported forms must stay local.
+- `M1 Baseline, Observability, Protocol, And Rollback Contract`: compatibility work is mostly meta and observability-focused. This milestone should not introduce new user-visible SQL behavior; it defines the contract and measurement baseline for later feature milestones.
+- `M2 Streaming Execution`: compatibility work is required at the pgwire and executor boundary. Streaming must preserve PostgreSQL-visible row order, portal suspension behavior, cancel behavior, statement timeout behavior, and final command completion sequencing. No new PostgreSQL-style tuning parameter is required by default; this milestone is mainly about preserving PostgreSQL protocol and visible execution semantics while changing internals.
+- `M3 Late Materialization And Index-Only`: compatibility work is required if covering-index capability extends DDL or planner behavior. If db9 adds stored payload columns for covering indexes, it should prefer PostgreSQL-compatible `CREATE INDEX ... INCLUDE (...)` syntax instead of inventing a DB9-only index-payload syntax. Any index-only or late-fetch path must preserve PostgreSQL-visible MVCC and row-visibility semantics even if the internal storage strategy differs from PostgreSQL heap plus visibility map.
+- `M4 Ordered Path And TopN`: compatibility work is required for `ORDER BY`, `LIMIT`, and `OFFSET` semantics. Ordered execution must preserve PostgreSQL behavior for `ASC/DESC`, `NULLS FIRST/LAST`, collation-sensitive order, and the rule that `LIMIT/OFFSET` without `ORDER BY` does not guarantee deterministic row order. If planner debug controls are introduced for ordered-path testing, prefer PostgreSQL-style names and semantics such as `enable_sort` or related planner toggles before inventing DB9-only controls.
+- `M5 StreamAggregate`: compatibility work is required for aggregate semantics, especially `GROUP BY`, `DISTINCT`, null handling, and finalization behavior. Internal stream aggregation is allowed to differ physically, but visible results must match PostgreSQL. If any planner-path debugging control is added, prefer PostgreSQL-compatible behavior modeled after existing planner toggles such as `enable_hashagg`.
+- `M6 Shared Plan Cache`: compatibility work is mandatory. Reuse PostgreSQL-compatible `plan_cache_mode=auto|force_custom_plan|force_generic_plan` semantics for generic-versus-custom control. Keep `db9.shared_plan_cache_max_bytes` as a clearly DB9-specific resource-governance parameter rather than a PostgreSQL compatibility surface.
+- `M7 Parallel And Distributed Execution`: compatibility work is required if user-visible parallel controls or observability are added. Prefer PostgreSQL-compatible controls and vocabulary where applicable, such as `max_parallel_workers_per_gather`, `parallel_setup_cost`, and `parallel_tuple_cost`, for local parallel planning behavior. Any DB9-specific distributed controls must use `db9.`-prefixed names. Result ordering must remain PostgreSQL-compatible, meaning unordered parallel paths still provide no order guarantee unless an explicit `ORDER BY` is present.
+- `M8 Spill And External Execution`: compatibility work is required for memory and temp-file governance. Prefer PostgreSQL-compatible semantics and naming around `work_mem`, `hash_mem_multiplier`, and `temp_file_limit` where the behavior is analogous, and only add DB9-specific parameters when PostgreSQL has no matching control surface. Spill must not change visible SQL results; it only changes resource usage and execution strategy.
 
 ## Composite Index Strategy For db9-server
 
-- For `M2` and `M3`, `db9-server` should adopt TiDB-style composite-index planning where the index column order is chosen to satisfy both filtering and ordering, not just one of them.
+- For `M3` and `M4`, `db9-server` should adopt TiDB-style composite-index planning where the index column order is chosen to satisfy both filtering and ordering, not just one of them.
 - Default composite-index priority for eligible queries should be: equality predicates, then `ORDER BY` columns, then range or multi-value predicates, then covering columns if index-only or late-materialization gains justify them.
 - Planner must model left-prefix behavior explicitly. A composite index only preserves order for downstream `ORDER BY` if the leading columns are fixed in a way that does not break ordered traversal.
 - Single-value equality predicates such as `=` and safe `IS NULL` checks may preserve ordered traversal for later sort keys. Multi-value `IN`, non-prefix ordering, incompatible mixed sort directions, unsupported collation rules, or earlier range predicates must not be labeled as order-preserving unless the implementation can prove correctness.
 - When an eligible composite index can satisfy filter plus order, planner should prefer `ordered index scan -> optional offset skip -> limit/topn -> late fetch`, instead of `index scan -> full row fetch -> sort -> limit`.
-- The practical evaluation criteria for `M2` and `M3` are not only latency. They must also show fewer KV requests, fewer bytes moved between `cloud-storage-engine` and `db9-server`, fewer decoded rows, and less sort memory.
+- The practical evaluation criteria for `M3` and `M4` are not only latency. They must also show fewer KV requests, fewer bytes moved between `cloud-storage-engine` and `db9-server`, fewer decoded rows, and less sort memory.
 
 ## Real Scenario Benchmark Gate
 
-- `M1` to `M7` cannot close without at least one real scenario benchmark that matches a realistic application query shape.
+- Feature milestones `M0` and `M2` to `M8` cannot close without at least one real scenario benchmark that matches a realistic application query shape.
 - Default minimum dataset size is `100k` rows. If the feature is expected to help medium or large scans, sorts, aggregates, joins, or distributed work, the preferred dataset is `1M+` rows.
 - The same benchmark harness must run three variants: `db9 before change`, `db9 after change`, and local `PostgreSQL 18.3`.
 - All three variants must use the same schema, logically equivalent indexes, same data distribution, same query text or equivalent prepared statement shape, same client driver or harness, and documented server settings.
@@ -133,7 +137,7 @@
 Use the following card structure for every assigned task:
 
 - `Owner`: `Architect-*` or `CI-*`
-- `Milestone`: one of `M0` to `M7`
+- `Milestone`: one of `M0` to `M8`
 - `Objective`: one sentence
 - `Repos`: `db9-server`, `cloud-storage-engine`, `proto`, or specific subset
 - `Inputs`: required documents, files, and existing constraints
@@ -149,7 +153,72 @@ Use the following card structure for every assigned task:
 
 ## M0 Backlog
 
-### Architect-00-Baseline-And-Contract
+### Architect-00-Builtin-Function-And-Operator-Pushdown
+
+- `Objective`: complete the ongoing first wave of builtin/function and operator pushdown as the currently active optimization project, while preserving semantic safety and keeping `cloud-storage-engine` changes minimal.
+- `Repos`: `db9-server`, `cloud-storage-engine`
+- `Inputs`: first-batch PRs already in progress:
+- upstream merged protocol prerequisites:
+- `kvproto` PR: [pingcap/kvproto#1439](https://github.com/pingcap/kvproto/pull/1439)
+- `kvproto` PR: [pingcap/kvproto#1444](https://github.com/pingcap/kvproto/pull/1444)
+- `cloud-storage-engine` PR: [tidbcloud/cloud-storage-engine#4876](https://github.com/tidbcloud/cloud-storage-engine/pull/4876)
+- `db9-server` PR: [db9-ai/db9-server#2374](https://github.com/db9-ai/db9-server/pull/2374)
+- second-batch PRs are expected after this first wave and should be linked here once opened
+- `Implementation or Test Backlog`:
+- finish the first-batch builtin/function pushdown and operator pushdown scope already under review
+- keep pushdown eligibility signature-specific and operator-form-specific; unsupported cases must remain local
+- preserve PostgreSQL-visible semantics, SQLSTATE surfaces, null handling, coercion behavior, and transaction visibility
+- keep `cloud-storage-engine` changes scoped to the DB9 extension path and do not broaden TiDB/TiKV interfaces
+- update `docs/sql/functions/list-of-expressions-for-pushdown.md` and this execution plan as the supported surface changes
+- define at least one `100k+` row real scenario benchmark for the newly pushed function or operator shapes and compare `db9 before`, `db9 after`, and local `PostgreSQL 18.3`
+- record the second-batch PR links and scope boundaries once they are opened
+- `Deliverables`:
+- merged first-batch pushdown PRs
+- recorded upstream merged `kvproto` prerequisites and the exact protocol dependency they unlock
+- updated pushdown support documentation
+- compatibility and regression evidence for newly pushed functions/operators
+- placeholder section for second-batch PR links and scope
+- `Positive Acceptance`:
+- newly supported functions/operators are pushed only when the planner/runtime can prove semantic safety
+- `EXPLAIN` and regression tests show pushdown on eligible cases and local execution on ineligible cases
+- the wave reduces payload bytes or KV requests on target query shapes without changing visible SQL results
+- `Negative Acceptance`:
+- unsupported signatures or operator forms must not be silently pushed
+- any semantic drift versus PostgreSQL, wrong SQLSTATE surface, or visibility regression fails the milestone
+- `cloud-storage-engine` changes that widen TiDB/TiKV behavior outside DB9 scope fail the milestone
+- `Exit Evidence`:
+- linked PRs for batch 1
+- linked upstream merged `kvproto` prerequisites and the consumed revision or dependency bump
+- updated pushdown whitelist/support report
+- PostgreSQL oracle evidence and pushdown compatibility regression report
+- real scenario benchmark report on `100k+` rows with `db9 before`, `db9 after`, and local `PostgreSQL 18.3`, including payload bytes or KV-request reduction on at least one target query shape
+
+### CI-00-Builtin-Function-And-Operator-Pushdown
+
+- `Objective`: validate the ongoing first wave of builtin/function and operator pushdown against semantic correctness, already-supported pushdown compatibility, and scoped DB9 Cop behavior.
+- `Repos`: `db9-server`, `cloud-storage-engine`
+- `Implementation or Test Backlog`:
+- add or extend oracle-driven SQL cases for the new pushed builtin/functions and operators
+- extend pushdown compatibility regression to cover new signatures and operator combinations introduced by batch 1
+- verify unsupported forms still remain local and produce PostgreSQL-compatible results and errors
+- verify `EXPLAIN` evidence for pushed versus local forms
+- verify `cloud-storage-engine` endpoint behavior remains DB9-scoped and does not alter TiDB/TiKV paths
+- add the real scenario benchmark gate for the pushed function or operator shapes on `100k+` rows, using the same harness against local `PostgreSQL 18.3`
+- reserve a follow-up slot in the compatibility matrix for batch-2 PRs once they are opened
+- `Positive Acceptance`:
+- newly pushed functions/operators behave the same as local execution and PostgreSQL on supported cases
+- unsupported cases stay local with correct behavior
+- `Negative Acceptance`:
+- false-positive pushdown, result drift, wrong errors, or TiDB/TiKV surface regression fail the milestone
+- `Exit Evidence`:
+- pushdown compatibility matrix update
+- oracle regression results for newly pushed signatures/operators
+- CSE non-regression evidence for DB9-scoped changes
+- real scenario benchmark report with elapsed time, p95, payload bytes, and KV requests for `db9 before`, `db9 after`, and local `PostgreSQL 18.3`
+
+## M1 Backlog
+
+### Architect-01-Baseline-And-Contract
 
 - `Objective`: freeze the execution contract and create the measurement baseline for all later milestones.
 - `Repos`: `db9-server`, `cloud-storage-engine`, `proto`
@@ -177,7 +246,7 @@ Use the following card structure for every assigned task:
 - metrics names and sample output
 - compatibility matrix note
 
-### CI-00-Baseline-And-Gates
+### CI-01-Baseline-And-Gates
 
 - `Objective`: establish the fixed gate set that every later milestone must pass.
 - `Repos`: `db9-server`, `cloud-storage-engine`
@@ -202,9 +271,9 @@ Use the following card structure for every assigned task:
 - `Exit Evidence`:
 - gate matrix and command inventory
 
-## M1 Backlog
+## M2 Backlog
 
-### Architect-01-Streaming-Execution
+### Architect-02-Streaming-Execution
 
 - `Objective`: remove forced `Vec<Row>` boundaries from the main scan and result path so `LIMIT` and client stop can trigger real early-stop behavior.
 - `Repos`: `db9-server`, `cloud-storage-engine`, `proto`
@@ -237,7 +306,7 @@ Use the following card structure for every assigned task:
 - streaming smoke trace for local and remote paths
 - real scenario benchmark on an `events`-like table with at least `1M` rows comparing `db9 before`, `db9 after`, and local `PostgreSQL 18.3`, including rows scanned before stop, payload bytes, and KV request count
 
-### CI-01-Streaming-Execution
+### CI-02-Streaming-Execution
 
 - `Objective`: validate correctness, bounded memory, compatibility, and real early-stop behavior of the streaming path.
 - `Repos`: `db9-server`, `cloud-storage-engine`
@@ -264,9 +333,9 @@ Use the following card structure for every assigned task:
 - perf table for small, medium, and large scans
 - real scenario report with first-row latency, total latency, peak RSS, rows scanned before stop, payload bytes, and KV requests
 
-## M2 Backlog
+## M3 Backlog
 
-### Architect-02-Late-Materialization-And-Index-Only
+### Architect-03-Late-Materialization-And-Index-Only
 
 - `Objective`: avoid unnecessary base-row fetch and full-row deserialization on index-driven queries, and make composite indexes serve filtering plus ordered traversal whenever possible.
 - `Repos`: `db9-server`, `cloud-storage-engine`, `proto`
@@ -298,7 +367,7 @@ Use the following card structure for every assigned task:
 - `EXPLAIN` examples for eligible and ineligible cases
 - real scenario benchmark on a `users/orders`-style table with at least `100k` rows and wide payload columns, using a composite index such as `(tenant_id, status, created_at, id)` to compare indexed lookup latency, row-fetch reduction, payload bytes, and KV requests against local `PostgreSQL 18.3`
 
-### CI-02-Late-Materialization-And-Index-Only
+### CI-03-Late-Materialization-And-Index-Only
 
 - `Objective`: prove that the new access path is correct under selective, non-selective, and edge-case workloads, including composite-index filter-plus-order cases.
 - `Repos`: `db9-server`, `cloud-storage-engine`
@@ -322,17 +391,17 @@ Use the following card structure for every assigned task:
 - perf comparison for index query corpus
 - real scenario report with row-fetch count, decoded rows, elapsed time, p95, payload bytes, and KV requests
 
-## M3 Backlog
+## M4 Backlog
 
-### Architect-03-Ordered-Path-And-TopN
+### Architect-04-Ordered-Path-And-TopN
 
 - `Objective`: turn `ORDER BY ... LIMIT` and `ORDER BY ... LIMIT ... OFFSET ...` from full sort into ordered execution and real TopN, with early-stop on ordered input.
 - `Repos`: `db9-server`, `cloud-storage-engine`, `proto`
-- `Inputs`: planner produces `TopNSort` but builder degrades to `Sort + Limit`; sort still materializes all rows; M2 should already provide composite-index ordered-scan eligibility that M3 must reuse
+- `Inputs`: planner produces `TopNSort` but builder degrades to `Sort + Limit`; sort still materializes all rows; M3 should already provide composite-index ordered-scan eligibility that M4 must reuse
 - `Implementation or Test Backlog`:
 - PR1: implement real heap-based `TopNOperator`
 - PR2: add order-preserving scan property for eligible B-tree scans
-- PR3: propagate ordering property through planner and builder, reusing composite-index rules from `M2`
+- PR3: propagate ordering property through planner and builder, reusing composite-index rules from `M3`
 - PR4: extend operator pushdown to `Filter`, `Project`, `Limit`, and `TopN` where semantics are provably safe
 - PR5: implement ordered `OFFSET + LIMIT` behavior so scanning stops after `offset + limit` qualifying index entries, and defer full-row fetch until after skip whenever possible
 - PR6: enable remote ordered path only for safe request shapes and negotiated capability, and only after proving the milestone target cannot be met well enough with a `db9-server`-only ordered path
@@ -355,7 +424,7 @@ Use the following card structure for every assigned task:
 - perf table for `ORDER BY ... LIMIT`
 - real scenario benchmark on a time-ordered feed table with at least `1M` rows comparing full sort versus ordered path and local `PostgreSQL 18.3`, including `ORDER BY ... LIMIT` and `ORDER BY ... LIMIT ... OFFSET ...` cases with payload bytes and KV requests
 
-### CI-03-Ordered-Path-And-TopN
+### CI-04-Ordered-Path-And-TopN
 
 - `Objective`: validate ordering correctness, pushdown safety, and TopN or ordered-offset performance wins.
 - `Repos`: `db9-server`, `cloud-storage-engine`
@@ -380,9 +449,9 @@ Use the following card structure for every assigned task:
 - TopN benchmark evidence
 - real scenario report with sort bytes, p95 latency, first-row latency if applicable, payload bytes, and KV requests
 
-## M4 Backlog
+## M5 Backlog
 
-### Architect-04-StreamAggregate
+### Architect-05-StreamAggregate
 
 - `Objective`: implement real stream aggregation on ordered input and remove the current fallback to hash aggregate.
 - `Repos`: `db9-server`, optional `cloud-storage-engine` follow-up if aggregate protocol needs extension
@@ -408,7 +477,7 @@ Use the following card structure for every assigned task:
 - `EXPLAIN` plan samples
 - real scenario benchmark on an ordered fact table with at least `1M` rows comparing hash aggregate versus stream aggregate and local `PostgreSQL 18.3`
 
-### CI-04-StreamAggregate
+### CI-05-StreamAggregate
 
 - `Objective`: validate semantic equivalence and streaming-memory behavior of stream aggregation.
 - `Repos`: `db9-server`
@@ -428,9 +497,9 @@ Use the following card structure for every assigned task:
 - memory profile comparison
 - real scenario report with peak memory, elapsed time, and group throughput
 
-## M5 Backlog
+## M6 Backlog
 
-### Architect-05-Shared-Plan-Cache
+### Architect-06-Shared-Plan-Cache
 
 - `Objective`: add broader reusable plan caching beyond the current session-local prepared cache.
 - `Repos`: `db9-server`
@@ -467,7 +536,7 @@ Use the following card structure for every assigned task:
 - compatibility note showing how `db9-server` maps its behavior to PostgreSQL generic/custom plan strategy
 - real scenario benchmark on a short-connection ORM-style workload with at least `10k` repeated parameterized queries, including local `PostgreSQL 18.3` reference numbers
 
-### CI-05-Shared-Plan-Cache
+### CI-06-Shared-Plan-Cache
 
 - `Objective`: validate plan reuse safety and real-world ORM wins.
 - `Repos`: `db9-server`
@@ -492,9 +561,9 @@ Use the following card structure for every assigned task:
 - eviction evidence and parameter-sensitive query compatibility report
 - real scenario report with p50, p95, planning CPU, and cache hit ratio
 
-## M6 Backlog
+## M7 Backlog
 
-### Architect-06-Parallel-And-Distributed
+### Architect-07-Parallel-And-Distributed
 
 - `Objective`: add controlled parallel execution only after the single-threaded pipeline is clean.
 - `Repos`: `db9-server`, `cloud-storage-engine`, `proto`
@@ -518,7 +587,7 @@ Use the following card structure for every assigned task:
 - task-level metrics report
 - real scenario benchmark on a large analytics query over at least `1M` rows, comparing single-worker db9, parallel db9, and local `PostgreSQL 18.3`
 
-### CI-06-Parallel-And-Distributed
+### CI-07-Parallel-And-Distributed
 
 - `Objective`: validate correctness under concurrency and prove that speedup is real rather than noisy.
 - `Repos`: `db9-server`, `cloud-storage-engine`
@@ -538,9 +607,9 @@ Use the following card structure for every assigned task:
 - parallel speedup curves
 - real scenario report with scale-up efficiency, p95 latency, and resource usage
 
-## M7 Backlog
+## M8 Backlog
 
-### Architect-07-Spill-And-External-Execution
+### Architect-08-Spill-And-External-Execution
 
 - `Objective`: make large sort, join, and aggregate workloads survive bounded memory.
 - `Repos`: `db9-server`, optional `cloud-storage-engine` if remote spill coordination is introduced
@@ -565,7 +634,7 @@ Use the following card structure for every assigned task:
 - spill failure-mode report
 - real scenario benchmark on a sort, join, or aggregate workload over at least `1M` rows under tight memory limits, compared with local `PostgreSQL 18.3`
 
-### CI-07-Spill-And-External-Execution
+### CI-08-Spill-And-External-Execution
 
 - `Objective`: validate correctness and robustness of spill paths under real failure modes.
 - `Repos`: `db9-server`
