@@ -2,6 +2,7 @@
 
 use std::iter::Iterator;
 
+use crate::proto::coprocessor;
 use crate::proto::kvrpcpb;
 use crate::proto::pdpb::Timestamp;
 /// This module provides constructor functions for requests which take arguments as high-level
@@ -20,6 +21,14 @@ use crate::BoundRange;
 /// types (i.e., the types from the client crate) and converts these to the types used in the
 /// generated protobuf code, then calls the low-level ctor functions in the requests module.
 use crate::Key;
+
+fn into_coprocessor_key_range(range: BoundRange) -> coprocessor::KeyRange {
+    let (start, end) = range.into_keys();
+    coprocessor::KeyRange {
+        start: start.into(),
+        end: end.unwrap_or_default().into(),
+    }
+}
 
 pub fn new_get_request(key: Key, timestamp: Timestamp) -> kvrpcpb::GetRequest {
     requests::new_get_request(key.into(), timestamp.version())
@@ -47,6 +56,20 @@ pub fn new_scan_request(
         limit,
         key_only,
         reverse,
+    )
+}
+
+pub fn new_coprocessor_request(
+    tp: i64,
+    data: Vec<u8>,
+    ranges: impl Iterator<Item = BoundRange>,
+    start_ts: Timestamp,
+) -> coprocessor::Request {
+    requests::new_coprocessor_request(
+        tp,
+        data,
+        start_ts.version(),
+        ranges.map(into_coprocessor_key_range).collect(),
     )
 }
 

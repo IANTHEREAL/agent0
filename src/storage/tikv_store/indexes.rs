@@ -4,6 +4,8 @@ use crate::storage::backpressure::tikv_op;
 use crate::txn::configured_key_size_limit;
 
 const INDEX_SENTINEL_VALUE: &[u8] = &[0x01];
+const INDEX_SCAN_BATCH_SIZE: u32 = 1024;
+const SCAN_VISIBLE_PREFIX_TRIMS: [usize; 2] = [2, 4];
 
 /// Check an encoded index key against TiKV's `max-key-size` limit and return
 /// an actionable `IndexKeyTooLarge` error when it exceeds the threshold.
@@ -48,6 +50,129 @@ pub(crate) struct BatchIndexEntry {
 }
 
 impl TikvStore {
+    fn index_scan_page_limit(limit: Option<usize>) -> u32 {
+        match limit {
+            Some(0) => 0,
+            Some(n) => scan_limit_to_u32(Some(n)).min(INDEX_SCAN_BATCH_SIZE),
+            None => INDEX_SCAN_BATCH_SIZE,
+        }
+    }
+
+    fn canonicalize_scan_cursor_key(
+        canonical_prefix: &[u8],
+        scanned_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        if scanned_key.starts_with(canonical_prefix) {
+            return Ok(scanned_key.to_vec());
+        }
+
+        for trimmed in SCAN_VISIBLE_PREFIX_TRIMS {
+            if canonical_prefix.len() <= trimmed {
+                continue;
+            }
+            let scan_visible_prefix = &canonical_prefix[trimmed..];
+            if scanned_key.starts_with(scan_visible_prefix) {
+                let mut canonical_key = canonical_prefix[..trimmed].to_vec();
+                canonical_key.extend_from_slice(scanned_key);
+                return Ok(canonical_key);
+            }
+        }
+
+        Err(anyhow!(
+            "scan returned key with unexpected cursor prefix: canonical_prefix={} scanned_key={}",
+            hex::encode(canonical_prefix),
+            hex::encode(scanned_key),
+        ))
+    }
+
+    fn next_scan_page_start(canonical_prefix: &[u8], scanned_key: &[u8]) -> Result<Vec<u8>> {
+        let mut next_start = Self::canonicalize_scan_cursor_key(canonical_prefix, scanned_key)?;
+        next_start.push(0x00);
+        Ok(next_start)
+    }
+
+    async fn scan_range_in_pages<F>(
+        &self,
+        txn: &mut Transaction,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+        canonical_prefix: &[u8],
+        limit: Option<usize>,
+        mut visit_pair: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        let mut next_start = start_key;
+        let mut scanned_pairs = 0usize;
+
+        loop {
+            let remaining = limit.map(|max| max.saturating_sub(scanned_pairs));
+            let page_limit = Self::index_scan_page_limit(remaining);
+            if page_limit == 0 {
+                break;
+            }
+
+            let range: BoundRange = (next_start.clone()..end_key.clone()).into();
+            let mut pairs = tikv_op!(txn.scan(range, page_limit).await)
+                .map_err(|e| anyhow!(e))?
+                .peekable();
+            if pairs.peek().is_none() {
+                break;
+            }
+
+            let mut page_len = 0usize;
+            let mut last_key: Option<Vec<u8>> = None;
+            for pair in pairs {
+                page_len += 1;
+                let full_key: &[u8] = pair.key().as_ref().into();
+                let value: &[u8] = pair.value().as_ref();
+                last_key = Some(full_key.to_vec());
+                visit_pair(full_key, value)?;
+                scanned_pairs += 1;
+            }
+
+            if page_len < page_limit as usize {
+                break;
+            }
+
+            let Some(last_key) = last_key else {
+                break;
+            };
+            next_start = Self::next_scan_page_start(canonical_prefix, &last_key)?;
+        }
+
+        Ok(scanned_pairs)
+    }
+
+    fn scan_visible_prefix_len(expected_prefix: &[u8], scanned_key: &[u8]) -> Result<usize> {
+        if scanned_key.starts_with(expected_prefix) {
+            return Ok(expected_prefix.len());
+        }
+
+        // `txn.scan()` can surface canonical DB9 index keys in two truncated
+        // shapes:
+        // - without the leading `d_` database marker
+        // - with the known 4-byte scan truncation applied
+        // Accept only those known trims instead of brute-forcing arbitrary
+        // suffix matches.
+        for trimmed in SCAN_VISIBLE_PREFIX_TRIMS {
+            if expected_prefix.len() <= trimmed {
+                continue;
+            }
+            let scan_visible_prefix = &expected_prefix[trimmed..];
+            if scanned_key.starts_with(scan_visible_prefix) {
+                return Ok(scan_visible_prefix.len());
+            }
+        }
+
+        Err(anyhow!(
+            "scan returned key with unexpected prefix: expected_prefix={} scanned_key={}",
+            hex::encode(expected_prefix),
+            hex::encode(scanned_key),
+        ))
+    }
+
     fn build_batch_unique_violation(entry: &BatchIndexEntry) -> SqlError {
         let vals: Vec<String> = entry.idx_values.iter().map(|v| format!("{}", v)).collect();
         SqlError::UniqueViolation {
@@ -91,12 +216,10 @@ impl TikvStore {
         index_column_types: &[DataType],
         pk_types: &[DataType],
     ) -> Result<Vec<Value>> {
-        let fixed_prefix_len = self
-            .make_index_key(db_id, table_id, index_id, &[], None)
-            .len();
+        let fixed_prefix = self.make_index_key(db_id, table_id, index_id, &[], None);
         self.decode_non_unique_pk_inner(
             full_key,
-            fixed_prefix_len,
+            &fixed_prefix,
             index_column_types,
             pk_types,
             db_id,
@@ -114,14 +237,15 @@ impl TikvStore {
     fn decode_non_unique_pk_inner(
         &self,
         full_key: &[u8],
-        fixed_prefix_len: usize,
+        fixed_prefix: &[u8],
         index_column_types: &[DataType],
         pk_types: &[DataType],
         db_id: u64,
         table_id: u64,
         index_id: u64,
     ) -> Result<Vec<Value>> {
-        if full_key.len() <= fixed_prefix_len {
+        let visible_prefix_len = Self::scan_visible_prefix_len(fixed_prefix, full_key)?;
+        if full_key.len() <= visible_prefix_len {
             return Err(anyhow!(
                 "non-unique index key too short (db_id={}, table_id={}, index_id={})",
                 db_id,
@@ -129,7 +253,7 @@ impl TikvStore {
                 index_id
             ));
         }
-        let mut offset = fixed_prefix_len;
+        let mut offset = visible_prefix_len;
         for data_type in index_column_types {
             let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
             offset += consumed;
@@ -465,22 +589,25 @@ impl TikvStore {
             end_raw.push(0x02);
             let end_key = self.key(&end_raw);
 
-            let range: BoundRange = (start_key.clone()..end_key).into();
-            let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await)
-                .map_err(|e| anyhow!(e))?;
-
             let mut pks = Vec::new();
-            let mut scanned_pairs = 0usize;
-            for pair in pairs {
-                scanned_pairs += 1;
-                let full_key: &[u8] = pair.key().as_ref().into();
-                if full_key.len() <= start_key.len() {
-                    continue;
-                }
-                let pk_bytes = &full_key[start_key.len()..];
-                let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
-                pks.push(pk);
-            }
+            let scanned_pairs = self
+                .scan_range_in_pages(txn, start_key.clone(), end_key, &start_key, limit, |full_key, _| {
+                    let visible_prefix_len = Self::scan_visible_prefix_len(&start_key, full_key)?;
+                    if full_key.len() <= visible_prefix_len {
+                        return Err(anyhow!(
+                            "non-unique exact index key too short (db_id={}, table_id={}, index_id={})",
+                            db_id,
+                            table_id,
+                            index_id
+                        ));
+                    }
+                    let pk_bytes = &full_key[visible_prefix_len..];
+                    let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+                    pks.push(pk);
+                    Ok(())
+                })
+                .await?;
+
             kv_stats::record_index_scan_pairs(scanned_pairs);
             Ok(pks)
         }
@@ -517,53 +644,56 @@ impl TikvStore {
         let mut end_raw = prefix;
         end_raw.push(0xFF);
         let end_key = self.key(&end_raw);
-
-        let range: BoundRange = (start_key..end_key).into();
-        let pairs =
-            tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await).map_err(|e| anyhow!(e))?;
+        let fixed_prefix = self.make_index_key(db_id, table_id, index_id, &[], None);
 
         let mut pks = Vec::new();
-        if unique {
-            let mut scanned_pairs = 0usize;
-            for pair in pairs {
-                scanned_pairs += 1;
-                let full_key: &[u8] = pair.key().as_ref().into();
-                let value: &[u8] = pair.value().as_ref();
-                let pk = self.decode_unique_pk_from_index_entry(
-                    full_key,
-                    value,
-                    db_id,
-                    table_id,
-                    index_id,
-                    index_column_types,
-                    pk_types,
-                )?;
-                pks.push(pk);
-            }
-            kv_stats::record_index_scan_pairs(scanned_pairs);
-            return Ok(pks);
-        }
-
-        // Compute once per scan (not per row) to avoid the per-row allocation cost of
-        // make_index_key inside decode_non_unique_pk_from_index_key.
-        let fixed_prefix_len = self
-            .make_index_key(db_id, table_id, index_id, &[], None)
-            .len();
-        let mut scanned_pairs = 0usize;
-        for pair in pairs {
-            scanned_pairs += 1;
-            let full_key: &[u8] = pair.key().as_ref().into();
-            let pk = self.decode_non_unique_pk_inner(
-                full_key,
-                fixed_prefix_len,
-                index_column_types,
-                pk_types,
-                db_id,
-                table_id,
-                index_id,
-            )?;
-            pks.push(pk);
-        }
+        let scanned_pairs = if unique {
+            self.scan_range_in_pages(
+                txn,
+                start_key,
+                end_key,
+                &fixed_prefix,
+                limit,
+                |full_key, value| {
+                    let pk = self.decode_unique_pk_from_index_entry(
+                        full_key,
+                        value,
+                        db_id,
+                        table_id,
+                        index_id,
+                        index_column_types,
+                        pk_types,
+                    )?;
+                    pks.push(pk);
+                    Ok(())
+                },
+            )
+            .await?
+        } else {
+            // Compute once per scan (not per row) to avoid the per-row allocation cost of
+            // make_index_key inside decode_non_unique_pk_from_index_key.
+            self.scan_range_in_pages(
+                txn,
+                start_key,
+                end_key,
+                &fixed_prefix,
+                limit,
+                |full_key, _| {
+                    let pk = self.decode_non_unique_pk_inner(
+                        full_key,
+                        &fixed_prefix,
+                        index_column_types,
+                        pk_types,
+                        db_id,
+                        table_id,
+                        index_id,
+                    )?;
+                    pks.push(pk);
+                    Ok(())
+                },
+            )
+            .await?
+        };
 
         kv_stats::record_index_scan_pairs(scanned_pairs);
         Ok(pks)
@@ -612,53 +742,56 @@ impl TikvStore {
         );
         let start_key = self.key(&start_raw);
         let end_key = self.key(&end_raw);
-
-        let range: BoundRange = (start_key..end_key).into();
-        let pairs =
-            tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await).map_err(|e| anyhow!(e))?;
+        let fixed_prefix = self.make_index_key(db_id, table_id, index_id, &[], None);
 
         let mut pks = Vec::new();
-        if unique {
-            let mut scanned_pairs = 0usize;
-            for pair in pairs {
-                scanned_pairs += 1;
-                let full_key: &[u8] = pair.key().as_ref().into();
-                let value: &[u8] = pair.value().as_ref();
-                let pk = self.decode_unique_pk_from_index_entry(
-                    full_key,
-                    value,
-                    db_id,
-                    table_id,
-                    index_id,
-                    index_column_types,
-                    pk_types,
-                )?;
-                pks.push(pk);
-            }
-            kv_stats::record_index_scan_pairs(scanned_pairs);
-            return Ok(pks);
-        }
-
-        // Compute once per scan (not per row) to avoid the per-row allocation cost of
-        // make_index_key inside decode_non_unique_pk_from_index_key.
-        let fixed_prefix_len = self
-            .make_index_key(db_id, table_id, index_id, &[], None)
-            .len();
-        let mut scanned_pairs = 0usize;
-        for pair in pairs {
-            scanned_pairs += 1;
-            let full_key: &[u8] = pair.key().as_ref().into();
-            let pk = self.decode_non_unique_pk_inner(
-                full_key,
-                fixed_prefix_len,
-                index_column_types,
-                pk_types,
-                db_id,
-                table_id,
-                index_id,
-            )?;
-            pks.push(pk);
-        }
+        let scanned_pairs = if unique {
+            self.scan_range_in_pages(
+                txn,
+                start_key,
+                end_key,
+                &fixed_prefix,
+                limit,
+                |full_key, value| {
+                    let pk = self.decode_unique_pk_from_index_entry(
+                        full_key,
+                        value,
+                        db_id,
+                        table_id,
+                        index_id,
+                        index_column_types,
+                        pk_types,
+                    )?;
+                    pks.push(pk);
+                    Ok(())
+                },
+            )
+            .await?
+        } else {
+            // Compute once per scan (not per row) to avoid the per-row allocation cost of
+            // make_index_key inside decode_non_unique_pk_from_index_key.
+            self.scan_range_in_pages(
+                txn,
+                start_key,
+                end_key,
+                &fixed_prefix,
+                limit,
+                |full_key, _| {
+                    let pk = self.decode_non_unique_pk_inner(
+                        full_key,
+                        &fixed_prefix,
+                        index_column_types,
+                        pk_types,
+                        db_id,
+                        table_id,
+                        index_id,
+                    )?;
+                    pks.push(pk);
+                    Ok(())
+                },
+            )
+            .await?
+        };
 
         kv_stats::record_index_scan_pairs(scanned_pairs);
         Ok(pks)
@@ -818,8 +951,6 @@ impl TikvStore {
         let prefix = self.key(&encode_gin_index_prefix_v2(
             db_id, table_id, index_id, token_hash,
         ));
-        let prefix_len = prefix.len();
-
         let end_key = {
             let mut end = prefix.clone();
             if let Some(last) = end.last_mut() {
@@ -842,8 +973,9 @@ impl TikvStore {
             scanned += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
             last_key = Some(full_key.to_vec());
-            if full_key.len() > prefix_len {
-                pk_bytes_list.push(full_key[prefix_len..].to_vec());
+            let visible_prefix_len = Self::scan_visible_prefix_len(&prefix, full_key)?;
+            if full_key.len() > visible_prefix_len {
+                pk_bytes_list.push(full_key[visible_prefix_len..].to_vec());
             }
         }
         kv_stats::record_index_scan_pairs(scanned);
@@ -939,7 +1071,6 @@ impl TikvStore {
         page_size: u32,
     ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
         let (table_start, table_end) = encode_table_data_range_v2(db_id, table_id);
-        let prefix_len = table_start.len();
         let start_key = cursor.map_or(table_start.clone(), |cursor| cursor.to_vec());
         let range: BoundRange = (start_key..table_end).into();
         let pairs = tikv_op!(txn.scan(range, page_size).await)?;
@@ -951,8 +1082,9 @@ impl TikvStore {
             scanned += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
             last_key = Some(full_key.to_vec());
-            if full_key.len() > prefix_len {
-                pk_bytes_list.push(full_key[prefix_len..].to_vec());
+            let visible_prefix_len = Self::scan_visible_prefix_len(&table_start, full_key)?;
+            if full_key.len() > visible_prefix_len {
+                pk_bytes_list.push(full_key[visible_prefix_len..].to_vec());
             }
         }
         kv_stats::record_table_scan_pairs(scanned);
@@ -1011,6 +1143,110 @@ mod tests {
                 &[DataType::Int32, DataType::Uuid],
             )
             .expect("decode composite PK");
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn decode_non_unique_pk_from_scan_visible_key_shape() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let scan_visible_key = &full_key[2..];
+
+        let decoded = store
+            .decode_non_unique_pk_from_index_key(
+                scan_visible_key,
+                1,
+                3,
+                1,
+                &[DataType::Text],
+                &[DataType::Int64],
+            )
+            .expect("decode scan-visible key");
+
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn scan_visible_prefix_len_accepts_scan_visible_exact_prefix() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let scan_visible_key = &full_key[2..];
+        let mut exact_prefix = store.make_index_key(1, 3, 1, &idx_values, None);
+        exact_prefix.push(0x01);
+
+        let visible_prefix_len =
+            TikvStore::scan_visible_prefix_len(&exact_prefix, scan_visible_key)
+                .expect("match scan-visible exact prefix");
+        let decoded = decode_pk_from_index_suffix(
+            &scan_visible_key[visible_prefix_len..],
+            &[DataType::Int64],
+        )
+        .expect("decode suffix from scan-visible exact key");
+
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn scan_visible_prefix_len_accepts_four_byte_trimmed_exact_prefix() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let four_byte_trimmed_key = &full_key[4..];
+        let mut exact_prefix = store.make_index_key(1, 3, 1, &idx_values, None);
+        exact_prefix.push(0x01);
+
+        let visible_prefix_len =
+            TikvStore::scan_visible_prefix_len(&exact_prefix, four_byte_trimmed_key)
+                .expect("match four-byte-trimmed exact prefix");
+        let decoded = decode_pk_from_index_suffix(
+            &four_byte_trimmed_key[visible_prefix_len..],
+            &[DataType::Int64],
+        )
+        .expect("decode suffix from four-byte-trimmed exact key");
+
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn scan_visible_prefix_len_rejects_noncanonical_trimmed_prefix_match() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let three_byte_trimmed_key = &full_key[3..];
+        let mut exact_prefix = store.make_index_key(1, 3, 1, &idx_values, None);
+        exact_prefix.push(0x01);
+
+        let err = TikvStore::scan_visible_prefix_len(&exact_prefix, three_byte_trimmed_key)
+            .expect_err("three-byte trim must be rejected");
+
+        assert!(err.to_string().contains("unexpected prefix"), "err: {err}");
+    }
+
+    #[test]
+    fn decode_non_unique_pk_from_four_byte_trimmed_scan_key_shape() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let four_byte_trimmed_key = &full_key[4..];
+
+        let decoded = store
+            .decode_non_unique_pk_from_index_key(
+                four_byte_trimmed_key,
+                1,
+                3,
+                1,
+                &[DataType::Text],
+                &[DataType::Int64],
+            )
+            .expect("decode four-byte-trimmed scan key");
+
         assert_eq!(decoded, pk_values);
     }
 
@@ -1074,5 +1310,61 @@ mod tests {
             .expect("decode legacy empty-value unique entry");
 
         assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn index_scan_page_limit_defaults_to_bounded_batch_size() {
+        assert_eq!(
+            TikvStore::index_scan_page_limit(None),
+            INDEX_SCAN_BATCH_SIZE
+        );
+        assert_eq!(TikvStore::index_scan_page_limit(Some(0)), 0);
+        assert_eq!(TikvStore::index_scan_page_limit(Some(7)), 7);
+        assert_eq!(
+            TikvStore::index_scan_page_limit(Some((INDEX_SCAN_BATCH_SIZE as usize) + 99)),
+            INDEX_SCAN_BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn next_scan_page_start_appends_zero_byte_after_last_key() {
+        assert_eq!(
+            TikvStore::next_scan_page_start(&[0x10, 0x20], &[0x10, 0x20, 0x30]).unwrap(),
+            vec![0x10, 0x20, 0x30, 0x00]
+        );
+    }
+
+    #[test]
+    fn next_scan_page_start_restores_two_byte_trimmed_scan_visible_key() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let trimmed_key = &full_key[2..];
+        let fixed_prefix = store.make_index_key(1, 3, 1, &[], None);
+
+        let next_start = TikvStore::next_scan_page_start(&fixed_prefix, trimmed_key)
+            .expect("restore two-byte-trimmed cursor");
+
+        let mut expected = full_key.clone();
+        expected.push(0x00);
+        assert_eq!(next_start, expected);
+    }
+
+    #[test]
+    fn next_scan_page_start_restores_four_byte_trimmed_scan_visible_key() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v0005".to_string())];
+        let pk_values = vec![Value::Int64(5)];
+        let full_key = store.make_index_key(1, 3, 1, &idx_values, Some(pk_values.as_slice()));
+        let trimmed_key = &full_key[4..];
+        let fixed_prefix = store.make_index_key(1, 3, 1, &[], None);
+
+        let next_start = TikvStore::next_scan_page_start(&fixed_prefix, trimmed_key)
+            .expect("restore four-byte-trimmed cursor");
+
+        let mut expected = full_key.clone();
+        expected.push(0x00);
+        assert_eq!(next_start, expected);
     }
 }

@@ -1,0 +1,32 @@
+phase
+pushdown_on_eq
+(1 row)
+id|payload
+6001|copied-target
+(1 row)
+phase
+pushdown_on_in
+(1 row)
+id|payload
+42|base-42
+6001|copied-target
+(2 rows)
+phase
+pushdown_off_eq
+(1 row)
+id|payload
+6001|copied-target
+(1 row)
+phase
+pushdown_off_in
+(1 row)
+id|payload
+42|base-42
+6001|copied-target
+(2 rows)
+check_name|mismatch_count
+copy_secondary_eq_parity|0
+(1 row)
+check_name|mismatch_count
+copy_secondary_in_parity|0
+(1 row)

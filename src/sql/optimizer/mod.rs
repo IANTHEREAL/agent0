@@ -12,6 +12,7 @@ pub mod logical_plan;
 pub mod logical_planner;
 pub mod physical_plan;
 pub mod physical_planner;
+pub mod pushdown;
 pub mod rewrite;
 pub mod selectivity;
 pub mod statistics;

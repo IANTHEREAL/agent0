@@ -1,0 +1,7 @@
+Seq Scan on db9_cop_seq_smoke
+Filter: (v >= 'b'::text)
+DB9 Cop Filter: (v >= 'b'::text)
+DB9 Cop Output: id, v
+DB9 Cop Limit: 1
+2|b
+seq_parity|0

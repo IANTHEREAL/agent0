@@ -101,6 +101,81 @@ def test_sqlalchemy_join_subquery_prepared_and_vector_ops():
                 assert row1 == ("a",)
                 assert row2 == ("b",)
 
+            # secondary-index row fetch + join over the same lookup table
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"""
+                    CREATE TABLE {SCHEMA_NAME}.lookup_owner (
+                      id INTEGER PRIMARY KEY,
+                      label VARCHAR NOT NULL
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    f"""
+                    CREATE TABLE {SCHEMA_NAME}.lookup_rows (
+                      id INTEGER PRIMARY KEY,
+                      owner_id INTEGER NOT NULL,
+                      a INTEGER NOT NULL,
+                      b INTEGER NOT NULL,
+                      payload VARCHAR NOT NULL
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    f"CREATE INDEX idx_lookup_owner_label ON {SCHEMA_NAME}.lookup_owner(label)"
+                )
+                conn.exec_driver_sql(
+                    f"CREATE INDEX idx_lookup_rows_ab ON {SCHEMA_NAME}.lookup_rows(a, b)"
+                )
+                conn.exec_driver_sql(
+                    f"""
+                    INSERT INTO {SCHEMA_NAME}.lookup_owner (id, label)
+                    VALUES
+                      (1, 'target-owner'),
+                      (2, 'other-owner')
+                    """
+                )
+                conn.exec_driver_sql(
+                    f"""
+                    INSERT INTO {SCHEMA_NAME}.lookup_rows (id, owner_id, a, b, payload)
+                    VALUES
+                      (100, 1, 1234, 1, 'target-hit'),
+                      (101, 1, 1234, 2, 'same-owner-other-b'),
+                      (102, 2, 4321, 1, 'other-owner-other-a')
+                    """
+                )
+
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT id, payload
+                        FROM {SCHEMA_NAME}.lookup_rows
+                        WHERE a = 1234
+                          AND b = abs(-1)
+                        ORDER BY id
+                        """
+                    )
+                ).fetchall()
+                assert rows == [(100, "target-hit")]
+
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT r.id, r.payload, o.label
+                        FROM {SCHEMA_NAME}.lookup_owner o
+                        JOIN {SCHEMA_NAME}.lookup_rows r
+                          ON r.owner_id = o.id
+                        WHERE o.label = 'target-owner'
+                          AND r.a = 1234
+                          AND r.b = abs(-1)
+                        ORDER BY r.id
+                        """
+                    )
+                ).fetchall()
+                assert rows == [(100, "target-hit", "target-owner")]
+
             # vector column / insert / distance / index / filter
             with engine.begin() as conn:
                 conn.exec_driver_sql(

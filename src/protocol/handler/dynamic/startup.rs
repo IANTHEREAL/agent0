@@ -112,6 +112,10 @@ type AuthDispatchOutcome = (
     Option<String>,
 );
 
+fn default_database_bootstrap_owner() -> String {
+    config::env_string("DB9_BOOTSTRAP_ADMIN_USER").unwrap_or_else(|| "admin".to_string())
+}
+
 impl DynamicPgHandler {
     pub(in crate::protocol::handler) async fn init_executor(
         &self,
@@ -227,30 +231,27 @@ impl DynamicPgHandler {
             )
         };
 
-        let mut db_txn = store
-            .begin_optimistic()
-            .await
-            .map_err(|e| fatal_internal(e.to_string()))?;
-        let database_id = match store
-            .get_database_id(&mut db_txn, &database_name)
-            .await
-            .map_err(|e| fatal_internal(e.to_string()))?
-        {
-            Some(id) => id,
-            None => {
-                if let Err(e) = db_txn.rollback().await {
-                    warn!("rollback failed during database lookup: {}", e);
+        let database_id = if database_name == "postgres" {
+            store
+                .ensure_default_database_visible(&default_database_bootstrap_owner())
+                .await
+                .map_err(|e| fatal_internal(e.to_string()))?
+        } else {
+            match store
+                .lookup_database_id(&database_name)
+                .await
+                .map_err(|e| fatal_internal(e.to_string()))?
+            {
+                Some(id) => id,
+                None => {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "3D000".to_owned(),
+                        format!("database \"{}\" does not exist", database_name),
+                    ))));
                 }
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "FATAL".to_owned(),
-                    "3D000".to_owned(),
-                    format!("database \"{}\" does not exist", database_name),
-                ))));
             }
         };
-        if let Err(e) = db_txn.rollback().await {
-            warn!("rollback failed after database lookup: {}", e);
-        }
 
         // Cache the principal identity before the username is moved into session.
         let principal_id = username.as_deref().unwrap_or("unknown").to_string();

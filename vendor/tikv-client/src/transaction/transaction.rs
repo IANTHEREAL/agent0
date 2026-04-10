@@ -774,6 +774,40 @@ impl<PdC: PdClient> Transaction<PdC> {
         self.timestamp.clone()
     }
 
+    /// Execute a transactional coprocessor request at this transaction's start timestamp.
+    pub async fn coprocessor(
+        &mut self,
+        tp: i64,
+        data: Vec<u8>,
+        ranges: impl IntoIterator<Item = impl Into<BoundRange>>,
+    ) -> Result<Vec<(Vec<std::ops::Range<Key>>, Vec<u8>)>> {
+        self.check_allow_operation().await?;
+
+        let keyspace = self.keyspace;
+        let request = new_coprocessor_request(
+            tp,
+            data,
+            ranges
+                .into_iter()
+                .map(|range| range.into().encode_keyspace(keyspace, KeyMode::Txn)),
+            self.timestamp.clone(),
+        );
+        let plan = PlanBuilder::new(self.rpc.clone(), keyspace, request)
+            .resolve_lock(self.options.retry_options.lock_backoff.clone(), keyspace)
+            .preserve_shard()
+            .retry_multi_region(self.options.retry_options.region_backoff.clone())
+            .extract_error()
+            .post_process_default()
+            .plan();
+
+        Ok(plan
+            .execute()
+            .await?
+            .into_iter()
+            .map(|(ranges, data)| (ranges.truncate_keyspace(keyspace), data))
+            .collect())
+    }
+
     /// Send a heart beat message to keep the transaction alive on the server and update its TTL.
     ///
     /// Returns the TTL set on the transaction's locks by TiKV.
@@ -824,6 +858,7 @@ impl<PdC: PdClient> Transaction<PdC> {
                 !key_only,
                 reverse,
                 move |new_range, new_limit| async move {
+                    let (repair_start, repair_end) = new_range.clone().into_keys();
                     let request =
                         new_scan_request(new_range, timestamp, new_limit, key_only, reverse);
                     let plan = PlanBuilder::new(rpc, keyspace, request)
@@ -833,7 +868,22 @@ impl<PdC: PdClient> Transaction<PdC> {
                         .plan();
                     plan.execute()
                         .await
-                        .map(|r| r.into_iter().map(Into::into).collect())
+                        .map(|r| {
+                            r.into_iter()
+                                .map(Into::into)
+                                .map(|KvPair(key, value)| {
+                                    KvPair(
+                                        repair_scan_result_key(
+                                            key,
+                                            &repair_start,
+                                            repair_end.as_ref(),
+                                            keyspace,
+                                        ),
+                                        value,
+                                    )
+                                })
+                                .collect()
+                        })
                 },
             )
             .await
@@ -1641,6 +1691,38 @@ impl From<u8> for TransactionStatus {
     }
 }
 
+fn key_in_scan_bounds(key: &Key, start: &Key, end: Option<&Key>) -> bool {
+    key >= start && end.map_or(true, |end_key| key < end_key)
+}
+
+fn repair_scan_result_key(
+    key: Key,
+    start: &Key,
+    end: Option<&Key>,
+    keyspace: Keyspace,
+) -> Key {
+    const SCAN_KEYSPACE_PREFIX_LEN: usize = 4;
+
+    if matches!(keyspace, Keyspace::Disable) || key_in_scan_bounds(&key, start, end) {
+        return key;
+    }
+
+    let start_bytes: &[u8] = start.as_ref().into();
+    if start_bytes.len() < SCAN_KEYSPACE_PREFIX_LEN {
+        return key;
+    }
+
+    let mut repaired = start_bytes[..SCAN_KEYSPACE_PREFIX_LEN].to_vec();
+    let key_bytes: &[u8] = key.as_ref().into();
+    repaired.extend_from_slice(key_bytes);
+    let repaired_key = Key::from(repaired);
+    if key_in_scan_bounds(&repaired_key, start, end) {
+        repaired_key
+    } else {
+        key
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -1655,11 +1737,42 @@ mod tests {
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
     use crate::proto::kvrpcpb;
+    use crate::request::{EncodeKeyspace, KeyMode, Keyspace};
     use crate::proto::pdpb::Timestamp;
-    use crate::request::Keyspace;
+    use crate::{BoundRange, Key};
     use crate::transaction::HeartbeatOption;
     use crate::Transaction;
     use crate::TransactionOptions;
+
+    use super::repair_scan_result_key;
+
+    #[test]
+    fn repair_scan_result_key_restores_keyspace_prefix_when_scan_key_is_prematurely_truncated() {
+        let keyspace = Keyspace::Enable { keyspace_id: 7 };
+        let range = BoundRange::from(("hello".to_owned(), "hellp".to_owned()))
+            .encode_keyspace(keyspace, KeyMode::Txn);
+        let (start, end) = range.into_keys();
+
+        let encoded_key = Key::from("hello".to_owned()).encode_keyspace(keyspace, KeyMode::Txn);
+        let truncated_key = Key::from("hello".to_owned());
+
+        let repaired = repair_scan_result_key(truncated_key, &start, end.as_ref(), keyspace);
+        assert_eq!(repaired, encoded_key);
+    }
+
+    #[test]
+    fn repair_scan_result_key_keeps_valid_encoded_keys_unchanged() {
+        let keyspace = Keyspace::Enable { keyspace_id: 9 };
+        let range = BoundRange::from(("abc".to_owned(), "abd".to_owned()))
+            .encode_keyspace(keyspace, KeyMode::Txn);
+        let (start, end) = range.into_keys();
+
+        let encoded_key = Key::from("abc".to_owned()).encode_keyspace(keyspace, KeyMode::Txn);
+
+        let repaired =
+            repair_scan_result_key(encoded_key.clone(), &start, end.as_ref(), keyspace);
+        assert_eq!(repaired, encoded_key);
+    }
 
     #[rstest::rstest]
     #[case(Keyspace::Disable)]

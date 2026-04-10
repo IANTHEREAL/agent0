@@ -32,6 +32,7 @@ pub(super) fn plan_has_correlated_refs(plan: &PhysicalPlan) -> bool {
         PhysicalNode::SeqScan { .. }
         | PhysicalNode::IndexScan { .. }
         | PhysicalNode::HnswScan { .. }
+        | PhysicalNode::Db9Cop { .. }
         | PhysicalNode::Empty => false,
         PhysicalNode::Values { rows } => rows.iter().flatten().any(has_correlated_ref),
         PhysicalNode::TableFunction { args, .. } => args.iter().any(|arg| match arg {

@@ -1,0 +1,12 @@
+pushdown_on_eq
+6001|copied-target
+pushdown_on_in
+42|base-42
+6001|copied-target
+pushdown_off_eq
+6001|copied-target
+pushdown_off_in
+42|base-42
+6001|copied-target
+copy_secondary_eq_parity|0
+copy_secondary_in_parity|0

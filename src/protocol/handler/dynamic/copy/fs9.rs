@@ -125,7 +125,7 @@ impl DynamicPgHandler {
 
         // All fallible work after begin() is wrapped in an async block so that
         // every `?` is caught by the single cleanup site below.
-        let result: PgWireResult<usize> = async {
+        let result: PgWireResult<(usize, crate::session_context::TxnDirtyTableIds)> = async {
             // Server-file privilege check first (PG checks file permission
             // before table privilege for COPY … FROM 'filename').
             // Without this, a non-superuser can probe table existence by
@@ -138,7 +138,6 @@ impl DynamicPgHandler {
                     "permission denied to COPY from a file".to_string(),
                 ))));
             }
-
             // INSERT privilege check
             {
                 let current_role = session.current_user().map(|s| s.to_string());
@@ -265,7 +264,7 @@ impl DynamicPgHandler {
             // Read file bytes from fs9 backend under the same statement runtime
             // contract as the later COPY insert work, so extension context
             // (tenant keyspace + TiKV client) is present for fs9 IO.
-            let file_data = super::with_copy_statement_context(&qctx, &runtime, async {
+            let (file_data, _) = super::with_copy_statement_context(&qctx, &runtime, async {
                 if !crate::extensions::fs::backend::is_backend_available() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
@@ -394,7 +393,7 @@ impl DynamicPgHandler {
             let mut pending_self_fk_keys: HashMap<String, HashSet<String>> = HashMap::new();
             let mut deferred_self_fk_checks: Vec<(usize, String, String, String)> = Vec::new();
 
-            let insert_result: PgWireResult<()> =
+            let insert_result: PgWireResult<crate::session_context::TxnDirtyTableIds> =
                 crate::sql::query_context::with_scoped_query_context(
                     &qctx,
                     crate::sql::runtime_context::wrap_with_statement_runtime_context(
@@ -455,19 +454,20 @@ impl DynamicPgHandler {
                                     })?;
                             }
 
-                            Ok(())
+                            Ok(crate::session_context::current_statement_dirty_table_ids())
                         },
                     ),
                 )
                 .await;
-            insert_result?;
+            let dirty_table_ids = insert_result?;
 
-            Ok(row_count)
+            Ok((row_count, dirty_table_ids))
         }
         .await;
 
         match result {
-            Ok(row_count) => {
+            Ok((row_count, dirty_table_ids)) => {
+                session.note_transaction_dirty_tables(dirty_table_ids);
                 if started_txn {
                     session.commit().await.map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -603,7 +603,7 @@ impl DynamicPgHandler {
 
         // All fallible work after begin() is wrapped in an async block so that
         // every `?` is caught by the single cleanup site below.
-        let result: PgWireResult<usize> = async {
+        let result: PgWireResult<(usize, crate::session_context::TxnDirtyTableIds)> = async {
             // Server-file privilege check first for fs9:// URLs (same as
             // the CSV/TEXT handler — PG checks file permission before table
             // privilege for COPY FROM 'filename').
@@ -614,7 +614,6 @@ impl DynamicPgHandler {
                     "permission denied to COPY from a file".to_string(),
                 ))));
             }
-
             let db_id = session.current_database_id();
 
             // Check extension is installed
@@ -670,23 +669,37 @@ impl DynamicPgHandler {
                 executor.tenant_keyspace(),
                 executor.store().transaction_client(),
             );
-            let row_count = crate::sql::query_context::with_scoped_query_context(
-                &qctx,
-                crate::sql::runtime_context::wrap_with_statement_runtime_context(&runtime, async {
-                    executor
-                        .execute_copy_from_parquet(&mut session, &table_name, &url, started_txn)
-                        .await
-                }),
-            )
-            .await
-            .map_err(|e| user_error("XX000", e.to_string()))?;
+            let (row_count, dirty_table_ids) =
+                crate::sql::query_context::with_scoped_query_context(
+                    &qctx,
+                    crate::sql::runtime_context::wrap_with_statement_runtime_context(
+                        &runtime,
+                        async {
+                            let row_count = executor
+                                .execute_copy_from_parquet(
+                                    &mut session,
+                                    &table_name,
+                                    &url,
+                                    started_txn,
+                                )
+                                .await?;
+                            Ok::<_, anyhow::Error>((
+                                row_count,
+                                crate::session_context::current_statement_dirty_table_ids(),
+                            ))
+                        },
+                    ),
+                )
+                .await
+                .map_err(|e| user_error("XX000", e.to_string()))?;
 
-            Ok(row_count)
+            Ok((row_count, dirty_table_ids))
         }
         .await;
 
         match result {
-            Ok(row_count) => {
+            Ok((row_count, dirty_table_ids)) => {
+                session.note_transaction_dirty_tables(dirty_table_ids);
                 if started_txn {
                     session
                         .commit()

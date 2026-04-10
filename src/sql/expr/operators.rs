@@ -1063,6 +1063,71 @@ fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
     }
 }
 
+fn compare_int64_and_float64(left: i64, right: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    if right.is_nan() {
+        return Ordering::Less;
+    }
+    if right.is_infinite() {
+        return if right.is_sign_positive() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    if right == 0.0 {
+        return left.cmp(&0);
+    }
+
+    let left_is_negative = left < 0;
+    let right_is_negative = right.is_sign_negative();
+    if left_is_negative != right_is_negative {
+        return if left_is_negative {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+
+    let magnitude_ordering = compare_uint64_and_positive_float64(left.unsigned_abs(), right.abs());
+    if left_is_negative {
+        magnitude_ordering.reverse()
+    } else {
+        magnitude_ordering
+    }
+}
+
+fn compare_uint64_and_positive_float64(left: u64, right: f64) -> std::cmp::Ordering {
+    let bits = right.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let mantissa = bits & ((1_u64 << 52) - 1);
+    let (significand, exponent) = if exponent_bits == 0 {
+        (mantissa, 1 - 1023 - 52)
+    } else {
+        ((1_u64 << 52) | mantissa, exponent_bits - 1023 - 52)
+    };
+
+    if exponent >= 0 {
+        if exponent > 11 {
+            return std::cmp::Ordering::Less;
+        }
+        let right_int = (significand as u128) << exponent as u32;
+        return (left as u128).cmp(&right_int);
+    }
+
+    let shift = (-exponent) as u32;
+    if shift > 63 {
+        return if left == 0 {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
+    }
+
+    ((left as u128) << shift).cmp(&(significand as u128))
+}
+
 /// Compare two values. Returns:
 /// - 0: equal
 /// - 1: left > right
@@ -1094,7 +1159,25 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         return compare_same_type(left, right);
     }
 
-    // Phase 4: Cross-type comparisons are rejected.
+    // Phase 4: Preserve exact mixed integer/float comparisons without lossy
+    // implicit promotion to f64.
+    match (left, right) {
+        (Value::Int32(left), Value::Float64(right)) => {
+            return Ok(compare_int64_and_float64(i64::from(*left), *right) as i8)
+        }
+        (Value::Float64(left), Value::Int32(right)) => {
+            return Ok(compare_int64_and_float64(i64::from(*right), *left).reverse() as i8)
+        }
+        (Value::Int64(left), Value::Float64(right)) => {
+            return Ok(compare_int64_and_float64(*left, *right) as i8)
+        }
+        (Value::Float64(left), Value::Int64(right)) => {
+            return Ok(compare_int64_and_float64(*right, *left).reverse() as i8)
+        }
+        _ => {}
+    }
+
+    // Phase 5: Cross-type comparisons are rejected.
     //
     // The Analyzer must insert implicit casts so values are type-compatible
     // before runtime evaluation. Keeping coercion here would be a hidden
@@ -1320,6 +1403,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Cannot compare values"));
+    }
+
+    #[test]
+    fn test_compare_values_preserve_exact_mixed_int_float_ordering() {
+        let large = Value::Int64(9_007_199_254_740_993);
+        let rounded = Value::Float64(9_007_199_254_740_992.0);
+
+        assert_eq!(compare_values(&large, &rounded).unwrap(), 1);
+        assert_eq!(compare_values(&rounded, &large).unwrap(), -1);
+        assert_eq!(
+            compare_values(&Value::Int32(42), &Value::Float64(42.0)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_compare_values_mixed_int_float_follow_float_nan_ordering() {
+        assert_eq!(
+            compare_values(&Value::Int64(1), &Value::Float64(f64::NAN)).unwrap(),
+            -1
+        );
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Int64(1)).unwrap(),
+            1
+        );
     }
 
     #[test]

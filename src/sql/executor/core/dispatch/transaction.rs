@@ -329,6 +329,9 @@ impl Executor {
                 session.clear_plan_cache();
             }
 
+            let statement_dirty_tables =
+                crate::session_context::current_statement_dirty_table_ids();
+
             if res
                 .as_ref()
                 .err()
@@ -345,6 +348,7 @@ impl Executor {
             if is_autocommit {
                 match res {
                     Ok((notices, result)) => {
+                        session.note_transaction_dirty_tables(statement_dirty_tables);
                         if is_observability_query {
                             session.rollback().await?;
                             self.clear_trigger_activations();
@@ -415,6 +419,7 @@ impl Executor {
             } else {
                 match res {
                     Ok((notices, result)) => {
+                        session.note_transaction_dirty_tables(statement_dirty_tables);
                         session.note_statement_success_in_transaction();
                         if matches!(result, ExecuteResult::AlterRole | ExecuteResult::DropRole) {
                             self.mark_init_cache_invalidation_pending();

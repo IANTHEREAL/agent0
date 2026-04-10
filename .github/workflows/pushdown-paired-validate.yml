@@ -1,0 +1,96 @@
+name: Pushdown Paired Validate
+
+on:
+  workflow_dispatch:
+    inputs:
+      pg_dsn:
+        description: 'PG_DSN for a running db9-server backed by a DB9-cop-capable CSE lane'
+        required: false
+        type: string
+  schedule:
+    - cron: '17 5 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pushdown-paired-validate:
+    runs-on: arc-runner-amd64-c6i-2xl
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: e2e/gorm_smoke/go.mod
+
+      - uses: astral-sh/setup-uv@v2
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Resolve paired PG_DSN
+        shell: bash
+        env:
+          INPUT_PG_DSN: ${{ inputs.pg_dsn }}
+          SECRET_PG_DSN: ${{ secrets.DB9_COP_PG_DSN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_PG_DSN}" ]]; then
+            echo "PG_DSN=${INPUT_PG_DSN}" >> "$GITHUB_ENV"
+          elif [[ -n "${SECRET_PG_DSN}" ]]; then
+            echo "PG_DSN=${SECRET_PG_DSN}" >> "$GITHUB_ENV"
+          else
+            echo "ERROR: provide workflow_dispatch input 'pg_dsn' or configure secret DB9_COP_PG_DSN" >&2
+            exit 2
+          fi
+
+      - name: Verify paired server matches checked-out ref
+        shell: bash
+        env:
+          EXPECTED_GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          expected_short="${EXPECTED_GITHUB_SHA:0:8}"
+          version="$(psql "$PG_DSN" -Atqc "SELECT version()")"
+          echo "Paired server version(): ${version}"
+          if [[ "${version}" != *"db9-server"* ]] || [[ "${version}" != *"${expected_short}"* ]]; then
+            echo "ERROR: paired server build does not match checkout SHA ${EXPECTED_GITHUB_SHA} (expected short hash ${expected_short})" >&2
+            exit 3
+          fi
+
+      - name: Run fast regression gate with pushdown tests enabled
+        shell: bash
+        env:
+          DB9_RUN_COP_PUSHDOWN_TESTS: '1'
+        run: |
+          set -euo pipefail
+          bash scripts/regression_gate.sh --dsn "$PG_DSN" --skip-orm --skip-unit --skip-build
+
+      - name: Run GORM smoke with pushdown enabled
+        shell: bash
+        env:
+          DB9_GORM_SMOKE_ENABLE_COP_PUSHDOWN: '1'
+        run: |
+          set -euo pipefail
+          bash scripts/e2e_tests.sh gorm_smoke
+
+      - name: Run SQLAlchemy smoke with pushdown checks enabled
+        shell: bash
+        env:
+          DB9_RUN_COP_PUSHDOWN_TESTS: '1'
+        run: |
+          set -euo pipefail
+          bash scripts/e2e_tests.sh sqlalchemy_smoke
+
+      - name: Run Dify SQLAlchemy compat with pushdown checks enabled
+        shell: bash
+        env:
+          DB9_RUN_COP_PUSHDOWN_TESTS: '1'
+        run: |
+          set -euo pipefail
+          bash scripts/e2e_tests.sh dify_sqlalchemy_compat

@@ -34,6 +34,27 @@ pub struct PhysicalCost {
     pub rows: usize,
 }
 
+/// Base scan kind for a DB9 coprocessor physical node.
+#[derive(Debug, Clone)]
+pub enum Db9CopScan {
+    Seq,
+    Index { scan_type: ScanType },
+}
+
+/// Ordered storage-side operations fused into a DB9 coprocessor node.
+#[derive(Debug, Clone)]
+pub enum Db9CopOp {
+    Filter {
+        predicate: TypedExpr,
+    },
+    Project {
+        projections: Vec<AnalyzedProjection>,
+    },
+    Limit {
+        limit: usize,
+    },
+}
+
 /// Physical plan node variants.
 ///
 /// Each variant maps to a specific operator implementation.
@@ -66,6 +87,21 @@ pub enum PhysicalNode {
         table_name: String,
         alias: Option<String>,
         scan_type: ScanType,
+    },
+
+    /// DB9 coprocessor pushdown node.
+    ///
+    /// This is a planner-visible, explain-visible physical node representing a
+    /// single-table scan plus an ordered unary chain fused for storage-side
+    /// execution. Runtime execution is added in a later PR; until then any
+    /// attempt to build operators from this node should fail explicitly.
+    Db9Cop {
+        table_name: String,
+        alias: Option<String>,
+        scan: Db9CopScan,
+        ops: Vec<Db9CopOp>,
+        /// Display-only column count for EXPLAIN when folded Project is hidden.
+        display_column_count: usize,
     },
 
     /// No-input operator (for SELECT without FROM).

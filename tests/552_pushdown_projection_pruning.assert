@@ -1,0 +1,6 @@
+Index Scan using db9_cop_proj_smoke_n_idx on db9_cop_proj_smoke
+DB9 Cop Access: point (20)
+DB9 Cop Output: v
+DB9 Cop Limit: 1
+b
+projection_parity|0

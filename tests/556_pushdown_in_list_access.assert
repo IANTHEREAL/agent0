@@ -1,0 +1,7 @@
+Index Scan using db9_cop_in_list_smoke_n_idx on db9_cop_in_list_smoke
+DB9 Cop Access: in-list (20), (30)
+DB9 Cop Output: id, v
+DB9 Cop Limit: 2
+2|b
+3|c
+in_list_parity|0

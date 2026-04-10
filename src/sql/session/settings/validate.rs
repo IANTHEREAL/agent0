@@ -193,6 +193,18 @@ pub(super) fn validate_db9_use_optimizer(value: &str) -> Result<String> {
     }
 }
 
+pub(super) fn validate_db9_enable_cop_pushdown(value: &str) -> Result<String> {
+    let normalized = value.trim().to_lowercase();
+    match normalized.as_str() {
+        "on" | "true" | "yes" | "1" => Ok("on".to_string()),
+        "off" | "false" | "no" | "0" => Ok("off".to_string()),
+        _ => Err(SqlError::InvalidParameterValue {
+            message: "parameter \"db9.enable_cop_pushdown\" requires a Boolean value".into(),
+        }
+        .into()),
+    }
+}
+
 pub(super) fn validate_embedding_dimensions(value: &str) -> Result<String> {
     let v: u32 = value
         .trim()

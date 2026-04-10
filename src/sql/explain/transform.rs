@@ -3,9 +3,10 @@
 //! Converts the optimizer's `PhysicalPlan` tree into the display-oriented `PlanNode`
 //! tree so that `EXPLAIN` shows the same plan that execution actually uses.
 
-use super::{format_typed_expr, PlanCost, PlanNode, DEFAULT_ROW_WIDTH};
+use super::{format_typed_expr, PlanAnnotations, PlanCost, PlanNode, DEFAULT_ROW_WIDTH};
+use crate::model::Value;
 use crate::sql::analyzer::types::JoinCondition;
-use crate::sql::optimizer::physical_plan::PhysicalNode;
+use crate::sql::optimizer::physical_plan::{Db9CopOp, Db9CopScan, PhysicalNode};
 use crate::sql::planner::ScanType;
 
 /// Convert a PhysicalPlan tree into a PlanNode tree for EXPLAIN display.
@@ -16,7 +17,7 @@ pub fn physical_plan_to_plan_node(
         startup: phys.cost.startup,
         total: phys.cost.total,
         rows: phys.cost.rows,
-        width: phys.schema.columns.len().saturating_mul(DEFAULT_ROW_WIDTH),
+        width: explain_width(phys),
     };
 
     match &phys.node {
@@ -24,6 +25,7 @@ pub fn physical_plan_to_plan_node(
             table_name: table_name.clone(),
             alias: alias.clone(),
             filter: None,
+            annotations: PlanAnnotations::default(),
             cost,
         },
         PhysicalNode::IndexScan {
@@ -38,6 +40,7 @@ pub fn physical_plan_to_plan_node(
                 index_name,
                 index_cond: None,
                 filter: None,
+                annotations: PlanAnnotations::default(),
                 cost,
             }
         }
@@ -59,6 +62,7 @@ pub fn physical_plan_to_plan_node(
                     index_name: index_name.clone(),
                     distance_metric: distance_metric.as_str().to_string(),
                     k: *k,
+                    annotations: PlanAnnotations::default(),
                     cost,
                 }
             } else {
@@ -66,10 +70,18 @@ pub fn physical_plan_to_plan_node(
                     table_name: table_name.clone(),
                     alias: alias.clone(),
                     filter: None,
+                    annotations: PlanAnnotations::default(),
                     cost,
                 }
             }
         }
+        PhysicalNode::Db9Cop {
+            table_name,
+            alias,
+            scan,
+            ops,
+            ..
+        } => db9_cop_plan_node(table_name, alias, scan, ops, cost),
         PhysicalNode::Filter { predicate, input } => {
             if let PhysicalNode::IndexScan {
                 table_name,
@@ -84,6 +96,7 @@ pub fn physical_plan_to_plan_node(
                     index_name,
                     index_cond: Some(format_typed_expr(predicate)),
                     filter: None,
+                    annotations: PlanAnnotations::default(),
                     cost,
                 };
             }
@@ -231,6 +244,16 @@ pub fn physical_plan_to_plan_node(
     }
 }
 
+fn explain_width(phys: &crate::sql::optimizer::physical_plan::PhysicalPlan) -> usize {
+    match &phys.node {
+        PhysicalNode::Db9Cop {
+            display_column_count,
+            ..
+        } => display_column_count.saturating_mul(DEFAULT_ROW_WIDTH),
+        _ => phys.schema.columns.len().saturating_mul(DEFAULT_ROW_WIDTH),
+    }
+}
+
 /// Extract the index name from a `ScanType`.
 fn extract_index_name(scan_type: &ScanType) -> String {
     match scan_type {
@@ -241,6 +264,183 @@ fn extract_index_name(scan_type: &ScanType) -> String {
         | ScanType::GinIndexScan { index_name, .. }
         | ScanType::HnswIndexScan { index_name, .. } => index_name.clone(),
         _ => "unknown".to_string(),
+    }
+}
+
+fn format_db9_value_for_explain(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Text(s) => super::format::quote_sql_literal(s),
+        Value::Json(s) => {
+            let json = super::format::format_json_literal_for_explain(s);
+            format!("{}::json", super::format::quote_sql_literal(&json))
+        }
+        Value::Jsonb(s) => {
+            let json = super::format::format_json_literal_for_explain(s);
+            format!("{}::jsonb", super::format::quote_sql_literal(&json))
+        }
+        Value::Tsquery(s) => format!("{}::tsquery", super::format::quote_sql_literal(s)),
+        Value::Tsvector(s) => format!("{}::tsvector", super::format::quote_sql_literal(s)),
+        other => other.to_string(),
+    }
+}
+
+fn format_db9_value_tuple(values: &[Value]) -> String {
+    format!(
+        "({})",
+        values
+            .iter()
+            .map(format_db9_value_for_explain)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn format_db9_bounded_range(
+    range_start: Option<&Value>,
+    start_inclusive: bool,
+    range_end: Option<&Value>,
+    end_inclusive: bool,
+) -> String {
+    let left_bracket = if range_start.is_some() && start_inclusive {
+        '['
+    } else {
+        '('
+    };
+    let right_bracket = if range_end.is_some() && end_inclusive {
+        ']'
+    } else {
+        ')'
+    };
+    let start = range_start
+        .map(format_db9_value_for_explain)
+        .unwrap_or_else(|| "-inf".to_string());
+    let end = range_end
+        .map(format_db9_value_for_explain)
+        .unwrap_or_else(|| "+inf".to_string());
+    format!("{left_bracket}{start}, {end}{right_bracket}")
+}
+
+fn format_db9_scan_access_detail(scan: &Db9CopScan) -> Option<String> {
+    let Db9CopScan::Index { scan_type } = scan else {
+        return None;
+    };
+
+    match scan_type {
+        ScanType::IndexScan { values, .. } => {
+            Some(format!("point {}", format_db9_value_tuple(values)))
+        }
+        ScanType::IndexRangeScan { prefix_values, .. } => {
+            Some(format!("prefix {}", format_db9_value_tuple(prefix_values)))
+        }
+        ScanType::IndexBoundedRangeScan {
+            prefix_values,
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => {
+            let mut parts = Vec::new();
+            if !prefix_values.is_empty() {
+                parts.push(format!("prefix {}", format_db9_value_tuple(prefix_values)));
+            }
+            parts.push(format!(
+                "range {}",
+                format_db9_bounded_range(
+                    range_start.as_ref(),
+                    *start_inclusive,
+                    range_end.as_ref(),
+                    *end_inclusive,
+                )
+            ));
+            Some(parts.join(", "))
+        }
+        ScanType::InListScan { column_values, .. } => Some(format!(
+            "in-list {}",
+            column_values
+                .iter()
+                .map(|values| format_db9_value_tuple(values))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => None,
+    }
+}
+
+fn db9_cop_filter(ops: &[Db9CopOp]) -> Option<String> {
+    ops.iter().find_map(|op| match op {
+        Db9CopOp::Filter { predicate } => Some(format_typed_expr(predicate)),
+        _ => None,
+    })
+}
+
+fn db9_cop_output(ops: &[Db9CopOp]) -> Option<Vec<String>> {
+    ops.iter().find_map(|op| match op {
+        Db9CopOp::Project { projections } => Some(
+            projections
+                .iter()
+                .map(|projection| projection.output_name.clone())
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    })
+}
+
+fn db9_cop_limit(ops: &[Db9CopOp]) -> Option<usize> {
+    ops.iter().find_map(|op| match op {
+        Db9CopOp::Limit { limit } => Some(*limit),
+        _ => None,
+    })
+}
+
+fn db9_cop_pushed_down(ops: &[Db9CopOp]) -> Vec<String> {
+    ops.iter()
+        .map(|op| match op {
+            Db9CopOp::Filter { .. } => "Filter".to_string(),
+            Db9CopOp::Project { .. } => "Project".to_string(),
+            Db9CopOp::Limit { .. } => "Limit".to_string(),
+        })
+        .collect()
+}
+
+fn db9_cop_annotations(scan: &Db9CopScan, ops: &[Db9CopOp]) -> PlanAnnotations {
+    PlanAnnotations {
+        task: Some("cop[tikv]".to_string()),
+        output: db9_cop_output(ops),
+        pushed_down: db9_cop_pushed_down(ops),
+        storage_access: format_db9_scan_access_detail(scan),
+        storage_limit: db9_cop_limit(ops),
+    }
+}
+
+fn db9_cop_plan_node(
+    table_name: &str,
+    alias: &Option<String>,
+    scan: &Db9CopScan,
+    ops: &[Db9CopOp],
+    cost: PlanCost,
+) -> PlanNode {
+    let annotations = db9_cop_annotations(scan, ops);
+    let filter = db9_cop_filter(ops);
+
+    match scan {
+        Db9CopScan::Seq => PlanNode::SeqScan {
+            table_name: table_name.to_string(),
+            alias: alias.clone(),
+            filter,
+            annotations,
+            cost,
+        },
+        Db9CopScan::Index { scan_type } => PlanNode::IndexScan {
+            table_name: table_name.to_string(),
+            alias: alias.clone(),
+            index_name: extract_index_name(scan_type),
+            index_cond: filter,
+            filter: None,
+            annotations,
+            cost,
+        },
     }
 }
 
@@ -277,9 +477,12 @@ mod tests {
         FunctionKind, JoinCondition, JoinType, ResolvedFunction, ResolvedUsingColumn, SetOpKind,
         TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
     };
+    use crate::sql::analyzer::AnalyzedProjection;
     use crate::sql::operators::WindowFunctionExpr;
     use crate::sql::optimizer::logical_plan::PlanSchema;
-    use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
+    use crate::sql::optimizer::physical_plan::{
+        Db9CopOp, Db9CopScan, PhysicalCost, PhysicalNode, PhysicalPlan,
+    };
     use crate::sql::planner::ScanType;
 
     fn bool_const(v: bool) -> TypedExpr {
@@ -310,6 +513,7 @@ mod tests {
         let idx = ScanType::IndexScan {
             index_id: 1,
             index_name: "idx_a".to_string(),
+            lookup_column: Some("a".to_string()),
             values: vec![Value::Int32(1)],
         };
         assert_eq!(extract_index_name(&idx), "idx_a");
@@ -335,6 +539,7 @@ mod tests {
         let idx = ScanType::InListScan {
             index_id: 4,
             index_name: "idx_d".to_string(),
+            lookup_column: Some("d".to_string()),
             column_values: vec![vec![Value::Int32(1), Value::Int32(2)]],
         };
         assert_eq!(extract_index_name(&idx), "idx_d");
@@ -426,6 +631,7 @@ mod tests {
                 scan_type: ScanType::IndexScan {
                     index_id: 1,
                     index_name: "idx_t_id".to_string(),
+                    lookup_column: Some("id".to_string()),
                     values: vec![Value::Int32(1)],
                 },
             },
@@ -744,6 +950,142 @@ mod tests {
             physical_plan_to_plan_node(&nlj),
             PlanNode::NestedLoop { join_type, .. } if join_type == "Left"
         ));
+    }
+
+    #[test]
+    fn physical_plan_db9_cop_maps_to_pg_scan_with_tikv_annotations() {
+        let db9 = PhysicalPlan {
+            node: PhysicalNode::Db9Cop {
+                table_name: "public.users".to_string(),
+                alias: Some("u".to_string()),
+                scan: Db9CopScan::Index {
+                    scan_type: ScanType::IndexScan {
+                        index_id: 1,
+                        index_name: "users_email_idx".to_string(),
+                        lookup_column: Some("email".to_string()),
+                        values: vec![Value::Text("a@example.com".to_string())],
+                    },
+                },
+                ops: vec![
+                    Db9CopOp::Filter {
+                        predicate: bool_const(true),
+                    },
+                    Db9CopOp::Project {
+                        projections: vec![AnalyzedProjection {
+                            expr: int_const(1),
+                            output_name: "id".to_string(),
+                        }],
+                    },
+                    Db9CopOp::Limit { limit: 10 },
+                ],
+                display_column_count: 4,
+            },
+            schema: one_col_schema("id", DataType::Int32),
+            cost: PhysicalCost {
+                startup: 0.1,
+                total: 0.2,
+                rows: 1,
+            },
+        };
+
+        match physical_plan_to_plan_node(&db9) {
+            PlanNode::IndexScan {
+                table_name,
+                alias,
+                index_name,
+                index_cond,
+                filter,
+                annotations,
+                cost,
+                ..
+            } => {
+                assert_eq!(table_name, "public.users");
+                assert_eq!(alias, Some("u".to_string()));
+                assert_eq!(index_name, "users_email_idx");
+                assert_eq!(index_cond.as_deref(), Some("true"));
+                assert!(filter.is_none());
+                assert_eq!(cost.width, 160);
+                assert_eq!(annotations.task.as_deref(), Some("cop[tikv]"));
+                assert_eq!(annotations.output, Some(vec!["id".to_string()]));
+                assert_eq!(
+                    annotations.pushed_down,
+                    vec![
+                        "Filter".to_string(),
+                        "Project".to_string(),
+                        "Limit".to_string()
+                    ]
+                );
+                assert_eq!(
+                    annotations.storage_access.as_deref(),
+                    Some("point ('a@example.com')")
+                );
+                assert_eq!(annotations.storage_limit, Some(10));
+            }
+            other => panic!("unexpected node: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn db9_cop_access_detail_covers_index_variants() {
+        let point = Db9CopScan::Index {
+            scan_type: ScanType::IndexScan {
+                index_id: 1,
+                index_name: "idx_point".to_string(),
+                lookup_column: Some("point_col".to_string()),
+                values: vec![Value::Int32(20)],
+            },
+        };
+        assert_eq!(
+            format_db9_scan_access_detail(&point),
+            Some("point (20)".to_string())
+        );
+
+        let prefix = Db9CopScan::Index {
+            scan_type: ScanType::IndexRangeScan {
+                index_id: 2,
+                index_name: "idx_prefix".to_string(),
+                prefix_values: vec![Value::Text("active".to_string())],
+            },
+        };
+        assert_eq!(
+            format_db9_scan_access_detail(&prefix),
+            Some("prefix ('active')".to_string())
+        );
+
+        let bounded = Db9CopScan::Index {
+            scan_type: ScanType::IndexBoundedRangeScan {
+                index_id: 3,
+                index_name: "idx_bounded".to_string(),
+                prefix_values: vec![Value::Text("active".to_string())],
+                range_start: Some(Value::Int32(100)),
+                start_inclusive: true,
+                range_end: None,
+                end_inclusive: false,
+            },
+        };
+        assert_eq!(
+            format_db9_scan_access_detail(&bounded),
+            Some("prefix ('active'), range [100, +inf)".to_string())
+        );
+
+        let in_list = Db9CopScan::Index {
+            scan_type: ScanType::InListScan {
+                index_id: 4,
+                index_name: "idx_in".to_string(),
+                lookup_column: Some("in_col".to_string()),
+                column_values: vec![
+                    vec![Value::Int32(10)],
+                    vec![Value::Int32(20)],
+                    vec![Value::Int32(30)],
+                ],
+            },
+        };
+        assert_eq!(
+            format_db9_scan_access_detail(&in_list),
+            Some("in-list (10), (20), (30)".to_string())
+        );
+
+        assert_eq!(format_db9_scan_access_detail(&Db9CopScan::Seq), None);
     }
 
     #[test]

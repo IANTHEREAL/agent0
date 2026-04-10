@@ -1,4 +1,5 @@
 use crate::sql::Session;
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,6 +53,7 @@ pub(crate) struct StatementRuntimeContext {
     pub is_in_transaction: bool,
     pub caller_sub: Option<String>,
     pub txn_snapshot_ts_version: Option<u64>,
+    pub txn_dirty_table_ids: Arc<crate::session_context::TxnDirtyTableIds>,
     pub session_txn_tracker: Option<Arc<crate::session_context::SessionTxnTracker>>,
     pub tikv_client: Option<Arc<TransactionClient>>,
     pub extension_txn_delta: Arc<crate::session_context::ExtensionTxnDelta>,
@@ -71,6 +73,7 @@ impl StatementRuntimeContext {
             is_in_transaction: session.is_in_transaction(),
             caller_sub: session.current_user().map(|s| s.to_string()),
             txn_snapshot_ts_version: session.active_txn_start_ts_version(),
+            txn_dirty_table_ids: session.transaction_dirty_table_ids_snapshot(),
             session_txn_tracker: session.session_txn_tracker(),
             tikv_client,
             extension_txn_delta: session.extension_delta_snapshot(),
@@ -94,10 +97,13 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
     let tenant_keyspace = runtime.tenant_keyspace.clone();
     let database_id = runtime.database_id;
     let txn_snapshot_ts_version = runtime.txn_snapshot_ts_version;
+    let txn_dirty_table_ids = runtime.txn_dirty_table_ids.clone();
     let session_txn_tracker = runtime.session_txn_tracker.clone();
     let tikv_client = runtime.tikv_client.clone();
     let extension_txn_delta = runtime.extension_txn_delta.clone();
     let extension_statement_state = runtime.extension_statement_state.clone();
+    let statement_dirty_table_ids =
+        Arc::new(Mutex::new(crate::session_context::TxnDirtyTableIds::new()));
 
     // Box::pin the inner half of the nesting to cap the compiler-generated
     // future size.  Without this, debug-mode builds accumulate all 11
@@ -141,7 +147,13 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                     settings.search_path,
                     crate::session_context::with_text_search_config(
                         settings.text_search_config,
-                        inner,
+                        crate::session_context::with_txn_dirty_table_ids(
+                            txn_dirty_table_ids,
+                            crate::session_context::with_statement_dirty_table_ids(
+                                statement_dirty_table_ids,
+                                inner,
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -314,6 +326,7 @@ mod tests {
             is_in_transaction: false,
             caller_sub: None,
             txn_snapshot_ts_version: Some(999),
+            txn_dirty_table_ids: Arc::new(HashSet::from([88_u64])),
             session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
@@ -330,7 +343,21 @@ mod tests {
             let tsc = crate::session_context::current_text_search_config();
             let db_id = crate::session_context::current_database_id();
             let txn_ts = crate::session_context::current_txn_snapshot_ts_version();
-            (tz, msb, first_schema, tenant, tsc, db_id, txn_ts)
+            let dirty_tables = crate::session_context::current_txn_dirty_table_ids();
+            crate::session_context::record_statement_dirty_table_id(99);
+            let statement_dirty_tables =
+                crate::session_context::current_statement_dirty_table_ids();
+            (
+                tz,
+                msb,
+                first_schema,
+                tenant,
+                tsc,
+                db_id,
+                txn_ts,
+                dirty_tables,
+                statement_dirty_tables,
+            )
         })
         .await;
 
@@ -341,6 +368,8 @@ mod tests {
         assert_eq!(out.4.as_ref(), "simple");
         assert_eq!(out.5, 42);
         assert_eq!(out.6, Some(999));
+        assert_eq!(&*out.7, &HashSet::from([88_u64]));
+        assert_eq!(out.8, HashSet::from([99_u64]));
     }
 
     #[test]
@@ -389,6 +418,7 @@ mod tests {
             is_in_transaction: false,
             caller_sub: None,
             txn_snapshot_ts_version: Some(999),
+            txn_dirty_table_ids: Arc::new(HashSet::new()),
             session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
@@ -432,6 +462,7 @@ mod tests {
             is_in_transaction: false,
             caller_sub: None,
             txn_snapshot_ts_version: Some(999),
+            txn_dirty_table_ids: Arc::new(HashSet::new()),
             session_txn_tracker: None,
             tikv_client: None,
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),

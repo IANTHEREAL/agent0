@@ -414,6 +414,8 @@ fn evaluate_index(
             ScanType::IndexScan {
                 index_id: index.id,
                 index_name: index.name.clone(),
+                lookup_column: (index.columns.len() == 1 && index.expressions.is_empty())
+                    .then(|| index.columns[0].to_lowercase()),
                 values: prefix_values,
             },
             cost,
@@ -452,6 +454,7 @@ fn evaluate_index(
             ScanType::InListScan {
                 index_id: index.id,
                 index_name: index.name.clone(),
+                lookup_column: Some(next_col.to_lowercase()),
                 column_values,
             },
             cost,
@@ -592,6 +595,7 @@ fn evaluate_expression_index_typed(
         ScanType::IndexScan {
             index_id: index.id,
             index_name: index.name.clone(),
+            lookup_column: None,
             values,
         },
         cost,

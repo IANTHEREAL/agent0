@@ -18,7 +18,7 @@ pub fn date_days_to_naive_date(days: i32) -> Result<NaiveDate> {
 
 pub fn parse_date_days(s: &str) -> Result<i32> {
     let date = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-        .map_err(|_| anyhow!("invalid input syntax for type date: \"{}\"", s))?;
+        .map_err(|_| anyhow!("invalid input syntax for type date: \"{s}\""))?;
     naive_date_to_days(date)
 }
 

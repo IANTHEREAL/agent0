@@ -1,5 +1,6 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+#![allow(clippy::result_large_err)]
 #![type_length_limit = "8165158"]
 
 mod common;

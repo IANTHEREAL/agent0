@@ -607,8 +607,7 @@ mod test {
         async fn retry_timed(client: Arc<MockClient>, total_timeout: Duration) -> Result<()> {
             let deadline = Instant::now() + total_timeout;
             retry_core_with_timeout!(client, "test_timed", total_timeout, {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let per_attempt = remaining.min(total_timeout * 2 / 3);
+                let _remaining = deadline.saturating_duration_since(Instant::now());
                 let _attempt = client.attempts.fetch_add(1, Ordering::SeqCst);
                 // Simulate slow PD: responds at 150ms (> timeout/3=100ms but
                 // within per_attempt cap of timeout*2/3=200ms)

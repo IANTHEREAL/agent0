@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
 
+use crate::proto::coprocessor;
 use crate::proto::kvrpcpb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::store::RegionWithLeader;
@@ -24,6 +25,28 @@ pub trait Request: Any + Sync + Send + 'static {
     fn as_any(&self) -> &dyn Any;
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()>;
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion);
+}
+
+fn set_request_leader(
+    context: &mut Option<kvrpcpb::Context>,
+    leader: &RegionWithLeader,
+) -> Result<()> {
+    let ctx = context.get_or_insert(kvrpcpb::Context::default());
+    let leader_peer = leader.leader.as_ref().ok_or(Error::LeaderNotFound {
+        region: leader.ver_id(),
+    })?;
+    ctx.region_id = leader.region.id;
+    ctx.region_epoch = leader.region.region_epoch.clone();
+    ctx.peer = Some(leader_peer.clone());
+    Ok(())
+}
+
+fn set_request_api_version(
+    context: &mut Option<kvrpcpb::Context>,
+    api_version: kvrpcpb::ApiVersion,
+) {
+    let ctx = context.get_or_insert(kvrpcpb::Context::default());
+    ctx.api_version = api_version.into();
 }
 
 macro_rules! impl_request {
@@ -54,19 +77,11 @@ macro_rules! impl_request {
             }
 
             fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
-                let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
-                let leader_peer = leader.leader.as_ref().ok_or(Error::LeaderNotFound {
-                    region: leader.ver_id(),
-                })?;
-                ctx.region_id = leader.region.id;
-                ctx.region_epoch = leader.region.region_epoch.clone();
-                ctx.peer = Some(leader_peer.clone());
-                Ok(())
+                set_request_leader(&mut self.context, leader)
             }
 
             fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
-                let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
-                ctx.api_version = api_version.into();
+                set_request_api_version(&mut self.context, api_version);
             }
         }
     };
@@ -84,6 +99,40 @@ impl_request!(RawBatchScanRequest, raw_batch_scan, "raw_batch_scan");
 impl_request!(RawDeleteRangeRequest, raw_delete_range, "raw_delete_range");
 impl_request!(RawCasRequest, raw_compare_and_swap, "raw_compare_and_swap");
 impl_request!(RawCoprocessorRequest, raw_coprocessor, "raw_coprocessor");
+
+#[async_trait]
+impl Request for coprocessor::Request {
+    async fn dispatch(
+        &self,
+        client: &TikvClient<Channel>,
+        timeout: Duration,
+    ) -> Result<Box<dyn Any>> {
+        let mut req = self.clone().into_request();
+        req.set_timeout(timeout);
+        client
+            .clone()
+            .coprocessor(req)
+            .await
+            .map(|r| Box::new(r.into_inner()) as Box<dyn Any>)
+            .map_err(Error::GrpcAPI)
+    }
+
+    fn label(&self) -> &'static str {
+        "coprocessor"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
+        set_request_leader(&mut self.context, leader)
+    }
+
+    fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
+        set_request_api_version(&mut self.context, api_version);
+    }
+}
 
 impl_request!(GetRequest, kv_get, "kv_get");
 impl_request!(ScanRequest, kv_scan, "kv_scan");

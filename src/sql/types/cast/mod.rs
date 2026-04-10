@@ -94,6 +94,20 @@ fn value_is_compatible_with_column_type(value: &Value, column_type: &DataType) -
     }
 }
 
+fn cast_array_value(value: Value, elem_type: &DataType, context: CastContext) -> Result<Value> {
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Array(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for elem in elems {
+                out.push(cast_array_value(elem, elem_type, context)?);
+            }
+            Ok(Value::Array(out))
+        }
+        other => cast(other, elem_type, context),
+    }
+}
+
 /// Unified cast function: convert `val` to `target` type under the given `context`.
 ///
 /// Context-dependent behavior:
@@ -555,22 +569,14 @@ fn cast_to_array(val: Value, target: &DataType, context: CastContext) -> Result<
             })?;
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                if v == Value::Null {
-                    out.push(Value::Null);
-                } else {
-                    out.push(cast(v, elem_type, context)?);
-                }
+                out.push(cast_array_value(v, elem_type, context)?);
             }
             Ok(Value::Array(out))
         }
         Value::Array(elems) => {
             let mut out = Vec::with_capacity(elems.len());
             for v in elems {
-                if v == Value::Null {
-                    out.push(Value::Null);
-                } else {
-                    out.push(cast(v, elem_type, context)?);
-                }
+                out.push(cast_array_value(v, elem_type, context)?);
             }
             Ok(Value::Array(out))
         }
@@ -737,79 +743,7 @@ pub(crate) fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Val
 
 /// Parse a PostgreSQL array literal string into a Vec<Value>
 pub(crate) fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
-    let s = s.trim();
-    if !s.starts_with('{') || !s.ends_with('}') {
-        return Err(anyhow!("Invalid array format"));
-    }
-
-    let inner = &s[1..s.len() - 1];
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut quoted_element = false;
-    let mut escape_next = false;
-
-    for c in inner.chars() {
-        if escape_next {
-            current.push(c);
-            escape_next = false;
-            continue;
-        }
-
-        match c {
-            '\\' => escape_next = true,
-            '"' => {
-                if !in_quotes && current.trim().is_empty() {
-                    quoted_element = true;
-                }
-                in_quotes = !in_quotes;
-            }
-            ',' if !in_quotes => {
-                let val = parse_array_element(&current, quoted_element);
-                result.push(val);
-                current.clear();
-                quoted_element = false;
-            }
-            _ => current.push(c),
-        }
-    }
-
-    if !current.is_empty() || inner.ends_with(',') {
-        let val = parse_array_element(&current, quoted_element);
-        result.push(val);
-    }
-
-    Ok(result)
-}
-
-/// Parse a single array element string into a Value
-fn parse_array_element(s: &str, quoted: bool) -> Value {
-    let s = s.trim();
-    if !quoted && s.eq_ignore_ascii_case("NULL") {
-        return Value::Null;
-    }
-
-    if let Ok(i) = s.parse::<i32>() {
-        return Value::Int32(i);
-    }
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::Int64(i);
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return Value::Float64(f);
-    }
-    if s.eq_ignore_ascii_case("true") {
-        return Value::Boolean(true);
-    }
-    if s.eq_ignore_ascii_case("false") {
-        return Value::Boolean(false);
-    }
-
-    Value::Text(s.to_string())
+    crate::sql::value_coercion::parse_pg_array(s)
 }
 
 /// Infer the DataType from a Value

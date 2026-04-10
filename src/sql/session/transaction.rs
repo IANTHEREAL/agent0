@@ -50,6 +50,7 @@ impl Session {
         let name_for_settings = name.clone();
         let name_for_tracker = name.clone();
         let name_for_seq = name.clone();
+        let name_for_dirty_tables = name.clone();
         self.savepoints.create(name).await?;
         {
             let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
@@ -59,6 +60,7 @@ impl Session {
             .push_settings_savepoint(name_for_settings.clone());
         self.settings.push_guc_savepoint(name_for_settings.clone());
         self.push_extension_delta_savepoint(name_for_settings.clone());
+        self.push_transaction_dirty_table_savepoint(name_for_dirty_tables);
         self.push_session_auth_savepoint(name_for_settings);
         self.last_sequence_values.push_savepoint(name_for_seq);
         Ok(())
@@ -82,6 +84,7 @@ impl Session {
         self.settings.release_settings_savepoint(name);
         self.settings.release_guc_savepoint(name);
         self.release_extension_delta_savepoint(name);
+        self.release_transaction_dirty_table_savepoint(name);
         self.release_session_auth_savepoint(name);
         self.last_sequence_values.release_savepoint(name);
         Ok(())
@@ -144,6 +147,7 @@ impl Session {
         self.settings.rollback_settings_to_savepoint(name);
         self.settings.rollback_guc_to_savepoint(name);
         self.rollback_extension_delta_to_savepoint(name);
+        self.rollback_transaction_dirty_tables_to_savepoint(name);
         self.rollback_session_auth_to_savepoint(name);
         self.last_sequence_values.rollback_to_savepoint(name);
         self.sync_plan_cache_settings();
@@ -176,6 +180,8 @@ impl Session {
                 self.settings.begin_transaction_settings();
                 self.extension_delta = super::ExtensionDelta::default();
                 self.extension_delta_savepoints.clear();
+                self.transaction_dirty_table_ids.clear();
+                self.transaction_dirty_table_savepoints.clear();
                 self.session_auth_savepoints.clear();
                 self.transaction_timestamp_ms = Some(ts);
                 self.tx_statement_count = 0;
@@ -199,6 +205,8 @@ impl Session {
         self.tx_statement_count = 0;
         self.extension_delta = super::ExtensionDelta::default();
         self.extension_delta_savepoints.clear();
+        self.transaction_dirty_table_ids.clear();
+        self.transaction_dirty_table_savepoints.clear();
         self.session_auth_savepoints.clear();
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
@@ -260,6 +268,8 @@ impl Session {
         self.tx_statement_count = 0;
         self.extension_delta = super::ExtensionDelta::default();
         self.extension_delta_savepoints.clear();
+        self.transaction_dirty_table_ids.clear();
+        self.transaction_dirty_table_savepoints.clear();
         self.session_auth_savepoints.clear();
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {

@@ -77,7 +77,7 @@ impl Executor {
         search_path: &[String],
         statement: &Statement,
         analyze: bool,
-        _verbose: bool,
+        verbose: bool,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         let (actual_rows, execution_time_ms, kv_stats) = if analyze {
@@ -149,7 +149,7 @@ impl Executor {
                 cost: explain::PlanCost::default(),
             }
         };
-        let mut plan_text = explain::format_plan_text(&plan, 0);
+        let mut plan_text = explain::format_plan_text(&plan, 0, verbose);
         if let (Some(actual_rows), Some(execution_time_ms)) = (actual_rows, execution_time_ms) {
             use std::fmt::Write;
             writeln!(&mut plan_text, "Actual Rows: {}", actual_rows).unwrap();

@@ -91,6 +91,15 @@
 //! ```
 
 #![allow(clippy::field_reassign_with_default)]
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    clippy::manual_repeat_n,
+    clippy::result_large_err,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_map_or,
+    clippy::useless_conversion
+)]
 
 pub mod backoff;
 #[doc(hidden)]

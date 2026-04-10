@@ -1388,6 +1388,71 @@ fn make_schema_with_index() -> TableSchema {
     schema
 }
 
+fn make_schema_with_composite_index() -> TableSchema {
+    let mut schema = TableSchema::new(
+        "orders".to_string(),
+        1,
+        vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+                unique: true,
+                is_serial: false,
+                default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
+                collation: None,
+                is_dropped: false,
+            },
+            ColumnDef {
+                name: "status".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
+                collation: None,
+                is_dropped: false,
+            },
+            ColumnDef {
+                name: "created_at".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
+                collation: None,
+                is_dropped: false,
+            },
+        ],
+        vec![0],
+    );
+    schema.indexes.push(IndexDef {
+        name: "idx_orders_status_created_at".to_string(),
+        id: 101,
+        columns: vec!["status".to_string(), "created_at".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: Some("btree".to_string()),
+        predicate: None,
+        expressions: vec![],
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
+    });
+    schema
+}
+
 #[test]
 fn test_filter_above_scan_selects_index() {
     // Filter(id = 42) above Scan("t") with btree index on id
@@ -1551,5 +1616,371 @@ fn test_filter_above_scan_range_predicate() {
         );
     } else {
         panic!("expected Filter");
+    }
+}
+
+#[test]
+fn test_db9_cop_folding_seq_filter_project_limit() {
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert(
+        "users".to_string(),
+        TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                    is_dropped: false,
+                },
+                ColumnDef {
+                    name: "email".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                    is_dropped: false,
+                },
+                ColumnDef {
+                    name: "active".to_string(),
+                    data_type: DataType::Boolean,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                    is_dropped: false,
+                },
+            ],
+            vec![0],
+        ),
+    );
+
+    let scan = LogicalPlan::scan(
+        "users".to_string(),
+        None,
+        PlanSchema::from_columns(vec![
+            ("id".to_string(), DataType::Int64),
+            ("email".to_string(), DataType::Text),
+            ("active".to_string(), DataType::Boolean),
+        ]),
+    );
+    let predicate = TypedExpr {
+        kind: TypedExprKind::BinaryOp {
+            left: Box::new(TypedExpr {
+                kind: TypedExprKind::ColumnRef {
+                    scope_depth: 0,
+                    column_index: 2,
+                    column_name: "active".to_string(),
+                },
+                data_type: DataType::Boolean,
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(TypedExpr::new(
+                TypedExprKind::Constant(crate::model::Value::Boolean(true)),
+                DataType::Boolean,
+            )),
+        },
+        data_type: DataType::Boolean,
+    };
+    let project_schema = PlanSchema::from_columns(vec![
+        ("id".to_string(), DataType::Int64),
+        ("email".to_string(), DataType::Text),
+    ]);
+    let plan = scan
+        .filter(predicate)
+        .project(
+            vec![
+                simple_projection("id", DataType::Int64),
+                simple_projection("email", DataType::Text),
+            ],
+            project_schema,
+        )
+        .limit(
+            Some(TypedExpr::new(
+                TypedExprKind::Constant(crate::model::Value::Int32(10)),
+                DataType::Int32,
+            )),
+            None,
+        );
+
+    let physical = PhysicalPlanner::plan(&plan, &ctx);
+    match &physical.node {
+        crate::sql::optimizer::physical_plan::PhysicalNode::Limit { input, .. } => {
+            match &input.node {
+                crate::sql::optimizer::physical_plan::PhysicalNode::Db9Cop {
+                    ops,
+                    display_column_count,
+                    ..
+                } => {
+                    assert_eq!(ops.len(), 3);
+                    assert_eq!(*display_column_count, 3);
+                    assert!(matches!(
+                        ops[0],
+                        crate::sql::optimizer::physical_plan::Db9CopOp::Filter { .. }
+                    ));
+                    assert!(matches!(
+                        ops[1],
+                        crate::sql::optimizer::physical_plan::Db9CopOp::Project { .. }
+                    ));
+                    assert!(matches!(
+                        ops[2],
+                        crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 10 }
+                    ));
+                }
+                other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
+            }
+        }
+        other => panic!("expected outer Limit, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_db9_cop_folding_bounded_range_limit() {
+    let schema = make_schema_with_index();
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert("t".to_string(), schema);
+    ctx.table_stats
+        .insert("t".to_string(), make_table_stats(10000, HashMap::new()));
+
+    let scan = LogicalPlan::scan(
+        "t".to_string(),
+        None,
+        PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+    );
+    let predicate = TypedExpr {
+        kind: TypedExprKind::BinaryOp {
+            left: Box::new(simple_column("id", DataType::Int64)),
+            op: BinaryOp::Gt,
+            right: Box::new(simple_constant(
+                crate::model::Value::Int32(100),
+                DataType::Int64,
+            )),
+        },
+        data_type: DataType::Boolean,
+    };
+    let logical = scan.filter(predicate).limit(
+        Some(TypedExpr::new(
+            TypedExprKind::Constant(crate::model::Value::Int32(10)),
+            DataType::Int32,
+        )),
+        None,
+    );
+
+    let physical = PhysicalPlanner::plan(&logical, &ctx);
+    match &physical.node {
+        PhysicalNode::Limit { input, .. } => match &input.node {
+            PhysicalNode::Db9Cop {
+                scan: crate::sql::optimizer::physical_plan::Db9CopScan::Index { scan_type },
+                ops,
+                ..
+            } => {
+                assert!(matches!(
+                    scan_type,
+                    crate::sql::planner::ScanType::IndexBoundedRangeScan { .. }
+                ));
+                assert_eq!(ops.len(), 2);
+                assert!(matches!(
+                    ops[0],
+                    crate::sql::optimizer::physical_plan::Db9CopOp::Filter { .. }
+                ));
+                assert!(matches!(
+                    ops[1],
+                    crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 10 }
+                ));
+            }
+            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
+        },
+        other => panic!(
+            "expected outer Limit for bounded range plan, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_db9_cop_folding_prefix_range_limit() {
+    let schema = make_schema_with_composite_index();
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert("orders".to_string(), schema);
+    ctx.table_stats.insert(
+        "orders".to_string(),
+        make_table_stats(10000, HashMap::new()),
+    );
+
+    let scan = LogicalPlan::scan(
+        "orders".to_string(),
+        None,
+        PlanSchema::from_columns(vec![
+            ("id".to_string(), DataType::Int64),
+            ("status".to_string(), DataType::Text),
+            ("created_at".to_string(), DataType::Int64),
+        ]),
+    );
+    let predicate = TypedExpr {
+        kind: TypedExprKind::BinaryOp {
+            left: Box::new(simple_column("status", DataType::Text)),
+            op: BinaryOp::Eq,
+            right: Box::new(simple_constant(
+                crate::model::Value::Text("active".to_string()),
+                DataType::Text,
+            )),
+        },
+        data_type: DataType::Boolean,
+    };
+    let logical = scan.filter(predicate).limit(
+        Some(TypedExpr::new(
+            TypedExprKind::Constant(crate::model::Value::Int32(5)),
+            DataType::Int32,
+        )),
+        None,
+    );
+
+    let physical = PhysicalPlanner::plan(&logical, &ctx);
+    match &physical.node {
+        PhysicalNode::Limit { input, .. } => match &input.node {
+            PhysicalNode::Db9Cop {
+                scan: crate::sql::optimizer::physical_plan::Db9CopScan::Index { scan_type },
+                ops,
+                ..
+            } => {
+                assert!(matches!(
+                    scan_type,
+                    crate::sql::planner::ScanType::IndexRangeScan { .. }
+                ));
+                assert_eq!(ops.len(), 2);
+                assert!(matches!(
+                    ops[0],
+                    crate::sql::optimizer::physical_plan::Db9CopOp::Filter { .. }
+                ));
+                assert!(matches!(
+                    ops[1],
+                    crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 5 }
+                ));
+            }
+            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
+        },
+        other => panic!(
+            "expected outer Limit for prefix range plan, got {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_db9_cop_folding_keeps_offset_limit_local() {
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert(
+        "users".to_string(),
+        TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+                unique: true,
+                is_serial: false,
+                default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
+                collation: None,
+                is_dropped: false,
+            }],
+            vec![0],
+        ),
+    );
+
+    let scan = LogicalPlan::scan(
+        "users".to_string(),
+        None,
+        PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+    );
+    let projected = scan.project(
+        vec![simple_projection("id", DataType::Int64)],
+        PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+    );
+    let logical = projected.limit(
+        Some(TypedExpr::new(
+            TypedExprKind::Constant(crate::model::Value::Int32(5)),
+            DataType::Int32,
+        )),
+        Some(TypedExpr::new(
+            TypedExprKind::Constant(crate::model::Value::Int32(2)),
+            DataType::Int32,
+        )),
+    );
+
+    let physical = PhysicalPlanner::plan(&logical, &ctx);
+    match &physical.node {
+        PhysicalNode::Limit { input, .. } => {
+            assert!(matches!(
+                input.node,
+                crate::sql::optimizer::physical_plan::PhysicalNode::Db9Cop { .. }
+            ));
+        }
+        other => panic!("expected outer Limit, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_db9_cop_folding_skips_virtual_catalog_tables() {
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+
+    let scan = LogicalPlan::scan(
+        "information_schema.tables".to_string(),
+        None,
+        PlanSchema::from_columns(vec![
+            ("table_schema".to_string(), DataType::Text),
+            ("table_name".to_string(), DataType::Text),
+        ]),
+    );
+    let predicate = TypedExpr {
+        kind: TypedExprKind::BinaryOp {
+            left: Box::new(TypedExpr {
+                kind: TypedExprKind::ColumnRef {
+                    scope_depth: 0,
+                    column_index: 0,
+                    column_name: "table_schema".to_string(),
+                },
+                data_type: DataType::Text,
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(simple_constant(
+                crate::model::Value::Text("public".to_string()),
+                DataType::Text,
+            )),
+        },
+        data_type: DataType::Boolean,
+    };
+    let physical = PhysicalPlanner::plan(&scan.filter(predicate), &ctx);
+
+    match &physical.node {
+        PhysicalNode::Filter { input, .. } => {
+            assert!(matches!(input.node, PhysicalNode::SeqScan { .. }));
+        }
+        other => panic!("expected local Filter over SeqScan, got {:?}", other),
     }
 }

@@ -89,7 +89,7 @@ impl TimeZoneSpec {
 
         zone.parse::<chrono_tz::Tz>()
             .map(Self::Named)
-            .map_err(|_| anyhow::anyhow!("time zone \"{}\" not recognized", setting))
+            .map_err(|_| anyhow::anyhow!("time zone \"{setting}\" not recognized"))
     }
 
     pub fn parse(setting: &str) -> Self {
@@ -148,11 +148,11 @@ fn format_offset_suffix(offset_secs: i32) -> String {
     let seconds = abs % 60;
 
     if seconds != 0 {
-        format!("{sign}{:02}:{:02}:{:02}", hours, minutes, seconds)
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
     } else if minutes == 0 {
-        format!("{sign}{:02}", hours)
+        format!("{sign}{hours:02}")
     } else {
-        format!("{sign}{:02}:{:02}", hours, minutes)
+        format!("{sign}{hours:02}:{minutes:02}")
     }
 }
 

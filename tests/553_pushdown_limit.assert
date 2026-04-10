@@ -1,0 +1,8 @@
+Index Scan using db9_cop_limit_smoke_n_idx on db9_cop_limit_smoke
+Index Cond: (n >= 20)
+DB9 Cop Access: range [20, +inf)
+DB9 Cop Filter: (n >= 20)
+DB9 Cop Output: id, v
+DB9 Cop Limit: 1
+2|b
+limit_parity|0

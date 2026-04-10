@@ -867,11 +867,14 @@ impl TikvStore {
         let range: BoundRange = (prefix.clone()..end).into();
         let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         let mut tables = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
             if key.starts_with(&prefix) {
                 let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
-                tables.push(name);
+                if seen.insert(name.clone()) {
+                    tables.push(name);
+                }
             }
         }
 
@@ -1137,6 +1140,7 @@ impl TikvStore {
         db_id: u64,
         schema: TableSchema,
     ) -> Result<()> {
+        crate::session_context::record_statement_dirty_table_id(schema.table_id);
         let schema_key = self.key(&encode_schema_key_v2(db_id, &schema.name));
         let schema_data = serialize_schema(&schema)?;
         txn_put(txn, schema_key, schema_data).await?;
@@ -1177,6 +1181,7 @@ impl TikvStore {
             .version
             .checked_add(1)
             .ok_or_else(|| anyhow!("Schema version overflow"))?;
+        crate::session_context::record_statement_dirty_table_id(schema.table_id);
 
         txn_put(txn, new_key, serialize_schema(&schema)?).await?;
         txn_delete(txn, old_key).await?;

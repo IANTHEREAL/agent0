@@ -53,6 +53,7 @@ pub enum ScanType {
     IndexScan {
         index_id: u64,
         index_name: String,
+        lookup_column: Option<String>,
         values: Vec<Value>,
     },
     IndexRangeScan {
@@ -72,6 +73,7 @@ pub enum ScanType {
     InListScan {
         index_id: u64,
         index_name: String,
+        lookup_column: Option<String>,
         column_values: Vec<Vec<Value>>,
     },
     /// GIN inverted-index scan (FTS `@@`, JSONB `@>`, ARRAY `@>` / `&&`).

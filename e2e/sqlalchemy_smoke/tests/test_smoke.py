@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import DateTime, Integer, String, cast, extract, func, literal_column, select
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.orm import Mapped, Session, declarative_base, mapped_column
 
 from sqlalchemy_smoke.harness import SCHEMA_NAME, engine_from_env, managed_schema
@@ -73,6 +73,43 @@ def test_sqlalchemy_smoke():
                 assert session.get(Item, 2) is None
 
             with Session(engine) as session:
+                pending = Item(
+                    id=3,
+                    name="txn_visible",
+                    payload={"kind": "txn", "phase": "inserted"},
+                    occurred_at=datetime(2020, 1, 1, 12, 1, 30),
+                )
+                session.add(pending)
+                session.flush()
+
+                inserted = session.execute(
+                    select(Item.id, Item.name).where(Item.name == "txn_visible")
+                ).all()
+                assert inserted == [(3, "txn_visible")]
+
+                pending.name = "txn_updated"
+                pending.payload = {"kind": "txn", "phase": "updated"}
+                session.flush()
+
+                updated = session.execute(
+                    select(Item.name, Item.payload).where(Item.id == 3)
+                ).one()
+                assert updated == ("txn_updated", {"kind": "txn", "phase": "updated"})
+
+                session.delete(pending)
+                session.flush()
+
+                deleted_count = session.execute(
+                    select(func.count()).select_from(Item).where(Item.id == 3)
+                ).scalar_one()
+                assert deleted_count == 0
+
+                session.rollback()
+
+            with Session(engine) as session:
+                assert session.get(Item, 3) is None
+
+            with Session(engine) as session:
                 session.add_all(
                     [
                         Item(
@@ -98,6 +135,65 @@ def test_sqlalchemy_smoke():
                     .order_by(Item.id)
                 ).scalars()
                 assert list(jsonb_ids) == [10]
+
+            with Session(engine) as session:
+                session.execute(
+                    insert(Item),
+                    [
+                        {
+                            "id": 30,
+                            "name": "write_1",
+                            "payload": {"kind": "write", "phase": "inserted"},
+                            "occurred_at": datetime(2020, 1, 1, 12, 4, 0),
+                        },
+                        {
+                            "id": 31,
+                            "name": "write_2",
+                            "payload": {"kind": "write", "phase": "inserted"},
+                            "occurred_at": datetime(2020, 1, 1, 12, 5, 0),
+                        },
+                    ],
+                )
+                session.commit()
+
+            with Session(engine) as session:
+                upsert_stmt = insert(Item).values(
+                    id=30,
+                    name="write_1_upserted",
+                    payload={"kind": "write", "phase": "upserted"},
+                    occurred_at=datetime(2020, 1, 1, 12, 6, 0),
+                )
+                upsert_stmt = upsert_stmt.on_conflict_do_update(
+                    index_elements=[Item.id],
+                    set_={
+                        "name": upsert_stmt.excluded.name,
+                        "payload": upsert_stmt.excluded.payload,
+                        "occurred_at": upsert_stmt.excluded.occurred_at,
+                    },
+                )
+                session.execute(upsert_stmt)
+
+                write_2 = session.get(Item, 31)
+                assert write_2 is not None
+                write_2.name = "write_2_updated"
+                write_2.payload = {"kind": "write", "phase": "updated"}
+                session.flush()
+                session.delete(write_2)
+                session.commit()
+
+            with Session(engine) as session:
+                final_rows = session.execute(
+                    select(Item).where(Item.id.in_([1, 30, 31])).order_by(Item.id)
+                ).scalars().all()
+                assert [(row.id, row.name) for row in final_rows] == [
+                    (30, "write_1_upserted"),
+                ]
+                assert final_rows[0].payload == {"kind": "write", "phase": "upserted"}
+
+                final_count = session.execute(
+                    select(func.count()).select_from(Item).where(Item.id.in_([1, 30, 31]))
+                ).scalar_one()
+                assert final_count == 1
 
             with Session(engine) as session:
                 session.add_all(

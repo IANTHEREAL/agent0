@@ -60,6 +60,7 @@ Environment:
   PG_HOST/PG_PORT/PG_USER/PG_PASSWORD control the default DSN when --dsn is not provided.
   CLUSTER_NAME controls the TiKV cluster name when auto-starting.
   MANIFEST_PATH overrides the manifest path (same as --manifest).
+  DB9_RUN_COP_PUSHDOWN_TESTS opt-in enables custom-CSE pushdown SQL cases (default: 0).
 EOF
 }
 
@@ -69,6 +70,25 @@ trim_manifest_line() {
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf '%s\n' "$s"
+}
+
+db9_cop_pushdown_tests_enabled() {
+  local raw="${DB9_RUN_COP_PUSHDOWN_TESTS:-0}"
+  local raw_lc
+  raw_lc="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw_lc" in
+    1|true|t|yes|y|on) return 0 ;;
+    0|false|f|no|n|off) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_db9_cop_pushdown_test() {
+  local test_file="$1"
+  case "$test_file" in
+    tests/*pushdown*.sql) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 build_dsn_with_database() {
@@ -206,7 +226,14 @@ else
   )
 fi
 
-REGRESSION_TESTS=("${SQL_TESTS[@]}")
+REGRESSION_TESTS=()
+for test_file in "${SQL_TESTS[@]}"; do
+  if ! db9_cop_pushdown_tests_enabled && is_db9_cop_pushdown_test "$test_file"; then
+    echo "INFO: skipping custom-CSE DB9 cop regression '$test_file' because DB9_RUN_COP_PUSHDOWN_TESTS is disabled."
+    continue
+  fi
+  REGRESSION_TESTS+=("$test_file")
+done
 
 for test_file in "${REGRESSION_TESTS[@]}"; do
   if [[ ! -f "$ROOT_DIR/$test_file" ]]; then

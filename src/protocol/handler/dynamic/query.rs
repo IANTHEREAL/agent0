@@ -762,6 +762,7 @@ impl DynamicPgHandler {
             batch_rows_since_commit: 0,
             pending_self_fk_keys: std::collections::HashMap::new(),
             deferred_self_fk_checks: Vec::new(),
+            dirty_table_ids: std::collections::HashSet::new(),
         });
 
         let column_formats: Vec<i16> = vec![0; col_count];

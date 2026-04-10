@@ -73,6 +73,15 @@ pub(crate) const GUC_TABLE: &[GucDef] = &[
         validate_fn: Some(validate_db9_dml_table_scan_max_rows),
     },
     GucDef {
+        name: "db9.enable_cop_pushdown",
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
+        description: "Enable DB9 coprocessor pushdown planning",
+        boot_default: "off",
+        flags: 0,
+        validate_fn: Some(validate_db9_enable_cop_pushdown),
+    },
+    GucDef {
         name: "db9.hash_join_work_mem",
         guc_type: GucType::ByteSize,
         context: GucContext::Userset,

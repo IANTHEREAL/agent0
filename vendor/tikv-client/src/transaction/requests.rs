@@ -2,6 +2,7 @@
 
 use std::cmp;
 use std::iter;
+use std::ops::Range;
 use std::sync::Arc;
 
 use either::Either;
@@ -13,6 +14,7 @@ use super::transaction::TXN_COMMIT_BATCH_SIZE;
 use crate::collect_single;
 use crate::common::Error::PessimisticLockError;
 use crate::pd::PdClient;
+use crate::proto::coprocessor;
 use crate::proto::kvrpcpb::Action;
 use crate::proto::kvrpcpb::LockInfo;
 use crate::proto::kvrpcpb::TxnHeartBeatResponse;
@@ -41,11 +43,12 @@ use crate::shardable_range;
 use crate::store::RegionStore;
 use crate::store::Request;
 use crate::store::Store;
-use crate::store::{region_stream_for_keys, region_stream_for_range};
+use crate::store::{region_stream_for_keys, region_stream_for_range, region_stream_for_ranges};
 use crate::timestamp::TimestampExt;
 use crate::transaction::requests::kvrpcpb::prewrite_request::PessimisticAction;
 use crate::transaction::HasLocks;
 use crate::util::iter::FlatMapOkIterExt;
+use crate::Key;
 use crate::KvPair;
 use crate::Result;
 use crate::Value;
@@ -840,6 +843,102 @@ pub struct SecondaryLocksStatus {
     pub fallback_2pc: bool,
 }
 
+fn into_kvrpc_key_range(range: coprocessor::KeyRange) -> kvrpcpb::KeyRange {
+    kvrpcpb::KeyRange {
+        start_key: range.start,
+        end_key: range.end,
+    }
+}
+
+fn into_coprocessor_key_range(range: kvrpcpb::KeyRange) -> coprocessor::KeyRange {
+    coprocessor::KeyRange {
+        start: range.start_key,
+        end: range.end_key,
+    }
+}
+
+pub fn new_coprocessor_request(
+    tp: i64,
+    data: Vec<u8>,
+    start_ts: u64,
+    ranges: Vec<coprocessor::KeyRange>,
+) -> coprocessor::Request {
+    let mut req = coprocessor::Request::default();
+    req.tp = tp;
+    req.data = data;
+    req.start_ts = start_ts;
+    req.ranges = ranges;
+    req
+}
+
+impl KvRequest for coprocessor::Request {
+    type Response = coprocessor::Response;
+}
+
+impl Shardable for coprocessor::Request {
+    type Shard = Vec<coprocessor::KeyRange>;
+
+    fn shards(
+        &self,
+        pd_client: &Arc<impl PdClient>,
+    ) -> BoxStream<'static, Result<(Self::Shard, RegionWithLeader)>> {
+        region_stream_for_ranges(
+            self.ranges
+                .clone()
+                .into_iter()
+                .map(into_kvrpc_key_range)
+                .collect(),
+            pd_client.clone(),
+        )
+        .map(|result| {
+            result.map(|(ranges, region)| {
+                (
+                    ranges.into_iter().map(into_coprocessor_key_range).collect(),
+                    region,
+                )
+            })
+        })
+        .boxed()
+    }
+
+    fn apply_shard(&mut self, shard: Self::Shard) {
+        self.ranges = shard;
+    }
+
+    fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
+        self.set_leader(&store.region_with_leader)
+    }
+}
+
+#[allow(clippy::type_complexity)]
+impl Process<Vec<Result<ResponseWithShard<coprocessor::Response, Vec<coprocessor::KeyRange>>>>>
+    for DefaultProcessor
+{
+    type Out = Vec<(Vec<Range<Key>>, Vec<u8>)>;
+
+    fn process(
+        &self,
+        input: Result<
+            Vec<Result<ResponseWithShard<coprocessor::Response, Vec<coprocessor::KeyRange>>>>,
+        >,
+    ) -> Result<Self::Out> {
+        input?
+            .into_iter()
+            .map(|shard_resp| {
+                shard_resp.map(|ResponseWithShard(resp, ranges)| {
+                    (
+                        ranges
+                            .into_iter()
+                            .map(|range| range.start.into()..range.end.into())
+                            .collect(),
+                        resp.data,
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
 pair_locks!(kvrpcpb::BatchGetResponse);
 pair_locks!(kvrpcpb::ScanResponse);
 error_locks!(kvrpcpb::GetResponse);
@@ -851,6 +950,12 @@ error_locks!(kvrpcpb::CheckTxnStatusResponse);
 error_locks!(kvrpcpb::CheckSecondaryLocksResponse);
 
 impl HasLocks for kvrpcpb::CleanupResponse {}
+
+impl HasLocks for coprocessor::Response {
+    fn take_locks(&mut self) -> Vec<kvrpcpb::LockInfo> {
+        self.locked.take().into_iter().collect()
+    }
+}
 
 impl HasLocks for kvrpcpb::ScanLockResponse {
     fn take_locks(&mut self) -> Vec<LockInfo> {

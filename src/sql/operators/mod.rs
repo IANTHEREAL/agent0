@@ -28,6 +28,7 @@
 mod aggregate;
 mod context;
 mod cte;
+mod db9_cop;
 mod distinct;
 mod executor;
 mod filter;
@@ -49,6 +50,7 @@ pub use aggregate::*;
 pub use context::*;
 #[allow(unused_imports)] // Operator framework — re-exported for future use
 pub use cte::*;
+pub use db9_cop::*;
 pub use distinct::*;
 pub use executor::*;
 pub use filter::*;

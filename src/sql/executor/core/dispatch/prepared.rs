@@ -70,6 +70,16 @@ fn is_plan_cache_eligible(exec: &PreparedExec, rls_sensitive: bool) -> bool {
         _ => false,
     }
 }
+
+fn prepared_query_touches_dirty_tables(
+    resolved_table_ids: &[u64],
+    txn_dirty_table_ids: &crate::session_context::TxnDirtyTableIds,
+) -> bool {
+    resolved_table_ids
+        .iter()
+        .any(|table_id| txn_dirty_table_ids.contains(table_id))
+}
+
 /// Decide prepared plan cache action and mutate cache state for this attempt.
 ///
 /// This helper is intentionally mutating (entry LRU touches + miss-path counter
@@ -390,6 +400,9 @@ impl Executor {
             )
             .await;
 
+            let statement_dirty_tables =
+                crate::session_context::current_statement_dirty_table_ids();
+
             if res
                 .as_ref()
                 .err()
@@ -405,6 +418,7 @@ impl Executor {
             if is_autocommit {
                 match res {
                     Ok(PreparedTxnResult::Executed(result)) => {
+                        session.note_transaction_dirty_tables(statement_dirty_tables);
                         if is_observability_query {
                             session.rollback().await?;
                             self.clear_trigger_activations();
@@ -485,7 +499,10 @@ impl Executor {
                 }
             } else {
                 return match res? {
-                    PreparedTxnResult::Executed(result) => Ok(ExecuteResults::single(result)),
+                    PreparedTxnResult::Executed(result) => {
+                        session.note_transaction_dirty_tables(statement_dirty_tables);
+                        Ok(ExecuteResults::single(result))
+                    }
                     PreparedTxnResult::SchemaDrift {
                         table_name,
                         expected,
@@ -525,6 +542,7 @@ impl Executor {
             .iter()
             .map(|(_, table_id, _)| *table_id)
             .collect();
+        let txn_dirty_table_ids = session.transaction_dirty_table_ids_snapshot();
         let cache_key = PlanCacheKey::new(
             sql.to_string(),
             param_data_types,
@@ -532,11 +550,17 @@ impl Executor {
             session.search_path(),
             &resolved_table_ids,
             current_role,
+            session.settings().enable_cop_pushdown(),
         );
 
         // Check eligibility: analyzed SELECT only, and never cache plans that
         // require pre-materialization (subquery/async constants).
-        let cache_eligible = is_plan_cache_eligible(exec, rls_sensitive);
+        //
+        // Same-transaction writes make cached Db9Cop plans unsafe for any
+        // prepared query that touches the dirty table set because transactional
+        // coprocessor reads do not see the client's local write buffer.
+        let cache_eligible = is_plan_cache_eligible(exec, rls_sensitive)
+            && !prepared_query_touches_dirty_tables(&resolved_table_ids, &txn_dirty_table_ids);
 
         // Plan cache decision contract:
         // - lookup cached entry first
@@ -1282,6 +1306,7 @@ mod plan_cache_flow_tests {
             &["public".to_string()],
             resolved_table_ids,
             None,
+            false,
         )
     }
 
@@ -1309,6 +1334,14 @@ mod plan_cache_flow_tests {
         assert!(cached.is_none());
         assert!(!should_promote);
         assert_eq!(cache.counter_len(), 0);
+    }
+
+    #[test]
+    fn prepared_query_touches_dirty_tables_only_on_intersection() {
+        let dirty = std::collections::HashSet::from([7_u64, 11_u64]);
+        assert!(prepared_query_touches_dirty_tables(&[5, 7], &dirty));
+        assert!(!prepared_query_touches_dirty_tables(&[5, 6], &dirty));
+        assert!(!prepared_query_touches_dirty_tables(&[], &dirty));
     }
 
     #[test]

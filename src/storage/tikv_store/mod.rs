@@ -18,6 +18,7 @@ use tracing::{debug, info};
 
 // Submodules
 mod collations;
+mod coprocessor;
 pub mod cron;
 mod database;
 pub(crate) mod ddl_journal;
@@ -319,26 +320,7 @@ impl TikvStore {
 
     /// Ensure the default `postgres` database exists (storage format v2).
     pub async fn bootstrap_default_database(&self, owner: &str) -> Result<()> {
-        const DEFAULT_DB: &str = "postgres";
-
-        let mut txn = self.begin().await?;
-        if self.get_database_id(&mut txn, DEFAULT_DB).await?.is_some() {
-            txn.rollback().await.ok();
-            return Ok(());
-        }
-
-        let db_id = self.next_database_id(&mut txn).await?;
-        let def = DatabaseDef::default_postgres(db_id, owner.to_string());
-
-        let name_key = self.key(&encode_database_name_key(DEFAULT_DB));
-        txn_put(&mut txn, name_key, db_id.to_be_bytes().to_vec()).await?;
-
-        let id_key = self.key(&encode_database_id_key(db_id));
-        let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
-        txn_put(&mut txn, id_key, data).await?;
-
-        tikv_op!(txn.commit().await)?;
-        info!("Bootstrapped default database 'postgres' with ID {}", db_id);
+        self.ensure_default_database_visible(owner).await?;
         Ok(())
     }
 

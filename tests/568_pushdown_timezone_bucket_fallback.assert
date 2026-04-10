@@ -1,0 +1,7 @@
+Limit  (cost=
+Seq Scan on db9_cop_timezone_bucket_smoke
+DB9 Cop Filter: (id <= 3)
+1|2024-01-02
+2|2024-01-03
+3|2024-01-03
+timezone_bucket_parity|0

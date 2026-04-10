@@ -100,6 +100,11 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms,
             )),
             "db9.dml_table_scan_max_rows" => Some(self.dml_table_scan_max_rows.to_string()),
+            "db9.enable_cop_pushdown" => Some(if self.enable_cop_pushdown() {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }),
             "db9.hash_join_work_mem" => Some(self.hash_join_work_mem.to_string()),
             "db9.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
             "db9.password_grace_seconds" => Some(self.password_grace_seconds.to_string()),
@@ -388,6 +393,22 @@ impl SessionSettings {
             }
         }
         self.dml_table_scan_max_rows
+    }
+
+    pub(crate) fn enable_cop_pushdown(&self) -> bool {
+        if let Some(v) = self.local_overrides.get("db9.enable_cop_pushdown") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "yes" | "1" => return true,
+                "off" | "false" | "no" | "0" => return false,
+                other => {
+                    tracing::error!(
+                        value = other,
+                        "invalid local db9.enable_cop_pushdown override"
+                    );
+                }
+            }
+        }
+        self.db9_enable_cop_pushdown
     }
 
     #[allow(dead_code)]

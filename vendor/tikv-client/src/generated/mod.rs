@@ -14,6 +14,9 @@ pub mod configpb {
 pub mod coprocessor {
     include!("coprocessor.rs");
 }
+pub mod db9_coprocessor {
+    include!("db9_coprocessor.rs");
+}
 pub mod deadlock {
     include!("deadlock.rs");
 }

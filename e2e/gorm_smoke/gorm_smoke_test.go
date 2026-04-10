@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 )
@@ -25,6 +27,8 @@ type Widget struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 }
+
+const gormPushdownEnv = "DB9_GORM_SMOKE_ENABLE_COP_PUSHDOWN"
 
 func TestGormSmoke(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("PG_DSN"))
@@ -99,6 +103,25 @@ func TestGormSmoke(t *testing.T) {
 	if byUnique.ID != widget.ID {
 		t.Fatalf("query by unique: expected id=%d, got %d", widget.ID, byUnique.ID)
 	}
+	withPushdownProof(t, db, ctx, func(pushdownDB *gorm.DB) error {
+		var proofUnique Widget
+		if err := pushdownDB.Select("id", "name").Where("name = ?", widget.Name).Take(&proofUnique).Error; err != nil {
+			return fmt.Errorf("pushdown query by unique: %w", err)
+		}
+		if proofUnique.ID != widget.ID {
+			return fmt.Errorf("pushdown query by unique: expected id=%d, got %d", widget.ID, proofUnique.ID)
+		}
+		return explainContainsSubstrings(
+			pushdownDB,
+			ctx,
+			fmt.Sprintf(
+				"SELECT id, name FROM %s.widgets WHERE name = %s LIMIT 1",
+				quoteIdent(schemaName),
+				quoteLiteral(widget.Name),
+			),
+			[]string{"DB9 Cop"},
+		)
+	})
 
 	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		tmp := Widget{
@@ -129,6 +152,141 @@ func TestGormSmoke(t *testing.T) {
 	// (<1ms) truncation/rounding deltas on roundtrip.
 	if delta := absDuration(byTime.HappenedAt.Sub(createdAt)); delta > time.Millisecond {
 		t.Fatalf("time roundtrip: expected %v, got %v (delta %v)", createdAt, byTime.HappenedAt, delta)
+	}
+
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		pending := Widget{
+			Name:       "widget_txn_visible",
+			HappenedAt: createdAt.Add(3 * time.Second),
+			Metadata: map[string]any{
+				"phase": "inserted",
+			},
+		}
+		if err := tx.Create(&pending).Error; err != nil {
+			return fmt.Errorf("txn create: %w", err)
+		}
+
+		var inserted Widget
+		if err := tx.Where("name = ?", pending.Name).First(&inserted).Error; err != nil {
+			return fmt.Errorf("txn read after insert: %w", err)
+		}
+		if inserted.ID != pending.ID {
+			return fmt.Errorf("txn read after insert: expected id=%d got %d", pending.ID, inserted.ID)
+		}
+
+		if err := tx.Model(&Widget{}).Where("id = ?", pending.ID).Updates(map[string]any{
+			"name": "widget_txn_updated",
+		}).Error; err != nil {
+			return fmt.Errorf("txn update: %w", err)
+		}
+
+		var updated Widget
+		if err := tx.Where("id = ?", pending.ID).First(&updated).Error; err != nil {
+			return fmt.Errorf("txn read after update: %w", err)
+		}
+		if updated.Name != "widget_txn_updated" {
+			return fmt.Errorf("txn read after update: expected updated name, got %q", updated.Name)
+		}
+
+		if err := tx.Delete(&Widget{}, pending.ID).Error; err != nil {
+			return fmt.Errorf("txn delete: %w", err)
+		}
+
+		var count int64
+		if err := tx.Model(&Widget{}).Where("id = ?", pending.ID).Count(&count).Error; err != nil {
+			return fmt.Errorf("txn read after delete: %w", err)
+		}
+		if count != 0 {
+			return fmt.Errorf("txn read after delete: expected count=0 got %d", count)
+		}
+
+		return errors.New("force rollback after write visibility check")
+	})
+	if err == nil {
+		t.Fatalf("expected write-visibility transaction to rollback")
+	}
+
+	var rolledBackCount int64
+	if err := db.WithContext(ctx).Model(&Widget{}).Where("name IN ?", []string{"widget_txn_visible", "widget_txn_updated"}).Count(&rolledBackCount).Error; err != nil {
+		t.Fatalf("rollback visibility cleanup: %v", err)
+	}
+	if rolledBackCount != 0 {
+		t.Fatalf("expected rolled back txn rows to disappear, got count=%d", rolledBackCount)
+	}
+
+	extra := []Widget{
+		{
+			Name:       "widget_batch_1",
+			HappenedAt: createdAt.Add(4 * time.Second),
+			Metadata: map[string]any{
+				"slot":  "batch_1",
+				"phase": "inserted",
+			},
+		},
+		{
+			Name:       "widget_batch_2",
+			HappenedAt: createdAt.Add(5 * time.Second),
+			Metadata: map[string]any{
+				"slot":  "batch_2",
+				"phase": "inserted",
+			},
+		},
+	}
+	if err := db.WithContext(ctx).Create(&extra).Error; err != nil {
+		t.Fatalf("batch create: %v", err)
+	}
+
+	upsertedAt := createdAt.Add(6 * time.Second)
+	upsert := Widget{
+		ID:         extra[0].ID,
+		Name:       "widget_batch_1_upserted",
+		HappenedAt: upsertedAt,
+	}
+	if err := db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"name":        upsert.Name,
+			"happened_at": upsert.HappenedAt,
+		}),
+	}).Create(&upsert).Error; err != nil {
+		t.Fatalf("upsert committed row: %v", err)
+	}
+
+	if err := db.WithContext(ctx).Model(&Widget{}).Where("id = ?", extra[1].ID).Updates(map[string]any{
+		"name": "widget_batch_2_updated",
+	}).Error; err != nil {
+		t.Fatalf("update committed row: %v", err)
+	}
+	if err := db.WithContext(ctx).Delete(&Widget{}, extra[1].ID).Error; err != nil {
+		t.Fatalf("delete committed row: %v", err)
+	}
+
+	var snapshot []Widget
+	if err := db.WithContext(ctx).Order("id").Find(&snapshot).Error; err != nil {
+		t.Fatalf("final snapshot query: %v", err)
+	}
+	if len(snapshot) != 2 {
+		t.Fatalf("final snapshot: expected 2 rows, got %d (%#v)", len(snapshot), snapshot)
+	}
+	if snapshot[0].ID != widget.ID || snapshot[0].Name != "widget_1" {
+		t.Fatalf("final snapshot row0 mismatch: %#v", snapshot[0])
+	}
+	if got := snapshot[0].Metadata["hello"]; got != "world" {
+		t.Fatalf("final snapshot row0 metadata mismatch: %#v", snapshot[0].Metadata)
+	}
+	if snapshot[1].ID != extra[0].ID || snapshot[1].Name != "widget_batch_1_upserted" {
+		t.Fatalf("final snapshot row1 mismatch: %#v", snapshot[1])
+	}
+	if delta := absDuration(snapshot[1].HappenedAt.Sub(upsertedAt)); delta > time.Millisecond {
+		t.Fatalf("final snapshot row1 happened_at mismatch: expected %v got %v (delta %v)", upsertedAt, snapshot[1].HappenedAt, delta)
+	}
+
+	var finalCount int64
+	if err := db.WithContext(ctx).Model(&Widget{}).Count(&finalCount).Error; err != nil {
+		t.Fatalf("final count: %v", err)
+	}
+	if finalCount != 2 {
+		t.Fatalf("final count: expected 2 got %d", finalCount)
 	}
 }
 
@@ -232,15 +390,118 @@ func openDB(t *testing.T, ctx context.Context, dsn, schemaName string) (*gorm.DB
 
 func normalizeDSN(dsn string) string {
 	if !(strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")) {
+		return strings.TrimSpace(dsn)
+	}
+
+	parsed, err := url.Parse(dsn)
+	if err != nil {
 		return dsn
 	}
-	if strings.Contains(dsn, "sslmode=") {
-		return dsn
+
+	query := parsed.Query()
+	if query.Get("sslmode") == "" {
+		query.Set("sslmode", "disable")
 	}
-	if strings.Contains(dsn, "?") {
-		return dsn + "&sslmode=disable"
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func gormPushdownEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(gormPushdownEnv))) {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	default:
+		return false
 	}
-	return dsn + "?sslmode=disable"
+}
+
+func withPushdownProof(
+	t *testing.T,
+	db *gorm.DB,
+	ctx context.Context,
+	fn func(pushdownDB *gorm.DB) error,
+) {
+	t.Helper()
+	if !gormPushdownEnabled() {
+		return
+	}
+
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL db9.enable_cop_pushdown = on").Error; err != nil {
+			return fmt.Errorf("enable db9 cop pushdown for proof query: %w", err)
+		}
+		return fn(tx.WithContext(ctx))
+	}); err != nil {
+		t.Fatalf("pushdown proof transaction: %v", err)
+	}
+}
+
+func explainContainsSubstrings(
+	db *gorm.DB,
+	ctx context.Context,
+	query string,
+	expected []string,
+	args ...any,
+) error {
+	if !gormPushdownEnabled() {
+		return nil
+	}
+
+	rows, err := db.WithContext(ctx).Raw("EXPLAIN VERBOSE "+query, args...).Rows()
+	if err != nil {
+		return fmt.Errorf("explain pushdown candidate %q: %w", query, err)
+	}
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return fmt.Errorf("scan EXPLAIN row for %q: %w", query, err)
+		}
+		lines = append(lines, line)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate EXPLAIN rows for %q: %w", query, err)
+	}
+
+	for _, needle := range expected {
+		found := false
+		for _, line := range lines {
+			if strings.Contains(line, needle) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf(
+				"expected %q in EXPLAIN VERBOSE for %q, got %#v",
+				needle,
+				query,
+				lines,
+			)
+		}
+	}
+	return nil
+}
+
+func assertExplainContainsSubstrings(
+	t *testing.T,
+	db *gorm.DB,
+	ctx context.Context,
+	query string,
+	expected []string,
+	args ...any,
+) {
+	t.Helper()
+	if err := explainContainsSubstrings(db, ctx, query, expected, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertExplainContainsDB9Cop(t *testing.T, db *gorm.DB, ctx context.Context, query string, args ...any) {
+	t.Helper()
+	assertExplainContainsSubstrings(t, db, ctx, query, []string{"DB9 Cop"}, args...)
 }
 
 func randomHex(t *testing.T, byteLen int) string {
@@ -255,6 +516,10 @@ func randomHex(t *testing.T, byteLen int) string {
 
 func quoteIdent(ident string) string {
 	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
+
+func quoteLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func absDuration(d time.Duration) time.Duration {

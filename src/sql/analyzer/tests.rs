@@ -2564,6 +2564,20 @@ fn analyze_insert_enum_array_cast_resolves_search_path_udt() {
 }
 
 #[test]
+fn analyze_insert_accepts_multidimensional_array_assignment_by_base_element_type() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "t_int_arr",
+            vec![("vals", DataType::Array(Box::new(DataType::Int32)), false)],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO t_int_arr (vals) VALUES (ARRAY[[1, 2], [3, 4]])");
+    let result = analyzer.analyze_statement(&stmt);
+    assert!(result.is_ok(), "unexpected analyzer error: {result:?}");
+}
+
+#[test]
 fn analyze_insert_values_preserves_quoted_target_columns() {
     let catalog = MockCatalog::builder()
         .table(

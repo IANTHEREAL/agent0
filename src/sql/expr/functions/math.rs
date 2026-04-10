@@ -64,8 +64,8 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
 
 pub fn abs(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
-        Some(Value::Int32(n)) => Ok(Value::Int32(n.abs())),
-        Some(Value::Int64(n)) => Ok(Value::Int64(n.abs())),
+        Some(Value::Int32(n)) => Ok(Value::Int32(n.saturating_abs())),
+        Some(Value::Int64(n)) => Ok(Value::Int64(n.saturating_abs())),
         Some(Value::Float64(n)) => Ok(Value::Float64(n.abs())),
         Some(Value::Numeric(d)) => Ok(Value::Numeric(d.abs())),
         _ => Ok(Value::Null),
@@ -473,6 +473,14 @@ mod tests {
         assert_eq!(
             abs(vec![Value::Float64(-std::f64::consts::PI)]).unwrap(),
             Value::Float64(std::f64::consts::PI)
+        );
+        assert_eq!(
+            abs(vec![Value::Int32(i32::MIN)]).unwrap(),
+            Value::Int32(i32::MAX)
+        );
+        assert_eq!(
+            abs(vec![Value::Int64(i64::MIN)]).unwrap(),
+            Value::Int64(i64::MAX)
         );
     }
 

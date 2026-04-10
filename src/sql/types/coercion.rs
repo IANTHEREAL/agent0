@@ -142,6 +142,17 @@ pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
         return Some(a.clone());
     }
 
+    // Mixed integer/float comparisons keep their original operand types so
+    // runtime evaluation can preserve integer precision without lossy `as f64`
+    // promotion above the 53-bit mantissa boundary.
+    if matches!(
+        (a, b),
+        (DataType::Int32 | DataType::Int64, DataType::Float64)
+            | (DataType::Float64, DataType::Int32 | DataType::Int64)
+    ) {
+        return None;
+    }
+
     // Unknown adapts to the other type.
     if matches!(a, DataType::Unknown) {
         return Some(b.clone());
@@ -209,8 +220,15 @@ pub fn is_assignment_compatible(from: &DataType, to: &DataType) -> bool {
     if matches!(from, DataType::Text) || matches!(to, DataType::Text) {
         return true;
     }
-    if let (DataType::Array(inner_from), DataType::Array(inner_to)) = (from, to) {
-        return is_assignment_compatible(inner_from, inner_to);
+    if let (DataType::Array(_), DataType::Array(_)) = (from, to) {
+        fn array_base_type(dt: &DataType) -> &DataType {
+            match dt {
+                DataType::Array(inner) => array_base_type(inner),
+                other => other,
+            }
+        }
+
+        return is_assignment_compatible(array_base_type(from), array_base_type(to));
     }
     if let (DataType::Vector(from_dim), DataType::Vector(to_dim)) = (from, to) {
         return match (*from_dim, *to_dim) {
@@ -462,6 +480,22 @@ mod tests {
     }
 
     #[test]
+    fn comparison_int_float_requires_exact_runtime_compare() {
+        assert_eq!(
+            comparison_target_type(&DataType::Int64, &DataType::Float64),
+            None
+        );
+        assert_eq!(
+            comparison_target_type(&DataType::Float64, &DataType::Int64),
+            None
+        );
+        assert_eq!(
+            comparison_target_type(&DataType::Int32, &DataType::Float64),
+            None
+        );
+    }
+
+    #[test]
     fn common_type_same_type() {
         assert_eq!(
             common_type(&DataType::Boolean, &DataType::Boolean),
@@ -603,6 +637,18 @@ mod tests {
         assert!(is_assignment_compatible(
             &DataType::Vector(1024),
             &DataType::Vector(1024)
+        ));
+    }
+
+    #[test]
+    fn assignment_compatibility_ignores_array_dimensions_when_base_types_match() {
+        assert!(is_assignment_compatible(
+            &DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32)))),
+            &DataType::Array(Box::new(DataType::Int32))
+        ));
+        assert!(!is_assignment_compatible(
+            &DataType::Array(Box::new(DataType::Array(Box::new(DataType::Boolean)))),
+            &DataType::Array(Box::new(DataType::Int32))
         ));
     }
 }

@@ -311,6 +311,84 @@ PG_DSN="$PG_DSN" bash scripts/e2e_tests.sh sqlalchemy_smoke
 PG_DSN="$PG_DSN" bash scripts/e2e_tests.sh dify_sqlalchemy_compat
 ```
 
+### 4.8.1 DB9 Cop pushdown smoke
+
+For the DB9 cop pushdown path specifically, run the dedicated smoke after TiKV
+and `db9-server` are already up:
+
+```bash
+bash scripts/db9_cop_pushdown_smoke.sh
+```
+
+What it validates:
+
+- exact index lookup
+- `IN (...)` index lookup
+- one-sided and two-sided bounded range
+- composite-index prefix range
+- supported function-whitelist projection parity:
+  `lower`, `upper`, `length`, `char_length`, `character_length`, `abs`,
+  `coalesce`, `nullif`
+- unsupported `substr(...)` still returns the correct result under
+  `db9.enable_cop_pushdown = on` without falling into a runtime
+  `not implemented` error
+- `db9.enable_cop_pushdown = on/off` result parity
+- pushdown-off `EXPLAIN` stays local for the baseline exact-lookup probe
+
+Useful overrides:
+
+```bash
+PGHOST=127.0.0.1 \
+PGPORT=5433 \
+PGPASSWORD=admin \
+DB9_PUSHDOWN_SMOKE_USER=admin \
+bash scripts/db9_cop_pushdown_smoke.sh
+```
+
+The script auto-detects `default.admin` vs `admin`, reseeds its own smoke
+tables on every run, tails `/tmp/db9-server.log` by default, and now asserts
+the concrete DB9 access-detail shapes for:
+
+- point lookup
+- in-list lookup
+- one-sided and two-sided bounded ranges
+- composite-index prefix lookup
+- composite-index prefix + bounded range
+
+For SQL golden coverage of the same DB9 cop surface, run the dedicated
+integration-test pack:
+
+```bash
+bash scripts/db9_cop_pushdown_regression.sh
+# Or:
+PG_DSN="$PG_DSN" bash scripts/db9_cop_pushdown_regression.sh
+```
+
+For the same pack through the actual fast-gate entrypoint, run:
+
+```bash
+bash scripts/db9_cop_pushdown_gate.sh
+# Or:
+PG_DSN="$PG_DSN" bash scripts/db9_cop_pushdown_gate.sh
+```
+
+Those cases are also wired into `scripts/regression_gate.list` so the fast
+regression gate now covers:
+
+- seq scan pushdown
+- exact secondary-index lookup
+- in-list secondary-index lookup
+- projection pruning
+- pushed limit
+- composite-index prefix access detail
+- composite-index prefix + bounded-range access detail
+- function-whitelist projection parity
+- unsupported-expression fallback parity
+
+The pushdown-only gate manifest lives in:
+
+- `scripts/regression_gate_pushdown.list`
+
 ### 4.9 Full suite (one command: TiKV + build + integration + ORM)
 
 ```bash

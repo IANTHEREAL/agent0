@@ -18,12 +18,22 @@ pub use transform::physical_plan_to_plan_node;
 
 const DEFAULT_ROW_WIDTH: usize = 40;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanAnnotations {
+    pub task: Option<String>,
+    pub output: Option<Vec<String>>,
+    pub pushed_down: Vec<String>,
+    pub storage_access: Option<String>,
+    pub storage_limit: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub enum PlanNode {
     SeqScan {
         table_name: String,
         alias: Option<String>,
         filter: Option<String>,
+        annotations: PlanAnnotations,
         cost: PlanCost,
     },
     IndexScan {
@@ -32,6 +42,7 @@ pub enum PlanNode {
         index_name: String,
         index_cond: Option<String>,
         filter: Option<String>,
+        annotations: PlanAnnotations,
         cost: PlanCost,
     },
     HnswScan {
@@ -40,6 +51,7 @@ pub enum PlanNode {
         index_name: String,
         distance_metric: String,
         k: usize,
+        annotations: PlanAnnotations,
         cost: PlanCost,
     },
     NestedLoop {

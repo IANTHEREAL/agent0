@@ -7,7 +7,9 @@ use crate::sql::analyzer::types::{
     JoinCondition, SetOpKind, TableRefSchema, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::optimizer::logical_plan::PlanSchema;
-use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
+use crate::sql::optimizer::physical_plan::{
+    Db9CopOp, Db9CopScan, PhysicalCost, PhysicalNode, PhysicalPlan,
+};
 use crate::sql::types::CastContext;
 
 fn test_table_schema() -> TableSchema {
@@ -24,6 +26,25 @@ fn test_table_schema() -> TableSchema {
 
 fn test_ctx() -> BuildContext {
     BuildContext::new().with_schema("test_table".to_string(), test_table_schema())
+}
+
+fn test_table_schema_with_backfill() -> TableSchema {
+    TableSchema::new(
+        "test_table".to_string(),
+        1,
+        vec![
+            ColumnDef::new("id", DataType::Int32, false)
+                .primary_key()
+                .serial()
+                .default_expr("nextval('public.test_table_id_seq')"),
+            ColumnDef::new("dept_id", DataType::Int32, true).default_expr("1"),
+        ],
+        vec![0],
+    )
+}
+
+fn test_ctx_with_backfill() -> BuildContext {
+    BuildContext::new().with_schema("test_table".to_string(), test_table_schema_with_backfill())
 }
 
 fn make_schema(cols: &[(&str, DataType)]) -> PlanSchema {
@@ -65,6 +86,80 @@ fn test_seq_scan_with_alias() {
     let ctx = BuildContext::new().with_schema(key, test_table_schema());
     let op = plan.build_operators(&ctx).unwrap();
     assert_eq!(op.schema().from_alias, Some("t".to_string()));
+}
+
+#[test]
+fn test_db9_cop_build_creates_runtime_operator() {
+    let plan = PhysicalPlan {
+        node: PhysicalNode::Db9Cop {
+            table_name: "test_table".to_string(),
+            alias: None,
+            scan: Db9CopScan::Seq,
+            ops: vec![],
+            display_column_count: 2,
+        },
+        schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
+        cost: PhysicalCost::default(),
+    };
+    let ctx = test_ctx();
+    let op = plan.build_operators(&ctx).unwrap();
+    assert_eq!(op.name(), "Db9Cop");
+    assert_eq!(op.schema().columns.len(), 2);
+}
+
+#[test]
+fn test_db9_cop_build_preserves_backfill_metadata_for_full_row_output() {
+    let plan = PhysicalPlan {
+        node: PhysicalNode::Db9Cop {
+            table_name: "test_table".to_string(),
+            alias: None,
+            scan: Db9CopScan::Seq,
+            ops: vec![],
+            display_column_count: 2,
+        },
+        schema: make_schema(&[("id", DataType::Int32), ("dept_id", DataType::Int32)]),
+        cost: PhysicalCost::default(),
+    };
+    let ctx = test_ctx_with_backfill();
+    let op = plan.build_operators(&ctx).unwrap();
+    assert!(op.schema().columns[0].is_serial);
+    assert_eq!(
+        op.schema().columns[0].default_expr.as_deref(),
+        Some("nextval('public.test_table_id_seq')")
+    );
+    assert_eq!(op.schema().columns[1].default_expr.as_deref(), Some("1"));
+}
+
+#[test]
+fn test_db9_cop_build_preserves_backfill_metadata_for_direct_column_projection() {
+    let plan = PhysicalPlan {
+        node: PhysicalNode::Db9Cop {
+            table_name: "test_table".to_string(),
+            alias: None,
+            scan: Db9CopScan::Seq,
+            ops: vec![Db9CopOp::Project {
+                projections: vec![AnalyzedProjection {
+                    expr: TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 1,
+                            column_name: "dept_id".to_string(),
+                        },
+                        data_type: DataType::Int32,
+                    },
+                    output_name: "department".to_string(),
+                }],
+            }],
+            display_column_count: 1,
+        },
+        schema: make_schema(&[("department", DataType::Int32)]),
+        cost: PhysicalCost::default(),
+    };
+    let ctx = test_ctx_with_backfill();
+    let op = plan.build_operators(&ctx).unwrap();
+    assert_eq!(op.schema().columns[0].name, "department");
+    assert_eq!(op.schema().columns[0].default_expr.as_deref(), Some("1"));
+    assert!(!op.schema().columns[0].is_serial);
 }
 
 #[test]

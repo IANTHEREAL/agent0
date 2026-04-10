@@ -211,6 +211,25 @@ fn array_cast_both_contexts() {
     assert_eq!(assignment, expected);
 }
 
+#[test]
+fn array_cast_recursively_coerces_multidimensional_values_by_base_type() {
+    let arr = Value::Array(vec![
+        Value::Array(vec![Value::Int64(1), Value::Int64(2)]),
+        Value::Array(vec![Value::Int64(3), Value::Int64(4)]),
+    ]);
+    let target = DataType::Array(Box::new(DataType::Int32));
+
+    let assignment = cast(arr, &target, CastContext::Assignment).unwrap();
+
+    assert_eq!(
+        assignment,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+        ])
+    );
+}
+
 // ---- Vector: works in both contexts ----
 #[test]
 fn vector_cast_both_contexts() {
@@ -724,6 +743,54 @@ fn test_parse_pg_array_quoted_null_is_text() {
     assert_eq!(result.len(), 2);
     assert_eq!(result[0], Value::Null);
     assert_eq!(result[1], Value::Text("NULL".to_string()));
+}
+
+#[test]
+fn cast_text_to_text_array_preserves_quoted_text_lexemes() {
+    let result = cast(
+        Value::Text("{\" 01 \",\"true\",\"NULL\",\"a,b\"}".to_string()),
+        &DataType::Array(Box::new(DataType::Text)),
+        CastContext::Explicit,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        Value::Array(vec![
+            Value::Text(" 01 ".to_string()),
+            Value::Text("true".to_string()),
+            Value::Text("NULL".to_string()),
+            Value::Text("a,b".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn test_parse_pg_array_multidimensional() {
+    let result = parse_pg_array("{{1,2},{3,NULL}}").unwrap();
+    assert_eq!(
+        result,
+        vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(3), Value::Null]),
+        ]
+    );
+}
+
+#[test]
+fn cast_text_to_int_array_preserves_multidimensional_shape() {
+    let result = cast(
+        Value::Text("{{1,2},{3,4}}".to_string()),
+        &DataType::Array(Box::new(DataType::Int32)),
+        CastContext::Explicit,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+        ])
+    );
 }
 
 #[test]

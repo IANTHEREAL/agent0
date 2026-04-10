@@ -2,6 +2,7 @@
 
 use std::fmt::Display;
 
+use crate::proto::coprocessor;
 use crate::proto::kvrpcpb;
 use crate::Error;
 
@@ -65,6 +66,7 @@ has_region_error!(kvrpcpb::RawScanResponse);
 has_region_error!(kvrpcpb::RawBatchScanResponse);
 has_region_error!(kvrpcpb::RawCasResponse);
 has_region_error!(kvrpcpb::RawCoprocessorResponse);
+has_region_error!(coprocessor::Response);
 
 macro_rules! has_key_error {
     ($type:ty) => {
@@ -103,6 +105,22 @@ macro_rules! has_str_error {
     };
 }
 
+macro_rules! has_other_str_error {
+    ($type:ty) => {
+        impl HasKeyErrors for $type {
+            fn key_errors(&mut self) -> Option<Vec<Error>> {
+                if self.other_error.is_empty() {
+                    None
+                } else {
+                    Some(vec![Error::KvError {
+                        message: std::mem::take(&mut self.other_error),
+                    }])
+                }
+            }
+        }
+    };
+}
+
 has_str_error!(kvrpcpb::RawGetResponse);
 has_str_error!(kvrpcpb::RawGetKeyTtlResponse);
 has_str_error!(kvrpcpb::RawPutResponse);
@@ -115,6 +133,7 @@ has_str_error!(kvrpcpb::RawCoprocessorResponse);
 has_str_error!(kvrpcpb::ImportResponse);
 has_str_error!(kvrpcpb::DeleteRangeResponse);
 has_str_error!(kvrpcpb::UnsafeDestroyRangeResponse);
+has_other_str_error!(coprocessor::Response);
 
 impl HasKeyErrors for kvrpcpb::ScanResponse {
     fn key_errors(&mut self) -> Option<Vec<Error>> {

@@ -21,9 +21,15 @@ Aliases:
 
 Environment:
   PG_DSN           PostgreSQL DSN (e.g. postgres://admin:admin@127.0.0.1:5433/postgres?sslmode=disable)
+  DB9_RUN_COP_PUSHDOWN_TESTS
+                   Opt in to pushdown-specific smoke tests that require a DB9-cop-capable CSE
+  DB9_E2E_IGNORE_COP_PUSHDOWN_TESTS
+                   Force-skip pushdown-specific smoke tests even when DB9_RUN_COP_PUSHDOWN_TESTS=1
 
 Examples:
   PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
+  PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres DB9_RUN_COP_PUSHDOWN_TESTS=1 \
+    bash scripts/e2e_tests.sh sqlalchemy_smoke
   PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh dify_sqlalchemy_compat
   PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh all
 EOF

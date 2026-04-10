@@ -429,6 +429,17 @@ bash scripts/regression_gate.sh --dsn "$PG_DSN"
 # Tier-2 E2E suites (app-like smoke tests; requires running db9-server)
 PG_DSN=postgres://admin:<password>@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
 
+# DB9 cop pushdown smoke (scan shapes + access details + function whitelist + local fallback)
+bash scripts/db9_cop_pushdown_smoke.sh
+
+# DB9 cop pushdown SQL regression pack (integration_test.py golden cases, 550..557)
+bash scripts/db9_cop_pushdown_regression.sh
+# Or override DSN explicitly:
+PG_DSN="$PG_DSN" bash scripts/db9_cop_pushdown_regression.sh
+
+# DB9 cop pushdown fast-gate entrypoint (runs through regression_gate.sh)
+bash scripts/db9_cop_pushdown_gate.sh
+
 # Full automated test suite (slower; broader coverage)
 ./run_tests.sh
 

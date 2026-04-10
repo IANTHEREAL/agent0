@@ -39,6 +39,8 @@ const TOPN_THRESHOLD: usize = 1000;
 pub struct PlanningContext {
     pub table_stats: HashMap<String, Arc<TableStatistics>>,
     pub table_schemas: HashMap<String, TableSchema>,
+    pub enable_db9_cop_pushdown: bool,
+    pub txn_dirty_table_ids: std::collections::HashSet<u64>,
 }
 
 impl PlanningContext {
@@ -47,6 +49,18 @@ impl PlanningContext {
         Self {
             table_stats: HashMap::new(),
             table_schemas: HashMap::new(),
+            enable_db9_cop_pushdown:
+                crate::sql::query_context::QueryContext::current_setting_snapshot(
+                    "db9.enable_cop_pushdown",
+                )
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "on" | "true" | "yes" | "1"
+                    )
+                })
+                .unwrap_or(false),
+            txn_dirty_table_ids: (*crate::session_context::current_txn_dirty_table_ids()).clone(),
         }
     }
 
@@ -67,7 +81,22 @@ pub struct PhysicalPlanner;
 impl PhysicalPlanner {
     /// Plan a logical plan into a physical plan.
     pub fn plan(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
-        Self::plan_node(logical, ctx)
+        let plan = Self::plan_node(logical, ctx);
+        if ctx.enable_db9_cop_pushdown {
+            let base_table_keys: std::collections::HashSet<String> = ctx
+                .table_schemas
+                .iter()
+                .filter(|(_, schema)| !ctx.txn_dirty_table_ids.contains(&schema.table_id))
+                .map(|(key, _)| key.clone())
+                .collect();
+            if base_table_keys.is_empty() {
+                plan
+            } else {
+                super::pushdown::apply_db9_cop_folding_for_base_tables(plan, &base_table_keys)
+            }
+        } else {
+            plan
+        }
     }
 
     /// Walk a logical subtree to find base-table stats.

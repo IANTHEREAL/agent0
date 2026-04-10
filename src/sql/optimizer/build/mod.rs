@@ -7,6 +7,7 @@
 //! construction is a pure, synchronous tree walk (no async catalog lookups).
 
 mod aggregate;
+mod db9_cop;
 mod join;
 mod scan;
 mod utils;
@@ -97,6 +98,21 @@ impl PhysicalPlan {
             } => {
                 scan::build_index_scan_operator(ctx, table_name, alias.as_deref(), scan_type, None)
             }
+
+            PhysicalNode::Db9Cop {
+                table_name,
+                alias,
+                scan,
+                ops,
+                ..
+            } => db9_cop::build_db9_cop_operator(
+                ctx,
+                &self.schema,
+                table_name,
+                alias.as_deref(),
+                scan,
+                ops,
+            ),
 
             PhysicalNode::Empty => {
                 // No-input operator for SELECT without FROM.

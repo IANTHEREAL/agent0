@@ -1,0 +1,14 @@
+Index Scan using db9_cop_prefix_smoke_status_created_idx on db9_cop_prefix_smoke
+Index Cond: (status = 'active'::text)
+DB9 Cop Access: prefix ('active')
+DB9 Cop Filter: (status = 'active'::text)
+DB9 Cop Output: id, created_at
+DB9 Cop Limit: 2
+1|100
+2|200
+Index Cond: ((status = 'active'::text) AND (created_at >= 200))
+DB9 Cop Access: prefix ('active'), range [200, +inf)
+DB9 Cop Filter: ((status = 'active'::text) AND (created_at >= 200))
+4|300
+prefix_parity|0
+prefix_range_parity|0

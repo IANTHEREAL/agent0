@@ -5,7 +5,7 @@
 
 use std::fmt::Write;
 
-use super::PlanNode;
+use super::{PlanAnnotations, PlanNode};
 use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
 
 pub(super) fn quote_sql_literal(s: &str) -> String {
@@ -126,10 +126,82 @@ pub(crate) fn format_typed_expr(expr: &TypedExpr) -> String {
 }
 
 /// Format a `PlanNode` tree as PostgreSQL-compatible EXPLAIN text output.
-pub fn format_plan_text(plan: &PlanNode, indent: usize) -> String {
+pub fn format_plan_text(plan: &PlanNode, indent: usize, verbose: bool) -> String {
     let mut output = String::new();
-    format_plan_node(&mut output, plan, indent, true);
+    format_plan_node(&mut output, plan, indent, true, verbose);
     output
+}
+
+fn format_plan_annotations(
+    output: &mut String,
+    annotations: &PlanAnnotations,
+    indent: usize,
+    verbose: bool,
+) {
+    let pad = " ".repeat(indent);
+
+    if let Some(task) = &annotations.task {
+        writeln!(output, "{}  Task: {}", pad, task).unwrap();
+    }
+
+    if !verbose {
+        return;
+    }
+
+    if let Some(columns) = &annotations.output {
+        if !columns.is_empty() {
+            writeln!(output, "{}  Output: {}", pad, columns.join(", ")).unwrap();
+        }
+    }
+
+    if !annotations.pushed_down.is_empty() {
+        writeln!(
+            output,
+            "{}  Pushed Down: {}",
+            pad,
+            annotations.pushed_down.join(", ")
+        )
+        .unwrap();
+    }
+
+    if let Some(access) = &annotations.storage_access {
+        writeln!(output, "{}  Storage Access: {}", pad, access).unwrap();
+    }
+
+    if let Some(limit) = annotations.storage_limit {
+        writeln!(output, "{}  Storage Limit: {}", pad, limit).unwrap();
+    }
+}
+
+fn is_db9_cop_annotations(annotations: &PlanAnnotations) -> bool {
+    annotations.task.as_deref() == Some("cop[tikv]")
+}
+
+fn format_db9_cop_annotations(
+    output: &mut String,
+    annotations: &PlanAnnotations,
+    indent: usize,
+    filter_expr: Option<&str>,
+) {
+    let pad = " ".repeat(indent);
+
+    if let Some(access) = &annotations.storage_access {
+        writeln!(output, "{}  DB9 Cop Access: {}", pad, access).unwrap();
+    }
+
+    if let Some(filter) = filter_expr {
+        writeln!(output, "{}  DB9 Cop Filter: {}", pad, filter).unwrap();
+    }
+
+    if let Some(columns) = &annotations.output {
+        if !columns.is_empty() {
+            writeln!(output, "{}  DB9 Cop Output: {}", pad, columns.join(", ")).unwrap();
+        }
+    }
+
+    if let Some(limit) = annotations.storage_limit {
+        writeln!(output, "{}  DB9 Cop Limit: {}", pad, limit).unwrap();
+    }
 }
 
 fn format_relation_display(table_name: &str, alias: Option<&str>) -> String {
@@ -145,7 +217,13 @@ fn format_relation_display(table_name: &str, alias: Option<&str>) -> String {
     }
 }
 
-fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_first: bool) {
+fn format_plan_node(
+    output: &mut String,
+    plan: &PlanNode,
+    indent: usize,
+    is_first: bool,
+    verbose: bool,
+) {
     let prefix = if is_first {
         " ".repeat(indent)
     } else {
@@ -157,6 +235,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             table_name,
             alias,
             filter,
+            annotations,
             cost,
         } => {
             let table_display = format_relation_display(table_name, alias.as_deref());
@@ -169,6 +248,11 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             if let Some(f) = filter {
                 writeln!(output, "{}  Filter: {}", " ".repeat(indent), f).unwrap();
             }
+            if is_db9_cop_annotations(annotations) {
+                format_db9_cop_annotations(output, annotations, indent, filter.as_deref());
+            } else {
+                format_plan_annotations(output, annotations, indent, verbose);
+            }
         }
         PlanNode::IndexScan {
             table_name,
@@ -176,6 +260,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             index_name,
             index_cond,
             filter,
+            annotations,
             cost,
         } => {
             let table_display = format_relation_display(table_name, alias.as_deref());
@@ -191,6 +276,16 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             if let Some(f) = filter {
                 writeln!(output, "{}  Filter: {}", " ".repeat(indent), f).unwrap();
             }
+            if is_db9_cop_annotations(annotations) {
+                format_db9_cop_annotations(
+                    output,
+                    annotations,
+                    indent,
+                    index_cond.as_deref().or(filter.as_deref()),
+                );
+            } else {
+                format_plan_annotations(output, annotations, indent, verbose);
+            }
         }
         PlanNode::HnswScan {
             table_name,
@@ -198,6 +293,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             index_name,
             distance_metric,
             k,
+            annotations,
             cost,
         } => {
             let table_display = format_relation_display(table_name, alias.as_deref());
@@ -207,6 +303,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 prefix, index_name, table_display, cost.startup, cost.total, cost.rows, cost.width
             )
             .unwrap();
+            format_plan_annotations(output, annotations, indent, verbose);
             writeln!(
                 output,
                 "{}  Distance Metric: {}  K: {}",
@@ -228,7 +325,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             )
             .unwrap();
             for (i, child) in children.iter().enumerate() {
-                format_plan_node(output, child, indent + 6, i == 0);
+                format_plan_node(output, child, indent + 6, i == 0, verbose);
             }
         }
         PlanNode::HashJoin {
@@ -247,7 +344,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 writeln!(output, "{}  Hash Cond: {}", " ".repeat(indent), cond).unwrap();
             }
             for (i, child) in children.iter().enumerate() {
-                format_plan_node(output, child, indent + 6, i == 0);
+                format_plan_node(output, child, indent + 6, i == 0, verbose);
             }
         }
         PlanNode::SemiJoin {
@@ -271,7 +368,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 writeln!(output, "{}  Hash Cond: {}", " ".repeat(indent), cond).unwrap();
             }
             for (i, child) in children.iter().enumerate() {
-                format_plan_node(output, child, indent + 6, i == 0);
+                format_plan_node(output, child, indent + 6, i == 0, verbose);
             }
         }
         PlanNode::Sort {
@@ -292,7 +389,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 sort_key.join(", ")
             )
             .unwrap();
-            format_plan_node(output, child, indent + 6, false);
+            format_plan_node(output, child, indent + 6, false, verbose);
         }
         PlanNode::Limit { cost, child } => {
             writeln!(
@@ -301,7 +398,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 prefix, cost.startup, cost.total, cost.rows, cost.width
             )
             .unwrap();
-            format_plan_node(output, child, indent + 6, false);
+            format_plan_node(output, child, indent + 6, false, verbose);
         }
         PlanNode::Aggregate {
             strategy,
@@ -323,7 +420,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             if !key_display.is_empty() {
                 writeln!(output, "{}{}", " ".repeat(indent), key_display).unwrap();
             }
-            format_plan_node(output, child, indent + 6, false);
+            format_plan_node(output, child, indent + 6, false, verbose);
         }
         PlanNode::Filter {
             condition,
@@ -337,7 +434,7 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             )
             .unwrap();
             writeln!(output, "{}  Filter: {}", " ".repeat(indent), condition).unwrap();
-            format_plan_node(output, child, indent + 6, false);
+            format_plan_node(output, child, indent + 6, false, verbose);
         }
         PlanNode::TableFunctionScan {
             function_name,

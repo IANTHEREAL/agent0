@@ -1,0 +1,4 @@
+Index Scan using db9_cop_fallback_smoke_n_idx on db9_cop_fallback_smoke
+DB9 Cop Access: point (20)
+b
+fallback_parity|0

@@ -1,0 +1,18 @@
+Index Scan using db9_cop_datetime_smoke_created_at_idx on db9_cop_datetime_smoke
+Index Cond: ((created_at >= 1704153600000) AND (created_at < 1704326400000))
+DB9 Cop Access: range [1704153600000, 1704326400000)
+DB9 Cop Filter: ((created_at >= 1704153600000) AND (created_at < 1704326400000))
+DB9 Cop Output: id, created_at
+DB9 Cop Limit: 2
+2|2024-01-02 12:34:56
+3|2024-01-03 23:59:59
+Index Scan using db9_cop_datetime_smoke_created_tz_idx on db9_cop_datetime_smoke
+DB9 Cop Access: point (1704355200000)
+DB9 Cop Output: id, created_tz
+DB9 Cop Limit: 1
+4|2024-01-04 08:00:00+00
+Filter: (date_trunc('day'::text, created_at) = 1704153600000)
+Seq Scan on db9_cop_datetime_smoke
+datetime_range_parity|0
+datetime_timestamptz_parity|0
+datetime_date_trunc_parity|0

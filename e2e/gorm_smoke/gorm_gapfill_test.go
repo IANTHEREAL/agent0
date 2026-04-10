@@ -183,6 +183,142 @@ func TestGormGapfillOps(t *testing.T) {
 		t.Fatalf("window: unexpected rows: %#v", windowRows)
 	}
 
+	// secondary-index row fetch: exact composite-index predicate returns non-index payload
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf(`
+			CREATE TABLE %s.lookup_owner (
+				id INTEGER PRIMARY KEY,
+				label TEXT NOT NULL
+			)`, quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("create lookup_owner: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf(`
+			CREATE TABLE %s.lookup_rows (
+				id INTEGER PRIMARY KEY,
+				owner_id INTEGER NOT NULL,
+				a INTEGER NOT NULL,
+				b INTEGER NOT NULL,
+				payload TEXT NOT NULL
+			)`, quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("create lookup_rows: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf("CREATE INDEX idx_lookup_owner_label ON %s.lookup_owner(label)", quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("create lookup_owner label index: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf("CREATE INDEX idx_lookup_rows_ab ON %s.lookup_rows(a, b)", quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("create lookup_rows ab index: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf(`
+			INSERT INTO %s.lookup_owner (id, label)
+			VALUES (1, 'target-owner'), (2, 'other-owner')`, quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("insert lookup_owner: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf(`
+			INSERT INTO %s.lookup_rows (id, owner_id, a, b, payload)
+			VALUES
+				(100, 1, 1234, 1, 'target-hit'),
+				(101, 1, 1234, 2, 'same-owner-other-b'),
+				(102, 2, 4321, 1, 'other-owner-other-a')`, quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("insert lookup_rows: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf(`
+			INSERT INTO %s.lookup_rows (id, owner_id, a, b, payload)
+			SELECT
+				1000 + i,
+				2,
+				20000 + i,
+				i %% 7,
+				'filler'
+			FROM generate_series(1, 2048) AS gs(i)`, quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("insert lookup_rows filler: %v", err)
+	}
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf("ANALYZE %s.lookup_rows", quoteIdent(schemaName)),
+	).Error; err != nil {
+		t.Fatalf("analyze lookup_rows: %v", err)
+	}
+
+	var rowFetchRows []struct {
+		ID      int    `gorm:"column:id"`
+		Payload string `gorm:"column:payload"`
+	}
+	rowFetchSQL := fmt.Sprintf(
+		"SELECT id, payload FROM %s.lookup_rows WHERE a = 1234 AND b = abs(-1) LIMIT 1",
+		quoteIdent(schemaName),
+	)
+	if err := db.WithContext(ctx).Raw(
+		rowFetchSQL,
+	).Scan(&rowFetchRows).Error; err != nil {
+		t.Fatalf("secondary-index row fetch: %v", err)
+	}
+	if len(rowFetchRows) != 1 || rowFetchRows[0].ID != 100 || rowFetchRows[0].Payload != "target-hit" {
+		t.Fatalf("secondary-index row fetch: unexpected rows: %#v", rowFetchRows)
+	}
+	withPushdownProof(t, db, ctx, func(pushdownDB *gorm.DB) error {
+		if err := explainContainsSubstrings(
+			pushdownDB,
+			ctx,
+			rowFetchSQL,
+			[]string{
+				fmt.Sprintf("Index Scan using idx_lookup_rows_ab on %s.lookup_rows", schemaName),
+				"DB9 Cop Access: prefix (1234)",
+				"DB9 Cop Output: id, payload",
+				"DB9 Cop Limit: 1",
+			},
+		); err != nil {
+			return err
+		}
+
+		var proofRows []struct {
+			ID      int    `gorm:"column:id"`
+			Payload string `gorm:"column:payload"`
+		}
+		if err := pushdownDB.WithContext(ctx).Raw(rowFetchSQL).Scan(&proofRows).Error; err != nil {
+			return fmt.Errorf("pushdown secondary-index row fetch: %w", err)
+		}
+		if len(proofRows) != 1 || proofRows[0].ID != 100 || proofRows[0].Payload != "target-hit" {
+			return fmt.Errorf("pushdown secondary-index row fetch: unexpected rows: %#v", proofRows)
+		}
+		return nil
+	})
+
+	var joinRows []struct {
+		ID      int    `gorm:"column:id"`
+		Payload string `gorm:"column:payload"`
+		Label   string `gorm:"column:label"`
+	}
+	if err := db.WithContext(ctx).Raw(
+		fmt.Sprintf(`
+			SELECT r.id, r.payload, o.label
+			FROM %s.lookup_owner o
+			INNER JOIN %s.lookup_rows r ON r.owner_id = o.id
+			WHERE o.label = 'target-owner'
+			  AND r.a = 1234
+			  AND r.b = abs(-1)
+			ORDER BY r.id`,
+			quoteIdent(schemaName),
+			quoteIdent(schemaName),
+		),
+	).Scan(&joinRows).Error; err != nil {
+		t.Fatalf("join + secondary-index row fetch: %v", err)
+	}
+	if len(joinRows) != 1 || joinRows[0].ID != 100 || joinRows[0].Payload != "target-hit" || joinRows[0].Label != "target-owner" {
+		t.Fatalf("join + secondary-index row fetch: unexpected rows: %#v", joinRows)
+	}
+
 	// json_and_array: array_insert / array_query
 	if err := db.WithContext(ctx).Exec(
 		fmt.Sprintf("CREATE TABLE %s.arr_t (id INTEGER PRIMARY KEY, tags INTEGER[])", quoteIdent(schemaName)),

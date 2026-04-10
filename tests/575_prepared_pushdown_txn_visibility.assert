@@ -1,0 +1,9 @@
+prepared_dml_on
+1|u1_upsert
+prepared_dml_off
+prepared_ddl_on
+3|c
+prepared_ddl_off
+prepared_copy_on
+4|d
+prepared_copy_off

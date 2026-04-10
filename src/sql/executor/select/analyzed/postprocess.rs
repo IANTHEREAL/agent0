@@ -587,7 +587,9 @@ fn coerce_any_all_rhs_for_comparison(
 
 #[cfg(test)]
 mod tests {
-    use super::has_skip_locked_clause;
+    use super::{build_any_all_rhs_constant_expr, has_skip_locked_clause};
+    use crate::model::{DataType, Value};
+    use crate::sql::analyzer::types::TypedExprKind;
     use sqlparser::ast::{LockClause, LockType, NonBlock};
 
     #[test]
@@ -620,5 +622,20 @@ mod tests {
         };
         assert!(!has_skip_locked_clause(&[share_plain]));
         assert!(!has_skip_locked_clause(&[update_nowait]));
+    }
+
+    #[test]
+    fn build_any_all_rhs_constant_expr_preserves_mixed_int_float_type() {
+        let rhs = build_any_all_rhs_constant_expr(
+            &DataType::Int64,
+            &DataType::Float64,
+            Value::Float64(9_007_199_254_740_992.0),
+        );
+
+        assert!(matches!(
+            rhs.kind,
+            TypedExprKind::Constant(Value::Float64(9_007_199_254_740_992.0))
+        ));
+        assert_eq!(rhs.data_type, DataType::Float64);
     }
 }

@@ -1646,6 +1646,54 @@ mod tests {
         assert!(session.is_superuser());
     }
 
+    #[test]
+    fn transaction_dirty_tables_rollback_to_savepoint_restores_snapshot() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_dirty_tables_sp");
+        let mut session =
+            Session::new_with_database(store, observability, 1, 1, "postgres".to_string(), 0, 0)
+                .unwrap();
+
+        session.force_test_transaction_state(true, false);
+        session.note_transaction_dirty_tables([10_u64]);
+        session.push_transaction_dirty_table_savepoint("sp1".to_string());
+
+        session.note_transaction_dirty_tables([20_u64]);
+        assert_eq!(
+            &*session.transaction_dirty_table_ids_snapshot(),
+            &std::collections::HashSet::from([10_u64, 20_u64])
+        );
+
+        session.rollback_transaction_dirty_tables_to_savepoint("sp1");
+        assert_eq!(
+            &*session.transaction_dirty_table_ids_snapshot(),
+            &std::collections::HashSet::from([10_u64])
+        );
+    }
+
+    #[test]
+    fn transaction_dirty_tables_release_savepoint_keeps_current_state() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_dirty_tables_release");
+        let mut session =
+            Session::new_with_database(store, observability, 1, 1, "postgres".to_string(), 0, 0)
+                .unwrap();
+
+        session.force_test_transaction_state(true, false);
+        session.note_transaction_dirty_tables([10_u64]);
+        session.push_transaction_dirty_table_savepoint("sp1".to_string());
+        session.note_transaction_dirty_tables([20_u64]);
+        session.push_transaction_dirty_table_savepoint("sp2".to_string());
+        session.note_transaction_dirty_tables([30_u64]);
+
+        session.release_transaction_dirty_table_savepoint("sp2");
+        session.rollback_transaction_dirty_tables_to_savepoint("sp1");
+        assert_eq!(
+            &*session.transaction_dirty_table_ids_snapshot(),
+            &std::collections::HashSet::from([10_u64])
+        );
+    }
+
     // --- bytea_output GUC validation (#1538) ---
 
     #[test]
@@ -1677,6 +1725,49 @@ mod tests {
         assert!(settings
             .set_known_setting("bytea_output", "".to_string())
             .is_err());
+    }
+
+    #[test]
+    fn db9_enable_cop_pushdown_defaults_to_off_and_round_trips() {
+        let mut settings = SessionSettings::new_with_defaults(0, 0);
+        assert_eq!(
+            settings.show_value("db9.enable_cop_pushdown").as_deref(),
+            Some("off")
+        );
+        assert!(!settings.enable_cop_pushdown());
+
+        settings
+            .set_known_setting("db9.enable_cop_pushdown", "on".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("db9.enable_cop_pushdown").as_deref(),
+            Some("on")
+        );
+        assert!(settings.enable_cop_pushdown());
+
+        settings.reset_setting("db9.enable_cop_pushdown");
+        assert_eq!(
+            settings.show_value("db9.enable_cop_pushdown").as_deref(),
+            Some("off")
+        );
+        assert!(!settings.enable_cop_pushdown());
+    }
+
+    #[test]
+    fn db9_enable_cop_pushdown_local_override_takes_precedence() {
+        let mut settings = SessionSettings::new_with_defaults(0, 0);
+        settings
+            .set_known_setting("db9.enable_cop_pushdown", "off".to_string())
+            .unwrap();
+        settings
+            .set_local_override("db9.enable_cop_pushdown", "on".to_string())
+            .unwrap();
+
+        assert_eq!(
+            settings.show_value("db9.enable_cop_pushdown").as_deref(),
+            Some("on")
+        );
+        assert!(settings.enable_cop_pushdown());
     }
 
     // ── statement_timeout hard cap tests ────────────────────────────────

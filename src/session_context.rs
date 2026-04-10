@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use tikv_client::{TimestampExt, Transaction};
 
 use crate::sql::{DEFAULT_HASH_JOIN_WORK_MEM, DEFAULT_MAX_SORT_BYTES};
@@ -10,6 +11,7 @@ use crate::storage::TikvStore;
 
 /// Extension transaction delta snapshot: (created_set, dropped_set).
 pub type ExtensionTxnDelta = (HashSet<String>, HashSet<String>);
+pub type TxnDirtyTableIds = HashSet<u64>;
 
 #[derive(Clone)]
 pub struct SessionTxnTracker {
@@ -72,6 +74,14 @@ tokio::task_local! {
 
 tokio::task_local! {
     static CURRENT_TXN_SNAPSHOT_TS_VERSION: Option<u64>;
+}
+
+tokio::task_local! {
+    static CURRENT_TXN_DIRTY_TABLE_IDS: Arc<TxnDirtyTableIds>;
+}
+
+tokio::task_local! {
+    static STATEMENT_DIRTY_TABLE_IDS: Arc<Mutex<TxnDirtyTableIds>>;
 }
 
 // Extension transaction delta: (created, dropped).
@@ -252,6 +262,44 @@ where
     CURRENT_TXN_SNAPSHOT_TS_VERSION.scope(ts_version, fut).await
 }
 
+pub fn current_txn_dirty_table_ids() -> Arc<TxnDirtyTableIds> {
+    CURRENT_TXN_DIRTY_TABLE_IDS
+        .try_with(|ids| ids.clone())
+        .unwrap_or_else(|_| Arc::new(HashSet::new()))
+}
+
+pub async fn with_txn_dirty_table_ids<R, Fut>(table_ids: Arc<TxnDirtyTableIds>, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    CURRENT_TXN_DIRTY_TABLE_IDS.scope(table_ids, fut).await
+}
+
+pub fn current_statement_dirty_table_ids() -> TxnDirtyTableIds {
+    STATEMENT_DIRTY_TABLE_IDS
+        .try_with(|ids| ids.lock().clone())
+        .unwrap_or_default()
+}
+
+pub fn record_statement_dirty_table_id(table_id: u64) {
+    if table_id == 0 {
+        return;
+    }
+    let _ = STATEMENT_DIRTY_TABLE_IDS.try_with(|ids| {
+        ids.lock().insert(table_id);
+    });
+}
+
+pub async fn with_statement_dirty_table_ids<R, Fut>(
+    table_ids: Arc<Mutex<TxnDirtyTableIds>>,
+    fut: Fut,
+) -> R
+where
+    Fut: Future<Output = R>,
+{
+    STATEMENT_DIRTY_TABLE_IDS.scope(table_ids, fut).await
+}
+
 pub async fn with_extension_txn_delta<R, Fut>(delta: Arc<ExtensionTxnDelta>, fut: Fut) -> R
 where
     Fut: Future<Output = R>,
@@ -325,6 +373,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use parking_lot::Mutex;
+
     #[tokio::test]
     async fn txn_snapshot_ts_is_scoped() {
         assert_eq!(super::current_txn_snapshot_ts_version(), None);
@@ -334,6 +384,32 @@ mod tests {
         .await;
         assert_eq!(got, Some(123));
         assert_eq!(super::current_txn_snapshot_ts_version(), None);
+    }
+
+    #[tokio::test]
+    async fn txn_dirty_table_ids_are_scoped() {
+        assert!(super::current_txn_dirty_table_ids().is_empty());
+        let ids = Arc::new(HashSet::from([7_u64, 9_u64]));
+        let got = super::with_txn_dirty_table_ids(ids.clone(), async {
+            super::current_txn_dirty_table_ids()
+        })
+        .await;
+        assert_eq!(&*got, &*ids);
+        assert!(super::current_txn_dirty_table_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn statement_dirty_table_ids_are_scoped() {
+        assert!(super::current_statement_dirty_table_ids().is_empty());
+        let dirty = Arc::new(Mutex::new(HashSet::new()));
+        let got = super::with_statement_dirty_table_ids(dirty, async {
+            super::record_statement_dirty_table_id(11);
+            super::record_statement_dirty_table_id(13);
+            super::current_statement_dirty_table_ids()
+        })
+        .await;
+        assert_eq!(got, HashSet::from([11_u64, 13_u64]));
+        assert!(super::current_statement_dirty_table_ids().is_empty());
     }
 
     #[tokio::test]

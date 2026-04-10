@@ -117,6 +117,11 @@ jobs:
       - name: Run regression gate
         shell: bash
         run: ./scripts/regression_gate.sh --skip-unit --skip-build
+        env:
+          # GitHub CI uses stock TiKV via tiup playground; DB9 cop pushdown-on
+          # coverage is delegated to the scheduled/manual paired lane in
+          # .github/workflows/pushdown-paired-validate.yml.
+          DB9_RUN_COP_PUSHDOWN_TESTS: '0'
 
       - name: Upload regression reports
         if: always()

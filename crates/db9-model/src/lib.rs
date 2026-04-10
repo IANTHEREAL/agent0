@@ -118,8 +118,8 @@ impl fmt::Display for DataType {
             DataType::Timestamp => write!(f, "TIMESTAMP"),
             DataType::Interval => write!(f, "INTERVAL"),
             DataType::Uuid => write!(f, "UUID"),
-            DataType::Array(elem_type) => write!(f, "{}[]", elem_type),
-            DataType::Vector(dim) => write!(f, "vector({})", dim),
+            DataType::Array(elem_type) => write!(f, "{elem_type}[]"),
+            DataType::Vector(dim) => write!(f, "vector({dim})"),
             DataType::Json => write!(f, "JSON"),
             DataType::Jsonb => write!(f, "JSONB"),
             DataType::Time => write!(f, "TIME"),
@@ -128,17 +128,17 @@ impl fmt::Display for DataType {
             DataType::Numeric {
                 precision: Some(p),
                 scale: Some(s),
-            } => write!(f, "NUMERIC({},{})", p, s),
+            } => write!(f, "NUMERIC({p},{s})"),
             DataType::Numeric {
                 precision: Some(p),
                 scale: None,
-            } => write!(f, "NUMERIC({})", p),
+            } => write!(f, "NUMERIC({p})"),
             DataType::Numeric { .. } => write!(f, "NUMERIC"),
             DataType::TimestampTz => write!(f, "TIMESTAMPTZ"),
             DataType::Tsvector => write!(f, "TSVECTOR"),
             DataType::Tsquery => write!(f, "TSQUERY"),
             DataType::Varchar(0) => write!(f, "VARCHAR"),
-            DataType::Varchar(n) => write!(f, "VARCHAR({})", n),
+            DataType::Varchar(n) => write!(f, "VARCHAR({n})"),
             DataType::Oid => write!(f, "OID"),
             DataType::Unknown => write!(f, "unknown"),
         }
@@ -252,7 +252,7 @@ impl fmt::Display for IntervalValue {
             let hours = abs_rem / (1000 * 60 * 60);
             let mins = (abs_rem % (1000 * 60 * 60)) / (1000 * 60);
             let secs = (abs_rem % (1000 * 60)) / 1000;
-            parts.push(format!("{}{:02}:{:02}:{:02}", sign, hours, mins, secs));
+            parts.push(format!("{sign}{hours:02}:{mins:02}:{secs:02}"));
         }
         write!(f, "{}", parts.join(" "))
     }
@@ -268,9 +268,9 @@ pub fn format_vector_pg_text(vec: &[f64]) -> String {
             out.push(',');
         }
         if v.fract() == 0.0 && v.is_finite() {
-            write!(out, "{:.0}", v).unwrap();
+            write!(out, "{v:.0}").unwrap();
         } else {
-            write!(out, "{}", v).unwrap();
+            write!(out, "{v}").unwrap();
         }
     }
     out.push(']');
@@ -368,14 +368,14 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Null => write!(f, "NULL"),
-            Value::Boolean(b) => write!(f, "{}", b),
-            Value::Int32(i) => write!(f, "{}", i),
-            Value::Int64(i) => write!(f, "{}", i),
-            Value::Float64(v) => write!(f, "{}", v),
-            Value::Text(s) => write!(f, "{}", s),
-            Value::Bytes(b) => write!(f, "{:?}", b),
-            Value::Timestamp(ts) => write!(f, "{}", ts),
-            Value::Interval(iv) => write!(f, "{}", iv),
+            Value::Boolean(b) => write!(f, "{b}"),
+            Value::Int32(i) => write!(f, "{i}"),
+            Value::Int64(i) => write!(f, "{i}"),
+            Value::Float64(v) => write!(f, "{v}"),
+            Value::Text(s) => write!(f, "{s}"),
+            Value::Bytes(b) => write!(f, "{b:?}"),
+            Value::Timestamp(ts) => write!(f, "{ts}"),
+            Value::Interval(iv) => write!(f, "{iv}"),
             Value::Time(micros) => {
                 let total_secs = *micros / 1_000_000;
                 let hours = total_secs / 3600;
@@ -383,9 +383,9 @@ impl fmt::Display for Value {
                 let secs = total_secs % 60;
                 let frac = *micros % 1_000_000;
                 if frac > 0 {
-                    write!(f, "{:02}:{:02}:{:02}.{:06}", hours, mins, secs, frac)
+                    write!(f, "{hours:02}:{mins:02}:{secs:02}.{frac:06}")
                 } else {
-                    write!(f, "{:02}:{:02}:{:02}", hours, mins, secs)
+                    write!(f, "{hours:02}:{mins:02}:{secs:02}")
                 }
             }
             Value::Uuid(bytes) => {
@@ -409,21 +409,21 @@ impl fmt::Display for Value {
                     }
                     match elem {
                         Value::Text(s) => write!(f, "\"{}\"", s.replace('"', "\\\""))?,
-                        v => write!(f, "{}", v)?,
+                        v => write!(f, "{v}")?,
                     }
                 }
                 write!(f, "}}")
             }
             Value::Vector(vec) => write!(f, "{}", format_vector_pg_text(vec)),
-            Value::Json(s) => write!(f, "{}", s),
-            Value::Jsonb(s) => write!(f, "{}", s),
+            Value::Json(s) => write!(f, "{s}"),
+            Value::Jsonb(s) => write!(f, "{s}"),
             Value::Date(days) => match date::format_date_days(*days) {
                 Ok(s) => write!(f, "{s}"),
                 Err(_) => write!(f, "{days}"),
             },
-            Value::Numeric(d) => write!(f, "{}", d),
-            Value::Tsvector(s) => write!(f, "{}", s),
-            Value::Tsquery(s) => write!(f, "{}", s),
+            Value::Numeric(d) => write!(f, "{d}"),
+            Value::Tsvector(s) => write!(f, "{s}"),
+            Value::Tsquery(s) => write!(f, "{s}"),
         }
     }
 }
@@ -767,7 +767,7 @@ impl TableSchema {
             None
         } else {
             let short = name.rsplit('.').next().unwrap_or(&name);
-            Some(format!("{}_pkey", short))
+            Some(format!("{short}_pkey"))
         };
         Self {
             name,

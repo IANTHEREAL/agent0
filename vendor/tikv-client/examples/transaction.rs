@@ -1,5 +1,7 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use tikv_client::BoundRange;

@@ -1,0 +1,12 @@
+Index Scan using db9_cop_timestamptz_smoke_created_tz_idx on db9_cop_timestamptz_smoke
+Index Cond: ((created_tz >= 1704153600000) AND (created_tz < 1704326400000))
+DB9 Cop Access: range [1704153600000, 1704326400000)
+DB9 Cop Filter: ((created_tz >= 1704153600000) AND (created_tz < 1704326400000))
+DB9 Cop Output: id, created_tz
+DB9 Cop Limit: 2
+2|2024-01-02 12:34:56+00
+3|2024-01-03 23:59:59+00
+Filter: (timezone('UTC'::text, created_tz) >= 1704153600000)
+Seq Scan on db9_cop_timestamptz_smoke
+timestamptz_range_parity|0
+timestamptz_at_time_zone_parity|0

@@ -46,6 +46,8 @@ pub struct CopyContext {
     /// validation at CopyDone.
     /// Each entry is `(constraint_id, fk_name, hash_key, display_values)`.
     pub deferred_self_fk_checks: Vec<(usize, String, String, String)>,
+    /// Dirty table ids accumulated across all COPY re-entry callbacks.
+    pub dirty_table_ids: HashSet<u64>,
 }
 
 /// A safety cap to prevent unbounded buffering if the client sends a single row without newlines.

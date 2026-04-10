@@ -214,12 +214,25 @@ pub(crate) async fn with_savepoints<R>(
     }
 }
 
+#[inline]
+fn record_statement_dirty_table_for_key(key: &[u8]) {
+    if let Some(table_id) = crate::storage::decode_table_id_from_mutation_key_v2(key) {
+        crate::session_context::record_statement_dirty_table_id(table_id);
+    }
+}
+
+fn record_statement_dirty_tables_for_mutations(mutations: &[BatchMutation]) {
+    for mutation in mutations {
+        record_statement_dirty_table_for_key(mutation.key());
+    }
+}
+
 /// TiKV `put` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+    record_statement_dirty_table_for_key(&key);
     check_key_size(&key)?;
     check_value_size(&key, &value)?;
-
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
     let should_record = match savepoints.as_ref() {
         Some(sp) => sp.should_record_key(&key).await?,
@@ -249,8 +262,12 @@ pub(crate) async fn txn_batch_mutate(
         return Ok(());
     }
 
-    // Size guards must run before any TiKV I/O (including savepoint
-    // undo recording) so that oversized keys never hit the network.
+    for (key, _) in &mutations {
+        record_statement_dirty_table_for_key(key);
+    }
+
+    // Size guards must run before any TiKV I/O (including savepoint undo
+    // recording) so that oversized keys never hit the network.
     for (k, v) in &mutations {
         check_key_size(k)?;
         check_value_size(k, v)?;
@@ -308,6 +325,8 @@ pub(crate) async fn txn_batch_mutate_mixed(
         return Ok(());
     }
 
+    record_statement_dirty_tables_for_mutations(&mutations);
+
     // Size guards must run before any TiKV I/O (including savepoint
     // undo recording) so that oversized keys never hit the network.
     for m in &mutations {
@@ -357,8 +376,8 @@ pub(crate) async fn txn_batch_mutate_mixed(
 /// TiKV `delete` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_delete(txn: &mut Transaction, key: Vec<u8>) -> Result<()> {
+    record_statement_dirty_table_for_key(&key);
     check_key_size(&key)?;
-
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
     let should_record = match savepoints.as_ref() {
         Some(sp) => sp.should_record_key(&key).await?,
@@ -378,6 +397,7 @@ pub(crate) async fn txn_delete(txn: &mut Transaction, key: Vec<u8>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     /// Build a realistic database-scoped key: `d_` + 8-byte db_id + `_` + suffix
     fn db_key(db_id: u64, suffix: &[u8]) -> Vec<u8> {
@@ -385,6 +405,12 @@ mod tests {
         key.extend_from_slice(&db_id.to_be_bytes());
         key.push(b'_');
         key.extend_from_slice(suffix);
+        key
+    }
+
+    fn table_row_key(db_id: u64, table_id: u64) -> Vec<u8> {
+        let mut key = db_key(db_id, b"t_");
+        key.extend_from_slice(&table_id.to_be_bytes());
         key
     }
 
@@ -480,6 +506,25 @@ mod tests {
         // d_ + 8 bytes + _ + unknown subsystem = "database data"
         let key = db_key(1, b"something_else");
         assert_eq!(key_subsystem(&key), "database data");
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_mutations_record_statement_dirty_tables() {
+        let dirty_tables = std::sync::Arc::new(parking_lot::Mutex::new(HashSet::new()));
+
+        let got = crate::session_context::with_statement_dirty_table_ids(dirty_tables, async {
+            let mutations = vec![
+                BatchMutation::Put(table_row_key(7, 11), vec![1]),
+                BatchMutation::Delete(table_row_key(7, 11)),
+                BatchMutation::Delete(table_row_key(7, 13)),
+                BatchMutation::Delete(db_key(7, b"sys_schema_ignore")),
+            ];
+            record_statement_dirty_tables_for_mutations(&mutations);
+            crate::session_context::current_statement_dirty_table_ids()
+        })
+        .await;
+
+        assert_eq!(got, HashSet::from([11_u64, 13_u64]));
     }
 
     /// A minimal tracing layer that counts WARN events whose message

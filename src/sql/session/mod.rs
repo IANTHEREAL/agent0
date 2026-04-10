@@ -50,6 +50,12 @@ pub(crate) struct ExtensionDeltaSavepoint {
     snapshot: ExtensionDelta,
 }
 
+#[derive(Clone)]
+pub(crate) struct DirtyTableSavepoint {
+    name: String,
+    snapshot: HashSet<u64>,
+}
+
 /// Saved session authorization state for SET LOCAL session_authorization.
 /// Captured before the first SET LOCAL in a transaction, restored on COMMIT/ROLLBACK.
 #[derive(Clone)]
@@ -141,6 +147,11 @@ pub struct Session {
     /// Cleared on COMMIT/ROLLBACK, savepoint-scoped within a transaction block.
     pub(crate) extension_delta: ExtensionDelta,
     pub(crate) extension_delta_savepoints: Vec<ExtensionDeltaSavepoint>,
+    /// Tables whose row/index state has been mutated in the current transaction.
+    /// DB9 Cop must stay off for these tables until COMMIT/ROLLBACK because
+    /// TiKV coprocessor reads do not see the transaction's local write buffer.
+    pub(crate) transaction_dirty_table_ids: HashSet<u64>,
+    pub(crate) transaction_dirty_table_savepoints: Vec<DirtyTableSavepoint>,
     /// True when executing a multi-statement simple-query batch (implicit transaction).
     /// LOCAL mutations should persist across statements within the batch, matching
     /// PostgreSQL's implicit transaction semantics for multi-statement simple queries.
@@ -238,6 +249,8 @@ impl Session {
             )),
             extension_delta: ExtensionDelta::default(),
             extension_delta_savepoints: Vec::new(),
+            transaction_dirty_table_ids: HashSet::new(),
+            transaction_dirty_table_savepoints: Vec::new(),
             in_implicit_batch: false,
             pending_notices: Vec::new(),
             local_session_auth_save: None,
@@ -313,6 +326,8 @@ impl Session {
             )),
             extension_delta: ExtensionDelta::default(),
             extension_delta_savepoints: Vec::new(),
+            transaction_dirty_table_ids: HashSet::new(),
+            transaction_dirty_table_savepoints: Vec::new(),
             in_implicit_batch: false,
             pending_notices: Vec::new(),
             local_session_auth_save: None,
@@ -615,6 +630,23 @@ impl Session {
         ))
     }
 
+    pub(crate) fn transaction_dirty_table_ids_snapshot(
+        &self,
+    ) -> Arc<crate::session_context::TxnDirtyTableIds> {
+        Arc::new(self.transaction_dirty_table_ids.clone())
+    }
+
+    pub(crate) fn note_transaction_dirty_tables<I>(&mut self, table_ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        for table_id in table_ids {
+            if table_id != 0 {
+                self.transaction_dirty_table_ids.insert(table_id);
+            }
+        }
+    }
+
     pub(crate) fn push_extension_delta_savepoint(&mut self, name: String) {
         self.extension_delta_savepoints
             .push(ExtensionDeltaSavepoint {
@@ -646,6 +678,42 @@ impl Session {
         };
 
         self.extension_delta_savepoints.truncate(target_idx);
+    }
+
+    pub(crate) fn push_transaction_dirty_table_savepoint(&mut self, name: String) {
+        self.transaction_dirty_table_savepoints
+            .push(DirtyTableSavepoint {
+                name,
+                snapshot: self.transaction_dirty_table_ids.clone(),
+            });
+    }
+
+    pub(crate) fn rollback_transaction_dirty_tables_to_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .transaction_dirty_table_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.transaction_dirty_table_ids = self.transaction_dirty_table_savepoints[target_idx]
+            .snapshot
+            .clone();
+        self.transaction_dirty_table_savepoints
+            .truncate(target_idx + 1);
+    }
+
+    pub(crate) fn release_transaction_dirty_table_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .transaction_dirty_table_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.transaction_dirty_table_savepoints.truncate(target_idx);
     }
 
     #[cfg(test)]

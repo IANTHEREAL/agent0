@@ -172,3 +172,23 @@ pub fn encode_database_data_range(db_id: u64) -> (Vec<u8>, Vec<u8>) {
     };
     (start, end)
 }
+
+/// Decode the table ID embedded in a database-scoped row or index mutation key.
+///
+/// Returns `None` for non-table keys (schema metadata, worker state, etc.).
+pub(crate) fn decode_table_id_from_mutation_key_v2(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(DATABASE_DATA_PREFIX)?;
+    let (_db_id, rest) = rest.split_at(8);
+    let rest = rest.strip_prefix(b"_")?;
+
+    let table_prefix = if rest.starts_with(TABLE_DATA_PREFIX) {
+        TABLE_DATA_PREFIX
+    } else if rest.starts_with(TABLE_INDEX_PREFIX) {
+        TABLE_INDEX_PREFIX
+    } else {
+        return None;
+    };
+
+    let table_bytes: [u8; 8] = rest.strip_prefix(table_prefix)?.get(..8)?.try_into().ok()?;
+    Some(u64::from_be_bytes(table_bytes))
+}

@@ -1,0 +1,9 @@
+pushdown_on
+Index Scan using ab_pushdown_demo_ab_idx on ab_pushdown_demo
+Index Cond: ((a = 1234) AND (b = abs((-1))))
+DB9 Cop Access: prefix (1234)
+DB9 Cop Filter: ((a = 1234) AND (b = abs((-1))))
+DB9 Cop Output: id, payload
+6001|target-hit
+pushdown_off
+secondary_index_row_fetch_parity|0

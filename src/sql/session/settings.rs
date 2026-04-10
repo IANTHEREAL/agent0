@@ -125,6 +125,10 @@ pub(crate) struct SessionSettings {
     /// Default: 10000. 0 = unlimited.
     dml_table_scan_max_rows: usize,
 
+    /// Whether the planner may lower eligible single-table scans into DB9 Cop.
+    /// Default: off.
+    db9_enable_cop_pushdown: bool,
+
     /// Plan cache capacity (max cached plans per session). Default: 128.
     prepared_plan_cache_size: usize,
     /// Plan cache promotion threshold (executions before caching). Default: 5.
@@ -261,6 +265,7 @@ impl SessionSettings {
             hash_join_work_mem: DEFAULT_HASH_JOIN_WORK_MEM,
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
             dml_table_scan_max_rows: DEFAULT_DML_TABLE_SCAN_MAX_ROWS,
+            db9_enable_cop_pushdown: false,
             prepared_plan_cache_size: 128,
             prepared_plan_cache_min_exec: 5,
             hnsw_ef_search: 40,
@@ -615,6 +620,9 @@ impl SessionSettings {
             "db9.hash_join_work_mem" => {
                 self.hash_join_work_mem = Self::parse_byte_size(value)?;
             }
+            "db9.enable_cop_pushdown" => {
+                self.db9_enable_cop_pushdown = value.eq_ignore_ascii_case("on");
+            }
             "db9.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(value)?;
             }
@@ -818,7 +826,10 @@ impl SessionSettings {
             "db9.dml_table_scan_max_rows" => {
                 self.dml_table_scan_max_rows = DEFAULT_DML_TABLE_SCAN_MAX_ROWS
             }
+
+            "db9.enable_cop_pushdown" => self.db9_enable_cop_pushdown = false,
             "db9.hash_join_work_mem" => self.hash_join_work_mem = DEFAULT_HASH_JOIN_WORK_MEM,
+
             "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
             "db9.password_grace_seconds" => self.password_grace_seconds = 0,
             "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
@@ -971,6 +982,7 @@ impl SessionSettings {
     /// this is called).
     fn restore_guc_value(&mut self, name: &str, value: Option<String>) {
         let canonical = Self::canonical_setting_name(name);
+
         match value {
             Some(v) => {
                 let _ = self.apply_setting_value(canonical, &v);
