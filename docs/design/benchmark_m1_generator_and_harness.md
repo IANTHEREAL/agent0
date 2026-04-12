@@ -46,6 +46,15 @@ Reserved subcommands:
 - `compare`: merge or compare `db9_before`, `db9_after`, and `postgres_18_3`
   raw outputs into one report
 
+Server-side restore-first workflow:
+
+- the benchmark server should prepare datasets once, back them up, and restore
+  them before each measured run
+- the current harness may rely on an external restore orchestration step until a
+  dedicated restore subcommand is added
+- data generation is allowed for local development and one-time dataset
+  preparation, but not for the hot path of server-side acceptance runs
+
 Optional metrics capture:
 
 - the harness may scrape a Prometheus endpoint such as
@@ -122,6 +131,12 @@ shipped it must not change silently.
 | `S` | `100000` | `200000` | `1000000` |
 | `M` | `250000` | `800000` | `5000000` |
 | `L` | `500000` | `2000000` | `10000000` |
+
+For server-side acceptance:
+
+- each prepared benchmark dataset artifact should target `10GB`
+- the artifact size should be recorded together with the benchmark result
+- the same `10GB` artifact must be restored before each measured benchmark run
 
 ### Determinism Rule
 
@@ -298,6 +313,12 @@ Responsibilities:
 - load deterministic data
 - optionally run `ANALYZE`
 - optionally verify cardinality checkpoints
+
+Server preparation policy:
+
+- `gen` is the one-time dataset preparation step on the benchmark server
+- after `gen` and `ANALYZE` complete, the dataset should be backed up
+- later measured runs should restore that backup instead of rerunning `gen`
 
 Required verification checkpoints:
 
@@ -502,6 +523,15 @@ benchmarks/
   side/
     tpcc/
     tpch/
+  server/
+    datasets/
+      canonical_10gb/
+      tpcc_10gb/
+      tpch_10gb/
+    baselines/
+      canonical/
+      tpcc/
+      tpch/
   logs/
     db9_before_L.log
     db9_after_L.log
@@ -512,6 +542,13 @@ Raw result file naming:
 
 ```text
 <engine_label>_<scale>[_<scenario_set>].json
+```
+
+Recommended server baseline naming:
+
+```text
+benchmarks/server/baselines/<suite>/accepted_<milestone>.json
+benchmarks/server/baselines/<suite>/accepted_<milestone>_compare.json
 ```
 
 ## Required Raw Metadata
@@ -552,6 +589,13 @@ The compare stage must compute at least:
 - whether lower is better or higher is better for the metric
 - representative lines for `db9_before`, `db9_after`, and `postgres_18_3`
 - one explicit PostgreSQL reference line per scenario family in the merged report
+
+For milestone acceptance on the benchmark server:
+
+- `db9_after` must be compared against the last accepted server baseline of the
+  same suite
+- the baseline artifact should come from the previous accepted milestone result
+- a newer ad hoc branch run must not silently replace the accepted baseline
 
 ## CI And Review Expectations
 

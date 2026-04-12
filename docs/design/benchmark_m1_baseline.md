@@ -178,6 +178,34 @@ Large-scale requirements:
   attached EBS, but large enough that in-memory full-sort or full-fetch
   behavior is visible
 
+## Server Acceptance Dataset Policy
+
+The benchmark server used for CI or milestone-close acceptance must not rebuild
+datasets in the hot path.
+
+Rules:
+
+- each benchmark dataset artifact used for server-side acceptance must target
+  `10GB` of prepared data
+- this rule applies to the canonical `M1` corpus and to any approved side
+  benchmark suites such as `TPC-C` or `TPC-H`
+- the exact measured size should be recorded in the evidence bundle
+- a small drift around the target is acceptable, but the intended contract is a
+  fixed `10GB` class dataset, not ad hoc row counts per run
+
+Operational policy:
+
+- prepare the dataset once on the benchmark server
+- run `ANALYZE` or the engine-equivalent statistics preparation once
+- take a backup or snapshot immediately after preparation
+- before each measured benchmark run, restore from that prepared backup instead
+  of regenerating data
+- the measured benchmark window must start after restore completes, not during
+  data generation
+
+This is required so benchmark time measures query execution behavior rather than
+dataset creation cost.
+
 ## Data Distribution Contract
 
 The generator must be deterministic and seeded. The seed is part of the
@@ -739,6 +767,29 @@ Rule:
 - A milestone may add exploratory micro-benchmarks, but it cannot replace the
   canonical scenario family above.
 - A milestone that improves `Qxx` but regresses `QxxF` does not pass.
+
+## Server Baseline Workflow
+
+The benchmark server must keep an accepted baseline for each suite.
+
+Minimum workflow:
+
+1. Prepare the canonical benchmark dataset on the benchmark server.
+2. Back up the prepared dataset in its fixed `10GB` form.
+3. Run the accepted baseline build and store the raw result plus compare report.
+4. For each new milestone, restore the prepared dataset before the run.
+5. Compare the new run against the last accepted server baseline from the same
+   suite.
+6. Only after the milestone is accepted should the new result become the next
+   accepted baseline.
+
+Baseline comparison rules:
+
+- compare on the same benchmark server or equivalent hardware class
+- compare on the same `10GB` dataset artifact
+- compare with the same query set, parameter packs, and warmup policy
+- compare against the previous accepted milestone result, not just against an
+  arbitrary recent branch run
 
 ## Explicit `M0` Pushdown Compatibility Requirement
 

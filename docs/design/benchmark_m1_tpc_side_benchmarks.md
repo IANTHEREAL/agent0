@@ -108,6 +108,15 @@ For local side benchmark runs against db9:
 - when using keyspaces on TiKV or CSE, ensure the storage side is configured for
   API V2 so db9 keyspace connections do not fail with `ApiVersionNotMatched`
 
+For server-side acceptance runs:
+
+- prepare one fixed `10GB` `TPC-C` dataset artifact on the benchmark server
+- prepare one fixed `10GB` `TPC-H` dataset artifact on the benchmark server
+- back up each prepared dataset after load and statistics preparation complete
+- restore the prepared backup before each measured side benchmark run
+- do not regenerate `TPC-C` or `TPC-H` data inside the measured benchmark
+  window
+
 Recommended local launch shape:
 
 ```bash
@@ -246,6 +255,13 @@ benchmarks/
     tpch/
       db9_after_sf1.json
       postgres_18_3_sf1.json
+  server/
+    datasets/
+      tpcc_10gb/
+      tpch_10gb/
+    baselines/
+      tpcc/
+      tpch/
 ```
 
 Minimum fields to preserve:
@@ -260,6 +276,7 @@ Minimum fields to preserve:
 - throughput metric from the external tool
 - p50 and p95 latency when the tool exposes them
 - db9 Prometheus deltas for any captured metrics
+- server baseline id when the run participates in milestone acceptance
 
 ## How These Side Benchmarks Should Be Used
 
@@ -267,6 +284,8 @@ Recommended usage:
 
 - `TPC-C`: nightly or milestone-side evidence for end-to-end OLTP behavior
 - `TPC-H`: nightly or milestone-side evidence for large analytical behavior
+- on the benchmark server, compare each new milestone run against the previous
+  accepted side-benchmark baseline of the same suite
 
 Do not use them as:
 
