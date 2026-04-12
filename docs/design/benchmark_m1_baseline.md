@@ -34,6 +34,8 @@ Companion artifacts:
   [`benchmark_m1_generator_and_harness.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_generator_and_harness.md)
 - raw result JSON schema:
   [`benchmark_m1_result_schema.json`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_result_schema.json)
+- TPC side benchmark note:
+  [`benchmark_m1_tpc_side_benchmarks.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_tpc_side_benchmarks.md)
 
 ## Design Principles
 
@@ -76,6 +78,28 @@ The corpus in this document uses three benchmark tables:
 
 Together they are enough to expose every required milestone payoff without
 forcing the team to maintain many unrelated datasets.
+
+## Side Benchmarks
+
+`TPC-C` and `TPC-H` should be part of the `M1` benchmark inventory, but they
+should not replace the canonical scenario families in this document.
+
+Positioning:
+
+- the canonical `Q01` to `Q10` corpus remains the blocking milestone gate
+- `TPC-C` is the side benchmark for end-to-end OLTP behavior, prepared
+  execution, and pooled application traffic
+- `TPC-H` is the side benchmark for large joins, aggregates, sort-heavy
+  analytics, and later `M5` to `M8` scale-up work
+
+Rule:
+
+- if the canonical corpus and a TPC side benchmark disagree, milestone close is
+  still blocked by the canonical corpus
+- TPC side benchmarks are additive evidence, not a replacement contract
+
+See the detailed runbook in
+[`benchmark_m1_tpc_side_benchmarks.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_tpc_side_benchmarks.md).
 
 ## Primary `M2` To `M4` Application Case
 
@@ -756,3 +780,5 @@ The benchmark gate therefore has two acceptance lines:
   defines the required benchmark-facing fields.
 - This document does not require every future milestone to beat PostgreSQL. It
   requires a stable comparison line and root-cause explanation for large gaps.
+- This document does not make `TPC-C` or `TPC-H` the primary acceptance gate.
+  They remain side benchmarks.

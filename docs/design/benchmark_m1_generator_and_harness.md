@@ -57,6 +57,15 @@ Optional metrics capture:
   populate that canonical field directly
 - otherwise the harness should store the value under `extra_metrics`
 
+External side benchmark inventory:
+
+- `TPC-C` and `TPC-H` are tracked as side benchmarks for `M1`, not as the main
+  gate
+- recommended tool inventory and db9-specific notes live in
+  [`benchmark_m1_tpc_side_benchmarks.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_tpc_side_benchmarks.md)
+- side benchmark outputs should be stored separately from the canonical
+  `Q01`..`Q10` raw result files so the primary acceptance path stays clean
+
 ## PostgreSQL Comparison Contract
 
 The harness must treat local `PostgreSQL 18.3` as a first-class benchmark
@@ -490,6 +499,9 @@ benchmarks/
     postgres_18_3_L.json
   reports/
     m2_m4_L_compare.json
+  side/
+    tpcc/
+    tpch/
   logs/
     db9_before_L.log
     db9_after_L.log
