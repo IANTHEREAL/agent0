@@ -59,7 +59,35 @@ It is not sufficient for:
 
 ## Recommended Tools
 
-### Default Choice: BenchBase
+### Default Choice For Local Compare: `tiup bench`
+
+Recommended default tool for **local** db9 compare runs:
+
+- tool: `tiup bench`
+- why:
+  - already common in the TiDB/TiKV ecosystem
+  - local `tiup bench` confirms support for `-d postgres`
+  - supports both `tpcc` and `tpch`
+  - easier to aim at db9's pgwire endpoint without building a separate Java tool
+
+Confirmed local support shape:
+
+- `tiup bench tpcc ... -d postgres`
+- `tiup bench tpch ... -d postgres`
+- PostgreSQL connection parameters can be passed through
+  `--conn-params sslmode=disable`
+
+This repo now includes a local wrapper script:
+
+- [`scripts/run_local_tiup_tpc_compare.sh`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/run_local_tiup_tpc_compare.sh)
+
+That script is designed for the requested local comparison flow:
+
+- `db9-server` PR `#2402`
+- `cloud-storage-engine` PR `#4921`
+- local PostgreSQL `18.3`
+
+### Default Choice For General Engineering: BenchBase
 
 Recommended default tool for db9:
 
@@ -75,7 +103,9 @@ BenchBase PostgreSQL sample configs exist upstream:
 - `config/postgres/sample_tpcc_config.xml`
 - `config/postgres/sample_tpch_config.xml`
 
-This makes it the most practical default for internal engineering runs.
+This still makes BenchBase the most practical default for broader engineering
+runs, CI lab servers, and cases where one team wants a runner that is
+independent of `tiup`.
 
 ### Optional Alternative: HammerDB
 
@@ -124,6 +154,9 @@ REDIS_URL=redis://127.0.0.1:6379/0 \
 DB9_DEV=1 \
 DB9_DEV_ADMIN_PASSWORD=admin \
 DB9_AUTO_ANALYZE_ENABLED=false \
+DB9_TENANT_MEMORY_QUOTA_BYTES=0 \
+DB9_STATEMENT_TIMEOUT_MS=0 \
+DB9_STATEMENT_TIMEOUT_HARD_CAP_MS=0 \
 DB9_METRICS_PORT=9090 \
 PD_ENDPOINTS=127.0.0.1:<pd_port> \
 PG_PORT=5433 \
@@ -169,6 +202,86 @@ java -jar target/benchbase-postgres.jar \
 The exact jar name can vary by BenchBase build layout. The key point is to use
 the PostgreSQL build target and the upstream `sample_tpcc_config.xml`.
 
+### Explicit `tiup bench` Commands For Local Compare
+
+For the requested local compare flow:
+
+- db9-server: PR `#2402`
+- cloud-storage-engine: PR `#4921`
+- PostgreSQL: `18.3`
+
+The practical `tiup bench` commands are:
+
+Prepare on PostgreSQL 18.3:
+
+```bash
+tiup bench tpcc prepare \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5432 \
+  -U <local_pg_user> \
+  -D tpcc10g_pg18 \
+  --conn-params sslmode=disable \
+  --warehouses 100 \
+  --dropdata \
+  --no-check
+```
+
+Prepare on db9:
+
+```bash
+tiup bench tpcc prepare \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5433 \
+  -U admin \
+  -p admin \
+  -D tpcc10g_db9 \
+  --conn-params sslmode=disable \
+  --warehouses 100 \
+  --dropdata \
+  --no-check
+```
+
+Run on PostgreSQL 18.3:
+
+```bash
+tiup bench tpcc run \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5432 \
+  -U <local_pg_user> \
+  -D tpcc10g_pg18 \
+  --conn-params sslmode=disable \
+  --warehouses 100 \
+  -T 32 \
+  --time 5m \
+  --output json
+```
+
+Run on db9:
+
+```bash
+tiup bench tpcc run \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5433 \
+  -U admin \
+  -p admin \
+  -D tpcc10g_db9 \
+  --conn-params sslmode=disable \
+  --warehouses 100 \
+  -T 32 \
+  --time 5m \
+  --output json
+```
+
+Important local note:
+
+- on db9, prefer `DB9_TENANT_MEMORY_QUOTA_BYTES=0` and
+  `DB9_STATEMENT_TIMEOUT_MS=0` during this local `TPC-C` compare, otherwise
+  `prepare` may fail on memory quota or statement timeout before the run begins
+
 ### Suggested Scale Levels For db9
 
 For the current `M1` inventory, treat these as practical internal levels:
@@ -212,6 +325,84 @@ java -jar target/benchbase-postgres.jar \
   -c config/postgres/sample_tpch_config.xml \
   --create=true --load=true --execute=true
 ```
+
+### Explicit `tiup bench` Commands For Local Compare
+
+For the requested local compare flow:
+
+- db9-server: PR `#2402`
+- cloud-storage-engine: PR `#4921`
+- PostgreSQL: `18.3`
+
+The practical `tiup bench` commands are:
+
+Prepare on PostgreSQL 18.3:
+
+```bash
+tiup bench tpch prepare \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5432 \
+  -U <local_pg_user> \
+  -D tpch10g_pg18 \
+  --conn-params sslmode=disable \
+  --sf 10 \
+  --dropdata \
+  --analyze
+```
+
+Prepare on db9:
+
+```bash
+tiup bench tpch prepare \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5433 \
+  -U admin \
+  -p admin \
+  -D tpch10g_db9 \
+  --conn-params sslmode=disable \
+  --sf 10 \
+  --dropdata \
+  --analyze
+```
+
+Run on PostgreSQL 18.3:
+
+```bash
+tiup bench tpch run \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5432 \
+  -U <local_pg_user> \
+  -D tpch10g_pg18 \
+  --conn-params sslmode=disable \
+  --sf 10 \
+  --time 5m \
+  --output json
+```
+
+Run on db9:
+
+```bash
+tiup bench tpch run \
+  -d postgres \
+  -H 127.0.0.1 \
+  -P 5433 \
+  -U admin \
+  -p admin \
+  -D tpch10g_db9 \
+  --conn-params sslmode=disable \
+  --sf 10 \
+  --time 5m \
+  --output json
+```
+
+Important local note:
+
+- on db9, prefer `DB9_STATEMENT_TIMEOUT_MS=0` during this local `TPC-H`
+  compare, otherwise long analytical queries may time out before the full suite
+  completes
 
 ### Suggested Scale Levels For db9
 
