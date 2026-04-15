@@ -1,0 +1,19 @@
+psql:tests/2430_prepare_row_value_inference.sql:4: NOTICE:  table "prep_row_inference" does not exist, skipping
+ s_i_id | s_quantity | s_data | s_dist_01 | s_dist_02 | s_dist_03 | s_dist_04 | s_dist_05 | s_dist_06 | s_dist_07 | s_dist_08 | s_dist_09 | s_dist_10 
+--------+------------+--------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------
+      1 |         10 | a      | a         | a         | a         | a         | a         | a         | a         | a         | a         | a
+      2 |         10 | b      | b         | b         | b         | b         | b         | b         | b         | b         | b         | b
+      3 |         10 | c      | c         | c         | c         | c         | c         | c         | c         | c         | c         | c
+      4 |         10 | d      | d         | d         | d         | d         | d         | d         | d         | d         | d         | d
+      5 |         10 | e      | e         | e         | e         | e         | e         | e         | e         | e         | e         | e
+(5 rows)
+
+ s_i_id | s_quantity | s_data | s_dist_01 | s_dist_02 | s_dist_03 | s_dist_04 | s_dist_05 | s_dist_06 | s_dist_07 | s_dist_08 | s_dist_09 | s_dist_10 
+--------+------------+--------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------
+      1 |         10 | a      | a         | a         | a         | a         | a         | a         | a         | a         | a         | a
+      2 |         10 | b      | b         | b         | b         | b         | b         | b         | b         | b         | b         | b
+      3 |         10 | c      | c         | c         | c         | c         | c         | c         | c         | c         | c         | c
+      4 |         10 | d      | d         | d         | d         | d         | d         | d         | d         | d         | d         | d
+      5 |         10 | e      | e         | e         | e         | e         | e         | e         | e         | e         | e         | e
+(5 rows)
+
