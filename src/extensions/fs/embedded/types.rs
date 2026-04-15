@@ -274,17 +274,17 @@ impl EmbeddedFsError {
 impl std::fmt::Display for EmbeddedFsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound(msg) => write!(f, "embedded_fs: NotFound: {}", msg),
-            Self::AlreadyExists(msg) => write!(f, "embedded_fs: AlreadyExists: {}", msg),
-            Self::IsDirectory(msg) => write!(f, "embedded_fs: IsDirectory: {}", msg),
-            Self::NotDirectory(msg) => write!(f, "embedded_fs: NotDirectory: {}", msg),
-            Self::DirectoryNotEmpty(msg) => write!(f, "embedded_fs: DirectoryNotEmpty: {}", msg),
-            Self::TooLarge(msg) => write!(f, "embedded_fs: TooLarge: {}", msg),
-            Self::PermissionDenied(msg) => write!(f, "embedded_fs: PermissionDenied: {}", msg),
-            Self::Conflict(msg) => write!(f, "embedded_fs: Conflict: {}", msg),
-            Self::RestartRequired(msg) => write!(f, "embedded_fs: RestartRequired: {}", msg),
-            Self::InvalidInput(msg) => write!(f, "embedded_fs: InvalidInput: {}", msg),
-            Self::Internal(msg) => write!(f, "embedded_fs: Internal: {}", msg),
+            Self::NotFound(msg) => write!(f, "fs: NotFound: {}", msg),
+            Self::AlreadyExists(msg) => write!(f, "fs: AlreadyExists: {}", msg),
+            Self::IsDirectory(msg) => write!(f, "fs: IsDirectory: {}", msg),
+            Self::NotDirectory(msg) => write!(f, "fs: NotDirectory: {}", msg),
+            Self::DirectoryNotEmpty(msg) => write!(f, "fs: DirectoryNotEmpty: {}", msg),
+            Self::TooLarge(msg) => write!(f, "fs: TooLarge: {}", msg),
+            Self::PermissionDenied(msg) => write!(f, "fs: PermissionDenied: {}", msg),
+            Self::Conflict(msg) => write!(f, "fs: Conflict: {}", msg),
+            Self::RestartRequired(msg) => write!(f, "fs: RestartRequired: {}", msg),
+            Self::InvalidInput(msg) => write!(f, "fs: InvalidInput: {}", msg),
+            Self::Internal(msg) => write!(f, "fs: Internal: {}", msg),
         }
     }
 }
@@ -389,34 +389,31 @@ mod tests {
     #[test]
     fn embedded_fs_error_constructors_and_display_are_consistent() {
         let e = EmbeddedFsError::not_found("/a");
-        assert_eq!(e.to_string(), "embedded_fs: NotFound: /a");
+        assert_eq!(e.to_string(), "fs: NotFound: /a");
 
         let e = EmbeddedFsError::already_exists("/b");
-        assert_eq!(e.to_string(), "embedded_fs: AlreadyExists: /b");
+        assert_eq!(e.to_string(), "fs: AlreadyExists: /b");
 
         let e = EmbeddedFsError::is_directory("/c");
-        assert_eq!(e.to_string(), "embedded_fs: IsDirectory: /c");
+        assert_eq!(e.to_string(), "fs: IsDirectory: /c");
 
         let e = EmbeddedFsError::not_directory("/d");
-        assert_eq!(e.to_string(), "embedded_fs: NotDirectory: /d");
+        assert_eq!(e.to_string(), "fs: NotDirectory: /d");
 
         let e = EmbeddedFsError::directory_not_empty("/e");
-        assert_eq!(e.to_string(), "embedded_fs: DirectoryNotEmpty: /e");
+        assert_eq!(e.to_string(), "fs: DirectoryNotEmpty: /e");
 
         let e = EmbeddedFsError::too_large("limit exceeded");
-        assert_eq!(e.to_string(), "embedded_fs: TooLarge: limit exceeded");
+        assert_eq!(e.to_string(), "fs: TooLarge: limit exceeded");
 
         let e = EmbeddedFsError::internal("boom");
-        assert_eq!(e.to_string(), "embedded_fs: Internal: boom");
+        assert_eq!(e.to_string(), "fs: Internal: boom");
 
         let e = EmbeddedFsError::PermissionDenied("/f".to_string());
-        assert_eq!(e.to_string(), "embedded_fs: PermissionDenied: /f");
+        assert_eq!(e.to_string(), "fs: PermissionDenied: /f");
 
         let e = EmbeddedFsError::restart_required("restart db9-server");
-        assert_eq!(
-            e.to_string(),
-            "embedded_fs: RestartRequired: restart db9-server"
-        );
+        assert_eq!(e.to_string(), "fs: RestartRequired: restart db9-server");
     }
 
     #[test]

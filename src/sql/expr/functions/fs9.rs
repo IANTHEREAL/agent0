@@ -61,6 +61,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FS9_WRITE_AT", fs9_write_at);
     map.insert("FS9_APPEND", fs9_append);
     map.insert("FS9_TRUNCATE", fs9_truncate);
+    map.insert("FS9_ADVANCE_NEXT_CHUNK", fs9_advance_next_chunk);
 }
 
 fn ensure_permissions() -> Result<()> {
@@ -503,6 +504,78 @@ pub fn fs9_truncate(args: Vec<Value>) -> Result<Value> {
     let client = get_client_sync()?;
     run_async(client.truncate(&path, size))?;
     Ok(Value::Boolean(true))
+}
+
+/// Advance the JuiceFS nextChunk counter for the current tenant's volume.
+/// Used after TiKV BR clone to prevent slice ID collision between volumes.
+/// Returns the new counter value.
+///
+/// Usage: SELECT fs9_advance_next_chunk(1099511627776); -- 2^40
+pub fn fs9_advance_next_chunk(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let offset = match args.first().unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v <= 0 {
+                return Err(anyhow!("fs9_advance_next_chunk: offset must be positive"));
+            }
+            *v
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_advance_next_chunk: expected BIGINT, got {:?}",
+                other
+            ))
+        }
+    };
+
+    let tenant = crate::extensions::context::tenant_keyspace()
+        .ok_or_else(|| anyhow!("fs9: tenant keyspace not available"))?;
+    let tenant_id = tenant.strip_prefix("db9_tenant_").unwrap_or(&tenant);
+    let jfs_keyspace = format!("jfs_t_{tenant_id}");
+
+    let cfg = crate::extensions::fs::config::fs9_config();
+    let result = run_async(async {
+        let channel = crate::extensions::fs::grpc::create_grpc_channel().await?;
+        let mut client =
+            crate::extensions::fs::grpc::proto::fs_plane_client::FsPlaneClient::new(channel);
+
+        // InitVolume first (idempotent)
+        let meta_url = format!(
+            "tikv://{}?keyspace={}&gc-interval=0",
+            cfg.grpc_pd_endpoints, jfs_keyspace,
+        );
+        client
+            .init_volume(crate::extensions::fs::grpc::proto::InitVolumeRequest {
+                volume_id: jfs_keyspace.clone(),
+                meta_url,
+                cache_size_mb: 16,
+            })
+            .await
+            .map_err(|e| anyhow!("InitVolume failed: {}", e.message()))?;
+
+        // Advance
+        let resp = client
+            .advance_next_chunk(
+                crate::extensions::fs::grpc::proto::AdvanceNextChunkRequest {
+                    volume_id: jfs_keyspace,
+                    offset,
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("AdvanceNextChunk: {}", e.message()))?;
+
+        let inner = resp.into_inner();
+        Ok::<_, anyhow::Error>((inner.old_value, inner.new_value))
+    })?;
+
+    tracing::info!(
+        old_value = result.0,
+        new_value = result.1,
+        offset,
+        "fs9_advance_next_chunk: advanced"
+    );
+    Ok(Value::Int64(result.1))
 }
 
 #[cfg(test)]

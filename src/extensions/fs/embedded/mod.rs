@@ -175,6 +175,10 @@ impl FsBackend for EmbeddedFsBackend {
         true
     }
 
+    fn supports_presigned(&self) -> bool {
+        crate::extensions::fs::config::fs9_config().s3.is_some()
+    }
+
     async fn batch_write_grouped(
         &self,
         files: Vec<FsBatchWriteFile>,

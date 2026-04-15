@@ -44,8 +44,22 @@ const DEFAULT_BATCH_WRITE_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_BATCH_WRITE_MAX_ENCODED_BYTES: usize = 1024 * 1024;
 const DEFAULT_PACK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fs9BackendType {
+    /// Auto-detect: use embedded if tenant has existing fs9 data in TiKV,
+    /// otherwise use JuiceFS (if proxy is configured).
+    Auto,
+    /// Direct TiKV storage (InlineBlob/PackEntry/Object). The original embedded backend.
+    Embedded,
+    /// JuiceFS via the fs9 gRPC proxy (db9-ai/fs9).
+    JuiceFs,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Fs9Config {
+    pub(crate) backend_type: Fs9BackendType,
+    pub(crate) grpc_socket: String,
+    pub(crate) grpc_pd_endpoints: String,
     pub(crate) inline_max_bytes: usize,
     pub(crate) object_min_bytes: usize,
     pub(crate) s3: Option<Fs9S3Config>,
@@ -96,6 +110,21 @@ pub(crate) struct Fs9S3Config {
 
 impl Fs9Config {
     pub(crate) fn from_env() -> Self {
+        let backend_type = match config::env_string("FS9_BACKEND").as_deref() {
+            Some("juicefs") => Fs9BackendType::JuiceFs,
+            Some("embedded") => Fs9BackendType::Embedded,
+            Some("auto") | None => Fs9BackendType::Auto,
+            Some(other) => {
+                warn!("FS9_BACKEND={other:?} is not recognized, falling back to auto");
+                Fs9BackendType::Auto
+            }
+        };
+        // Accepts Unix socket path (/var/run/fs9/fs9.sock), unix:// URI, or TCP (http://host:port, host:port)
+        let grpc_socket = config::env_string("FS9_GRPC_ADDR")
+            .or_else(|| config::env_string("FS9_GRPC_SOCKET"))
+            .unwrap_or_else(|| "/var/run/fs9/fs9.sock".to_string());
+        let grpc_pd_endpoints = config::env_string("FS9_GRPC_PD_ENDPOINTS").unwrap_or_default();
+
         let inline_max_bytes = config::env_string("FS9_INLINE_MAX")
             .and_then(|v| parse_bytes(&v))
             .unwrap_or(DEFAULT_INLINE_MAX_BYTES);
@@ -140,6 +169,9 @@ impl Fs9Config {
         });
 
         Self {
+            backend_type,
+            grpc_socket,
+            grpc_pd_endpoints,
             inline_max_bytes,
             object_min_bytes,
             s3,

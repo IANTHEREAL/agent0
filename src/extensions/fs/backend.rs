@@ -351,6 +351,12 @@ pub(crate) trait FsBackend: Send + Sync {
     fn supports_batch_write_atomic(&self) -> bool {
         false
     }
+
+    /// Whether this backend supports presigned S3 URLs for direct upload/download.
+    /// When false, the client must use WS streaming for all file sizes.
+    fn supports_presigned(&self) -> bool {
+        false
+    }
     /// Grouped atomic batch write: files are grouped by parent directory and
     /// each subgroup (bounded by `grouped_write_subgroup_size`) is committed
     /// in a single transaction. Per-subgroup atomic semantics.
@@ -426,16 +432,116 @@ fn normalize_readdir_path(path: &str) -> String {
 }
 
 async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
-    let client = crate::extensions::context::tikv_client().ok_or_else(|| {
-        anyhow!(
-            "fs9: TiKV client not available in extension context. \
-             Ensure the caller wraps this in with_context_opts()."
-        )
-    })?;
-    EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
-        .await
-        .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
-        .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+    use crate::extensions::fs::config::Fs9BackendType;
+
+    let backend_type = resolve_backend_type(tenant_keyspace).await;
+    tracing::info!(
+        keyspace = tenant_keyspace,
+        ?backend_type,
+        "init_backend: resolved backend type"
+    );
+
+    match backend_type {
+        Fs9BackendType::JuiceFs => crate::extensions::fs::grpc::GrpcFsBackend::new(tenant_keyspace)
+            .await
+            .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
+            .map_err(|e| anyhow!("fs9: failed to init gRPC backend: {e}")),
+        Fs9BackendType::Embedded | Fs9BackendType::Auto => {
+            let client = crate::extensions::context::tikv_client().ok_or_else(|| {
+                anyhow!(
+                    "fs9: TiKV client not available in extension context. \
+                     Ensure the caller wraps this in with_context_opts()."
+                )
+            })?;
+            EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
+                .await
+                .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
+                .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+        }
+    }
+}
+
+/// Resolve backend type for WS path (has TransactionClient directly).
+pub(crate) async fn resolve_backend_type_for_ws(
+    client: &Arc<tikv_client::TransactionClient>,
+    tenant_keyspace: &str,
+) -> crate::extensions::fs::config::Fs9BackendType {
+    resolve_backend_type_core(Some(client), tenant_keyspace).await
+}
+
+/// Resolve the effective backend type for a tenant (SQL path, gets client from context).
+async fn resolve_backend_type(
+    tenant_keyspace: &str,
+) -> crate::extensions::fs::config::Fs9BackendType {
+    resolve_backend_type_core(
+        crate::extensions::context::tikv_client().as_ref(),
+        tenant_keyspace,
+    )
+    .await
+}
+
+/// Auto mode: check if tenant has existing fs9 data in TiKV (superblock key `_fs_S`).
+/// If data exists → Embedded. If no data and gRPC proxy configured → JuiceFs.
+async fn resolve_backend_type_core(
+    client: Option<&Arc<tikv_client::TransactionClient>>,
+    tenant_keyspace: &str,
+) -> crate::extensions::fs::config::Fs9BackendType {
+    use crate::extensions::fs::config::{fs9_config, Fs9BackendType};
+    use tikv_client::TransactionOptions;
+
+    let cfg = fs9_config();
+    match cfg.backend_type {
+        Fs9BackendType::Embedded | Fs9BackendType::JuiceFs => cfg.backend_type,
+        Fs9BackendType::Auto => {
+            if cfg.grpc_pd_endpoints.is_empty() {
+                return Fs9BackendType::Embedded;
+            }
+
+            // Probe TiKV for existing embedded data. On error, fall back to
+            // Embedded — a transient TiKV failure must not silently route an
+            // existing tenant to an empty JuiceFS volume.
+            let probe_result = match client {
+                Some(client) => {
+                    let options = TransactionOptions::new_optimistic()
+                        .read_only()
+                        .drop_check(tikv_client::CheckLevel::Warn);
+                    match client.begin_with_options(options).await {
+                        Ok(mut txn) => match txn.get(b"_fs_S".to_vec()).await {
+                            Ok(Some(_)) => Some(true),
+                            Ok(None) => Some(false),
+                            Err(e) => {
+                                tracing::warn!(keyspace = tenant_keyspace, err = %e, "auto: TiKV read failed, defaulting to embedded");
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(keyspace = tenant_keyspace, err = %e, "auto: TiKV txn failed, defaulting to embedded");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            match probe_result {
+                Some(true) => {
+                    tracing::debug!(
+                        keyspace = tenant_keyspace,
+                        "auto: existing fs9 data, using embedded"
+                    );
+                    Fs9BackendType::Embedded
+                }
+                Some(false) => {
+                    tracing::info!(
+                        keyspace = tenant_keyspace,
+                        "auto: no fs9 data, using juicefs"
+                    );
+                    Fs9BackendType::JuiceFs
+                }
+                None => Fs9BackendType::Embedded,
+            }
+        }
+    }
 }
 
 /// Acquire the authoritative fs9 backend for the current statement.
@@ -956,7 +1062,7 @@ mod tests {
         assert!(matches!(fs_err, EmbeddedFsError::TooLarge(_)));
         assert_eq!(
             fs_err.to_string(),
-            "embedded_fs: TooLarge: batch_inline_read raw payload exceeds limit 8 bytes"
+            "fs: TooLarge: batch_inline_read raw payload exceeds limit 8 bytes"
         );
     }
 

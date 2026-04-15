@@ -35,6 +35,7 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
+COPY proto ./proto
 
 # Build args for version info (no .git in Docker context)
 ARG BUILD_GIT_HASH=""

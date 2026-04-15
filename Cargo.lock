@@ -1492,7 +1492,11 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-stream",
  "tokio-tungstenite",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "usearch",
@@ -3667,7 +3671,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.37",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3704,9 +3708,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5320,6 +5324,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

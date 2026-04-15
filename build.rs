@@ -1,6 +1,20 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=proto/fsplane/v1/fsplane.proto");
+
+    // Compile fsplane.proto if protoc is available. The generated file
+    // (src/extensions/fs/grpc/proto/fsplane.v1.rs) is committed, so CI
+    // environments without protoc still build correctly.
+    if let Err(e) = tonic_build::configure()
+        .build_server(false)
+        .build_client(true)
+        .out_dir("src/extensions/fs/grpc/proto")
+        .compile(&["proto/fsplane/v1/fsplane.proto"], &["proto"])
+    {
+        println!("cargo:warning=skipping proto compilation: {e}");
+    }
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/");
 

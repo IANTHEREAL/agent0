@@ -82,6 +82,9 @@ impl WsSession {
         if self.backend.supports_batch_write_atomic() {
             capabilities.push("batch_write_atomic");
         }
+        if !self.backend.supports_presigned() {
+            capabilities.push("streaming_only");
+        }
         serde_json::json!({
             "user": self.user,
             "tenant": tenant_from_keyspace(&self.keyspace),
@@ -242,19 +245,37 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    let backend = EmbeddedFsBackend::new(client, keyspace.clone())
-        .await
-        .map_err(|err| {
-            WsResponse::error(
-                id,
-                WsErrorCode::Eio,
-                format!("failed to initialize fs backend: {err}"),
-            )
-        })?;
+    let effective_backend =
+        crate::extensions::fs::backend::resolve_backend_type_for_ws(&client, &keyspace).await;
+
+    let backend: Arc<dyn FsBackend> = match effective_backend {
+        crate::extensions::fs::config::Fs9BackendType::JuiceFs => Arc::new(
+            crate::extensions::fs::grpc::GrpcFsBackend::new(&keyspace)
+                .await
+                .map_err(|err| {
+                    WsResponse::error(
+                        id,
+                        WsErrorCode::Eio,
+                        format!("failed to initialize gRPC fs backend: {err}"),
+                    )
+                })?,
+        ),
+        _ => Arc::new(
+            EmbeddedFsBackend::new(client, keyspace.clone())
+                .await
+                .map_err(|err| {
+                    WsResponse::error(
+                        id,
+                        WsErrorCode::Eio,
+                        format!("failed to initialize fs backend: {err}"),
+                    )
+                })?,
+        ),
+    };
 
     Ok(WsSession {
         _tenant_handle: tenant_handle,
-        backend: Arc::new(backend),
+        backend,
         user: actual_user,
         keyspace,
         access_mode,

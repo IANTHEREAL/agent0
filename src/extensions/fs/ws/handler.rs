@@ -2278,10 +2278,11 @@ mod tests {
                 .expect("capabilities must be an array");
             assert_eq!(
                 caps.len(),
-                1,
-                "unsupported backend should only have watch capability"
+                2,
+                "unsupported backend should have watch + streaming_only capabilities"
             );
             assert_eq!(caps[0], "watch");
+            assert_eq!(caps[1], "streaming_only");
         }
 
         /// Pins the partial-success boundary: one directory subgroup fails
