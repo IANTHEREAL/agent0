@@ -9,6 +9,70 @@ use super::super::types::*;
 use super::super::Analyzer;
 
 impl<'a> Analyzer<'a> {
+    fn analyze_row_in_list(
+        &mut self,
+        left: TypedExpr,
+        list: Vec<TypedExpr>,
+        negated: bool,
+    ) -> Result<Option<TypedExpr>, AnalyzerError> {
+        let TypedExprKind::Row(left_items) = &left.kind else {
+            return Ok(None);
+        };
+
+        if !list.iter().all(|item| matches!(item.kind, TypedExprKind::Row(_))) {
+            return Ok(None);
+        }
+
+        let arity = left_items.len();
+        let mut list_rows: Vec<Vec<TypedExpr>> = Vec::with_capacity(list.len());
+        for item in &list {
+            let TypedExprKind::Row(items) = &item.kind else {
+                unreachable!("checked above");
+            };
+            if items.len() != arity {
+                return Err(AnalyzerError::TypesCannotBeMatched {
+                    types: vec![left.data_type.clone(), item.data_type.clone()],
+                    context: "IN list row arity".to_string(),
+                });
+            }
+            list_rows.push(items.clone());
+        }
+
+        let mut coerced_left_items = left_items.clone();
+        for idx in 0..arity {
+            let mut refs: Vec<&TypedExpr> = vec![&coerced_left_items[idx]];
+            refs.extend(list_rows.iter().map(|row| &row[idx]));
+            let common = self.unify_expr_types(&refs, "IN list")?;
+
+            coerced_left_items[idx] =
+                self.coerce_if_needed(coerced_left_items[idx].clone(), &common)?;
+            for row in &mut list_rows {
+                row[idx] = self.coerce_if_needed(row[idx].clone(), &common)?;
+            }
+        }
+
+        let coerced_left =
+            TypedExpr::new(TypedExprKind::Row(coerced_left_items), left.data_type);
+        let coerced_list = list_rows
+            .into_iter()
+            .map(|items| {
+                TypedExpr::new(
+                    TypedExprKind::Row(items),
+                    DataType::UserDefined("record".to_string()),
+                )
+            })
+            .collect();
+
+        Ok(Some(TypedExpr::new(
+            TypedExprKind::InList {
+                expr: Box::new(coerced_left),
+                list: coerced_list,
+                negated,
+            },
+            DataType::Boolean,
+        )))
+    }
+
     pub(super) fn analyze_between(&mut self, expr: &Expr) -> Result<TypedExpr, AnalyzerError> {
         let Expr::Between {
             expr,
@@ -52,6 +116,11 @@ impl<'a> Analyzer<'a> {
             .iter()
             .map(|item| self.analyze_expr(item))
             .collect::<Result<_, _>>()?;
+        if let Some(row_expr) =
+            self.analyze_row_in_list(e.clone(), analyzed_list.clone(), *negated)?
+        {
+            return Ok(row_expr);
+        }
         // All elements must be type-compatible with the expression.
         let mut in_refs: Vec<&TypedExpr> = vec![&e];
         in_refs.extend(analyzed_list.iter());

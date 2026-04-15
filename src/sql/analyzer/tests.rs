@@ -4177,6 +4177,48 @@ fn analyze_parameter_in_list() {
 }
 
 #[test]
+fn analyze_parameter_in_row_value_in_list() {
+    // WHERE (id, age) IN (($1, $2), ($3, $4)) → params typed positionally.
+    let catalog = test_catalog();
+    let stmt = parse_statement(
+        "SELECT * FROM users WHERE (id, age) IN (($1, $2), ($3, $4))",
+    );
+    let mut analyzer = Analyzer::new_with_params(&catalog, 4, &[None, None, None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        types,
+        vec![
+            DataType::Int32,
+            DataType::Int32,
+            DataType::Int32,
+            DataType::Int32
+        ]
+    );
+}
+
+#[test]
+fn analyze_parameter_in_row_value_in_list_mixed_types() {
+    // WHERE (id, name) IN (($1, $2), ($3, $4)) → params typed from each column position.
+    let catalog = test_catalog();
+    let stmt = parse_statement(
+        "SELECT * FROM users WHERE (id, name) IN (($1, $2), ($3, $4))",
+    );
+    let mut analyzer = Analyzer::new_with_params(&catalog, 4, &[None, None, None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        types,
+        vec![
+            DataType::Int32,
+            DataType::Text,
+            DataType::Int32,
+            DataType::Text
+        ]
+    );
+}
+
+#[test]
 fn analyze_parameter_coalesce() {
     // COALESCE($1, 42) → param typed as Int32
     let catalog = test_catalog();
