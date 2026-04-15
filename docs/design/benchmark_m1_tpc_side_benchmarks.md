@@ -282,6 +282,88 @@ Important local note:
   `DB9_STATEMENT_TIMEOUT_MS=0` during this local `TPC-C` compare, otherwise
   `prepare` may fail on memory quota or statement timeout before the run begins
 
+### TPC-C Correctness Validation
+
+`TPC-C` side benchmarks should not stop at throughput alone. For db9 milestone
+work, the local and server-side flow should validate relational invariants both
+after `prepare` and after `run`.
+
+This repo now includes:
+
+- [`scripts/tpcc_correctness_check.py`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/tpcc_correctness_check.py)
+- [`scripts/run_local_tiup_tpc_compare.sh`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/run_local_tiup_tpc_compare.sh)
+
+The correctness checker validates invariants such as:
+
+- each warehouse owns exactly `10` districts
+- each district owns exactly `3000` customers
+- each district's `d_next_o_id` matches both `COUNT(orders)` and `MAX(o_id) + 1`
+- every `new_order` row points at an `orders` row with `o_carrier_id IS NULL`
+- every order with `o_carrier_id IS NULL` still has a `new_order` row
+- every order has `5..15` `order_line` rows and matches `orders.o_ol_cnt`
+- `history`, `orders`, and `order_line` rows still reference valid parents
+
+Example direct commands:
+
+Validate PostgreSQL 18.3 after `prepare`:
+
+```bash
+python3 scripts/tpcc_correctness_check.py \
+  --host 127.0.0.1 \
+  --port 5432 \
+  --user <local_pg_user> \
+  --db tpcc10g_pg18 \
+  --label pg18 \
+  --phase after_prepare \
+  --output /tmp/tpcc_pg18_after_prepare_correctness.json
+```
+
+Validate db9 after `run`:
+
+```bash
+python3 scripts/tpcc_correctness_check.py \
+  --host 127.0.0.1 \
+  --port 5433 \
+  --user admin \
+  --password admin \
+  --db tpcc10g_db9 \
+  --label db9 \
+  --phase after_run \
+  --output /tmp/tpcc_db9_after_run_correctness.json
+```
+
+When using the local wrapper:
+
+- correctness checks run automatically after `TPC-C prepare` and after `TPC-C run`
+- use `--skip-correctness-check` only when debugging runner issues, not for
+  milestone evidence
+
+Why not rely only on `tiup bench tpcc check`:
+
+- `tiup bench tpcc check --check-all` is still useful immediately after
+  `prepare`
+- however, it contains initial-load assumptions such as fixed per-district
+  counts that no longer hold after `run`
+- for post-benchmark correctness, keep the custom invariant checker as the
+  primary gate
+
+Observed local validation on April 15, 2026:
+
+- PostgreSQL `18.3`, `1 warehouse`:
+  - custom checker passed after `prepare`
+  - custom checker passed after `run`
+- db9-server `PR #2402` + cloud-storage-engine `PR #4921`, `1 warehouse`:
+  - custom checker passed after `prepare`
+  - `tiup bench tpcc run` is currently blocked before workload execution by:
+    `pq: could not determine data type of parameter $1`
+  - failing statement shape:
+    `SELECT ... FROM stock WHERE (s_w_id, s_i_id) IN ((?,?),(?,?),(?,?),(?,?),(?,?)) FOR UPDATE`
+
+This means the new correctness environment is in place and locally validated
+through `after_prepare` on db9, but the `after_run` db9 validation remains
+blocked by current prepared-statement type inference compatibility in
+`db9-server`.
+
 ### Suggested Scale Levels For db9
 
 For the current `M1` inventory, treat these as practical internal levels:

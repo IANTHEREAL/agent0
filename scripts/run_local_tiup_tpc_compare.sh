@@ -26,6 +26,7 @@ MODE="both"
 START_STACK=1
 RUN_PREPARE=1
 RUN_EXECUTE=1
+RUN_CORRECTNESS_CHECK=1
 KEEP_STACK=0
 TPCH_SF=10
 TPCC_WAREHOUSES=""
@@ -90,6 +91,7 @@ Options:
   --skip-stack-start             Reuse existing local db9/CSE/Redis stack
   --skip-prepare                 Skip data preparation and only execute workload
   --skip-run                     Prepare data but do not execute workload
+  --skip-correctness-check       Skip TPC-C correctness validation after prepare/run
   --keep-stack                   Leave started db9/CSE/Redis processes running
   -h, --help                     Show this help
 
@@ -117,6 +119,7 @@ while [[ $# -gt 0 ]]; do
     --skip-stack-start) START_STACK=0; shift ;;
     --skip-prepare) RUN_PREPARE=0; shift ;;
     --skip-run) RUN_EXECUTE=0; shift ;;
+    --skip-correctness-check) RUN_CORRECTNESS_CHECK=0; shift ;;
     --keep-stack) KEEP_STACK=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -399,6 +402,21 @@ run_tpcc_execute() {
     >"$RAW_DIR/tpcc_${label}.json" 2>"$LOG_DIR/tpcc_${label}.log"
 }
 
+run_tpcc_correctness_check() {
+  local label="$1" host="$2" port="$3" user="$4" password="$5" db="$6" phase="$7"
+  log "tpcc correctness check on ${label} (${phase})"
+  python3 "$ROOT_DIR/scripts/tpcc_correctness_check.py" \
+    --host "$host" \
+    --port "$port" \
+    --user "$user" \
+    --password "$password" \
+    --db "$db" \
+    --label "$label" \
+    --phase "$phase" \
+    --output "$RAW_DIR/tpcc_${label}_${phase}_correctness.json" \
+    >"$LOG_DIR/tpcc_${label}_${phase}_correctness.log"
+}
+
 write_report() {
   local report="$REPORT_DIR/report.md"
   cat >"$report" <<EOF
@@ -440,6 +458,8 @@ Commands were executed with:
 Notes:
 
 - This script uses \`tiup bench\` with PostgreSQL wire.
+- For TPC-C, correctness JSON artifacts are emitted after \`prepare\` and after
+  \`run\` unless \`--skip-correctness-check\` is used.
 - For TPC-C, “10GB” is approximated by the chosen warehouse count and should be
   calibrated on PostgreSQL using \`pg_database_size()\`.
 - This report is an execution wrapper and artifact index. Interpret throughput
@@ -475,12 +495,20 @@ if [[ "$MODE" == "tpcc" || "$MODE" == "both" ]]; then
   if [[ "$RUN_PREPARE" -eq 1 ]]; then
     run_tpcc_prepare "$PG18_HOST" "$PG18_PORT" "$PG18_USER" "$PG18_PASSWORD" "$TPCC_PG_DB"
     run_tpcc_prepare "$DB9_HOST" "$DB9_PORT" "$DB9_USER" "$DB9_PASSWORD" "$TPCC_DB9_DB"
+    if [[ "$RUN_CORRECTNESS_CHECK" -eq 1 ]]; then
+      run_tpcc_correctness_check "pg18" "$PG18_HOST" "$PG18_PORT" "$PG18_USER" "$PG18_PASSWORD" "$TPCC_PG_DB" "after_prepare"
+      run_tpcc_correctness_check "db9" "$DB9_HOST" "$DB9_PORT" "$DB9_USER" "$DB9_PASSWORD" "$TPCC_DB9_DB" "after_prepare"
+    fi
   fi
   if [[ "$RUN_EXECUTE" -eq 1 ]]; then
     run_db9_metrics_snapshot "$RAW_DIR/tpcc_db9_before.prom"
     run_tpcc_execute "pg18" "$PG18_HOST" "$PG18_PORT" "$PG18_USER" "$PG18_PASSWORD" "$TPCC_PG_DB"
     run_tpcc_execute "db9" "$DB9_HOST" "$DB9_PORT" "$DB9_USER" "$DB9_PASSWORD" "$TPCC_DB9_DB"
     run_db9_metrics_snapshot "$RAW_DIR/tpcc_db9_after.prom"
+    if [[ "$RUN_CORRECTNESS_CHECK" -eq 1 ]]; then
+      run_tpcc_correctness_check "pg18" "$PG18_HOST" "$PG18_PORT" "$PG18_USER" "$PG18_PASSWORD" "$TPCC_PG_DB" "after_run"
+      run_tpcc_correctness_check "db9" "$DB9_HOST" "$DB9_PORT" "$DB9_USER" "$DB9_PASSWORD" "$TPCC_DB9_DB" "after_run"
+    fi
   fi
 fi
 
