@@ -19,7 +19,10 @@ impl<'a> Analyzer<'a> {
             return Ok(None);
         };
 
-        if !list.iter().all(|item| matches!(item.kind, TypedExprKind::Row(_))) {
+        if !list
+            .iter()
+            .all(|item| matches!(item.kind, TypedExprKind::Row(_)))
+        {
             return Ok(None);
         }
 
@@ -51,8 +54,7 @@ impl<'a> Analyzer<'a> {
             }
         }
 
-        let coerced_left =
-            TypedExpr::new(TypedExprKind::Row(coerced_left_items), left.data_type);
+        let coerced_left = TypedExpr::new(TypedExprKind::Row(coerced_left_items), left.data_type);
         let coerced_list = list_rows
             .into_iter()
             .map(|items| {
