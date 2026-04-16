@@ -215,38 +215,36 @@ pub(super) fn bind_variables_in_expr(expr: &mut Expr, ctx: &PlpgsqlContext) {
 
         // Qualified identifiers: first try record field access (`rec.field`),
         // then PostgreSQL's `function_name.param_name` disambiguation syntax.
-        Expr::CompoundIdentifier(parts) => {
-            if parts.len() == 2 && parts[0].quote_style.is_none() {
-                let qualifier = parts[0].value.to_lowercase();
-                let field = parts[1].value.to_lowercase();
-                let full_key = format!("{}.{}", qualifier, field);
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 && parts[0].quote_style.is_none() => {
+            let qualifier = parts[0].value.to_lowercase();
+            let field = parts[1].value.to_lowercase();
+            let full_key = format!("{}.{}", qualifier, field);
 
-                // Record field access: FOR-loop variables are stored as "rec.field".
-                // Only resolve when the qualifier is a known record variable (has
-                // at least one "qualifier.*" entry) to avoid shadowing SQL aliases.
-                let is_record = ctx
-                    .variables
-                    .keys()
-                    .any(|k| k.starts_with(&format!("{}.", qualifier)));
-                if is_record {
-                    if let Some(value) = ctx.variables.get(&full_key) {
-                        let data_type = ctx
-                            .variable_types
-                            .get(&full_key)
-                            .cloned()
-                            .unwrap_or(DataType::Text);
-                        *expr = value_to_ast_expr(value, &data_type);
-                    }
-                } else if !ctx.function_name.is_empty() && qualifier == ctx.function_name {
-                    // function_name.param_name disambiguation
-                    if let Some(value) = ctx.variables.get(&field) {
-                        let data_type = ctx
-                            .variable_types
-                            .get(&field)
-                            .cloned()
-                            .unwrap_or(DataType::Text);
-                        *expr = value_to_ast_expr(value, &data_type);
-                    }
+            // Record field access: FOR-loop variables are stored as "rec.field".
+            // Only resolve when the qualifier is a known record variable (has
+            // at least one "qualifier.*" entry) to avoid shadowing SQL aliases.
+            let is_record = ctx
+                .variables
+                .keys()
+                .any(|k| k.starts_with(&format!("{}.", qualifier)));
+            if is_record {
+                if let Some(value) = ctx.variables.get(&full_key) {
+                    let data_type = ctx
+                        .variable_types
+                        .get(&full_key)
+                        .cloned()
+                        .unwrap_or(DataType::Text);
+                    *expr = value_to_ast_expr(value, &data_type);
+                }
+            } else if !ctx.function_name.is_empty() && qualifier == ctx.function_name {
+                // function_name.param_name disambiguation
+                if let Some(value) = ctx.variables.get(&field) {
+                    let data_type = ctx
+                        .variable_types
+                        .get(&field)
+                        .cloned()
+                        .unwrap_or(DataType::Text);
+                    *expr = value_to_ast_expr(value, &data_type);
                 }
             }
         }

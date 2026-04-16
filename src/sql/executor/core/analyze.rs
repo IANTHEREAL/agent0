@@ -245,11 +245,7 @@ fn finalize_column(acc: &ColumnAccumulator, row_count: usize) -> ColumnStatistic
     // assumed distinct (matches PG: "Overwidth values are assumed to have been
     // distinct"). This may over-count if wide values repeat, but matches PG.
     let n_distinct = (acc.value_counts.len() + acc.wide_value_count) as f64;
-    let avg_width = if acc.non_null_count > 0 {
-        acc.total_width / acc.non_null_count
-    } else {
-        0
-    };
+    let avg_width = acc.total_width.checked_div(acc.non_null_count).unwrap_or(0);
 
     // MCV: top values by frequency, tie-broken by canonical key bytes ascending.
     let mut entries: Vec<(&Vec<u8>, &(Value, usize))> = acc.value_counts.iter().collect();

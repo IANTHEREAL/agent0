@@ -380,29 +380,27 @@ pub async fn execute_create_table(
                 columns,
                 is_primary,
                 ..
-            } => {
-                if !*is_primary {
-                    let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
-                    let idx_name = name.as_ref().map(|n| n.value.clone()).unwrap_or_else(|| {
-                        format!("{}_{}_key", table_object_name, col_names.join("_"))
-                    });
-                    indexes.push(IndexDef {
-                        name: idx_name,
-                        id: next_index_id,
-                        columns: col_names,
-                        unique: true,
-                        is_constraint: true,
-                        method: None,
-                        predicate: None,
-                        expressions: Vec::new(),
-                        state: IndexState::Ready,
-                        cached_predicate_conjuncts: None,
-                        hnsw_m: None,
-                        hnsw_ef_construction: None,
-                        hnsw_distance_metric: None,
-                    });
-                    next_index_id += 1;
-                }
+            } if !*is_primary => {
+                let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
+                let idx_name = name.as_ref().map(|n| n.value.clone()).unwrap_or_else(|| {
+                    format!("{}_{}_key", table_object_name, col_names.join("_"))
+                });
+                indexes.push(IndexDef {
+                    name: idx_name,
+                    id: next_index_id,
+                    columns: col_names,
+                    unique: true,
+                    is_constraint: true,
+                    method: None,
+                    predicate: None,
+                    expressions: Vec::new(),
+                    state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
+                });
+                next_index_id += 1;
             }
             TableConstraint::ForeignKey {
                 name,

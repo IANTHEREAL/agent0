@@ -40,11 +40,11 @@ pub(super) fn expr_has_unqualified_type_cast(expr_sql: &str, target_name: &str) 
             AstExpr::Cast { data_type, .. }
             | AstExpr::TryCast { data_type, .. }
             | AstExpr::SafeCast { data_type, .. }
-            | AstExpr::TypedString { data_type, .. } => {
-                if datatype_has_unqualified_type_name(data_type, target_name) {
-                    found = true;
-                    return ControlFlow::Break(());
-                }
+            | AstExpr::TypedString { data_type, .. }
+                if datatype_has_unqualified_type_name(data_type, target_name) =>
+            {
+                found = true;
+                return ControlFlow::Break(());
             }
             _ => {}
         }
@@ -61,11 +61,11 @@ pub(super) fn query_has_unqualified_type_cast(query_sql: &str, target_name: &str
             AstExpr::Cast { data_type, .. }
             | AstExpr::TryCast { data_type, .. }
             | AstExpr::SafeCast { data_type, .. }
-            | AstExpr::TypedString { data_type, .. } => {
-                if datatype_has_unqualified_type_name(data_type, target_name) {
-                    found = true;
-                    return ControlFlow::Break(());
-                }
+            | AstExpr::TypedString { data_type, .. }
+                if datatype_has_unqualified_type_name(data_type, target_name) =>
+            {
+                found = true;
+                return ControlFlow::Break(());
             }
             _ => {}
         }

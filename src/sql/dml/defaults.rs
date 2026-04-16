@@ -67,11 +67,11 @@ fn expr_has_custom_type_cast(expr: &sqlparser::ast::Expr) -> bool {
         match e {
             Expr::Cast { data_type, .. }
             | Expr::TryCast { data_type, .. }
-            | Expr::SafeCast { data_type, .. } => {
-                if data_type_has_custom_type(data_type) {
-                    found = true;
-                    return ControlFlow::Break(());
-                }
+            | Expr::SafeCast { data_type, .. }
+                if data_type_has_custom_type(data_type) =>
+            {
+                found = true;
+                return ControlFlow::Break(());
             }
             _ => {}
         }

@@ -171,7 +171,7 @@ pub async fn apply_default_table_privileges_for_new_table(
     for ((grantee, privilege), with_grant_option) in merged {
         let mut expanded: Vec<Privilege> = Vec::new();
         if privilege == Privilege::All {
-            expanded.extend(Privilege::expand_all().into_iter());
+            expanded.extend(Privilege::expand_all());
         } else {
             expanded.push(privilege);
         }

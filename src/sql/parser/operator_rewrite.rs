@@ -710,7 +710,7 @@ pub(super) fn rewrite_table_shorthand(sql: &str) -> Result<String, String> {
     }
 
     // Apply in reverse byte order so earlier indices stay valid.
-    mods.sort_by(|a, b| b.0.cmp(&a.0));
+    mods.sort_by_key(|m| std::cmp::Reverse(m.0));
     let mut result = sql.to_string();
     for (start, end, replacement) in mods {
         result.replace_range(start..end, &replacement);

@@ -745,10 +745,8 @@ fn analyze_create_index_with_params(sql: &str) -> CreateIndexWithAnalysis {
                 if tok.kind == TokenKind::Punct {
                     match tok.text.as_str() {
                         "(" => depth += 1,
-                        ")" => {
-                            if depth > 0 {
-                                depth -= 1;
-                            }
+                        ")" if depth > 0 => {
+                            depth -= 1;
                         }
                         _ => {}
                     }

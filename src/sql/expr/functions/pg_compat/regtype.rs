@@ -394,10 +394,10 @@ fn parse_special_builtin_lookup(raw: &str, is_array: bool) -> Result<Option<Pars
     };
 
     match base.as_str() {
-        "boolean" | "smallint" | "integer" | "int" | "bigint" | "real" | "double precision" => {
-            if typmod.is_some() {
-                return Err(invalid_type_name(raw));
-            }
+        "boolean" | "smallint" | "integer" | "int" | "bigint" | "real" | "double precision"
+            if typmod.is_some() =>
+        {
+            return Err(invalid_type_name(raw));
         }
         "character varying" | "varchar" | "character" | "bit varying" => {
             if let Some(tm) = typmod.as_deref() {
@@ -642,32 +642,26 @@ fn parse_resolved_typmod_int_list(typmod: &str, original_name: &str) -> Result<V
 
 fn validate_typmod_bounds(base: &str, args: &[i32]) -> Result<()> {
     match base {
-        "varchar" | "character varying" => {
-            if args.len() == 1 && args[0] < 1 {
-                return Err(crate::sql::error::SqlError::SqlStructure(
-                    "length for type varchar must be at least 1".to_string(),
-                )
-                .into());
-            }
+        "varchar" | "character varying" if args.len() == 1 && args[0] < 1 => {
+            return Err(crate::sql::error::SqlError::SqlStructure(
+                "length for type varchar must be at least 1".to_string(),
+            )
+            .into());
         }
-        "bpchar" | "character" => {
-            if args.len() == 1 && args[0] < 1 {
-                return Err(crate::sql::error::SqlError::SqlStructure(
-                    "length for type char must be at least 1".to_string(),
-                )
-                .into());
-            }
+        "bpchar" | "character" if args.len() == 1 && args[0] < 1 => {
+            return Err(crate::sql::error::SqlError::SqlStructure(
+                "length for type char must be at least 1".to_string(),
+            )
+            .into());
         }
-        "numeric" | "decimal" => {
-            if !args.is_empty() {
-                let precision = args[0];
-                if !(1..=1000).contains(&precision) {
-                    return Err(crate::sql::error::SqlError::SqlStructure(format!(
-                        "NUMERIC precision {} must be between 1 and 1000",
-                        precision
-                    ))
-                    .into());
-                }
+        "numeric" | "decimal" if !args.is_empty() => {
+            let precision = args[0];
+            if !(1..=1000).contains(&precision) {
+                return Err(crate::sql::error::SqlError::SqlStructure(format!(
+                    "NUMERIC precision {} must be between 1 and 1000",
+                    precision
+                ))
+                .into());
             }
         }
         _ => {}

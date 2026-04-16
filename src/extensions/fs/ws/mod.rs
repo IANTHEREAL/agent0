@@ -506,20 +506,10 @@ where
                             continue;
                         }
 
-                        if let Some(expected_size) = size {
-                            if expected_size > MAX_BYTES_PER_FILE as u64 {
-                                let resp = WsResponse::error(
-                                    &id,
-                                    WsErrorCode::Efbig,
-                                    format!(
-                                        "file too large: {} bytes exceeds limit {}",
-                                        expected_size, MAX_BYTES_PER_FILE
-                                    ),
-                                );
-                                let _ = send_response_tx(&out_tx, &resp).await;
-                                continue;
-                            }
-                        }
+                        // No size limit on streaming writes — memory is bounded at
+                        // one chunk buffer regardless of file size (gRPC: ~12 MB,
+                        // embedded TiKV: ~256 KB, embedded S3: ~64 MB).
+                        // Inline writes still enforce MAX_BYTES_PER_FILE.
 
                         let writer = match session
                             .backend
@@ -878,19 +868,26 @@ where
                     break;
                 }
 
-                let next_size = state.bytes_written.saturating_add(chunk.len() as u64);
-                if next_size > MAX_BYTES_PER_FILE as u64 {
-                    let resp = WsResponse::error(
-                        &state.request_id,
-                        WsErrorCode::Efbig,
-                        format!(
-                            "file too large: {} bytes exceeds limit {}",
-                            next_size, MAX_BYTES_PER_FILE
-                        ),
-                    );
-                    abort_streaming_write(state).await;
-                    let _ = send_response_tx(&out_tx, &resp).await;
-                    break;
+                // Enforce `expected_size` incrementally at the trust boundary so a
+                // client cannot stream unbounded bytes to fs9 and only get rejected at
+                // end-stream. The end-stream total-size check still runs — this just
+                // catches overruns earlier. When `expected_size` is unset, no cumulative
+                // cap is applied here (external quota/rate-limit governs).
+                let projected = state.bytes_written.saturating_add(chunk.len() as u64);
+                if let Some(expected_size) = state.expected_size {
+                    if projected > expected_size {
+                        let resp = WsResponse::error(
+                            &state.request_id,
+                            WsErrorCode::Efbig,
+                            format!(
+                                "streaming write exceeded expected_size: expected {expected_size}, \
+                                 received {projected}"
+                            ),
+                        );
+                        abort_streaming_write(state).await;
+                        let _ = send_response_tx(&out_tx, &resp).await;
+                        break;
+                    }
                 }
 
                 if let Err(err) = state.writer.write_chunk(chunk).await {
@@ -901,7 +898,7 @@ where
                     break;
                 }
 
-                state.bytes_written = next_size;
+                state.bytes_written = state.bytes_written.saturating_add(chunk.len() as u64);
                 state.hasher.update(chunk);
                 streaming_write = Some(state);
             }
@@ -1076,14 +1073,18 @@ async fn handle_ws_read_tx(
         }
     };
 
-    if actual_size > MAX_BYTES_PER_FILE as u64 {
+    let should_stream = should_stream_read(requested_streaming, actual_size);
+
+    // Enforce size limit only for inline reads, which load the entire file into
+    // memory for base64 encoding. Streaming reads use bounded chunk buffers.
+    if !should_stream && actual_size > MAX_BYTES_PER_FILE as u64 {
         send_response_tx(
             out_tx,
             &WsResponse::error(
                 id,
                 WsErrorCode::Efbig,
                 format!(
-                    "file too large: {} bytes exceeds limit {}",
+                    "inline read too large: {} bytes exceeds limit {}",
                     actual_size, MAX_BYTES_PER_FILE
                 ),
             ),
@@ -1092,7 +1093,6 @@ async fn handle_ws_read_tx(
         return Ok(());
     }
 
-    let should_stream = should_stream_read(requested_streaming, actual_size);
     if !should_stream || actual_size == 0 {
         let data = match (offset, length) {
             (Some(off), Some(len)) => session.backend.read_file_at(path, off, len).await,
@@ -1129,7 +1129,7 @@ async fn handle_ws_read_tx(
         (None, None) => {
             let reader = match session
                 .backend
-                .read_file_stream(path, MAX_BYTES_PER_FILE)
+                .read_file_stream(path, actual_size as usize)
                 .await
             {
                 Ok(reader) => reader,

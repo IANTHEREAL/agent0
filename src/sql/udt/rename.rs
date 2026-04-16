@@ -323,6 +323,9 @@ fn rewrite_query_type_casts(
     let mut changed = false;
 
     let _ = visit_expressions_mut(&mut query, |e| {
+        // Cannot use a collapsed pattern guard here: `rewrite_type_in_datatype`
+        // takes `&mut data_type`, but pattern-guard bindings are immutable (E0596).
+        #[allow(clippy::collapsible_match)]
         match e {
             AstExpr::Cast { data_type, .. }
             | AstExpr::TryCast { data_type, .. }
@@ -363,6 +366,9 @@ pub(super) fn rewrite_expr_type_casts(
     let mut changed = false;
 
     let _ = visit_expressions_mut(&mut expr, |e| {
+        // Cannot use a collapsed pattern guard here: `rewrite_type_in_datatype`
+        // takes `&mut data_type`, but pattern-guard bindings are immutable (E0596).
+        #[allow(clippy::collapsible_match)]
         match e {
             AstExpr::Cast { data_type, .. }
             | AstExpr::TryCast { data_type, .. }

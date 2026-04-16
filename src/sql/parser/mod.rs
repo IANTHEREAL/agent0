@@ -151,16 +151,12 @@ fn parse_insert_returning_wildcard_fallback(
 
         match tok.text.as_str() {
             "(" => depth_paren += 1,
-            ")" => {
-                if depth_paren > 0 {
-                    depth_paren -= 1;
-                }
+            ")" if depth_paren > 0 => {
+                depth_paren -= 1;
             }
             "[" => depth_bracket += 1,
-            "]" => {
-                if depth_bracket > 0 {
-                    depth_bracket -= 1;
-                }
+            "]" if depth_bracket > 0 => {
+                depth_bracket -= 1;
             }
             _ => {}
         }

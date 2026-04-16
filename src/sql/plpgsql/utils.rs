@@ -109,7 +109,7 @@ pub(super) fn format_raise_message(_ctx: &PlpgsqlContext, msg: &str) -> String {
 pub(super) fn substitute_variables(ctx: &PlpgsqlContext, s: &str) -> String {
     let mut result = s.to_string();
     let mut vars: Vec<(&String, &Value)> = ctx.variables.iter().collect();
-    vars.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
+    vars.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
     for (name, value) in vars {
         let value_str = match value {
             Value::Null => "NULL".to_string(),

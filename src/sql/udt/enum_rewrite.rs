@@ -791,55 +791,47 @@ fn rewrite_enum_literal_in_node(
             expr: inner,
             data_type,
             ..
-        } => {
-            if data_type_matches_target(data_type, enum_full_name, allow_unqualified_type_match) {
-                changed |= rewrite_string_literal_expr(inner, old_label, new_label);
-            }
+        } if data_type_matches_target(data_type, enum_full_name, allow_unqualified_type_match) => {
+            changed |= rewrite_string_literal_expr(inner, old_label, new_label);
         }
-        AstExpr::TypedString { data_type, value } => {
-            if data_type_matches_target(data_type, enum_full_name, allow_unqualified_type_match)
-                && value == old_label
-            {
-                *value = new_label.to_string();
-                changed = true;
-            }
+        AstExpr::TypedString { data_type, value }
+            if data_type_matches_target(
+                data_type,
+                enum_full_name,
+                allow_unqualified_type_match,
+            ) && value == old_label =>
+        {
+            *value = new_label.to_string();
+            changed = true;
         }
-        AstExpr::BinaryOp { left, op, right } => {
-            if is_comparison_op(op) {
-                if allow_column_context
-                    && expr_is_target_enum_context(
-                        left,
-                        enum_columns,
-                        enum_full_name,
-                        allow_unqualified_type_match,
-                    )
-                {
-                    changed |= rewrite_string_literal_expr(right, old_label, new_label);
-                }
-                if allow_column_context
-                    && expr_is_target_enum_context(
-                        right,
-                        enum_columns,
-                        enum_full_name,
-                        allow_unqualified_type_match,
-                    )
-                {
-                    changed |= rewrite_string_literal_expr(left, old_label, new_label);
-                }
-                if expr_is_target_enum_cast_context(
+        AstExpr::BinaryOp { left, op, right } if is_comparison_op(op) => {
+            if allow_column_context
+                && expr_is_target_enum_context(
                     left,
+                    enum_columns,
                     enum_full_name,
                     allow_unqualified_type_match,
-                ) {
-                    changed |= rewrite_string_literal_expr(right, old_label, new_label);
-                }
-                if expr_is_target_enum_cast_context(
+                )
+            {
+                changed |= rewrite_string_literal_expr(right, old_label, new_label);
+            }
+            if allow_column_context
+                && expr_is_target_enum_context(
                     right,
+                    enum_columns,
                     enum_full_name,
                     allow_unqualified_type_match,
-                ) {
-                    changed |= rewrite_string_literal_expr(left, old_label, new_label);
-                }
+                )
+            {
+                changed |= rewrite_string_literal_expr(left, old_label, new_label);
+            }
+            if expr_is_target_enum_cast_context(left, enum_full_name, allow_unqualified_type_match)
+            {
+                changed |= rewrite_string_literal_expr(right, old_label, new_label);
+            }
+            if expr_is_target_enum_cast_context(right, enum_full_name, allow_unqualified_type_match)
+            {
+                changed |= rewrite_string_literal_expr(left, old_label, new_label);
             }
         }
         AstExpr::IsDistinctFrom(left, right) | AstExpr::IsNotDistinctFrom(left, right) => {
@@ -872,8 +864,8 @@ fn rewrite_enum_literal_in_node(
                 changed |= rewrite_string_literal_expr(left, old_label, new_label);
             }
         }
-        AstExpr::InList { expr, list, .. } => {
-            if allow_column_context
+        AstExpr::InList { expr, list, .. }
+            if (allow_column_context
                 && expr_is_target_enum_context(
                     expr,
                     enum_columns,
@@ -884,54 +876,49 @@ fn rewrite_enum_literal_in_node(
                     expr,
                     enum_full_name,
                     allow_unqualified_type_match,
-                )
-            {
-                for item in list {
-                    changed |= rewrite_string_literal_expr(item, old_label, new_label);
-                }
+                )) =>
+        {
+            for item in list {
+                changed |= rewrite_string_literal_expr(item, old_label, new_label);
             }
         }
         AstExpr::Between {
             expr, low, high, ..
-        } => {
-            if allow_column_context
-                && expr_is_target_enum_context(
-                    expr,
-                    enum_columns,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-                || expr_is_target_enum_cast_context(
-                    expr,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-            {
-                changed |= rewrite_string_literal_expr(low, old_label, new_label);
-                changed |= rewrite_string_literal_expr(high, old_label, new_label);
-            }
+        } if (allow_column_context
+            && expr_is_target_enum_context(
+                expr,
+                enum_columns,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )
+            || expr_is_target_enum_cast_context(
+                expr,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )) =>
+        {
+            changed |= rewrite_string_literal_expr(low, old_label, new_label);
+            changed |= rewrite_string_literal_expr(high, old_label, new_label);
         }
         AstExpr::Case {
             operand: Some(operand),
             conditions,
             ..
-        } => {
-            if allow_column_context
-                && expr_is_target_enum_context(
-                    operand,
-                    enum_columns,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-                || expr_is_target_enum_cast_context(
-                    operand,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-            {
-                for cond in conditions {
-                    changed |= rewrite_string_literal_expr(cond, old_label, new_label);
-                }
+        } if (allow_column_context
+            && expr_is_target_enum_context(
+                operand,
+                enum_columns,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )
+            || expr_is_target_enum_cast_context(
+                operand,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )) =>
+        {
+            for cond in conditions {
+                changed |= rewrite_string_literal_expr(cond, old_label, new_label);
             }
         }
         _ => {}
@@ -966,55 +953,47 @@ fn rewrite_enum_literal_in_node_with_scope(
             expr: inner,
             data_type,
             ..
-        } => {
-            if data_type_matches_target(data_type, enum_full_name, allow_unqualified_type_match) {
-                changed |= rewrite_string_literal_expr(inner, old_label, new_label);
-            }
+        } if data_type_matches_target(data_type, enum_full_name, allow_unqualified_type_match) => {
+            changed |= rewrite_string_literal_expr(inner, old_label, new_label);
         }
-        AstExpr::TypedString { data_type, value } => {
-            if data_type_matches_target(data_type, enum_full_name, allow_unqualified_type_match)
-                && value == old_label
-            {
-                *value = new_label.to_string();
-                changed = true;
-            }
+        AstExpr::TypedString { data_type, value }
+            if data_type_matches_target(
+                data_type,
+                enum_full_name,
+                allow_unqualified_type_match,
+            ) && value == old_label =>
+        {
+            *value = new_label.to_string();
+            changed = true;
         }
-        AstExpr::BinaryOp { left, op, right } => {
-            if is_comparison_op(op) {
-                if allow_column_context
-                    && expr_is_target_enum_context_with_scope(
-                        left,
-                        scope,
-                        enum_full_name,
-                        allow_unqualified_type_match,
-                    )
-                {
-                    changed |= rewrite_string_literal_expr(right, old_label, new_label);
-                }
-                if allow_column_context
-                    && expr_is_target_enum_context_with_scope(
-                        right,
-                        scope,
-                        enum_full_name,
-                        allow_unqualified_type_match,
-                    )
-                {
-                    changed |= rewrite_string_literal_expr(left, old_label, new_label);
-                }
-                if expr_is_target_enum_cast_context(
+        AstExpr::BinaryOp { left, op, right } if is_comparison_op(op) => {
+            if allow_column_context
+                && expr_is_target_enum_context_with_scope(
                     left,
+                    scope,
                     enum_full_name,
                     allow_unqualified_type_match,
-                ) {
-                    changed |= rewrite_string_literal_expr(right, old_label, new_label);
-                }
-                if expr_is_target_enum_cast_context(
+                )
+            {
+                changed |= rewrite_string_literal_expr(right, old_label, new_label);
+            }
+            if allow_column_context
+                && expr_is_target_enum_context_with_scope(
                     right,
+                    scope,
                     enum_full_name,
                     allow_unqualified_type_match,
-                ) {
-                    changed |= rewrite_string_literal_expr(left, old_label, new_label);
-                }
+                )
+            {
+                changed |= rewrite_string_literal_expr(left, old_label, new_label);
+            }
+            if expr_is_target_enum_cast_context(left, enum_full_name, allow_unqualified_type_match)
+            {
+                changed |= rewrite_string_literal_expr(right, old_label, new_label);
+            }
+            if expr_is_target_enum_cast_context(right, enum_full_name, allow_unqualified_type_match)
+            {
+                changed |= rewrite_string_literal_expr(left, old_label, new_label);
             }
         }
         AstExpr::IsDistinctFrom(left, right) | AstExpr::IsNotDistinctFrom(left, right) => {
@@ -1047,8 +1026,8 @@ fn rewrite_enum_literal_in_node_with_scope(
                 changed |= rewrite_string_literal_expr(left, old_label, new_label);
             }
         }
-        AstExpr::InList { expr, list, .. } => {
-            if allow_column_context
+        AstExpr::InList { expr, list, .. }
+            if (allow_column_context
                 && expr_is_target_enum_context_with_scope(
                     expr,
                     scope,
@@ -1059,54 +1038,49 @@ fn rewrite_enum_literal_in_node_with_scope(
                     expr,
                     enum_full_name,
                     allow_unqualified_type_match,
-                )
-            {
-                for item in list {
-                    changed |= rewrite_string_literal_expr(item, old_label, new_label);
-                }
+                )) =>
+        {
+            for item in list {
+                changed |= rewrite_string_literal_expr(item, old_label, new_label);
             }
         }
         AstExpr::Between {
             expr, low, high, ..
-        } => {
-            if allow_column_context
-                && expr_is_target_enum_context_with_scope(
-                    expr,
-                    scope,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-                || expr_is_target_enum_cast_context(
-                    expr,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-            {
-                changed |= rewrite_string_literal_expr(low, old_label, new_label);
-                changed |= rewrite_string_literal_expr(high, old_label, new_label);
-            }
+        } if (allow_column_context
+            && expr_is_target_enum_context_with_scope(
+                expr,
+                scope,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )
+            || expr_is_target_enum_cast_context(
+                expr,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )) =>
+        {
+            changed |= rewrite_string_literal_expr(low, old_label, new_label);
+            changed |= rewrite_string_literal_expr(high, old_label, new_label);
         }
         AstExpr::Case {
             operand: Some(operand),
             conditions,
             ..
-        } => {
-            if allow_column_context
-                && expr_is_target_enum_context_with_scope(
-                    operand,
-                    scope,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-                || expr_is_target_enum_cast_context(
-                    operand,
-                    enum_full_name,
-                    allow_unqualified_type_match,
-                )
-            {
-                for cond in conditions {
-                    changed |= rewrite_string_literal_expr(cond, old_label, new_label);
-                }
+        } if (allow_column_context
+            && expr_is_target_enum_context_with_scope(
+                operand,
+                scope,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )
+            || expr_is_target_enum_cast_context(
+                operand,
+                enum_full_name,
+                allow_unqualified_type_match,
+            )) =>
+        {
+            for cond in conditions {
+                changed |= rewrite_string_literal_expr(cond, old_label, new_label);
             }
         }
         _ => {}

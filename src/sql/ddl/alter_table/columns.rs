@@ -922,16 +922,16 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
             names: &mut Vec<String>,
         ) {
             match factor {
-                TableFactor::Table { name, alias, .. } => {
-                    if object_name_matches(name, target_full, target_bare) {
-                        // The bare table name itself.
-                        if let Some(last) = name.0.last() {
-                            names.push(crate::sql::names::normalize_ident(last));
-                        }
-                        // Its alias, if any.
-                        if let Some(a) = alias {
-                            names.push(crate::sql::names::normalize_ident(&a.name));
-                        }
+                TableFactor::Table { name, alias, .. }
+                    if object_name_matches(name, target_full, target_bare) =>
+                {
+                    // The bare table name itself.
+                    if let Some(last) = name.0.last() {
+                        names.push(crate::sql::names::normalize_ident(last));
+                    }
+                    // Its alias, if any.
+                    if let Some(a) = alias {
+                        names.push(crate::sql::names::normalize_ident(&a.name));
                     }
                 }
                 TableFactor::NestedJoin {
@@ -999,10 +999,10 @@ fn view_sql_depends_on_column(view_sql: &str, table_full_name: &str, col_name: &
                 match e {
                     // Bare column reference — conservatively matches any
                     // same-name column regardless of qualifier.
-                    AstExpr::Identifier(ident) => {
-                        if crate::sql::names::normalize_ident(ident) == self.col_lower {
-                            return ControlFlow::Break(());
-                        }
+                    AstExpr::Identifier(ident)
+                        if crate::sql::names::normalize_ident(ident) == self.col_lower =>
+                    {
+                        return ControlFlow::Break(());
                     }
                     // Qualified column reference — only matches when the
                     // qualifier resolves to our target table.

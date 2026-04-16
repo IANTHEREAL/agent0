@@ -510,10 +510,7 @@ fn jsonb_containment_to_gin_qual(rhs: &TypedExpr) -> Option<GinQual> {
 
     let mut seen = HashSet::with_capacity(key_value_hashes.len() + key_exists_hashes.len());
     let mut hashes = Vec::with_capacity(key_value_hashes.len() + key_exists_hashes.len());
-    for hash in key_value_hashes
-        .into_iter()
-        .chain(key_exists_hashes.into_iter())
-    {
+    for hash in key_value_hashes.into_iter().chain(key_exists_hashes) {
         if seen.insert(hash) {
             hashes.push(hash);
         }

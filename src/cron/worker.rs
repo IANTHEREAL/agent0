@@ -186,7 +186,7 @@ async fn gc_database_batch_inner(
         let mut recovered = 0usize;
         let mut deleted = 0usize;
 
-        for (run, raw_key) in runs.into_iter().zip(raw_keys.into_iter()) {
+        for (run, raw_key) in runs.into_iter().zip(raw_keys) {
             let mut needs_update = false;
             let mut should_delete = false;
             let mut updated_run = run;

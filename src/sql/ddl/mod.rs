@@ -872,11 +872,9 @@ pub(super) fn check_expr_references_column(expr_str: &str, col_name: &str) -> Re
         }
 
         match e {
-            AstExpr::Identifier(ident) => {
-                if normalize_ident(ident) == col_name {
-                    found = true;
-                    return ControlFlow::Break(());
-                }
+            AstExpr::Identifier(ident) if normalize_ident(ident) == col_name => {
+                found = true;
+                return ControlFlow::Break(());
             }
             AstExpr::CompoundIdentifier(parts) => {
                 if let Some(last) = parts.last() {
@@ -913,11 +911,9 @@ pub(super) fn rewrite_check_expr_column(
 
     let _ = visit_expressions_mut(&mut expr, |e| {
         match e {
-            AstExpr::Identifier(ident) => {
-                if normalize_ident(ident) == old_col_name {
-                    ident.value = new_col_name.to_string();
-                    ident.quote_style = new_quote_style;
-                }
+            AstExpr::Identifier(ident) if normalize_ident(ident) == old_col_name => {
+                ident.value = new_col_name.to_string();
+                ident.quote_style = new_quote_style;
             }
             AstExpr::CompoundIdentifier(parts) => {
                 if let Some(last) = parts.last_mut() {

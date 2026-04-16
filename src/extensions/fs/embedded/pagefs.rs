@@ -2880,7 +2880,7 @@ async fn hydrate_directory_raw_entries(
     let child_inodes = load_inodes_batch(txn, &child_inode_ids).await?;
     let child_inode_map: HashMap<u64, Inode> = child_inode_ids
         .into_iter()
-        .zip(child_inodes.into_iter())
+        .zip(child_inodes)
         .filter_map(|(inode_id, inode)| inode.map(|inode| (inode_id, inode)))
         .collect();
 

@@ -432,7 +432,7 @@ impl TenantObservability {
             })
             .collect();
 
-        groups.sort_by(|a, b| b.sample_count.cmp(&a.sample_count));
+        groups.sort_by_key(|g| std::cmp::Reverse(g.sample_count));
         groups.truncate(self.config.max_sample_groups);
         groups
     }
