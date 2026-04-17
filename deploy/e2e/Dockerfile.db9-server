@@ -18,6 +18,7 @@ ENV BUILD_DATE=${BUILD_DATE}
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
 COPY src/ src/
 COPY vendor/ vendor/
 COPY crates/ crates/

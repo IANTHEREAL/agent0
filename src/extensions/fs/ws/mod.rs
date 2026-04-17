@@ -916,7 +916,10 @@ where
                 }
 
                 state.bytes_written = state.bytes_written.saturating_add(chunk.len() as u64);
+                let sha_start = std::time::Instant::now();
                 state.hasher.update(chunk);
+                ::metrics::histogram!("db9_upload_sha256_seconds")
+                    .record(sha_start.elapsed().as_secs_f64());
                 streaming_write = Some(state);
             }
             Message::Ping(payload) => {

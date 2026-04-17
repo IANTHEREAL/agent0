@@ -7,7 +7,7 @@
 //! subsequent calls to `metrics::counter!()`, `gauge!()`, `histogram!()`
 //! anywhere in the codebase are captured automatically.
 
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::SystemTime;
 use tracing::{info, warn};
 
@@ -21,25 +21,54 @@ const FAST_BUCKETS: &[f64] = &[
 #[allow(dead_code)]
 const SLOW_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0];
 
+/// Histogram buckets for upload hot-path timers (seconds).
+/// Covers two overlapping signals whose healthy ranges differ by ~4 orders
+/// of magnitude:
+///
+/// * SHA-256 update() on a 64 KiB chunk: healthy ~100–300 µs, pathological
+///   ~tens of ms.
+/// * mpsc send into the fs9 WriteParts channel: healthy <1 µs (unblocked),
+///   backpressured up to multiple seconds when fs9 itself is stalled —
+///   exactly the failure mode `mpsc_bound` exists to surface.
+///
+/// A single bucket set sized only for the healthy end (≤ 100 ms) would
+/// saturate p99 at the ceiling during the backpressure scenario we need
+/// to diagnose. Buckets span 100 µs → 10 s.
+const UPLOAD_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+
 /// Install the global Prometheus metrics recorder.
 ///
 /// Returns a [`PrometheusHandle`] used to render metrics at the HTTP endpoint.
-/// Must be called exactly once, early in `main()`.
+/// Must be called exactly once, early in `main()`, before any metric
+/// emission or description. Startup metric values (`db9_server_build_info`,
+/// `db9_server_start_time_seconds`, `db9_tokio_worker_threads`) are emitted
+/// from `main` *after* this returns and after descriptions are registered,
+/// so their first scrape carries HELP/TYPE metadata.
 pub fn install_recorder() -> PrometheusHandle {
-    let handle = PrometheusBuilder::new()
+    PrometheusBuilder::new()
         .set_buckets(FAST_BUCKETS)
         .expect("failed to set default buckets")
+        .set_buckets_for_metric(
+            Matcher::Full("db9_upload_sha256_seconds".to_string()),
+            UPLOAD_BUCKETS,
+        )
+        .expect("failed to set upload buckets for sha256 timer")
+        .set_buckets_for_metric(
+            Matcher::Full("db9_upload_mpsc_send_seconds".to_string()),
+            UPLOAD_BUCKETS,
+        )
+        .expect("failed to set upload buckets for mpsc send timer")
         .install_recorder()
-        .expect("failed to install Prometheus recorder");
+        .expect("failed to install Prometheus recorder")
+}
 
-    metrics::gauge!("db9_server_start_time_seconds").set(
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64(),
-    );
-
-    handle
+/// Current time in seconds since the Unix epoch, for the
+/// `db9_server_start_time_seconds` startup gauge.
+pub fn unix_now_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 /// Start a lightweight HTTP server that serves `/internal/metrics`.
@@ -163,6 +192,17 @@ mod tests {
         for w in SLOW_BUCKETS.windows(2) {
             assert!(w[0] < w[1], "buckets must be strictly increasing");
         }
+    }
+
+    #[test]
+    fn upload_buckets_span_micro_to_seconds_and_are_strictly_increasing() {
+        for w in UPLOAD_BUCKETS.windows(2) {
+            assert!(w[0] < w[1], "buckets must be strictly increasing");
+        }
+        // Sanity: must reach sub-millisecond resolution (SHA-256 floor)
+        // and multi-second ceiling (backpressured mpsc send tail).
+        assert!(UPLOAD_BUCKETS.first().copied().unwrap() <= 0.001);
+        assert!(UPLOAD_BUCKETS.last().copied().unwrap() >= 1.0);
     }
 
     /// Create a local recorder + handle for isolated test use.

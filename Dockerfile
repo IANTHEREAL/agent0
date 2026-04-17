@@ -32,6 +32,7 @@ WORKDIR /app
 
 # Copy everything needed for build
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY .cargo ./.cargo
 COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src

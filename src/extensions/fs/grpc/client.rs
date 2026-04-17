@@ -334,7 +334,8 @@ impl GrpcMultipartUpload {
     /// Caller pushes parts through the returned handle, then calls `close()` to
     /// finish the stream and get the authoritative `bytes_received` from the ACK.
     fn open_stream(&self) -> GrpcMultipartUploadStream {
-        let (tx, rx) = mpsc::channel::<proto::WritePartRequest>(2);
+        const MPSC_CAPACITY: usize = 2;
+        let (tx, rx) = mpsc::channel::<proto::WritePartRequest>(MPSC_CAPACITY);
         let mut client = self.client.clone();
         let path = self.path.clone();
         let task: JoinHandle<Result<u64>> = tokio::spawn(async move {
@@ -481,9 +482,20 @@ impl GrpcMultipartUploadStream {
             offset: self.cursor,
             data,
         };
-        if tx.send(req).await.is_err() {
-            // The RPC task dropped its receiver — surface the underlying error by
-            // joining the task instead of reporting a generic "channel closed".
+        // Instrument mpsc send latency as the primary `mpsc_bound` signal:
+        // a non-trivial send_seconds p99 with free workers means the channel
+        // is backpressuring the writer against fs9's WriteParts consumer.
+        // A separate queue-depth gauge would be last-writer-wins across
+        // concurrent uploads sharing the same series, so the histogram
+        // owns the backpressure signal on its own.
+        let send_start = std::time::Instant::now();
+        let send_result = tx.send(req).await;
+        ::metrics::histogram!(
+            "db9_upload_mpsc_send_seconds",
+            "channel" => "fs9_write_parts",
+        )
+        .record(send_start.elapsed().as_secs_f64());
+        if send_result.is_err() {
             return Err(self.drain_task_err().await);
         }
         self.cursor = self.cursor.saturating_add(len);

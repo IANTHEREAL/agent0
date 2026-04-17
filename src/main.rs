@@ -26,6 +26,7 @@ mod model;
 mod observability;
 mod pool;
 mod protocol;
+mod runtime_metrics;
 mod session_context;
 mod sql;
 mod storage;
@@ -179,15 +180,75 @@ fn main() -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&mb| mb > 0)
         .unwrap_or(DEFAULT_TOKIO_STACK_MB);
-    tokio::runtime::Builder::new_multi_thread()
+
+    // Tokio worker_threads defaults to num_cpus::get(), which reads host CPU
+    // count — NOT cgroup quota. In a 2 vCPU container on a 16-core node,
+    // this spawns 16 workers into a 2-CPU CFS slot. Under concurrent load
+    // CFS throttles the whole process in 100ms periods; work-stealing
+    // bursts exhaust quota in <100ms and every worker parks for the rest
+    // of the period. Tail latency and throughput both degrade.
+    //
+    // Resolve workers from (in order):
+    //   1. DB9_TOKIO_WORKER_THREADS env override (trust the operator)
+    //   2. cgroup CPU quota (ceil(quota/period); see runtime_metrics)
+    //   3. std::thread::available_parallelism
+    //   4. 2 as a last-resort default when no signal resolves
+    let (workers, workers_source) = resolve_tokio_worker_threads();
+    let build = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .thread_stack_size(stack_mb * 1024 * 1024)
         .build()
-        .unwrap()
-        .block_on(async_main(cli_args))
+        .unwrap();
+    // Emit startup line BEFORE handing control to async_main so it lands
+    // in logs even when the tracing subscriber isn't fully set up yet.
+    eprintln!(
+        "tokio runtime: workers={} (source={})",
+        workers, workers_source
+    );
+    build.block_on(async_main(cli_args, workers))
 }
 
-async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
+/// Returns (worker_count, source) for the tokio multi-thread runtime.
+/// Source is one of: "env", "cgroup", "available_parallelism", "fallback".
+fn resolve_tokio_worker_threads() -> (usize, &'static str) {
+    pick_workers(
+        env::var("DB9_TOKIO_WORKER_THREADS").ok().as_deref(),
+        runtime_metrics::cgroup_worker_count(),
+        std::thread::available_parallelism().ok().map(|n| n.get()),
+    )
+}
+
+/// Pure selector: given the three possible signals in priority order,
+/// return the winner. Extracted so the selection policy has direct unit
+/// tests — the regression being guarded against is a reintroduction of
+/// the `.max(2)` floor that silently promoted `1` to `2` on ≤1 vCPU pods.
+///
+/// Each signal is trusted at face value — no floor, no clamp. A 500m
+/// pod resolves to 1, an unbounded 16-core host resolves to 16. Tokio
+/// supports `worker_threads(1)`; blocking work lives on the separate
+/// blocking pool regardless.
+fn pick_workers(
+    env_val: Option<&str>,
+    cgroup: Option<usize>,
+    avail: Option<usize>,
+) -> (usize, &'static str) {
+    if let Some(n) = env_val
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return (n, "env");
+    }
+    if let Some(n) = cgroup.filter(|&n| n > 0) {
+        return (n, "cgroup");
+    }
+    if let Some(n) = avail.filter(|&n| n > 0) {
+        return (n, "available_parallelism");
+    }
+    (2, "fallback")
+}
+
+async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -198,12 +259,31 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
     // Install Prometheus metrics recorder (global, must be before any metrics! calls).
     let prometheus_handle = metrics::install_recorder();
+
+    // Register HELP/TYPE for every metric before the first emit so the
+    // initial scrape carries full metadata.
+    runtime_metrics::describe_metrics();
+
+    ::metrics::gauge!("db9_server_start_time_seconds").set(metrics::unix_now_seconds());
     ::metrics::gauge!(
         "db9_server_build_info",
         "version" => env!("CARGO_PKG_VERSION"),
         "git_hash" => env!("BUILD_GIT_HASH"),
     )
     .set(1.0);
+    // Config-binding guard for perf bench automation: scraping this gauge
+    // lets the bench harness reject runs where the requested
+    // DB9_TOKIO_WORKER_THREADS did not actually take effect (e.g. env not
+    // propagated via the StatefulSet pod spec).
+    ::metrics::gauge!("db9_tokio_worker_threads").set(tokio_worker_threads as f64);
+
+    // 1 Hz sampler (cgroup cpu.stat + tokio RuntimeMetrics). Wrapped in
+    // the supervisor so a panic inside the sampler restarts it instead
+    // of permanently killing observability.
+    tokio::spawn(supervised_background_loop(
+        "runtime_metrics sampler",
+        runtime_metrics::sampler_loop,
+    ));
 
     let pd_endpoints = cli_args.pd_endpoints.unwrap_or_else(|| {
         env::var("PD_ENDPOINTS").unwrap_or_else(|_| DEFAULT_PD_ENDPOINTS.to_string())
@@ -1268,5 +1348,42 @@ mod tests {
             cancel_engine < abort_engine && wake_worker < abort_engine,
             "worker shutdown must try graceful cancellation before aborting the engine task"
         );
+    }
+
+    #[test]
+    fn pick_workers_honors_env_without_floor() {
+        // Regression guard: the prior `.max(2)` clamp silently promoted 1→2,
+        // defeating DB9_TOKIO_WORKER_THREADS=1 and any cgroup result below 2.
+        assert_eq!(pick_workers(Some("1"), Some(8), Some(16)), (1, "env"));
+        assert_eq!(pick_workers(Some("3"), None, None), (3, "env"));
+    }
+
+    #[test]
+    fn pick_workers_falls_through_on_invalid_env() {
+        // Non-numeric / zero env values must fall through, not panic or
+        // be treated as a valid override.
+        assert_eq!(pick_workers(Some(""), Some(4), Some(8)), (4, "cgroup"));
+        assert_eq!(pick_workers(Some("0"), Some(4), Some(8)), (4, "cgroup"));
+        assert_eq!(pick_workers(Some("abc"), Some(4), Some(8)), (4, "cgroup"));
+    }
+
+    #[test]
+    fn pick_workers_uses_cgroup_without_clamp() {
+        // The headline fix: cgroup-derived 1 must flow through as 1.
+        assert_eq!(pick_workers(None, Some(1), Some(16)), (1, "cgroup"));
+        assert_eq!(pick_workers(None, Some(4), Some(16)), (4, "cgroup"));
+    }
+
+    #[test]
+    fn pick_workers_uses_available_parallelism_when_no_cgroup() {
+        assert_eq!(
+            pick_workers(None, None, Some(8)),
+            (8, "available_parallelism")
+        );
+    }
+
+    #[test]
+    fn pick_workers_fallback_only_when_nothing_resolves() {
+        assert_eq!(pick_workers(None, None, None), (2, "fallback"));
     }
 }

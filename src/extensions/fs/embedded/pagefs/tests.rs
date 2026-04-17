@@ -2502,7 +2502,10 @@ async fn test_begin_write_stream_behavioral_matches_write_file() {
     ensure_dir(&fs, base).await;
 
     let path = &format!("{base}/streamed.bin");
-    let data: Vec<u8> = (0..(PAGE_SIZE * 5 + 77))
+    // Size kept below fs9_config().inline_max_bytes (64 KiB) so the test
+    // exercises the staging → inline commit path without requiring S3
+    // backing, which make_fs() does not attach.
+    let data: Vec<u8> = (0..(PAGE_SIZE * 3 + 77))
         .map(|idx| (idx % 239) as u8)
         .collect();
 
@@ -2955,7 +2958,9 @@ async fn test_begin_write_stream_replaces_existing_file() {
     let path = &format!("{base}/replace.bin");
     fs.write_file(path, b"old-data", None).await.unwrap();
 
-    let new_data: Vec<u8> = (0..(PAGE_SIZE * 4 + 19))
+    // Size kept below fs9_config().inline_max_bytes (64 KiB); see
+    // test_begin_write_stream_behavioral_matches_write_file for rationale.
+    let new_data: Vec<u8> = (0..(PAGE_SIZE * 3 + 19))
         .map(|idx| (idx % 251) as u8)
         .collect();
     let mut writer = fs

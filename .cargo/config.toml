@@ -1,2 +1,9 @@
 [resolver]
 incompatible-rust-versions = "fallback"
+
+# tokio_unstable: unlocks `tokio::runtime::RuntimeMetrics` per-worker
+# counters (busy_duration, park_count, local_queue_depth) that the
+# runtime_metrics sampler exports as `db9_tokio_*`. The cfg only changes
+# which tokio APIs compile — no runtime behavior change.
+[build]
+rustflags = ["--cfg", "tokio_unstable"]
