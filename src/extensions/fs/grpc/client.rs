@@ -7,7 +7,7 @@ use tokio::io::AsyncBufRead;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
 use tracing::{debug, info, warn};
 
@@ -27,9 +27,25 @@ use crate::extensions::fs::FsError;
 pub(crate) async fn create_channel() -> Result<Channel> {
     let cfg = fs9_config();
     let addr = cfg.grpc_socket.clone();
-    info!(addr = %addr, "connecting to fs9 proxy");
+
+    // Surface any TLS misconfiguration (`FS9_TLS=true` + missing/unreadable
+    // cert, scheme mismatch, UDS-with-TLS) at the first gRPC connect
+    // attempt. Fail-closed semantics apply only where TLS actually
+    // matters — Embedded backends that never call create_channel aren't
+    // affected by a stray `FS9_TLS=true`.
+    let grpc_tls = cfg
+        .grpc_tls
+        .as_ref()
+        .map_err(|e| anyhow!("fs9 mTLS misconfigured: {e}"))?
+        .as_ref();
 
     let channel: Channel = if addr.starts_with('/') || addr.starts_with("unix://") {
+        // UDS path — always plaintext (pod-local, no wire to protect).
+        // Config parse rejects FS9_TLS=true + UDS up-front (fs9's server
+        // shares one grpc.Server across UDS and TCP, so TLS-on would
+        // require UDS clients to present a cert too), so reaching this
+        // branch implies grpc_tls is None.
+        info!(addr = %addr, tls_mode = "plaintext", "connecting to fs9 proxy");
         let socket_path = addr.strip_prefix("unix://").unwrap_or(&addr).to_string();
         Endpoint::try_from("http://[::]:50051")
             .map_err(|e| anyhow!("invalid endpoint: {e}"))?
@@ -56,17 +72,54 @@ pub(crate) async fn create_channel() -> Result<Channel> {
             .await
             .map_err(|e| anyhow!("connect to fs9 proxy (unix): {e}"))?
     } else {
-        let uri = if addr.starts_with("http") {
+        // TCP path — apply mTLS when Fs9GrpcTls is configured.
+        // https scheme when TLS on, http otherwise (tonic routes on scheme).
+        // Config parse rejects http:// + TLS-on up-front, so the
+        // starts_with("http") short-circuit cannot produce a silent
+        // plaintext URI while TLS config is attached.
+        let tls_mode = if grpc_tls.is_some() {
+            "mTLS"
+        } else {
+            "plaintext"
+        };
+        info!(addr = %addr, tls_mode, "connecting to fs9 proxy");
+        let scheme = if grpc_tls.is_some() { "https" } else { "http" };
+        let uri = if addr.to_ascii_lowercase().starts_with("http") {
             addr.clone()
         } else {
-            format!("http://{addr}")
+            format!("{scheme}://{addr}")
         };
-        Endpoint::try_from(uri.clone())
+        let mut endpoint = Endpoint::try_from(uri.clone())
             .map_err(|e| anyhow!("invalid endpoint {uri}: {e}"))?
             .connect_timeout(std::time::Duration::from_secs(10))
             .http2_keep_alive_interval(std::time::Duration::from_secs(10))
             .keep_alive_timeout(std::time::Duration::from_secs(5))
-            .keep_alive_while_idle(true)
+            .keep_alive_while_idle(true);
+
+        if let Some(tls) = grpc_tls {
+            // Mirrors vendor/tikv-client/src/common/security.rs::tls_channel
+            // — same ClientTlsConfig shape that already works against TiKV.
+            let ca_pem = std::fs::read(&tls.ca_path)
+                .map_err(|e| anyhow!("read fs9 CA {}: {e}", tls.ca_path))?;
+            let cert_pem = std::fs::read(&tls.cert_path)
+                .map_err(|e| anyhow!("read fs9 cert {}: {e}", tls.cert_path))?;
+            let key_pem = std::fs::read(&tls.key_path)
+                .map_err(|e| anyhow!("read fs9 key {}: {e}", tls.key_path))?;
+
+            let tls_config = ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(ca_pem))
+                .identity(Identity::from_pem(cert_pem, key_pem))
+                .domain_name(tls.server_name.clone());
+            endpoint = endpoint
+                .tls_config(tls_config)
+                .map_err(|e| anyhow!("fs9 tls config: {e}"))?;
+            info!(
+                server_name = %tls.server_name,
+                "fs9 gRPC client mTLS configured"
+            );
+        }
+
+        endpoint
             .connect()
             .await
             .map_err(|e| anyhow!("connect to fs9 proxy (tcp {uri}): {e}"))?
