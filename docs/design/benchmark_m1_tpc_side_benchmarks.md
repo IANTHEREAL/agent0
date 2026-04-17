@@ -59,70 +59,53 @@ It is not sufficient for:
 
 ## Recommended Tools
 
-### Default Choice For Local Compare: `tiup bench`
+### Standard Choice: HammerDB Fork
 
-Recommended default tool for **local** db9 compare runs:
-
-- tool: `tiup bench`
-- why:
-  - already common in the TiDB/TiKV ecosystem
-  - local `tiup bench` confirms support for `-d postgres`
-  - supports both `tpcc` and `tpch`
-  - easier to aim at db9's pgwire endpoint without building a separate Java tool
-
-Confirmed local support shape:
-
-- `tiup bench tpcc ... -d postgres`
-- `tiup bench tpch ... -d postgres`
-- PostgreSQL connection parameters can be passed through
-  `--conn-params sslmode=disable`
-
-This repo now includes a local wrapper script:
-
-- [`scripts/run_local_tiup_tpc_compare.sh`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/run_local_tiup_tpc_compare.sh)
-
-That script is designed for the requested local comparison flow:
-
-- `db9-server` PR `#2402`
-- `cloud-storage-engine` PR `#4921`
-- local PostgreSQL `18.3`
-
-### Default Choice For General Engineering: BenchBase
-
-Recommended default tool for db9:
-
-- project: [BenchBase](https://github.com/cmu-db/benchbase)
-- why:
-  - open source
-  - speaks PostgreSQL through JDBC
-  - supports both `TPC-C` and `TPC-H`
-  - easy to aim at db9 because db9 already exposes pgwire
-
-BenchBase PostgreSQL sample configs exist upstream:
-
-- `config/postgres/sample_tpcc_config.xml`
-- `config/postgres/sample_tpch_config.xml`
-
-This still makes BenchBase the most practical default for broader engineering
-runs, CI lab servers, and cases where one team wants a runner that is
-independent of `tiup`.
-
-### Optional Alternative: HammerDB
-
-Optional alternative when a team wants a single packaged benchmark runner with
-its own scripting flow:
+Recommended standard side-benchmark runner for db9 and PostgreSQL `18.3`:
 
 - project: [HammerDB](https://www.hammerdb.com/)
+- fork: [dbsid/HammerDB](https://github.com/dbsid/HammerDB)
+- why:
+  - one runner family for both `TPC-C` and `TPC-H`
+  - easier to adapt at the PostgreSQL workload-script layer than `tiup bench`
+  - already validated locally against PostgreSQL `18.3`
+  - db9 compatibility work can live in one dedicated fork instead of a growing
+    pile of shell wrappers
 
 Important note:
 
 - HammerDB uses `TPROC-C` and `TPROC-H` naming for its public benchmark
   reporting flow
-- if we use HammerDB-derived workloads, we should preserve that naming in public
-  reports and avoid implying audited `TPC-C` or `TPC-H` comparability
+- in internal db9 documents we still map these to `TPC-C` / `TPC-H` style side
+  benchmarks
+- in public reporting, keep HammerDB's `TPROC-*` naming and do not imply
+  audited `TPC-C` / `TPC-H` comparability
 
-For this repo, BenchBase is still the recommended first choice because it is
-lighter to integrate with db9's PostgreSQL surface.
+This fork carries db9-specific PostgreSQL compatibility logic such as:
+
+- db9 detection through `select version()`
+- db9-safe role/bootstrap SQL
+- db9-safe `TPROC-C` non-stored-procedure profile
+- db9 fallback handling for fragile PostgreSQL catalog assumptions
+
+Reference document in the fork:
+
+- [`db9-compat.md`](https://github.com/dbsid/HammerDB/blob/main/docs/db9-compat.md)
+
+### Secondary Choice: BenchBase
+
+BenchBase remains useful as an engineering comparison tool, especially when the
+team wants a JDBC-centric runner, but it is no longer the standard `M1`
+`TPC-C` / `TPC-H` side-benchmark tool.
+
+### Legacy Fallback: `tiup bench`
+
+`tiup bench` is still useful as a historical local fallback and for ad hoc
+comparisons, but it is no longer the standard runner for `M1` side benchmarks.
+
+Keep the existing `tiup bench` wrapper only as a legacy reference:
+
+- [`scripts/run_local_tiup_tpc_compare.sh`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/run_local_tiup_tpc_compare.sh)
 
 ## Recommended db9 Setup
 
@@ -167,50 +150,47 @@ PG_PORT=5433 \
 
 ### Suggested Workflow
 
-Use BenchBase against db9's PostgreSQL endpoint.
+Use the HammerDB fork against db9's PostgreSQL endpoint.
 
-Connection mapping:
+Standard local runner:
 
-- JDBC URL:
-  `jdbc:postgresql://127.0.0.1:5433/postgres?sslmode=disable&ApplicationName=tpcc`
-- username: `admin`
-- password: `admin`
+- repo: [dbsid/HammerDB](https://github.com/dbsid/HammerDB)
+- benchmark flavor: `TPROC-C`
+- recommended db9 mode: `pg_storedprocs=false`
 
 High-level steps:
 
-1. build BenchBase
-2. copy the upstream PostgreSQL `TPC-C` sample config
-3. replace the host, port, username, password, and database with db9 values
-4. run create
-5. run load
-6. run execute
-7. capture both BenchBase output and db9 Prometheus deltas
+1. use the HammerDB fork
+2. use the db9-specific `TPC-C` non-stored-procedure script set
+3. run `buildschema`
+4. run correctness checks after `prepare`
+5. run the timed workload
+6. run correctness checks after `run`
+7. capture HammerDB output plus db9 metrics and correctness JSON
 
-Suggested command pattern:
+Suggested command pattern from the fork:
 
 ```bash
-git clone https://github.com/cmu-db/benchbase.git
-cd benchbase
-./mvnw clean package -DskipTests
+git clone https://github.com/dbsid/HammerDB.git
+cd HammerDB
 
-java -jar target/benchbase-postgres.jar \
-  -b tpcc \
-  -c config/postgres/sample_tpcc_config.xml \
-  --create=true --load=true --execute=true
+./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_buildschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_checkschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_run.tcl
 ```
 
-The exact jar name can vary by BenchBase build layout. The key point is to use
-the PostgreSQL build target and the upstream `sample_tpcc_config.xml`.
+Equivalent PostgreSQL `18.3` commands use the `pg18` scripts from the same
+fork:
 
-### Explicit `tiup bench` Commands For Local Compare
+```bash
+./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_pg18_buildschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_pg18_checkschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_pg18_run.tcl
+```
 
-For the requested local compare flow:
+### Legacy `tiup bench` Commands For Local Compare
 
-- db9-server: PR `#2402`
-- cloud-storage-engine: PR `#4921`
-- PostgreSQL: `18.3`
-
-The practical `tiup bench` commands are:
+The following `tiup bench` commands are kept only as a historical fallback:
 
 Prepare on PostgreSQL 18.3:
 
@@ -288,10 +268,9 @@ Important local note:
 work, the local and server-side flow should validate relational invariants both
 after `prepare` and after `run`.
 
-This repo now includes:
+This repo now includes the authoritative post-benchmark correctness checker:
 
 - [`scripts/tpcc_correctness_check.py`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/tpcc_correctness_check.py)
-- [`scripts/run_local_tiup_tpc_compare.sh`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/run_local_tiup_tpc_compare.sh)
 
 The correctness checker validates invariants such as:
 
@@ -332,37 +311,32 @@ python3 scripts/tpcc_correctness_check.py \
   --output /tmp/tpcc_db9_after_run_correctness.json
 ```
 
-When using the local wrapper:
+Standard correctness flow:
 
-- correctness checks run automatically after `TPC-C prepare` and after `TPC-C run`
-- use `--skip-correctness-check` only when debugging runner issues, not for
-  milestone evidence
+1. HammerDB `buildschema`
+2. HammerDB `checkschema`
+3. custom `tpcc_correctness_check.py --phase after_prepare`
+4. HammerDB `run`
+5. custom `tpcc_correctness_check.py --phase after_run`
 
-Why not rely only on `tiup bench tpcc check`:
+Correctness acceptance rule:
 
-- `tiup bench tpcc check --check-all` is still useful immediately after
-  `prepare`
-- however, it contains initial-load assumptions such as fixed per-district
-  counts that no longer hold after `run`
-- for post-benchmark correctness, keep the custom invariant checker as the
-  primary gate
+- PostgreSQL `18.3` and db9 must both pass the post-run correctness check for
+  the benchmark result to count as valid
+- HammerDB `checkschema` is useful, but the invariant checker is the
+  authoritative post-run correctness gate
 
-Observed local validation on April 15, 2026:
+Current local validation status:
 
-- PostgreSQL `18.3`, `1 warehouse`:
-  - custom checker passed after `prepare`
-  - custom checker passed after `run`
-- db9-server `PR #2402` + cloud-storage-engine `PR #4921`, `1 warehouse`:
-  - custom checker passed after `prepare`
-  - `tiup bench tpcc run` is currently blocked before workload execution by:
-    `pq: could not determine data type of parameter $1`
-  - failing statement shape:
-    `SELECT ... FROM stock WHERE (s_w_id, s_i_id) IN ((?,?),(?,?),(?,?),(?,?),(?,?)) FOR UPDATE`
-
-This means the new correctness environment is in place and locally validated
-through `after_prepare` on db9, but the `after_run` db9 validation remains
-blocked by current prepared-statement type inference compatibility in
-`db9-server`.
+- PostgreSQL `18.3`:
+  - HammerDB `TPROC-C buildschema/checkschema/run` works locally
+  - post-run invariant checking is already supported by
+    `tpcc_correctness_check.py`
+- db9:
+  - HammerDB `TPROC-C buildschema` works locally in `pg_storedprocs=false`
+    mode
+  - remaining db9 gaps are now later-stage HammerDB runtime and check logic
+    issues, not the original bootstrap blocker set
 
 ### Suggested Scale Levels For db9
 
@@ -385,30 +359,28 @@ What `TPC-C` is best at surfacing for db9:
 
 ### Suggested Workflow
 
-Use BenchBase first, because it keeps the runner family consistent with the
-`TPC-C` side benchmark and already ships a PostgreSQL `TPC-H` sample config.
-
-Connection mapping:
-
-- JDBC URL:
-  `jdbc:postgresql://127.0.0.1:5433/postgres?sslmode=disable&ApplicationName=tpch`
-- username: `admin`
-- password: `admin`
+Use the same HammerDB fork as the standard runner.
 
 Suggested command pattern:
 
 ```bash
-git clone https://github.com/cmu-db/benchbase.git
-cd benchbase
-./mvnw clean package -DskipTests
+git clone https://github.com/dbsid/HammerDB.git
+cd HammerDB
 
-java -jar target/benchbase-postgres.jar \
-  -b tpch \
-  -c config/postgres/sample_tpch_config.xml \
-  --create=true --load=true --execute=true
+./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_db9_buildschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_db9_checkschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_db9_run.tcl
 ```
 
-### Explicit `tiup bench` Commands For Local Compare
+Equivalent PostgreSQL `18.3` commands:
+
+```bash
+./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_pg18_buildschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_pg18_checkschema.tcl
+./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_pg18_run.tcl
+```
+
+### Legacy `tiup bench` Commands For Local Compare
 
 For the requested local compare flow:
 
@@ -494,6 +466,22 @@ For internal engineering:
 - daily side benchmark: scale factor `1`
 - milestone side benchmark: scale factor `3` to `10`, depending on local load
   time budget and disk budget
+
+### TPC-H Correctness Validation
+
+`TPC-H` is read-only during `run`, so the standard correctness rule is:
+
+1. HammerDB `buildschema`
+2. HammerDB `checkschema`
+3. HammerDB `run`
+4. HammerDB `checkschema` again
+
+For db9 and PostgreSQL `18.3`:
+
+- if `checkschema` passes before and after `run`, the benchmark result is
+  treated as correctness-valid
+- this is sufficient for `TPC-H` because the workload does not mutate the
+  dataset
 
 ### Recommended Query Subset
 
@@ -589,6 +577,7 @@ For this PR and the `M1` benchmark program:
 
 - keep the current canonical corpus as the blocking gate
 - add `TPC-C` and `TPC-H` as side benchmark inventory
-- prefer BenchBase as the default runner for both because it fits db9's
-  PostgreSQL protocol surface
+- use the HammerDB fork at [dbsid/HammerDB](https://github.com/dbsid/HammerDB)
+  as the standard `TPC-C` / `TPC-H` side-benchmark runner
+- keep `BenchBase` and `tiup bench` as secondary or legacy fallback tools only
 - keep all side benchmark outputs separate from the canonical raw result files
