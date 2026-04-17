@@ -26,11 +26,8 @@ impl EmbeddedPageFs {
                     },
                 )
                 .await?;
-            if let Err(err) = writer.write_chunk(data).await {
-                let _ = writer.abort().await;
-                return Err(err);
-            }
-            return writer.finish().await;
+            let outcome = writer.write_chunk(data).await;
+            return writer.terminate(outcome).await;
         }
 
         let mut txn = self.begin().await?;
@@ -368,6 +365,9 @@ impl EmbeddedPageFs {
                             bytes_written: 0,
                             hasher: Sha256::new(),
                             last_lifecycle_refresh: now,
+                            guard: crate::extensions::fs::termination_guard::TerminationGuard::new(
+                                "EmbeddedObjectWriteStream",
+                            ),
                         }));
                     }
                     Err(err) if attempt + 1 < attempts => {
@@ -410,6 +410,9 @@ impl EmbeddedPageFs {
                         buffered: Vec::with_capacity(WRITE_STREAM_FLUSH_BYTES),
                         committed_bytes: 0,
                         last_staging_refresh: now,
+                        guard: crate::extensions::fs::termination_guard::TerminationGuard::new(
+                            "EmbeddedStagingWriteStream",
+                        ),
                     }));
                 }
                 Err(err) if attempt + 1 < attempts => {

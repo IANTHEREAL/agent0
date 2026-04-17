@@ -322,11 +322,7 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn finish(self: Box<Self>) -> Result<usize> {
-            anyhow::bail!("not implemented")
-        }
-
-        async fn abort(self: Box<Self>) -> Result<()> {
+        async fn terminate(self: Box<Self>, _outcome: Result<()>) -> Result<usize> {
             anyhow::bail!("not implemented")
         }
     }

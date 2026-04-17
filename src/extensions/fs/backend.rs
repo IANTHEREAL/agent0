@@ -141,8 +141,40 @@ pub(crate) struct FsPreparedDownload {
 #[async_trait]
 pub(crate) trait FsWriteStream: Send {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()>;
-    async fn finish(self: Box<Self>) -> Result<usize>;
-    async fn abort(self: Box<Self>) -> Result<()>;
+
+    /// Consume the writer with a caller-declared outcome.
+    ///
+    /// - `outcome = Ok(())`  → commit; return bytes written.
+    /// - `outcome = Err(e)` → ordered, observable abort; return `e`
+    ///   (cleanup-path failures are logged, not returned — the caller's
+    ///   error is always authoritative).
+    ///
+    /// This is the ONLY consumer; there is no `finish` / `abort` pair
+    /// for callers to choose between. The choice that produced years of
+    /// abort-vs-drop oscillation is eliminated at the type level.
+    ///
+    /// # Cancellation
+    /// The `Err` arm is cancel-safe: the wire sequence runs on a detached
+    /// task; dropping the `terminate` future (e.g. `tokio::time::timeout`
+    /// elapsing) does NOT truncate the work, and close-then-abort still
+    /// reaches the server in order.
+    ///
+    /// The `Ok` arm is NOT cancel-safe — callers MUST NOT wrap
+    /// `terminate(Ok(()))` in a timeout.
+    ///
+    /// # Implementor contract
+    /// Implementations MUST set their `terminated` flag synchronously,
+    /// before any `.await` in `terminate`, so a cancelled `terminate`
+    /// future (constructed but never polled past the first await point)
+    /// does not trip the drop-bomb. Advisory cleanup in `Drop` still
+    /// runs on such cancellations — the flag gates only the debug_assert.
+    ///
+    /// # Drop semantics
+    /// Dropping the stream without calling `terminate` is a bug:
+    /// - debug builds: `debug_assert!` fires, so CI catches forgot-terminate
+    /// - release builds: `warn!` log + best-effort advisory cleanup spawn
+    /// - server TTL remains the authoritative backstop in all cases
+    async fn terminate(self: Box<Self>, outcome: Result<()>) -> Result<usize>;
 }
 
 #[async_trait]
@@ -377,6 +409,19 @@ pub(crate) trait FsBackend: Send + Sync {
     ) -> Result<Box<dyn FsWriteStream>>;
     async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>>;
     async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize>;
+    /// Append `data` to the end of `path`. Returns the number of bytes
+    /// appended.
+    ///
+    /// ## Whole-write assumption
+    ///
+    /// All current backends implement append as whole-write — on success,
+    /// `data.len()` bytes are durably appended; on failure, zero. There is no
+    /// partial-append success case. Callers of this method may assume the
+    /// returned count equals `data.len()` when the result is `Ok`.
+    ///
+    /// If a future backend adopts a different contract (e.g. S3-style short
+    /// writes, quota-based truncation), it MUST update both this doc and the
+    /// trait method's return type to carry the server-reported delta.
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize>;
     async fn truncate(&self, path: &str, size: u64) -> Result<()>;
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()>;

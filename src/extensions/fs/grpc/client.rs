@@ -6,6 +6,7 @@ use std::error::Error as StdError;
 use tokio::io::AsyncBufRead;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tracing::{debug, info, warn};
@@ -218,162 +219,358 @@ fn parse_errno(message: &str) -> Option<i32> {
     message[start..end].parse().ok()
 }
 
-/// Streaming write adapter — pipes chunks to fs9 over gRPC via a background task.
+/// Default chunk size for streaming multipart writes.
 ///
-/// Commit is an explicit in-band signal (`WireMsg::Commit`), decoupled from channel
-/// lifetime. Dropping the stream without committing cancels the in-flight RPC and
-/// lets fs9 clean up the partial upload. This matches the staging-then-publish
-/// semantics of the embedded backends, so drop is safe across all `FsWriteStream`
-/// implementations.
-///
-/// Memory is bounded by `GRPC_WRITE_CHUNK_SIZE + channel_capacity × message_size`,
-/// independent of caller slice size or file size: `write_chunk` streams the caller's
-/// input directly into `GRPC_WRITE_CHUNK_SIZE` pieces and stages only a sub-chunk
-/// tail remainder in `self.buf`.
+/// The gRPC `WritePartRequest` payload ceiling is 4 MiB; `WriteParts` is designed
+/// around that cadence. Individual `write_chunk` calls stage a sub-chunk tail in
+/// `self.buf` to keep wire frames aligned to this size.
 const GRPC_WRITE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-/// Runtime protocol between `GrpcWriteStream` (producer) and its background task
-/// (consumer). `Commit` is the only signal that lets the task close the gRPC stream
-/// cleanly — any other termination (channel drop, producer error) drops the RPC
-/// future and triggers HTTP/2 cancellation. The header is not a variant here: it's
-/// static construction-time metadata that the task receives via its spawn closure.
-enum WireMsg {
-    Data(Vec<u8>),
-    Commit,
-}
-
-struct GrpcWriteStream {
-    tx: mpsc::Sender<WireMsg>,
-    task: JoinHandle<Result<proto::WriteFileResponse>>,
-    buf: BytesMut,
+/// Low-level adapter over the fs9 `BeginWrite → WriteParts → CommitWrite` multipart
+/// protocol.
+///
+/// Two usage modes on top of the same upload id:
+/// 1. Inline (caller knows all bytes): `begin` → `put_all_from_iter(chunks)` → `commit`.
+/// 2. Producer/consumer (streaming caller): `begin` → `open_stream()` pushes parts
+///    through an `mpsc`-backed client-streaming RPC → `close()` the stream handle →
+///    `commit`.
+///
+/// Safety: Drop fire-and-forges an `AbortWrite` on the runtime when the upload was
+/// neither committed nor explicitly aborted. The server's staging TTL is the real
+/// backstop — the spawn is best-effort cleanup only.
+struct GrpcMultipartUpload {
+    client: FsPlaneClient<Channel>,
+    upload_id: String,
     path: String,
-    keyspace: String,
-    notify_ring: std::sync::Arc<crate::extensions::fs::notify::EventRing>,
+    bytes_sent: u64,
+    committed_or_aborted: bool,
+    /// Drop-bomb guard (must be last field). Marks the upload as properly
+    /// consumed via `commit` or `abort` — catches direct Drops that bypass
+    /// the single-entry consumer `write_chunks_then_terminate`.
+    guard: crate::extensions::fs::termination_guard::TerminationGuard,
 }
 
-impl GrpcWriteStream {
-    fn new(
+impl GrpcMultipartUpload {
+    async fn begin(
         mut client: FsPlaneClient<Channel>,
         volume_id: String,
         path: String,
-        mode: u32,
-        keyspace: String,
-        notify_ring: std::sync::Arc<crate::extensions::fs::notify::EventRing>,
-    ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<WireMsg>(2);
+        file_mode: u32,
+        umask: u32,
+        write_mode: proto::WriteMode,
+        expected_size: Option<u64>,
+    ) -> Result<Self> {
+        let resp = client
+            .begin_write(proto::BeginWriteRequest {
+                volume_id,
+                path: path.clone(),
+                mode: write_mode as i32,
+                file_mode,
+                umask,
+                expected_size,
+            })
+            .await
+            .map_err(|e| grpc_err(e, &path))?
+            .into_inner();
 
-        let header = proto::WriteFileHeader {
-            volume_id,
-            path: path.clone(),
-            mode,
-            umask: 0o022,
-            create_only: false,
-            flush: true,
-        };
+        Ok(Self {
+            client,
+            upload_id: resp.upload_id,
+            path,
+            bytes_sent: 0,
+            committed_or_aborted: false,
+            guard: crate::extensions::fs::termination_guard::TerminationGuard::new(
+                "GrpcMultipartUpload",
+            ),
+        })
+    }
 
-        let grpc_path = path.clone();
-        let task = tokio::spawn(async move {
-            // Inner proto channel feeds tonic's request stream. Keeping two channels
-            // (outer `WireMsg`, inner `proto::WriteFileRequest`) lets us drive the RPC
-            // future concurrently with `rx.recv()` via `select!` — so server-side errors
-            // surface through the task's own `Result` instead of being masked by a
-            // generic "channel closed" on the producer side.
-            let (data_tx, data_rx) = mpsc::channel::<proto::WriteFileRequest>(2);
-            let rpc_future =
-                client.write_file(tokio_stream::wrappers::ReceiverStream::new(data_rx));
-            tokio::pin!(rpc_future);
-
-            // First frame on the gRPC stream is the header. This runs in the same async
-            // context as `rpc_future`, so there is no cross-context race to worry about.
-            // If `rpc_future` has already errored (transport init failure, etc.) the inner
-            // send returns Err and the select loop below surfaces the real cause on its
-            // first iteration.
-            let _ = data_tx
-                .send(proto::WriteFileRequest {
-                    header: Some(header),
-                    data: Vec::new(),
-                })
-                .await;
-
-            let mut committed = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    // Priority: if the RPC future resolves first, something server-side
-                    // happened (early error, connection drop). Surface it as the task's
-                    // Result so the producer's next send() failure maps to the real cause.
-                    result = &mut rpc_future => {
-                        return result
-                            .map(|r| r.into_inner())
-                            .map_err(|e| grpc_err(e, &grpc_path));
-                    }
-                    msg = rx.recv() => match msg {
-                        Some(WireMsg::Data(data)) => {
-                            if data_tx
-                                .send(proto::WriteFileRequest { header: None, data })
-                                .await
-                                .is_err()
-                            {
-                                // data_rx dropped = rpc_future finished. Loop once more so
-                                // the rpc_future arm of select! fires with the real error.
-                                continue;
-                            }
-                        }
-                        Some(WireMsg::Commit) => {
-                            committed = true;
-                            break;
-                        }
-                        None => {
-                            // Producer dropped its sender without Commit — implicit abort.
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if committed {
-                // Explicit commit: close the inner stream cleanly so fs9 commits the file,
-                // then await the response.
-                drop(data_tx);
-                (&mut rpc_future)
-                    .await
-                    .map(|r| r.into_inner())
-                    .map_err(|e| grpc_err(e, &grpc_path))
-            } else {
-                // Implicit abort: leaving this scope drops `rpc_future` mid-request,
-                // which sends HTTP/2 RST_STREAM; fs9 rolls back the partial upload.
-                Err(anyhow!("gRPC write stream aborted before commit"))
+    /// Send all chunks in one client-streaming RPC. Accumulates `bytes_sent` eagerly
+    /// as the stream is built; on error we return early and Drop cleans up.
+    ///
+    /// Note: `bytes_sent` counts bytes we *enqueued* — on mid-stream failure the
+    /// client side may overcount relative to server `bytes_received`. We don't retry
+    /// in v1, so this is only used to report a failure and abort.
+    async fn put_all_from_iter<I>(&mut self, chunks: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+        I::IntoIter: Send + 'static,
+    {
+        // Build a lazy iterator of WritePartRequest. `bytes_sent` tracks the
+        // rolling offset the server expects; each part's `offset` must equal the
+        // server's cumulative `bytes_received`, which for a single strict-in-order
+        // stream is the same as our own cumulative `bytes_sent` *before* the part.
+        let upload_id = self.upload_id.clone();
+        let mut offset = self.bytes_sent;
+        let requests = chunks.into_iter().map(move |data| {
+            let this_offset = offset;
+            offset = offset.saturating_add(data.len() as u64);
+            proto::WritePartRequest {
+                upload_id: upload_id.clone(),
+                offset: this_offset,
+                data,
             }
         });
 
-        Self {
-            tx,
-            task,
-            buf: BytesMut::with_capacity(GRPC_WRITE_CHUNK_SIZE),
-            path,
-            keyspace,
-            notify_ring,
-        }
-    }
-
-    /// Send a data chunk; on channel closure, drain the task's real error.
-    async fn send_data(&mut self, data: Vec<u8>) -> Result<()> {
-        if self.tx.send(WireMsg::Data(data)).await.is_err() {
-            return Err(self.drain_task_err().await);
-        }
+        // Collect the iterator AND accumulate bytes_sent for caller visibility.
+        // tokio_stream::iter is eager over the iterator but doesn't require Vec;
+        // we map through a plain iterator adapter. The caller's `chunks` iterator
+        // decides how much memory is resident at any point.
+        //
+        // We still need to know `bytes_sent` after the RPC completes. The simplest
+        // correct choice: peek the server's ACK. We update self.bytes_sent from
+        // the returned WritePartsResponse.bytes_received (authoritative).
+        let resp = self
+            .client
+            .write_parts(tokio_stream::iter(requests))
+            .await
+            .map_err(|e| grpc_err(e, &self.path))?
+            .into_inner();
+        self.bytes_sent = resp.bytes_received;
         Ok(())
     }
 
-    /// Called when a producer-side send fails (receiver dropped ⇒ task has ended
-    /// or is about to). Awaits the task to surface the underlying `tonic::Status`
-    /// instead of the generic "channel closed" message.
+    /// Open a live `WriteParts` client-streaming RPC backed by an mpsc channel.
+    /// Caller pushes parts through the returned handle, then calls `close()` to
+    /// finish the stream and get the authoritative `bytes_received` from the ACK.
+    fn open_stream(&self) -> GrpcMultipartUploadStream {
+        let (tx, rx) = mpsc::channel::<proto::WritePartRequest>(2);
+        let mut client = self.client.clone();
+        let path = self.path.clone();
+        let task: JoinHandle<Result<u64>> = tokio::spawn(async move {
+            let resp = client
+                .write_parts(ReceiverStream::new(rx))
+                .await
+                .map_err(|e| grpc_err(e, &path))?
+                .into_inner();
+            Ok(resp.bytes_received)
+        });
+
+        GrpcMultipartUploadStream {
+            tx: Some(tx),
+            task,
+            upload_id: self.upload_id.clone(),
+            path: self.path.clone(),
+            cursor: self.bytes_sent,
+        }
+    }
+
+    async fn commit(mut self) -> Result<u64> {
+        // Mark terminated BEFORE the RPC: if commit_write succeeds server-side
+        // but the response is dropped (network blip) and we return Err, Drop
+        // must not spawn an AbortWrite against an already-committed upload.
+        // Mirrors the "commit intent before RPC" pattern in `abort`.
+        self.committed_or_aborted = true;
+        self.guard.mark_terminated();
+        let resp = self
+            .client
+            .commit_write(proto::CommitWriteRequest {
+                upload_id: self.upload_id.clone(),
+                total_size: self.bytes_sent,
+            })
+            .await
+            .map_err(|e| grpc_err(e, &self.path))?
+            .into_inner();
+        Ok(resp.new_size)
+    }
+
+    /// Explicit, ordered, observable abort. INTERNAL — the only external
+    /// consumer (`write_chunks_then_terminate`) and `GrpcWriteStream::terminate`
+    /// call this via the single-entry `write_chunks_then_terminate` / the
+    /// terminate(Err) branch. Direct callers must not exist — they reintroduce
+    /// the commit-vs-abort oscillation that `terminate` was built to prevent.
+    async fn abort(mut self) -> Result<()> {
+        if self.upload_id.is_empty() {
+            self.committed_or_aborted = true;
+            self.guard.mark_terminated();
+            return Ok(());
+        }
+        // Commit intent before the RPC: move upload_id out and mark aborted.
+        // If the RPC fails (or panics), Drop sees an empty upload_id /
+        // committed_or_aborted = true and skips the retry spawn.
+        let upload_id = std::mem::take(&mut self.upload_id);
+        self.committed_or_aborted = true;
+        self.guard.mark_terminated();
+        self.client
+            .abort_write(proto::AbortWriteRequest { upload_id })
+            .await
+            .map_err(|e| grpc_err(e, &self.path))?;
+        Ok(())
+    }
+
+    /// Single-entry consumer: push all chunks, then commit on success or
+    /// abort on error — ordered wire sequence, no caller-side choice
+    /// between commit and abort. This is the ONLY external consumer;
+    /// `commit` and `abort` are internal implementation details reached
+    /// via this method.
+    async fn write_chunks_then_terminate<I>(mut self, chunks: I) -> Result<u64>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+        I::IntoIter: Send + 'static,
+    {
+        match self.put_all_from_iter(chunks).await {
+            Ok(()) => self.commit().await,
+            Err(caller_err) => {
+                let path = self.path.clone();
+                if let Err(cleanup_err) = self.abort().await {
+                    warn!(
+                        path = %path,
+                        error = %cleanup_err,
+                        "AbortWrite failed after caller error; TTL reclaims"
+                    );
+                }
+                Err(caller_err)
+            }
+        }
+    }
+}
+
+impl Drop for GrpcMultipartUpload {
+    fn drop(&mut self) {
+        if self.committed_or_aborted || self.upload_id.is_empty() {
+            return;
+        }
+        // Advisory backstop — reached only on panic unwind or runtime
+        // shutdown, since the ONLY external consumer is
+        // `write_chunks_then_terminate` which always invokes commit or abort
+        // through a single ordered entry. Server TTL reclaims otherwise.
+        let mut client = self.client.clone();
+        let upload_id = std::mem::take(&mut self.upload_id);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = client
+                        .abort_write(proto::AbortWriteRequest { upload_id })
+                        .await;
+                });
+            }
+            Err(_) => {
+                // No runtime (e.g. drop during teardown). TTL will reap.
+                warn!(
+                    upload_id = %upload_id,
+                    "GrpcMultipartUpload dropped outside tokio runtime; \
+                     relying on fs9 staging TTL to reclaim orphaned upload"
+                );
+            }
+        }
+    }
+}
+
+/// Live handle over a `WriteParts` client-streaming RPC. Each `push_part` sends a
+/// single `WritePartRequest`; `close` drops the sender (so the server sees EOS),
+/// awaits the joined task, and returns the authoritative `bytes_received`.
+struct GrpcMultipartUploadStream {
+    tx: Option<mpsc::Sender<proto::WritePartRequest>>,
+    task: JoinHandle<Result<u64>>,
+    upload_id: String,
+    path: String,
+    /// Rolling cumulative offset consumed so far — MUST match the server's
+    /// `bytes_received` for the next `WritePartRequest.offset`.
+    cursor: u64,
+}
+
+impl GrpcMultipartUploadStream {
+    async fn push_part(&mut self, data: Vec<u8>) -> Result<()> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("gRPC write stream already closed"))?;
+        let len = data.len() as u64;
+        let req = proto::WritePartRequest {
+            upload_id: self.upload_id.clone(),
+            offset: self.cursor,
+            data,
+        };
+        if tx.send(req).await.is_err() {
+            // The RPC task dropped its receiver — surface the underlying error by
+            // joining the task instead of reporting a generic "channel closed".
+            return Err(self.drain_task_err().await);
+        }
+        self.cursor = self.cursor.saturating_add(len);
+        Ok(())
+    }
+
+    /// Close the sender and await the RPC task. Returns the server's authoritative
+    /// cumulative `bytes_received`.
+    async fn close(mut self) -> Result<u64> {
+        // Dropping the sender signals EOS to the server's request stream.
+        drop(self.tx.take());
+        match self.task.await {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(e),
+            Err(e) if e.is_cancelled() => Err(anyhow!("gRPC write task cancelled")),
+            Err(e) => Err(anyhow!("gRPC write task panicked: {e}")),
+        }
+    }
+
     async fn drain_task_err(&mut self) -> anyhow::Error {
-        match (&mut self.task).await {
-            Ok(Ok(_)) => anyhow!("gRPC write stream closed before commit was sent"),
+        // Drop sender first so the task can settle.
+        drop(self.tx.take());
+        // SAFETY: after this, self.task is moved out via take. But we're called
+        // from &mut self — move via mem::replace with a sentinel.
+        // We only need the error path; replace with a never-resolving dummy task.
+        let path = self.path.clone();
+        let fake: JoinHandle<Result<u64>> =
+            tokio::spawn(async move { Err(anyhow!("replaced: {path}")) });
+        let real = std::mem::replace(&mut self.task, fake);
+        match real.await {
+            Ok(Ok(_)) => anyhow!("gRPC write stream closed before close() was called"),
             Ok(Err(e)) => e,
             Err(e) if e.is_cancelled() => anyhow!("gRPC write task cancelled"),
             Err(e) => anyhow!("gRPC write task panicked: {e}"),
         }
+    }
+}
+
+/// Streaming `FsWriteStream` adapter — a thin shell over `GrpcMultipartUpload` plus
+/// a live `WriteParts` stream handle. Aligns caller chunks to 4 MiB wire frames via
+/// `self.buf` staging tail and only keeps one in-flight chunk plus the mpsc channel
+/// buffer in memory at a time.
+struct GrpcWriteStream {
+    upload: Option<GrpcMultipartUpload>,
+    stream: Option<GrpcMultipartUploadStream>,
+    buf: BytesMut,
+    path: String,
+    keyspace: String,
+    notify_ring: std::sync::Arc<crate::extensions::fs::notify::EventRing>,
+    /// Drop-bomb guard. Must be the LAST field (field drop order runs the
+    /// host's advisory cleanup before the guard's debug_assert). See
+    /// `termination_guard` module for the invariant.
+    guard: crate::extensions::fs::termination_guard::TerminationGuard,
+}
+
+impl GrpcWriteStream {
+    fn new(
+        upload: GrpcMultipartUpload,
+        path: String,
+        keyspace: String,
+        notify_ring: std::sync::Arc<crate::extensions::fs::notify::EventRing>,
+    ) -> Self {
+        let stream = upload.open_stream();
+        Self {
+            upload: Some(upload),
+            stream: Some(stream),
+            buf: BytesMut::with_capacity(GRPC_WRITE_CHUNK_SIZE),
+            path,
+            keyspace,
+            notify_ring,
+            guard: crate::extensions::fs::termination_guard::TerminationGuard::new(
+                "GrpcWriteStream",
+            ),
+        }
+    }
+
+    async fn push(&mut self, data: Vec<u8>) -> Result<()> {
+        let len = data.len() as u64;
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| anyhow!("gRPC write stream already closed"))?;
+        stream.push_part(data).await?;
+        if let Some(upload) = self.upload.as_mut() {
+            upload.bytes_sent = upload.bytes_sent.saturating_add(len);
+        }
+        Ok(())
     }
 }
 
@@ -382,8 +579,8 @@ impl FsWriteStream for GrpcWriteStream {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         let mut rest = chunk;
 
-        // If a sub-chunk tail was staged from the previous call, top it up to
-        // GRPC_WRITE_CHUNK_SIZE before streaming new full chunks.
+        // Top up any staged sub-chunk tail to GRPC_WRITE_CHUNK_SIZE before
+        // streaming fresh full chunks from the caller's slice.
         if !self.buf.is_empty() {
             let need = GRPC_WRITE_CHUNK_SIZE - self.buf.len();
             let take = rest.len().min(need);
@@ -391,19 +588,18 @@ impl FsWriteStream for GrpcWriteStream {
             rest = &rest[take..];
             if self.buf.len() == GRPC_WRITE_CHUNK_SIZE {
                 let data = self.buf.split().freeze().to_vec();
-                self.send_data(data).await?;
+                self.push(data).await?;
             }
         }
 
-        // Stream full chunks directly from the caller's slice; memory stays bounded
-        // regardless of how large `chunk` is.
+        // Stream full chunks directly from the caller's slice — memory stays
+        // bounded regardless of caller slice size.
         while rest.len() >= GRPC_WRITE_CHUNK_SIZE {
             let (head, tail) = rest.split_at(GRPC_WRITE_CHUNK_SIZE);
-            self.send_data(head.to_vec()).await?;
+            self.push(head.to_vec()).await?;
             rest = tail;
         }
 
-        // Stage the sub-chunk remainder for the next call.
         if !rest.is_empty() {
             self.buf.extend_from_slice(rest);
         }
@@ -411,59 +607,159 @@ impl FsWriteStream for GrpcWriteStream {
         Ok(())
     }
 
-    async fn finish(mut self: Box<Self>) -> Result<usize> {
-        // Flush any staged sub-chunk tail.
-        if !self.buf.is_empty() {
-            let data = self.buf.split().freeze().to_vec();
-            self.send_data(data).await?;
+    async fn terminate(mut self: Box<Self>, outcome: Result<()>) -> Result<usize> {
+        // Drop-bomb flag MUST be set synchronously before any .await so a
+        // cancelled terminate future does not trip the debug_assert.
+        self.guard.mark_terminated();
+
+        match outcome {
+            Err(caller_err) => {
+                // Cancellation-safe close-then-abort.
+                //
+                // Both fields are taken synchronously, then the ordered wire
+                // sequence runs on a detached task. If the caller's future
+                // is cancelled (e.g. wrapped in `tokio::time::timeout`),
+                // dropping the returned JoinHandle does NOT cancel the
+                // spawned task (tokio semantics) — so close-then-abort still
+                // reaches the server in order. Server's staging TTL is the
+                // authoritative backstop.
+                let stream = self.stream.take();
+                let upload = self.upload.take();
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    // No runtime: per-field Drops log + TTL reclaims.
+                    // Caller's error still propagates.
+                    return Err(caller_err);
+                };
+                let join = handle.spawn(async move {
+                    if let Some(s) = stream {
+                        let _ = s.close().await;
+                    }
+                    if let Some(u) = upload {
+                        let _ = u.abort().await;
+                    }
+                });
+                match join.await {
+                    Ok(()) => {}
+                    Err(e) if e.is_cancelled() => {
+                        // is_cancelled() here means the tokio runtime itself
+                        // is shutting down and dropped the spawned task
+                        // before it finished — NOT that a caller timeout
+                        // elapsed (a caller timeout drops the outer future
+                        // at `join.await` and the spawned task keeps
+                        // running on the runtime). TTL reclaims in both
+                        // cases.
+                        debug!("GrpcWriteStream::terminate cleanup cancelled by runtime shutdown");
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "GrpcWriteStream::terminate cleanup task panicked; TTL reclaims"
+                        );
+                    }
+                }
+                // Caller's error is always authoritative on the Err arm.
+                Err(caller_err)
+            }
+            Ok(()) => {
+                // NOT cancel-safe — callers must not wrap this in a timeout
+                // (see trait doc). Flush + close + commit run in the caller's
+                // future; cancellation mid-sequence leaves fields partially
+                // taken, which Drop handles via the advisory spawn.
+                if !self.buf.is_empty() {
+                    let data = self.buf.split().freeze().to_vec();
+                    self.push(data).await?;
+                }
+
+                let stream = self
+                    .stream
+                    .take()
+                    .ok_or_else(|| anyhow!("gRPC write stream already closed"))?;
+                let bytes_received = stream.close().await?;
+
+                let mut upload = self
+                    .upload
+                    .take()
+                    .ok_or_else(|| anyhow!("gRPC upload state missing"))?;
+                upload.bytes_sent = bytes_received;
+                let new_size = upload.commit().await?;
+
+                let event = FsEventBuilder {
+                    event_type: FsEventType::Write,
+                    path: self.path.clone(),
+                    old_path: None,
+                    inode: 0,
+                    parent_inode: 0,
+                    generation: 0,
+                    is_dir: false,
+                    size: new_size,
+                };
+                crate::extensions::fs::notify::enqueue_persist_events(
+                    &self.keyspace,
+                    vec![event.clone()],
+                );
+                let metrics =
+                    crate::extensions::fs::notify::notify_metrics_for_keyspace(&self.keyspace);
+                match self.notify_ring.push(event) {
+                    Ok(_) => metrics.record_emit(&FsEventType::Write),
+                    Err(_) => metrics.record_emit_error(),
+                }
+
+                Ok(new_size as usize)
+            }
         }
-
-        // Explicit commit marker — only this lets the task close the RPC stream cleanly.
-        if self.tx.send(WireMsg::Commit).await.is_err() {
-            return Err(self.drain_task_err().await);
-        }
-
-        // Drop tx so the task's rx.recv() returns None after it processes Commit.
-        drop(self.tx);
-
-        let resp = match self.task.await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(e),
-            Err(e) if e.is_cancelled() => return Err(anyhow!("gRPC write task cancelled")),
-            Err(e) => return Err(anyhow!("gRPC write task panicked: {e}")),
-        };
-
-        // Emit advisory event — same pattern as GrpcFsBackend::write_file.
-        let event = FsEventBuilder {
-            event_type: FsEventType::Write,
-            path: self.path.clone(),
-            old_path: None,
-            inode: 0,
-            parent_inode: 0,
-            generation: 0,
-            is_dir: false,
-            size: resp.new_size,
-        };
-        crate::extensions::fs::notify::enqueue_persist_events(&self.keyspace, vec![event.clone()]);
-        let metrics = crate::extensions::fs::notify::notify_metrics_for_keyspace(&self.keyspace);
-        match self.notify_ring.push(event) {
-            Ok(_) => metrics.record_emit(&FsEventType::Write),
-            Err(_) => metrics.record_emit_error(),
-        }
-
-        Ok(resp.new_size as usize)
     }
+}
 
-    async fn abort(self: Box<Self>) -> Result<()> {
-        // Drop is the abort path. Dropping `self` drops `tx` — the task's `rx.recv()`
-        // returns None without seeing Commit, and the scope exit drops `rpc_future`
-        // mid-request, producing HTTP/2 RST_STREAM. fs9 rolls back the partial upload.
-        //
-        // The same drop path runs on panic or future cancellation, so callers that
-        // forget to call `abort()` still get safe cleanup — commit requires an
-        // explicit, deliberate Commit marker that can only originate from `finish()`.
-        drop(self);
-        Ok(())
+impl Drop for GrpcWriteStream {
+    fn drop(&mut self) {
+        // Host-side Drop: emit context-rich warn when terminate was forgotten,
+        // then run advisory cleanup. The debug_assert lives in the guard's
+        // Drop, which runs AFTER this (guard is declared last).
+        if !self.guard.is_terminated() && !std::thread::panicking() {
+            warn!(
+                path = %self.path,
+                "GrpcWriteStream dropped without terminate(); \
+                 advisory cleanup spawned, fs9 staging TTL reclaims"
+            );
+        }
+        // Advisory cleanup runs whenever fields are still present — true
+        // for both forgot-terminate AND terminate(Err) mid-cancellation.
+        // Taking both fields moves ownership into ONE spawned future that
+        // performs close-then-abort in wire order, avoiding the
+        // field-drop-order race (AbortWrite arriving before WriteParts tail).
+        let stream = self.stream.take();
+        let upload = self.upload.take();
+        if stream.is_none() && upload.is_none() {
+            return;
+        }
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let path = self.path.clone();
+                handle.spawn(async move {
+                    if let Some(stream) = stream {
+                        if let Err(err) = stream.close().await {
+                            debug!(path = %path, "GrpcWriteStream drop: stream close: {err:#}");
+                        }
+                    }
+                    if let Some(upload) = upload {
+                        if let Err(err) = upload.abort().await {
+                            debug!(path = %path, "GrpcWriteStream drop: upload abort: {err:#}");
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                warn!(
+                    path = %self.path,
+                    "GrpcWriteStream dropped outside tokio runtime; \
+                     relying on fs9 staging TTL to reclaim orphaned upload"
+                );
+                // stream and upload fall out of scope here. GrpcMultipartUpload::Drop
+                // will also hit the no-runtime branch and log; the wire-order race
+                // is irrelevant because no RPC will be sent from this thread anyway.
+            }
+        }
     }
 }
 
@@ -674,42 +970,55 @@ impl FsBackend for GrpcFsBackend {
     }
 
     async fn write_file(&self, path: &str, data: &[u8], mode: Option<u32>) -> Result<usize> {
-        let mut client = self.client.clone();
-        let header = proto::WriteFileHeader {
-            volume_id: self.volume_id.clone(),
-            path: path.to_string(),
-            mode: mode.unwrap_or(0o644),
-            umask: 0o022,
-            create_only: false,
-            flush: true,
-        };
+        let file_mode = mode.unwrap_or(0o644);
 
-        const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB per stream message
-        let mut messages: Vec<proto::WriteFileRequest> = Vec::new();
-
-        // First message carries header + first chunk of data
-        let first_chunk_end = data.len().min(CHUNK_SIZE);
-        messages.push(proto::WriteFileRequest {
-            header: Some(header),
-            data: data[..first_chunk_end].to_vec(),
-        });
-
-        // Remaining data in subsequent messages (no header)
-        let mut offset = first_chunk_end;
-        while offset < data.len() {
-            let end = data.len().min(offset + CHUNK_SIZE);
-            messages.push(proto::WriteFileRequest {
-                header: None,
-                data: data[offset..end].to_vec(),
+        // Fast path: single PutFile RPC for payloads that fit inside one 4 MiB frame.
+        if data.len() <= GRPC_WRITE_CHUNK_SIZE {
+            let resp = self
+                .client
+                .clone()
+                .put_file(proto::PutFileRequest {
+                    volume_id: self.volume_id.clone(),
+                    path: path.to_string(),
+                    mode: proto::WriteMode::Replace as i32,
+                    file_mode,
+                    umask: 0o022,
+                    data: data.to_vec(),
+                })
+                .await
+                .map_err(|e| grpc_err(e, path))?
+                .into_inner();
+            self.emit_event(FsEventBuilder {
+                event_type: FsEventType::Write,
+                path: path.to_string(),
+                old_path: None,
+                inode: 0,
+                parent_inode: 0,
+                generation: 0,
+                is_dir: false,
+                size: resp.new_size,
             });
-            offset = end;
+            return Ok(resp.new_size as usize);
         }
 
-        let resp = client
-            .write_file(tokio_stream::iter(messages))
-            .await
-            .map_err(|e| grpc_err(e, path))?
-            .into_inner();
+        // Slow path: BeginWrite → WriteParts (single client-streaming RPC) → CommitWrite.
+        // `write_chunks_then_terminate` is the single consumer — no caller-side
+        // choice between commit/abort; an error on WriteParts triggers ordered abort.
+        let upload = GrpcMultipartUpload::begin(
+            self.client.clone(),
+            self.volume_id.clone(),
+            path.to_string(),
+            file_mode,
+            0o022,
+            proto::WriteMode::Replace,
+            Some(data.len() as u64),
+        )
+        .await?;
+        let chunks: Vec<Vec<u8>> = data
+            .chunks(GRPC_WRITE_CHUNK_SIZE)
+            .map(|c| c.to_vec())
+            .collect();
+        let new_size = upload.write_chunks_then_terminate(chunks).await?;
 
         self.emit_event(FsEventBuilder {
             event_type: FsEventType::Write,
@@ -719,9 +1028,9 @@ impl FsBackend for GrpcFsBackend {
             parent_inode: 0,
             generation: 0,
             is_dir: false,
-            size: resp.new_size,
+            size: new_size,
         });
-        Ok(resp.new_size as usize)
+        Ok(new_size as usize)
     }
 
     async fn begin_write_stream(
@@ -729,11 +1038,19 @@ impl FsBackend for GrpcFsBackend {
         path: &str,
         opts: FsWriteStreamOptions,
     ) -> Result<Box<dyn FsWriteStream>> {
-        Ok(Box::new(GrpcWriteStream::new(
+        let upload = GrpcMultipartUpload::begin(
             self.client.clone(),
             self.volume_id.clone(),
             path.to_string(),
             opts.mode.unwrap_or(0o644),
+            0o022,
+            proto::WriteMode::Replace,
+            opts.expected_size,
+        )
+        .await?;
+        Ok(Box::new(GrpcWriteStream::new(
+            upload,
+            path.to_string(),
             self.keyspace.clone(),
             self.notify_ring.clone(),
         )))
@@ -767,37 +1084,56 @@ impl FsBackend for GrpcFsBackend {
     }
 
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
-        let mut client = self.client.clone();
-        let header = proto::AppendHeader {
-            volume_id: self.volume_id.clone(),
-            path: path.to_string(),
-            flush: true,
-        };
-
-        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-        let mut messages: Vec<proto::AppendRequest> = Vec::new();
-
-        let first_chunk_end = data.len().min(CHUNK_SIZE);
-        messages.push(proto::AppendRequest {
-            header: Some(header),
-            data: data[..first_chunk_end].to_vec(),
-        });
-
-        let mut offset = first_chunk_end;
-        while offset < data.len() {
-            let end = data.len().min(offset + CHUNK_SIZE);
-            messages.push(proto::AppendRequest {
-                header: None,
-                data: data[offset..end].to_vec(),
+        // Fast path: single PutFile RPC with Append mode for payloads that fit
+        // inside one 4 MiB frame.
+        if data.len() <= GRPC_WRITE_CHUNK_SIZE {
+            let resp = self
+                .client
+                .clone()
+                .put_file(proto::PutFileRequest {
+                    volume_id: self.volume_id.clone(),
+                    path: path.to_string(),
+                    mode: proto::WriteMode::Append as i32,
+                    file_mode: 0o644,
+                    umask: 0o022,
+                    data: data.to_vec(),
+                })
+                .await
+                .map_err(|e| grpc_err(e, path))?
+                .into_inner();
+            self.emit_event(FsEventBuilder {
+                event_type: FsEventType::Write,
+                path: path.to_string(),
+                old_path: None,
+                inode: 0,
+                parent_inode: 0,
+                generation: 0,
+                is_dir: false,
+                size: resp.new_size,
             });
-            offset = end;
+            // `bytes_written` is not exposed by PutFileResponse; the caller only
+            // uses the return value to know "how many bytes did my append add,"
+            // which for successful replace/append is `data.len()`.
+            return Ok(data.len());
         }
 
-        let resp = client
-            .append(tokio_stream::iter(messages))
-            .await
-            .map_err(|e| grpc_err(e, path))?
-            .into_inner();
+        // Slow path: BeginWrite(Append) → WriteParts → CommitWrite.
+        // Single-entry consumer — see `write_chunks_then_terminate`.
+        let upload = GrpcMultipartUpload::begin(
+            self.client.clone(),
+            self.volume_id.clone(),
+            path.to_string(),
+            0o644,
+            0o022,
+            proto::WriteMode::Append,
+            Some(data.len() as u64),
+        )
+        .await?;
+        let chunks: Vec<Vec<u8>> = data
+            .chunks(GRPC_WRITE_CHUNK_SIZE)
+            .map(|c| c.to_vec())
+            .collect();
+        let new_size = upload.write_chunks_then_terminate(chunks).await?;
 
         self.emit_event(FsEventBuilder {
             event_type: FsEventType::Write,
@@ -807,9 +1143,9 @@ impl FsBackend for GrpcFsBackend {
             parent_inode: 0,
             generation: 0,
             is_dir: false,
-            size: resp.new_size,
+            size: new_size,
         });
-        Ok(resp.bytes_written as usize)
+        Ok(data.len())
     }
 
     async fn truncate(&self, path: &str, size: u64) -> Result<()> {

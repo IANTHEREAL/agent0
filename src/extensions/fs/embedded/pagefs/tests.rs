@@ -2489,6 +2489,10 @@ async fn test_read_file_stream_behavioral_matches_read_file() {
     cleanup(&fs, base).await;
 }
 
+// Drop-bomb invariant tested in `src/extensions/fs/termination_guard.rs`
+// (pure Rust unit tests, runs in PR CI). Behavioral `.terminate(Ok)` /
+// `.terminate(Err)` paths below run in the nightly integration tier.
+
 #[tokio::test]
 #[ignore]
 async fn test_begin_write_stream_behavioral_matches_write_file() {
@@ -2515,7 +2519,7 @@ async fn test_begin_write_stream_behavioral_matches_write_file() {
     for chunk in data.chunks(11_111) {
         writer.write_chunk(chunk).await.unwrap();
     }
-    let written = writer.finish().await.unwrap();
+    let written = writer.terminate(Ok(())).await.unwrap();
 
     assert_eq!(written, data.len());
     assert_eq!(fs.read_file(path).await.unwrap(), data);
@@ -2679,7 +2683,7 @@ async fn test_begin_write_stream_without_size_keeps_small_files_mutable() {
     for chunk in data.chunks(7) {
         writer.write_chunk(chunk).await.unwrap();
     }
-    let written = writer.finish().await.unwrap();
+    let written = writer.terminate(Ok(())).await.unwrap();
 
     assert_eq!(written, data.len());
     let inode = fs.stat(path).await.unwrap();
@@ -2765,7 +2769,7 @@ async fn test_begin_write_stream_without_size_routes_large_files_after_spool() {
     for chunk in data.chunks(19_337) {
         writer.write_chunk(chunk).await.unwrap();
     }
-    let written = writer.finish().await.unwrap();
+    let written = writer.terminate(Ok(())).await.unwrap();
 
     assert_eq!(written, data.len());
     let inode = fs.stat(path).await.unwrap();
@@ -2839,7 +2843,12 @@ async fn test_begin_write_stream_abort_preserves_existing_file() {
         .write_chunk(b"new-data-that-must-not-commit")
         .await
         .unwrap();
-    writer.abort().await.unwrap();
+    // Explicit abort via terminate(Err). Exercises the ordered/observable
+    // cleanup path so regressions to Drop-only cleanup surface here.
+    writer
+        .terminate(Err(anyhow::anyhow!("test: abandon staged write")))
+        .await
+        .unwrap_err();
 
     assert_eq!(fs.read_file(path).await.unwrap(), original);
 
@@ -2962,7 +2971,7 @@ async fn test_begin_write_stream_replaces_existing_file() {
     for chunk in new_data.chunks(8192) {
         writer.write_chunk(chunk).await.unwrap();
     }
-    let written = writer.finish().await.unwrap();
+    let written = writer.terminate(Ok(())).await.unwrap();
 
     assert_eq!(written, new_data.len());
     assert_eq!(fs.read_file(path).await.unwrap(), new_data);

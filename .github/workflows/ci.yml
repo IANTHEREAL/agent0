@@ -181,6 +181,15 @@ jobs:
           PD_ENDPOINTS=127.0.0.1:2379 cargo test test_symlink_creation_bumps_superblock_to_v5 -- --ignored --nocapture
           PD_ENDPOINTS=127.0.0.1:2379 cargo test test_keyspace_without_symlinks_stays_at_v4 -- --ignored --nocapture
 
+      - name: Run fs9 FsWriteStream::terminate behavioral tests
+        shell: bash
+        run: |
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_behavioral_matches_write_file -- --ignored --nocapture
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_abort_preserves_existing_file -- --ignored --nocapture
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_replaces_existing_file -- --ignored --nocapture
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_without_size_keeps_small_files_mutable -- --ignored --nocapture
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_without_size_routes_large_files_after_spool -- --ignored --nocapture
+
       - name: Start db9-server
         run: |
           PD_ENDPOINTS=127.0.0.1:2379 \

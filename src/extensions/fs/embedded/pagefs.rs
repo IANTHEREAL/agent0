@@ -301,6 +301,10 @@ struct EmbeddedStagingWriteStream {
     buffered: Vec<u8>,
     committed_bytes: u64,
     last_staging_refresh: i64,
+    /// Drop-bomb guard. Embedded as the LAST field so the host's own `Drop`
+    /// (advisory cleanup) runs before the guard's `Drop` (debug_assert). See
+    /// `termination_guard` for the invariant.
+    guard: super::super::termination_guard::TerminationGuard,
 }
 
 impl EmbeddedStagingWriteStream {
@@ -347,37 +351,83 @@ impl FsWriteStream for EmbeddedStagingWriteStream {
         Ok(())
     }
 
-    async fn finish(mut self: Box<Self>) -> Result<usize> {
-        if let Err(err) = self.flush_buffer().await {
-            let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
-            return Err(err);
-        }
+    async fn terminate(mut self: Box<Self>, outcome: Result<()>) -> Result<usize> {
+        // Drop-bomb flag MUST be set synchronously (before any .await) so
+        // cancelled terminate futures do not trip the debug_assert.
+        self.guard.mark_terminated();
 
-        if let Err(err) = self
-            .fs
-            .finalize_stream_spool(self.staging_inode_id, self.committed_bytes)
-            .await
-        {
-            let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
-            return Err(err);
-        }
+        match outcome {
+            Err(caller_err) => {
+                if let Err(cleanup_err) = self.fs.abort_staged_write(self.staging_inode_id).await {
+                    warn!(
+                        staging_inode_id = self.staging_inode_id,
+                        error = %cleanup_err,
+                        "staging abort failed after caller error; TTL reclaims"
+                    );
+                }
+                Err(caller_err)
+            }
+            Ok(()) => {
+                if let Err(err) = self.flush_buffer().await {
+                    let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
+                    return Err(err);
+                }
 
-        match self
-            .fs
-            .publish_staged_write(&self.path, self.staging_inode_id)
-            .await
-        {
-            Ok(written) => Ok(written),
-            Err(err) => {
-                let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
-                Err(err)
+                if let Err(err) = self
+                    .fs
+                    .finalize_stream_spool(self.staging_inode_id, self.committed_bytes)
+                    .await
+                {
+                    let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
+                    return Err(err);
+                }
+
+                match self
+                    .fs
+                    .publish_staged_write(&self.path, self.staging_inode_id)
+                    .await
+                {
+                    Ok(written) => Ok(written),
+                    Err(err) => {
+                        let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
+                        Err(err)
+                    }
+                }
             }
         }
     }
+}
 
-    async fn abort(self: Box<Self>) -> Result<()> {
-        let _ = self.fs.abort_staged_write(self.staging_inode_id).await;
-        Ok(())
+impl Drop for EmbeddedStagingWriteStream {
+    fn drop(&mut self) {
+        // Host-side Drop: context-rich warn + advisory cleanup when caller
+        // forgot to terminate. The debug_assert lives in the guard's Drop,
+        // which runs AFTER this (guard is the last field by declaration).
+        if self.guard.is_terminated() {
+            // terminate() owned cleanup; Drop has nothing to do.
+            return;
+        }
+        warn!(
+            staging_inode_id = self.staging_inode_id,
+            "EmbeddedStagingWriteStream dropped without terminate(); \
+             advisory cleanup spawned, staging TTL reclaims"
+        );
+        let fs = self.fs.clone();
+        let staging_inode_id = self.staging_inode_id;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = fs.abort_staged_write(staging_inode_id).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    staging_inode_id,
+                    "EmbeddedStagingWriteStream dropped outside tokio runtime; \
+                     relying on staging TTL to reclaim"
+                );
+            }
+        }
     }
 }
 
@@ -395,6 +445,8 @@ struct EmbeddedObjectWriteStream {
     bytes_written: u64,
     hasher: Sha256,
     last_lifecycle_refresh: i64,
+    /// Drop-bomb guard. See matching field on `EmbeddedStagingWriteStream`.
+    guard: super::super::termination_guard::TerminationGuard,
 }
 
 impl EmbeddedObjectWriteStream {
@@ -470,6 +522,17 @@ impl EmbeddedObjectWriteStream {
 
     async fn abort_upload(&mut self) {
         if !self.should_abort_external_data().await {
+            // Staging inode has been linked by a concurrent path (committed
+            // by another flow). We must NOT delete the S3 object it now
+            // references. The multipart upload_id is effectively orphaned —
+            // S3 lifecycle rules reclaim it. Log so ops can see the pattern.
+            warn!(
+                staging_inode_id = self.staging_inode_id,
+                key = %self.key,
+                upload_id = %self.upload_id,
+                "abort_upload skipped: staging inode linked (nlink > 0); \
+                 S3 multipart upload_id orphaned, lifecycle reclaims"
+            );
             return;
         }
         self.abort_multipart_unchecked().await;
@@ -504,7 +567,15 @@ impl FsWriteStream for EmbeddedObjectWriteStream {
         Ok(())
     }
 
-    async fn finish(mut self: Box<Self>) -> Result<usize> {
+    async fn terminate(mut self: Box<Self>, outcome: Result<()>) -> Result<usize> {
+        // Drop-bomb flag MUST be set synchronously (before any .await).
+        self.guard.mark_terminated();
+
+        if let Err(caller_err) = outcome {
+            self.abort_upload().await;
+            return Err(caller_err);
+        }
+
         if let Err(err) = self.flush_parts().await {
             self.abort_upload().await;
             return Err(err);
@@ -645,10 +716,57 @@ impl FsWriteStream for EmbeddedObjectWriteStream {
             }
         }
     }
+}
 
-    async fn abort(mut self: Box<Self>) -> Result<()> {
-        self.abort_upload().await;
-        Ok(())
+impl Drop for EmbeddedObjectWriteStream {
+    fn drop(&mut self) {
+        if self.guard.is_terminated() {
+            return;
+        }
+        warn!(
+            staging_inode_id = self.staging_inode_id,
+            upload_id = %self.upload_id,
+            key = %self.key,
+            "EmbeddedObjectWriteStream dropped without terminate(); \
+             advisory cleanup spawned, staging TTL + S3 lifecycle reclaim"
+        );
+        let fs = self.fs.clone();
+        let s3 = self.s3.clone();
+        let key = std::mem::take(&mut self.key);
+        let upload_id = std::mem::take(&mut self.upload_id);
+        let staging_inode_id = self.staging_inode_id;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    // Only clean up external data if the staging inode has no
+                    // remaining links — mirrors `abort_upload`'s guard.
+                    let should_abort = {
+                        let mut txn = match fs.begin_internal().await {
+                            Ok(txn) => txn,
+                            Err(_) => return,
+                        };
+                        let inode = load_inode(&mut txn, staging_inode_id).await;
+                        let _ = txn.rollback().await;
+                        matches!(inode, Ok(Some(inode)) if inode.nlink == 0)
+                    };
+                    if !should_abort {
+                        return;
+                    }
+                    let _ = s3.abort_multipart_upload(&key, &upload_id).await;
+                    let _ = s3.delete_object(&key).await;
+                    let _ = fs.abort_staged_write(staging_inode_id).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    staging_inode_id,
+                    upload_id = %upload_id,
+                    key = %key,
+                    "EmbeddedObjectWriteStream dropped outside tokio runtime; \
+                     relying on staging TTL + S3 lifecycle to reclaim"
+                );
+            }
+        }
     }
 }
 

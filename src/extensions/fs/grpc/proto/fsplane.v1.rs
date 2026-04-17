@@ -101,37 +101,102 @@ pub struct DirEntry {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WriteFileRequest {
-    /// Header — set only in the first message of the stream.
-    #[prost(message, optional, tag = "1")]
-    pub header: ::core::option::Option<WriteFileHeader>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WriteFileHeader {
+pub struct PutFileRequest {
     #[prost(string, tag = "1")]
     pub volume_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub path: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "3")]
-    pub mode: u32,
+    #[prost(enumeration = "WriteMode", tag = "3")]
+    pub mode: i32,
     #[prost(uint32, tag = "4")]
+    pub file_mode: u32,
+    #[prost(uint32, tag = "5")]
     pub umask: u32,
-    /// If true, fail with ALREADY_EXISTS when file exists (O_EXCL).
-    #[prost(bool, tag = "5")]
-    pub create_only: bool,
-    /// If true, flush before close (durable). If false, buffer (batch mode).
-    #[prost(bool, tag = "6")]
-    pub flush: bool,
+    /// Payload. Server MUST reject if > 4 MiB (use BeginWrite/WriteParts/CommitWrite
+    /// for anything larger).
+    #[prost(bytes = "vec", tag = "6")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WriteFileResponse {
+pub struct PutFileResponse {
     #[prost(uint64, tag = "1")]
     pub new_size: u64,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BeginWriteRequest {
+    #[prost(string, tag = "1")]
+    pub volume_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(enumeration = "WriteMode", tag = "3")]
+    pub mode: i32,
+    #[prost(uint32, tag = "4")]
+    pub file_mode: u32,
+    #[prost(uint32, tag = "5")]
+    pub umask: u32,
+    /// Optional upper bound on total bytes. Server fast-fails at WritePart when
+    /// cumulative would exceed this; re-checked at Commit.
+    #[prost(uint64, optional, tag = "6")]
+    pub expected_size: ::core::option::Option<u64>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BeginWriteResponse {
+    /// Opaque, 128-bit random, unguessable.
+    #[prost(string, tag = "1")]
+    pub upload_id: ::prost::alloc::string::String,
+    /// Recommended max bytes per WritePartRequest.data. Default 4 MiB.
+    ///
+    /// NO expires_at — server is authoritative on TTL; client must not compute
+    /// "time remaining" from a wire value (clock skew hazard).
+    #[prost(uint64, tag = "2")]
+    pub part_size_hint: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WritePartRequest {
+    #[prost(string, tag = "1")]
+    pub upload_id: ::prost::alloc::string::String,
+    /// MUST equal the server's cumulative bytes_received; FAILED_PRECONDITION
+    /// otherwise. Strict in-order, no gaps, no overlap.
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WritePartsResponse {
+    /// Cumulative bytes successfully staged by this stream.
+    #[prost(uint64, tag = "1")]
+    pub bytes_received: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CommitWriteRequest {
+    #[prost(string, tag = "1")]
+    pub upload_id: ::prost::alloc::string::String,
+    /// MUST equal server bytes_received; FAILED_PRECONDITION otherwise.
+    #[prost(uint64, tag = "2")]
+    pub total_size: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CommitWriteResponse {
+    #[prost(uint64, tag = "1")]
+    pub new_size: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AbortWriteRequest {
+    #[prost(string, tag = "1")]
+    pub upload_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AbortWriteResponse {}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriteAtRequest {
@@ -149,33 +214,6 @@ pub struct WriteAtRequest {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WriteAtResponse {
-    #[prost(uint64, tag = "1")]
-    pub bytes_written: u64,
-    #[prost(uint64, tag = "2")]
-    pub new_size: u64,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AppendRequest {
-    /// Header — set only in the first message of the stream.
-    #[prost(message, optional, tag = "1")]
-    pub header: ::core::option::Option<AppendHeader>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AppendHeader {
-    #[prost(string, tag = "1")]
-    pub volume_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub path: ::prost::alloc::string::String,
-    #[prost(bool, tag = "3")]
-    pub flush: bool,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AppendResponse {
     #[prost(uint64, tag = "1")]
     pub bytes_written: u64,
     #[prost(uint64, tag = "2")]
@@ -316,6 +354,43 @@ pub struct PingResponse {
     pub active_volumes: u32,
     #[prost(uint64, tag = "2")]
     pub rss_bytes: u64,
+}
+/// WriteMode selects the publish semantic at CommitWrite / PutFile time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WriteMode {
+    Unspecified = 0,
+    /// REPLACE: atomic rename-over target.
+    Replace = 1,
+    /// CREATE_ONLY: atomic rename with RENAME_NOREPLACE; ALREADY_EXISTS on
+    /// collision at commit.
+    CreateOnly = 2,
+    /// APPEND: concat to existing target under flock at commit.
+    Append = 3,
+}
+impl WriteMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            WriteMode::Unspecified => "WRITE_MODE_UNSPECIFIED",
+            WriteMode::Replace => "WRITE_MODE_REPLACE",
+            WriteMode::CreateOnly => "WRITE_MODE_CREATE_ONLY",
+            WriteMode::Append => "WRITE_MODE_APPEND",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WRITE_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "WRITE_MODE_REPLACE" => Some(Self::Replace),
+            "WRITE_MODE_CREATE_ONLY" => Some(Self::CreateOnly),
+            "WRITE_MODE_APPEND" => Some(Self::Append),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod fs_plane_client {
@@ -528,13 +603,13 @@ pub mod fs_plane_client {
             req.extensions_mut().insert(GrpcMethod::new("fsplane.v1.FsPlane", "Stat"));
             self.inner.unary(req, path, codec).await
         }
-        /// WriteFile creates or fully replaces a file from a stream of chunks.
-        /// First message MUST contain the header. Subsequent messages carry data only.
-        pub async fn write_file(
+        /// PutFile creates / replaces / appends a file in a single unary RPC.
+        /// Server rejects requests with len(data) > 4 MiB (clients must use multipart).
+        pub async fn put_file(
             &mut self,
-            request: impl tonic::IntoStreamingRequest<Message = super::WriteFileRequest>,
+            request: impl tonic::IntoRequest<super::PutFileRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::WriteFileResponse>,
+            tonic::Response<super::PutFileResponse>,
             tonic::Status,
         > {
             self.inner
@@ -548,16 +623,126 @@ pub mod fs_plane_client {
                 })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/fsplane.v1.FsPlane/WriteFile",
+                "/fsplane.v1.FsPlane/PutFile",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("fsplane.v1.FsPlane", "PutFile"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// BeginWrite opens a multipart upload session. Returns an opaque upload_id
+        /// that the caller uses for WriteParts / CommitWrite / AbortWrite.
+        pub async fn begin_write(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BeginWriteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BeginWriteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/fsplane.v1.FsPlane/BeginWrite",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("fsplane.v1.FsPlane", "BeginWrite"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// WriteParts streams data into an open upload. Single-writer per upload_id
+        /// by construction (one streaming RPC == one writer). offset in each
+        /// WritePartRequest MUST equal the server's cumulative bytes_received.
+        /// Stream EOS means "data phase done, awaiting CommitWrite" — NOT commit.
+        pub async fn write_parts(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::WritePartRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WritePartsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/fsplane.v1.FsPlane/WriteParts",
             );
             let mut req = request.into_streaming_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("fsplane.v1.FsPlane", "WriteFile"));
+                .insert(GrpcMethod::new("fsplane.v1.FsPlane", "WriteParts"));
             self.inner.client_streaming(req, path, codec).await
         }
-        /// WriteAt writes data at a specific offset. Does not truncate the file.
-        /// If offset is beyond file size, JuiceFS zero-fills the gap (POSIX).
-        /// Unary — for bounded regions up to ~4MB.
+        /// CommitWrite publishes the multipart upload atomically (temp + rename for
+        /// REPLACE / CREATE_ONLY; flock + seek-end + write for APPEND). Idempotent
+        /// within the server's receipt retention window.
+        pub async fn commit_write(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CommitWriteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CommitWriteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/fsplane.v1.FsPlane/CommitWrite",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("fsplane.v1.FsPlane", "CommitWrite"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// AbortWrite discards an upload. Idempotent; safe on terminal sessions;
+        /// TTL is the authoritative backstop if the client never calls this.
+        pub async fn abort_write(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AbortWriteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AbortWriteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/fsplane.v1.FsPlane/AbortWrite",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("fsplane.v1.FsPlane", "AbortWrite"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// WriteAt writes data at a specific offset on an existing file. Does not
+        /// truncate. Unary — for bounded regions up to 4 MiB.
         pub async fn write_at(
             &mut self,
             request: impl tonic::IntoRequest<super::WriteAtRequest>,
@@ -582,29 +767,6 @@ pub mod fs_plane_client {
             req.extensions_mut()
                 .insert(GrpcMethod::new("fsplane.v1.FsPlane", "WriteAt"));
             self.inner.unary(req, path, codec).await
-        }
-        /// Append appends data to the end of a file via streaming.
-        /// First message MUST contain the header. Subsequent messages carry data.
-        pub async fn append(
-            &mut self,
-            request: impl tonic::IntoStreamingRequest<Message = super::AppendRequest>,
-        ) -> std::result::Result<tonic::Response<super::AppendResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::new(
-                        tonic::Code::Unknown,
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/fsplane.v1.FsPlane/Append",
-            );
-            let mut req = request.into_streaming_request();
-            req.extensions_mut().insert(GrpcMethod::new("fsplane.v1.FsPlane", "Append"));
-            self.inner.client_streaming(req, path, codec).await
         }
         /// Truncate changes file size. Smaller = discard. Larger = zero-extend.
         pub async fn truncate(

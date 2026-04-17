@@ -6,6 +6,7 @@ pub(crate) mod stream;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
@@ -413,7 +414,7 @@ where
                         }
                     }
 
-                    let write_result = state.writer.finish().await;
+                    let write_result = state.writer.terminate(Ok(())).await;
                     let response = match write_result {
                         Ok(written) => {
                             WsResponse::success(&state.request_id, json!({ "written": written }))
@@ -542,8 +543,24 @@ where
                             serde_json::to_value(ready).unwrap_or_else(|_| json!({})),
                         );
                         if send_response_tx(&out_tx, &ready_resp).await.is_err() {
-                            // Writer exists but is not in streaming_write yet — abort directly.
-                            let _ = writer.abort().await;
+                            // Writer exists but never made it into `streaming_write`.
+                            // Use the explicit abort path, bounded to keep ws
+                            // disconnect responsive.
+                            const T: std::time::Duration = std::time::Duration::from_secs(5);
+                            match tokio::time::timeout(
+                                T,
+                                writer.terminate(Err(anyhow!(
+                                    "ws client disconnected before stream start"
+                                ))),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(err)) => debug!("fs9 ws pre-stream abort: {err:#}"),
+                                Err(_) => debug!(
+                                    "fs9 ws pre-stream abort timed out after 5s; TTL backstops"
+                                ),
+                            }
                             break;
                         }
                         streaming_write = Some(StreamingWriteState {
@@ -926,7 +943,23 @@ where
 }
 
 async fn abort_streaming_write(state: StreamingWriteState) {
-    let _ = state.writer.abort().await;
+    // Terminate(Err) is cancel-safe (spawn-and-join on detached task), so
+    // the 5s timeout bounds only the *observation* — close-then-abort still
+    // reaches the server in order even if the caller's future is dropped.
+    // Errors are swallowed; TTL is the authoritative backstop.
+    const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    match tokio::time::timeout(
+        ABORT_TIMEOUT,
+        state
+            .writer
+            .terminate(Err(anyhow!("ws streaming write aborted"))),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => debug!("fs9 ws streaming write abort: {err:#}"),
+        Err(_) => debug!("fs9 ws streaming write abort timed out after 5s; TTL backstops"),
+    }
 }
 
 fn parse_auth_request(message: Message) -> Result<WsRequest, WsResponse> {

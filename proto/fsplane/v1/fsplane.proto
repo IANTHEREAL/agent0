@@ -51,19 +51,43 @@ service FsPlane {
   rpc Stat(StatRequest) returns (StatResponse);
 
   // --- Data mutations ---
+  //
+  // Write paths (see db9-ai/fs9#6):
+  //   * PutFile  — unary; ≤ 4 MiB; REPLACE | CREATE_ONLY | APPEND
+  //   * BeginWrite / WriteParts / CommitWrite / AbortWrite — streaming + explicit
+  //     commit; any size; REPLACE | CREATE_ONLY | APPEND
+  //   * WriteAt  — unary; partial overwrite at offset on existing file
+  //
+  // Commit is always an explicit unary RPC (CommitWrite or PutFile return) —
+  // never the wire-level end-of-stream. Dropping a WriteParts stream mid-upload
+  // leaves the upload OPEN; only TTL expiry or AbortWrite reclaims it.
 
-  // WriteFile creates or fully replaces a file from a stream of chunks.
-  // First message MUST contain the header. Subsequent messages carry data only.
-  rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
+  // PutFile creates / replaces / appends a file in a single unary RPC.
+  // Server rejects requests with len(data) > 4 MiB (clients must use multipart).
+  rpc PutFile(PutFileRequest) returns (PutFileResponse);
 
-  // WriteAt writes data at a specific offset. Does not truncate the file.
-  // If offset is beyond file size, JuiceFS zero-fills the gap (POSIX).
-  // Unary — for bounded regions up to ~4MB.
+  // BeginWrite opens a multipart upload session. Returns an opaque upload_id
+  // that the caller uses for WriteParts / CommitWrite / AbortWrite.
+  rpc BeginWrite(BeginWriteRequest) returns (BeginWriteResponse);
+
+  // WriteParts streams data into an open upload. Single-writer per upload_id
+  // by construction (one streaming RPC == one writer). offset in each
+  // WritePartRequest MUST equal the server's cumulative bytes_received.
+  // Stream EOS means "data phase done, awaiting CommitWrite" — NOT commit.
+  rpc WriteParts(stream WritePartRequest) returns (WritePartsResponse);
+
+  // CommitWrite publishes the multipart upload atomically (temp + rename for
+  // REPLACE / CREATE_ONLY; flock + seek-end + write for APPEND). Idempotent
+  // within the server's receipt retention window.
+  rpc CommitWrite(CommitWriteRequest) returns (CommitWriteResponse);
+
+  // AbortWrite discards an upload. Idempotent; safe on terminal sessions;
+  // TTL is the authoritative backstop if the client never calls this.
+  rpc AbortWrite(AbortWriteRequest) returns (AbortWriteResponse);
+
+  // WriteAt writes data at a specific offset on an existing file. Does not
+  // truncate. Unary — for bounded regions up to 4 MiB.
   rpc WriteAt(WriteAtRequest) returns (WriteAtResponse);
-
-  // Append appends data to the end of a file via streaming.
-  // First message MUST contain the header. Subsequent messages carry data.
-  rpc Append(stream AppendRequest) returns (AppendResponse);
 
   // Truncate changes file size. Smaller = discard. Larger = zero-extend.
   rpc Truncate(TruncateRequest) returns (TruncateResponse);
@@ -188,26 +212,86 @@ message DirEntry {
 // Mutations
 // =============================================================================
 
-message WriteFileRequest {
-  // Header — set only in the first message of the stream.
-  WriteFileHeader header = 1;
-  bytes data = 2;
+// WriteMode selects the publish semantic at CommitWrite / PutFile time.
+enum WriteMode {
+  WRITE_MODE_UNSPECIFIED = 0;
+  // REPLACE: atomic rename-over target.
+  WRITE_MODE_REPLACE     = 1;
+  // CREATE_ONLY: atomic rename with RENAME_NOREPLACE; ALREADY_EXISTS on
+  // collision at commit.
+  WRITE_MODE_CREATE_ONLY = 2;
+  // APPEND: concat to existing target under flock at commit.
+  WRITE_MODE_APPEND      = 3;
 }
 
-message WriteFileHeader {
+message PutFileRequest {
   string volume_id = 1;
-  string path = 2;
-  uint32 mode = 3;
-  uint32 umask = 4;
-  // If true, fail with ALREADY_EXISTS when file exists (O_EXCL).
-  bool create_only = 5;
-  // If true, flush before close (durable). If false, buffer (batch mode).
-  bool flush = 6;
+  string path      = 2;
+  WriteMode mode   = 3;
+  uint32 file_mode = 4;
+  uint32 umask     = 5;
+  // Payload. Server MUST reject if > 4 MiB (use BeginWrite/WriteParts/CommitWrite
+  // for anything larger).
+  bytes data       = 6;
+  reserved 7 to 10;
 }
 
-message WriteFileResponse {
+message PutFileResponse {
   uint64 new_size = 1;
 }
+
+message BeginWriteRequest {
+  string volume_id = 1;
+  string path      = 2;
+  WriteMode mode   = 3;
+  uint32 file_mode = 4;
+  uint32 umask     = 5;
+  // Optional upper bound on total bytes. Server fast-fails at WritePart when
+  // cumulative would exceed this; re-checked at Commit.
+  optional uint64 expected_size = 6;
+  reserved 7 to 15;  // future: encryption, content-type, hints
+}
+
+message BeginWriteResponse {
+  // Opaque, 128-bit random, unguessable.
+  string upload_id       = 1;
+  // Recommended max bytes per WritePartRequest.data. Default 4 MiB.
+  uint64 part_size_hint  = 2;
+  // NO expires_at — server is authoritative on TTL; client must not compute
+  // "time remaining" from a wire value (clock skew hazard).
+}
+
+message WritePartRequest {
+  string upload_id = 1;
+  // MUST equal the server's cumulative bytes_received; FAILED_PRECONDITION
+  // otherwise. Strict in-order, no gaps, no overlap.
+  uint64 offset    = 2;
+  bytes  data      = 3;
+  // Reserved: per-part crc32c. DO NOT add without evidence of silent
+  // corruption on the proxy transport; gRPC/TLS/UDS already provide
+  // end-to-end integrity, and a per-part CRC mutates the hot path.
+  reserved 4;
+  reserved 5 to 8;
+}
+
+message WritePartsResponse {
+  // Cumulative bytes successfully staged by this stream.
+  uint64 bytes_received = 1;
+}
+
+message CommitWriteRequest {
+  string upload_id  = 1;
+  // MUST equal server bytes_received; FAILED_PRECONDITION otherwise.
+  uint64 total_size = 2;
+  reserved 3 to 7;  // future: whole-file checksum
+}
+
+message CommitWriteResponse {
+  uint64 new_size = 1;
+}
+
+message AbortWriteRequest  { string upload_id = 1; }
+message AbortWriteResponse {}
 
 message WriteAtRequest {
   string volume_id = 1;
@@ -218,23 +302,6 @@ message WriteAtRequest {
 }
 
 message WriteAtResponse {
-  uint64 bytes_written = 1;
-  uint64 new_size = 2;
-}
-
-message AppendRequest {
-  // Header — set only in the first message of the stream.
-  AppendHeader header = 1;
-  bytes data = 2;
-}
-
-message AppendHeader {
-  string volume_id = 1;
-  string path = 2;
-  bool flush = 3;
-}
-
-message AppendResponse {
   uint64 bytes_written = 1;
   uint64 new_size = 2;
 }
