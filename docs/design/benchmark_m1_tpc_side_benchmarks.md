@@ -179,6 +179,54 @@ cd HammerDB
 ./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_run.tcl
 ```
 
+Validated local command pattern using the official HammerDB image plus the
+forked db9 script layer:
+
+```bash
+git clone https://github.com/dbsid/HammerDB.git
+cd HammerDB
+
+docker run --rm --platform linux/amd64 \
+  -v "$PWD":/workspace \
+  --add-host=host.docker.internal:host-gateway \
+  -i tpcorg/hammerdb:latest \
+  /bin/sh -lc "
+    cp /workspace/scripts/tcl/postgres/tprocc/db9_runtime_overrides.tcl /tmp/db9_runtime_overrides.tcl &&
+    perl -0pe 's/127\\.0\\.0\\.1/host.docker.internal/g' \
+      /workspace/scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_buildschema.tcl \
+      > /tmp/buildschema.tcl &&
+    /home/HammerDB-5.0/hammerdbcli auto /tmp/buildschema.tcl
+  "
+
+docker run --rm --platform linux/amd64 \
+  -v "$PWD":/workspace \
+  --add-host=host.docker.internal:host-gateway \
+  -i tpcorg/hammerdb:latest \
+  /bin/sh -lc "
+    perl -0pe 's/127\\.0\\.0\\.1/host.docker.internal/g' \
+      /workspace/scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_run.tcl \
+      > /tmp/run.tcl &&
+    /home/HammerDB-5.0/hammerdbcli auto /tmp/run.tcl
+  "
+
+python3 /Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/tpcc_correctness_check.py \
+  --host 127.0.0.1 \
+  --port 5543 \
+  --user admin \
+  --password admin \
+  --db tpcc_db9 \
+  --label db9 \
+  --phase after_run \
+  --output /Users/chenhuansheng/hammerdb-results/tpcc_db9_after_run_correctness_latest.json
+```
+
+This exact flow was validated locally on **2026-04-18** with:
+
+- db9-server commit `318c713a`
+- HammerDB fork commit `49b824e`
+- result `10 NOPM`
+- correctness `all_passed = true`
+
 Equivalent PostgreSQL `18.3` commands use the `pg18` scripts from the same
 fork:
 
