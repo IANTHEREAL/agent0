@@ -346,9 +346,22 @@ Current local validation status:
     - result: `TEST RESULT : System achieved 9 NOPM from 0 PostgreSQL TPM`
     - raw log:
       [`db9_tprocc_run_nosp_5544_after_auto_analyze_fix.log`](/Users/chenhuansheng/hammerdb-results/db9_tprocc_run_nosp_5544_after_auto_analyze_fix.log)
+  - fork-script validation on **2026-04-18** also confirmed that the official
+    HammerDB image can run against db9 when it is pointed at the db9-specific
+    script layer from [dbsid/HammerDB](https://github.com/dbsid/HammerDB)
+    instead of the stock in-image scripts
+  - reference fork-script run:
+    - db9-server commit: `d698b122`
+    - HammerDB fork commit: `8f9c92c`
+    - runner shape: official `tpcorg/hammerdb:latest` image with
+      `/workspace/scripts/tcl/postgres/tprocc/*` mounted from the fork
+    - result: `TEST RESULT : System achieved 13 NOPM from 0 PostgreSQL TPM`
+    - this run also proved that the fork's db9 `buildschema` helper can
+      replace the stock `TPC-C` routines with db9-friendly definitions after
+      schema bootstrap
   - this is valid side-benchmark engineering evidence, but it does **not** yet
-    mean the stock HammerDB image is the standard db9 runner from a fresh
-    schema bootstrap
+    mean the completely unmodified stock HammerDB image is the standard db9
+    runner from a fresh schema bootstrap
   - the standard tool choice for db9 remains the HammerDB fork at
     [dbsid/HammerDB](https://github.com/dbsid/HammerDB), because the fork still
     carries the db9-specific runtime and routine fallback layer needed for a
