@@ -335,8 +335,24 @@ Current local validation status:
 - db9:
   - HammerDB `TPROC-C buildschema` works locally in `pg_storedprocs=false`
     mode
-  - remaining db9 gaps are now later-stage HammerDB runtime and check logic
-    issues, not the original bootstrap blocker set
+  - local engineering validation on **2026-04-18** confirmed that a full
+    HammerDB `TPROC-C run` can complete against db9 after the current db9
+    compatibility fixes and db9-compatible `TPC-C` routine definitions are
+    installed
+  - reference local run:
+    - db9-server commit: `d698b122`
+    - tool: official `tpcorg/hammerdb:latest` image
+    - dataset: local `tpcc_db9` schema on `127.0.0.1:5544`
+    - result: `TEST RESULT : System achieved 9 NOPM from 0 PostgreSQL TPM`
+    - raw log:
+      [`db9_tprocc_run_nosp_5544_after_auto_analyze_fix.log`](/Users/chenhuansheng/hammerdb-results/db9_tprocc_run_nosp_5544_after_auto_analyze_fix.log)
+  - this is valid side-benchmark engineering evidence, but it does **not** yet
+    mean the stock HammerDB image is the standard db9 runner from a fresh
+    schema bootstrap
+  - the standard tool choice for db9 remains the HammerDB fork at
+    [dbsid/HammerDB](https://github.com/dbsid/HammerDB), because the fork still
+    carries the db9-specific runtime and routine fallback layer needed for a
+    fully reproducible workflow
 
 ### Suggested Scale Levels For db9
 
