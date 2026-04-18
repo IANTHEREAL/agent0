@@ -351,14 +351,20 @@ Current local validation status:
     script layer from [dbsid/HammerDB](https://github.com/dbsid/HammerDB)
     instead of the stock in-image scripts
   - reference fork-script run:
-    - db9-server commit: `d698b122`
-    - HammerDB fork commit: `8f9c92c`
+    - db9-server commit: `318c713a`
+    - HammerDB fork commit: `49b824e`
     - runner shape: official `tpcorg/hammerdb:latest` image with
       `/workspace/scripts/tcl/postgres/tprocc/*` mounted from the fork
-    - result: `TEST RESULT : System achieved 13 NOPM from 0 PostgreSQL TPM`
+    - result: `TEST RESULT : System achieved 10 NOPM from 0 PostgreSQL TPM`
+    - post-run correctness:
+      [`tpcc_db9_after_run_correctness_latest.json`](/Users/chenhuansheng/hammerdb-results/tpcc_db9_after_run_correctness_latest.json)
+      with `all_passed = true`
     - this run also proved that the fork's db9 `buildschema` helper can
       replace the stock `TPC-C` routines with db9-friendly definitions after
       schema bootstrap
+    - this run also removed the previous `AutoAnalyze` SQL-parse warning, so
+      the current local fork-script path is now both front-path and worker-path
+      clean enough to serve as the main local db9 `TPC-C` engineering baseline
   - this is valid side-benchmark engineering evidence, but it does **not** yet
     mean the completely unmodified stock HammerDB image is the standard db9
     runner from a fresh schema bootstrap
