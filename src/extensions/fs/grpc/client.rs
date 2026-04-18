@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::BytesMut;
-use futures_util::Stream;
+use futures_util::{stream, Stream, StreamExt};
 use std::error::Error as StdError;
 use tokio::io::AsyncBufRead;
 use tokio::sync::mpsc;
@@ -89,12 +89,28 @@ pub(crate) async fn create_channel() -> Result<Channel> {
         } else {
             format!("{scheme}://{addr}")
         };
+        // h2 flow control windows. Tonic/h2 default (64 KiB/stream, 64 KiB/conn)
+        // was a non-issue while fs9 ran as a same-pod UDS sidecar (zero RTT made
+        // WINDOW_UPDATE frames effectively free) but caps single-stream
+        // throughput at ~64 KiB/RTT once fs9 moved cross-pod on TCP+mTLS. Raise
+        // to 8 MiB/stream + 16 MiB/connection — these values are *initial*; h2's
+        // BDP auto-tuner grows them further under measured load. A stalled
+        // stream holds at most window_size of pre-acked bytes, so peak memory
+        // per connection is bounded by the connection window, not unbounded
+        // fan-in.
+        //
+        // Not env-configurable: round-3 DATA-CHALLENGER showed tx_queue peaks
+        // at 0.21% of the window during real uploads, meaning the window is
+        // never the binding clamp post-raise. Exposing an env knob would
+        // invite operators to over-tune a non-bottleneck.
         let mut endpoint = Endpoint::try_from(uri.clone())
             .map_err(|e| anyhow!("invalid endpoint {uri}: {e}"))?
             .connect_timeout(std::time::Duration::from_secs(10))
             .http2_keep_alive_interval(std::time::Duration::from_secs(10))
             .keep_alive_timeout(std::time::Duration::from_secs(5))
-            .keep_alive_while_idle(true);
+            .keep_alive_while_idle(true)
+            .initial_stream_window_size(8 * 1024 * 1024)
+            .initial_connection_window_size(16 * 1024 * 1024);
 
         if let Some(tls) = grpc_tls {
             // Mirrors vendor/tikv-client/src/common/security.rs::tls_channel
@@ -387,7 +403,30 @@ impl GrpcMultipartUpload {
     /// Caller pushes parts through the returned handle, then calls `close()` to
     /// finish the stream and get the authoritative `bytes_received` from the ACK.
     fn open_stream(&self) -> GrpcMultipartUploadStream {
-        const MPSC_CAPACITY: usize = 2;
+        // MPSC_CAPACITY = 8 × GRPC_WRITE_CHUNK_SIZE (4 MiB) = 32 MiB per stream.
+        //
+        // Previous value (2) was a manual mirror of h2's legacy 64 KiB default
+        // window, translated into our 4 MiB chunks — i.e. 8 MiB ≈ 2 chunks. But
+        // h2's BDP auto-tuner and our own raised initial window already own the
+        // wire-side flow control on client-streaming uploads. The mpsc was the
+        // REMAINING producer-side clamp. Live measurements (round 3 DATA-
+        // CHALLENGER): tx_queue peaked at 0.21% of the 8 MiB h2 window during a
+        // 10 GiB upload, and fs9's `object_request_uploading` sat at mean 3 /
+        // max 5 against a 200-slot pool (98% S3 slack). fs9 BufferSize usage
+        // held at 8 MiB / 128 MiB. The only clamp with no slack was this
+        // channel — raising it unblocks the producer; downstream auto-scales.
+        //
+        // Multi-tenant memory bound:
+        //   per-stream peak = 8 × 4 MiB = 32 MiB (transient, only when the
+        //   consumer stalls; at steady state h2/BDP keeps it near-empty).
+        //   per-tenant peak = DEFAULT_WS_MAX_INFLIGHT_UPLOADS_PER_CONNECTION
+        //                     (16 today) × 32 MiB = 512 MiB under adversarial
+        //                     stall. N tenants × 512 MiB is the pod budget the
+        //                     operator sizes against ws_max_inflight_uploads.
+        //
+        // Do NOT raise past 8 without first raising or justifying the
+        // ws_max_inflight_uploads cap — they compose multiplicatively.
+        const MPSC_CAPACITY: usize = 8;
         let (tx, rx) = mpsc::channel::<proto::WritePartRequest>(MPSC_CAPACITY);
         let mut client = self.client.clone();
         let path = self.path.clone();
@@ -944,6 +983,32 @@ impl FsBackend for GrpcFsBackend {
             storage: None,
             sealed: Some(false),
         })
+    }
+
+    /// Concurrent batch stat over the gRPC backend.
+    ///
+    /// The `FsBackend::batch_stat` default impl at backend.rs:183 is a plain
+    /// sequential `for path in paths { stat(path).await }` loop — zero
+    /// concurrency. The embedded backend has always used
+    /// `batch_stat_concurrency` from config to parallelise its batch reads
+    /// (embedded/pagefs/read_impl.rs:232); the gRPC backend never did,
+    /// because this override was missing. That is the single largest
+    /// contributor to the measured 200-file-stat regression vs the embedded
+    /// baseline (~10 s observed here vs 306 ms on embedded prod) — every
+    /// cold FUSE lookup batch unspooled serially against fs9.
+    ///
+    /// `buffered` (not `buffer_unordered`) preserves the Result-Vec order
+    /// to match the input `paths` slice — several callers of batch_stat
+    /// index the result by the same position as the input. Concurrency is
+    /// capped at `batch_stat_concurrency` (default 16; config.rs:31).
+    async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<FsFileInfo>>> {
+        let concurrency = fs9_config().batch_stat_concurrency.max(1);
+        let results = stream::iter(paths.iter().cloned())
+            .map(|p| async move { self.stat(&p).await })
+            .buffered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(results)
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
