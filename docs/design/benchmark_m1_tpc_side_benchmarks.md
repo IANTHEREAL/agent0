@@ -173,10 +173,30 @@ Suggested command pattern from the fork:
 ```bash
 git clone https://github.com/dbsid/HammerDB.git
 cd HammerDB
+git checkout 49b824e
 
 ./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_buildschema.tcl
 ./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_checkschema.tcl
+python3 <db9-server>/scripts/tpcc_correctness_check.py \
+  --host 127.0.0.1 \
+  --port 5433 \
+  --user admin \
+  --password admin \
+  --db tpcc10g_db9 \
+  --label db9 \
+  --phase after_prepare \
+  --output benchmarks/side/tpcc/db9_after_prepare_correctness.json
 ./hammerdbcli auto scripts/tcl/postgres/tprocc/pg_tprocc_db9_nosp_run.tcl
+python3 <db9-server>/scripts/tpcc_correctness_check.py \
+  --host 127.0.0.1 \
+  --port 5433 \
+  --user admin \
+  --password admin \
+  --db tpcc10g_db9 \
+  --label db9 \
+  --phase after_run \
+  --prior-phase-json benchmarks/side/tpcc/db9_after_prepare_correctness.json \
+  --output benchmarks/side/tpcc/db9_after_run_correctness.json
 ```
 
 Validated local command pattern using the official HammerDB image plus the
@@ -185,6 +205,7 @@ forked db9 script layer:
 ```bash
 git clone https://github.com/dbsid/HammerDB.git
 cd HammerDB
+git checkout 49b824e
 
 docker run --rm --platform linux/amd64 \
   -v "$PWD":/workspace \
@@ -216,8 +237,19 @@ python3 /Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/tpcc_cor
   --password admin \
   --db tpcc_db9 \
   --label db9 \
+  --phase after_prepare \
+  --output benchmarks/side/tpcc/db9_after_prepare_correctness.json
+
+python3 /Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/scripts/tpcc_correctness_check.py \
+  --host 127.0.0.1 \
+  --port 5543 \
+  --user admin \
+  --password admin \
+  --db tpcc_db9 \
+  --label db9 \
   --phase after_run \
-  --output /Users/chenhuansheng/hammerdb-results/tpcc_db9_after_run_correctness_latest.json
+  --prior-phase-json benchmarks/side/tpcc/db9_after_prepare_correctness.json \
+  --output benchmarks/side/tpcc/db9_after_run_correctness.json
 ```
 
 This exact flow was validated locally on **2026-04-18** with:
@@ -324,7 +356,9 @@ The correctness checker validates invariants such as:
 
 - each warehouse owns exactly `10` districts
 - each district owns exactly `3000` customers
+- `SUM(district.d_ytd)` per warehouse matches `warehouse.w_ytd`
 - each district's `d_next_o_id` matches both `COUNT(orders)` and `MAX(o_id) + 1`
+- `SUM(orders.o_ol_cnt)` per district matches `COUNT(order_line)`
 - every `new_order` row points at an `orders` row with `o_carrier_id IS NULL`
 - every order with `o_carrier_id IS NULL` still has a `new_order` row
 - every order has `5..15` `order_line` rows and matches `orders.o_ol_cnt`
@@ -356,6 +390,7 @@ python3 scripts/tpcc_correctness_check.py \
   --db tpcc10g_db9 \
   --label db9 \
   --phase after_run \
+  --prior-phase-json /tmp/tpcc_db9_after_prepare_correctness.json \
   --output /tmp/tpcc_db9_after_run_correctness.json
 ```
 
@@ -369,6 +404,8 @@ Standard correctness flow:
 
 Correctness acceptance rule:
 
+- `after_run` validation must refuse to pass unless it is given a successful
+  `after_prepare` JSON artifact from the same engine label and database
 - PostgreSQL `18.3` and db9 must both pass the post-run correctness check for
   the benchmark result to count as valid
 - HammerDB `checkschema` is useful, but the invariant checker is the
@@ -393,7 +430,7 @@ Current local validation status:
     - dataset: local `tpcc_db9` schema on `127.0.0.1:5544`
     - result: `TEST RESULT : System achieved 9 NOPM from 0 PostgreSQL TPM`
     - raw log:
-      [`db9_tprocc_run_nosp_5544_after_auto_analyze_fix.log`](/Users/chenhuansheng/hammerdb-results/db9_tprocc_run_nosp_5544_after_auto_analyze_fix.log)
+      [`benchmark_m1_validation_evidence.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_validation_evidence.md)
   - fork-script validation on **2026-04-18** also confirmed that the official
     HammerDB image can run against db9 when it is pointed at the db9-specific
     script layer from [dbsid/HammerDB](https://github.com/dbsid/HammerDB)
@@ -405,7 +442,7 @@ Current local validation status:
       `/workspace/scripts/tcl/postgres/tprocc/*` mounted from the fork
     - result: `TEST RESULT : System achieved 10 NOPM from 0 PostgreSQL TPM`
     - post-run correctness:
-      [`tpcc_db9_after_run_correctness_latest.json`](/Users/chenhuansheng/hammerdb-results/tpcc_db9_after_run_correctness_latest.json)
+      [`benchmark_m1_validation_evidence.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_validation_evidence.md)
       with `all_passed = true`
     - this run also proved that the fork's db9 `buildschema` helper can
       replace the stock `TPC-C` routines with db9-friendly definitions after
@@ -449,6 +486,7 @@ Suggested command pattern:
 ```bash
 git clone https://github.com/dbsid/HammerDB.git
 cd HammerDB
+git checkout 49b824e
 
 ./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_db9_buildschema.tcl
 ./hammerdbcli auto scripts/tcl/postgres/tproch/pg_tproch_db9_checkschema.tcl

@@ -1508,6 +1508,57 @@ def summarize_elapsed_and_first_row(elapsed_ms: list[float], first_row_ms: list[
     }
 
 
+def tukey_outlier_count(values: list[float]) -> int:
+    if len(values) < 4:
+        return 0
+    q1 = percentile(values, 0.25)
+    q3 = percentile(values, 0.75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return 0
+    lower = q1 - (1.5 * iqr)
+    upper = q3 + (1.5 * iqr)
+    return sum(1 for value in values if value < lower or value > upper)
+
+
+def confidence_interval_95(values: list[float]) -> tuple[float, float, float]:
+    mean = statistics.fmean(values)
+    if len(values) < 2:
+        return mean, mean, 0.0
+    stdev = statistics.stdev(values)
+    margin = 1.96 * stdev / math.sqrt(len(values))
+    return mean - margin, mean + margin, stdev
+
+
+def aggregate_repeat_results(repeat_results: list[dict[str, Any]]) -> dict[str, Any]:
+    elapsed_samples = [
+        float(sample)
+        for repeat in repeat_results
+        for sample in repeat["measurements"]["elapsed_ms"]
+    ]
+    first_row_samples = [
+        float(sample)
+        for repeat in repeat_results
+        for sample in repeat["measurements"]["first_row_latency_ms"]
+    ]
+    ci_low, ci_high, stdev = confidence_interval_95(elapsed_samples)
+    return {
+        "repeat_count": len(repeat_results),
+        "outlier_rule": "tukey_iqr_1_5x",
+        "summary": {
+            "count": len(elapsed_samples),
+            "elapsed_ms": metric(statistics.fmean(elapsed_samples), "ms", "client_timer"),
+            "p50_ms": metric(percentile(elapsed_samples, 0.50), "ms", "client_timer"),
+            "p95_ms": metric(percentile(elapsed_samples, 0.95), "ms", "client_timer"),
+            "first_row_latency_ms": metric(statistics.fmean(first_row_samples), "ms", "client_timer"),
+            "elapsed_stdev_ms": metric(stdev, "ms", "client_timer"),
+            "elapsed_ci95_low_ms": metric(ci_low, "ms", "client_timer"),
+            "elapsed_ci95_high_ms": metric(ci_high, "ms", "client_timer"),
+            "elapsed_outlier_count": metric(tukey_outlier_count(elapsed_samples), "count", "tukey_iqr_1_5x"),
+        },
+    }
+
+
 def null_counters() -> dict[str, Any]:
     return {
         "scanned_rows": metric(None, "rows", None),
@@ -1698,6 +1749,10 @@ def run_scenario(
                     "summary": summary,
                     "counters": counters,
                     "extra_metrics": extra_metrics,
+                    "measurements": {
+                        "elapsed_ms": elapsed_ms_samples,
+                        "first_row_latency_ms": first_row_samples,
+                    },
                 }
             )
             print(
@@ -1721,6 +1776,7 @@ def run_scenario(
             "memory_limit_mb": scenario.memory_limit_mb,
             "explain": explain_lines,
             "repeats": repeat_results,
+            "aggregate": aggregate_repeat_results(repeat_results),
             "representative_repeat": repeat_results[rep_idx]["repeat"],
             "applied_settings": applied_settings,
         }
@@ -1880,6 +1936,13 @@ def representative_repeat(scenario: dict[str, Any]) -> dict[str, Any]:
     raise KeyError(f"representative repeat {rep_no} not found")
 
 
+def summary_for_compare(scenario: dict[str, Any]) -> dict[str, Any]:
+    aggregate = scenario.get("aggregate")
+    if isinstance(aggregate, dict) and isinstance(aggregate.get("summary"), dict):
+        return aggregate["summary"]
+    return representative_repeat(scenario)["summary"]
+
+
 def compare_scenarios(before: dict[str, Any], after: dict[str, Any], postgres: dict[str, Any]) -> list[dict[str, Any]]:
     def index(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
         return {scenario_key(item): item for item in raw["scenarios"]}
@@ -1922,17 +1985,20 @@ def compare_scenarios(before: dict[str, Any], after: dict[str, Any], postgres: d
         before_rep = representative_repeat(before_s)
         after_rep = representative_repeat(after_s)
         postgres_rep = representative_repeat(postgres_s)
+        before_summary = summary_for_compare(before_s)
+        after_summary = summary_for_compare(after_s)
+        postgres_summary = summary_for_compare(postgres_s)
 
         metric_rows: dict[str, Any] = {}
-        summary_keys = set(before_rep["summary"].keys()) | set(after_rep["summary"].keys()) | set(postgres_rep["summary"].keys())
+        summary_keys = set(before_summary.keys()) | set(after_summary.keys()) | set(postgres_summary.keys())
         counter_keys = set(before_rep["counters"].keys()) | set(after_rep["counters"].keys()) | set(postgres_rep["counters"].keys())
 
         for metric_name in sorted(summary_keys):
             if metric_name == "count":
                 continue
-            before_metric = before_rep["summary"].get(metric_name)
-            after_metric = after_rep["summary"].get(metric_name)
-            postgres_metric = postgres_rep["summary"].get(metric_name)
+            before_metric = before_summary.get(metric_name)
+            after_metric = after_summary.get(metric_name)
+            postgres_metric = postgres_summary.get(metric_name)
             before_value = before_metric["value"] if before_metric is not None else None
             after_value = after_metric["value"] if after_metric is not None else None
             postgres_value = postgres_metric["value"] if postgres_metric is not None else None
@@ -2024,6 +2090,7 @@ def compare_scenarios(before: dict[str, Any], after: dict[str, Any], postgres: d
                 "worker_count": before_s.get("worker_count"),
                 "memory_limit_mb": before_s.get("memory_limit_mb"),
                 "metrics": metric_rows,
+                "summary_source": "aggregate" if "aggregate" in before_s else "representative_repeat",
                 "postgres_reference_line": {
                     "engine_label": postgres["meta"]["engine_label"],
                     "engine_version": postgres["meta"]["engine_version"],

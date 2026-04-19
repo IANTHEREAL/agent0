@@ -20,6 +20,17 @@ SPEC.loader.exec_module(benchmark_m1_baseline)
 
 
 def make_raw(engine_label: str, engine_version: str, elapsed_ms: float) -> dict:
+    aggregate_summary = {
+        "count": 1,
+        "elapsed_ms": {"value": elapsed_ms, "unit": "ms", "source": "client"},
+        "p50_ms": {"value": elapsed_ms, "unit": "ms", "source": "client"},
+        "p95_ms": {"value": elapsed_ms, "unit": "ms", "source": "client"},
+        "first_row_latency_ms": {"value": elapsed_ms / 2.0, "unit": "ms", "source": "client"},
+        "elapsed_stdev_ms": {"value": 0.0, "unit": "ms", "source": "client"},
+        "elapsed_ci95_low_ms": {"value": elapsed_ms, "unit": "ms", "source": "client"},
+        "elapsed_ci95_high_ms": {"value": elapsed_ms, "unit": "ms", "source": "client"},
+        "elapsed_outlier_count": {"value": 0.0, "unit": "count", "source": "tukey_iqr_1_5x"},
+    }
     return {
         "schema_version": benchmark_m1_baseline.SCHEMA_VERSION,
         "meta": {
@@ -91,8 +102,17 @@ def make_raw(engine_label: str, engine_version: str, elapsed_ms: float) -> dict:
                             "planning_cpu_ms": {"value": None, "unit": "ms", "source": None},
                             "cleanup_ok": None,
                         },
+                        "measurements": {
+                            "elapsed_ms": [elapsed_ms],
+                            "first_row_latency_ms": [elapsed_ms / 2.0],
+                        },
                     }
                 ],
+                "aggregate": {
+                    "repeat_count": 1,
+                    "outlier_rule": "tukey_iqr_1_5x",
+                    "summary": aggregate_summary,
+                },
                 "representative_repeat": 1,
             }
         ],
@@ -194,6 +214,22 @@ class BenchmarkM1BaselineTests(unittest.TestCase):
         self.assertEqual(metrics["custom_counter"]["before"], 10.0)
         self.assertEqual(metrics["custom_counter"]["after"], 14.0)
         self.assertEqual(metrics["custom_counter"]["postgres_18_3"], 9.0)
+
+    def test_compare_prefers_aggregate_summary_over_representative_repeat(self) -> None:
+        before = make_raw("db9_before", "db9 before", 10.0)
+        after = make_raw("db9_after", "db9 after", 7.0)
+        postgres = make_raw("postgres_18_3", "PostgreSQL 18.3", 6.0)
+
+        before["scenarios"][0]["aggregate"]["summary"]["elapsed_ms"]["value"] = 100.0
+        after["scenarios"][0]["aggregate"]["summary"]["elapsed_ms"]["value"] = 70.0
+        postgres["scenarios"][0]["aggregate"]["summary"]["elapsed_ms"]["value"] = 60.0
+
+        comparisons = benchmark_m1_baseline.compare_scenarios(before, after, postgres)
+        metrics = comparisons[0]["metrics"]
+        self.assertEqual(metrics["elapsed_ms"]["before"], 100.0)
+        self.assertEqual(metrics["elapsed_ms"]["after"], 70.0)
+        self.assertEqual(metrics["elapsed_ms"]["postgres_18_3"], 60.0)
+        self.assertEqual(comparisons[0]["summary_source"], "aggregate")
 
 
 if __name__ == "__main__":

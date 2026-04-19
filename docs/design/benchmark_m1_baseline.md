@@ -696,6 +696,8 @@ Comparison rules:
 
 - `db9_before`, `db9_after`, and `postgres_18_3` must use the same scale, seed,
   dataset shape, parameter-pack ids, warmup policy, and measured-run count
+- `db9_before`, `db9_after`, and `postgres_18_3` must run on the same hardware
+  class, with the same connection-pool shape and the same cache-warmup policy
 - schema must be the same, except for engine-specific DDL that is strictly
   required to express the same logical index shape
 - function companion cases `QxxF` must also run on PostgreSQL, not only the base
@@ -722,6 +724,26 @@ Recommended run policy:
 - `Q08`: run at `1`, `2`, `4`, and `8` worker levels
 - `Q09` and `Q10`: run at two memory levels such as `64MB` and `128MB`
 
+## Statistical Acceptance Gate
+
+The acceptance gate must not cherry-pick one measured run or one convenient
+repeat.
+
+Required rules:
+
+- raw output must preserve every measured sample inside each repeat
+- each scenario must emit one aggregate summary across all measured samples in
+  the run
+- the aggregate summary must include at least aggregate `p50`, aggregate `p95`,
+  mean latency, `95%` confidence interval bounds for mean latency, and outlier
+  count
+- the outlier rule must be explicit and stable; current contract uses Tukey IQR
+  with `1.5x` fences
+- `representative_repeat` may still be used for `EXPLAIN` and counter readback,
+  but not as the sole milestone pass/fail statistic
+- milestone-close reporting must quote the aggregate summary, not a single
+  measured sample
+
 ## Reporting Contract
 
 Every result row must include:
@@ -734,6 +756,8 @@ Every result row must include:
 - elapsed time
 - `p50`
 - `p95`
+- aggregate `95%` confidence interval bounds
+- aggregate outlier count and outlier rule
 - first-row latency when relevant
 - peak RSS
 - CPU time when available
@@ -747,6 +771,7 @@ Every result row must include:
 - spill bytes
 - spill passes
 - plan-cache hit ratio
+- measured-sample arrays for the raw per-run timings
 
 If a field is not available on PostgreSQL, keep the column and record `null`.
 
@@ -787,7 +812,8 @@ Baseline comparison rules:
 
 - compare on the same benchmark server or equivalent hardware class
 - compare on the same `10GB` dataset artifact
-- compare with the same query set, parameter packs, and warmup policy
+- compare with the same query set, parameter packs, warmup policy, and
+  connection-pool shape
 - compare against the previous accepted milestone result, not just against an
   arbitrary recent branch run
 

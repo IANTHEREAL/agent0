@@ -436,6 +436,18 @@ Defaults:
 - repeats: `1` for large scenarios unless the milestone explicitly needs
   repeated outer loops
 
+Statistical rules:
+
+- the measured iterations are the primary statistical unit; they must be kept in
+  raw output, not discarded after summary generation
+- each scenario must emit one aggregate summary across all measured iterations
+  from all repeats
+- the aggregate summary must include aggregate `p50`, aggregate `p95`, mean
+  latency `95%` confidence interval bounds, and outlier count
+- `representative_repeat` remains useful for `EXPLAIN` and counter attachment,
+  but compare and acceptance must read the aggregate summary instead of a single
+  representative run
+
 ### Prepared Versus Text Protocol
 
 The harness must record the execution mode:
@@ -587,7 +599,7 @@ The compare stage must compute at least:
 - absolute delta
 - percentage delta
 - whether lower is better or higher is better for the metric
-- representative lines for `db9_before`, `db9_after`, and `postgres_18_3`
+- aggregate summary lines for `db9_before`, `db9_after`, and `postgres_18_3`
 - one explicit PostgreSQL reference line per scenario family in the merged report
 
 For milestone acceptance on the benchmark server:

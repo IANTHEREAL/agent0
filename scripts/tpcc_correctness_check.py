@@ -29,6 +29,8 @@ TABLES = [
     "order_line",
 ]
 
+VALID_PHASES = ("after_prepare", "after_run")
+
 
 @dataclass(frozen=True)
 class ConnectionConfig:
@@ -89,6 +91,22 @@ CHECKS: List[CheckDef] = [
             FROM stock
             GROUP BY s_w_id
             HAVING COUNT(*) <> (SELECT COUNT(*) FROM item)
+        ) AS anomalies;
+        """,
+    ),
+    CheckDef(
+        "warehouse_ytd_matches_district_sum",
+        "sum(district.d_ytd) per warehouse must equal warehouse.w_ytd",
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT w.w_id
+            FROM warehouse AS w
+            LEFT JOIN district AS d
+              ON d.d_w_id = w.w_id
+            GROUP BY w.w_id, w.w_ytd
+            HAVING COALESCE(SUM(CAST(d.d_ytd AS NUMERIC)), CAST(0 AS NUMERIC))
+                   <> CAST(w.w_ytd AS NUMERIC)
         ) AS anomalies;
         """,
     ),
@@ -154,6 +172,33 @@ CHECKS: List[CheckDef] = [
          AND no.no_o_id = o.o_id
         WHERE o.o_carrier_id IS NULL
           AND no.no_o_id IS NULL;
+        """,
+    ),
+    CheckDef(
+        "sum_o_ol_cnt_matches_order_line_rows",
+        "sum(orders.o_ol_cnt) per district must equal count(order_line rows)",
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT d.d_w_id, d.d_id
+            FROM district AS d
+            LEFT JOIN (
+                SELECT o_w_id, o_d_id, SUM(CAST(o_ol_cnt AS BIGINT)) AS expected_lines
+                FROM orders
+                GROUP BY o_w_id, o_d_id
+            ) AS per_district_orders
+              ON per_district_orders.o_w_id = d.d_w_id
+             AND per_district_orders.o_d_id = d.d_id
+            LEFT JOIN (
+                SELECT ol_w_id, ol_d_id, COUNT(*) AS actual_lines
+                FROM order_line
+                GROUP BY ol_w_id, ol_d_id
+            ) AS per_district_lines
+              ON per_district_lines.ol_w_id = d.d_w_id
+             AND per_district_lines.ol_d_id = d.d_id
+            WHERE COALESCE(per_district_orders.expected_lines, CAST(0 AS BIGINT))
+                  <> COALESCE(per_district_lines.actual_lines, CAST(0 AS BIGINT))
+        ) AS anomalies;
         """,
     ),
     CheckDef(
@@ -231,14 +276,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", default="")
     parser.add_argument("--db", dest="database")
     parser.add_argument("--label", required=True, help="Short label for the target engine, for example pg18 or db9")
-    parser.add_argument("--phase", required=True, help="Validation phase label, for example after_prepare or after_run")
+    parser.add_argument("--phase", choices=VALID_PHASES, required=True, help="Validation phase label")
     parser.add_argument("--psql-bin", default="psql", help="Path to the psql client binary")
     parser.add_argument("--output", help="Optional JSON output path")
+    parser.add_argument(
+        "--prior-phase-json",
+        help=(
+            "Required when --phase=after_run. "
+            "Must point at a passing JSON artifact produced by an after_prepare run."
+        ),
+    )
     args = parser.parse_args()
     if not args.dsn:
         missing = [name for name in ("host", "port", "user", "database") if getattr(args, name) in (None, "")]
         if missing:
             parser.error(f"either --dsn or all of --host/--port/--user/--db are required; missing: {', '.join(missing)}")
+    if args.phase == "after_prepare" and args.prior_phase_json:
+        parser.error("--prior-phase-json is only valid with --phase after_run")
+    if args.phase == "after_run" and not args.prior_phase_json:
+        parser.error("--phase after_run requires --prior-phase-json from a passing after_prepare run")
     return args
 
 
@@ -317,14 +373,66 @@ def collect_table_counts(psql_bin: str, conn: ConnectionConfig) -> Dict[str, int
     return counts
 
 
+def configured_checks() -> List[CheckDef]:
+    if not CHECKS:
+        raise RuntimeError("no TPC-C correctness checks are configured")
+    seen_ids: set[str] = set()
+    for check in CHECKS:
+        if check.check_id in seen_ids:
+            raise RuntimeError(f"duplicate TPC-C correctness check_id: {check.check_id}")
+        seen_ids.add(check.check_id)
+    return CHECKS
+
+
+def validate_phase_prerequisite(args: argparse.Namespace, conn: ConnectionConfig) -> Optional[dict]:
+    if args.phase != "after_run":
+        return None
+
+    prior_path = Path(args.prior_phase_json)
+    if not prior_path.is_file():
+        raise RuntimeError(f"prior phase artifact does not exist: {prior_path}")
+
+    try:
+        prior = json.loads(prior_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"prior phase artifact is not valid JSON: {prior_path}") from exc
+
+    if prior.get("phase") != "after_prepare":
+        raise RuntimeError(
+            f"prior phase artifact must come from after_prepare, got: {prior.get('phase')!r}"
+        )
+    if prior.get("all_passed") is not True:
+        raise RuntimeError("prior after_prepare phase did not pass; refusing after_run validation")
+    if prior.get("label") != args.label:
+        raise RuntimeError(
+            f"prior phase artifact label {prior.get('label')!r} does not match current label {args.label!r}"
+        )
+
+    prior_connection = prior.get("connection") or {}
+    prior_database = prior_connection.get("database")
+    if prior_database and prior_database != conn.database:
+        raise RuntimeError(
+            f"prior phase artifact database {prior_database!r} does not match current database {conn.database!r}"
+        )
+
+    return {
+        "required_prior_phase": "after_prepare",
+        "validated_artifact": str(prior_path),
+        "validated_label": prior.get("label"),
+        "validated_database": prior_database or conn.database,
+    }
+
+
 def main() -> int:
     args = parse_args()
     conn = connection_from_args(args)
     try:
+        phase_guard = validate_phase_prerequisite(args, conn)
+        checks = configured_checks()
         table_counts = collect_table_counts(args.psql_bin, conn)
         check_results = []
         all_passed = True
-        for check in CHECKS:
+        for check in checks:
             value, elapsed = run_scalar_query(args.psql_bin, conn, check.sql)
             ok = value == check.expected
             all_passed = all_passed and ok
@@ -352,6 +460,8 @@ def main() -> int:
             "all_passed": all_passed,
             "checks": check_results,
         }
+        if phase_guard is not None:
+            output["phase_guard"] = phase_guard
     except Exception as exc:  # pragma: no cover - exercised via local validation
         output = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),

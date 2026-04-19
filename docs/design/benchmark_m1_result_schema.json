@@ -269,6 +269,7 @@
         "sql",
         "params",
         "repeats",
+        "aggregate",
         "representative_repeat"
       ],
       "properties": {
@@ -355,6 +356,9 @@
             "$ref": "#/$defs/repeat"
           }
         },
+        "aggregate": {
+          "$ref": "#/$defs/aggregate"
+        },
         "representative_repeat": {
           "type": "integer",
           "minimum": 1
@@ -367,7 +371,8 @@
       "required": [
         "repeat",
         "summary",
-        "counters"
+        "counters",
+        "measurements"
       ],
       "properties": {
         "repeat": {
@@ -385,6 +390,54 @@
           "additionalProperties": {
             "$ref": "#/$defs/metricValue"
           }
+        },
+        "measurements": {
+          "$ref": "#/$defs/measurements"
+        }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "elapsed_ms",
+        "first_row_latency_ms"
+      ],
+      "properties": {
+        "elapsed_ms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "number"
+          }
+        },
+        "first_row_latency_ms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repeat_count",
+        "outlier_rule",
+        "summary"
+      ],
+      "properties": {
+        "repeat_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "outlier_rule": {
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/aggregateSummary"
         }
       }
     },
@@ -418,6 +471,49 @@
           "$ref": "#/$defs/metricValue"
         },
         "cpu_time_ms": {
+          "$ref": "#/$defs/metricValue"
+        }
+      }
+    },
+    "aggregateSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "elapsed_ms",
+        "p50_ms",
+        "p95_ms",
+        "elapsed_ci95_low_ms",
+        "elapsed_ci95_high_ms",
+        "elapsed_outlier_count"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "p50_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "p95_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "first_row_latency_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_stdev_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_ci95_low_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_ci95_high_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_outlier_count": {
           "$ref": "#/$defs/metricValue"
         }
       }
