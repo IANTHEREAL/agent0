@@ -1,5 +1,8 @@
 # M1 Benchmark Local Validation Evidence
 
+**Status**: Active
+**Date**: 2026-04-19
+
 This file is the repo-tracked evidence note referenced by
 [`benchmark_m1_tpc_side_benchmarks.md`](/Users/chenhuansheng/Documents/GitHub/db9-ai/db9-server/docs/design/benchmark_m1_tpc_side_benchmarks.md).
 Machine-local paths under `/Users/.../hammerdb-results` are not authoritative
