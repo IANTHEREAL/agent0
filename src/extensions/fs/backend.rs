@@ -686,10 +686,7 @@ mod tests {
         use crate::extensions::fs::config::Fs9BackendType;
         // Transient TiKV failure must never silently route an existing
         // tenant to an empty JuiceFs volume.
-        assert_eq!(
-            decide_backend_type(false, None),
-            Fs9BackendType::Embedded
-        );
+        assert_eq!(decide_backend_type(false, None), Fs9BackendType::Embedded);
     }
 
     struct BatchInlineReadTestBackend {
