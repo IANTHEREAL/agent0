@@ -1,0 +1,570 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://db9.ai/schemas/benchmark_m1_result_schema.json",
+  "title": "db9-server M1 benchmark raw result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "meta",
+    "dataset",
+    "run_config",
+    "scenarios"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "m1-benchmark-result/v1"
+    },
+    "meta": {
+      "$ref": "#/$defs/meta"
+    },
+    "dataset": {
+      "$ref": "#/$defs/dataset"
+    },
+    "run_config": {
+      "$ref": "#/$defs/runConfig"
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/scenario"
+      }
+    }
+  },
+  "$defs": {
+    "nullableNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "metricValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "value": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine_label",
+        "engine_version",
+        "git_sha",
+        "timestamp_utc",
+        "hostname",
+        "platform",
+        "harness_version"
+      ],
+      "properties": {
+        "engine_label": {
+          "type": "string",
+          "enum": [
+            "db9_before",
+            "db9_after",
+            "postgres_18_3"
+          ]
+        },
+        "engine_version": {
+          "type": "string"
+        },
+        "git_sha": {
+          "type": "string"
+        },
+        "timestamp_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "harness_version": {
+          "type": "string"
+        },
+        "dsn_redacted": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cpu_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cpu_count_logical": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "python": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dataset_id",
+        "scale",
+        "seed",
+        "tables"
+      ],
+      "properties": {
+        "dataset_id": {
+          "type": "string"
+        },
+        "scale": {
+          "type": "string",
+          "enum": [
+            "S",
+            "M",
+            "L"
+          ]
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "tables": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/tableInfo"
+          }
+        },
+        "validation_checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/validationCheck"
+          }
+        }
+      }
+    },
+    "tableInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "table_name",
+        "row_count"
+      ],
+      "properties": {
+        "table_name": {
+          "type": "string"
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checksum": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "validationCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "sql",
+        "value"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "sql": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "integer",
+            "number",
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "runConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_set",
+        "warmup",
+        "measured"
+      ],
+      "properties": {
+        "scenario_set": {
+          "type": "string"
+        },
+        "warmup": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measured": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "repeats": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "protocol_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "simple_text",
+            "extended_prepared",
+            "extended_cursor_stream",
+            null
+          ]
+        },
+        "server_settings": {
+          "type": "object"
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "milestone_focus",
+        "variant_kind",
+        "parameter_pack_id",
+        "sql",
+        "params",
+        "repeats",
+        "aggregate",
+        "representative_repeat"
+      ],
+      "properties": {
+        "scenario_id": {
+          "type": "string",
+          "pattern": "^Q[0-9]{2}F?$"
+        },
+        "milestone_focus": {
+          "type": "string",
+          "enum": [
+            "M2",
+            "M3",
+            "M4",
+            "M5",
+            "M6",
+            "M7",
+            "M8"
+          ]
+        },
+        "variant_kind": {
+          "type": "string",
+          "enum": [
+            "base",
+            "function_companion"
+          ]
+        },
+        "parameter_pack_id": {
+          "type": "string"
+        },
+        "sql": {
+          "type": "string"
+        },
+        "params": {
+          "type": "array"
+        },
+        "execution_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "simple_text",
+            "extended_prepared",
+            "extended_cursor_stream",
+            null
+          ]
+        },
+        "submode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worker_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "memory_limit_mb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "explain": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "applied_settings": {
+          "type": "object"
+        },
+        "repeats": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/repeat"
+          }
+        },
+        "aggregate": {
+          "$ref": "#/$defs/aggregate"
+        },
+        "representative_repeat": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "repeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repeat",
+        "summary",
+        "counters",
+        "measurements"
+      ],
+      "properties": {
+        "repeat": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        },
+        "counters": {
+          "$ref": "#/$defs/counters"
+        },
+        "extra_metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/metricValue"
+          }
+        },
+        "measurements": {
+          "$ref": "#/$defs/measurements"
+        }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "elapsed_ms",
+        "first_row_latency_ms"
+      ],
+      "properties": {
+        "elapsed_ms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "number"
+          }
+        },
+        "first_row_latency_ms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repeat_count",
+        "outlier_rule",
+        "summary"
+      ],
+      "properties": {
+        "repeat_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "outlier_rule": {
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/aggregateSummary"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "elapsed_ms",
+        "p50_ms",
+        "p95_ms"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "p50_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "p95_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "first_row_latency_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "peak_rss_bytes": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "cpu_time_ms": {
+          "$ref": "#/$defs/metricValue"
+        }
+      }
+    },
+    "aggregateSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "elapsed_ms",
+        "p50_ms",
+        "p95_ms",
+        "elapsed_ci95_low_ms",
+        "elapsed_ci95_high_ms",
+        "elapsed_outlier_count"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "p50_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "p95_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "first_row_latency_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_stdev_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_ci95_low_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_ci95_high_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "elapsed_outlier_count": {
+          "$ref": "#/$defs/metricValue"
+        }
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scanned_rows": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "decoded_rows": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "fetched_base_rows": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "rows_scanned_before_stop": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "payload_bytes": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "kv_requests": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "sort_bytes": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "aggregate_memory_bytes": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "spill_bytes": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "spill_passes": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "plan_cache_hit_ratio": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "planning_cpu_ms": {
+          "$ref": "#/$defs/metricValue"
+        },
+        "cleanup_ok": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}
