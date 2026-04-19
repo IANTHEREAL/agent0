@@ -491,7 +491,7 @@ async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
             .await
             .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
             .map_err(|e| anyhow!("fs9: failed to init gRPC backend: {e}")),
-        Fs9BackendType::Embedded | Fs9BackendType::Auto => {
+        Fs9BackendType::Embedded => {
             let client = crate::extensions::context::tikv_client().ok_or_else(|| {
                 anyhow!(
                     "fs9: TiKV client not available in extension context. \
@@ -525,67 +525,90 @@ async fn resolve_backend_type(
     .await
 }
 
-/// Auto mode: check if tenant has existing fs9 data in TiKV (superblock key `_fs_S`).
-/// If data exists → Embedded. If no data and gRPC proxy configured → JuiceFs.
+/// Per-tenant backend selection.
+///
+/// Asks the embedded backend whether this tenant's TiKV keyspace
+/// already holds any embedded fs9 data. Routing is then:
+///   * gRPC proxy not configured → Embedded (only backend available).
+///   * keyspace has embedded data → Embedded (do not orphan existing data).
+///   * keyspace is empty → JuiceFs (safe to init fresh).
+///   * probe failed (transient TiKV error) → Embedded (fail-closed).
+///
+/// The probe delegates to
+/// [`crate::extensions::fs::embedded::pagefs::probe_keyspace_has_embedded_data`]
+/// rather than testing specific key names. That keeps this resolver in
+/// lockstep with the embedded backend's own re-init guard: if the
+/// embedded side considers a keyspace "already used" and refuses to
+/// overwrite it, the resolver must also route there.
 async fn resolve_backend_type_core(
     client: Option<&Arc<tikv_client::TransactionClient>>,
     tenant_keyspace: &str,
 ) -> crate::extensions::fs::config::Fs9BackendType {
-    use crate::extensions::fs::config::{fs9_config, Fs9BackendType};
-    use tikv_client::TransactionOptions;
+    use crate::extensions::fs::config::fs9_config;
 
     let cfg = fs9_config();
-    match cfg.backend_type {
-        Fs9BackendType::Embedded | Fs9BackendType::JuiceFs => cfg.backend_type,
-        Fs9BackendType::Auto => {
-            if cfg.grpc_pd_endpoints.is_empty() {
-                return Fs9BackendType::Embedded;
-            }
 
-            // Probe TiKV for existing embedded data. On error, fall back to
-            // Embedded — a transient TiKV failure must not silently route an
-            // existing tenant to an empty JuiceFS volume.
-            let probe_result = match client {
-                Some(client) => {
-                    let options = TransactionOptions::new_optimistic()
-                        .read_only()
-                        .drop_check(tikv_client::CheckLevel::Warn);
-                    match client.begin_with_options(options).await {
-                        Ok(mut txn) => match txn.get(b"_fs_S".to_vec()).await {
-                            Ok(Some(_)) => Some(true),
-                            Ok(None) => Some(false),
-                            Err(e) => {
-                                tracing::warn!(keyspace = tenant_keyspace, err = %e, "auto: TiKV read failed, defaulting to embedded");
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!(keyspace = tenant_keyspace, err = %e, "auto: TiKV txn failed, defaulting to embedded");
-                            None
-                        }
+    let probe_result = if cfg.grpc_pd_endpoints.is_empty() {
+        // Skip the probe — gRPC isn't available so the answer is
+        // Embedded either way; `decide_backend_type` handles it.
+        None
+    } else {
+        match client {
+            Some(client) => {
+                match crate::extensions::fs::embedded::pagefs::probe_keyspace_has_embedded_data(
+                    client,
+                )
+                .await
+                {
+                    Ok(has_data) => Some(has_data),
+                    Err(e) => {
+                        tracing::warn!(keyspace = tenant_keyspace, err = %e, "fs9 resolve: TiKV probe failed, defaulting to embedded");
+                        None
                     }
                 }
-                None => None,
-            };
-
-            match probe_result {
-                Some(true) => {
-                    tracing::debug!(
-                        keyspace = tenant_keyspace,
-                        "auto: existing fs9 data, using embedded"
-                    );
-                    Fs9BackendType::Embedded
-                }
-                Some(false) => {
-                    tracing::info!(
-                        keyspace = tenant_keyspace,
-                        "auto: no fs9 data, using juicefs"
-                    );
-                    Fs9BackendType::JuiceFs
-                }
-                None => Fs9BackendType::Embedded,
             }
+            None => None,
         }
+    };
+
+    let decision = decide_backend_type(cfg.grpc_pd_endpoints.is_empty(), probe_result);
+    match decision {
+        crate::extensions::fs::config::Fs9BackendType::Embedded => {
+            tracing::debug!(
+                keyspace = tenant_keyspace,
+                ?probe_result,
+                "fs9 resolve: routing to embedded"
+            );
+        }
+        crate::extensions::fs::config::Fs9BackendType::JuiceFs => {
+            tracing::info!(
+                keyspace = tenant_keyspace,
+                "fs9 resolve: empty keyspace, routing to juicefs"
+            );
+        }
+    }
+    decision
+}
+
+/// Pure decision function: collapses (gRPC-configured, probe-result)
+/// to the backend choice. Exposed for unit tests so the five
+/// transitions can be locked down without a live TiKV.
+fn decide_backend_type(
+    grpc_endpoints_empty: bool,
+    probe_result: Option<bool>,
+) -> crate::extensions::fs::config::Fs9BackendType {
+    use crate::extensions::fs::config::Fs9BackendType;
+
+    if grpc_endpoints_empty {
+        return Fs9BackendType::Embedded;
+    }
+    match probe_result {
+        // Keyspace has embedded data — preserve it.
+        Some(true) => Fs9BackendType::Embedded,
+        // Keyspace is empty — safe to init JuiceFS.
+        Some(false) => Fs9BackendType::JuiceFs,
+        // Probe failed — fail closed rather than silently re-route.
+        None => Fs9BackendType::Embedded,
     }
 }
 
@@ -609,6 +632,65 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use tokio::io::{empty, AsyncBufRead};
+
+    // Lock down the five transitions of `decide_backend_type`. The fs9
+    // mis-routing incident that motivated removing the explicit
+    // `FS9_BACKEND` knob would be reproduced by any regression to this
+    // table — keep it tight.
+    #[test]
+    fn decide_backend_type_routes_empty_gprc_to_embedded() {
+        use crate::extensions::fs::config::Fs9BackendType;
+        // gRPC unconfigured — probe is irrelevant; Embedded is the only
+        // option regardless of what TiKV says.
+        assert_eq!(
+            decide_backend_type(true, None),
+            Fs9BackendType::Embedded,
+            "empty gRPC + no probe → Embedded"
+        );
+        assert_eq!(
+            decide_backend_type(true, Some(false)),
+            Fs9BackendType::Embedded,
+            "empty gRPC + empty keyspace → Embedded"
+        );
+        assert_eq!(
+            decide_backend_type(true, Some(true)),
+            Fs9BackendType::Embedded,
+            "empty gRPC + has embedded data → Embedded"
+        );
+    }
+
+    #[test]
+    fn decide_backend_type_preserves_existing_embedded_data() {
+        use crate::extensions::fs::config::Fs9BackendType;
+        // Keyspace has ANY fs9 metadata → must stay on embedded, even
+        // if the superblock is missing/corrupt. Routing to JuiceFs would
+        // freshly init an empty volume and silently orphan the data.
+        assert_eq!(
+            decide_backend_type(false, Some(true)),
+            Fs9BackendType::Embedded
+        );
+    }
+
+    #[test]
+    fn decide_backend_type_routes_empty_keyspace_to_juicefs() {
+        use crate::extensions::fs::config::Fs9BackendType;
+        // gRPC configured + nothing in TiKV → safe to init JuiceFs.
+        assert_eq!(
+            decide_backend_type(false, Some(false)),
+            Fs9BackendType::JuiceFs
+        );
+    }
+
+    #[test]
+    fn decide_backend_type_fails_closed_on_probe_error() {
+        use crate::extensions::fs::config::Fs9BackendType;
+        // Transient TiKV failure must never silently route an existing
+        // tenant to an empty JuiceFs volume.
+        assert_eq!(
+            decide_backend_type(false, None),
+            Fs9BackendType::Embedded
+        );
+    }
 
     struct BatchInlineReadTestBackend {
         stats: HashMap<String, Result<FsFileInfo>>,
