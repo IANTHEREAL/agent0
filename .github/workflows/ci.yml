@@ -32,6 +32,8 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-git-
+      - name: Configure git credentials for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.CROSS_REPO_TOKEN }}@github.com/".insteadOf https://github.com/
       - run: cargo build --release
       - run: sccache --show-stats
       - uses: actions/upload-artifact@v4
@@ -59,6 +61,8 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-git-
+      - name: Configure git credentials for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.CROSS_REPO_TOKEN }}@github.com/".insteadOf https://github.com/
       - run: cargo fmt -p db9-server -p db9-model -- --check
       - run: cargo clippy --all-targets --no-deps -- -D warnings
 
@@ -79,6 +83,8 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-git-
+      - name: Configure git credentials for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.CROSS_REPO_TOKEN }}@github.com/".insteadOf https://github.com/
       - run: cargo test
 
   # -- Regression Gate (download binary, no Rust needed) --------------------

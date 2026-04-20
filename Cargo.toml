@@ -12,6 +12,7 @@ rust-version = "1.88"
 [dependencies]
 # Workspace crates
 db9-model = { path = "crates/db9-model" }
+auth9-core = { git = "https://github.com/db9-ai/db9-auth", rev = "b0fbee357cab01b8b4dabfbb886fe96e94ac1910", features = ["verify", "fail-closed", "error", "metrics-names"] }
 
 # Memory allocator — jemalloc replaces glibc malloc to prevent arena
 # fragmentation that inflates RSS 5-10× in multi-tenant deployments.

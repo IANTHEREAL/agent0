@@ -7,3 +7,6 @@ incompatible-rust-versions = "fallback"
 # which tokio APIs compile — no runtime behavior change.
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+
+[net]
+git-fetch-with-cli = true

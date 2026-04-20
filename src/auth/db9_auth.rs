@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::config;
 use anyhow::Result as AnyhowResult;
+use auth9_core::wire::verify::{InactiveReason, VerifyRequest, VerifyResponse};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -163,7 +164,7 @@ pub(crate) enum Db9AuthError {
     #[error("JWT validation failed: {reason}")]
     InvalidJwt { reason: String },
 
-    #[error("connect key validation is not configured (set DB9_AUTH_CONNECT_KEY_INTROSPECT_URL)")]
+    #[error("connect key validation is not configured (set DB9_AUTH_CONNECT_KEY_INTROSPECT_URL, or DB9_AUTH_CREDENTIAL_VERIFY_URL when AUTH9_ENABLED=true)")]
     ConnectKeyNotConfigured,
 
     #[error("connect key validation failed: {reason}")]
@@ -630,6 +631,110 @@ pub(crate) async fn verify_jwt_connect_token(
 }
 
 pub(crate) async fn verify_connect_key(
+    connect_key: &str,
+    expected_keyspace: &str,
+    expected_role: &str,
+) -> Result<(), Db9AuthError> {
+    if config::env_bool("AUTH9_ENABLED") {
+        verify_connect_key_auth9(connect_key, expected_keyspace, expected_role).await
+    } else {
+        verify_connect_key_legacy(connect_key, expected_keyspace, expected_role).await
+    }
+}
+
+async fn verify_connect_key_auth9(
+    connect_key: &str,
+    expected_keyspace: &str,
+    expected_role: &str,
+) -> Result<(), Db9AuthError> {
+    let tenant_id =
+        tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
+    let verify_url = config::env_string("DB9_AUTH_CREDENTIAL_VERIFY_URL")
+        .ok_or(Db9AuthError::ConnectKeyNotConfigured)?;
+    let api_key = config::env_string("DB9_AUTH9_SERVICE_API_KEY");
+
+    let mut req = http_client().post(&verify_url).json(&VerifyRequest {
+        credential: connect_key.to_string(),
+    });
+    if let Some(key) = api_key.as_deref() {
+        req = req.header("X-API-Key", key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|err| Db9AuthError::InvalidConnectKey {
+            reason: format!("verify request failed: {err}"),
+        })?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| Db9AuthError::InvalidConnectKey {
+            reason: format!("verify response read failed: {err}"),
+        })?;
+    if !status.is_success() {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: format!("verify HTTP {}", status.as_u16()),
+        });
+    }
+
+    let info: VerifyResponse =
+        serde_json::from_str(&body).map_err(|err| Db9AuthError::InvalidConnectKey {
+            reason: format!("verify parse failed: {err}"),
+        })?;
+
+    validate_auth9_verify_response(&info, tenant_id, expected_role)
+}
+
+fn validate_auth9_verify_response(
+    info: &VerifyResponse,
+    tenant_id: &str,
+    expected_role: &str,
+) -> Result<(), Db9AuthError> {
+    match info {
+        VerifyResponse::Inactive { reason, .. } => {
+            let reason_str = match reason {
+                InactiveReason::NotFound => "not found",
+                InactiveReason::Revoked => "revoked",
+                InactiveReason::NotYetValid => "not yet valid",
+                InactiveReason::Expired => "expired",
+            };
+            Err(Db9AuthError::InvalidConnectKey {
+                reason: reason_str.to_string(),
+            })
+        }
+        VerifyResponse::Active {
+            subject_id,
+            tenant_id: resp_tid,
+            ..
+        } => {
+            match resp_tid {
+                None => {
+                    return Err(Db9AuthError::InvalidConnectKey {
+                        reason: "missing tenant_id".to_string(),
+                    });
+                }
+                Some(resp_tid) if resp_tid != tenant_id => {
+                    return Err(Db9AuthError::TenantMismatch {
+                        expected: tenant_id.to_string(),
+                        actual: resp_tid.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+            if subject_id != expected_role {
+                return Err(Db9AuthError::RoleMismatch {
+                    expected: expected_role.to_string(),
+                    actual: subject_id.clone(),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn verify_connect_key_legacy(
     connect_key: &str,
     expected_keyspace: &str,
     expected_role: &str,
@@ -1406,6 +1511,103 @@ JwIDAQAB
             err,
             Db9AuthError::InvalidConnectKey { reason } if reason == "revoked"
         ));
+    }
+
+    fn auth9_active(subject_id: &str, tenant_id: Option<&str>) -> VerifyResponse {
+        VerifyResponse::Active {
+            active: true,
+            id: "cred_test".to_string(),
+            subject_id: subject_id.to_string(),
+            tenant_id: tenant_id.map(str::to_string),
+            service_id: None,
+            scope: None,
+            expires_at: None,
+        }
+    }
+
+    fn auth9_inactive(reason: InactiveReason) -> VerifyResponse {
+        VerifyResponse::Inactive {
+            active: false,
+            reason,
+        }
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_inactive_not_found_is_denied() {
+        let info = auth9_inactive(InactiveReason::NotFound);
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "not found"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_inactive_revoked_is_denied() {
+        let info = auth9_inactive(InactiveReason::Revoked);
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "revoked"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_inactive_not_yet_valid_is_denied() {
+        let info = auth9_inactive(InactiveReason::NotYetValid);
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "not yet valid"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_inactive_expired_is_denied() {
+        let info = auth9_inactive(InactiveReason::Expired);
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "expired"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_active_missing_tenant_is_denied() {
+        let info = auth9_active("admin", None);
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "missing tenant_id"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_active_tenant_mismatch_is_denied() {
+        let info = auth9_active("admin", Some("t2"));
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::TenantMismatch { expected, actual }
+                if expected == "t1" && actual == "t2"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_active_role_mismatch_is_denied() {
+        let info = auth9_active("alice", Some("t1"));
+        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::RoleMismatch { expected, actual }
+                if expected == "admin" && actual == "alice"
+        ));
+    }
+
+    #[test]
+    fn validate_auth9_verify_response_active_happy_path() {
+        let info = auth9_active("admin", Some("t1"));
+        validate_auth9_verify_response(&info, "t1", "admin").unwrap();
     }
 
     /// Multi-connection JWKS server that counts how many HTTP requests it receives.
