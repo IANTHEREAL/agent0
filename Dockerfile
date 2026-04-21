@@ -44,8 +44,16 @@ ARG BUILD_DATE=""
 ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
 ENV BUILD_DATE=${BUILD_DATE}
 
-# Build db9-server for arm64
-RUN cargo build --release --target aarch64-unknown-linux-gnu
+# `db9-server` depends on `auth9-core`, which lives in the private
+# `db9-ai/db9-auth` repo. Cargo needs HTTPS credentials to clone it during
+# dep resolution. The CI workflow in `db9-ai/db9-build/_image-package.yml`
+# forwards `cross_repo_token` to BuildKit via `secrets: gh_token=...`;
+# mount it here only for this RUN step so the token never lands in any
+# image layer. Clear the config afterwards for belt-and-suspenders.
+RUN --mount=type=secret,id=gh_token,required=true \
+    git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" \
+    && cargo build --release --target aarch64-unknown-linux-gnu \
+    && git config --global --unset url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf
 
 # Runtime stage (arm64)
 FROM --platform=$TARGETPLATFORM debian:bookworm-slim
