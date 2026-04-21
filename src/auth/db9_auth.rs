@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -311,6 +312,8 @@ struct JwksCacheState {
 }
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+static INTROSPECT_URL_DEPRECATED: AtomicBool = AtomicBool::new(false);
 /// Global JWKS cache shared across all tenants.
 ///
 /// **Known limitation (TODO #2345):** this is a single-entry cross-tenant cache.
@@ -707,6 +710,8 @@ fn validate_auth9_verify_response(
         VerifyResponse::Active {
             subject_id,
             tenant_id: resp_tid,
+            service_id,
+            scope,
             ..
         } => {
             match resp_tid {
@@ -729,6 +734,13 @@ fn validate_auth9_verify_response(
                     actual: subject_id.clone(),
                 });
             }
+            tracing::info!(
+                subject_id = subject_id.as_str(),
+                service_id = service_id.as_deref().unwrap_or(""),
+                scope = ?scope,
+                tenant_id,
+                "auth9 credential verified"
+            );
             Ok(())
         }
     }
@@ -743,6 +755,14 @@ async fn verify_connect_key_legacy(
         tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
     let introspect_url = config::env_string("DB9_AUTH_CONNECT_KEY_INTROSPECT_URL")
         .ok_or(Db9AuthError::ConnectKeyNotConfigured)?;
+
+    if !INTROSPECT_URL_DEPRECATED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "DB9_AUTH_CONNECT_KEY_INTROSPECT_URL is deprecated; \
+             set DB9_AUTH_CREDENTIAL_VERIFY_URL instead"
+        );
+    }
+
     let api_key = config::env_string("DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY");
 
     #[derive(serde::Serialize)]
