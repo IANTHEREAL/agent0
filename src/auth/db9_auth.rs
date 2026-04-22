@@ -654,7 +654,16 @@ async fn verify_connect_key_auth9(
         tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
     let verify_url = config::env_string("DB9_AUTH_CREDENTIAL_VERIFY_URL")
         .ok_or(Db9AuthError::ConnectKeyNotConfigured)?;
-    let api_key = config::env_string("DB9_AUTH9_SERVICE_API_KEY");
+    static LEGACY_KEY_WARNED: std::sync::Once = std::sync::Once::new();
+    let api_key = config::env_string("DB9_AUTH9_SERVICE_API_KEY").or_else(|| {
+        config::env_string("DB9_AUTH9_SERVICE_KEY").inspect(|_| {
+            LEGACY_KEY_WARNED.call_once(|| {
+                tracing::warn!(
+                    "DB9_AUTH9_SERVICE_KEY is deprecated, use DB9_AUTH9_SERVICE_API_KEY"
+                );
+            });
+        })
+    });
 
     let mut req = http_client().post(&verify_url).json(&VerifyRequest {
         credential: connect_key.to_string(),
