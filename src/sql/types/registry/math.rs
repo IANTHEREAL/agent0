@@ -144,10 +144,34 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
             .with_arg_types(vec![f64.clone(), f64.clone()]),
     );
 
-    // Int result functions
+    // SIGN per PostgreSQL 16.13: two concrete overloads in pg_proc —
+    //   sign(double precision) -> double precision
+    //   sign(numeric)          -> numeric
+    // Registered as two distinct overloads so:
+    //   * pg_catalog.pg_proc emits two rows (matching PG exactly);
+    //   * overload resolution picks dp for int/bigint/float inputs
+    //     (int-to-dp is implicit in PG) and numeric for numeric inputs;
+    //   * numeric input resolves to a bare `numeric` return type —
+    //     no typmod leak into view/catalog metadata, matching
+    //     PG's behavior for CREATE VIEW v AS SELECT sign(x::numeric(p,s)).
+    // Registration order matters: the dp overload is registered first
+    // so it wins the tie for integer inputs (PG's numeric-category
+    // preference routes int → dp rather than int → numeric).
+    let numeric = DataType::Numeric {
+        precision: None,
+        scale: None,
+    };
     r.register(
         "SIGN",
-        FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "SIGN",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
     );
 
     // Zero-arg functions

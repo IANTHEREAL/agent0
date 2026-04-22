@@ -68,6 +68,61 @@ pub fn is_numeric(dt: &DataType) -> bool {
     )
 }
 
+/// Is `from` implicitly coercible to `to` in PostgreSQL's sense (entries
+/// in `pg_catalog.pg_cast` with `castcontext = 'i'`)? This is the
+/// predicate used by the planner during **function overload resolution**
+/// (FunctionRegistry::resolve_return_type) — a declared argument type
+/// accepts an actual value whose type implicitly casts to it without an
+/// explicit `CAST` / `::` annotation.
+///
+/// PG distinguishes implicit (any SQL expression), assignment (INSERT
+/// target), and explicit (`CAST(...)` only) cast contexts. Overload
+/// resolution uses implicit only; cross-category numeric casts like
+/// dp ↔ numeric are explicit in PG and deliberately excluded here — so
+/// `SIGN(1.5::numeric)` does not match the `sign(double precision)`
+/// overload, and vice versa.
+///
+/// Verified against PG 16.13's `pg_cast` for the numeric category:
+///
+/// ```text
+/// SELECT castsource::regtype, casttarget::regtype, castcontext
+///   FROM pg_cast
+///  WHERE castsource IN (21,23,20,700,701,1700)
+///    AND casttarget IN (21,23,20,700,701,1700)
+///    AND castcontext = 'i';
+/// -- smallint / int / bigint → smallint / int / bigint / real / dp / numeric
+/// -- real → dp
+/// -- (no real↔numeric, no dp↔numeric implicit)
+/// ```
+pub fn is_implicitly_coercible(from: &DataType, to: &DataType) -> bool {
+    if from == to {
+        return true;
+    }
+    // Numeric typmod (precision/scale) is not part of the implicit-cast
+    // identity — sign(numeric(10,2)) resolves to the sign(numeric)
+    // overload regardless of typmod.
+    if let (DataType::Numeric { .. }, DataType::Numeric { .. }) = (from, to) {
+        return true;
+    }
+    // Integer-family (smallint, int, bigint, oid) widens implicitly into
+    // any larger numeric-category target: int → bigint, int → dp, int →
+    // numeric, etc. This matches PG's implicit-cast entries for the
+    // integer types.
+    if matches!(from, DataType::Int32 | DataType::Int64 | DataType::Oid)
+        && matches!(
+            to,
+            DataType::Int32
+                | DataType::Int64
+                | DataType::Oid
+                | DataType::Float64
+                | DataType::Numeric { .. }
+        )
+    {
+        return true;
+    }
+    false
+}
+
 pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
     // Both Unknown → resolve to Text (PG defaults UNKNOWNOID to TEXT).
     if matches!(a, DataType::Unknown) && matches!(b, DataType::Unknown) {

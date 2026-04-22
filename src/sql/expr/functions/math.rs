@@ -332,29 +332,25 @@ pub fn log10(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn sign(args: Vec<Value>) -> Result<Value> {
-    match args.into_iter().next() {
-        Some(Value::Int32(n)) => Ok(Value::Int32(if n > 0 {
-            1
-        } else if n < 0 {
-            -1
-        } else {
-            0
-        })),
-        Some(Value::Int64(n)) => Ok(Value::Int64(if n > 0 {
-            1
-        } else if n < 0 {
-            -1
-        } else {
-            0
-        })),
-        Some(Value::Float64(n)) => Ok(Value::Float64(if n > 0.0 {
+    // Per PostgreSQL: sign(double precision) -> double precision,
+    // sign(numeric) -> numeric. Integer inputs are coerced to double
+    // precision and return double precision. Match runtime to that
+    // contract so the analyzer (which consults the registry's Custom
+    // return-type fn) and the runtime agree on column types.
+    fn dp(n: f64) -> f64 {
+        if n > 0.0 {
             1.0
         } else if n < 0.0 {
             -1.0
         } else {
             0.0
-        })),
-        Some(Value::Numeric(d)) => Ok(Value::Int32(d.cmp(&Decimal::ZERO) as i32)),
+        }
+    }
+    match args.into_iter().next() {
+        Some(Value::Int32(n)) => Ok(Value::Float64(dp(n as f64))),
+        Some(Value::Int64(n)) => Ok(Value::Float64(dp(n as f64))),
+        Some(Value::Float64(n)) => Ok(Value::Float64(dp(n))),
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(Decimal::from(d.cmp(&Decimal::ZERO) as i32))),
         _ => Ok(Value::Null),
     }
 }
@@ -584,9 +580,41 @@ mod tests {
 
     #[test]
     fn test_sign() {
-        assert_eq!(sign(vec![Value::Int32(-5)]).unwrap(), Value::Int32(-1));
-        assert_eq!(sign(vec![Value::Int32(5)]).unwrap(), Value::Int32(1));
-        assert_eq!(sign(vec![Value::Int32(0)]).unwrap(), Value::Int32(0));
+        // Per PG: int / bigint / double precision all return double
+        // precision; numeric returns numeric.
+        assert_eq!(sign(vec![Value::Int32(-5)]).unwrap(), Value::Float64(-1.0));
+        assert_eq!(sign(vec![Value::Int32(5)]).unwrap(), Value::Float64(1.0));
+        assert_eq!(sign(vec![Value::Int32(0)]).unwrap(), Value::Float64(0.0));
+
+        assert_eq!(sign(vec![Value::Int64(-5)]).unwrap(), Value::Float64(-1.0));
+        assert_eq!(sign(vec![Value::Int64(5)]).unwrap(), Value::Float64(1.0));
+        assert_eq!(sign(vec![Value::Int64(0)]).unwrap(), Value::Float64(0.0));
+
+        assert_eq!(
+            sign(vec![Value::Float64(-2.5)]).unwrap(),
+            Value::Float64(-1.0)
+        );
+        assert_eq!(
+            sign(vec![Value::Float64(2.5)]).unwrap(),
+            Value::Float64(1.0)
+        );
+        assert_eq!(
+            sign(vec![Value::Float64(0.0)]).unwrap(),
+            Value::Float64(0.0)
+        );
+
+        assert_eq!(
+            sign(vec![Value::Numeric(Decimal::new(-25, 1))]).unwrap(),
+            Value::Numeric(Decimal::from(-1)),
+        );
+        assert_eq!(
+            sign(vec![Value::Numeric(Decimal::new(25, 1))]).unwrap(),
+            Value::Numeric(Decimal::from(1)),
+        );
+        assert_eq!(
+            sign(vec![Value::Numeric(Decimal::ZERO)]).unwrap(),
+            Value::Numeric(Decimal::from(0)),
+        );
     }
 
     #[test]

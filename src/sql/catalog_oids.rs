@@ -55,9 +55,22 @@ pub fn pg_proc_function_oid(function_oid: u32) -> i64 {
     FUNCTION_OID_BASE + function_oid as i64
 }
 
-pub fn pg_builtin_function_oid(function_name: &str) -> i64 {
+/// Overload-aware OID derivation for a builtin function. PG's pg_proc
+/// assigns a distinct oid per (proname, proargtypes) row — DB9 mirrors
+/// that by folding the argument-type OIDs into the hash. Two overloads
+/// of the same name (SIGN's double-precision and numeric forms, ABS's
+/// six integer/float/numeric forms, ...) therefore get distinct oids
+/// and `SELECT oid FROM pg_proc WHERE proname='sign'` returns two
+/// values — matching PG's introspection contract.
+pub fn pg_builtin_function_overload_oid(function_name: &str, arg_type_oids: &[i64]) -> i64 {
     let lower = function_name.to_ascii_lowercase();
-    BUILTIN_FUNCTION_OID_BASE + (fnv1a_64(lower.as_bytes()) % 1_000_000_000) as i64
+    let mut hasher_bytes = Vec::with_capacity(lower.len() + 1 + arg_type_oids.len() * 8);
+    hasher_bytes.extend_from_slice(lower.as_bytes());
+    hasher_bytes.push(b'(');
+    for oid in arg_type_oids {
+        hasher_bytes.extend_from_slice(&oid.to_le_bytes());
+    }
+    BUILTIN_FUNCTION_OID_BASE + (fnv1a_64(&hasher_bytes) % 1_000_000_000) as i64
 }
 
 pub fn pg_trigger_oid(trigger_oid: u32) -> i64 {

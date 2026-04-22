@@ -47,27 +47,47 @@ impl VirtualTable for PgProc {
         // the extension-specific path (lines below). Filter them here to
         // prevent duplicate rows.
         let http_names = crate::sql::types::registry::http::HTTP_FUNCTION_NAMES;
-        let mut builtin_funcs: Vec<(String, &crate::sql::types::registry::FunctionSignature)> =
-            global_registry()
-                .iter()
-                .filter_map(|(name, sig)| match &sig.return_type {
-                    ReturnType::Fixed(_) => {
-                        let upper = name.to_ascii_uppercase();
-                        if http_names.contains(&upper.as_str()) {
-                            None
-                        } else {
-                            Some((name.to_ascii_lowercase(), sig))
-                        }
-                    }
-                    _ => None,
-                })
-                .collect();
-        builtin_funcs.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+        // Resolve an overload's Fixed return type (the only shape that
+        // can appear in pg_proc — SameAsArg / Custom / FirstNonNull
+        // depend on runtime argument types and don't describe a concrete
+        // row). Polymorphic functions register one overload per concrete
+        // (arg_types, return_type) pair so each appears here, matching
+        // PG's pg_proc layout (e.g. SIGN registers two overloads and
+        // yields two rows: one for double precision, one for numeric).
+        fn fixed_return_type(
+            sig: &crate::sql::types::registry::FunctionSignature,
+        ) -> Option<crate::model::DataType> {
+            match &sig.return_type {
+                ReturnType::Fixed(dt) => Some(dt.clone()),
+                _ => None,
+            }
+        }
+        let mut builtin_funcs: Vec<(
+            String,
+            &crate::sql::types::registry::FunctionSignature,
+            crate::model::DataType,
+        )> = global_registry()
+            .iter_overloads()
+            .filter_map(|(name, sig)| {
+                let upper = name.to_ascii_uppercase();
+                if http_names.contains(&upper.as_str()) {
+                    return None;
+                }
+                let prorettype = fixed_return_type(sig)?;
+                Some((name.to_ascii_lowercase(), sig, prorettype))
+            })
+            .collect();
+        // Sort by (name, prorettype-OID) so multi-overload functions
+        // like SIGN produce a deterministic row order within a name.
+        builtin_funcs.sort_by(|lhs, rhs| {
+            lhs.0.cmp(&rhs.0).then_with(|| {
+                crate::sql::pg_types::oid_and_typlen_for_datatype(&lhs.2)
+                    .0
+                    .cmp(&crate::sql::pg_types::oid_and_typlen_for_datatype(&rhs.2).0)
+            })
+        });
 
-        for (name, sig) in builtin_funcs {
-            let ReturnType::Fixed(prorettype) = &sig.return_type else {
-                continue;
-            };
+        for (name, sig, prorettype) in builtin_funcs {
             let prokind = if sig.is_aggregate {
                 "a"
             } else if sig.is_window {
@@ -75,12 +95,23 @@ impl VirtualTable for PgProc {
             } else {
                 "f"
             };
+            let prorettype_oid = crate::sql::pg_types::oid_and_typlen_for_datatype(&prorettype).0;
+            // Overload-aware OID derivation keyed on (proname,
+            // proargtypes) — matches PG's uniqueness key for pg_proc
+            // and gives SIGN's dp / numeric rows (and ABS's six
+            // numeric-family rows) distinct oids.
+            let arg_oids: Vec<i64> = sig
+                .arg_types
+                .iter()
+                .map(|t| crate::sql::pg_types::oid_and_typlen_for_datatype(t).0)
+                .collect();
+            let oid = catalog_oids::pg_builtin_function_overload_oid(&name, &arg_oids);
             rows.push(Row::new(vec![
-                int_val(catalog_oids::pg_builtin_function_oid(&name)),
+                int_val(oid),
                 text_val(&name),
                 int_val(pg_catalog_oid),
                 int_val(catalog_oids::pg_role_oid("postgres")),
-                int_val(crate::sql::pg_types::oid_and_typlen_for_datatype(prorettype).0),
+                int_val(prorettype_oid),
                 text_val(prokind),
                 Value::Boolean(false),
             ]));

@@ -70,6 +70,30 @@ sign_neg
 sign_zero
 0
 (1 row)
+sign_typeof_int
+double precision
+(1 row)
+sign_typeof_bigint
+double precision
+(1 row)
+sign_typeof_double
+double precision
+(1 row)
+sign_typeof_numeric
+numeric
+(1 row)
+sign_typeof_numeric_typmod
+numeric
+(1 row)
+v
+1
+(1 row)
+v
+-1
+(1 row)
+v
+0
+(1 row)
 greatest
 9
 (1 row)

@@ -643,7 +643,21 @@ impl<'a> Analyzer<'a> {
                 // Generic fallback: use registry arg_types if available.
                 // Covers ordinary single-signature functions like lower(text),
                 // length(text), sqrt(float8) etc. for PREPARE parameter inference.
-                let sig = global_registry().get(func_name);
+                //
+                // For multi-overload functions (SIGN, and the upcoming
+                // ABS/CEIL/FLOOR/ROUND/TRUNC sets), pick the overload
+                // that best matches the actual arg types so PREPARE /
+                // typed-param calls see the right declared arg_types.
+                // `PREPARE q(numeric) AS SELECT sign($1)` must route to
+                // the numeric overload rather than the primary dp one —
+                // falling back to `.get()` (first overload) would reject
+                // the numeric parameter as incompatible with Float64.
+                let registry = global_registry();
+                let actual_types: Vec<DataType> =
+                    args.iter().map(|a| a.data_type.clone()).collect();
+                let sig = registry
+                    .resolve_overload(func_name, &actual_types)
+                    .or_else(|| registry.get(func_name));
                 match sig {
                     Some(sig) if !sig.arg_types.is_empty() => {
                         self.coerce_registry_arg_types(func_name, args, &sig.arg_types)
