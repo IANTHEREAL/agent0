@@ -654,16 +654,7 @@ async fn verify_connect_key_auth9(
         tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
     let verify_url = config::env_string("DB9_AUTH_CREDENTIAL_VERIFY_URL")
         .ok_or(Db9AuthError::ConnectKeyNotConfigured)?;
-    static LEGACY_KEY_WARNED: std::sync::Once = std::sync::Once::new();
-    let api_key = config::env_string("DB9_AUTH9_SERVICE_API_KEY").or_else(|| {
-        config::env_string("DB9_AUTH9_SERVICE_KEY").inspect(|_| {
-            LEGACY_KEY_WARNED.call_once(|| {
-                tracing::warn!(
-                    "DB9_AUTH9_SERVICE_KEY is deprecated, use DB9_AUTH9_SERVICE_API_KEY"
-                );
-            });
-        })
-    });
+    let api_key = config::env_string("DB9_AUTH9_SERVICE_API_KEY");
 
     let mut req = http_client().post(&verify_url).json(&VerifyRequest {
         credential: connect_key.to_string(),
@@ -2243,5 +2234,57 @@ JwIDAQAB
         );
 
         server_task.await.unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn auth9_legacy_service_key_env_alone_does_not_populate_api_key_header() {
+        let _guard = test_lock().lock();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_task = captured.clone();
+
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = socket.read(&mut buf).await {
+                    captured_for_task.lock().extend_from_slice(&buf[..n]);
+                }
+                let body = r#"{"status":"inactive","reason":"not_found"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let _verify_url = set_env(
+            "DB9_AUTH_CREDENTIAL_VERIFY_URL",
+            &format!("http://{addr}/verify"),
+        );
+        let _legacy = set_env("DB9_AUTH9_SERVICE_KEY", "legacy-value-must-be-ignored");
+        let _modern = {
+            let prev = std::env::var("DB9_AUTH9_SERVICE_API_KEY").ok();
+            std::env::remove_var("DB9_AUTH9_SERVICE_API_KEY");
+            EnvVarGuard {
+                key: "DB9_AUTH9_SERVICE_API_KEY",
+                prev,
+            }
+        };
+
+        let _ = verify_connect_key_auth9("db9ck_token", "db9_tenant_t1", "admin").await;
+
+        server_task.await.unwrap();
+
+        let captured_bytes = captured.lock().clone();
+        let request_text = String::from_utf8_lossy(&captured_bytes).to_ascii_lowercase();
+        assert!(
+            !request_text.contains("x-api-key"),
+            "legacy DB9_AUTH9_SERVICE_KEY must not populate X-API-Key header; captured request:\n{request_text}"
+        );
     }
 }
