@@ -1,0 +1,93 @@
+name: auth9-core scheduled bump
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          persist-credentials: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure git credentials for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.CROSS_REPO_TOKEN }}@github.com/".insteadOf https://github.com/
+
+      - name: Capture pre-update auth9-core SHA
+        id: pre
+        run: |
+          OLD_SHA=$(grep -E '^source = "git\+https://github.com/db9-ai/db9-auth' Cargo.lock | head -n1 | sed -E 's/.*#([0-9a-f]+)".*/\1/')
+          echo "old_sha=$OLD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Run cargo update -p auth9-core
+        run: cargo update -p auth9-core
+
+      - name: Detect Cargo.lock drift
+        id: diff
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Capture post-update auth9-core SHA
+        if: steps.diff.outputs.changed == 'true'
+        id: post
+        run: |
+          NEW_SHA=$(grep -E '^source = "git\+https://github.com/db9-ai/db9-auth' Cargo.lock | head -n1 | sed -E 's/.*#([0-9a-f]+)".*/\1/')
+          echo "new_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          echo "new_sha_short=${NEW_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build changelog
+        if: steps.diff.outputs.changed == 'true'
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          OLD_SHA: ${{ steps.pre.outputs.old_sha }}
+          NEW_SHA: ${{ steps.post.outputs.new_sha }}
+        run: |
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo "Bumps \`auth9-core\` from \`${OLD_SHA:0:12}\` to \`${NEW_SHA:0:12}\` (db9-auth main)."
+            echo
+            echo "## Changes"
+            echo
+            gh api "repos/db9-ai/db9-auth/compare/${OLD_SHA}...${NEW_SHA}" \
+              --jq '.commits[] | "- " + (.sha[0:12]) + " " + (.commit.message | split("\n")[0])' \
+              || echo "_(changelog fetch failed; see compare view: https://github.com/db9-ai/db9-auth/compare/${OLD_SHA}...${NEW_SHA})_"
+            echo
+            echo "Triggered by \`.github/workflows/auth9-core-bump.yml\` (Refs db9-ai/db9-server#2487)."
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          NEW_SHA_SHORT: ${{ steps.post.outputs.new_sha_short }}
+          PR_BODY: ${{ steps.changelog.outputs.body }}
+        run: |
+          BRANCH="auto/auth9-core-bump-${NEW_SHA_SHORT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Cargo.lock
+          git commit -m "chore(deps): bump auth9-core to ${NEW_SHA_SHORT}"
+          git push --set-upstream origin "$BRANCH"
+          gh pr create \
+            --base master \
+            --head "$BRANCH" \
+            --title "chore(deps): bump auth9-core to ${NEW_SHA_SHORT}" \
+            --body "$PR_BODY"
