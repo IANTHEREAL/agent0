@@ -112,11 +112,32 @@ For milestones that touch access path or ordering:
 - failpoint or chaos tests
 - real scenario benchmark gate
 
+### 11.1 Benchmark Tooling
+
+If the milestone uses `TPC-C` or `TPC-H` for its real-scenario performance gate, the design doc must state the benchmark tool explicitly.
+
+For `db9` vs `PostgreSQL 18.3` comparison work in this program, the default requirement is:
+
+- use the **client-side HammerDB variant** as the benchmark tool
+- keep db9 and PostgreSQL on the same warehouses, duration, threads, and `pg_storedprocs` mode
+- record both:
+  - `CLIENT SIDE RESULT : ...`
+  - `TEST RESULT : ...`
+- attach prepare/readback and post-run readback artifacts for both sides
+
+If a milestone wants to use a different benchmark tool or metric source, the design doc must explain why the client-side HammerDB standard is insufficient and how metric comparability with PostgreSQL 18.3 is preserved.
+
 ### 12. Acceptance
 
 - positive acceptance checklist
 - negative acceptance checklist
 - evidence required before the milestone is declared done
+
+For milestones that depend on `TPC-C` or `TPC-H` benchmark evidence, the acceptance section must also answer:
+
+- was the client-side HammerDB benchmark standard used?
+- if not, why was a deviation necessary?
+- are the db9 and PostgreSQL metric sources still apples-to-apples?
 
 ## Special Notes For `M5` Shared Plan Cache
 

@@ -53,7 +53,7 @@
 - Every optimization milestone must add or update a dedicated design document under `docs/design/` that explains how the optimization works, what scope it changes, what assumptions it relies on, and how it is rolled out and rolled back.
 - Any optimization-introduced parameter, flag, GUC, environment variable, DDL option, or `cloud-storage-engine` runtime knob must be documented in `docs/performance-optimization-parameters.md` in the same milestone.
 - If the new parameter is an operator-facing runtime input for `db9-server`, the same change must also update `docs/sot/ops-config.md` as the authoritative registry.
-- Every optimization milestone must prove compatibility with all functions, expressions, and operators that are already supported for DB9 Cop pushdown. The user-facing pushdown support inventory is owned by the dedicated pushdown feature PR, and the planner or runtime implementation remains the final source of truth for what is supported.
+- Every optimization milestone must prove compatibility with all functions, expressions, and operators that are already supported for DB9 Cop pushdown. The baseline user-facing reference is `docs/sql/functions/list-of-expressions-for-pushdown.md`, and the planner or runtime implementation remains the final source of truth for what is supported.
 - Baseline milestone `M1` defines the benchmark harness and observability baseline rather than shipping a standalone optimization feature.
 - Every feature milestone `M0` and `M2` to `M8` must include at least one real scenario benchmark gate against local PostgreSQL 18.3.
 - A milestone is not done until both `Architect-*` and `CI-*` backlogs are closed.
@@ -132,6 +132,28 @@
 - Comparison to local `PostgreSQL 18.3` is a mandatory reference line. Beating PostgreSQL is not required, but any large gap must include a short root-cause explanation and the next bottleneck to address.
 - All benchmark runs must include workload description, hardware description, dataset generator, server settings, query text, run count, warmup policy, and raw output attachment.
 
+### HammerDB Client-Side Benchmark Standard
+
+For `M2` to `M8`, when the real-scenario benchmark shape is `TPC-C` or `TPC-H`, the default benchmark tool must be the **client-side HammerDB variant** that is compatible with both `db9` and local `PostgreSQL 18.3`.
+
+This standard exists for one reason: on the current db9 path, server-side PostgreSQL-derived transaction counters can be missing, stubbed, or intentionally compatibility-shimmed. Therefore:
+
+- the formal benchmark result must not depend on `pg_stat_database` or any db9-only performance view as the primary metric source
+- the benchmark tool must emit client-side `NOPM` / `TPM` from the same HammerDB transaction-counting logic on both db9 and PostgreSQL
+- the benchmark artifacts must keep the same run shape on both sides: warehouses, duration, threads, `pg_storedprocs` mode, and workload driver
+- every formal comparison bundle must include:
+  - the `CLIENT SIDE RESULT : ...` line
+  - the final `TEST RESULT : ...` line
+  - prepare/readback artifacts
+  - post-run readback artifacts
+
+For the current optimization program, the intended usage is:
+
+- `TPC-C`: use the client-side HammerDB PostgreSQL lane with `pg_storedprocs=false` when running the db9-compatible path
+- `TPC-H`: use the same client-side-metrics policy and artifact shape even if the query mix differs from TPC-C
+
+Until a later design explicitly replaces this standard, **M2 to M8 TPC-C/TPC-H performance gates should treat the client-side HammerDB variant as the authoritative comparison tool**.
+
 ## Backlog Template
 
 Use the following card structure for every assigned task:
@@ -169,7 +191,7 @@ Use the following card structure for every assigned task:
 - keep pushdown eligibility signature-specific and operator-form-specific; unsupported cases must remain local
 - preserve PostgreSQL-visible semantics, SQLSTATE surfaces, null handling, coercion behavior, and transaction visibility
 - keep `cloud-storage-engine` changes scoped to the DB9 extension path and do not broaden TiDB/TiKV interfaces
-- update the pushdown support inventory in the dedicated pushdown feature PR and keep this execution plan aligned as the supported surface changes
+- update `docs/sql/functions/list-of-expressions-for-pushdown.md` and this execution plan as the supported surface changes
 - define at least one `100k+` row real scenario benchmark for the newly pushed function or operator shapes and compare `db9 before`, `db9 after`, and local `PostgreSQL 18.3`
 - record the second-batch PR links and scope boundaries once they are opened
 - `Deliverables`:
@@ -236,6 +258,7 @@ Use the following card structure for every assigned task:
 - one benchmark harness or script inventory
 - baseline metrics report
 - milestone-to-scenario benchmark matrix
+- benchmark tooling standard for TPC-C/TPC-H, including the client-side HammerDB requirement for M2 to M8
 - `Positive Acceptance`:
 - all future milestones have a stable contract and measurable baseline
 - `Negative Acceptance`:
@@ -264,6 +287,7 @@ Use the following card structure for every assigned task:
 - benchmark seed and dataset note
 - PostgreSQL 18.3 comparison harness note
 - pushdown compatibility matrix and command inventory
+- client-side HammerDB command inventory for TPC-C/TPC-H comparison runs where db9 compatibility paths are used
 - `Positive Acceptance`:
 - each later milestone can reuse the same gate package with milestone-specific additions
 - `Negative Acceptance`:
