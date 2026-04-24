@@ -565,6 +565,24 @@ fn validate_connect_key_introspection(
     Ok(())
 }
 
+fn jwt_issuers() -> Vec<String> {
+    let Some(raw) = config::env_string("DB9_AUTH_ISSUERS") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let owned = trimmed.to_string();
+        if !out.contains(&owned) {
+            out.push(owned);
+        }
+    }
+    out
+}
+
 pub(crate) async fn verify_jwt_connect_token(
     token: &str,
     expected_keyspace: &str,
@@ -574,6 +592,7 @@ pub(crate) async fn verify_jwt_connect_token(
         tenant_id_from_keyspace(expected_keyspace).ok_or(Db9AuthError::MissingTenantInUsername)?;
     let key = jwt_decoding_key(token).await?;
 
+    let issuers = jwt_issuers();
     let issuer = config::env_string("DB9_AUTH_ISSUER");
     let audience =
         config::env_string("DB9_AUTH_AUDIENCE").unwrap_or_else(|| DEFAULT_AUDIENCE.to_string());
@@ -583,7 +602,9 @@ pub(crate) async fn verify_jwt_connect_token(
         Validation::new(algorithms.first().copied().unwrap_or(DEFAULT_JWT_ALGORITHM));
     validation.algorithms = algorithms;
     validation.set_audience(&[audience]);
-    if let Some(iss) = issuer.as_deref() {
+    if !issuers.is_empty() {
+        validation.set_issuer(&issuers);
+    } else if let Some(iss) = issuer.as_deref() {
         validation.set_issuer(&[iss]);
     }
 
@@ -1387,6 +1408,139 @@ JwIDAQAB
             all_claims["nullable"].is_null(),
             "full claims blob should preserve explicit null claims"
         );
+    }
+
+    fn encode_token_with_issuer(iss: &'static str) -> String {
+        let exp = (chrono::Utc::now().timestamp() + 60) as usize;
+        let claims = Claims {
+            iss,
+            aud: "db9-server",
+            tid: "t1",
+            usr: "admin",
+            sub: "auth0|admin-user",
+            email_verified: true,
+            roles: vec!["admin"],
+            nullable: None,
+            exp,
+        };
+        encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn jwt_issuers_parses_csv_trims_and_dedupes() {
+        let _guard = test_lock().lock();
+        let _k = set_env(
+            "DB9_AUTH_ISSUERS",
+            " https://a.example , ,https://b.example,https://a.example ",
+        );
+        assert_eq!(
+            jwt_issuers(),
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn jwt_issuers_empty_when_unset() {
+        let _guard = test_lock().lock();
+        std::env::remove_var("DB9_AUTH_ISSUERS");
+        assert!(jwt_issuers().is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_plural_issuers_first_accepted() {
+        let _guard = test_lock().lock();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        let _k2 = set_env(
+            "DB9_AUTH_ISSUERS",
+            "https://auth9.example,https://legacy.example",
+        );
+        std::env::remove_var("DB9_AUTH_ISSUER");
+
+        let token = encode_token_with_issuer("https://auth9.example");
+        verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_plural_issuers_second_accepted() {
+        let _guard = test_lock().lock();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        let _k2 = set_env(
+            "DB9_AUTH_ISSUERS",
+            "https://auth9.example,https://legacy.example",
+        );
+        std::env::remove_var("DB9_AUTH_ISSUER");
+
+        let token = encode_token_with_issuer("https://legacy.example");
+        verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_plural_issuers_unlisted_rejected() {
+        let _guard = test_lock().lock();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        let _k2 = set_env(
+            "DB9_AUTH_ISSUERS",
+            "https://auth9.example,https://legacy.example",
+        );
+        std::env::remove_var("DB9_AUTH_ISSUER");
+
+        let token = encode_token_with_issuer("https://other.example");
+        let err = verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Db9AuthError::InvalidJwt { .. }),
+            "non-listed issuer must be rejected, got {err:?}"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_singular_issuer_fallback() {
+        let _guard = test_lock().lock();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        std::env::remove_var("DB9_AUTH_ISSUERS");
+        let _k2 = set_env("DB9_AUTH_ISSUER", "https://issuer.example");
+
+        let good = encode_token_with_issuer("https://issuer.example");
+        verify_jwt_connect_token(&good, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
+
+        let bad = encode_token_with_issuer("https://other.example");
+        let err = verify_jwt_connect_token(&bad, "db9_tenant_t1", "admin")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Db9AuthError::InvalidJwt { .. }));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_jwt_connect_token_no_issuer_env_accepts_any_iss() {
+        let _guard = test_lock().lock();
+        let _k1 = set_env("DB9_AUTH_JWT_PUBLIC_KEY", TEST_RSA_PUBLIC_KEY);
+        std::env::remove_var("DB9_AUTH_ISSUERS");
+        std::env::remove_var("DB9_AUTH_ISSUER");
+
+        let token = encode_token_with_issuer("https://whatever.example");
+        verify_jwt_connect_token(&token, "db9_tenant_t1", "admin")
+            .await
+            .unwrap();
     }
 
     #[allow(clippy::await_holding_lock)]

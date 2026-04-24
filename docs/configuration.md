@@ -19,7 +19,8 @@ This document is a convenience overview. The authoritative list of config keys +
 | `DB9_AUTH_JWKS_URL` | (unset) | JWT verification via remote JWKS (preferred) |
 | `DB9_AUTH_JWT_PUBLIC_KEY` | (unset) | JWT verification via RSA public key (PEM) |
 | `DB9_AUTH_JWT_ALGORITHM` | `RS256` | Allowed JWT algorithms (comma-separated). Default: `RS256`. |
-| `DB9_AUTH_ISSUER` | (unset) | Optional JWT issuer constraint |
+| `DB9_AUTH_ISSUER` | (unset) | Optional JWT issuer constraint (single value; used as fallback when `DB9_AUTH_ISSUERS` is unset) |
+| `DB9_AUTH_ISSUERS` | (unset) | Optional JWT issuer constraint accepting multiple values (comma-separated, e.g. `https://auth9.example,https://legacy.example`). When set, overrides `DB9_AUTH_ISSUER`. |
 | `DB9_AUTH_AUDIENCE` | `db9-server` | JWT audience constraint |
 | `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | (unset) | Connect-key introspection endpoint URL |
 | `DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY` | (unset) | Optional `X-API-Key` header for connect-key introspection |
