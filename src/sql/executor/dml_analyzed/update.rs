@@ -168,7 +168,10 @@ impl Executor {
         // concurrency. Re-reading under `batch_get_for_update` closes that
         // gap and gives us the latest committed row image in deterministic PK
         // order.
-        if !rows.is_empty() {
+        let txn_dirty_tables = crate::session_context::current_txn_dirty_table_ids();
+        let table_dirty_in_txn = txn_dirty_tables.contains(&schema.table_id);
+
+        if !rows.is_empty() && !table_dirty_in_txn {
             let pk_list: Vec<Vec<Value>> = rows.iter().map(|r| schema.get_pk_values(r)).collect();
             rows = self
                 .store()
@@ -181,6 +184,7 @@ impl Executor {
                     qctx.lock_timeout,
                 )
                 .await?;
+            rows = fill_fetched_rows(rows, &schema)?;
             append_ctid_to_rows(&mut rows);
         }
 
