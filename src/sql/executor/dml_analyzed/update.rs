@@ -169,7 +169,9 @@ impl Executor {
         // gap and gives us the latest committed row image in deterministic PK
         // order.
         let txn_dirty_tables = crate::session_context::current_txn_dirty_table_ids();
-        let table_dirty_in_txn = txn_dirty_tables.contains(&schema.table_id);
+        let statement_dirty_tables = crate::session_context::current_statement_dirty_table_ids();
+        let table_dirty_in_txn = txn_dirty_tables.contains(&schema.table_id)
+            || statement_dirty_tables.contains(&schema.table_id);
 
         if !rows.is_empty() && !table_dirty_in_txn {
             let pk_list: Vec<Vec<Value>> = rows.iter().map(|r| schema.get_pk_values(r)).collect();

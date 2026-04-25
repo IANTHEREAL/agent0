@@ -997,30 +997,41 @@ impl TikvStore {
             tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await)
                 .map_err(|e| anyhow!(e))
         };
-        match lock_timeout {
+        let pairs = match lock_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, lock_fetch).await {
-                Ok(result) => {
-                    result?;
-                }
+                Ok(result) => result?,
                 Err(_elapsed) => return Err(SqlError::LockTimeout.into()),
             },
-            None => {
-                lock_fetch.await?;
-            }
+            None => lock_fetch.await?,
         };
         // For clean tables (the caller skips this path once the table has
-        // already been dirtied in the current transaction), use the values
-        // returned by `batch_get_for_update` directly. In pessimistic mode
-        // this does not follow the transaction snapshot: it reads the latest
-        // committed row image under lock, which is exactly what UPDATE needs
-        // to avoid stale read-modify-write lost updates under concurrency.
-        let pairs = tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await)
-            .map_err(|e| anyhow!(e))?;
+        // already been dirtied in the current transaction), prefer the latest
+        // committed row image returned under lock. But rows inserted earlier in
+        // this same transaction are not yet committed and therefore absent from
+        // `batch_get_for_update`; fill only those missing keys from the txn
+        // buffer so intra-function read-your-own-writes still works.
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 
         for pair in pairs {
             let tikv_client::KvPair(key, value) = pair;
             by_key.insert(key, value);
+        }
+
+        let missing_keys: Vec<Vec<u8>> = data_keys
+            .iter()
+            .filter(|key| {
+                let key_ref: &Key = (*key).into();
+                !by_key.contains_key(key_ref)
+            })
+            .cloned()
+            .collect();
+        if !missing_keys.is_empty() {
+            let buffered_pairs =
+                tikv_op!(txn.batch_get(missing_keys).await).map_err(|e| anyhow!(e))?;
+            for pair in buffered_pairs {
+                let tikv_client::KvPair(key, value) = pair;
+                by_key.insert(key, value);
+            }
         }
 
         for key in data_keys {
