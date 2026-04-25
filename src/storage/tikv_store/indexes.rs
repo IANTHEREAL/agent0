@@ -984,17 +984,32 @@ impl TikvStore {
         lock_timeout: Option<std::time::Duration>,
     ) -> Result<()> {
         kv_stats::record_batch_get_keys(data_keys.len());
-        let fetch = async {
+        let lock_fetch = async {
             tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await)
                 .map_err(|e| anyhow!(e))
         };
-        let pairs = match lock_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, fetch).await {
-                Ok(result) => result?,
+        match lock_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, lock_fetch).await {
+                Ok(result) => {
+                    result?;
+                }
                 Err(_elapsed) => return Err(SqlError::LockTimeout.into()),
             },
-            None => fetch.await?,
+            None => {
+                lock_fetch.await?;
+            }
         };
+
+        // `batch_get_for_update` locks rows against concurrent writers, but in
+        // pessimistic mode it bypasses the transaction's local write buffer.
+        // UPDATE execution must compute new values from the txn-visible row
+        // image, not just the latest committed value, otherwise we regress
+        // same-transaction sequences such as INSERT ...; UPDATE ... and
+        // PL/pgSQL `RETURNING ... INTO` chains. Re-read through `batch_get`
+        // after the lock step so uncommitted writes from this transaction
+        // overlay the committed row image.
+        let pairs =
+            tikv_op!(txn.batch_get(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 
         for pair in pairs {
