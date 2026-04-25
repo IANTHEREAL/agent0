@@ -906,6 +906,50 @@ impl TikvStore {
         Ok(rows)
     }
 
+    /// Batch get rows by PKs using TiKV's pessimistic read+lock path.
+    ///
+    /// Unlike `batch_get_rows`, this uses `batch_get_for_update` so the caller
+    /// sees the latest committed row image while acquiring the lock in the same
+    /// round-trip. This closes the classic TOCTOU gap of:
+    ///   1. snapshot read old row
+    ///   2. later acquire lock
+    ///   3. still compute new value from stale row
+    pub async fn batch_get_rows_for_update(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        pks: Vec<Vec<Value>>,
+        _schema: &TableSchema,
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<Row>> {
+        let mut rows = Vec::with_capacity(pks.len());
+        let mut data_keys: Vec<Vec<u8>> = Vec::with_capacity(BATCH_GET_CHUNK_SIZE);
+
+        for pk in &pks {
+            let row_key = encode_pk_values(pk);
+            data_keys.push(self.key(&encode_data_key_v2(db_id, table_id, &row_key)));
+
+            if data_keys.len() >= BATCH_GET_CHUNK_SIZE {
+                self.batch_get_rows_by_data_keys_for_update(
+                    txn,
+                    &data_keys,
+                    &mut rows,
+                    lock_timeout,
+                )
+                .await?;
+                data_keys.clear();
+            }
+        }
+
+        if !data_keys.is_empty() {
+            self.batch_get_rows_by_data_keys_for_update(txn, &data_keys, &mut rows, lock_timeout)
+                .await?;
+        }
+
+        Ok(rows)
+    }
+
     async fn batch_get_rows_by_data_keys(
         &self,
         txn: &mut Transaction,
@@ -915,6 +959,42 @@ impl TikvStore {
         kv_stats::record_batch_get_keys(data_keys.len());
         let pairs =
             tikv_op!(txn.batch_get(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
+        let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
+
+        for pair in pairs {
+            let tikv_client::KvPair(key, value) = pair;
+            by_key.insert(key, value);
+        }
+
+        for key in data_keys {
+            let key_ref: &Key = key.into();
+            if let Some(val) = by_key.get(key_ref) {
+                out.push(deserialize_row(val)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn batch_get_rows_by_data_keys_for_update(
+        &self,
+        txn: &mut Transaction,
+        data_keys: &[Vec<u8>],
+        out: &mut Vec<Row>,
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        kv_stats::record_batch_get_keys(data_keys.len());
+        let fetch = async {
+            tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await)
+                .map_err(|e| anyhow!(e))
+        };
+        let pairs = match lock_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, fetch).await {
+                Ok(result) => result?,
+                Err(_elapsed) => return Err(SqlError::LockTimeout.into()),
+            },
+            None => fetch.await?,
+        };
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 
         for pair in pairs {
