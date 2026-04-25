@@ -1008,12 +1008,14 @@ impl TikvStore {
                 lock_fetch.await?;
             }
         };
-        // `batch_get_for_update` acquires the pessimistic lock using the
-        // latest committed row image, but it bypasses the transaction-local
-        // buffer. Re-read through plain `batch_get` so same-transaction writes
-        // remain visible while still preserving the lock acquisition step above.
+        // For clean tables (the caller skips this path once the table has
+        // already been dirtied in the current transaction), use the values
+        // returned by `batch_get_for_update` directly. In pessimistic mode
+        // this does not follow the transaction snapshot: it reads the latest
+        // committed row image under lock, which is exactly what UPDATE needs
+        // to avoid stale read-modify-write lost updates under concurrency.
         let pairs =
-            tikv_op!(txn.batch_get(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
+            tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 
         for pair in pairs {
