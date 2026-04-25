@@ -932,15 +932,27 @@ impl TikvStore {
             data_keys.push(self.key(&encode_data_key_v2(db_id, table_id, &row_key)));
 
             if data_keys.len() >= BATCH_GET_CHUNK_SIZE {
-                self.batch_get_rows_by_data_keys_for_update(txn, &data_keys, &mut rows, schema, lock_timeout)
+                self.batch_get_rows_by_data_keys_for_update(
+                    txn,
+                    &data_keys,
+                    &mut rows,
+                    schema,
+                    lock_timeout,
+                )
                 .await?;
                 data_keys.clear();
             }
         }
 
         if !data_keys.is_empty() {
-            self.batch_get_rows_by_data_keys_for_update(txn, &data_keys, &mut rows, schema, lock_timeout)
-                .await?;
+            self.batch_get_rows_by_data_keys_for_update(
+                txn,
+                &data_keys,
+                &mut rows,
+                schema,
+                lock_timeout,
+            )
+            .await?;
         }
 
         Ok(rows)
