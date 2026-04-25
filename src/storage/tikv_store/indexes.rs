@@ -1014,8 +1014,8 @@ impl TikvStore {
         // this does not follow the transaction snapshot: it reads the latest
         // committed row image under lock, which is exactly what UPDATE needs
         // to avoid stale read-modify-write lost updates under concurrency.
-        let pairs =
-            tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
+        let pairs = tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await)
+            .map_err(|e| anyhow!(e))?;
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 
         for pair in pairs {
