@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::sql::projection::fill_row_defaults;
 use crate::storage::backpressure::tikv_op;
 use crate::txn::configured_key_size_limit;
 
@@ -920,7 +921,7 @@ impl TikvStore {
         db_id: u64,
         table_id: u64,
         pks: Vec<Vec<Value>>,
-        _schema: &TableSchema,
+        schema: &TableSchema,
         lock_timeout: Option<std::time::Duration>,
     ) -> Result<Vec<Row>> {
         let mut rows = Vec::with_capacity(pks.len());
@@ -931,19 +932,14 @@ impl TikvStore {
             data_keys.push(self.key(&encode_data_key_v2(db_id, table_id, &row_key)));
 
             if data_keys.len() >= BATCH_GET_CHUNK_SIZE {
-                self.batch_get_rows_by_data_keys_for_update(
-                    txn,
-                    &data_keys,
-                    &mut rows,
-                    lock_timeout,
-                )
+                self.batch_get_rows_by_data_keys_for_update(txn, &data_keys, &mut rows, schema, lock_timeout)
                 .await?;
                 data_keys.clear();
             }
         }
 
         if !data_keys.is_empty() {
-            self.batch_get_rows_by_data_keys_for_update(txn, &data_keys, &mut rows, lock_timeout)
+            self.batch_get_rows_by_data_keys_for_update(txn, &data_keys, &mut rows, schema, lock_timeout)
                 .await?;
         }
 
@@ -981,6 +977,7 @@ impl TikvStore {
         txn: &mut Transaction,
         data_keys: &[Vec<u8>],
         out: &mut Vec<Row>,
+        schema: &TableSchema,
         lock_timeout: Option<std::time::Duration>,
     ) -> Result<()> {
         kv_stats::record_batch_get_keys(data_keys.len());
@@ -999,15 +996,10 @@ impl TikvStore {
                 lock_fetch.await?;
             }
         };
-
-        // `batch_get_for_update` locks rows against concurrent writers, but in
-        // pessimistic mode it bypasses the transaction's local write buffer.
-        // UPDATE execution must compute new values from the txn-visible row
-        // image, not just the latest committed value, otherwise we regress
-        // same-transaction sequences such as INSERT ...; UPDATE ... and
-        // PL/pgSQL `RETURNING ... INTO` chains. Re-read through `batch_get`
-        // after the lock step so uncommitted writes from this transaction
-        // overlay the committed row image.
+        // `batch_get_for_update` acquires the pessimistic lock using the
+        // latest committed row image, but it bypasses the transaction-local
+        // buffer. Re-read through plain `batch_get` so same-transaction writes
+        // remain visible while still preserving the lock acquisition step above.
         let pairs =
             tikv_op!(txn.batch_get(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
@@ -1020,7 +1012,9 @@ impl TikvStore {
         for key in data_keys {
             let key_ref: &Key = key.into();
             if let Some(val) = by_key.get(key_ref) {
-                out.push(deserialize_row(val)?);
+                let mut row = deserialize_row(val)?;
+                fill_row_defaults(&mut row, schema)?;
+                out.push(row);
             }
         }
 
