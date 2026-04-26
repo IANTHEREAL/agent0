@@ -948,28 +948,29 @@ impl Executor {
 
     /// Attempt point-get fetch when WHERE targets PK or a unique index.
     ///
-    /// Supports three strict predicate shapes:
-    /// 1. `pk = const` — single/composite PK equality
+    /// Supports three predicate shapes:
+    /// 1. AND-conjuncts containing `pk = const` — single/composite PK equality,
+    ///    with additional residual predicates evaluated after fetch
     /// 2. `pk IN (c1, c2, ...)` — single-column PK in-list (all constants)
-    /// 3. AND-connected `col = const` covering all columns of a UNIQUE index
+    /// 3. AND-conjuncts covering all columns of a UNIQUE index
     ///
     /// Returns `Some(rows)` when the predicate qualifies for fast fetch,
     /// `None` to fall back to full table scan.
-    async fn try_pk_fast_fetch(
+    pub(crate) async fn try_pk_fast_fetch(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         schema: &TableSchema,
         where_expr: &TypedExpr,
     ) -> Result<Option<Vec<Row>>> {
-        // --- Path A: pure AND-tree of col = const ---
+        // --- Path A: AND-tree with usable col = const conjuncts ---
         // Keyed by column_index (not name) to avoid case-folding bugs
         // with quoted identifiers (e.g. "A" vs "a").
         let mut eq_map: HashMap<usize, Value> = HashMap::new();
-        if collect_eq_by_col_index(where_expr, &mut eq_map).is_some() {
+        if collect_conjunctive_eq_by_col_index(where_expr, &mut eq_map).is_some() {
             // NULL constants disable fast path (col = NULL is UNKNOWN).
             if eq_map.values().any(|v| matches!(v, Value::Null)) {
-                return Ok(None);
+                return Ok(Some(vec![]));
             }
 
             // Check if all PK columns are covered → single PK point-get.
@@ -982,6 +983,18 @@ impl Executor {
                 let rows = self
                     .store()
                     .batch_get_rows(txn, db_id, schema.table_id, vec![pk_values], schema)
+                    .await?;
+                return Ok(Some(fill_fetched_rows(rows, schema)?));
+            }
+
+            // Check if a leading PK prefix is covered. This avoids the
+            // scan_and_fill fallback for composite-PK predicates such as
+            // TPC-C delivery's order_line update:
+            // `(ol_w_id, ol_d_id, ol_o_id) = (...)`, with ol_number omitted.
+            if let Some(pk_prefix_values) = pk_prefix_values_from_eq_map(schema, &eq_map) {
+                let rows = self
+                    .store()
+                    .scan_rows_by_pk_prefix(txn, db_id, schema.table_id, &pk_prefix_values, None)
                     .await?;
                 return Ok(Some(fill_fetched_rows(rows, schema)?));
             }
@@ -1038,7 +1051,9 @@ impl Executor {
             }
 
             // Equalities don't cover PK or any qualifying unique index.
-            return Ok(None);
+            if !eq_map.is_empty() {
+                return Ok(None);
+            }
         }
 
         // --- Path B: pk IN (c1, c2, ...) for single-column PK ---
@@ -1097,7 +1112,32 @@ impl Executor {
     }
 }
 
-/// Extract a conjunction of `col = const` predicates keyed by
+/// Return equality values for a non-empty, non-complete leading primary-key
+/// prefix. Complete PK predicates are handled by point-get before this helper.
+fn pk_prefix_values_from_eq_map(
+    schema: &TableSchema,
+    eq_map: &HashMap<usize, Value>,
+) -> Option<Vec<Value>> {
+    if schema.pk_indices.len() < 2 {
+        return None;
+    }
+
+    let mut values = Vec::new();
+    for pk_idx in &schema.pk_indices {
+        match eq_map.get(pk_idx) {
+            Some(value) => values.push(value.clone()),
+            None => break,
+        }
+    }
+
+    if values.is_empty() || values.len() == schema.pk_indices.len() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+/// Extract top-level AND-conjunct `col = const` predicates keyed by
 /// `column_index` (from `ColumnRef`).
 ///
 /// Unlike `collect_typed_eq_predicates` (which keys by lowercased name),
@@ -1105,16 +1145,24 @@ impl Executor {
 /// `"A"` and `"a"` are distinct in PostgreSQL but would collide under
 /// `to_lowercase()`).
 ///
-/// Returns `None` if the expression is not a pure AND tree of equalities,
-/// or if the same column index appears with conflicting values.
-fn collect_eq_by_col_index(expr: &TypedExpr, out: &mut HashMap<usize, Value>) -> Option<()> {
+/// Non-equality conjuncts are left as residual filters and evaluated after
+/// fetch. This allows `UPDATE ... WHERE pk = ? AND old_col IS NOT DISTINCT
+/// FROM ?` to point-fetch and lock only the target PK row while preserving the
+/// original compare-and-swap predicate semantics.
+///
+/// Returns `None` if the same column index appears with conflicting equality
+/// values.
+fn collect_conjunctive_eq_by_col_index(
+    expr: &TypedExpr,
+    out: &mut HashMap<usize, Value>,
+) -> Option<()> {
     use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
 
     match &expr.kind {
         TypedExprKind::BinaryOp { left, op, right } => match op {
             TypedBinaryOp::And => {
-                collect_eq_by_col_index(left, out)?;
-                collect_eq_by_col_index(right, out)?;
+                collect_conjunctive_eq_by_col_index(left, out)?;
+                collect_conjunctive_eq_by_col_index(right, out)?;
                 Some(())
             }
             TypedBinaryOp::Eq => {
@@ -1144,9 +1192,9 @@ fn collect_eq_by_col_index(expr: &TypedExpr, out: &mut HashMap<usize, Value>) ->
                 out.insert(col_idx, val);
                 Some(())
             }
-            _ => None,
+            _ => Some(()),
         },
-        _ => None,
+        _ => Some(()),
     }
 }
 
@@ -1160,4 +1208,125 @@ fn fill_fetched_rows(rows: Vec<Row>, schema: &TableSchema) -> Result<Vec<Row>> {
         filled.push(row);
     }
     Ok(filled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ColumnDef;
+    use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
+
+    fn col(idx: usize, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: idx,
+                column_name: name.to_string(),
+            },
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn int(value: i32) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::Constant(Value::Int32(value)),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn bin(left: TypedExpr, op: TypedBinaryOp, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+        }
+    }
+
+    fn composite_pk_schema() -> TableSchema {
+        TableSchema::new(
+            "order_line".to_string(),
+            1,
+            vec![
+                ColumnDef::new("ol_w_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("ol_d_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("ol_o_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("ol_number", DataType::Int32, false).primary_key(),
+            ],
+            vec![0, 1, 2, 3],
+        )
+    }
+
+    #[test]
+    fn collect_conjunctive_eq_keeps_pk_equalities_with_residual_cas_predicates() {
+        let pk_eq = bin(col(0, "id"), TypedBinaryOp::Eq, int(42));
+        let residual = TypedExpr {
+            kind: TypedExprKind::IsDistinctFrom {
+                left: Box::new(col(1, "old_balance")),
+                right: Box::new(int(7)),
+                negated: true,
+            },
+            data_type: DataType::Boolean,
+        };
+        let predicate = bin(pk_eq, TypedBinaryOp::And, residual);
+
+        let mut eq_map = HashMap::new();
+        collect_conjunctive_eq_by_col_index(&predicate, &mut eq_map).unwrap();
+
+        assert_eq!(eq_map.get(&0), Some(&Value::Int32(42)));
+        assert_eq!(eq_map.len(), 1);
+    }
+
+    #[test]
+    fn collect_conjunctive_eq_does_not_extract_from_or_residuals() {
+        let or_predicate = bin(
+            bin(col(0, "id"), TypedBinaryOp::Eq, int(42)),
+            TypedBinaryOp::Or,
+            bin(col(0, "id"), TypedBinaryOp::Eq, int(43)),
+        );
+        let predicate = bin(
+            bin(col(1, "tenant_id"), TypedBinaryOp::Eq, int(9)),
+            TypedBinaryOp::And,
+            or_predicate,
+        );
+
+        let mut eq_map = HashMap::new();
+        collect_conjunctive_eq_by_col_index(&predicate, &mut eq_map).unwrap();
+
+        assert_eq!(eq_map.get(&1), Some(&Value::Int32(9)));
+        assert!(!eq_map.contains_key(&0));
+    }
+
+    #[test]
+    fn pk_prefix_values_extracts_leading_non_complete_prefix() {
+        let schema = composite_pk_schema();
+        let mut eq_map = HashMap::new();
+        eq_map.insert(0, Value::Int32(1));
+        eq_map.insert(1, Value::Int32(2));
+        eq_map.insert(2, Value::Int32(3001));
+
+        assert_eq!(
+            pk_prefix_values_from_eq_map(&schema, &eq_map),
+            Some(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3001)])
+        );
+    }
+
+    #[test]
+    fn pk_prefix_values_rejects_non_leading_or_complete_pk() {
+        let schema = composite_pk_schema();
+
+        let mut non_leading = HashMap::new();
+        non_leading.insert(1, Value::Int32(2));
+        non_leading.insert(2, Value::Int32(3001));
+        assert!(pk_prefix_values_from_eq_map(&schema, &non_leading).is_none());
+
+        let mut complete = HashMap::new();
+        complete.insert(0, Value::Int32(1));
+        complete.insert(1, Value::Int32(2));
+        complete.insert(2, Value::Int32(3001));
+        complete.insert(3, Value::Int32(7));
+        assert!(pk_prefix_values_from_eq_map(&schema, &complete).is_none());
+    }
 }

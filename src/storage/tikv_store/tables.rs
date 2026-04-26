@@ -820,6 +820,49 @@ impl TikvStore {
         Ok(matching_rows)
     }
 
+    /// Scan rows whose physical primary-key encoding starts with `pk_prefix_values`.
+    ///
+    /// This is used for predicates that constrain a leading prefix of a
+    /// composite primary key, for example TPC-C `order_line` lookups by
+    /// `(ol_w_id, ol_d_id, ol_o_id)` where `ol_number` remains unconstrained.
+    pub async fn scan_rows_by_pk_prefix(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        pk_prefix_values: &[Value],
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>> {
+        let row_prefix = encode_pk_values(pk_prefix_values);
+        let raw_start = encode_data_key_v2(db_id, table_id, &row_prefix);
+        let raw_end = encode_prefix_end(&raw_start);
+        let end_key = self.key(&raw_end);
+        let mut start_key = self.key(&raw_start);
+        let total_limit = limit.unwrap_or(usize::MAX);
+        let mut rows = Vec::new();
+
+        loop {
+            if rows.len() >= total_limit {
+                break;
+            }
+            let remaining = total_limit - rows.len();
+            let batch_size = std::cmp::min(TABLE_SCAN_BATCH_SIZE as usize, remaining) as u32;
+            let (pairs, next_start) =
+                scan_one_page(txn, start_key.clone(), end_key.clone(), batch_size).await?;
+            let batch_len = pairs.len();
+            for pair in pairs {
+                rows.push(deserialize_row(pair.value())?);
+            }
+            kv_stats::record_table_scan_pairs(batch_len);
+            match next_start {
+                Some(k) => start_key = k,
+                None => break,
+            }
+        }
+
+        Ok(rows)
+    }
+
     /// Encode the TiKV data key for a row without performing any IO.
     /// Used by batch DELETE/UPDATE to collect keys before a single `batch_mutate`.
     pub fn encode_data_key_for_row(

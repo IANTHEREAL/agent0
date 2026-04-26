@@ -49,7 +49,21 @@ impl Executor {
 
         let qctx = QueryContext::from_task_locals();
         let folded_where = del.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
-        let mut rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
+        let mut rows = if del.using.is_empty() {
+            if let Some(ref where_expr) = folded_where {
+                match self
+                    .try_pk_fast_fetch(txn, db_id, &schema, where_expr)
+                    .await?
+                {
+                    Some(fetched) => fetched,
+                    None => self.scan_and_fill(txn, db_id, t, &schema).await?,
+                }
+            } else {
+                self.scan_and_fill(txn, db_id, t, &schema).await?
+            }
+        } else {
+            self.scan_and_fill(txn, db_id, t, &schema).await?
+        };
         append_ctid_to_rows(&mut rows);
         let mut cnt = 0;
         let mut ret_rows = Vec::new();

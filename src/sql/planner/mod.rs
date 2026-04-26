@@ -50,6 +50,14 @@ pub enum GinQual {
 #[allow(clippy::enum_variant_names)]
 pub enum ScanType {
     FullTableScan,
+    PrimaryKeyScan {
+        index_name: String,
+        values: Vec<Value>,
+    },
+    PrimaryKeyRangeScan {
+        index_name: String,
+        prefix_values: Vec<Value>,
+    },
     IndexScan {
         index_id: u64,
         index_name: String,

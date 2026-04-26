@@ -257,7 +257,9 @@ fn explain_width(phys: &crate::sql::optimizer::physical_plan::PhysicalPlan) -> u
 /// Extract the index name from a `ScanType`.
 fn extract_index_name(scan_type: &ScanType) -> String {
     match scan_type {
-        ScanType::IndexScan { index_name, .. }
+        ScanType::PrimaryKeyScan { index_name, .. }
+        | ScanType::PrimaryKeyRangeScan { index_name, .. }
+        | ScanType::IndexScan { index_name, .. }
         | ScanType::IndexRangeScan { index_name, .. }
         | ScanType::IndexBoundedRangeScan { index_name, .. }
         | ScanType::InListScan { index_name, .. }
@@ -327,8 +329,11 @@ fn format_db9_scan_access_detail(scan: &Db9CopScan) -> Option<String> {
     };
 
     match scan_type {
-        ScanType::IndexScan { values, .. } => {
+        ScanType::PrimaryKeyScan { values, .. } | ScanType::IndexScan { values, .. } => {
             Some(format!("point {}", format_db9_value_tuple(values)))
+        }
+        ScanType::PrimaryKeyRangeScan { prefix_values, .. } => {
+            Some(format!("prefix {}", format_db9_value_tuple(prefix_values)))
         }
         ScanType::IndexRangeScan { prefix_values, .. } => {
             Some(format!("prefix {}", format_db9_value_tuple(prefix_values)))

@@ -866,24 +866,22 @@ impl<PdC: PdClient> Transaction<PdC> {
                         .retry_multi_region(retry_options.region_backoff)
                         .merge(Collect)
                         .plan();
-                    plan.execute()
-                        .await
-                        .map(|r| {
-                            r.into_iter()
-                                .map(Into::into)
-                                .map(|KvPair(key, value)| {
-                                    KvPair(
-                                        repair_scan_result_key(
-                                            key,
-                                            &repair_start,
-                                            repair_end.as_ref(),
-                                            keyspace,
-                                        ),
-                                        value,
-                                    )
-                                })
-                                .collect()
-                        })
+                    plan.execute().await.map(|r| {
+                        r.into_iter()
+                            .map(Into::into)
+                            .map(|KvPair(key, value)| {
+                                KvPair(
+                                    repair_scan_result_key(
+                                        key,
+                                        &repair_start,
+                                        repair_end.as_ref(),
+                                        keyspace,
+                                    ),
+                                    value,
+                                )
+                            })
+                            .collect()
+                    })
                 },
             )
             .await
@@ -1695,12 +1693,7 @@ fn key_in_scan_bounds(key: &Key, start: &Key, end: Option<&Key>) -> bool {
     key >= start && end.map_or(true, |end_key| key < end_key)
 }
 
-fn repair_scan_result_key(
-    key: Key,
-    start: &Key,
-    end: Option<&Key>,
-    keyspace: Keyspace,
-) -> Key {
+fn repair_scan_result_key(key: Key, start: &Key, end: Option<&Key>, keyspace: Keyspace) -> Key {
     const SCAN_KEYSPACE_PREFIX_LEN: usize = 4;
 
     if matches!(keyspace, Keyspace::Disable) || key_in_scan_bounds(&key, start, end) {
@@ -1737,12 +1730,12 @@ mod tests {
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
     use crate::proto::kvrpcpb;
-    use crate::request::{EncodeKeyspace, KeyMode, Keyspace};
     use crate::proto::pdpb::Timestamp;
-    use crate::{BoundRange, Key};
+    use crate::request::{EncodeKeyspace, KeyMode, Keyspace};
     use crate::transaction::HeartbeatOption;
     use crate::Transaction;
     use crate::TransactionOptions;
+    use crate::{BoundRange, Key};
 
     use super::repair_scan_result_key;
 
@@ -1769,8 +1762,7 @@ mod tests {
 
         let encoded_key = Key::from("abc".to_owned()).encode_keyspace(keyspace, KeyMode::Txn);
 
-        let repaired =
-            repair_scan_result_key(encoded_key.clone(), &start, end.as_ref(), keyspace);
+        let repaired = repair_scan_result_key(encoded_key.clone(), &start, end.as_ref(), keyspace);
         assert_eq!(repaired, encoded_key);
     }
 

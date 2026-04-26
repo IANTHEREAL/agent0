@@ -272,6 +272,20 @@ fn summarize_db9_scan(scan: &Db9CopScan) -> String {
 fn summarize_db9_scan_type(scan_type: &ScanType) -> String {
     match scan_type {
         ScanType::FullTableScan => "full_table".to_string(),
+        ScanType::PrimaryKeyScan {
+            index_name, values, ..
+        } => {
+            format!("primary_key(name={}, values={})", index_name, values.len())
+        }
+        ScanType::PrimaryKeyRangeScan {
+            index_name,
+            prefix_values,
+            ..
+        } => format!(
+            "primary_key_prefix(name={}, prefix_values={})",
+            index_name,
+            prefix_values.len()
+        ),
         ScanType::IndexScan {
             index_name, values, ..
         } => {
@@ -398,6 +412,9 @@ fn build_scan_spec(scan: &Db9CopScan) -> Result<wire::Db9ScanSpec> {
         }),
         Db9CopScan::Index { scan_type } => {
             let (kind, index_id, index_name) = match scan_type {
+                ScanType::PrimaryKeyScan { .. } | ScanType::PrimaryKeyRangeScan { .. } => {
+                    return Err(anyhow!("DB9 cop runtime does not support primary-key scan"));
+                }
                 ScanType::IndexScan {
                     index_id,
                     index_name,
@@ -447,11 +464,20 @@ fn build_db9_request_ranges(
     scan: &Db9CopScan,
 ) -> Result<Vec<BoundRange>> {
     match scan {
+        Db9CopScan::Index {
+            scan_type: ScanType::PrimaryKeyRangeScan { .. },
+            ..
+        } => Err(anyhow!(
+            "PrimaryKeyRangeScan is not supported by DB9 coprocessor"
+        )),
         Db9CopScan::Seq => {
             let (start, end) = encode_table_data_range_v2(db_id, table_schema.table_id);
             Ok(vec![(start..end).into()])
         }
         Db9CopScan::Index { scan_type } => match scan_type {
+            ScanType::PrimaryKeyScan { .. } => {
+                Err(anyhow!("DB9 cop runtime does not support primary-key scan"))
+            }
             ScanType::IndexScan {
                 index_id, values, ..
             } => Ok(vec![index_exact_range(

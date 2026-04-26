@@ -55,6 +55,13 @@ fn choose_best_access_path_with_typed_filter(
         cost: estimated_table_rows as f64,
     };
 
+    if let Some((scan_type, cost)) = evaluate_primary_key(schema, predicates, estimated_table_rows)
+    {
+        if cost < best_path.cost {
+            best_path = AccessPath { scan_type, cost };
+        }
+    }
+
     for index in &schema.indexes {
         if !is_planner_usable_index(index) {
             continue;
@@ -103,6 +110,74 @@ fn choose_best_access_path_with_typed_filter(
     }
 
     best_path
+}
+
+fn primary_key_index_name(schema: &TableSchema) -> String {
+    schema.pk_constraint_name.clone().unwrap_or_else(|| {
+        let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+        format!("{}_pkey", table_name)
+    })
+}
+
+fn evaluate_primary_key(
+    schema: &TableSchema,
+    predicates: &[TypedPredicate],
+    estimated_table_rows: usize,
+) -> Option<(ScanType, f64)> {
+    if schema.pk_indices.is_empty() {
+        return None;
+    }
+
+    let eq_predicate_map: std::collections::HashMap<&str, &Value> = predicates
+        .iter()
+        .filter_map(|p| {
+            if let TypedPredicate::Comparison {
+                column,
+                op: CmpOp::Eq,
+                value,
+            } = p
+            {
+                Some((column.as_str(), value))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut values = Vec::with_capacity(schema.pk_indices.len());
+    for &col_idx in &schema.pk_indices {
+        let col = &schema.columns[col_idx].name;
+        let Some(val) = eq_predicate_map.get(col.as_str()) else {
+            break;
+        };
+        values.push(coerce_index_predicate_value(schema, col, val));
+    }
+
+    if values.is_empty() {
+        return None;
+    }
+
+    if values.len() < schema.pk_indices.len() {
+        let selectivity = CostModel::NON_UNIQUE_SELECTIVITY_BASE.powi(values.len() as i32);
+        let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+        let cost = index_scan_cost(estimated_rows, estimated_table_rows);
+        return Some((
+            ScanType::PrimaryKeyRangeScan {
+                index_name: primary_key_index_name(schema),
+                prefix_values: values,
+            },
+            cost,
+        ));
+    }
+
+    let cost = index_scan_cost(1, estimated_table_rows);
+    Some((
+        ScanType::PrimaryKeyScan {
+            index_name: primary_key_index_name(schema),
+            values,
+        },
+        cost,
+    ))
 }
 
 fn is_planner_usable_index(index: &IndexDef) -> bool {

@@ -135,6 +135,197 @@ impl PhysicalOperator for TableScanOperator {
     }
 }
 
+// ── PrimaryKeyScanOperator ───────────────────────────────────────
+
+#[derive(Debug)]
+pub struct PrimaryKeyScanOperator {
+    schema: TableSchema,
+    pk_values: Vec<Value>,
+    scan_limit: Option<usize>,
+    buffer: Vec<Row>,
+    position: usize,
+    opened: bool,
+}
+
+impl PrimaryKeyScanOperator {
+    pub fn new(schema: TableSchema, pk_values: Vec<Value>, scan_limit: Option<usize>) -> Self {
+        Self {
+            schema,
+            pk_values,
+            scan_limit,
+            buffer: Vec::new(),
+            position: 0,
+            opened: false,
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for PrimaryKeyScanOperator {
+    fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.position = 0;
+        self.opened = true;
+        self.buffer.clear();
+
+        if matches!(self.scan_limit, Some(0)) {
+            return Ok(());
+        }
+
+        let rows = ctx
+            .store
+            .batch_get_rows(
+                ctx.txn,
+                ctx.db_id,
+                self.schema.table_id,
+                vec![self.pk_values.clone()],
+                &self.schema,
+            )
+            .await?;
+
+        self.buffer = rows
+            .into_iter()
+            .map(|r| fill_row_defaults_scan(r, &self.schema))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(limit) = self.scan_limit {
+            self.buffer.truncate(limit);
+        }
+
+        Ok(())
+    }
+
+    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+        if !self.opened {
+            return Err(anyhow!("Operator not opened"));
+        }
+
+        if self.position < self.buffer.len() {
+            let row = self.buffer[self.position].clone();
+            self.position += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.buffer.clear();
+        self.opened = false;
+        Ok(())
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "PrimaryKeyScan"
+    }
+
+    #[cfg(test)]
+    fn explain_info(&self) -> Option<String> {
+        Some(format!("table={}", self.schema.name))
+    }
+}
+
+// ── PrimaryKeyRangeScanOperator ─────────────────────────────────
+
+#[derive(Debug)]
+pub struct PrimaryKeyRangeScanOperator {
+    schema: TableSchema,
+    pk_prefix_values: Vec<Value>,
+    scan_limit: Option<usize>,
+    buffer: Vec<Row>,
+    position: usize,
+    opened: bool,
+}
+
+impl PrimaryKeyRangeScanOperator {
+    pub fn new(
+        schema: TableSchema,
+        pk_prefix_values: Vec<Value>,
+        scan_limit: Option<usize>,
+    ) -> Self {
+        Self {
+            schema,
+            pk_prefix_values,
+            scan_limit,
+            buffer: Vec::new(),
+            position: 0,
+            opened: false,
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for PrimaryKeyRangeScanOperator {
+    fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.position = 0;
+        self.opened = true;
+        self.buffer.clear();
+
+        if matches!(self.scan_limit, Some(0)) {
+            return Ok(());
+        }
+
+        let rows = ctx
+            .store
+            .scan_rows_by_pk_prefix(
+                ctx.txn,
+                ctx.db_id,
+                self.schema.table_id,
+                &self.pk_prefix_values,
+                self.scan_limit,
+            )
+            .await?;
+
+        self.buffer = rows
+            .into_iter()
+            .map(|r| fill_row_defaults_scan(r, &self.schema))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(())
+    }
+
+    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+        if !self.opened {
+            return Err(anyhow!("Operator not opened"));
+        }
+
+        if self.position < self.buffer.len() {
+            let row = self.buffer[self.position].clone();
+            self.position += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.buffer.clear();
+        self.opened = false;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "PrimaryKeyRangeScan"
+    }
+
+    #[cfg(test)]
+    fn explain_info(&self) -> Option<String> {
+        Some(format!("table={}", self.schema.name))
+    }
+}
+
 // ── Index scan shared infrastructure ─────────────────────────────
 
 /// Shared state and methods for all index scan operators.
