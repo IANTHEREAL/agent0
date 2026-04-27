@@ -164,11 +164,7 @@ pub(super) fn coerce_index_predicate_value(
     col: &str,
     value: &Value,
 ) -> Value {
-    if let Some(col_def) = schema
-        .columns
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(col))
-    {
+    if let Some(col_def) = schema.columns.iter().find(|c| c.name == col) {
         crate::sql::types::cast::coerce_value_for_column(value.clone(), col_def)
             .unwrap_or_else(|_| value.clone())
     } else {

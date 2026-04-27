@@ -15,6 +15,7 @@ use crate::model::{build_predicate_conjunct_cache, IndexDef, TableSchema, Value}
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::worker::types::IndexState;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Choose the best B-tree access path for a typed filter expression.
 ///
@@ -128,26 +129,12 @@ fn evaluate_primary_key(
         return None;
     }
 
-    let eq_predicate_map: std::collections::HashMap<&str, &Value> = predicates
-        .iter()
-        .filter_map(|p| {
-            if let TypedPredicate::Comparison {
-                column,
-                op: CmpOp::Eq,
-                value,
-            } = p
-            {
-                Some((column.as_str(), value))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let eq_predicate_map = eq_predicates_by_column_index(schema, predicates);
 
     let mut values = Vec::with_capacity(schema.pk_indices.len());
     for &col_idx in &schema.pk_indices {
         let col = &schema.columns[col_idx].name;
-        let Some(val) = eq_predicate_map.get(col.as_str()) else {
+        let Some(val) = eq_predicate_map.get(&col_idx) else {
             break;
         };
         values.push(coerce_index_predicate_value(schema, col, val));
@@ -189,6 +176,52 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
     }
     let method = index.method.as_deref().unwrap_or("btree");
     method.eq_ignore_ascii_case("btree") || method.eq_ignore_ascii_case("gin")
+}
+
+fn predicate_matches_column(
+    schema: &TableSchema,
+    predicate_column: &str,
+    predicate_column_index: usize,
+    target_column_index: usize,
+) -> bool {
+    let Some(target_column) = schema.columns.get(target_column_index) else {
+        return false;
+    };
+
+    if schema.columns.get(predicate_column_index).is_some() {
+        return predicate_column_index == target_column_index
+            && target_column.name == predicate_column;
+    }
+
+    // Unit tests and a few synthetic optimizer paths may construct TypedExprs
+    // without analyzer-accurate column_index values. Only allow exact-name
+    // fallback when the index is invalid; a valid-but-mismatched index/name pair
+    // is ambiguous and must not drive an over-restrictive access path.
+    target_column.name == predicate_column
+}
+
+fn eq_predicates_by_column_index<'a>(
+    schema: &TableSchema,
+    predicates: &'a [TypedPredicate],
+) -> HashMap<usize, &'a Value> {
+    let mut out = HashMap::new();
+    for predicate in predicates {
+        if let TypedPredicate::Comparison {
+            column,
+            column_index,
+            op: CmpOp::Eq,
+            value,
+        } = predicate
+        {
+            for (target_column_index, _) in schema.columns.iter().enumerate() {
+                if predicate_matches_column(schema, column, *column_index, target_column_index) {
+                    out.entry(target_column_index).or_insert(value);
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Returns true if this index uses the GIN access method.
@@ -453,27 +486,19 @@ fn evaluate_index(
     estimated_table_rows: usize,
     table_stats: Option<&TableStatistics>,
 ) -> Option<(ScanType, f64)> {
-    // Build a map of column → constant value for Eq predicates.
-    let eq_predicate_map: std::collections::HashMap<&str, &Value> = predicates
+    let index_column_indices: Vec<usize> = index
+        .columns
         .iter()
-        .filter_map(|p| {
-            if let TypedPredicate::Comparison {
-                column,
-                op: CmpOp::Eq,
-                value,
-            } = p
-            {
-                Some((column.as_str(), value))
-            } else {
-                None
-            }
-        })
-        .collect();
+        .map(|column| schema.column_index(column))
+        .collect::<Option<Vec<_>>>()?;
+
+    // Build a map of column index → constant value for Eq predicates.
+    let eq_predicate_map = eq_predicates_by_column_index(schema, predicates);
 
     let mut prefix_values = Vec::new();
 
-    for col in &index.columns {
-        if let Some(val) = eq_predicate_map.get(col.as_str()) {
+    for (col, col_idx) in index.columns.iter().zip(index_column_indices.iter()) {
+        if let Some(val) = eq_predicate_map.get(col_idx) {
             prefix_values.push(coerce_index_predicate_value(schema, col, val));
         } else {
             break;
@@ -490,7 +515,7 @@ fn evaluate_index(
                 index_id: index.id,
                 index_name: index.name.clone(),
                 lookup_column: (index.columns.len() == 1 && index.expressions.is_empty())
-                    .then(|| index.columns[0].to_lowercase()),
+                    .then(|| index.columns[0].clone()),
                 values: prefix_values,
             },
             cost,
@@ -498,10 +523,18 @@ fn evaluate_index(
     }
 
     let next_col = index.columns.get(prefix_values.len())?;
+    let next_col_idx = index_column_indices[prefix_values.len()];
 
     if let Some(in_values) = predicates.iter().find_map(|p| {
-        if let TypedPredicate::InList { column, values } = p {
-            if column.eq_ignore_ascii_case(next_col) && !values.is_empty() {
+        if let TypedPredicate::InList {
+            column,
+            column_index,
+            values,
+        } = p
+        {
+            if predicate_matches_column(schema, column, *column_index, next_col_idx)
+                && !values.is_empty()
+            {
                 return Some(values);
             }
         }
@@ -529,7 +562,7 @@ fn evaluate_index(
             ScanType::InListScan {
                 index_id: index.id,
                 index_name: index.name.clone(),
-                lookup_column: Some(next_col.to_lowercase()),
+                lookup_column: Some(next_col.clone()),
                 column_values,
             },
             cost,
@@ -542,8 +575,14 @@ fn evaluate_index(
     let mut upper_inclusive = None;
     let mut upper_exclusive = None;
     for p in predicates {
-        if let TypedPredicate::Comparison { column, op, value } = p {
-            if column.eq_ignore_ascii_case(next_col) {
+        if let TypedPredicate::Comparison {
+            column,
+            column_index,
+            op,
+            value,
+        } = p
+        {
+            if predicate_matches_column(schema, column, *column_index, next_col_idx) {
                 match op {
                     CmpOp::Ge => lower_inclusive = lower_inclusive.or(Some(value)),
                     CmpOp::Gt => lower_exclusive = lower_exclusive.or(Some(value)),

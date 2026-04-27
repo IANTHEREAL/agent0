@@ -532,7 +532,7 @@ fn filter_matches_single_column_exact_lookup(
         return false;
     };
 
-    column_name.eq_ignore_ascii_case(lookup_column) && value == values[0]
+    column_name == lookup_column && value == values[0]
 }
 
 fn filter_matches_single_column_in_list_lookup(
@@ -547,7 +547,7 @@ fn filter_matches_single_column_in_list_lookup(
     else {
         return false;
     };
-    if !column_name.eq_ignore_ascii_case(lookup_column) {
+    if column_name != lookup_column {
         return false;
     }
 

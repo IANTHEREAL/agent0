@@ -11,7 +11,7 @@ fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::ColumnRef {
             scope_depth: 0,
-            column_index: 0,
+            column_index: usize::MAX,
             column_name: name.to_string(),
         },
         data_type: dt,

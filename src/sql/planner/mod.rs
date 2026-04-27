@@ -146,9 +146,14 @@ pub enum TypedPredicate {
     /// `column OP constant` where OP is a scalar comparison.
     Comparison {
         column: String,
+        column_index: usize,
         op: CmpOp,
         value: Value,
     },
     /// `column IN (v1, v2, ...)` — all list elements are constants.
-    InList { column: String, values: Vec<Value> },
+    InList {
+        column: String,
+        column_index: usize,
+        values: Vec<Value>,
+    },
 }

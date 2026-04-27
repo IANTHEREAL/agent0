@@ -294,15 +294,10 @@ fn typed_filter_is_exact_index_lookup(
     }
 
     for (i, col) in index.columns.iter().take(lookup_values.len()).enumerate() {
-        let key = col.to_lowercase();
-        let Some(pred_value) = predicates.get(&key) else {
+        let Some(pred_value) = predicates.get(col) else {
             return false;
         };
-        let coerced = if let Some(col_def) = schema
-            .columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(col))
-        {
+        let coerced = if let Some(col_def) = schema.columns.iter().find(|c| c.name == *col) {
             coerce_value_for_column(pred_value.clone(), col_def)
                 .unwrap_or_else(|_| pred_value.clone())
         } else {

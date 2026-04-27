@@ -973,54 +973,18 @@ impl Executor {
                 return Ok(Some(vec![]));
             }
 
-            // Check if all PK columns are covered → single PK point-get.
-            if schema.pk_indices.iter().all(|i| eq_map.contains_key(i)) {
-                let pk_values: Vec<Value> = schema
-                    .pk_indices
-                    .iter()
-                    .map(|i| eq_map[i].clone())
-                    .collect();
-                let rows = self
-                    .store()
-                    .batch_get_rows(txn, db_id, schema.table_id, vec![pk_values], schema)
-                    .await?;
-                return Ok(Some(fill_fetched_rows(rows, schema)?));
-            }
-
-            // Check if a leading PK prefix is covered. This avoids the
-            // scan_and_fill fallback for composite-PK predicates such as
-            // TPC-C delivery's order_line update:
-            // `(ol_w_id, ol_d_id, ol_o_id) = (...)`, with ol_number omitted.
-            if let Some(pk_prefix_values) = pk_prefix_values_from_eq_map(schema, &eq_map) {
-                let rows = self
-                    .store()
-                    .scan_rows_by_pk_prefix(txn, db_id, schema.table_id, &pk_prefix_values, None)
-                    .await?;
-                return Ok(Some(fill_fetched_rows(rows, schema)?));
-            }
-
-            // Check unique indexes (only Ready, pure-column, non-partial,
-            // non-expression indexes qualify).
-            for idx in &schema.indexes {
-                if !idx.unique
-                    || !matches!(idx.state, IndexState::Ready)
-                    || !idx.expressions.is_empty()
-                    || idx.predicate.is_some()
-                {
-                    continue;
+            match choose_fast_fetch_candidate(schema, &eq_map) {
+                Some(FastFetchCandidate::PrimaryKey(pk_values)) => {
+                    let rows = self
+                        .store()
+                        .batch_get_rows(txn, db_id, schema.table_id, vec![pk_values], schema)
+                        .await?;
+                    return Ok(Some(fill_fetched_rows(rows, schema)?));
                 }
-                // Resolve index column names to schema column indices.
-                let idx_col_indices: Vec<usize> = idx
-                    .columns
-                    .iter()
-                    .filter_map(|c| schema.column_index(c))
-                    .collect();
-                if idx_col_indices.len() != idx.columns.len() {
-                    continue; // unresolvable column — skip
-                }
-                if idx_col_indices.iter().all(|i| eq_map.contains_key(i)) {
-                    let idx_values: Vec<Value> =
-                        idx_col_indices.iter().map(|i| eq_map[i].clone()).collect();
+                Some(FastFetchCandidate::UniqueIndex {
+                    index_id,
+                    index_values,
+                }) => {
                     let pk_types: Vec<DataType> = schema
                         .pk_indices
                         .iter()
@@ -1032,8 +996,8 @@ impl Executor {
                             txn,
                             db_id,
                             schema.table_id,
-                            idx.id,
-                            &idx_values,
+                            index_id,
+                            &index_values,
                             true,
                             &pk_types,
                             None,
@@ -1048,6 +1012,20 @@ impl Executor {
                         .await?;
                     return Ok(Some(fill_fetched_rows(rows, schema)?));
                 }
+                Some(FastFetchCandidate::PrimaryKeyPrefix(pk_prefix_values)) => {
+                    let rows = self
+                        .store()
+                        .scan_rows_by_pk_prefix(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            &pk_prefix_values,
+                            None,
+                        )
+                        .await?;
+                    return Ok(Some(fill_fetched_rows(rows, schema)?));
+                }
+                None => {}
             }
 
             // Equalities don't cover PK or any qualifying unique index.
@@ -1110,6 +1088,73 @@ impl Executor {
 
         Ok(None)
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum FastFetchCandidate {
+    PrimaryKey(Vec<Value>),
+    UniqueIndex {
+        index_id: u64,
+        index_values: Vec<Value>,
+    },
+    PrimaryKeyPrefix(Vec<Value>),
+}
+
+fn choose_fast_fetch_candidate(
+    schema: &TableSchema,
+    eq_map: &HashMap<usize, Value>,
+) -> Option<FastFetchCandidate> {
+    if schema.pk_indices.iter().all(|i| eq_map.contains_key(i)) {
+        let pk_values = schema
+            .pk_indices
+            .iter()
+            .map(|i| eq_map[i].clone())
+            .collect();
+        return Some(FastFetchCandidate::PrimaryKey(pk_values));
+    }
+
+    if let Some((index_id, index_values)) = unique_index_values_from_eq_map(schema, eq_map) {
+        return Some(FastFetchCandidate::UniqueIndex {
+            index_id,
+            index_values,
+        });
+    }
+
+    pk_prefix_values_from_eq_map(schema, eq_map).map(FastFetchCandidate::PrimaryKeyPrefix)
+}
+
+/// Return values for a fully-covered unique index. This intentionally runs
+/// before PK-prefix range fetch so `tenant_id = ? AND email = ?` prefers the
+/// unique email point lookup over scanning every row in the tenant prefix.
+fn unique_index_values_from_eq_map(
+    schema: &TableSchema,
+    eq_map: &HashMap<usize, Value>,
+) -> Option<(u64, Vec<Value>)> {
+    for idx in &schema.indexes {
+        if !idx.unique
+            || !matches!(idx.state, IndexState::Ready)
+            || !idx.expressions.is_empty()
+            || idx.predicate.is_some()
+        {
+            continue;
+        }
+
+        let Some(idx_col_indices) = idx
+            .columns
+            .iter()
+            .map(|c| schema.column_index(c))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+
+        if idx_col_indices.iter().all(|i| eq_map.contains_key(i)) {
+            let idx_values = idx_col_indices.iter().map(|i| eq_map[i].clone()).collect();
+            return Some((idx.id, idx_values));
+        }
+    }
+
+    None
 }
 
 /// Return equality values for a non-empty, non-complete leading primary-key
@@ -1213,7 +1258,7 @@ fn fill_fetched_rows(rows: Vec<Row>, schema: &TableSchema) -> Result<Vec<Row>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ColumnDef;
+    use crate::model::{ColumnDef, IndexDef};
     use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
 
     fn col(idx: usize, name: &str) -> TypedExpr {
@@ -1257,6 +1302,35 @@ mod tests {
             ],
             vec![0, 1, 2, 3],
         )
+    }
+
+    fn tenant_user_schema_with_unique_email() -> TableSchema {
+        let mut schema = TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![
+                ColumnDef::new("tenant_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("email", DataType::Text, false),
+            ],
+            vec![0, 1],
+        );
+        schema.indexes = vec![IndexDef {
+            id: 77,
+            name: "users_email_key".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: Vec::new(),
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }];
+        schema
     }
 
     #[test]
@@ -1328,5 +1402,26 @@ mod tests {
         complete.insert(2, Value::Int32(3001));
         complete.insert(3, Value::Int32(7));
         assert!(pk_prefix_values_from_eq_map(&schema, &complete).is_none());
+    }
+
+    #[test]
+    fn fast_fetch_candidate_prefers_unique_point_get_over_pk_prefix_scan() {
+        let schema = tenant_user_schema_with_unique_email();
+        let mut eq_map = HashMap::new();
+        eq_map.insert(0, Value::Int32(42));
+        eq_map.insert(2, Value::Text("a@example.com".to_string()));
+
+        assert_eq!(
+            pk_prefix_values_from_eq_map(&schema, &eq_map),
+            Some(vec![Value::Int32(42)]),
+            "test setup should also qualify for a potentially large PK-prefix scan"
+        );
+        assert_eq!(
+            choose_fast_fetch_candidate(&schema, &eq_map),
+            Some(FastFetchCandidate::UniqueIndex {
+                index_id: 77,
+                index_values: vec![Value::Text("a@example.com".to_string())],
+            })
+        );
     }
 }

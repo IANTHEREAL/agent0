@@ -24,10 +24,14 @@ fn typed_constant(v: Value, dt: DataType) -> TypedExpr {
 }
 
 fn typed_column(name: &str, dt: DataType) -> TypedExpr {
+    typed_column_at(usize::MAX, name, dt)
+}
+
+fn typed_column_at(column_index: usize, name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::ColumnRef {
             scope_depth: 0,
-            column_index: 0,
+            column_index,
             column_name: name.to_string(),
         },
         data_type: dt,
@@ -1324,6 +1328,122 @@ fn test_primary_key_prefix_match_uses_primary_key_range_scan() {
         }
         other => panic!("expected PrimaryKeyRangeScan, got {:?}", other),
     }
+}
+
+#[test]
+fn test_primary_key_match_uses_column_index_for_quoted_identifier_collision() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let mut schema = TableSchema::new(
+        "casey".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("A", DataType::Int32, false),
+            crate::model::ColumnDef::new("a", DataType::Int32, false).primary_key(),
+        ],
+        vec![1],
+    );
+    schema.owner = String::new();
+    schema.pk_constraint_name = Some("casey_pkey".to_string());
+
+    let quoted_a_filter = typed_binop(
+        typed_column_at(0, "A", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let quoted_a_path =
+        choose_btree_access_path_for_typed_filter(&schema, &quoted_a_filter, 10_000, None);
+    assert!(
+        matches!(quoted_a_path.scan_type, ScanType::FullTableScan),
+        "quoted \"A\" predicate must not use primary key column a, got {:?}",
+        quoted_a_path.scan_type
+    );
+
+    let pk_a_filter = typed_binop(
+        typed_column_at(1, "a", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let pk_a_path = choose_btree_access_path_for_typed_filter(&schema, &pk_a_filter, 10_000, None);
+    assert!(
+        matches!(
+            pk_a_path.scan_type,
+            ScanType::PrimaryKeyScan {
+                ref index_name,
+                ref values
+            } if index_name == "casey_pkey" && values == &vec![Value::Int32(1)]
+        ),
+        "primary key column a should still use PrimaryKeyScan, got {:?}",
+        pk_a_path.scan_type
+    );
+}
+
+#[test]
+fn test_btree_index_match_uses_column_index_for_quoted_identifier_collision() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let mut schema = TableSchema::new(
+        "casey".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("A", DataType::Int32, false),
+            crate::model::ColumnDef::new("a", DataType::Int32, false),
+        ],
+        vec![],
+    );
+    schema.owner = String::new();
+    schema.indexes = vec![IndexDef {
+        id: 9,
+        name: "idx_casey_a".to_string(),
+        columns: vec!["a".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
+    }];
+
+    let quoted_a_filter = typed_binop(
+        typed_column_at(0, "A", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let quoted_a_path =
+        choose_btree_access_path_for_typed_filter(&schema, &quoted_a_filter, 10_000, None);
+    assert!(
+        matches!(quoted_a_path.scan_type, ScanType::FullTableScan),
+        "quoted \"A\" predicate must not use secondary index on a, got {:?}",
+        quoted_a_path.scan_type
+    );
+
+    let indexed_a_filter = typed_binop(
+        typed_column_at(1, "a", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let indexed_a_path =
+        choose_btree_access_path_for_typed_filter(&schema, &indexed_a_filter, 10_000, None);
+    assert!(
+        matches!(
+            indexed_a_path.scan_type,
+            ScanType::IndexScan {
+                ref index_name,
+                ref values,
+                ..
+            } if index_name == "idx_casey_a" && values == &[Value::Int32(1)]
+        ),
+        "secondary index column a should still use IndexScan, got {:?}",
+        indexed_a_path.scan_type
+    );
 }
 
 // ── Range scan tests (bounded range, single-pass predicate extraction) ──
