@@ -163,6 +163,20 @@ python3 scripts/integration_test.py
 cd orm-tests && npm test
 ```
 
+## Local TiKV Metrics
+
+When local TiKV metrics are needed for debugging or benchmarking, start
+`tiup playground` with Grafana enabled explicitly:
+
+```bash
+tiup playground --mode tikv-slim \
+  --kv.config deploy/e2e/config/tikv.toml \
+  --grafana.port 3000
+```
+
+This keeps Prometheus/Grafana available for TiKV monitoring. Do not add
+`--without-monitor` when metrics are required.
+
 ## E2E Integration Testing (mandatory for cross-component changes)
 
 Changes touching `fs9` (sh9 shell, fs9-server, fs9-meta, fs9-client) **must** be validated in the full E2E Docker Compose environment before merging.
