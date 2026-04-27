@@ -10,7 +10,8 @@ use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::functions::embedding::embed_query_text_with_cache;
 use crate::sql::operators::{
     BoxedOperator, GinScanOperator, HnswScanOperator, InListScanOperator, IndexScanOperator,
-    ProjectOperator, RangeIndexScanOperator, TableScanOperator,
+    PrimaryKeyRangeScanOperator, PrimaryKeyScanOperator, ProjectOperator, RangeIndexScanOperator,
+    TableScanOperator,
 };
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::planner::hnsw_predicate::HnswQueryVector;
@@ -62,6 +63,14 @@ pub(super) fn build_index_scan_operator(
         schema.from_alias = Some(a.to_string());
     }
     match scan_type {
+        ScanType::PrimaryKeyScan { values, .. } => Ok(Box::new(PrimaryKeyScanOperator::new(
+            schema,
+            values.clone(),
+            scan_limit,
+        ))),
+        ScanType::PrimaryKeyRangeScan { prefix_values, .. } => Ok(Box::new(
+            PrimaryKeyRangeScanOperator::new(schema, prefix_values.clone(), scan_limit),
+        )),
         ScanType::IndexScan {
             index_id,
             index_name,
@@ -285,15 +294,10 @@ fn typed_filter_is_exact_index_lookup(
     }
 
     for (i, col) in index.columns.iter().take(lookup_values.len()).enumerate() {
-        let key = col.to_lowercase();
-        let Some(pred_value) = predicates.get(&key) else {
+        let Some(pred_value) = predicates.get(col) else {
             return false;
         };
-        let coerced = if let Some(col_def) = schema
-            .columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(col))
-        {
+        let coerced = if let Some(col_def) = schema.columns.iter().find(|c| c.name == *col) {
             coerce_value_for_column(pred_value.clone(), col_def)
                 .unwrap_or_else(|_| pred_value.clone())
         } else {

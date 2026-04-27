@@ -948,66 +948,43 @@ impl Executor {
 
     /// Attempt point-get fetch when WHERE targets PK or a unique index.
     ///
-    /// Supports three strict predicate shapes:
-    /// 1. `pk = const` — single/composite PK equality
+    /// Supports three predicate shapes:
+    /// 1. AND-conjuncts containing `pk = const` — single/composite PK equality,
+    ///    with additional residual predicates evaluated after fetch
     /// 2. `pk IN (c1, c2, ...)` — single-column PK in-list (all constants)
-    /// 3. AND-connected `col = const` covering all columns of a UNIQUE index
+    /// 3. AND-conjuncts covering all columns of a UNIQUE index
     ///
     /// Returns `Some(rows)` when the predicate qualifies for fast fetch,
     /// `None` to fall back to full table scan.
-    async fn try_pk_fast_fetch(
+    pub(crate) async fn try_pk_fast_fetch(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         schema: &TableSchema,
         where_expr: &TypedExpr,
     ) -> Result<Option<Vec<Row>>> {
-        // --- Path A: pure AND-tree of col = const ---
+        // --- Path A: AND-tree with usable col = const conjuncts ---
         // Keyed by column_index (not name) to avoid case-folding bugs
         // with quoted identifiers (e.g. "A" vs "a").
         let mut eq_map: HashMap<usize, Value> = HashMap::new();
-        if collect_eq_by_col_index(where_expr, &mut eq_map).is_some() {
+        if collect_conjunctive_eq_by_col_index(where_expr, &mut eq_map).is_some() {
             // NULL constants disable fast path (col = NULL is UNKNOWN).
             if eq_map.values().any(|v| matches!(v, Value::Null)) {
-                return Ok(None);
+                return Ok(Some(vec![]));
             }
 
-            // Check if all PK columns are covered → single PK point-get.
-            if schema.pk_indices.iter().all(|i| eq_map.contains_key(i)) {
-                let pk_values: Vec<Value> = schema
-                    .pk_indices
-                    .iter()
-                    .map(|i| eq_map[i].clone())
-                    .collect();
-                let rows = self
-                    .store()
-                    .batch_get_rows(txn, db_id, schema.table_id, vec![pk_values], schema)
-                    .await?;
-                return Ok(Some(fill_fetched_rows(rows, schema)?));
-            }
-
-            // Check unique indexes (only Ready, pure-column, non-partial,
-            // non-expression indexes qualify).
-            for idx in &schema.indexes {
-                if !idx.unique
-                    || !matches!(idx.state, IndexState::Ready)
-                    || !idx.expressions.is_empty()
-                    || idx.predicate.is_some()
-                {
-                    continue;
+            match choose_fast_fetch_candidate(schema, &eq_map) {
+                Some(FastFetchCandidate::PrimaryKey(pk_values)) => {
+                    let rows = self
+                        .store()
+                        .batch_get_rows(txn, db_id, schema.table_id, vec![pk_values], schema)
+                        .await?;
+                    return Ok(Some(fill_fetched_rows(rows, schema)?));
                 }
-                // Resolve index column names to schema column indices.
-                let idx_col_indices: Vec<usize> = idx
-                    .columns
-                    .iter()
-                    .filter_map(|c| schema.column_index(c))
-                    .collect();
-                if idx_col_indices.len() != idx.columns.len() {
-                    continue; // unresolvable column — skip
-                }
-                if idx_col_indices.iter().all(|i| eq_map.contains_key(i)) {
-                    let idx_values: Vec<Value> =
-                        idx_col_indices.iter().map(|i| eq_map[i].clone()).collect();
+                Some(FastFetchCandidate::UniqueIndex {
+                    index_id,
+                    index_values,
+                }) => {
                     let pk_types: Vec<DataType> = schema
                         .pk_indices
                         .iter()
@@ -1019,8 +996,8 @@ impl Executor {
                             txn,
                             db_id,
                             schema.table_id,
-                            idx.id,
-                            &idx_values,
+                            index_id,
+                            &index_values,
                             true,
                             &pk_types,
                             None,
@@ -1035,10 +1012,26 @@ impl Executor {
                         .await?;
                     return Ok(Some(fill_fetched_rows(rows, schema)?));
                 }
+                Some(FastFetchCandidate::PrimaryKeyPrefix(pk_prefix_values)) => {
+                    let rows = self
+                        .store()
+                        .scan_rows_by_pk_prefix(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            &pk_prefix_values,
+                            None,
+                        )
+                        .await?;
+                    return Ok(Some(fill_fetched_rows(rows, schema)?));
+                }
+                None => {}
             }
 
             // Equalities don't cover PK or any qualifying unique index.
-            return Ok(None);
+            if !eq_map.is_empty() {
+                return Ok(None);
+            }
         }
 
         // --- Path B: pk IN (c1, c2, ...) for single-column PK ---
@@ -1097,7 +1090,99 @@ impl Executor {
     }
 }
 
-/// Extract a conjunction of `col = const` predicates keyed by
+#[derive(Debug, PartialEq)]
+enum FastFetchCandidate {
+    PrimaryKey(Vec<Value>),
+    UniqueIndex {
+        index_id: u64,
+        index_values: Vec<Value>,
+    },
+    PrimaryKeyPrefix(Vec<Value>),
+}
+
+fn choose_fast_fetch_candidate(
+    schema: &TableSchema,
+    eq_map: &HashMap<usize, Value>,
+) -> Option<FastFetchCandidate> {
+    if schema.pk_indices.iter().all(|i| eq_map.contains_key(i)) {
+        let pk_values = schema
+            .pk_indices
+            .iter()
+            .map(|i| eq_map[i].clone())
+            .collect();
+        return Some(FastFetchCandidate::PrimaryKey(pk_values));
+    }
+
+    if let Some((index_id, index_values)) = unique_index_values_from_eq_map(schema, eq_map) {
+        return Some(FastFetchCandidate::UniqueIndex {
+            index_id,
+            index_values,
+        });
+    }
+
+    pk_prefix_values_from_eq_map(schema, eq_map).map(FastFetchCandidate::PrimaryKeyPrefix)
+}
+
+/// Return values for a fully-covered unique index. This intentionally runs
+/// before PK-prefix range fetch so `tenant_id = ? AND email = ?` prefers the
+/// unique email point lookup over scanning every row in the tenant prefix.
+fn unique_index_values_from_eq_map(
+    schema: &TableSchema,
+    eq_map: &HashMap<usize, Value>,
+) -> Option<(u64, Vec<Value>)> {
+    for idx in &schema.indexes {
+        if !idx.unique
+            || !matches!(idx.state, IndexState::Ready)
+            || !idx.expressions.is_empty()
+            || idx.predicate.is_some()
+        {
+            continue;
+        }
+
+        let Some(idx_col_indices) = idx
+            .columns
+            .iter()
+            .map(|c| schema.column_index(c))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+
+        if idx_col_indices.iter().all(|i| eq_map.contains_key(i)) {
+            let idx_values = idx_col_indices.iter().map(|i| eq_map[i].clone()).collect();
+            return Some((idx.id, idx_values));
+        }
+    }
+
+    None
+}
+
+/// Return equality values for a non-empty, non-complete leading primary-key
+/// prefix. Complete PK predicates are handled by point-get before this helper.
+fn pk_prefix_values_from_eq_map(
+    schema: &TableSchema,
+    eq_map: &HashMap<usize, Value>,
+) -> Option<Vec<Value>> {
+    if schema.pk_indices.len() < 2 {
+        return None;
+    }
+
+    let mut values = Vec::new();
+    for pk_idx in &schema.pk_indices {
+        match eq_map.get(pk_idx) {
+            Some(value) => values.push(value.clone()),
+            None => break,
+        }
+    }
+
+    if values.is_empty() || values.len() == schema.pk_indices.len() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+/// Extract top-level AND-conjunct `col = const` predicates keyed by
 /// `column_index` (from `ColumnRef`).
 ///
 /// Unlike `collect_typed_eq_predicates` (which keys by lowercased name),
@@ -1105,16 +1190,24 @@ impl Executor {
 /// `"A"` and `"a"` are distinct in PostgreSQL but would collide under
 /// `to_lowercase()`).
 ///
-/// Returns `None` if the expression is not a pure AND tree of equalities,
-/// or if the same column index appears with conflicting values.
-fn collect_eq_by_col_index(expr: &TypedExpr, out: &mut HashMap<usize, Value>) -> Option<()> {
+/// Non-equality conjuncts are left as residual filters and evaluated after
+/// fetch. This allows `UPDATE ... WHERE pk = ? AND old_col IS NOT DISTINCT
+/// FROM ?` to point-fetch and lock only the target PK row while preserving the
+/// original compare-and-swap predicate semantics.
+///
+/// Returns `None` if the same column index appears with conflicting equality
+/// values.
+fn collect_conjunctive_eq_by_col_index(
+    expr: &TypedExpr,
+    out: &mut HashMap<usize, Value>,
+) -> Option<()> {
     use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
 
     match &expr.kind {
         TypedExprKind::BinaryOp { left, op, right } => match op {
             TypedBinaryOp::And => {
-                collect_eq_by_col_index(left, out)?;
-                collect_eq_by_col_index(right, out)?;
+                collect_conjunctive_eq_by_col_index(left, out)?;
+                collect_conjunctive_eq_by_col_index(right, out)?;
                 Some(())
             }
             TypedBinaryOp::Eq => {
@@ -1144,9 +1237,9 @@ fn collect_eq_by_col_index(expr: &TypedExpr, out: &mut HashMap<usize, Value>) ->
                 out.insert(col_idx, val);
                 Some(())
             }
-            _ => None,
+            _ => Some(()),
         },
-        _ => None,
+        _ => Some(()),
     }
 }
 
@@ -1160,4 +1253,175 @@ fn fill_fetched_rows(rows: Vec<Row>, schema: &TableSchema) -> Result<Vec<Row>> {
         filled.push(row);
     }
     Ok(filled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnDef, IndexDef};
+    use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
+
+    fn col(idx: usize, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: idx,
+                column_name: name.to_string(),
+            },
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn int(value: i32) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::Constant(Value::Int32(value)),
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn bin(left: TypedExpr, op: TypedBinaryOp, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            data_type: DataType::Boolean,
+        }
+    }
+
+    fn composite_pk_schema() -> TableSchema {
+        TableSchema::new(
+            "order_line".to_string(),
+            1,
+            vec![
+                ColumnDef::new("ol_w_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("ol_d_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("ol_o_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("ol_number", DataType::Int32, false).primary_key(),
+            ],
+            vec![0, 1, 2, 3],
+        )
+    }
+
+    fn tenant_user_schema_with_unique_email() -> TableSchema {
+        let mut schema = TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![
+                ColumnDef::new("tenant_id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("email", DataType::Text, false),
+            ],
+            vec![0, 1],
+        );
+        schema.indexes = vec![IndexDef {
+            id: 77,
+            name: "users_email_key".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: Vec::new(),
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }];
+        schema
+    }
+
+    #[test]
+    fn collect_conjunctive_eq_keeps_pk_equalities_with_residual_cas_predicates() {
+        let pk_eq = bin(col(0, "id"), TypedBinaryOp::Eq, int(42));
+        let residual = TypedExpr {
+            kind: TypedExprKind::IsDistinctFrom {
+                left: Box::new(col(1, "old_balance")),
+                right: Box::new(int(7)),
+                negated: true,
+            },
+            data_type: DataType::Boolean,
+        };
+        let predicate = bin(pk_eq, TypedBinaryOp::And, residual);
+
+        let mut eq_map = HashMap::new();
+        collect_conjunctive_eq_by_col_index(&predicate, &mut eq_map).unwrap();
+
+        assert_eq!(eq_map.get(&0), Some(&Value::Int32(42)));
+        assert_eq!(eq_map.len(), 1);
+    }
+
+    #[test]
+    fn collect_conjunctive_eq_does_not_extract_from_or_residuals() {
+        let or_predicate = bin(
+            bin(col(0, "id"), TypedBinaryOp::Eq, int(42)),
+            TypedBinaryOp::Or,
+            bin(col(0, "id"), TypedBinaryOp::Eq, int(43)),
+        );
+        let predicate = bin(
+            bin(col(1, "tenant_id"), TypedBinaryOp::Eq, int(9)),
+            TypedBinaryOp::And,
+            or_predicate,
+        );
+
+        let mut eq_map = HashMap::new();
+        collect_conjunctive_eq_by_col_index(&predicate, &mut eq_map).unwrap();
+
+        assert_eq!(eq_map.get(&1), Some(&Value::Int32(9)));
+        assert!(!eq_map.contains_key(&0));
+    }
+
+    #[test]
+    fn pk_prefix_values_extracts_leading_non_complete_prefix() {
+        let schema = composite_pk_schema();
+        let mut eq_map = HashMap::new();
+        eq_map.insert(0, Value::Int32(1));
+        eq_map.insert(1, Value::Int32(2));
+        eq_map.insert(2, Value::Int32(3001));
+
+        assert_eq!(
+            pk_prefix_values_from_eq_map(&schema, &eq_map),
+            Some(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3001)])
+        );
+    }
+
+    #[test]
+    fn pk_prefix_values_rejects_non_leading_or_complete_pk() {
+        let schema = composite_pk_schema();
+
+        let mut non_leading = HashMap::new();
+        non_leading.insert(1, Value::Int32(2));
+        non_leading.insert(2, Value::Int32(3001));
+        assert!(pk_prefix_values_from_eq_map(&schema, &non_leading).is_none());
+
+        let mut complete = HashMap::new();
+        complete.insert(0, Value::Int32(1));
+        complete.insert(1, Value::Int32(2));
+        complete.insert(2, Value::Int32(3001));
+        complete.insert(3, Value::Int32(7));
+        assert!(pk_prefix_values_from_eq_map(&schema, &complete).is_none());
+    }
+
+    #[test]
+    fn fast_fetch_candidate_prefers_unique_point_get_over_pk_prefix_scan() {
+        let schema = tenant_user_schema_with_unique_email();
+        let mut eq_map = HashMap::new();
+        eq_map.insert(0, Value::Int32(42));
+        eq_map.insert(2, Value::Text("a@example.com".to_string()));
+
+        assert_eq!(
+            pk_prefix_values_from_eq_map(&schema, &eq_map),
+            Some(vec![Value::Int32(42)]),
+            "test setup should also qualify for a potentially large PK-prefix scan"
+        );
+        assert_eq!(
+            choose_fast_fetch_candidate(&schema, &eq_map),
+            Some(FastFetchCandidate::UniqueIndex {
+                index_id: 77,
+                index_values: vec![Value::Text("a@example.com".to_string())],
+            })
+        );
+    }
 }

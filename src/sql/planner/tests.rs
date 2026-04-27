@@ -24,10 +24,14 @@ fn typed_constant(v: Value, dt: DataType) -> TypedExpr {
 }
 
 fn typed_column(name: &str, dt: DataType) -> TypedExpr {
+    typed_column_at(usize::MAX, name, dt)
+}
+
+fn typed_column_at(column_index: usize, name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::ColumnRef {
             scope_depth: 0,
-            column_index: 0,
+            column_index,
             column_name: name.to_string(),
         },
         data_type: dt,
@@ -47,7 +51,7 @@ fn typed_binop(left: TypedExpr, op: TypedBinaryOp, right: TypedExpr, dt: DataTyp
 
 fn orders_columns_with_region() -> Vec<crate::model::ColumnDef> {
     vec![
-        crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+        crate::model::ColumnDef::new("id", DataType::Int64, false),
         crate::model::ColumnDef::new("status", DataType::Text, false),
         crate::model::ColumnDef::new("region", DataType::Text, false),
     ]
@@ -278,10 +282,10 @@ fn test_partial_index_typed_exact_predicate() {
             "orders".to_string(),
             1,
             vec![
-                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("id", DataType::Int64, false),
                 crate::model::ColumnDef::new("status", DataType::Text, false),
             ],
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -341,10 +345,10 @@ fn test_partial_index_typed_missing_predicate() {
             "orders".to_string(),
             1,
             vec![
-                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("id", DataType::Int64, false),
                 crate::model::ColumnDef::new("status", DataType::Text, false),
             ],
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -390,7 +394,7 @@ fn test_partial_index_typed_valid_cached_predicate() {
             "orders".to_string(),
             1,
             orders_columns_with_region(),
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -447,7 +451,7 @@ fn test_partial_index_typed_malformed_predicate() {
             "orders".to_string(),
             1,
             orders_columns_with_region(),
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -502,7 +506,7 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
             "orders".to_string(),
             1,
             orders_columns_with_region(),
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -1181,6 +1185,264 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
          (combined sel = 1/100 * 2/5 = 0.004), got {:?} with cost {}",
         path.scan_type,
         path.cost,
+    );
+}
+
+#[test]
+fn test_primary_key_exact_match_preferred_over_secondary_prefix_scan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let mut schema = TableSchema::new(
+        "customer".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("c_w_id", DataType::Int32, false),
+            crate::model::ColumnDef::new("c_d_id", DataType::Int32, false),
+            crate::model::ColumnDef::new("c_id", DataType::Int32, false),
+            crate::model::ColumnDef::new("c_last", DataType::Text, false),
+            crate::model::ColumnDef::new("c_first", DataType::Text, false),
+        ],
+        vec![0, 1, 2],
+    );
+    schema.owner = String::new();
+    schema.pk_constraint_name = Some("customer_i1".to_string());
+    schema.indexes = vec![IndexDef {
+        id: 1,
+        name: "customer_i2".to_string(),
+        columns: vec![
+            "c_w_id".to_string(),
+            "c_d_id".to_string(),
+            "c_last".to_string(),
+            "c_first".to_string(),
+            "c_id".to_string(),
+        ],
+        unique: true,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
+        cached_predicate_conjuncts: None,
+    }];
+
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("c_w_id", DataType::Int32),
+            TypedBinaryOp::Eq,
+            typed_constant(Value::Int32(13), DataType::Int32),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_binop(
+                typed_column("c_d_id", DataType::Int32),
+                TypedBinaryOp::Eq,
+                typed_constant(Value::Int32(4), DataType::Int32),
+                DataType::Boolean,
+            ),
+            TypedBinaryOp::And,
+            typed_binop(
+                typed_column("c_id", DataType::Int32),
+                TypedBinaryOp::Eq,
+                typed_constant(Value::Int32(1584), DataType::Int32),
+                DataType::Boolean,
+            ),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 600_000, None);
+    match path.scan_type {
+        ScanType::PrimaryKeyScan { index_name, values } => {
+            assert_eq!(index_name, "customer_i1");
+            assert_eq!(
+                values,
+                vec![Value::Int32(13), Value::Int32(4), Value::Int32(1584)]
+            );
+        }
+        other => panic!("expected PrimaryKeyScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_primary_key_prefix_match_uses_primary_key_range_scan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let mut schema = TableSchema::new(
+        "order_line".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("ol_w_id", DataType::Int32, false),
+            crate::model::ColumnDef::new("ol_d_id", DataType::Int32, false),
+            crate::model::ColumnDef::new("ol_o_id", DataType::Int32, false),
+            crate::model::ColumnDef::new("ol_number", DataType::Int32, false),
+            crate::model::ColumnDef::new("ol_amount", DataType::Float64, false),
+        ],
+        vec![0, 1, 2, 3],
+    );
+    schema.owner = String::new();
+    schema.pk_constraint_name = Some("order_line_i1".to_string());
+
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("ol_w_id", DataType::Int32),
+            TypedBinaryOp::Eq,
+            typed_constant(Value::Int32(13), DataType::Int32),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        typed_binop(
+            typed_binop(
+                typed_column("ol_d_id", DataType::Int32),
+                TypedBinaryOp::Eq,
+                typed_constant(Value::Int32(4), DataType::Int32),
+                DataType::Boolean,
+            ),
+            TypedBinaryOp::And,
+            typed_binop(
+                typed_column("ol_o_id", DataType::Int32),
+                TypedBinaryOp::Eq,
+                typed_constant(Value::Int32(1584), DataType::Int32),
+                DataType::Boolean,
+            ),
+            DataType::Boolean,
+        ),
+        DataType::Boolean,
+    );
+
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 6_000_000, None);
+    match path.scan_type {
+        ScanType::PrimaryKeyRangeScan {
+            index_name,
+            prefix_values,
+        } => {
+            assert_eq!(index_name, "order_line_i1");
+            assert_eq!(
+                prefix_values,
+                vec![Value::Int32(13), Value::Int32(4), Value::Int32(1584)]
+            );
+        }
+        other => panic!("expected PrimaryKeyRangeScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_primary_key_match_uses_column_index_for_quoted_identifier_collision() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let mut schema = TableSchema::new(
+        "casey".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("A", DataType::Int32, false),
+            crate::model::ColumnDef::new("a", DataType::Int32, false).primary_key(),
+        ],
+        vec![1],
+    );
+    schema.owner = String::new();
+    schema.pk_constraint_name = Some("casey_pkey".to_string());
+
+    let quoted_a_filter = typed_binop(
+        typed_column_at(0, "A", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let quoted_a_path =
+        choose_btree_access_path_for_typed_filter(&schema, &quoted_a_filter, 10_000, None);
+    assert!(
+        matches!(quoted_a_path.scan_type, ScanType::FullTableScan),
+        "quoted \"A\" predicate must not use primary key column a, got {:?}",
+        quoted_a_path.scan_type
+    );
+
+    let pk_a_filter = typed_binop(
+        typed_column_at(1, "a", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let pk_a_path = choose_btree_access_path_for_typed_filter(&schema, &pk_a_filter, 10_000, None);
+    assert!(
+        matches!(
+            pk_a_path.scan_type,
+            ScanType::PrimaryKeyScan {
+                ref index_name,
+                ref values
+            } if index_name == "casey_pkey" && values == &vec![Value::Int32(1)]
+        ),
+        "primary key column a should still use PrimaryKeyScan, got {:?}",
+        pk_a_path.scan_type
+    );
+}
+
+#[test]
+fn test_btree_index_match_uses_column_index_for_quoted_identifier_collision() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let mut schema = TableSchema::new(
+        "casey".to_string(),
+        1,
+        vec![
+            crate::model::ColumnDef::new("A", DataType::Int32, false),
+            crate::model::ColumnDef::new("a", DataType::Int32, false),
+        ],
+        vec![],
+    );
+    schema.owner = String::new();
+    schema.indexes = vec![IndexDef {
+        id: 9,
+        name: "idx_casey_a".to_string(),
+        columns: vec!["a".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
+    }];
+
+    let quoted_a_filter = typed_binop(
+        typed_column_at(0, "A", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let quoted_a_path =
+        choose_btree_access_path_for_typed_filter(&schema, &quoted_a_filter, 10_000, None);
+    assert!(
+        matches!(quoted_a_path.scan_type, ScanType::FullTableScan),
+        "quoted \"A\" predicate must not use secondary index on a, got {:?}",
+        quoted_a_path.scan_type
+    );
+
+    let indexed_a_filter = typed_binop(
+        typed_column_at(1, "a", DataType::Int32),
+        TypedBinaryOp::Eq,
+        typed_constant(Value::Int32(1), DataType::Int32),
+        DataType::Boolean,
+    );
+    let indexed_a_path =
+        choose_btree_access_path_for_typed_filter(&schema, &indexed_a_filter, 10_000, None);
+    assert!(
+        matches!(
+            indexed_a_path.scan_type,
+            ScanType::IndexScan {
+                ref index_name,
+                ref values,
+                ..
+            } if index_name == "idx_casey_a" && values == &[Value::Int32(1)]
+        ),
+        "secondary index column a should still use IndexScan, got {:?}",
+        indexed_a_path.scan_type
     );
 }
 

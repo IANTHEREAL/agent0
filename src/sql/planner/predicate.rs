@@ -20,8 +20,8 @@ pub fn analyze_typed_predicates(
     predicates
 }
 
-/// Collect a conjunction of `col = const` predicates into a map keyed by
-/// lower-cased column name.
+/// Collect a conjunction of `col = const` predicates into a map keyed by the
+/// analyzer-resolved column name.
 ///
 /// Returns `None` if the expression is not an AND tree of equality predicates,
 /// or if the same column appears with conflicting constant values.
@@ -41,13 +41,13 @@ pub(crate) fn collect_typed_eq_predicates(
             TypedBinaryOp::Eq => {
                 let (col, val) = if let TypedExprKind::ColumnRef { column_name, .. } = &left.kind {
                     if let TypedExprKind::Constant(v) = &right.kind {
-                        (column_name.to_lowercase(), v.clone())
+                        (column_name.clone(), v.clone())
                     } else {
                         return None;
                     }
                 } else if let TypedExprKind::ColumnRef { column_name, .. } = &right.kind {
                     if let TypedExprKind::Constant(v) = &left.kind {
-                        (column_name.to_lowercase(), v.clone())
+                        (column_name.clone(), v.clone())
                     } else {
                         return None;
                     }
@@ -114,7 +114,12 @@ pub(super) fn collect_typed_predicates(
             list,
             negated: false,
         } => {
-            if let TypedExprKind::ColumnRef { column_name, .. } = &inner.kind {
+            if let TypedExprKind::ColumnRef {
+                column_name,
+                column_index,
+                ..
+            } = &inner.kind
+            {
                 let values: Vec<Value> = list
                     .iter()
                     .filter_map(|e| {
@@ -127,7 +132,8 @@ pub(super) fn collect_typed_predicates(
                     .collect();
                 if values.len() == list.len() && !values.is_empty() {
                     predicates.push(TypedPredicate::InList {
-                        column: column_name.to_lowercase(),
+                        column: column_name.clone(),
+                        column_index: *column_index,
                         values,
                     });
                 }
@@ -143,10 +149,16 @@ pub(super) fn extract_typed_simple_predicate(
     op: CmpOp,
 ) -> Option<TypedPredicate> {
     use crate::sql::analyzer::types::TypedExprKind;
-    if let TypedExprKind::ColumnRef { column_name, .. } = &maybe_col.kind {
+    if let TypedExprKind::ColumnRef {
+        column_name,
+        column_index,
+        ..
+    } = &maybe_col.kind
+    {
         if let TypedExprKind::Constant(val) = &maybe_val.kind {
             return Some(TypedPredicate::Comparison {
-                column: column_name.to_lowercase(),
+                column: column_name.clone(),
+                column_index: *column_index,
                 op,
                 value: val.clone(),
             });

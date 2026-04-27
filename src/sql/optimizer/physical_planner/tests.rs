@@ -11,7 +11,7 @@ fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::ColumnRef {
             scope_depth: 0,
-            column_index: 0,
+            column_index: usize::MAX,
             column_name: name.to_string(),
         },
         data_type: dt,
@@ -1363,12 +1363,10 @@ fn make_schema_with_index() -> TableSchema {
         "t".to_string(),
         1,
         vec![
-            ColumnDef::new("id", DataType::Int64, false)
-                .primary_key()
-                .unique(),
+            ColumnDef::new("id", DataType::Int64, false),
             ColumnDef::new("name", DataType::Text, true),
         ],
-        vec![0],
+        vec![],
     );
     schema.indexes.push(IndexDef {
         name: "idx_t_id".to_string(),

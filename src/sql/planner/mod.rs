@@ -50,6 +50,14 @@ pub enum GinQual {
 #[allow(clippy::enum_variant_names)]
 pub enum ScanType {
     FullTableScan,
+    PrimaryKeyScan {
+        index_name: String,
+        values: Vec<Value>,
+    },
+    PrimaryKeyRangeScan {
+        index_name: String,
+        prefix_values: Vec<Value>,
+    },
     IndexScan {
         index_id: u64,
         index_name: String,
@@ -138,9 +146,14 @@ pub enum TypedPredicate {
     /// `column OP constant` where OP is a scalar comparison.
     Comparison {
         column: String,
+        column_index: usize,
         op: CmpOp,
         value: Value,
     },
     /// `column IN (v1, v2, ...)` — all list elements are constants.
-    InList { column: String, values: Vec<Value> },
+    InList {
+        column: String,
+        column_index: usize,
+        values: Vec<Value>,
+    },
 }
