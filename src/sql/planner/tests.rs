@@ -47,7 +47,7 @@ fn typed_binop(left: TypedExpr, op: TypedBinaryOp, right: TypedExpr, dt: DataTyp
 
 fn orders_columns_with_region() -> Vec<crate::model::ColumnDef> {
     vec![
-        crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+        crate::model::ColumnDef::new("id", DataType::Int64, false),
         crate::model::ColumnDef::new("status", DataType::Text, false),
         crate::model::ColumnDef::new("region", DataType::Text, false),
     ]
@@ -278,10 +278,10 @@ fn test_partial_index_typed_exact_predicate() {
             "orders".to_string(),
             1,
             vec![
-                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("id", DataType::Int64, false),
                 crate::model::ColumnDef::new("status", DataType::Text, false),
             ],
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -341,10 +341,10 @@ fn test_partial_index_typed_missing_predicate() {
             "orders".to_string(),
             1,
             vec![
-                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("id", DataType::Int64, false),
                 crate::model::ColumnDef::new("status", DataType::Text, false),
             ],
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -390,7 +390,7 @@ fn test_partial_index_typed_valid_cached_predicate() {
             "orders".to_string(),
             1,
             orders_columns_with_region(),
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -447,7 +447,7 @@ fn test_partial_index_typed_malformed_predicate() {
             "orders".to_string(),
             1,
             orders_columns_with_region(),
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
@@ -502,7 +502,7 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
             "orders".to_string(),
             1,
             orders_columns_with_region(),
-            vec![0],
+            vec![],
         );
         s.pk_constraint_name = None;
         s.owner = String::new();
