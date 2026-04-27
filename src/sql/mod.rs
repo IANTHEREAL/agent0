@@ -42,7 +42,7 @@ mod pg_numeric;
 pub(crate) mod pg_types;
 mod planner;
 mod plpgsql;
-mod projection;
+pub(crate) mod projection;
 pub(crate) mod query_context;
 pub(crate) mod quoting;
 pub(crate) mod raw_sql;

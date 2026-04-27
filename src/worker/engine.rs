@@ -4,6 +4,7 @@ use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::ddl;
+use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
@@ -40,6 +41,13 @@ use tracing::{info, warn};
 
 const STATEMENT_TIMEOUT_ERROR: &str = "canceling statement due to statement timeout";
 const CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by administrator";
+const WORKER_BGSQL_MAX_RETRY_ATTEMPTS: usize = 64;
+
+async fn worker_bgsql_backoff(attempt: usize) {
+    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
+    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+}
 
 pub struct WorkerEngine {
     config: WorkerConfig,
@@ -1137,76 +1145,102 @@ impl WorkerEngine {
         };
         let tikv_client = store.transaction_client();
 
-        let mut txn = store.begin().await?;
-        let mut txn_guard = crate::worker::active_txn_registry::global_registry()
-            .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
-        let mut sequence_values = crate::sql::sequences::SequenceSession::new();
-        let task_fut = async {
-            let statements = parse_sql(&entry.command)?;
-            for stmt in &statements {
-                let stmt_ts = now_epoch_ms();
-                let qctx = QueryContext::new(
-                    0,
-                    database_name.clone(),
-                    current_user.clone(),
-                    stmt_ts,
-                    tx_start_ms,
-                    timezone.clone(),
-                );
-
-                // Wrap each statement in its own extension context to reset
-                // http_requests counter and isolate statement memory lifecycle.
-                let ext_ctx = background_statement_extension_context(
-                    is_cron,
-                    &entry.keyspace,
-                    tikv_client.clone(),
-                );
-                let fut = crate::pool::run_with_statement_memory_scope(
-                    Some(statement_memory_accountant.clone()),
-                    with_context_opts(
-                        ext_ctx,
-                        query_context::with_scoped_query_context(
-                            &qctx,
-                            exec.execute_statement_on_txn(
-                                &mut txn,
-                                entry.db_id,
-                                &mut sequence_values,
-                                &search_path,
-                                stmt,
-                                None,
-                                None,
-                            ),
-                        ),
-                    ),
-                );
-                let _ = fut.await?;
-            }
-            txn.commit().await?;
-            Ok(statements.len())
+        let max_attempts = if entry.task_type == TaskType::BgSql {
+            WORKER_BGSQL_MAX_RETRY_ATTEMPTS
+        } else {
+            1
         };
 
-        let result = run_with_guards(
-            task_fut,
-            task_deadline,
-            cancel_signal.as_ref(),
-            shutdown_signal.as_ref(),
-        )
-        .await;
+        for attempt in 0..max_attempts {
+            let mut txn = store.begin().await?;
+            let mut txn_guard = crate::worker::active_txn_registry::global_registry()
+                .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
+            let mut sequence_values = crate::sql::sequences::SequenceSession::new();
 
-        match result {
-            Ok(completed_commands) => Ok(completed_commands),
-            Err(e) => {
-                if txn.rollback().await.is_err() {
-                    // Rollback failed — the txn may still be live in TiKV.
-                    // Keep the GC registration so the safepoint does not
-                    // advance past this potentially live transaction.
-                    if let Some(g) = txn_guard.as_mut() {
-                        g.quarantine();
-                    }
+            let task_fut = async {
+                let statements = parse_sql(&entry.command)?;
+                for stmt in &statements {
+                    let stmt_ts = now_epoch_ms();
+                    let qctx = QueryContext::new(
+                        0,
+                        database_name.clone(),
+                        current_user.clone(),
+                        stmt_ts,
+                        tx_start_ms,
+                        timezone.clone(),
+                    );
+
+                    // Wrap each statement in its own extension context to reset
+                    // http_requests counter and isolate statement memory lifecycle.
+                    let ext_ctx = background_statement_extension_context(
+                        is_cron,
+                        &entry.keyspace,
+                        tikv_client.clone(),
+                    );
+                    let fut = crate::pool::run_with_statement_memory_scope(
+                        Some(statement_memory_accountant.clone()),
+                        with_context_opts(
+                            ext_ctx,
+                            query_context::with_scoped_query_context(
+                                &qctx,
+                                exec.execute_statement_on_txn(
+                                    &mut txn,
+                                    entry.db_id,
+                                    &mut sequence_values,
+                                    &search_path,
+                                    stmt,
+                                    None,
+                                    None,
+                                ),
+                            ),
+                        ),
+                    );
+                    let _ = fut.await?;
                 }
-                Err(e)
+                txn.commit().await?;
+                Ok(statements.len())
+            };
+
+            let result = run_with_guards(
+                task_fut,
+                task_deadline,
+                cancel_signal.as_ref(),
+                shutdown_signal.as_ref(),
+            )
+            .await;
+
+            match result {
+                Ok(completed_commands) => return Ok(completed_commands),
+                Err(e) => {
+                    if txn.rollback().await.is_err() {
+                        // Rollback failed — the txn may still be live in TiKV.
+                        // Keep the GC registration so the safepoint does not
+                        // advance past this potentially live transaction.
+                        if let Some(g) = txn_guard.as_mut() {
+                            g.quarantine();
+                        }
+                    }
+
+                    let should_retry = entry.task_type == TaskType::BgSql
+                        && attempt + 1 < max_attempts
+                        && is_retryable_tikv_error(&e);
+                    if should_retry {
+                        tracing::info!(
+                            attempt = attempt + 1,
+                            max_attempts,
+                            task_id = entry.task_id,
+                            "bg_sql write conflict or deadlock, retrying task"
+                        );
+                        worker_bgsql_backoff(attempt).await;
+                        continue;
+                    }
+
+                    return Err(e);
+                }
             }
         }
+
+        unreachable!("worker retry loop must return")
     }
 
     async fn execute_bg_ddl_backfill(store: &Arc<TikvStore>, entry: &TaskQueueEntry) -> Result<()> {

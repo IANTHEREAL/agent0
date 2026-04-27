@@ -160,6 +160,36 @@ impl Executor {
             rows = sorted_rows;
         }
 
+        // Refresh target rows via TiKV's read+lock path before evaluating the
+        // update. A plain lock acquired after the initial scan is insufficient:
+        // it prevents later writers from overtaking us, but we would still
+        // compute new values from a stale pre-lock snapshot (`read old value,
+        // then unconditional upsert`), which silently loses updates under
+        // concurrency. Re-reading under `batch_get_for_update` closes that
+        // gap and gives us the latest committed row image in deterministic PK
+        // order.
+        let txn_dirty_tables = crate::session_context::current_txn_dirty_table_ids();
+        let statement_dirty_tables = crate::session_context::current_statement_dirty_table_ids();
+        let table_dirty_in_txn = txn_dirty_tables.contains(&schema.table_id)
+            || statement_dirty_tables.contains(&schema.table_id);
+
+        if !rows.is_empty() && !table_dirty_in_txn {
+            let pk_list: Vec<Vec<Value>> = rows.iter().map(|r| schema.get_pk_values(r)).collect();
+            rows = self
+                .store()
+                .batch_get_rows_for_update(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    pk_list,
+                    &schema,
+                    qctx.lock_timeout,
+                )
+                .await?;
+            rows = fill_fetched_rows(rows, &schema)?;
+            append_ctid_to_rows(&mut rows);
+        }
+
         // Check whether BEFORE UPDATE triggers exist.  When they do,
         // we must execute per-row (triggers can veto, mutate, or query
         // intermediate txn state).  Without them, we use the batch fast

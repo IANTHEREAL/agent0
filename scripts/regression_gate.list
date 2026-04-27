@@ -308,6 +308,7 @@ tests/txn_value_size_guard_1968.py
 tests/txn_value_size_guard_update_1968.py
 tests/txn_value_size_guard_copy_1968.py
 tests/txn_value_size_guard_multicolumn_1968.py
+tests/safety_plpgsql_udf_atomicity.py
 tests/fs9_ws_symlink_contract_1873.py
 tests/fs9_ws_mode_on_create_1902.py
 # #1969 – HNSW graph freeze on oversize (raft-entry-max-size)

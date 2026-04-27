@@ -21,7 +21,6 @@ use crate::storage::TikvStore;
 use super::{
     assign_generated_check_constraint_names, check_expr_references_column, constraint_name_exists,
     find_check_constraint_index, rewrite_check_expr_column, validate_column_default_expr,
-    KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 
 use columns::{
@@ -437,22 +436,26 @@ pub async fn execute_alter_table(
                         return Ok((ExecuteResult::AlterTable, None));
                     }
 
-                    let (start, end) =
-                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-                    let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-                    while let Some(batch) = scanner.next_batch(txn).await? {
-                        for pair in batch {
-                            let mut row = crate::storage::deserialize_row(pair.value())?;
-                            fill_row_defaults(&mut row, &schema)?;
-                            if matches!(row.values[col_idx], Value::Null) {
-                                let short_table =
-                                    schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                                return Err(anyhow!(
-                                    "column \"{}\" of relation \"{}\" contains null values",
-                                    col_name,
-                                    short_table
-                                ));
-                            }
+                    // Validate NOT NULL against the txn-visible row image. Raw
+                    // KV scans bypass the transaction's local write buffer, so
+                    // a migration sequence such as:
+                    //   ALTER TABLE ... ADD COLUMN
+                    //   UPDATE ... SET new_col = ...
+                    //   ALTER TABLE ... ALTER COLUMN new_col SET NOT NULL
+                    // would incorrectly keep seeing pre-backfill NULLs inside
+                    // the same transaction. `store.scan()` honors
+                    // read-your-own-writes; we then fill missing trailing
+                    // columns/defaults before checking for NULL.
+                    for mut row in store.scan(txn, db_id, &schema.name, None).await? {
+                        fill_row_defaults(&mut row, &schema)?;
+                        if matches!(row.values[col_idx], Value::Null) {
+                            let short_table =
+                                schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                            return Err(anyhow!(
+                                "column \"{}\" of relation \"{}\" contains null values",
+                                col_name,
+                                short_table
+                            ));
                         }
                     }
 
