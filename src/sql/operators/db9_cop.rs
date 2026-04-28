@@ -1,5 +1,6 @@
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema};
+use crate::pool::try_shrink_statement_memory_scope;
 use crate::sql::optimizer::physical_plan::{Db9CopOp, Db9CopScan};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -11,6 +12,7 @@ pub struct Db9CopOperator {
     scan: Db9CopScan,
     ops: Vec<Db9CopOp>,
     rows: Vec<Row>,
+    rows_charged_bytes: usize,
     position: usize,
     opened: bool,
 }
@@ -28,9 +30,22 @@ impl Db9CopOperator {
             scan,
             ops,
             rows: Vec::new(),
+            rows_charged_bytes: 0,
             position: 0,
             opened: false,
         }
+    }
+
+    fn release_buffer(&mut self) {
+        try_shrink_statement_memory_scope(self.rows_charged_bytes);
+        self.rows_charged_bytes = 0;
+        self.rows.clear();
+    }
+}
+
+impl Drop for Db9CopOperator {
+    fn drop(&mut self) {
+        self.release_buffer();
     }
 }
 
@@ -43,8 +58,9 @@ impl PhysicalOperator for Db9CopOperator {
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         let store = ctx.store.clone();
         let db_id = ctx.db_id;
+        self.release_buffer();
         self.position = 0;
-        self.rows = store
+        let (rows, charged_bytes) = store
             .cop_select(
                 ctx.txn,
                 db_id,
@@ -54,6 +70,8 @@ impl PhysicalOperator for Db9CopOperator {
                 &self.output_schema,
             )
             .await?;
+        self.rows = rows;
+        self.rows_charged_bytes = charged_bytes;
         self.opened = true;
         Ok(())
     }
@@ -73,7 +91,7 @@ impl PhysicalOperator for Db9CopOperator {
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.rows.clear();
+        self.release_buffer();
         self.position = 0;
         self.opened = false;
         Ok(())

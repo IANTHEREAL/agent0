@@ -6,6 +6,10 @@ use crate::sql::analyzer::types::{
 use crate::sql::error::SqlError;
 use crate::sql::optimizer::physical_plan::{Db9CopOp, Db9CopScan};
 use crate::sql::ScanType;
+use crate::{
+    pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope},
+    sql::memory::estimate_row_size,
+};
 use anyhow::{anyhow, Context, Result};
 use prost::Message;
 use std::sync::LazyLock;
@@ -17,8 +21,8 @@ use tikv_client::BoundRange;
 const DB9_COP_CODEC_VERSION: u32 = 1;
 // Must stay aligned with the engine-side REQ_TYPE_DB9_DAG contract.
 const DB9_COP_REQUEST_TYPE_DAG: i64 = 10_001;
-const DEFAULT_DB9_COP_MAX_BUFFERED_ROWS: usize = 50_000;
 const DB9_JSONB_BINARY_MAGIC: &[u8] = b"\0db9jb1";
+const DB9_COP_BUFFER_COMPONENT: &str = "storage.db9_cop.buffered_rows";
 static DB9_COP_KV_ERROR_MESSAGE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"message: (?:"((?:[^"\\]|\\.)*)"|\\\"((?:[^"\\]|\\.)*)\\\")"#)
         .expect("DB9 cop KV error message regex must compile")
@@ -142,32 +146,10 @@ fn map_db9_coprocessor_rpc_error(err: tikv_client::Error, request_summary: &str)
     }
 }
 
-fn db9_cop_max_buffered_rows() -> usize {
-    std::env::var("DB9_COP_MAX_BUFFERED_ROWS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DB9_COP_MAX_BUFFERED_ROWS)
-}
-
-fn ensure_db9_cop_buffer_limit(
-    buffered_rows: usize,
-    next_chunk_rows: usize,
-    max_rows: usize,
-    request_summary: &str,
-) -> Result<()> {
-    let total_rows = buffered_rows
-        .checked_add(next_chunk_rows)
-        .ok_or_else(|| anyhow!("DB9 cop buffered row count overflowed for {request_summary}"))?;
-    if total_rows > max_rows {
-        return Err(anyhow!(
-            "DB9 cop buffered row limit exceeded for {request_summary}: {total_rows} rows exceeds limit {max_rows}; reduce result size or set DB9_COP_MAX_BUFFERED_ROWS to raise the cap"
-        ));
-    }
-    Ok(())
-}
-
 impl TikvStore {
+    /// Execute a DB9 coprocessor request and return buffered rows plus the bytes
+    /// charged against the current statement memory scope. The caller owns that
+    /// charge and must release it when the buffer is dropped.
     pub async fn cop_select(
         &self,
         txn: &mut Transaction,
@@ -176,7 +158,7 @@ impl TikvStore {
         scan: &Db9CopScan,
         ops: &[Db9CopOp],
         output_schema: &TableSchema,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<(Vec<Row>, usize)> {
         let request = build_db9_dag_request(db_id, table_schema, scan, ops).with_context(|| {
             format!(
                 "failed to build {}",
@@ -190,7 +172,6 @@ impl TikvStore {
             )
         })?;
         let request_summary = summarize_db9_request(db_id, table_schema, scan, ops, ranges.len());
-        let max_buffered_rows = db9_cop_max_buffered_rows();
         let responses = txn
             .coprocessor(
                 DB9_COP_REQUEST_TYPE_DAG,
@@ -199,49 +180,64 @@ impl TikvStore {
             )
             .await
             .map_err(|err| map_db9_coprocessor_rpc_error(err, &request_summary))?;
-        decode_db9_select_chunks(
-            responses,
-            output_schema,
-            max_buffered_rows,
-            &request_summary,
-        )
+        decode_db9_select_chunks(responses, output_schema, &request_summary)
     }
 }
 
 fn decode_db9_select_chunks<I, R>(
     responses: I,
     output_schema: &TableSchema,
-    max_buffered_rows: usize,
     request_summary: &str,
-) -> Result<Vec<Row>>
+) -> Result<(Vec<Row>, usize)>
 where
     I: IntoIterator<Item = (R, Vec<u8>)>,
 {
     let mut rows = Vec::new();
+    let mut charged_bytes = 0usize;
 
     for (chunk_index, (_meta, data)) in responses.into_iter().enumerate() {
-        let response = decode_db9_select_response(&data).with_context(|| {
-            format!(
-                "failed to decode DB9 cop response chunk {} for {}",
-                chunk_index, request_summary
-            )
+        let decoded_rows = match decode_db9_select_response(&data)
+            .with_context(|| {
+                format!(
+                    "failed to decode DB9 cop response chunk {} for {}",
+                    chunk_index, request_summary
+                )
+            })
+            .and_then(|response| {
+                decode_db9_rows(response, output_schema).with_context(|| {
+                    format!(
+                        "failed to decode DB9 cop rows from chunk {} for {}",
+                        chunk_index, request_summary
+                    )
+                })
+            }) {
+            Ok(decoded_rows) => decoded_rows,
+            Err(err) => {
+                try_shrink_statement_memory_scope(charged_bytes);
+                return Err(err);
+            }
+        };
+
+        let chunk_bytes = decoded_rows
+            .iter()
+            .try_fold(0usize, |acc, row| acc.checked_add(estimate_row_size(row)))
+            .ok_or_else(|| {
+                try_shrink_statement_memory_scope(charged_bytes);
+                anyhow!("DB9 cop buffered byte count overflowed for {request_summary}")
+            })?;
+        let new_charged_bytes = charged_bytes.checked_add(chunk_bytes).ok_or_else(|| {
+            try_shrink_statement_memory_scope(charged_bytes);
+            anyhow!("DB9 cop buffered byte count overflowed for {request_summary}")
         })?;
-        let decoded_rows = decode_db9_rows(response, output_schema).with_context(|| {
-            format!(
-                "failed to decode DB9 cop rows from chunk {} for {}",
-                chunk_index, request_summary
-            )
-        })?;
-        ensure_db9_cop_buffer_limit(
-            rows.len(),
-            decoded_rows.len(),
-            max_buffered_rows,
-            request_summary,
-        )?;
+        if let Err(err) = try_grow_statement_memory_scope(DB9_COP_BUFFER_COMPONENT, chunk_bytes) {
+            try_shrink_statement_memory_scope(charged_bytes);
+            return Err(err.into());
+        }
+        charged_bytes = new_charged_bytes;
         rows.extend(decoded_rows);
     }
 
-    Ok(rows)
+    Ok((rows, charged_bytes))
 }
 
 fn summarize_db9_request(
@@ -996,6 +992,10 @@ fn db9_cop_value_type_mismatch(actual_kind: &str, expected_type: &DataType) -> a
 mod tests {
     use super::*;
     use crate::model::ColumnDef;
+    use crate::pool::{
+        run_with_statement_memory_scope, try_grow_statement_memory_scope,
+        try_shrink_statement_memory_scope, TenantHandle,
+    };
     use crate::sql::analyzer::types::{AnalyzedProjection, TypedExpr, TypedExprKind};
 
     fn test_schema() -> TableSchema {
@@ -1061,6 +1061,29 @@ mod tests {
         )
     }
 
+    fn encoded_response_with_rows(row_count: usize) -> Vec<u8> {
+        let response = wire::Db9SelectResponse {
+            rows: (0..row_count)
+                .map(|idx| wire::Db9Row {
+                    values: vec![
+                        wire::Db9Value {
+                            kind: Some(db9_value::Kind::Int32Value(idx as i32)),
+                        },
+                        wire::Db9Value {
+                            kind: Some(db9_value::Kind::TextValue(format!("name-{idx}"))),
+                        },
+                    ],
+                })
+                .collect(),
+            stats: None,
+            warnings: vec![],
+        };
+        response.encode_to_vec()
+    }
+
+    fn single_decoded_test_row() -> Row {
+        Row::new(vec![Value::Int32(0), Value::Text("name-0".to_owned())])
+    }
     #[test]
     fn decode_db9_select_response_accepts_empty_payload_as_empty_response() {
         let response = decode_db9_select_response(&[]).expect("empty proto3 payload should decode");
@@ -1097,19 +1120,97 @@ mod tests {
             warnings: vec![],
         };
 
-        let rows = decode_db9_select_chunks(
+        let (rows, charged_bytes) = decode_db9_select_chunks(
             vec![((), Vec::new()), ((), response.encode_to_vec())],
             &schema,
-            db9_cop_max_buffered_rows(),
             "db_id=11 table=public.t#42",
         )
         .expect("mixed empty/non-empty DB9 cop chunks should decode");
 
         assert_eq!(rows.len(), 1);
+        assert!(charged_bytes > 0);
         assert_eq!(
             rows[0].values,
             vec![Value::Int32(7), Value::Text("alpha".to_owned())]
         );
+    }
+
+    #[test]
+    fn decode_db9_select_chunks_allows_more_than_legacy_row_cap() {
+        let schema = test_schema();
+        let row_count = 50_001;
+        let (rows, charged_bytes) = decode_db9_select_chunks(
+            vec![((), encoded_response_with_rows(row_count))],
+            &schema,
+            "db_id=11 table=public.t#42",
+        )
+        .expect("DB9 cop buffering is byte-accounted, not capped by row count");
+
+        assert_eq!(rows.len(), row_count);
+        assert!(charged_bytes >= row_count * std::mem::size_of::<Row>());
+    }
+
+    #[tokio::test]
+    async fn decode_db9_select_chunks_shares_statement_memory_quota() {
+        let schema = test_schema();
+        let existing_executor_bytes = 64usize;
+        let row_bytes = estimate_row_size(&single_decoded_test_row());
+        let handle = TenantHandle::new_with_limits(0, existing_executor_bytes + row_bytes - 1);
+        let accountant = handle.memory_accountant();
+
+        run_with_statement_memory_scope(Some(accountant.clone()), async {
+            try_grow_statement_memory_scope("test.executor.buffer", existing_executor_bytes)
+                .expect("precharge should fit below quota");
+            let err = decode_db9_select_chunks(
+                vec![((), encoded_response_with_rows(1))],
+                &schema,
+                "db_id=11 table=public.t#42",
+            )
+            .expect_err("cop buffer should share and exceed the statement quota");
+            let sql_err = err
+                .downcast_ref::<SqlError>()
+                .expect("quota failures must preserve SqlError");
+            assert_eq!(sql_err.sqlstate(), "53200");
+            assert_eq!(
+                accountant.used_bytes(),
+                existing_executor_bytes,
+                "failed cop buffering must not leak charged bytes"
+            );
+            try_shrink_statement_memory_scope(existing_executor_bytes);
+        })
+        .await;
+
+        assert_eq!(accountant.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn decode_db9_select_chunks_allows_short_result_within_quota() {
+        let schema = test_schema();
+        let existing_executor_bytes = 64usize;
+        let row_bytes = estimate_row_size(&single_decoded_test_row());
+        let handle = TenantHandle::new_with_limits(0, existing_executor_bytes + row_bytes);
+        let accountant = handle.memory_accountant();
+
+        run_with_statement_memory_scope(Some(accountant.clone()), async {
+            try_grow_statement_memory_scope("test.executor.buffer", existing_executor_bytes)
+                .expect("precharge should fit below quota");
+            let (rows, charged_bytes) = decode_db9_select_chunks(
+                vec![((), encoded_response_with_rows(1))],
+                &schema,
+                "db_id=11 table=public.t#42",
+            )
+            .expect("small OLTP-style cop result should fit the shared memory quota");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(charged_bytes, row_bytes);
+            assert_eq!(accountant.used_bytes(), existing_executor_bytes + row_bytes);
+
+            try_shrink_statement_memory_scope(charged_bytes);
+            assert_eq!(accountant.used_bytes(), existing_executor_bytes);
+            try_shrink_statement_memory_scope(existing_executor_bytes);
+        })
+        .await;
+
+        assert_eq!(accountant.used_bytes(), 0);
     }
 
     #[test]
@@ -1549,16 +1650,6 @@ mod tests {
         assert_eq!(
             legacy_utf8_jsonb,
             Value::Jsonb("{\"a\":1,\"b\":2}".to_owned())
-        );
-    }
-
-    #[test]
-    fn ensure_db9_cop_buffer_limit_fails_closed() {
-        let err = ensure_db9_cop_buffer_limit(49_999, 2, 50_000, "db_id=11 table=public.t#42")
-            .expect_err("buffer limit must fail closed");
-        assert!(
-            err.to_string().contains("buffered row limit exceeded"),
-            "unexpected error: {err}"
         );
     }
 
