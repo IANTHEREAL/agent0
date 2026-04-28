@@ -365,7 +365,7 @@ dependencies = [
 [[package]]
 name = "auth9-core"
 version = "0.1.0"
-source = "git+https://github.com/db9-ai/db9-auth?branch=main#fbdb0e595a44f96ae5b6b0625706063bcc45f86b"
+source = "git+https://github.com/db9-ai/db9-auth?branch=main#5fe59f440a6569fbd8203e645d78ebd45e3334f7"
 dependencies = [
  "chrono",
  "moka",

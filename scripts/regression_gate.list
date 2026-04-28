@@ -348,6 +348,16 @@ tests/safety_copy_selfref_fk.py
 # No SQL regression test — internal cache behavior, not observable via SQL.
 # Regression coverage: unit-tests job (cargo test schema_deser_cache_prevents_reparse,
 # jwks_rejects_oversized_key_set, evict_user_tsc_keyspace_removes_all_entries)
+# #2487 / #2507 – auth9-core Phase-4 verify surface (prefix/hash decoupling, tenant_id NOT NULL,
+# service_attributes). No SQL regression test — verify surface is HTTP-mocked, not observable via SQL.
+# Regression coverage: unit-tests job (cargo test auth9_verify_response_missing_tenant_fails_to_deserialize,
+# validate_auth9_verify_response_active_tenant_mismatch_is_denied,
+# validate_auth9_verify_response_active_role_mismatch_is_denied,
+# validate_auth9_verify_response_active_happy_path,
+# validate_auth9_verify_response_inactive_not_found_is_denied,
+# validate_auth9_verify_response_inactive_revoked_is_denied,
+# validate_auth9_verify_response_inactive_not_yet_valid_is_denied,
+# validate_auth9_verify_response_inactive_expired_is_denied)
 [orm]
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts

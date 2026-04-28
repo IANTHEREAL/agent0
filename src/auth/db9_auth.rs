@@ -679,6 +679,7 @@ async fn verify_connect_key_auth9(
 
     let mut req = http_client().post(&verify_url).json(&VerifyRequest {
         credential: connect_key.to_string(),
+        prefix: None,
     });
     if let Some(key) = api_key.as_deref() {
         req = req.header("X-API-Key", key);
@@ -735,19 +736,11 @@ fn validate_auth9_verify_response(
             scope,
             ..
         } => {
-            match resp_tid {
-                None => {
-                    return Err(Db9AuthError::InvalidConnectKey {
-                        reason: "missing tenant_id".to_string(),
-                    });
-                }
-                Some(resp_tid) if resp_tid != tenant_id => {
-                    return Err(Db9AuthError::TenantMismatch {
-                        expected: tenant_id.to_string(),
-                        actual: resp_tid.clone(),
-                    });
-                }
-                Some(_) => {}
+            if resp_tid != tenant_id {
+                return Err(Db9AuthError::TenantMismatch {
+                    expected: tenant_id.to_string(),
+                    actual: resp_tid.clone(),
+                });
             }
             if subject_id != expected_role {
                 return Err(Db9AuthError::RoleMismatch {
@@ -1687,15 +1680,16 @@ JwIDAQAB
         ));
     }
 
-    fn auth9_active(subject_id: &str, tenant_id: Option<&str>) -> VerifyResponse {
+    fn auth9_active(subject_id: &str, tenant_id: &str) -> VerifyResponse {
         VerifyResponse::Active {
             active: true,
             id: "cred_test".to_string(),
             subject_id: subject_id.to_string(),
-            tenant_id: tenant_id.map(str::to_string),
+            tenant_id: tenant_id.to_string(),
             service_id: None,
             scope: None,
             expires_at: None,
+            service_attributes: serde_json::Value::Null,
         }
     }
 
@@ -1747,18 +1741,27 @@ JwIDAQAB
     }
 
     #[test]
-    fn validate_auth9_verify_response_active_missing_tenant_is_denied() {
-        let info = auth9_active("admin", None);
-        let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
-        assert!(matches!(
-            err,
-            Db9AuthError::InvalidConnectKey { reason } if reason == "missing tenant_id"
-        ));
+    fn auth9_verify_response_missing_tenant_fails_to_deserialize() {
+        // Phase-4 (auth9-core #222): tenant_id is NOT NULL on the wire.
+        // Missing tenant_id is now rejected at the deserializer layer, not the validator.
+        let body = r#"{
+            "active": true,
+            "id": "cred_test",
+            "subject_id": "admin",
+            "service_id": null,
+            "scope": null,
+            "expires_at": null
+        }"#;
+        let parsed: Result<VerifyResponse, _> = serde_json::from_str(body);
+        assert!(
+            parsed.is_err(),
+            "missing tenant_id must fail to deserialize"
+        );
     }
 
     #[test]
     fn validate_auth9_verify_response_active_tenant_mismatch_is_denied() {
-        let info = auth9_active("admin", Some("t2"));
+        let info = auth9_active("admin", "t2");
         let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
         assert!(matches!(
             err,
@@ -1769,7 +1772,7 @@ JwIDAQAB
 
     #[test]
     fn validate_auth9_verify_response_active_role_mismatch_is_denied() {
-        let info = auth9_active("alice", Some("t1"));
+        let info = auth9_active("alice", "t1");
         let err = validate_auth9_verify_response(&info, "t1", "admin").unwrap_err();
         assert!(matches!(
             err,
@@ -1780,7 +1783,7 @@ JwIDAQAB
 
     #[test]
     fn validate_auth9_verify_response_active_happy_path() {
-        let info = auth9_active("admin", Some("t1"));
+        let info = auth9_active("admin", "t1");
         validate_auth9_verify_response(&info, "t1", "admin").unwrap();
     }
 
