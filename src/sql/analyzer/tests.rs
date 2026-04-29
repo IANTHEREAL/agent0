@@ -974,6 +974,169 @@ fn analyze_advisory_lock_two_arg_rejects_bigint_bigint() {
     ));
 }
 
+// Regression: #2469 — width_bucket must reject `bigint` count at the analyzer
+// (PG17 publishes no float8/numeric/array overload that takes a bigint count).
+// Prior fix only pinned registry arg types, but the registry coercion path
+// passes non-parameter expressions through, so a bigint count was still
+// accepted and reached the runtime `n as i32` truncation site.
+#[test]
+fn analyze_width_bucket_accepts_int4_count() {
+    let expr =
+        analyze_expr_with_users("width_bucket(5::float8, 0::float8, 10::float8, 4)").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+}
+
+#[test]
+fn analyze_width_bucket_rejects_bigint_count() {
+    let err = analyze_expr_with_users(
+        "width_bucket(5::float8, 0::float8, 10::float8, 4294967297::bigint)",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. }
+            if name.eq_ignore_ascii_case("WIDTH_BUCKET")
+    ));
+}
+
+// Regression: PG17 publishes a width_bucket(numeric, numeric, numeric, int4)
+// overload alongside the float8 form. The dedicated coercer must NOT reject
+// pre-typed Numeric parameters on slots 0-2 (Numeric→Float64 isn't an
+// implicit cast in this codebase, so the prior version errored).
+#[test]
+fn analyze_width_bucket_accepts_numeric_typed_params() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT width_bucket($1, $2, $3, $4)");
+    let mut analyzer = Analyzer::new_with_params(
+        &catalog,
+        4,
+        &[
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None,
+            }),
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None,
+            }),
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None,
+            }),
+            Some(DataType::Int32),
+        ],
+    );
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        types,
+        vec![
+            DataType::Numeric {
+                precision: None,
+                scale: None
+            },
+            DataType::Numeric {
+                precision: None,
+                scale: None
+            },
+            DataType::Numeric {
+                precision: None,
+                scale: None
+            },
+            DataType::Int32,
+        ]
+    );
+}
+
+#[test]
+fn analyze_width_bucket_rejects_bigint_typed_count_param() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT width_bucket(5::float8, 0::float8, 10::float8, $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Int64)]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. }
+            if name.eq_ignore_ascii_case("WIDTH_BUCKET")
+    ));
+}
+
+// All-integer literals route to the float8 family (PG's preferred numeric
+// category for integer literals).
+#[test]
+fn analyze_width_bucket_accepts_integer_literal_operands() {
+    let expr = analyze_expr_with_users("width_bucket(5, 0, 10, 4)").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+}
+
+// Non-numeric operand types are not members of either width_bucket overload;
+// must fail name resolution instead of silently coercing through a Cast node.
+#[test]
+fn analyze_width_bucket_rejects_text_typed_param_operand() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT width_bucket($1, 0::float8, 10::float8, 4)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Text)]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. }
+            if name.eq_ignore_ascii_case("WIDTH_BUCKET")
+    ));
+}
+
+#[test]
+fn analyze_width_bucket_rejects_boolean_typed_param_operand() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT width_bucket($1, 0::float8, 10::float8, 4)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Boolean)]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. }
+            if name.eq_ignore_ascii_case("WIDTH_BUCKET")
+    ));
+}
+
+// PG17.7 pg_cast.dat publishes Numeric -> Float64 as an implicit cast, so a
+// mixed numeric + float8 width_bucket call routes to the float8 overload.
+// Both forms below must analyze cleanly, with the Numeric arg coerced to
+// Float64 by the analyzer (not rejected as a missing overload).
+#[test]
+fn analyze_width_bucket_accepts_mixed_float8_and_numeric_typed_params() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT width_bucket($1, $2, 10::float8, 4)");
+    let mut analyzer = Analyzer::new_with_params(
+        &catalog,
+        2,
+        &[
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None,
+            }),
+            Some(DataType::Float64),
+        ],
+    );
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        types,
+        vec![
+            DataType::Numeric {
+                precision: None,
+                scale: None,
+            },
+            DataType::Float64,
+        ]
+    );
+}
+
+#[test]
+fn analyze_width_bucket_accepts_mixed_numeric_float8_literals() {
+    let expr =
+        analyze_expr_with_users("width_bucket(5::numeric, 0::float8, 10::float8, 4)").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+}
+
 #[test]
 fn analyze_generate_subscripts_coerces_dim_and_reverse() {
     let expr = analyze_expr_with_users("generate_subscripts(ARRAY[1,2], '1', 'true')").unwrap();

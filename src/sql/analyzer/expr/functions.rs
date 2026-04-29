@@ -636,6 +636,7 @@ impl<'a> Analyzer<'a> {
             "HTTP_GET" | "HTTP_HEAD" | "HTTP_DELETE" | "HTTP_POST" | "HTTP_PUT" | "HTTP_PATCH"
             | "HTTP" => self.coerce_http_signature(func_name, args),
             "MAKE_INTERVAL" => self.reorder_make_interval_named_args(args, func),
+            "WIDTH_BUCKET" => self.coerce_width_bucket_signature(func_name, args),
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -782,6 +783,109 @@ impl<'a> Analyzer<'a> {
                 name: func_name.to_string(),
                 arg_types,
             });
+        }
+        Ok(coerced)
+    }
+
+    /// Resolve the 4-arg `width_bucket` overload (#2469).
+    ///
+    /// PG17 publishes two 4-arg forms (the 2-arg threshold-array form is a
+    /// separate overload, not handled here):
+    ///
+    /// - `width_bucket(operand float8,  low float8,  high float8,  count int4) -> int4`
+    /// - `width_bucket(operand numeric, low numeric, high numeric, count int4) -> int4`
+    ///
+    /// Family selection from slots 0-2 follows PG17 overload resolution:
+    ///
+    /// - Any `Float64` operand selects the float8 family. PG17.7 `pg_cast.dat`
+    ///   has `numeric -> float8` as an implicit cast, so a mixed numeric +
+    ///   float8 call routes to the float8 overload with the numeric arg
+    ///   coerced via `coerce_if_needed`.
+    /// - Otherwise, any `Numeric` operand selects the numeric family.
+    /// - `Int32` / `Int64` are members of either family and don't drive the
+    ///   choice on their own.
+    /// - Unresolved / `NULL` / `Unknown` impose no constraint (inherit the
+    ///   chosen family).
+    /// - Anything else (Text, Boolean, Date, ...) fails name resolution.
+    /// - All-integer / all-unresolved defaults to float8 (PG's preferred
+    ///   numeric category for integer literals).
+    ///
+    /// Slot 3 is strictly `Int32`. A non-parameter `Int64` (or any other
+    /// concrete non-integer type) is rejected -- that was the original
+    /// #2469 silent-truncation surface.
+    fn coerce_width_bucket_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 4 {
+            return Ok(args);
+        }
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let nf_err = || AnalyzerError::FunctionNotFound {
+            name: func_name.to_string(),
+            arg_types: arg_types.clone(),
+        };
+
+        // Pass 1 — classify slots 0-2. Float8 wins over Numeric (mixed call
+        // routes to the float8 overload via the implicit numeric -> float8
+        // cast that PG17.7 publishes).
+        let mut saw_float8 = false;
+        let mut saw_numeric = false;
+        for arg in args.iter().take(3) {
+            if self.is_unresolved_param(arg)
+                || arg.is_null_constant()
+                || arg.data_type == DataType::Unknown
+            {
+                continue;
+            }
+            match &arg.data_type {
+                DataType::Float64 => saw_float8 = true,
+                DataType::Numeric { .. } => saw_numeric = true,
+                DataType::Int32 | DataType::Int64 => {}
+                _ => return Err(nf_err()),
+            }
+        }
+        let target_operand = if saw_float8 {
+            DataType::Float64
+        } else if saw_numeric {
+            DataType::Numeric {
+                precision: None,
+                scale: None,
+            }
+        } else {
+            // All-integer / all-unresolved → float8 (PG preferred category).
+            DataType::Float64
+        };
+
+        // Pass 2 — coerce. Slots 0-2 are guaranteed compatible by pass 1.
+        let mut coerced = Vec::with_capacity(4);
+        let mut iter = args.into_iter();
+        for _ in 0..3 {
+            let arg = iter.next().unwrap();
+            if arg.data_type == target_operand {
+                coerced.push(arg);
+            } else {
+                coerced.push(self.coerce_if_needed(arg, &target_operand)?);
+            }
+        }
+
+        // Slot 3 — strict Int32.
+        let arg = iter.next().unwrap();
+        let target_count = DataType::Int32;
+        let count_ok = arg.data_type == target_count
+            || self.is_unresolved_param(&arg)
+            || arg.is_null_constant()
+            || arg.data_type == DataType::Unknown
+            || (matches!(arg.kind, TypedExprKind::Parameter { .. })
+                && is_implicitly_compatible(&arg.data_type, &target_count));
+        if !count_ok {
+            return Err(nf_err());
+        }
+        if arg.data_type == target_count {
+            coerced.push(arg);
+        } else {
+            coerced.push(self.coerce_if_needed(arg, &target_count)?);
         }
         Ok(coerced)
     }

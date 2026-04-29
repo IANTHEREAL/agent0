@@ -193,8 +193,21 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "LEAST",
         FunctionSignature::same_as_arg(0).with_args(1, None),
     );
+    // PG17 publishes two 4-arg width_bucket overloads:
+    //   width_bucket(float8,  float8,  float8,  int4) → int4
+    //   width_bucket(numeric, numeric, numeric, int4) → int4
+    // (plus the unrelated 2-arg threshold-array form). Family selection
+    // happens in `coerce_width_bucket_signature` in the analyzer (#2469);
+    // we only register the float8 form here. The arg_types drive PREPARE
+    // inference for the all-untyped-params case (which the analyzer
+    // defaults to float8 anyway).
+    //
+    // Catalog visibility for the numeric overload via pg_proc tracks #2486
+    // (polymorphic / second-overload coverage); not in scope for #2469.
     r.register(
         "WIDTH_BUCKET",
-        FunctionSignature::fixed(DataType::Int32).with_args(4, Some(4)),
+        FunctionSignature::fixed(DataType::Int32)
+            .with_args(4, Some(4))
+            .with_arg_types(vec![f64.clone(), f64.clone(), f64.clone(), DataType::Int32]),
     );
 }
