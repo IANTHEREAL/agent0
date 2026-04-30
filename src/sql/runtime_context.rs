@@ -1,4 +1,5 @@
 use crate::sql::Session;
+use crate::storage::TikvStore;
 use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
@@ -56,15 +57,39 @@ pub(crate) struct StatementRuntimeContext {
     pub txn_dirty_table_ids: Arc<crate::session_context::TxnDirtyTableIds>,
     pub session_txn_tracker: Option<Arc<crate::session_context::SessionTxnTracker>>,
     pub tikv_client: Option<Arc<TransactionClient>>,
+    pub pd_endpoints: Arc<[String]>,
     pub extension_txn_delta: Arc<crate::session_context::ExtensionTxnDelta>,
     pub extension_statement_state: Arc<crate::extensions::context::ExtensionStatementState>,
 }
 
 impl StatementRuntimeContext {
+    #[cfg(test)]
     pub(crate) fn from_session(
         session: &Session,
         tenant_keyspace: &str,
         tikv_client: Option<Arc<TransactionClient>>,
+    ) -> Self {
+        Self::from_session_parts(session, tenant_keyspace, tikv_client, Arc::from([]))
+    }
+
+    pub(crate) fn from_session_with_store(
+        session: &Session,
+        tenant_keyspace: &str,
+        store: &TikvStore,
+    ) -> Self {
+        Self::from_session_parts(
+            session,
+            tenant_keyspace,
+            store.transaction_client(),
+            Arc::from(store.pd_endpoints().to_vec()),
+        )
+    }
+
+    fn from_session_parts(
+        session: &Session,
+        tenant_keyspace: &str,
+        tikv_client: Option<Arc<TransactionClient>>,
+        pd_endpoints: Arc<[String]>,
     ) -> Self {
         Self {
             settings: RuntimeSettings::from_session(session),
@@ -76,6 +101,7 @@ impl StatementRuntimeContext {
             txn_dirty_table_ids: session.transaction_dirty_table_ids_snapshot(),
             session_txn_tracker: session.session_txn_tracker(),
             tikv_client,
+            pd_endpoints,
             extension_txn_delta: session.extension_delta_snapshot(),
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
@@ -127,6 +153,7 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                             )
                             .with_in_transaction(runtime.is_in_transaction)
                             .with_caller_sub(runtime.caller_sub.clone())
+                            .with_pd_endpoints(runtime.pd_endpoints.clone())
                             .with_statement_state(extension_statement_state)
                             .with_tikv_client(tikv_client),
                             fut,
@@ -325,6 +352,7 @@ mod tests {
             txn_dirty_table_ids: Arc::new(HashSet::from([88_u64])),
             session_txn_tracker: None,
             tikv_client: None,
+            pd_endpoints: Arc::from(["pd1:2379".to_string(), "pd2:2379".to_string()]),
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
@@ -338,6 +366,9 @@ mod tests {
             let tenant = crate::extensions::context::tenant_keyspace().unwrap_or_default();
             let tsc = crate::session_context::current_text_search_config();
             let db_id = crate::session_context::current_database_id();
+            let pd_endpoints = crate::extensions::context::pd_endpoints()
+                .map(|endpoints| endpoints.to_vec())
+                .unwrap_or_default();
             let txn_ts = crate::session_context::current_txn_snapshot_ts_version();
             let dirty_tables = crate::session_context::current_txn_dirty_table_ids();
             crate::session_context::record_statement_dirty_table_id(99);
@@ -350,6 +381,7 @@ mod tests {
                 tenant,
                 tsc,
                 db_id,
+                pd_endpoints,
                 txn_ts,
                 dirty_tables,
                 statement_dirty_tables,
@@ -363,9 +395,10 @@ mod tests {
         assert_eq!(out.3, "tenant_a");
         assert_eq!(out.4.as_ref(), "simple");
         assert_eq!(out.5, 42);
-        assert_eq!(out.6, Some(999));
-        assert_eq!(&*out.7, &HashSet::from([88_u64]));
-        assert_eq!(out.8, HashSet::from([99_u64]));
+        assert_eq!(out.6, vec!["pd1:2379".to_string(), "pd2:2379".to_string()]);
+        assert_eq!(out.7, Some(999));
+        assert_eq!(&*out.8, &HashSet::from([88_u64]));
+        assert_eq!(out.9, HashSet::from([99_u64]));
     }
 
     #[test]
@@ -417,6 +450,7 @@ mod tests {
             txn_dirty_table_ids: Arc::new(HashSet::new()),
             session_txn_tracker: None,
             tikv_client: None,
+            pd_endpoints: Arc::from([]),
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
@@ -461,6 +495,7 @@ mod tests {
             txn_dirty_table_ids: Arc::new(HashSet::new()),
             session_txn_tracker: None,
             tikv_client: None,
+            pd_endpoints: Arc::from([]),
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),

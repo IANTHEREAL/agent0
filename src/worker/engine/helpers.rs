@@ -103,11 +103,16 @@ pub(super) fn background_statement_extension_context(
     is_cron: bool,
     keyspace: &str,
     tikv_client: Option<Arc<tikv_client::TransactionClient>>,
+    pd_endpoints: Arc<[String]>,
 ) -> ExtensionContextOpts {
     if is_cron {
-        ExtensionContextOpts::cron(keyspace).with_tikv_client(tikv_client)
+        ExtensionContextOpts::cron(keyspace)
+            .with_pd_endpoints(pd_endpoints)
+            .with_tikv_client(tikv_client)
     } else {
-        ExtensionContextOpts::statement(true, true, keyspace).with_tikv_client(tikv_client)
+        ExtensionContextOpts::statement(true, true, keyspace)
+            .with_pd_endpoints(pd_endpoints)
+            .with_tikv_client(tikv_client)
     }
 }
 

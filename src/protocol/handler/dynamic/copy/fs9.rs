@@ -255,11 +255,12 @@ impl DynamicPgHandler {
             let statement_ts = chrono::Utc::now().timestamp_millis();
             let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
             let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
-            let runtime = crate::sql::runtime_context::StatementRuntimeContext::from_session(
-                &session,
-                executor.tenant_keyspace(),
-                executor.store().transaction_client(),
-            );
+            let runtime =
+                crate::sql::runtime_context::StatementRuntimeContext::from_session_with_store(
+                    &session,
+                    executor.tenant_keyspace(),
+                    &executor.store(),
+                );
 
             // Read file bytes from fs9 backend under the same statement runtime
             // contract as the later COPY insert work, so extension context
@@ -664,11 +665,12 @@ impl DynamicPgHandler {
 
             // Delegate streaming import to Executor under the same statement
             // runtime context contract as regular statements and COPY STDIN.
-            let runtime = crate::sql::runtime_context::StatementRuntimeContext::from_session(
-                &session,
-                executor.tenant_keyspace(),
-                executor.store().transaction_client(),
-            );
+            let runtime =
+                crate::sql::runtime_context::StatementRuntimeContext::from_session_with_store(
+                    &session,
+                    executor.tenant_keyspace(),
+                    &executor.store(),
+                );
             let (row_count, dirty_table_ids) =
                 crate::sql::query_context::with_scoped_query_context(
                     &qctx,

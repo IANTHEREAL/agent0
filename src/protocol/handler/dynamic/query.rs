@@ -727,10 +727,10 @@ impl DynamicPgHandler {
                 };
 
             let runtime_context =
-                crate::sql::runtime_context::StatementRuntimeContext::from_session(
+                crate::sql::runtime_context::StatementRuntimeContext::from_session_with_store(
                     &session,
                     executor.tenant_keyspace(),
-                    executor.store().transaction_client(),
+                    &executor.store(),
                 );
 
             let col_count = resolved_columns.len();
@@ -1090,6 +1090,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 bypass_rls,
                 &tenant_keyspace,
             )
+            .with_pd_endpoints(Arc::from(store.pd_endpoints().to_vec()))
             .with_tikv_client(tikv_client);
 
             // Temporary read-only transaction for catalog access

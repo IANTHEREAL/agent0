@@ -136,10 +136,10 @@ impl Executor {
                 }
             }
             let start = Instant::now();
-            let runtime = StatementRuntimeContext::from_session(
+            let runtime = StatementRuntimeContext::from_session_with_store(
                 session,
                 self.tenant_keyspace(),
-                self.store.transaction_client(),
+                &self.store,
             );
             let mut stmt_exec: Result<Vec<ExecuteResult>> =
                 wrap_with_statement_runtime_context(&runtime, async {

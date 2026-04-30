@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_is_overload_error_grpc_transport() {
-        // Grpc variant wraps tonic::transport::Error — always overload.
+        // TiKV gRPC transport failures are always treated as overload.
         let err = tikv_client::Error::StringError("not overload".into());
         assert!(!is_overload_error(&err));
     }

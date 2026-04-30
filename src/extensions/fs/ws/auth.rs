@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
-use crate::extensions::fs::backend::FsBackend;
+use crate::extensions::fs::backend::{ensure_embedded_backend_bootstrap_allowed, FsBackend};
 use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
@@ -245,33 +245,27 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    let effective_backend =
-        crate::extensions::fs::backend::resolve_backend_type_for_ws(&client, &keyspace).await;
+    ensure_embedded_backend_bootstrap_allowed(&client, &keyspace, Some(pool.pd_endpoints()))
+        .await
+        .map_err(|err| {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("failed to initialize fs backend: {err}"),
+            )
+        })?;
 
-    let backend: Arc<dyn FsBackend> = match effective_backend {
-        crate::extensions::fs::config::Fs9BackendType::JuiceFs => Arc::new(
-            crate::extensions::fs::grpc::GrpcFsBackend::new(&keyspace)
-                .await
-                .map_err(|err| {
-                    WsResponse::error(
-                        id,
-                        WsErrorCode::Eio,
-                        format!("failed to initialize gRPC fs backend: {err}"),
-                    )
-                })?,
-        ),
-        _ => Arc::new(
-            EmbeddedFsBackend::new(client, keyspace.clone())
-                .await
-                .map_err(|err| {
-                    WsResponse::error(
-                        id,
-                        WsErrorCode::Eio,
-                        format!("failed to initialize fs backend: {err}"),
-                    )
-                })?,
-        ),
-    };
+    let backend: Arc<dyn FsBackend> = Arc::new(
+        EmbeddedFsBackend::new(client, keyspace.clone())
+            .await
+            .map_err(|err| {
+                WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("failed to initialize fs backend: {err}"),
+                )
+            })?,
+    );
 
     Ok(WsSession {
         _tenant_handle: tenant_handle,

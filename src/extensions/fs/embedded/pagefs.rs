@@ -4503,25 +4503,6 @@ pub(crate) struct FsStorageStats {
     pub total_logical_bytes: i64,
 }
 
-/// Does this tenant keyspace contain ANY embedded fs9 data (any
-/// key under `_fs_`), regardless of whether a recognized superblock
-/// is present?
-///
-/// Mirrors the re-init guard at [`load_or_init_superblock`] / [`fs_keyspace_is_empty`]:
-/// if there's any fs9 metadata, the keyspace belongs to the embedded
-/// backend (even if the superblock is a legacy/unrecognized format)
-/// and must not be silently re-routed. Callers outside `pagefs` should
-/// treat this as the single source of truth for "is this tenant
-/// embedded?" — do NOT re-derive by checking individual keys like
-/// `_fs_S`, which miss corrupt / partially-initialized keyspaces.
-pub(crate) async fn probe_keyspace_has_embedded_data(
-    client: &Arc<TransactionClient>,
-) -> Result<bool> {
-    let mut txn = begin_read_transaction(client).await?;
-    let empty = fs_keyspace_is_empty(&mut txn).await?;
-    Ok(!empty)
-}
-
 /// Non-initializing, validated superblock probe.
 ///
 /// Returns `Ok(Some(superblock))` if the filesystem is fully initialized

@@ -95,6 +95,7 @@ pub(crate) struct CommentRecord {
 pub struct TikvStore {
     client: Option<Arc<TransactionClient>>,
     keyspace: Option<String>,
+    pd_endpoints: Vec<String>,
 }
 
 impl TikvStore {
@@ -115,6 +116,10 @@ impl TikvStore {
     /// Returns the keyspace this store is scoped to.
     pub fn keyspace(&self) -> Option<&str> {
         self.keyspace.as_deref()
+    }
+
+    pub fn pd_endpoints(&self) -> &[String] {
+        &self.pd_endpoints
     }
 
     pub async fn new_with_keyspace(
@@ -139,6 +144,7 @@ impl TikvStore {
             info!("TiKV TLS enabled: ca={}, cert={}, key={}", ca, cert, key);
             config = config.with_security(ca, cert, key);
         }
+        let store_pd_endpoints = pd_endpoints.clone();
         let client = TransactionClient::new_with_config(pd_endpoints, config)
             .await
             .context("Failed to connect to TiKV")?;
@@ -146,6 +152,7 @@ impl TikvStore {
         let store = Self {
             client: Some(Arc::new(client)),
             keyspace: keyspace.clone(),
+            pd_endpoints: store_pd_endpoints,
         };
 
         store.check_format_version().await?;
@@ -177,12 +184,14 @@ impl TikvStore {
             config = config.with_security(ca, cert, key);
         }
 
+        let store_pd_endpoints = pd_endpoints.clone();
         let client = TransactionClient::new_with_config(pd_endpoints, config)
             .await
             .context("Failed to connect to TiKV")?;
         let store = Self {
             client: Some(Arc::new(client)),
             keyspace: Some(keyspace.to_string()),
+            pd_endpoints: store_pd_endpoints,
         };
 
         store.check_format_version().await?;
@@ -199,6 +208,7 @@ impl TikvStore {
             Arc::new(Self {
                 client: None,
                 keyspace: None,
+                pd_endpoints: Vec::new(),
             })
         })
         .clone()

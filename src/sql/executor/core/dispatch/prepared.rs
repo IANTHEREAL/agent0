@@ -307,10 +307,10 @@ impl Executor {
         qctx: &'a crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
-        let runtime = StatementRuntimeContext::from_session(
+        let runtime = StatementRuntimeContext::from_session_with_store(
             session,
             self.tenant_keyspace(),
-            self.store.transaction_client(),
+            &self.store,
         );
         let execute_future: Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> =
             Box::pin(self.execute_prepared_autocommit(

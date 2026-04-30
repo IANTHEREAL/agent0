@@ -11,7 +11,6 @@ pub(crate) mod config;
 pub(crate) mod decoders;
 pub(crate) mod embedded;
 pub(crate) mod glob;
-pub(crate) mod grpc;
 pub(crate) mod notify;
 pub(crate) mod redis_events;
 pub(crate) mod s3;
@@ -21,10 +20,6 @@ pub(crate) mod streaming;
 pub(crate) mod termination_guard;
 pub(crate) mod upload_token;
 pub(crate) mod ws;
-
-// Re-export EmbeddedFsError as FsError for use by both embedded and gRPC backends.
-// New code should use FsError. Old code will be migrated in a separate PR.
-pub(crate) use embedded::types::EmbeddedFsError as FsError;
 
 mod directory;
 mod file_stream;

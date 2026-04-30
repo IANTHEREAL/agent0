@@ -4,7 +4,6 @@ FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 RUN dpkg --add-architecture arm64 && \
     apt-get update && apt-get install -y \
     cmake \
-    protobuf-compiler \
     pkg-config \
     gcc-aarch64-linux-gnu \
     g++-aarch64-linux-gnu \
@@ -36,7 +35,6 @@ COPY .cargo ./.cargo
 COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
-COPY proto ./proto
 
 # Build args for version info (no .git in Docker context)
 ARG BUILD_GIT_HASH=""
