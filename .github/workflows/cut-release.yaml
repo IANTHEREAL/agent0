@@ -1,0 +1,17 @@
+name: cut-release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  cut-release:
+    name: Cut Release Branch From Main
+    uses: db9-ai/sys9-build/.github/workflows/_sys9-cut-release.yml@main
+    permissions:
+      contents: write
+    with:
+      version_file: VERSION

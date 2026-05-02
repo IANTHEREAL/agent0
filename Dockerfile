@@ -1,68 +1,60 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-arch image for db9-server.
+#
+# This Dockerfile is invoked once per target architecture by the Sys9
+# `_sys9-dev-image.yml` reusable workflow, on a runner that natively
+# matches the target arch (`arc-runner-amd64-c6i-xl` for linux/amd64,
+# `arc-runner-arm64-c7g-xl` for linux/arm64). `$BUILDPLATFORM` therefore
+# equals `$TARGETPLATFORM` in every build, so no cross-compilation
+# toolchain is needed — cargo builds for the host triple directly.
+
 FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 
-# Add arm64 architecture and install cross-compilation toolchain
-RUN dpkg --add-architecture arm64 && \
-    apt-get update && apt-get install -y \
-    cmake \
-    pkg-config \
-    gcc-aarch64-linux-gnu \
-    g++-aarch64-linux-gnu \
-    libc6-dev-arm64-cross \
-    libssl-dev:arm64 \
-    libclang-dev \
-    libicu-dev:arm64 \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        pkg-config \
+        libclang-dev \
+        libssl-dev \
+        libicu-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Add arm64 target
-RUN rustup target add aarch64-unknown-linux-gnu
-
-# Configure cross-compilation
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
-    OPENSSL_DIR=/usr \
-    OPENSSL_INCLUDE_DIR=/usr/include/aarch64-linux-gnu \
-    OPENSSL_LIB_DIR=/usr/lib/aarch64-linux-gnu \
-    PKG_CONFIG_ALLOW_CROSS=1 \
-    PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
-    PKG_CONFIG_SYSROOT_DIR=/
 
 WORKDIR /app
 
-# Copy everything needed for build
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY .cargo ./.cargo
 COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
 
-# Build args for version info (no .git in Docker context)
 ARG BUILD_GIT_HASH=""
 ARG BUILD_DATE=""
-ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
-ENV BUILD_DATE=${BUILD_DATE}
+ENV BUILD_GIT_HASH=${BUILD_GIT_HASH} \
+    BUILD_DATE=${BUILD_DATE}
 
 # `db9-server` depends on `auth9-core`, which lives in the private
-# `db9-ai/db9-auth` repo. Cargo needs HTTPS credentials to clone it during
-# dep resolution. The CI workflow in `db9-ai/db9-build/_image-package.yml`
-# forwards `cross_repo_token` to BuildKit via `secrets: gh_token=...`;
-# mount it here only for this RUN step so the token never lands in any
-# image layer. Clear the config afterwards for belt-and-suspenders.
+# `db9-ai/db9-auth` repo. Cargo needs HTTPS credentials to clone it
+# during dep resolution. The CD workflow forwards the token via the
+# `_sys9-dev-image.yml` `secrets.build_secrets` input as
+# `gh_token=${{ secrets.CROSS_REPO_TOKEN }}`. Mount it for this single
+# RUN; clear the config afterwards so no token survives the layer.
 RUN --mount=type=secret,id=gh_token,required=true \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
     git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" \
-    && cargo build --release --target aarch64-unknown-linux-gnu \
+    && cargo build --release \
+    && cp target/release/db9-server /usr/local/bin/db9-server \
     && git config --global --unset url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf
 
-# Runtime stage (arm64)
-FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
-    libssl3 \
-    ca-certificates \
-    libicu72 \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 \
+        ca-certificates \
+        libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9-server /usr/local/bin/db9-server
+COPY --from=builder /usr/local/bin/db9-server /usr/local/bin/db9-server
 
 EXPOSE 5433
 

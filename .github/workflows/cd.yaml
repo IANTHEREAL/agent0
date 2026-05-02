@@ -1,0 +1,27 @@
+name: cd
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-dev-image:
+    name: Publish Dev ECR Image
+    uses: db9-ai/sys9-build/.github/workflows/_sys9-dev-image.yml@main
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      dev_ecr_registry: "052750482888.dkr.ecr.us-west-2.amazonaws.com"
+      dev_ecr_repository: sys9/db9
+      dev_aws_role_arn: arn:aws:iam::052750482888:role/sys9-account-shared-artifacts-mirror-sync
+      dev_aws_allowed_account_ids: "052750482888"
+      version_file: VERSION
+      dockerfile: ./Dockerfile
+      build_context: .
+    secrets:
+      build_secrets: |
+        gh_token=${{ secrets.CROSS_REPO_TOKEN }}

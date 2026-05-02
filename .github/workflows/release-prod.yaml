@@ -1,0 +1,32 @@
+name: release-prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Existing rc-* tag in Dev ECR to publish to production."
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-prod:
+    name: Publish Release Image To Prod ECR
+    uses: db9-ai/sys9-build/.github/workflows/_sys9-release-prod.yml@main
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      source_tag: ${{ inputs.source_tag }}
+      dev_ecr_registry: "052750482888.dkr.ecr.us-west-2.amazonaws.com"
+      dev_ecr_repository: sys9/db9
+      dev_aws_role_arn: arn:aws:iam::052750482888:role/sys9-account-shared-artifacts-mirror-sync
+      dev_aws_allowed_account_ids: "052750482888"
+      prod_aws_region: ${{ vars.PROD_AWS_REGION || 'us-west-2' }}
+      prod_ecr_registry: ${{ vars.PROD_ECR_REGISTRY }}
+      prod_ecr_repository: ${{ vars.PROD_ECR_REPOSITORY || 'sys9/db9' }}
+      version_file: VERSION
+    secrets:
+      prod_aws_role_arn: ${{ secrets.PROD_AWS_ROLE_ARN }}

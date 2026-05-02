@@ -1,0 +1,12 @@
+target/
+.git/
+**/node_modules/
+orm-tests/node_modules/
+docs/
+**/*.md
+.github/
+tests/
+scripts/
+.vscode/
+.idea/
+*.log
