@@ -15,10 +15,24 @@ jobs:
       contents: read
       id-token: write
     with:
-      dev_ecr_registry: "052750482888.dkr.ecr.us-west-2.amazonaws.com"
-      dev_ecr_repository: sys9/db9
-      dev_aws_role_arn: arn:aws:iam::052750482888:role/sys9-account-shared-artifacts-mirror-sync
-      dev_aws_allowed_account_ids: "052750482888"
+      aws_region: us-west-2
+      registry_targets: |
+        [
+          {
+            "name": "dev",
+            "registry": "052750482888.dkr.ecr.us-west-2.amazonaws.com",
+            "repository": "sys9/db9",
+            "role_arn": "arn:aws:iam::052750482888:role/sys9-account-shared-artifacts-mirror-sync",
+            "allowed_account_ids": "052750482888"
+          },
+          {
+            "name": "deployment",
+            "registry": "274703560910.dkr.ecr.us-west-2.amazonaws.com",
+            "repository": "sys9/db9",
+            "role_arn": "arn:aws:iam::274703560910:role/CICD-Deployment-Role",
+            "allowed_account_ids": "274703560910"
+          }
+        ]
       version_file: VERSION
       dockerfile: ./Dockerfile
       build_context: .
