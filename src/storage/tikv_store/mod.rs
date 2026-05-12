@@ -218,6 +218,51 @@ impl TikvStore {
         tikv_op!(self.client().begin_with_options(options).await).map_err(|e| anyhow!(e))
     }
 
+    /// Begin a pessimistic transaction wrapped in the storage facade.
+    ///
+    /// Additive helper introduced in PR-1 (#2524) — the existing
+    /// [`TikvStore::begin`] still returns the concrete TiKV transaction so
+    /// PR-1 lands with no behavior change for current callers. PR-2 (#20)
+    /// performs the call-site migration.
+    #[allow(dead_code)] // Surface introduced in PR-1; first caller arrives in PR-2.
+    pub async fn begin_facade(&self) -> Result<crate::storage::facade::StorageTxn> {
+        let txn = self.begin().await?;
+        Ok(crate::storage::facade::StorageTxn::from_tikv(txn))
+    }
+
+    /// Begin an optimistic transaction wrapped in the storage facade. See
+    /// [`Self::begin_facade`] for the migration policy.
+    #[allow(dead_code)] // Surface introduced in PR-1; first caller arrives in PR-2.
+    pub async fn begin_optimistic_facade(&self) -> Result<crate::storage::facade::StorageTxn> {
+        let txn = self.begin_optimistic().await?;
+        Ok(crate::storage::facade::StorageTxn::from_tikv(txn))
+    }
+
+    /// Open a snapshot at the given timestamp, wrapped in the storage facade.
+    #[allow(dead_code)] // Surface introduced in PR-1; first caller arrives in PR-2.
+    pub fn snapshot_facade(
+        &self,
+        timestamp: tikv_client::Timestamp,
+    ) -> crate::storage::facade::StorageSnapshot {
+        use tikv_client::TimestampExt;
+        let read_ts_version = timestamp.version();
+        let snap = self
+            .client()
+            .snapshot(timestamp, TransactionOptions::new_optimistic());
+        crate::storage::facade::StorageSnapshot::from_tikv(snap, read_ts_version)
+    }
+
+    /// Return the storage facade view of this store.
+    ///
+    /// PR-1 returns the TiKV variant. PR-3 (#21) will introduce the memory
+    /// variant under the `mock-storage` feature flag.
+    #[allow(dead_code)] // Surface introduced in PR-1; first caller arrives in PR-2.
+    pub fn storage_client(&self) -> Option<crate::storage::facade::StorageClient> {
+        self.client
+            .clone()
+            .map(crate::storage::facade::StorageClient::Tikv)
+    }
+
     /// Perform a single-key read/modify/write in its own auto-committed transaction.
     ///
     /// This is used to emulate PostgreSQL non-transactional semantics (e.g. sequences),

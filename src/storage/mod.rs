@@ -6,8 +6,17 @@ use std::fmt;
 
 pub(crate) mod backpressure;
 mod encoding;
+pub(crate) mod error;
+pub(crate) mod facade;
 mod kv_stats;
 mod tikv_store;
+
+// Re-export the canonical storage error surface so PR-1.5 (#19) and PR-3 (#21)
+// callers can `use crate::storage::{StorageError, WriteConflictReason}` without
+// reaching through `error::` or `facade::`. PR-1 introduces the surface; first
+// callers arrive in PR-1.5.
+#[allow(unused_imports)]
+pub(crate) use error::{StorageError, WriteConflictReason};
 
 pub(crate) use encoding::{
     decode_pk_from_index_suffix, decode_table_id_from_mutation_key_v2,
