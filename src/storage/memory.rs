@@ -11,19 +11,23 @@
 // land; tests in this module exercise the public fixture surface meanwhile.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tikv_client::KvPair;
 use tokio::sync::{Notify, RwLock};
+use tokio::time::Instant;
 
 use super::facade::{StorageCapabilities, StorageMutation, StorageRange};
 use super::{StorageError, WriteConflictReason};
 
 pub(crate) type TxnId = u64;
+
+const DEFAULT_MEMORY_LOCK_WAIT_TIMEOUT_MS: u64 = 10_000;
 
 /// Shared in-process memory backend state.
 ///
@@ -61,6 +65,13 @@ struct LockTable {
     owners: HashMap<Vec<u8>, TxnId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockAttempt {
+    Acquired,
+    AlreadyOwned,
+    Blocked,
+}
+
 #[derive(Clone, Debug)]
 struct Version {
     commit_ts: u64,
@@ -80,7 +91,7 @@ pub(crate) struct MemoryTxn {
     start_ts: u64,
     optimistic: bool,
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    held_locks: BTreeSet<Vec<u8>>,
+    held_locks: BTreeMap<Vec<u8>, u64>,
     finished: bool,
 }
 
@@ -130,7 +141,9 @@ impl MemoryUniverse {
             keyspace.clear().await;
         }
         self.clock.store(0, Ordering::SeqCst);
-        self.next_txn_id.store(0, Ordering::SeqCst);
+        // Stale transaction handles may still run rollback/drop cleanup after a
+        // fixture reset. Keep transaction IDs monotonic across `clear()` so
+        // stale handles cannot release locks owned by fresh post-reset txns.
         record_keyspace_bytes(0);
         record_active_txns(0);
     }
@@ -178,7 +191,7 @@ impl MemoryClient {
             start_ts,
             optimistic,
             writes: BTreeMap::new(),
-            held_locks: BTreeSet::new(),
+            held_locks: BTreeMap::new(),
             finished: false,
         })
     }
@@ -218,11 +231,11 @@ impl KeyspaceHandle {
         self.active_txn_start_ts.lock().insert(txn_id, start_ts);
     }
 
-    fn release_txn(&self, txn_id: TxnId, held_locks: &BTreeSet<Vec<u8>>) {
+    fn release_txn(&self, txn_id: TxnId, held_locks: &BTreeMap<Vec<u8>, u64>) {
         self.active_txn_start_ts.lock().remove(&txn_id);
         if !held_locks.is_empty() {
             let mut locks = self.locks.lock();
-            for key in held_locks {
+            for key in held_locks.keys() {
                 if locks.owners.get(key) == Some(&txn_id) {
                     locks.owners.remove(key);
                 }
@@ -230,6 +243,43 @@ impl KeyspaceHandle {
         }
         self.lock_notify.notify_waiters();
         record_active_txns(self.active_txn_count());
+    }
+
+    fn release_locks(&self, txn_id: TxnId, keys: &[Vec<u8>]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut locks = self.locks.lock();
+        for key in keys {
+            if locks.owners.get(key) == Some(&txn_id) {
+                locks.owners.remove(key);
+            }
+        }
+        drop(locks);
+        self.lock_notify.notify_waiters();
+    }
+
+    fn try_claim_lock(&self, txn_id: TxnId, key: &[u8]) -> LockAttempt {
+        let mut locks = self.locks.lock();
+        match locks.owners.get(key) {
+            Some(owner) if *owner == txn_id => LockAttempt::AlreadyOwned,
+            Some(_) => LockAttempt::Blocked,
+            None => {
+                locks.owners.insert(key.to_vec(), txn_id);
+                LockAttempt::Acquired
+            }
+        }
+    }
+
+    fn lock_owner(&self, key: &[u8]) -> Option<TxnId> {
+        self.locks.lock().owners.get(key).copied()
+    }
+
+    async fn latest_commit_ts(&self, key: &[u8]) -> u64 {
+        let data = self.data.read().await;
+        data.get(key)
+            .and_then(|versions| versions.last())
+            .map_or(0, |version| version.commit_ts)
     }
 
     fn active_txn_count(&self) -> usize {
@@ -320,9 +370,101 @@ impl MemoryTxn {
         .await
     }
 
+    pub(crate) async fn get_for_update(
+        &mut self,
+        key: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.ensure_open()?;
+        self.ensure_current_epoch()?;
+        self.lock_keys([key.clone()], timeout).await?;
+        let data = self.keyspace.data.read().await;
+        self.ensure_current_epoch()?;
+        Ok(data
+            .get(&key)
+            .and_then(|versions| visible_value_at(versions, u64::MAX)))
+    }
+
+    pub(crate) async fn batch_get_for_update<I>(
+        &mut self,
+        keys: I,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<KvPair>, StorageError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.ensure_open()?;
+        self.ensure_current_epoch()?;
+        let keys: Vec<Vec<u8>> = keys.into_iter().collect();
+        self.lock_keys(keys.clone(), timeout).await?;
+
+        let data = self.keyspace.data.read().await;
+        self.ensure_current_epoch()?;
+        let mut pairs = Vec::new();
+        for key in keys {
+            if let Some(value) = data
+                .get(&key)
+                .and_then(|versions| visible_value_at(versions, u64::MAX))
+            {
+                pairs.push(KvPair::new(key, value));
+            }
+        }
+        Ok(pairs)
+    }
+
+    pub(crate) async fn lock_keys<I>(
+        &mut self,
+        keys: I,
+        timeout: Option<Duration>,
+    ) -> Result<(), StorageError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.ensure_open()?;
+        self.ensure_current_epoch()?;
+        self.acquire_locks(keys, LockWait::Blocking(timeout)).await
+    }
+
+    pub(crate) async fn lock_keys_nowait<I>(&mut self, keys: I) -> Result<(), StorageError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.ensure_open()?;
+        self.ensure_current_epoch()?;
+        self.acquire_locks(keys, LockWait::Nowait).await
+    }
+
+    pub(crate) async fn lock_keys_skip_locked<I>(
+        &mut self,
+        keys: I,
+        max_locks: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>, StorageError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.ensure_open()?;
+        self.ensure_current_epoch()?;
+        let mut locked = Vec::new();
+        let max_locks = max_locks.unwrap_or(usize::MAX);
+        for key in keys {
+            if locked.len() >= max_locks {
+                break;
+            }
+            match self.lock_keys_nowait([key.clone()]).await {
+                Ok(()) => locked.push(key),
+                Err(StorageError::LockNotAvailable) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(locked)
+    }
+
     pub(crate) async fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), StorageError> {
         self.ensure_open()?;
         self.ensure_current_epoch()?;
+        if !self.optimistic {
+            self.lock_keys([key.clone()], None).await?;
+        }
         self.writes.insert(key, Some(value));
         Ok(())
     }
@@ -330,6 +472,9 @@ impl MemoryTxn {
     pub(crate) async fn delete(&mut self, key: Vec<u8>) -> Result<(), StorageError> {
         self.ensure_open()?;
         self.ensure_current_epoch()?;
+        if !self.optimistic {
+            self.lock_keys([key.clone()], None).await?;
+        }
         self.writes.insert(key, None);
         Ok(())
     }
@@ -340,13 +485,125 @@ impl MemoryTxn {
     {
         self.ensure_open()?;
         self.ensure_current_epoch()?;
+        if self.optimistic {
+            for mutation in mutations {
+                self.apply_mutation(mutation);
+            }
+            return Ok(());
+        }
+
+        let mutations: Vec<StorageMutation> = mutations.into_iter().collect();
+        let lock_keys = mutations.iter().map(mutation_key).collect::<Vec<_>>();
+        self.lock_keys(lock_keys, None).await?;
         for mutation in mutations {
-            match mutation {
-                StorageMutation::Put(key, value) => {
-                    self.writes.insert(key, Some(value));
+            self.apply_mutation(mutation);
+        }
+        Ok(())
+    }
+
+    fn apply_mutation(&mut self, mutation: StorageMutation) {
+        match mutation {
+            StorageMutation::Put(key, value) => {
+                self.writes.insert(key, Some(value));
+            }
+            StorageMutation::Delete(key) => {
+                self.writes.insert(key, None);
+            }
+        }
+    }
+
+    async fn acquire_locks<I>(&mut self, keys: I, wait: LockWait) -> Result<(), StorageError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        keys.sort();
+        keys.dedup();
+
+        let deadline = wait.deadline();
+        let mut newly_acquired = Vec::new();
+        for key in keys {
+            match acquire_one_lock(
+                Arc::clone(&self.keyspace),
+                self.txn_id,
+                self.reset_epoch,
+                key.clone(),
+                wait,
+                deadline,
+            )
+            .await
+            {
+                Ok(Some(observed_commit_ts)) => {
+                    self.held_locks.insert(key.clone(), observed_commit_ts);
+                    newly_acquired.push(key);
+                    record_lock_acquired("ok");
                 }
-                StorageMutation::Delete(key) => {
-                    self.writes.insert(key, None);
+                Ok(None) => {}
+                Err(err) => {
+                    self.keyspace.release_locks(self.txn_id, &newly_acquired);
+                    for key in newly_acquired {
+                        self.held_locks.remove(&key);
+                    }
+                    record_lock_acquired(lock_error_outcome(&err));
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_lock_conflicts(&self) -> Result<(), StorageError> {
+        for key in self.writes.keys() {
+            if let Some(owner) = self.keyspace.lock_owner(key) {
+                if owner != self.txn_id {
+                    return Err(StorageError::LockConflict);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_pessimistic_locks(
+        &self,
+        data: &BTreeMap<Vec<u8>, Vec<Version>>,
+    ) -> Result<(), StorageError> {
+        for key in self.writes.keys() {
+            let Some(locked_commit_ts) = self.held_locks.get(key) else {
+                return Err(StorageError::WriteConflict {
+                    reason: WriteConflictReason::Pessimistic,
+                });
+            };
+            if self.keyspace.lock_owner(key) != Some(self.txn_id) {
+                return Err(StorageError::WriteConflict {
+                    reason: WriteConflictReason::Pessimistic,
+                });
+            }
+            let latest_commit_ts = data
+                .get(key)
+                .and_then(|versions| versions.last())
+                .map_or(0, |version| version.commit_ts);
+            if latest_commit_ts > *locked_commit_ts {
+                return Err(StorageError::WriteConflict {
+                    reason: WriteConflictReason::Pessimistic,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_optimistic_conflicts(
+        &self,
+        data: &BTreeMap<Vec<u8>, Vec<Version>>,
+    ) -> Result<(), StorageError> {
+        for key in self.writes.keys() {
+            if let Some(latest) = data.get(key).and_then(|versions| versions.last()) {
+                if latest.commit_ts > self.start_ts {
+                    return Err(StorageError::WriteConflict {
+                        reason: WriteConflictReason::Optimistic,
+                    });
                 }
             }
         }
@@ -381,18 +638,13 @@ impl MemoryTxn {
             return Ok(());
         }
 
+        self.validate_lock_conflicts()?;
         let mut data = self.keyspace.data.write().await;
         self.ensure_current_epoch()?;
         if self.optimistic {
-            for key in self.writes.keys() {
-                if let Some(latest) = data.get(key).and_then(|versions| versions.last()) {
-                    if latest.commit_ts > self.start_ts {
-                        return Err(StorageError::WriteConflict {
-                            reason: WriteConflictReason::Optimistic,
-                        });
-                    }
-                }
-            }
+            self.validate_optimistic_conflicts(&data)?;
+        } else {
+            self.validate_pessimistic_locks(&data)?;
         }
 
         let commit_ts = self.universe.next_ts();
@@ -438,6 +690,118 @@ impl Drop for MemoryTxn {
         if !self.finished {
             self.finish();
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LockWait {
+    Blocking(Option<Duration>),
+    Nowait,
+}
+
+impl LockWait {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            LockWait::Blocking(timeout) => {
+                let timeout = timeout.unwrap_or_else(memory_lock_wait_timeout);
+                Some(Instant::now() + timeout)
+            }
+            LockWait::Nowait => None,
+        }
+    }
+
+    fn is_nowait(self) -> bool {
+        matches!(self, LockWait::Nowait)
+    }
+}
+
+async fn acquire_one_lock(
+    keyspace: Arc<KeyspaceHandle>,
+    txn_id: TxnId,
+    reset_epoch: u64,
+    key: Vec<u8>,
+    wait: LockWait,
+    deadline: Option<Instant>,
+) -> Result<Option<u64>, StorageError> {
+    loop {
+        ensure_keyspace_epoch(&keyspace, reset_epoch, "memory transaction")?;
+        match keyspace.try_claim_lock(txn_id, &key) {
+            LockAttempt::Acquired => {
+                let observed_commit_ts = keyspace.latest_commit_ts(&key).await;
+                ensure_keyspace_epoch(&keyspace, reset_epoch, "memory transaction")?;
+                return Ok(Some(observed_commit_ts));
+            }
+            LockAttempt::AlreadyOwned => return Ok(None),
+            LockAttempt::Blocked if wait.is_nowait() => return Err(StorageError::LockNotAvailable),
+            LockAttempt::Blocked => {}
+        }
+
+        let notified = keyspace.lock_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        match keyspace.try_claim_lock(txn_id, &key) {
+            LockAttempt::Acquired => {
+                let observed_commit_ts = keyspace.latest_commit_ts(&key).await;
+                ensure_keyspace_epoch(&keyspace, reset_epoch, "memory transaction")?;
+                return Ok(Some(observed_commit_ts));
+            }
+            LockAttempt::AlreadyOwned => return Ok(None),
+            LockAttempt::Blocked => {}
+        }
+
+        let Some(deadline) = deadline else {
+            return Err(StorageError::Internal(
+                "memory lock wait deadline missing".to_string(),
+            ));
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(StorageError::LockTimeout);
+        }
+        let wait_for = deadline.saturating_duration_since(now);
+        let wait_started = Instant::now();
+        match tokio::time::timeout(wait_for, notified).await {
+            Ok(()) => record_lock_wait(wait_started.elapsed()),
+            Err(_) => {
+                record_lock_wait(wait_started.elapsed());
+                return Err(StorageError::LockTimeout);
+            }
+        }
+    }
+}
+
+fn ensure_keyspace_epoch(
+    keyspace: &KeyspaceHandle,
+    expected_epoch: u64,
+    handle_name: &'static str,
+) -> Result<(), StorageError> {
+    if keyspace.reset_epoch() != expected_epoch {
+        return Err(StorageError::Internal(format!(
+            "{handle_name} invalidated by fixture reset"
+        )));
+    }
+    Ok(())
+}
+
+fn memory_lock_wait_timeout() -> Duration {
+    std::env::var("DB9_MEMORY_LOCK_WAIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_MEMORY_LOCK_WAIT_TIMEOUT_MS))
+}
+
+fn mutation_key(mutation: &StorageMutation) -> Vec<u8> {
+    match mutation {
+        StorageMutation::Put(key, _) | StorageMutation::Delete(key) => key.clone(),
+    }
+}
+
+fn lock_error_outcome(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::LockNotAvailable => "not_available",
+        StorageError::LockTimeout => "timeout",
+        _ => "error",
     }
 }
 
@@ -558,6 +922,15 @@ fn record_keyspace_bytes(bytes: usize) {
     metrics::gauge!("db9_server_storage_memory_keyspace_bytes").set(bytes as f64);
 }
 
+fn record_lock_acquired(outcome: &'static str) {
+    metrics::counter!("db9_server_storage_memory_lock_acquired_total", "outcome" => outcome)
+        .increment(1);
+}
+
+fn record_lock_wait(duration: Duration) {
+    metrics::histogram!("db9_server_storage_memory_lock_wait_seconds").record(duration);
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -581,8 +954,8 @@ mod tests {
         let client = universe.client_for_keyspace("tenant-a");
         assert_eq!(client.keyspace_name(), "tenant-a");
         assert!(!client.capabilities().supports_db9_cop);
-        assert!(!client.capabilities().supports_get_for_update);
-        assert!(!client.capabilities().supports_lock_skip_locked);
+        assert!(client.capabilities().supports_get_for_update);
+        assert!(client.capabilities().supports_lock_skip_locked);
         assert!(client.capabilities().supports_snapshot_at_ts);
 
         let mut txn = client.begin_optimistic().await.unwrap();
@@ -665,6 +1038,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn universe_clear_prevents_stale_handles_from_releasing_fresh_locks() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut stale_commit = client.begin().await.unwrap();
+        stale_commit
+            .lock_keys_nowait([key(b"commit")])
+            .await
+            .unwrap();
+        let stale_commit_id = stale_commit.txn_id;
+        universe.clear().await;
+        universe.assert_clean();
+
+        let mut fresh_commit = client.begin().await.unwrap();
+        fresh_commit
+            .lock_keys_nowait([key(b"commit")])
+            .await
+            .unwrap();
+        assert_ne!(stale_commit_id, fresh_commit.txn_id);
+        let err = stale_commit.commit().await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Internal(message) if message.contains("fixture reset"))
+        );
+        let mut contender = client.begin().await.unwrap();
+        let err = contender
+            .lock_keys_nowait([key(b"commit")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::LockNotAvailable));
+        contender.rollback().await.unwrap();
+        fresh_commit.rollback().await.unwrap();
+
+        let mut stale_rollback = client.begin().await.unwrap();
+        stale_rollback
+            .lock_keys_nowait([key(b"rollback")])
+            .await
+            .unwrap();
+        let stale_rollback_id = stale_rollback.txn_id;
+        universe.clear().await;
+        universe.assert_clean();
+
+        let mut fresh_rollback = client.begin().await.unwrap();
+        fresh_rollback
+            .lock_keys_nowait([key(b"rollback")])
+            .await
+            .unwrap();
+        assert_ne!(stale_rollback_id, fresh_rollback.txn_id);
+        stale_rollback.rollback().await.unwrap();
+        let mut contender = client.begin().await.unwrap();
+        let err = contender
+            .lock_keys_nowait([key(b"rollback")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::LockNotAvailable));
+        contender.rollback().await.unwrap();
+        fresh_rollback.rollback().await.unwrap();
+
+        let mut stale_drop = client.begin().await.unwrap();
+        stale_drop.lock_keys_nowait([key(b"drop")]).await.unwrap();
+        let stale_drop_id = stale_drop.txn_id;
+        universe.clear().await;
+        universe.assert_clean();
+
+        let mut fresh_drop = client.begin().await.unwrap();
+        fresh_drop.lock_keys_nowait([key(b"drop")]).await.unwrap();
+        assert_ne!(stale_drop_id, fresh_drop.txn_id);
+        drop(stale_drop);
+        let mut contender = client.begin().await.unwrap();
+        let err = contender
+            .lock_keys_nowait([key(b"drop")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::LockNotAvailable));
+        contender.rollback().await.unwrap();
+        fresh_drop.rollback().await.unwrap();
+        universe.assert_clean();
+    }
+
+    #[tokio::test]
     async fn scan_merges_local_write_overlay_in_key_order() {
         let universe = Arc::new(MemoryUniverse::new());
         let client = universe.client_for_keyspace("tenant-a");
@@ -695,6 +1147,193 @@ mod tests {
             ]
         );
         txn.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn for_update_reads_committed_value_not_local_overlay() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut seed = client.begin_optimistic().await.unwrap();
+        seed.put(key(b"k"), key(b"committed")).await.unwrap();
+        seed.commit().await.unwrap();
+
+        let mut txn = client.begin().await.unwrap();
+        txn.put(key(b"k"), key(b"local")).await.unwrap();
+        assert_eq!(
+            txn.get_for_update(key(b"k"), Some(Duration::from_millis(50)))
+                .await
+                .unwrap(),
+            Some(key(b"committed"))
+        );
+        assert_eq!(txn.get(key(b"k")).await.unwrap(), Some(key(b"local")));
+        txn.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn nowait_conflict_fails_without_blocking_and_self_lock_succeeds() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut holder = client.begin().await.unwrap();
+        holder.lock_keys_nowait([key(b"k")]).await.unwrap();
+        holder.lock_keys_nowait([key(b"k")]).await.unwrap();
+
+        let mut contender = client.begin().await.unwrap();
+        let err = contender.lock_keys_nowait([key(b"k")]).await.unwrap_err();
+        assert!(matches!(err, StorageError::LockNotAvailable));
+        contender.rollback().await.unwrap();
+        holder.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn skip_locked_returns_only_unlocked_keys() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut holder = client.begin().await.unwrap();
+        holder.lock_keys_nowait([key(b"k1")]).await.unwrap();
+
+        let mut contender = client.begin().await.unwrap();
+        let locked = contender
+            .lock_keys_skip_locked([key(b"k1"), key(b"k2"), key(b"k3")], Some(2))
+            .await
+            .unwrap();
+        assert_eq!(locked, vec![key(b"k2"), key(b"k3")]);
+
+        contender.rollback().await.unwrap();
+        holder.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn blocking_lock_wait_times_out_and_keeps_partial_batch_atomic() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut holder = client.begin().await.unwrap();
+        holder.lock_keys_nowait([key(b"k2")]).await.unwrap();
+
+        let mut contender = client.begin().await.unwrap();
+        let err = contender
+            .lock_keys([key(b"k1"), key(b"k2")], Some(Duration::from_millis(20)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::LockTimeout));
+
+        let mut probe = client.begin().await.unwrap();
+        probe.lock_keys_nowait([key(b"k1")]).await.unwrap();
+        probe.rollback().await.unwrap();
+        contender.rollback().await.unwrap();
+        holder.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn blocking_lock_wait_wakes_after_release() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut holder = client.begin().await.unwrap();
+        holder.lock_keys_nowait([key(b"k")]).await.unwrap();
+
+        let waiter_client = client.clone();
+        let waiter = tokio::spawn(async move {
+            let mut txn = waiter_client.begin().await.unwrap();
+            txn.lock_keys([key(b"k")], Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+            txn.rollback().await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        holder.rollback().await.unwrap();
+        waiter.await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn drop_releases_held_locks() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+        {
+            let mut holder = client.begin().await.unwrap();
+            holder.lock_keys_nowait([key(b"k")]).await.unwrap();
+        }
+
+        let mut contender = client.begin().await.unwrap();
+        contender.lock_keys_nowait([key(b"k")]).await.unwrap();
+        contender.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn locks_are_keyspace_scoped() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let left = universe.client_for_keyspace("left");
+        let right = universe.client_for_keyspace("right");
+
+        let mut left_txn = left.begin().await.unwrap();
+        left_txn.lock_keys_nowait([key(b"k")]).await.unwrap();
+
+        let mut right_txn = right.begin().await.unwrap();
+        right_txn.lock_keys_nowait([key(b"k")]).await.unwrap();
+
+        right_txn.rollback().await.unwrap();
+        left_txn.rollback().await.unwrap();
+        universe.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn optimistic_commit_fails_while_other_txn_holds_lock() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut holder = client.begin().await.unwrap();
+        holder.lock_keys_nowait([key(b"k")]).await.unwrap();
+
+        let mut writer = client.begin_optimistic().await.unwrap();
+        writer.put(key(b"k"), key(b"optimistic")).await.unwrap();
+        let err = writer.commit().await.unwrap_err();
+        assert!(matches!(err, StorageError::LockConflict));
+
+        holder.rollback().await.unwrap();
+        let mut reader = client.begin_optimistic().await.unwrap();
+        assert_eq!(reader.get(key(b"k")).await.unwrap(), None);
+        reader.rollback().await.unwrap();
+        client.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn pessimistic_txn_started_before_newer_commit_can_update_after_locking() {
+        let universe = Arc::new(MemoryUniverse::new());
+        let client = universe.client_for_keyspace("tenant-a");
+
+        let mut old_txn = client.begin().await.unwrap();
+
+        let mut writer = client.begin_optimistic().await.unwrap();
+        writer.put(key(b"k"), key(b"newer")).await.unwrap();
+        writer.commit().await.unwrap();
+
+        assert_eq!(
+            old_txn
+                .get_for_update(key(b"k"), Some(Duration::from_millis(50)))
+                .await
+                .unwrap(),
+            Some(key(b"newer"))
+        );
+        old_txn.put(key(b"k"), key(b"pessimistic")).await.unwrap();
+        old_txn.commit().await.unwrap();
+
+        let mut reader = client.begin_optimistic().await.unwrap();
+        assert_eq!(
+            reader.get(key(b"k")).await.unwrap(),
+            Some(key(b"pessimistic"))
+        );
+        reader.rollback().await.unwrap();
         client.assert_clean();
     }
 

@@ -57,6 +57,21 @@ use super::memory::{MemoryClient, MemorySnapshot, MemoryTxn};
 #[allow(unused_imports)] // wired by PR-2 / PR-3 callers; re-exported for PR-1.5.
 pub(crate) use super::error::{StorageError, WriteConflictReason};
 
+fn is_tikv_lock_conflict(err: &tikv_client::Error) -> bool {
+    match err {
+        tikv_client::Error::KeyError(key_err) => {
+            key_err.locked.is_some() || key_err.conflict.is_some() || key_err.deadlock.is_some()
+        }
+        tikv_client::Error::PessimisticLockError { inner, .. } => is_tikv_lock_conflict(inner),
+        tikv_client::Error::UndeterminedError(inner) => is_tikv_lock_conflict(inner),
+        tikv_client::Error::ExtractedErrors(errors)
+        | tikv_client::Error::MultipleKeyErrors(errors) => {
+            !errors.is_empty() && errors.iter().all(is_tikv_lock_conflict)
+        }
+        _ => err.is_lock_conflict(),
+    }
+}
+
 // ─── Mutations ──────────────────────────────────────────────────────────────
 
 /// Backend-neutral mutation kind for batch writes. The underlying engine only
@@ -155,10 +170,8 @@ impl StorageCapabilities {
     pub(crate) const fn memory() -> Self {
         Self {
             supports_db9_cop: false,
-            // PR-3 exposes optimistic MVCC core only. PR-4 flips these when
-            // pessimistic locks / for-update / skip-locked behavior lands.
-            supports_get_for_update: false,
-            supports_lock_skip_locked: false,
+            supports_get_for_update: true,
+            supports_lock_skip_locked: true,
             supports_snapshot_at_ts: true,
         }
     }
@@ -392,6 +405,144 @@ impl StorageTxn {
             }
             #[cfg(feature = "mock-storage")]
             StorageTxn::Memory(txn) => txn.scan(range, limit).await.map_err(anyhow::Error::new),
+        }
+    }
+
+    pub(crate) async fn get_for_update(
+        &mut self,
+        key: Vec<u8>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<Vec<u8>>, anyhow::Error> {
+        match self {
+            StorageTxn::Tikv { inner, finished } => {
+                let txn = Self::require_open(inner, *finished)?;
+                let get = async { tikv_op!(txn.get_for_update(key).await) };
+                match timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, get).await {
+                        Ok(result) => result.map_err(anyhow::Error::from),
+                        Err(_) => Err(anyhow::Error::new(StorageError::LockTimeout)),
+                    },
+                    None => get.await.map_err(anyhow::Error::from),
+                }
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn
+                .get_for_update(key, timeout)
+                .await
+                .map_err(anyhow::Error::new),
+        }
+    }
+
+    pub(crate) async fn batch_get_for_update<I>(
+        &mut self,
+        keys: I,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<KvPair>, anyhow::Error>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let keys: Vec<Vec<u8>> = keys.into_iter().collect();
+        match self {
+            StorageTxn::Tikv { inner, finished } => {
+                let txn = Self::require_open(inner, *finished)?;
+                let get = async { tikv_op!(txn.batch_get_for_update(keys).await) };
+                match timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, get).await {
+                        Ok(result) => result.map_err(anyhow::Error::from),
+                        Err(_) => Err(anyhow::Error::new(StorageError::LockTimeout)),
+                    },
+                    None => get.await.map_err(anyhow::Error::from),
+                }
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn
+                .batch_get_for_update(keys, timeout)
+                .await
+                .map_err(anyhow::Error::new),
+        }
+    }
+
+    pub(crate) async fn lock_keys<I>(
+        &mut self,
+        keys: I,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(), anyhow::Error>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let keys: Vec<Vec<u8>> = keys.into_iter().collect();
+        match self {
+            StorageTxn::Tikv { inner, finished } => {
+                let txn = Self::require_open(inner, *finished)?;
+                let lock = async { tikv_op!(txn.lock_keys(keys).await) };
+                match timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, lock).await {
+                        Ok(result) => result.map_err(anyhow::Error::from),
+                        Err(_) => Err(anyhow::Error::new(StorageError::LockTimeout)),
+                    },
+                    None => lock.await.map_err(anyhow::Error::from),
+                }
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn
+                .lock_keys(keys, timeout)
+                .await
+                .map_err(anyhow::Error::new),
+        }
+    }
+
+    pub(crate) async fn lock_keys_nowait<I>(&mut self, keys: I) -> Result<(), anyhow::Error>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let keys: Vec<Vec<u8>> = keys.into_iter().collect();
+        match self {
+            StorageTxn::Tikv { inner, finished } => {
+                let txn = Self::require_open(inner, *finished)?;
+                match tikv_op!(txn.lock_keys_nowait(keys).await) {
+                    Ok(()) => Ok(()),
+                    Err(err) if is_tikv_lock_conflict(&err) => {
+                        Err(anyhow::Error::new(StorageError::LockNotAvailable))
+                    }
+                    Err(err) => Err(anyhow::Error::from(err)),
+                }
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.lock_keys_nowait(keys).await.map_err(anyhow::Error::new),
+        }
+    }
+
+    pub(crate) async fn lock_keys_skip_locked<I>(
+        &mut self,
+        keys: I,
+        max_locks: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>, anyhow::Error>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let keys: Vec<Vec<u8>> = keys.into_iter().collect();
+        match self {
+            StorageTxn::Tikv { inner, finished } => {
+                let txn = Self::require_open(inner, *finished)?;
+                let max_locks = max_locks.unwrap_or(usize::MAX);
+                let mut locked = Vec::new();
+                for key in keys {
+                    if locked.len() >= max_locks {
+                        break;
+                    }
+                    match tikv_op!(txn.lock_keys_nowait(vec![key.clone()]).await) {
+                        Ok(()) => locked.push(key),
+                        Err(err) if is_tikv_lock_conflict(&err) => {}
+                        Err(err) => return Err(anyhow::Error::from(err)),
+                    }
+                }
+                Ok(locked)
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn
+                .lock_keys_skip_locked(keys, max_locks)
+                .await
+                .map_err(anyhow::Error::new),
         }
     }
 
@@ -629,6 +780,54 @@ mod tests {
         assert!(caps.supports_get_for_update);
         assert!(caps.supports_lock_skip_locked);
         assert!(caps.supports_snapshot_at_ts);
+    }
+
+    #[cfg(feature = "mock-storage")]
+    #[tokio::test]
+    async fn memory_facade_dispatches_for_update_and_skip_locked() {
+        let universe = std::sync::Arc::new(crate::storage::MemoryUniverse::new());
+        let client =
+            StorageClient::Memory(universe.client_for_keyspace("facade-lock-dispatch-test"));
+        assert!(client.capabilities().supports_get_for_update);
+        assert!(client.capabilities().supports_lock_skip_locked);
+
+        let mut seed = client.begin_optimistic().await.unwrap();
+        seed.put(b"a".to_vec(), b"committed-a".to_vec())
+            .await
+            .unwrap();
+        seed.put(b"b".to_vec(), b"committed-b".to_vec())
+            .await
+            .unwrap();
+        seed.commit().await.unwrap();
+
+        let mut holder = client.begin().await.unwrap();
+        holder.lock_keys_nowait([b"a".to_vec()]).await.unwrap();
+
+        let mut contender = client.begin().await.unwrap();
+        let locked = contender
+            .lock_keys_skip_locked([b"a".to_vec(), b"b".to_vec()], None)
+            .await
+            .unwrap();
+        assert_eq!(locked, vec![b"b".to_vec()]);
+        let err = contender
+            .lock_keys_nowait([b"a".to_vec()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StorageError>(),
+            Some(StorageError::LockNotAvailable)
+        ));
+
+        holder.rollback().await.unwrap();
+        assert_eq!(
+            contender
+                .get_for_update(b"a".to_vec(), Some(std::time::Duration::from_millis(50)))
+                .await
+                .unwrap(),
+            Some(b"committed-a".to_vec())
+        );
+        contender.rollback().await.unwrap();
+        universe.assert_clean();
     }
 
     // `StorageError::is_retryable` classification is tested in
