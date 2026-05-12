@@ -49,7 +49,6 @@ pub(crate) struct ExtensionContextOpts {
     pub(crate) is_in_transaction: bool,
     pub(crate) caller_sub: Option<String>,
     pub(crate) tenant_keyspace: String,
-    pub(crate) pd_endpoints: Option<Arc<[String]>>,
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
     pub(crate) statement_state: Arc<ExtensionStatementState>,
@@ -63,7 +62,6 @@ impl ExtensionContextOpts {
             is_in_transaction: false,
             caller_sub: None,
             tenant_keyspace: tenant_keyspace.to_string(),
-            pd_endpoints: None,
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
@@ -77,7 +75,6 @@ impl ExtensionContextOpts {
             is_in_transaction: false,
             caller_sub: None,
             tenant_keyspace: tenant_keyspace.to_string(),
-            pd_endpoints: None,
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
@@ -99,11 +96,6 @@ impl ExtensionContextOpts {
         self
     }
 
-    pub(crate) fn with_pd_endpoints(mut self, pd_endpoints: Arc<[String]>) -> Self {
-        self.pd_endpoints = Some(pd_endpoints);
-        self
-    }
-
     pub(crate) fn with_statement_state(
         mut self,
         statement_state: Arc<ExtensionStatementState>,
@@ -120,7 +112,6 @@ pub(crate) struct ExtensionContext {
     is_in_transaction: bool,
     caller_sub: Option<String>,
     pub(crate) tenant_keyspace: String,
-    pd_endpoints: Option<Arc<[String]>>,
     execution_kind: ExecutionKind,
     embedding_mode: Cell<EmbeddingExecutionMode>,
     /// When `true`, the current execution is inside a SECURITY DEFINER function
@@ -171,7 +162,6 @@ pub(crate) async fn with_context_opts<R>(
         is_in_transaction: opts.is_in_transaction,
         caller_sub: opts.caller_sub,
         tenant_keyspace: opts.tenant_keyspace,
-        pd_endpoints: opts.pd_endpoints,
         execution_kind: opts.execution_kind,
         embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
         security_definer_superuser: Cell::new(false),
@@ -225,10 +215,6 @@ pub(crate) fn bypass_rls() -> bool {
 
 pub(crate) fn tenant_keyspace() -> Option<String> {
     CTX.try_with(|ctx| ctx.tenant_keyspace.clone()).ok()
-}
-
-pub(crate) fn pd_endpoints() -> Option<Arc<[String]>> {
-    CTX.try_with(|ctx| ctx.pd_endpoints.clone()).ok().flatten()
 }
 
 pub(crate) fn execution_kind() -> ExecutionKind {

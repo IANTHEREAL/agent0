@@ -1090,7 +1090,6 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 bypass_rls,
                 &tenant_keyspace,
             )
-            .with_pd_endpoints(Arc::from(store.pd_endpoints().to_vec()))
             .with_tikv_client(tikv_client);
 
             // Temporary read-only transaction for catalog access

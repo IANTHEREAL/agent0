@@ -1176,7 +1176,6 @@ impl WorkerEngine {
                         is_cron,
                         &entry.keyspace,
                         tikv_client.clone(),
-                        Arc::from(store.pd_endpoints().to_vec()),
                     );
                     let fut = crate::pool::run_with_statement_memory_scope(
                         Some(statement_memory_accountant.clone()),

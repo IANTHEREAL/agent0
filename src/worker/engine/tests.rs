@@ -21,8 +21,8 @@ fn idx(name: &str, state: IndexState) -> IndexDef {
 
 #[test]
 fn background_statement_extension_context_uses_fresh_statement_state_per_call() {
-    let first = background_statement_extension_context(true, "tenant_a", None, Arc::from([]));
-    let second = background_statement_extension_context(true, "tenant_a", None, Arc::from([]));
+    let first = background_statement_extension_context(true, "tenant_a", None);
+    let second = background_statement_extension_context(true, "tenant_a", None);
     assert_eq!(
         first.execution_kind,
         crate::extensions::context::ExecutionKind::Cron
@@ -36,8 +36,7 @@ fn background_statement_extension_context_uses_fresh_statement_state_per_call() 
         "each background statement must start with a fresh statement-scoped extension state"
     );
 
-    let interactive =
-        background_statement_extension_context(false, "tenant_a", None, Arc::from([]));
+    let interactive = background_statement_extension_context(false, "tenant_a", None);
     assert_eq!(
         interactive.execution_kind,
         crate::extensions::context::ExecutionKind::Interactive

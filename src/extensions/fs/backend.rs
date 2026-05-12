@@ -1,17 +1,12 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::AsyncBufRead;
 
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
-
-const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -505,202 +500,36 @@ fn legacy_juicefs_config_markers() -> Vec<String> {
     legacy_juicefs_config_markers_with(crate::config::env_string)
 }
 
-fn parse_pd_endpoints(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn pd_endpoints_from_env() -> Vec<String> {
-    let raw = crate::config::env_string("PD_ENDPOINTS")
-        .unwrap_or_else(|| DEFAULT_PD_ENDPOINTS.to_string());
-    parse_pd_endpoints(&raw)
-}
-
-fn legacy_juicefs_keyspace_name(tenant_keyspace: &str) -> String {
-    let tenant_id = tenant_keyspace
-        .strip_prefix("db9_tenant_")
-        .unwrap_or(tenant_keyspace);
-    format!("jfs_t_{tenant_id}")
-}
-
-fn pd_base_url(pd_endpoint: &str) -> String {
-    let endpoint = pd_endpoint.trim().trim_end_matches('/');
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return endpoint.to_string();
+fn refuse_if_external_fs9_configured_with(
+    tenant_keyspace: &str,
+    markers: &[String],
+) -> Result<()> {
+    if !markers.is_empty() {
+        anyhow::bail!(
+            "fs9: refusing to initialize embedded PageFS for tenant `{}` because this server is configured for external fs9 ({}). Embedded PageFS and external fs9 must not be mixed in one process.",
+            tenant_keyspace,
+            markers.join(", ")
+        );
     }
-
-    if std::env::var("TIKV_CA_PATH").is_ok() {
-        format!("https://{endpoint}")
-    } else {
-        format!("http://{endpoint}")
-    }
-}
-
-fn build_pd_probe_client() -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
-
-    if let (Ok(ca), Ok(cert_path), Ok(key_path)) = (
-        std::env::var("TIKV_CA_PATH"),
-        std::env::var("TIKV_CERT_PATH"),
-        std::env::var("TIKV_KEY_PATH"),
-    ) {
-        let ca_pem = std::fs::read(&ca)
-            .with_context(|| format!("failed to read PD CA cert for fs9 guard: {ca}"))?;
-        let ca_cert = reqwest::tls::Certificate::from_pem(&ca_pem)
-            .context("failed to parse PD CA cert for fs9 guard")?;
-
-        let cert_pem = std::fs::read(&cert_path)
-            .with_context(|| format!("failed to read PD client cert for fs9 guard: {cert_path}"))?;
-        let key_pem = std::fs::read(&key_path)
-            .with_context(|| format!("failed to read PD client key for fs9 guard: {key_path}"))?;
-        let mut identity_pem = cert_pem;
-        identity_pem.extend_from_slice(&key_pem);
-        let identity = reqwest::tls::Identity::from_pem(&identity_pem)
-            .context("failed to parse PD client identity for fs9 guard")?;
-
-        builder = builder
-            .add_root_certificate(ca_cert)
-            .identity(identity)
-            .danger_accept_invalid_certs(false);
-    }
-
-    builder
-        .build()
-        .context("failed to build PD HTTP client for fs9 guard")
-}
-
-fn parse_pd_keyspace_state_response(
-    keyspace: &str,
-    endpoint: &str,
-    status: StatusCode,
-    body: &str,
-) -> Result<Option<String>> {
-    if status == StatusCode::NOT_FOUND
-        || (status == StatusCode::INTERNAL_SERVER_ERROR && pd_body_is_missing_keyspace(body))
-    {
-        return Ok(None);
-    }
-
-    if status.is_success() {
-        let body: serde_json::Value = serde_json::from_str(body).with_context(|| {
-            format!("PD keyspace probe for `{keyspace}` at `{endpoint}` returned invalid JSON")
-        })?;
-        let state = body
-            .get("state")
-            .and_then(|state| state.as_str())
-            .ok_or_else(|| {
-                anyhow!(
-                    "PD keyspace probe for `{keyspace}` at `{endpoint}` returned no string `state`"
-                )
-            })?;
-        return Ok(Some(state.to_string()));
-    }
-
-    Err(anyhow!(
-        "PD keyspace probe for `{keyspace}` at `{endpoint}` returned HTTP {status}: {body}"
-    ))
-}
-
-fn pd_body_is_missing_keyspace(body: &str) -> bool {
-    let body = body.trim();
-    body == "keyspace does not exist" || body == r#""keyspace does not exist""#
-}
-
-async fn query_pd_keyspace_state(
-    pd_endpoints: &[String],
-    keyspace: &str,
-) -> Result<Option<String>> {
-    if pd_endpoints.is_empty() {
-        anyhow::bail!("no PD endpoints available for fs9 legacy keyspace probe");
-    }
-
-    let client = build_pd_probe_client()?;
-    let mut errors = Vec::new();
-    for endpoint in pd_endpoints {
-        let url = format!("{}/pd/api/v2/keyspaces/{}", pd_base_url(endpoint), keyspace);
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let body = match resp.text().await {
-                    Ok(body) => body,
-                    Err(err) => {
-                        errors.push(format!(
-                            "`{endpoint}` failed to read PD response body for `{keyspace}`: {err}"
-                        ));
-                        continue;
-                    }
-                };
-                match parse_pd_keyspace_state_response(keyspace, endpoint, status, &body) {
-                    Ok(state) => return Ok(state),
-                    Err(err) => errors.push(err.to_string()),
-                }
-            }
-            Err(err) => errors.push(format!(
-                "`{endpoint}` failed to query PD keyspace `{keyspace}`: {err}"
-            )),
-        }
-    }
-
-    anyhow::bail!(
-        "failed to determine whether legacy JuiceFS keyspace `{}` exists via PD endpoints [{}]: {}",
-        keyspace,
-        pd_endpoints.join(", "),
-        errors.join("; ")
-    )
+    Ok(())
 }
 
 pub(crate) async fn ensure_embedded_backend_bootstrap_allowed(
     client: &Arc<tikv_client::TransactionClient>,
     tenant_keyspace: &str,
-    pd_endpoints: Option<&[String]>,
 ) -> Result<()> {
-    match crate::extensions::fs::embedded::pagefs::probe_superblock_readonly(client).await {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => {}
-        Err(err) => {
-            anyhow::bail!(
-                "fs9: refusing to initialize embedded PageFS for tenant `{}` because existing embedded PageFS metadata is invalid or unavailable: {err}",
-                tenant_keyspace
-            );
-        }
-    }
+    // External-fs9 mode is an unconditional refusal: a server configured for
+    // external fs9 must not serve embedded for any tenant, including tenants
+    // that already have an embedded superblock from a prior config.
+    refuse_if_external_fs9_configured_with(tenant_keyspace, &legacy_juicefs_config_markers())?;
 
-    let markers = legacy_juicefs_config_markers();
-    if !markers.is_empty() {
-        anyhow::bail!(
-            "fs9: refusing to initialize embedded PageFS for tenant `{}` because legacy JuiceFS/fs-plane configuration is still present ({}). JuiceFS backend support was removed from db9-server; migrate/export the legacy fs9 data before enabling embedded PageFS.",
-            tenant_keyspace,
-            markers.join(", ")
-        );
-    }
-
-    let endpoints: Cow<'_, [String]> = match pd_endpoints {
-        Some(endpoints) if !endpoints.is_empty() => Cow::Borrowed(endpoints),
-        _ => Cow::Owned(pd_endpoints_from_env()),
-    };
-
-    let legacy_keyspace = legacy_juicefs_keyspace_name(tenant_keyspace);
-    match query_pd_keyspace_state(&endpoints, &legacy_keyspace).await {
-        Ok(Some(state)) => {
-            anyhow::bail!(
-                "fs9: refusing to initialize embedded PageFS for tenant `{}` because legacy JuiceFS keyspace `{}` exists in PD with state `{}`. Migrate/export that volume before using embedded PageFS.",
-                tenant_keyspace,
-                legacy_keyspace,
-                state
-            );
-        }
-        Ok(None) => {}
-        Err(err) => {
-            anyhow::bail!(
-                "fs9: refusing to initialize embedded PageFS for tenant `{}` because legacy JuiceFS keyspace probe for `{}` did not reach a definitive not-found result: {err}",
-                tenant_keyspace,
-                legacy_keyspace
-            );
-        }
-    }
+    crate::extensions::fs::embedded::pagefs::probe_superblock_readonly(client)
+        .await
+        .map_err(|err| {
+            anyhow!(
+                "fs9: refusing to initialize embedded PageFS for tenant `{tenant_keyspace}` because existing embedded PageFS metadata is invalid or unavailable: {err}"
+            )
+        })?;
 
     Ok(())
 }
@@ -713,9 +542,7 @@ async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
         )
     })?;
 
-    let pd_endpoints = crate::extensions::context::pd_endpoints();
-    ensure_embedded_backend_bootstrap_allowed(&client, tenant_keyspace, pd_endpoints.as_deref())
-        .await?;
+    ensure_embedded_backend_bootstrap_allowed(&client, tenant_keyspace).await?;
 
     EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
         .await
@@ -1052,124 +879,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_pd_endpoints_trims_empty_entries() {
-        assert_eq!(
-            parse_pd_endpoints(" pd1:2379, ,pd2:2379 "),
-            vec!["pd1:2379".to_string(), "pd2:2379".to_string()]
-        );
-    }
-
-    #[test]
-    fn legacy_juicefs_keyspace_uses_tenant_suffix() {
-        assert_eq!(legacy_juicefs_keyspace_name("tenant_a"), "jfs_t_tenant_a");
-    }
-
-    #[test]
-    fn legacy_juicefs_keyspace_strips_db9_tenant_prefix() {
-        assert_eq!(
-            legacy_juicefs_keyspace_name("db9_tenant_tenant_a"),
-            "jfs_t_tenant_a"
-        );
-    }
-
-    #[test]
-    fn pd_keyspace_state_response_returns_none_only_for_404() {
-        let state = parse_pd_keyspace_state_response(
-            "jfs_t_tenant_a",
-            "pd:2379",
-            StatusCode::NOT_FOUND,
-            "not found",
+    fn external_fs9_markers_refuse_bootstrap_even_with_existing_embedded_state() {
+        // Regression: a process configured for external fs9 must refuse embedded
+        // bootstrap unconditionally. The check must precede the superblock fast-path
+        // so a tenant that happens to have embedded data from a prior config does
+        // not silently bypass the "must not be mixed in one process" contract.
+        let err = refuse_if_external_fs9_configured_with(
+            "tenant_a",
+            &["FS9_BACKEND=juicefs".to_string()],
         )
-        .expect("404 should be classified as definitive not-found");
-
-        assert_eq!(state, None);
-    }
-
-    #[test]
-    fn pd_keyspace_state_response_treats_pd_missing_keyspace_500_as_not_found() {
-        let state = parse_pd_keyspace_state_response(
-            "jfs_t_default",
-            "pd:2379",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "keyspace does not exist",
-        )
-        .expect("PD missing-keyspace 500 must be classified as definitive not-found");
-
-        assert_eq!(state, None);
-    }
-
-    #[test]
-    fn pd_keyspace_state_response_treats_json_string_missing_keyspace_500_as_not_found() {
-        let state = parse_pd_keyspace_state_response(
-            "jfs_t_default",
-            "pd:2379",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#""keyspace does not exist""#,
-        )
-        .expect("PD JSON-string missing-keyspace 500 must be definitive not-found");
-
-        assert_eq!(state, None);
-    }
-
-    #[test]
-    fn pd_keyspace_state_response_returns_state_for_success() {
-        let state = parse_pd_keyspace_state_response(
-            "jfs_t_tenant_a",
-            "pd:2379",
-            StatusCode::OK,
-            r#"{"state":"ENABLED"}"#,
-        )
-        .expect("valid PD response should parse");
-
-        assert_eq!(state, Some("ENABLED".to_string()));
-    }
-
-    #[test]
-    fn pd_keyspace_state_response_errors_on_non_404_status() {
-        let err = parse_pd_keyspace_state_response(
-            "jfs_t_tenant_a",
-            "pd:2379",
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "boom",
-        )
-        .expect_err("500 must not be classified as not-found");
-
+        .expect_err("external fs9 markers must block embedded bootstrap");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("HTTP 500"),
-            "unexpected error: {err}"
+            msg.contains("FS9_BACKEND=juicefs"),
+            "error must surface the offending marker: {msg}"
+        );
+        assert!(
+            msg.contains("must not be mixed"),
+            "error must state the mixing-prohibition contract: {msg}"
         );
     }
 
     #[test]
-    fn pd_keyspace_state_response_errors_on_invalid_json() {
-        let err = parse_pd_keyspace_state_response(
-            "jfs_t_tenant_a",
-            "pd:2379",
-            StatusCode::OK,
-            "not-json",
-        )
-        .expect_err("invalid JSON must not be classified as not-found");
-
-        assert!(
-            err.to_string().contains("invalid JSON"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn pd_keyspace_state_response_errors_when_state_missing() {
-        let err = parse_pd_keyspace_state_response(
-            "jfs_t_tenant_a",
-            "pd:2379",
-            StatusCode::OK,
-            r#"{"name":"jfs_t_tenant_a"}"#,
-        )
-        .expect_err("missing state must not be classified as not-found");
-
-        assert!(
-            err.to_string().contains("no string `state`"),
-            "unexpected error: {err}"
-        );
+    fn no_external_fs9_markers_permits_bootstrap() {
+        refuse_if_external_fs9_configured_with("tenant_a", &[])
+            .expect("empty markers must permit embedded bootstrap");
     }
 
     #[test]

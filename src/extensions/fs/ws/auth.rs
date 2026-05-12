@@ -245,7 +245,7 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    ensure_embedded_backend_bootstrap_allowed(&client, &keyspace, Some(pool.pd_endpoints()))
+    ensure_embedded_backend_bootstrap_allowed(&client, &keyspace)
         .await
         .map_err(|err| {
             WsResponse::error(

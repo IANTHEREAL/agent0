@@ -624,7 +624,6 @@ mod tests {
             txn_dirty_table_ids: Arc::new(HashSet::from([9_u64])),
             session_txn_tracker: None,
             tikv_client: None,
-            pd_endpoints: Arc::from([]),
             extension_txn_delta: Arc::new((
                 HashSet::from(["embedding".to_string()]),
                 HashSet::new(),
@@ -684,7 +683,6 @@ mod tests {
             txn_dirty_table_ids: Arc::new(HashSet::new()),
             session_txn_tracker: None,
             tikv_client: None,
-            pd_endpoints: Arc::from([]),
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
@@ -729,7 +727,6 @@ mod tests {
             txn_dirty_table_ids: Arc::new(HashSet::new()),
             session_txn_tracker: None,
             tikv_client: None,
-            pd_endpoints: Arc::from([]),
             extension_txn_delta: Arc::new((HashSet::new(), HashSet::new())),
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
