@@ -120,6 +120,10 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 [features]
 default = ["parquet"]
 parquet = ["dep:parquet", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast"]
+mock-storage = []
+
+[dev-dependencies]
+proptest = "1.6"
 
 [patch.crates-io]
 pgwire = { path = "crates/pgwire" }

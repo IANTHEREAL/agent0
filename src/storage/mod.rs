@@ -9,6 +9,8 @@ mod encoding;
 pub(crate) mod error;
 pub(crate) mod facade;
 mod kv_stats;
+#[cfg(feature = "mock-storage")]
+pub(crate) mod memory;
 mod tikv_store;
 
 // Re-export the canonical storage error surface so PR-1.5 (#19) and PR-3 (#21)
@@ -26,6 +28,9 @@ pub(crate) use error::StorageError;
 #[allow(unused_imports)]
 pub(crate) use error::WriteConflictReason;
 pub(crate) use kv_stats::{with_kv_read_stats, KvReadStatsSnapshot};
+#[cfg(feature = "mock-storage")]
+#[allow(unused_imports)]
+pub(crate) use memory::{MemoryClient, MemoryUniverse};
 pub use tikv_store::*;
 
 #[derive(Debug)]

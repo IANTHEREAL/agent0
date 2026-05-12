@@ -1510,6 +1510,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "parquet",
  "pgwire",
+ "proptest",
  "prost",
  "quick_cache",
  "rand 0.8.5",

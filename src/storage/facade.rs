@@ -47,6 +47,8 @@ use tikv_client::{
 };
 
 use super::backpressure::tikv_op;
+#[cfg(feature = "mock-storage")]
+use super::memory::{MemoryClient, MemorySnapshot, MemoryTxn};
 // `StorageError` and `WriteConflictReason` are owned by `src/storage/error.rs`
 // (canonical surface per #2523 Consensus Amendments §D and architect-2's
 // integration ruling on PR-1 / PR-1.5). The facade re-imports them so PR-2
@@ -148,6 +150,18 @@ impl StorageCapabilities {
             supports_snapshot_at_ts: true,
         }
     }
+
+    #[cfg(feature = "mock-storage")]
+    pub(crate) const fn memory() -> Self {
+        Self {
+            supports_db9_cop: false,
+            // PR-3 exposes optimistic MVCC core only. PR-4 flips these when
+            // pessimistic locks / for-update / skip-locked behavior lands.
+            supports_get_for_update: false,
+            supports_lock_skip_locked: false,
+            supports_snapshot_at_ts: true,
+        }
+    }
 }
 
 // ─── Backend variants ───────────────────────────────────────────────────────
@@ -159,12 +173,16 @@ impl StorageCapabilities {
 /// surface backend-agnostic without requiring trait objects.
 pub(crate) enum StorageClient {
     Tikv(std::sync::Arc<TransactionClient>),
+    #[cfg(feature = "mock-storage")]
+    Memory(MemoryClient),
 }
 
 impl StorageClient {
     pub(crate) fn capabilities(&self) -> StorageCapabilities {
         match self {
             StorageClient::Tikv(_) => StorageCapabilities::tikv(),
+            #[cfg(feature = "mock-storage")]
+            StorageClient::Memory(client) => client.capabilities(),
         }
     }
 
@@ -178,6 +196,12 @@ impl StorageClient {
                 let txn = tikv_op!(client.begin_with_options(options).await)?;
                 Ok(StorageTxn::from_tikv(txn))
             }
+            #[cfg(feature = "mock-storage")]
+            StorageClient::Memory(client) => client
+                .begin()
+                .await
+                .map(StorageTxn::from_memory)
+                .map_err(anyhow::Error::new),
         }
     }
 
@@ -189,6 +213,12 @@ impl StorageClient {
                 let txn = tikv_op!(client.begin_with_options(options).await)?;
                 Ok(StorageTxn::from_tikv(txn))
             }
+            #[cfg(feature = "mock-storage")]
+            StorageClient::Memory(client) => client
+                .begin_optimistic()
+                .await
+                .map(StorageTxn::from_memory)
+                .map_err(anyhow::Error::new),
         }
     }
 
@@ -203,6 +233,10 @@ impl StorageClient {
                     read_ts_version,
                 }
             }
+            #[cfg(feature = "mock-storage")]
+            StorageClient::Memory(client) => {
+                StorageSnapshot::Memory(client.snapshot_at_version(timestamp.version()))
+            }
         }
     }
 }
@@ -216,8 +250,14 @@ impl StorageClient {
 /// rollback succeeds (or is observed to fail), no subsequent commit / rollback
 /// call may re-issue the underlying RPC. Forgetting to set `finished` in
 /// commit/rollback is a correctness bug, per #2523 Consensus Amendments A.
+#[allow(clippy::large_enum_variant)] // Keep production TiKV handles inline; mock-storage is test-only.
 pub(crate) enum StorageTxn {
-    Tikv { inner: Transaction, finished: bool },
+    Tikv {
+        inner: Transaction,
+        finished: bool,
+    },
+    #[cfg(feature = "mock-storage")]
+    Memory(MemoryTxn),
 }
 
 /// Storage snapshot handle. Read methods take `&mut self` to match the
@@ -227,11 +267,14 @@ pub(crate) enum StorageTxn {
 /// snapshot. The underlying `tikv_client::Snapshot` does not expose its
 /// timestamp directly, so the facade records it at construction time and
 /// returns it from [`StorageSnapshot::read_ts_version`].
+#[allow(clippy::large_enum_variant)] // Avoid boxing the TiKV snapshot hot path for a test-only variant.
 pub(crate) enum StorageSnapshot {
     Tikv {
         snap: tikv_client::Snapshot,
         read_ts_version: u64,
     },
+    #[cfg(feature = "mock-storage")]
+    Memory(MemorySnapshot),
 }
 
 // ─── Constructors (TiKV) ─────────────────────────────────────────────────────
@@ -245,6 +288,11 @@ impl StorageTxn {
         }
     }
 
+    #[cfg(feature = "mock-storage")]
+    pub(crate) fn from_memory(txn: MemoryTxn) -> Self {
+        StorageTxn::Memory(txn)
+    }
+
     /// Returns true once `commit` or `rollback` has been driven to completion.
     /// Used by tests asserting the `finished` invariant; production callers
     /// should not need this.
@@ -252,6 +300,8 @@ impl StorageTxn {
     pub(crate) fn is_finished(&self) -> bool {
         match self {
             StorageTxn::Tikv { finished, .. } => *finished,
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.is_finished(),
         }
     }
 }
@@ -275,6 +325,8 @@ impl StorageTxn {
     pub(crate) fn capabilities(&self) -> StorageCapabilities {
         match self {
             StorageTxn::Tikv { .. } => StorageCapabilities::tikv(),
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.capabilities(),
         }
     }
 
@@ -284,6 +336,8 @@ impl StorageTxn {
     pub(crate) fn start_ts_version(&self) -> u64 {
         match self {
             StorageTxn::Tikv { inner, .. } => inner.start_timestamp().version(),
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.start_ts_version(),
         }
     }
 
@@ -305,6 +359,8 @@ impl StorageTxn {
                 let txn = Self::require_open(inner, *finished)?;
                 tikv_op!(txn.get(key).await).map_err(anyhow::Error::from)
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.get(key).await.map_err(anyhow::Error::new),
         }
     }
 
@@ -318,6 +374,8 @@ impl StorageTxn {
                 let pairs = tikv_op!(txn.batch_get(keys).await)?;
                 Ok(pairs.collect())
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.batch_get(keys).await.map_err(anyhow::Error::new),
         }
     }
 
@@ -332,6 +390,8 @@ impl StorageTxn {
                 let pairs = tikv_op!(txn.scan(range.to_tikv_bound_range(), limit).await)?;
                 Ok(pairs.collect())
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.scan(range, limit).await.map_err(anyhow::Error::new),
         }
     }
 
@@ -342,6 +402,8 @@ impl StorageTxn {
                 #[allow(clippy::disallowed_methods)]
                 tikv_op!(txn.put(key, value).await).map_err(anyhow::Error::from)
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.put(key, value).await.map_err(anyhow::Error::new),
         }
     }
 
@@ -351,6 +413,8 @@ impl StorageTxn {
                 let txn = Self::require_open(inner, *finished)?;
                 tikv_op!(txn.delete(key).await).map_err(anyhow::Error::from)
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.delete(key).await.map_err(anyhow::Error::new),
         }
     }
 
@@ -365,6 +429,11 @@ impl StorageTxn {
                     mutations.into_iter().map(Into::into).collect();
                 tikv_op!(txn.batch_mutate(tikv_muts).await).map_err(anyhow::Error::from)
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn
+                .batch_mutate(mutations)
+                .await
+                .map_err(anyhow::Error::new),
         }
     }
 
@@ -386,6 +455,8 @@ impl StorageTxn {
                 *finished = true;
                 result.map_err(anyhow::Error::from)
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.commit().await.map_err(anyhow::Error::new),
         }
     }
 
@@ -403,6 +474,8 @@ impl StorageTxn {
                 *finished = true;
                 result.map_err(anyhow::Error::from)
             }
+            #[cfg(feature = "mock-storage")]
+            StorageTxn::Memory(txn) => txn.rollback().await.map_err(anyhow::Error::new),
         }
     }
 }
@@ -413,6 +486,8 @@ impl StorageSnapshot {
     pub(crate) fn capabilities(&self) -> StorageCapabilities {
         match self {
             StorageSnapshot::Tikv { .. } => StorageCapabilities::tikv(),
+            #[cfg(feature = "mock-storage")]
+            StorageSnapshot::Memory(snapshot) => snapshot.capabilities(),
         }
     }
 
@@ -427,6 +502,8 @@ impl StorageSnapshot {
             StorageSnapshot::Tikv {
                 read_ts_version, ..
             } => *read_ts_version,
+            #[cfg(feature = "mock-storage")]
+            StorageSnapshot::Memory(snapshot) => snapshot.read_ts_version(),
         }
     }
 
@@ -434,6 +511,10 @@ impl StorageSnapshot {
         match self {
             StorageSnapshot::Tikv { snap, .. } => {
                 tikv_op!(snap.get(key).await).map_err(anyhow::Error::from)
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageSnapshot::Memory(snapshot) => {
+                snapshot.get(key).await.map_err(anyhow::Error::new)
             }
         }
     }
@@ -446,6 +527,10 @@ impl StorageSnapshot {
             StorageSnapshot::Tikv { snap, .. } => {
                 let pairs = tikv_op!(snap.batch_get(keys).await)?;
                 Ok(pairs.collect())
+            }
+            #[cfg(feature = "mock-storage")]
+            StorageSnapshot::Memory(snapshot) => {
+                snapshot.batch_get(keys).await.map_err(anyhow::Error::new)
             }
         }
     }
@@ -460,6 +545,11 @@ impl StorageSnapshot {
                 let pairs = tikv_op!(snap.scan(range.to_tikv_bound_range(), limit).await)?;
                 Ok(pairs.collect())
             }
+            #[cfg(feature = "mock-storage")]
+            StorageSnapshot::Memory(snapshot) => snapshot
+                .scan(range, limit)
+                .await
+                .map_err(anyhow::Error::new),
         }
     }
 }
