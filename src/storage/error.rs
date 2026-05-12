@@ -32,6 +32,18 @@ pub(crate) enum WriteConflictReason {
     Other(&'static str),
 }
 
+impl WriteConflictReason {
+    /// Keep observability parity with TiKV's write-conflict reason buckets:
+    /// optimistic=1, pessimistic=2, fallback/other=0.
+    pub(crate) fn metrics_reason_code(self) -> i32 {
+        match self {
+            Self::Optimistic => 1,
+            Self::Pessimistic => 2,
+            Self::Other(_) => 0,
+        }
+    }
+}
+
 /// Backend-neutral storage error surface.
 ///
 /// PR-1.5 (#19) owns the full `StorageError` -> `SQLSTATE` translation contract;
@@ -64,15 +76,52 @@ pub(crate) enum StorageError {
 }
 
 impl StorageError {
+    /// PostgreSQL SQLSTATE surface required by issue #2523.
+    pub(crate) fn sqlstate(&self) -> &'static str {
+        match self {
+            Self::WriteConflict { .. } => "40001",
+            Self::Deadlock => "40P01",
+            // Keep legacy TiKV protocol parity for lock-conflict style MVCC
+            // errors during the staged migration: they surface as 40001, but
+            // are not currently part of the retry loop.
+            Self::LockConflict => "40001",
+            Self::LockNotAvailable | Self::LockTimeout => "55P03",
+            Self::CapabilityUnavailable(_) => "0A000",
+            Self::KeyTooLarge(_) | Self::ValueTooLarge(_) => "54000",
+            Self::Unavailable(_) | Self::Internal(_) => "XX000",
+        }
+    }
+
     /// Return `true` when the error is the kind that the SQL retry loop should
-    /// re-run a single-statement transaction for. PR-1.5 will replace the
-    /// in-place `tikv_client::Error` matching in `src/sql/executor/core/retry.rs:3`
-    /// with a check against this method on the mapped `StorageError`.
+    /// re-run a single-statement transaction for.
+    ///
+    /// This intentionally matches today's TiKV retry loop rather than a more
+    /// aggressive lock-conflict policy: write conflicts and deadlocks retry,
+    /// lock-conflict classification does not yet.
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
             StorageError::WriteConflict { .. } | StorageError::Deadlock
         )
+    }
+
+    /// PostgreSQL-standard message text when the wire protocol should suppress
+    /// backend-specific details.
+    pub(crate) fn pg_message(&self) -> Option<&'static str> {
+        match self {
+            Self::WriteConflict { .. } | Self::LockConflict => {
+                Some("could not serialize access due to concurrent update")
+            }
+            Self::Deadlock => Some("deadlock detected"),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn write_conflict_reason_code(&self) -> Option<i32> {
+        match self {
+            Self::WriteConflict { reason } => Some(reason.metrics_reason_code()),
+            _ => None,
+        }
     }
 }
 

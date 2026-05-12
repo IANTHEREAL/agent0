@@ -1,5 +1,6 @@
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::timeout::StatementTimeoutError;
+use crate::storage::StorageError;
 use pgwire::error::{ErrorInfo, PgWireError};
 
 fn is_ident_char(b: u8) -> bool {
@@ -68,6 +69,11 @@ fn is_tikv_lock_resolution_failure(err: &anyhow::Error) -> bool {
     })
 }
 
+fn storage_error(err: &anyhow::Error) -> Option<&StorageError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<StorageError>())
+}
+
 pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     if let Some(sql_err) = err.downcast_ref::<SqlError>() {
         return sql_err.sqlstate();
@@ -75,6 +81,10 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     // Statement timeout → 57014 (query_canceled), matching PostgreSQL.
     if err.is::<StatementTimeoutError>() {
         return "57014";
+    }
+    // StorageError → the staged facade SQLSTATE surface from issue #2523.
+    if let Some(storage_err) = storage_error(err) {
+        return storage_err.sqlstate();
     }
     // WriteConflict → 40001 (serialization_failure): client should retry the txn.
     if is_tikv_write_conflict(err) {
@@ -100,6 +110,12 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
 /// leaking internal implementation details to clients. Non-TiKV errors
 /// preserve their original message text.
 pub(super) fn pg_error_message(err: &anyhow::Error, sqlstate: &str) -> String {
+    if let Some(storage_err) = storage_error(err) {
+        if let Some(message) = storage_err.pg_message() {
+            return message.to_string();
+        }
+    }
+
     match sqlstate {
         "40001" => {
             if is_tikv_write_conflict(err) || is_tikv_lock_resolution_failure(err) {

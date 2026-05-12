@@ -302,7 +302,8 @@ fn test_cast_current_setting_value_integer() {
 }
 
 mod write_conflict_retry_tests {
-    use super::super::is_retryable_tikv_error;
+    use super::super::{extract_write_conflict_reason, is_retryable_tikv_error};
+    use crate::storage::{StorageError, WriteConflictReason};
 
     #[test]
     fn test_unrelated_tikv_error_not_retryable() {
@@ -377,6 +378,42 @@ mod write_conflict_retry_tests {
         };
         let anyhow_err = anyhow::Error::new(pessimistic_err);
         assert!(!is_retryable_tikv_error(&anyhow_err));
+    }
+
+    #[test]
+    fn test_storage_write_conflict_retryable() {
+        let optimistic = anyhow::Error::new(StorageError::WriteConflict {
+            reason: WriteConflictReason::Optimistic,
+        });
+        assert!(is_retryable_tikv_error(&optimistic));
+        assert_eq!(extract_write_conflict_reason(&optimistic), Some(1));
+
+        let pessimistic = anyhow::Error::new(StorageError::WriteConflict {
+            reason: WriteConflictReason::Pessimistic,
+        });
+        assert!(is_retryable_tikv_error(&pessimistic));
+        assert_eq!(extract_write_conflict_reason(&pessimistic), Some(2));
+    }
+
+    #[test]
+    fn test_storage_deadlock_retryable() {
+        let anyhow_err = anyhow::Error::new(StorageError::Deadlock);
+        assert!(is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
+    }
+
+    #[test]
+    fn test_storage_lock_conflict_not_retryable() {
+        let anyhow_err = anyhow::Error::new(StorageError::LockConflict);
+        assert!(!is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
+    }
+
+    #[test]
+    fn test_storage_capability_unavailable_not_retryable() {
+        let anyhow_err = anyhow::Error::new(StorageError::CapabilityUnavailable("db9_cop"));
+        assert!(!is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
     }
 }
 

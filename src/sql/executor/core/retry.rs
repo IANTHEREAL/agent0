@@ -1,6 +1,17 @@
 //! Retry helpers
 
+use crate::storage::StorageError;
+
+fn storage_error(err: &anyhow::Error) -> Option<&StorageError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<StorageError>())
+}
+
 pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
+    if let Some(storage_err) = storage_error(err) {
+        return storage_err.is_retryable();
+    }
+
     fn contains_retryable_error(err: &tikv_client::Error) -> bool {
         // Retry on WriteConflict AND Deadlock errors.
         //
@@ -42,11 +53,16 @@ pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Extract the TiKV WriteConflict reason code from a retryable error.
+/// Extract the write-conflict reason code from a retryable error.
 ///
-/// Returns the `kvrpcpb::write_conflict::Reason` integer (0..=5) if found,
-/// or `None` if the error is not a write conflict.
+/// Returns the existing TiKV `kvrpcpb::write_conflict::Reason` integer (0..=5)
+/// for legacy errors, or the staged `StorageError` equivalent when the facade
+/// path is in use. Returns `None` if the error is not a write conflict.
 pub(super) fn extract_write_conflict_reason(err: &anyhow::Error) -> Option<i32> {
+    if let Some(storage_err) = storage_error(err) {
+        return storage_err.write_conflict_reason_code();
+    }
+
     fn first_reason(err: &tikv_client::Error) -> Option<i32> {
         match err {
             tikv_client::Error::PessimisticLockError { inner, .. } => first_reason(inner),

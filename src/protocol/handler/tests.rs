@@ -4,6 +4,7 @@ use crate::pool::TenantHandle;
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::{Analyzer, Catalog};
 use crate::sql::error::SqlError;
+use crate::storage::{StorageError, WriteConflictReason};
 use async_trait::async_trait;
 use bytes::Buf;
 use bytes::Bytes;
@@ -386,6 +387,46 @@ fn test_sqlstate_for_executor_error() {
             expected_code
         );
     }
+
+    let storage_cases: Vec<(StorageError, &str)> = vec![
+        (
+            StorageError::WriteConflict {
+                reason: WriteConflictReason::Optimistic,
+            },
+            "40001",
+        ),
+        (
+            StorageError::WriteConflict {
+                reason: WriteConflictReason::Pessimistic,
+            },
+            "40001",
+        ),
+        (StorageError::Deadlock, "40P01"),
+        (StorageError::LockConflict, "40001"),
+        (StorageError::LockNotAvailable, "55P03"),
+        (StorageError::LockTimeout, "55P03"),
+        (StorageError::CapabilityUnavailable("db9_cop"), "0A000"),
+        (StorageError::KeyTooLarge("key too large".into()), "54000"),
+        (
+            StorageError::ValueTooLarge("value too large".into()),
+            "54000",
+        ),
+        (
+            StorageError::Unavailable("backend unavailable".into()),
+            "XX000",
+        ),
+        (StorageError::Internal("boom".into()), "XX000"),
+    ];
+
+    for (storage_err, expected_code) in storage_cases {
+        let anyhow_err = anyhow::Error::new(storage_err);
+        assert_eq!(
+            sqlstate_for_executor_error(&anyhow_err),
+            expected_code,
+            "failed for StorageError SQLSTATE {}",
+            expected_code
+        );
+    }
 }
 
 #[test]
@@ -414,6 +455,26 @@ fn test_pg_error_message_sanitizes_tikv_errors() {
     assert_eq!(
         pg_error_message(&tikv_lock, "40001"),
         "could not serialize access due to concurrent update"
+    );
+
+    let storage_wc = anyhow::Error::new(StorageError::WriteConflict {
+        reason: WriteConflictReason::Optimistic,
+    });
+    assert_eq!(
+        pg_error_message(&storage_wc, "40001"),
+        "could not serialize access due to concurrent update"
+    );
+
+    let storage_lock_conflict = anyhow::Error::new(StorageError::LockConflict);
+    assert_eq!(
+        pg_error_message(&storage_lock_conflict, "40001"),
+        "could not serialize access due to concurrent update"
+    );
+
+    let storage_deadlock = anyhow::Error::new(StorageError::Deadlock);
+    assert_eq!(
+        pg_error_message(&storage_deadlock, "40P01"),
+        "deadlock detected"
     );
 
     // SqlError → preserves original message (not sanitized).

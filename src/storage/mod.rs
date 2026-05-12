@@ -15,9 +15,6 @@ mod tikv_store;
 // callers can `use crate::storage::{StorageError, WriteConflictReason}` without
 // reaching through `error::` or `facade::`. PR-1 introduces the surface; first
 // callers arrive in PR-1.5.
-#[allow(unused_imports)]
-pub(crate) use error::{StorageError, WriteConflictReason};
-
 pub(crate) use encoding::{
     decode_pk_from_index_suffix, decode_table_id_from_mutation_key_v2,
     decode_worker_queue_fire_time, deserialize_row, deserialize_schema, encode_database_data_range,
@@ -25,6 +22,9 @@ pub(crate) use encoding::{
     encode_schema_key_v2, encode_sequence_value_key_v2, encode_storage_stats_key_v2,
     encode_table_data_range_v2, serialize_row,
 };
+pub(crate) use error::StorageError;
+#[allow(unused_imports)]
+pub(crate) use error::WriteConflictReason;
 pub(crate) use kv_stats::{with_kv_read_stats, KvReadStatsSnapshot};
 pub use tikv_store::*;
 
