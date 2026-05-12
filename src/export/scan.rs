@@ -20,10 +20,10 @@
 //! next fetch to keep per-page memory under the byte cap.
 
 use crate::model::Row;
-use crate::storage::backpressure::tikv_op;
-use crate::storage::deserialize_row;
+use crate::storage::facade::StorageRange;
+use crate::storage::{deserialize_row, TikvStore};
 use anyhow::{anyhow, Context, Result};
-use tikv_client::{BoundRange, KvPair, TimestampExt, TransactionClient, TransactionOptions};
+use tikv_client::TimestampExt;
 
 /// Maximum rows per TiKV scan request. This bounds the gRPC response size
 /// from TiKV. The actual batch emitted to callers may be smaller due to
@@ -57,18 +57,19 @@ pub(crate) struct ExportScanPage {
 /// `end_key`, and returns up to `EXPORT_SCAN_PAGE_SIZE` rows plus a cursor
 /// for the next page.
 pub(crate) async fn scan_table_page(
-    client: &TransactionClient,
+    store: &TikvStore,
     snapshot_ts: u64,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
 ) -> Result<ExportScanPage> {
     let ts = tikv_client::Timestamp::from_version(snapshot_ts);
-    let mut snap = client.snapshot(ts, TransactionOptions::new_optimistic());
+    let mut snap = store.snapshot_facade(ts);
 
-    let range: BoundRange = (start_key..end_key.clone()).into();
-    let iter =
-        tikv_op!(snap.scan(range, EXPORT_SCAN_PAGE_SIZE).await).context("export scan page")?;
-    let pairs: Vec<KvPair> = iter.collect();
+    let range = StorageRange::from_half_open(start_key, end_key.clone());
+    let pairs = snap
+        .scan(range, EXPORT_SCAN_PAGE_SIZE)
+        .await
+        .context("export scan page")?;
 
     let mut rows = Vec::with_capacity(pairs.len());
     let mut last_key: Option<Vec<u8>> = None;
@@ -115,16 +116,19 @@ pub(crate) async fn scan_table_page(
 /// Creates a short-lived snapshot reader to fetch the schema, ensuring
 /// the DDL view is consistent with the data snapshot.
 pub(crate) async fn get_schema_at_snapshot(
-    client: &TransactionClient,
+    store: &TikvStore,
     snapshot_ts: u64,
     db_id: u64,
     table_name: &str,
 ) -> Result<crate::model::TableSchema> {
     let ts = tikv_client::Timestamp::from_version(snapshot_ts);
-    let mut snap = client.snapshot(ts, TransactionOptions::new_optimistic());
+    let mut snap = store.snapshot_facade(ts);
 
     let schema_key = crate::storage::encode_schema_key_v2(db_id, table_name);
-    let data = tikv_op!(snap.get(schema_key).await).context("get schema at snapshot")?;
+    let data = snap
+        .get(schema_key)
+        .await
+        .context("get schema at snapshot")?;
 
     let Some(data) = data else {
         return Err(anyhow!("table '{}' not found at snapshot", table_name));

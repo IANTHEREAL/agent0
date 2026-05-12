@@ -43,11 +43,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Symbols that the storage facade absorbs. PR-1 lands the script with the
-# Transaction / TransactionClient block. PR-2 expands the block to BoundRange
-# and the transaction Mutation enum once StorageRange / StorageMutation cover
-# every existing call site.
+# Symbols that the storage facade absorbs. PR-1 landed the Transaction /
+# TransactionClient block. PR-2 adds BoundRange for modules migrated to
+# StorageRange; Mutation remains deferred until StorageMutation covers the
+# relevant call sites.
 BLOCKED_SYMBOLS=(
+  'BoundRange'
   'Transaction'
   'TransactionClient'
 )
@@ -63,7 +64,6 @@ ALLOW_LIST=(
   'src/auth/rbac.rs'
   'src/export/lifecycle.rs'
   'src/export/registry.rs'
-  'src/export/scan.rs'
   'src/extensions/context.rs'
   'src/extensions/embedding.rs'
   'src/extensions/fs/backend.rs'
@@ -76,6 +76,7 @@ ALLOW_LIST=(
   'src/extensions/http.rs'
   'src/session_context.rs'
   'src/sql/catalog/mod.rs'
+  'src/sql/catalog/table_privileges.rs'
   'src/sql/ddl/alter_table/columns.rs'
   'src/sql/ddl/alter_table/constraints.rs'
   'src/sql/ddl/alter_table/mod.rs'
@@ -105,6 +106,7 @@ ALLOW_LIST=(
   'src/sql/executor/core/view_rewrite/table.rs'
   'src/sql/executor/cron.rs'
   'src/sql/executor/cte.rs'
+  'src/sql/executor/database.rs'
   'src/sql/executor/ddl.rs'
   'src/sql/executor/dml_analyzed/delete.rs'
   'src/sql/executor/dml_analyzed/insert.rs'
@@ -153,9 +155,12 @@ ALLOW_LIST=(
   'src/sql/udt/rename.rs'
   'src/sql/udt/validation.rs'
   'src/storage/facade.rs'
+  'src/storage/tikv_store/coprocessor.rs'
   'src/storage/tikv_store/mod.rs'
   'src/txn/mod.rs'
+  'src/worker/engine.rs'
   'src/worker/engine/helpers.rs'
+  'src/worker/gc/hnsw_impl.rs'
 )
 
 # The facade module itself and the TiKV adapter shim must be allowed to use
@@ -201,7 +206,7 @@ if [ ${#violations[@]} -gt 0 ]; then
   cat >&2 <<EOF
 
 Migrated modules must use the \`crate::storage::facade\` types instead of
-direct \`tikv_client\` transaction primitives. Either:
+direct \`tikv_client\` storage primitives. Either:
 
   1. Migrate this file to the facade (preferred), then remove it from the
      ALLOW_LIST in scripts/check-facade-bypass.sh. See #2523 for the

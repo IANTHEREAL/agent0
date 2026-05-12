@@ -131,19 +131,7 @@ impl DynamicPgHandler {
             ))));
         }
 
-        // Get TiKV client.
-        let tikv_client = self
-            .auth()
-            .executor
-            .store()
-            .transaction_client()
-            .ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "TiKV client not available".to_string(),
-                )))
-            })?;
+        let store = self.auth().executor.store();
 
         let snapshot_ts = snap.snapshot_ts;
         let db_id = snap.database_id;
@@ -157,16 +145,20 @@ impl DynamicPgHandler {
         };
 
         // Look up table schema at the pinned snapshot.
-        let schema =
-            export::scan::get_schema_at_snapshot(&tikv_client, snapshot_ts, db_id, &qualified_name)
-                .await
-                .map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "42P01".to_string(),
-                        format!("failed to get schema for '{}': {e}", qualified_name),
-                    )))
-                })?;
+        let schema = export::scan::get_schema_at_snapshot(
+            store.as_ref(),
+            snapshot_ts,
+            db_id,
+            &qualified_name,
+        )
+        .await
+        .map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42P01".to_string(),
+                format!("failed to get schema for '{}': {e}", qualified_name),
+            )))
+        })?;
 
         let col_count = schema.columns.len();
         let table_id = schema.table_id;
@@ -196,7 +188,7 @@ impl DynamicPgHandler {
 
         loop {
             let page =
-                export::scan::scan_table_page(&tikv_client, snapshot_ts, cursor, raw_end.clone())
+                export::scan::scan_table_page(store.as_ref(), snapshot_ts, cursor, raw_end.clone())
                     .await
                     .map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
