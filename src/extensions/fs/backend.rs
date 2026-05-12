@@ -500,10 +500,7 @@ fn legacy_juicefs_config_markers() -> Vec<String> {
     legacy_juicefs_config_markers_with(crate::config::env_string)
 }
 
-fn refuse_if_external_fs9_configured_with(
-    tenant_keyspace: &str,
-    markers: &[String],
-) -> Result<()> {
+fn refuse_if_external_fs9_configured_with(tenant_keyspace: &str, markers: &[String]) -> Result<()> {
     if !markers.is_empty() {
         anyhow::bail!(
             "fs9: refusing to initialize embedded PageFS for tenant `{}` because this server is configured for external fs9 ({}). Embedded PageFS and external fs9 must not be mixed in one process.",
