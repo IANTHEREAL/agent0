@@ -52,6 +52,14 @@ pub(crate) struct ExtensionContextOpts {
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
     pub(crate) statement_state: Arc<ExtensionStatementState>,
+    /// User connect-token forwarded to fs9 v2 backend via db9-backend's
+    /// exchange endpoint. None for sessions authenticated with a
+    /// connect-key or password — those cannot access JuiceFS tenants.
+    pub(crate) fs_exchange_bearer: Option<Arc<str>>,
+    /// PostgreSQL role of the authenticated user. Used to derive the
+    /// scope (`fs:volume:jfs_t_<tid>:r|rw`) requested from the exchange
+    /// endpoint.
+    pub(crate) authenticated_role: Option<String>,
 }
 
 impl ExtensionContextOpts {
@@ -65,6 +73,8 @@ impl ExtensionContextOpts {
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
+            fs_exchange_bearer: None,
+            authenticated_role: None,
         }
     }
 
@@ -78,6 +88,13 @@ impl ExtensionContextOpts {
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
+            // Cron sessions have no user JWT, so they cannot mint a
+            // fs-plane token via the exchange endpoint. fs9 access from
+            // cron will fail at backend init with a clear error — this
+            // matches the project decision to defer the
+            // service-principal cron path.
+            fs_exchange_bearer: None,
+            authenticated_role: None,
         }
     }
 
@@ -104,6 +121,16 @@ impl ExtensionContextOpts {
         self.statement_state = statement_state;
         self
     }
+
+    pub(crate) fn with_fs_exchange_bearer(mut self, bearer: Option<Arc<str>>) -> Self {
+        self.fs_exchange_bearer = bearer;
+        self
+    }
+
+    pub(crate) fn with_authenticated_role(mut self, role: Option<String>) -> Self {
+        self.authenticated_role = role;
+        self
+    }
 }
 
 pub(crate) struct ExtensionContext {
@@ -120,6 +147,8 @@ pub(crate) struct ExtensionContext {
     security_definer_superuser: Cell<bool>,
     statement_state: Arc<ExtensionStatementState>,
     tikv_client: Option<Arc<TransactionClient>>,
+    fs_exchange_bearer: Option<Arc<str>>,
+    authenticated_role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -167,6 +196,8 @@ pub(crate) async fn with_context_opts<R>(
         security_definer_superuser: Cell::new(false),
         statement_state: opts.statement_state,
         tikv_client: opts.tikv_client,
+        fs_exchange_bearer: opts.fs_exchange_bearer,
+        authenticated_role: opts.authenticated_role,
     };
 
     // See `sql::query_context::with_query_context` for rationale.
@@ -273,6 +304,23 @@ pub(crate) fn leave_invoke() {
 
 pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
     CTX.try_with(|ctx| ctx.tikv_client.clone()).ok().flatten()
+}
+
+/// Borrow the raw connect-token captured at login, if this session has
+/// one. Used by the fs9 v2 backend to mint a per-tenant fs-plane token
+/// via db9-backend's exchange endpoint.
+pub(crate) fn fs_exchange_bearer() -> Option<Arc<str>> {
+    CTX.try_with(|ctx| ctx.fs_exchange_bearer.clone())
+        .ok()
+        .flatten()
+}
+
+/// Borrow the PG role the session authenticated as. Used to derive the
+/// fs9 `scp` (read vs read-write) when minting a fs-plane token.
+pub(crate) fn authenticated_role() -> Option<String> {
+    CTX.try_with(|ctx| ctx.authenticated_role.clone())
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn cached_fs_backend() -> Option<Arc<dyn SharedFsBackend>> {

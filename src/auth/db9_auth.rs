@@ -55,6 +55,13 @@ pub(crate) enum Db9AuthDispatchFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedJwtClaims {
     settings: BTreeMap<String, String>,
+    /// Original JWT string, preserved verbatim so downstream callers (fs9
+    /// v2 client) can present it to db9-backend's
+    /// `/internal/connect-token/exchange` endpoint as the user-Bearer
+    /// component of an exchange request. Never echoed to SQL via the
+    /// `request.jwt.*` settings (those would expose it to
+    /// `current_setting()`).
+    raw_token: Option<String>,
 }
 
 impl VerifiedJwtClaims {
@@ -66,9 +73,29 @@ impl VerifiedJwtClaims {
         self.settings.get(name).map(String::as_str)
     }
 
+    /// The original JWT string the verifier accepted. Present iff the
+    /// caller supplied one through the JWT (not connect-key) path.
+    pub(crate) fn raw_token(&self) -> Option<&str> {
+        self.raw_token.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_settings(settings: BTreeMap<String, String>) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            raw_token: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_settings_with_token(
+        settings: BTreeMap<String, String>,
+        raw_token: String,
+    ) -> Self {
+        Self {
+            settings,
+            raw_token: Some(raw_token),
+        }
     }
 }
 
@@ -204,7 +231,10 @@ struct Db9ConnectTokenClaims {
 }
 
 impl Db9ConnectTokenClaims {
-    fn into_verified_jwt_claims(self) -> Result<VerifiedJwtClaims, Db9AuthError> {
+    fn into_verified_jwt_claims(
+        self,
+        raw_token: Option<String>,
+    ) -> Result<VerifiedJwtClaims, Db9AuthError> {
         let mut claims = self.extra;
         claims.insert("exp".to_string(), serde_json::json!(self.exp));
         claims.insert("tid".to_string(), JsonValue::from(self.tid));
@@ -218,6 +248,14 @@ impl Db9ConnectTokenClaims {
         let mut settings = BTreeMap::new();
         settings.insert("request.jwt.claims".to_string(), all_claims_json);
         for (claim_name, value) in claims {
+            // Defensive belt-and-braces: never let a "raw_token" claim
+            // (which the issuer shouldn't emit but might in the future)
+            // reach `current_setting('request.jwt.claim.raw_token')` and
+            // become SQL-visible. The raw JWT travels through a separate
+            // VerifiedJwtClaims field (see `raw_token()`).
+            if claim_name.eq_ignore_ascii_case("raw_token") {
+                continue;
+            }
             let Some(setting_value) = claim_value_to_setting_string(&value) else {
                 continue;
             };
@@ -230,7 +268,10 @@ impl Db9ConnectTokenClaims {
             );
         }
 
-        Ok(VerifiedJwtClaims { settings })
+        Ok(VerifiedJwtClaims {
+            settings,
+            raw_token,
+        })
     }
 }
 
@@ -651,7 +692,7 @@ pub(crate) async fn verify_jwt_connect_token(
         });
     }
 
-    claims.into_verified_jwt_claims()
+    claims.into_verified_jwt_claims(Some(token.to_string()))
 }
 
 pub(crate) async fn verify_connect_key(

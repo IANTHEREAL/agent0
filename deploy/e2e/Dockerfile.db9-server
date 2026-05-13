@@ -7,20 +7,25 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     pkg-config \
     clang \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 ARG BUILD_GIT_HASH="dev"
 ARG BUILD_DATE="unknown"
 ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
 ENV BUILD_DATE=${BUILD_DATE}
+# DB9_REQUIRE_PROTOC=1 makes proto-compile failure a hard error so the
+# e2e image can't silently lose the fs9 v2 gRPC backend.
+ENV DB9_REQUIRE_PROTOC=1
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY .cargo/ .cargo/
 COPY src/ src/
 COPY vendor/ vendor/
 COPY crates/ crates/
+COPY proto/ proto/
 
 RUN cargo build --release
 

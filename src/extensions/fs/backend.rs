@@ -538,13 +538,152 @@ async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
              Ensure the caller wraps this in with_context_opts()."
         )
     })?;
+    let bearer = crate::extensions::context::fs_exchange_bearer();
+    let role = crate::extensions::context::authenticated_role();
+    init_backend_with_args(tenant_keyspace, client, bearer, role).await
+}
 
-    ensure_embedded_backend_bootstrap_allowed(&client, tenant_keyspace).await?;
+/// Routing decision exposed to non-SQL callers (notably the WebSocket
+/// handler, which authenticates outside the ExtensionContext task-local).
+///
+/// If fs9 v2 gRPC is configured AND a user JWT is available, route to
+/// `GrpcFsBackend`. Otherwise fall back to `EmbeddedFsBackend`. If v2
+/// is configured but the per-session bits are missing, fail-fast — never
+/// silently downgrade to embedded (which would route JuiceFS data
+/// through the wrong backend).
+pub(crate) async fn init_backend_with_args(
+    tenant_keyspace: &str,
+    tikv_client: Arc<tikv_client::TransactionClient>,
+    fs_exchange_bearer: Option<Arc<str>>,
+    authenticated_role: Option<String>,
+) -> Result<Arc<dyn FsBackend>> {
+    #[cfg(fsplane_v2_generated)]
+    {
+        if let Some(b) = try_init_grpc_backend(
+            tenant_keyspace,
+            fs_exchange_bearer.clone(),
+            authenticated_role.clone(),
+        )
+        .await?
+        {
+            return Ok(b);
+        }
+    }
+    // Suppress unused-arg lints when grpc cfg is absent.
+    let _ = (&fs_exchange_bearer, &authenticated_role);
 
-    EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
+    ensure_embedded_backend_bootstrap_allowed(&tikv_client, tenant_keyspace).await?;
+
+    EmbeddedFsBackend::new(tikv_client, tenant_keyspace.to_string())
         .await
         .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
         .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+}
+
+/// Attempt to instantiate the fs9 v2 gRPC backend. Returns:
+///   - `Ok(Some(_))` if all configuration is present and the channel +
+///     token provider were built;
+///   - `Ok(None)` if the deployment hasn't configured fs9 v2 (operator
+///     intent is "embedded-only on this server");
+///   - `Err(_)` if configuration is partial / inconsistent — fail-fast
+///     instead of silently falling back to embedded, so a misconfigured
+///     env doesn't downgrade authZ guarantees.
+#[cfg(fsplane_v2_generated)]
+async fn try_init_grpc_backend(
+    tenant_keyspace: &str,
+    fs_exchange_bearer: Option<Arc<str>>,
+    authenticated_role: Option<String>,
+) -> Result<Option<Arc<dyn FsBackend>>> {
+    use crate::auth::fs_plane_token::ExchangeConfig;
+    use crate::extensions::fs::grpc::client::{ExchangeTokenProvider, GrpcFsBackend};
+    use crate::extensions::fs::grpc::connector::shared_channel;
+
+    // fs9 v2 opt-in is all-or-nothing across four env vars. Reading any
+    // ONE of them present and the others missing is operator
+    // misconfiguration, not "embedded-only" intent — silently degrading
+    // would route JuiceFS tenant data to the wrong backend.
+    let endpoint = crate::config::env_string("FS9_GRPC_ENDPOINT");
+    let server_name = crate::config::env_string("FS9_GRPC_TLS_SERVER_NAME");
+    let backend_url = crate::config::env_string("DB9_BACKEND_URL");
+    let api_key = crate::config::env_string("DB9_SERVER_API_KEY");
+
+    // Embedded-only deployment: none of the v2 vars present. The
+    // backend.rs caller will route this tenant to EmbeddedFsBackend.
+    if endpoint.is_none() && server_name.is_none() && backend_url.is_none() && api_key.is_none() {
+        return Ok(None);
+    }
+
+    // Any v2 var present → all required. Fail fast with a single message
+    // listing what's missing so the operator can fix the deployment
+    // before any tenant traffic is mis-routed.
+    let mut missing = Vec::new();
+    if endpoint.is_none() {
+        missing.push("FS9_GRPC_ENDPOINT");
+    }
+    if server_name.is_none() {
+        missing.push("FS9_GRPC_TLS_SERVER_NAME");
+    }
+    if backend_url.is_none() {
+        missing.push("DB9_BACKEND_URL");
+    }
+    if api_key.is_none() {
+        missing.push("DB9_SERVER_API_KEY");
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "fs9 v2 partially configured: missing {}. Set all of \
+             {{FS9_GRPC_ENDPOINT, FS9_GRPC_TLS_SERVER_NAME, DB9_BACKEND_URL, \
+             DB9_SERVER_API_KEY}}, or unset all to run embedded-only.",
+            missing.join(", ")
+        );
+    }
+
+    // Safe to unwrap — `missing` was empty.
+    let exchange_cfg = ExchangeConfig::new(backend_url.unwrap(), api_key.unwrap());
+    let _ = (endpoint, server_name); // consumed by shared_channel via env
+
+    // Past this point the operator HAS opted into v2; missing per-session
+    // bits (bearer, role) are fatal — we don't silently downgrade.
+    let bearer = fs_exchange_bearer.ok_or_else(|| {
+        anyhow!(
+            "fs9 v2: session has no user JWT to forward to db9-backend exchange. \
+             Password / connect-key logins cannot access JuiceFS tenants on this \
+             server; switch the client to a connect-token login."
+        )
+    })?;
+    let role = authenticated_role.ok_or_else(|| {
+        anyhow!("fs9 v2: caller did not provide an authenticated_role; cannot derive scp.")
+    })?;
+    let tenant_id = tenant_keyspace
+        .strip_prefix("db9_tenant_")
+        .ok_or_else(|| {
+            anyhow!(
+                "fs9 v2: tenant keyspace '{tenant_keyspace}' lacks the db9_tenant_ \
+                 prefix; cannot derive tid claim."
+            )
+        })?
+        .to_string();
+
+    let channel = shared_channel().await?;
+    let cache = fs9_plane_token_cache();
+    let provider = Arc::new(ExchangeTokenProvider::new(
+        cache,
+        exchange_cfg,
+        bearer,
+        tenant_id.clone(),
+        role,
+    ));
+    let backend = GrpcFsBackend::new(channel, &tenant_id, provider);
+    Ok(Some(Arc::new(backend) as Arc<dyn FsBackend>))
+}
+
+#[cfg(fsplane_v2_generated)]
+fn fs9_plane_token_cache() -> Arc<crate::auth::fs_plane_token::Fs9PlaneTokenCache> {
+    use crate::auth::fs_plane_token::Fs9PlaneTokenCache;
+    static CACHE: std::sync::OnceLock<Arc<Fs9PlaneTokenCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| Arc::new(Fs9PlaneTokenCache::new()))
+        .clone()
 }
 
 /// Acquire the authoritative fs9 backend for the current statement.

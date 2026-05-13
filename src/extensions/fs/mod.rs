@@ -11,6 +11,7 @@ pub(crate) mod config;
 pub(crate) mod decoders;
 pub(crate) mod embedded;
 pub(crate) mod glob;
+pub(crate) mod grpc;
 pub(crate) mod notify;
 pub(crate) mod redis_events;
 pub(crate) mod s3;

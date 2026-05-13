@@ -59,6 +59,14 @@ pub(crate) struct StatementRuntimeContext {
     pub tikv_client: Option<Arc<TransactionClient>>,
     pub extension_txn_delta: Arc<crate::session_context::ExtensionTxnDelta>,
     pub extension_statement_state: Arc<crate::extensions::context::ExtensionStatementState>,
+    /// Raw connect-token captured at login; forwarded to db9-backend's
+    /// `/internal/connect-token/exchange` when this statement needs a
+    /// fs9 v2 fs-plane token. None for password/connect-key logins.
+    pub fs_exchange_bearer: Option<Arc<str>>,
+    /// The PG role this session authenticated as (e.g. `admin`,
+    /// `_db9_sys_readonly`). Used to derive the fs9 `scp` requested from
+    /// the exchange endpoint.
+    pub authenticated_role: Option<String>,
 }
 
 impl StatementRuntimeContext {
@@ -98,6 +106,13 @@ impl StatementRuntimeContext {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            fs_exchange_bearer: session.fs_exchange_bearer(),
+            // session.current_user() is the EFFECTIVE role after SET ROLE.
+            // For fs9 scope derivation we want the role the operator
+            // ACTUALLY authenticated as, not what they SET ROLE'd into,
+            // so the scope can't be elevated. session.session_user() is
+            // immutable across SET ROLE — that's what we use.
+            authenticated_role: session.session_user().map(|s| s.to_string()),
         }
     }
 }
@@ -120,6 +135,8 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
     let tikv_client = runtime.tikv_client.clone();
     let extension_txn_delta = runtime.extension_txn_delta.clone();
     let extension_statement_state = runtime.extension_statement_state.clone();
+    let fs_exchange_bearer = runtime.fs_exchange_bearer.clone();
+    let authenticated_role = runtime.authenticated_role.clone();
     let statement_dirty_table_ids =
         Arc::new(Mutex::new(crate::session_context::TxnDirtyTableIds::new()));
 
@@ -146,7 +163,9 @@ pub(crate) fn wrap_with_statement_runtime_context<'a, T: Send + 'a>(
                             .with_in_transaction(runtime.is_in_transaction)
                             .with_caller_sub(runtime.caller_sub.clone())
                             .with_statement_state(extension_statement_state)
-                            .with_tikv_client(tikv_client),
+                            .with_tikv_client(tikv_client)
+                            .with_fs_exchange_bearer(fs_exchange_bearer)
+                            .with_authenticated_role(authenticated_role),
                             fut,
                         ),
                     ),
@@ -347,6 +366,8 @@ mod tests {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            fs_exchange_bearer: None,
+            authenticated_role: None,
         };
 
         let out = wrap_with_statement_runtime_context(&runtime, async {
@@ -439,6 +460,8 @@ mod tests {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            fs_exchange_bearer: None,
+            authenticated_role: None,
         };
         let backend: Arc<dyn FsBackend> = Arc::new(RuntimeTestBackend);
 
@@ -483,6 +506,8 @@ mod tests {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            fs_exchange_bearer: None,
+            authenticated_role: None,
         };
 
         let authorized = wrap_with_statement_runtime_context(&runtime, async {

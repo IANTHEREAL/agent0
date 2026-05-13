@@ -6,9 +6,8 @@ use parking_lot::RwLock;
 
 use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
-use crate::extensions::fs::backend::{ensure_embedded_backend_bootstrap_allowed, FsBackend};
+use crate::extensions::fs::backend::{init_backend_with_args, FsBackend};
 use crate::extensions::fs::config::fs9_config;
-use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
 use crate::extensions::fs::ws::tenant_from_keyspace;
 use crate::pool::{TenantHandle, TikvClientPool};
@@ -183,7 +182,7 @@ pub(crate) async fn handle_auth(
         WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
     })?;
 
-    let (user, _trusted_jwt_claims, failure) = match dispatch_db9_auth(
+    let (user, trusted_jwt_claims, failure) = match dispatch_db9_auth(
         &auth_manager,
         &mut auth_txn,
         auth_mode,
@@ -245,7 +244,19 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    ensure_embedded_backend_bootstrap_allowed(&client, &keyspace)
+    // Forward the verified token (if any) to the router so a JuiceFS
+    // tenant can mint a fs-plane JWT via db9-backend exchange. WS
+    // sessions authenticated by password / connect-key leave this None;
+    // those won't reach JuiceFS tenants and will fail-fast at backend
+    // init with a clear message rather than silently downgrading to
+    // embedded.
+    let fs_exchange_bearer = trusted_jwt_claims
+        .as_ref()
+        .and_then(|c| c.raw_token())
+        .map(Arc::from);
+    let authenticated_role = Some(actual_user.clone());
+
+    let backend = init_backend_with_args(&keyspace, client, fs_exchange_bearer, authenticated_role)
         .await
         .map_err(|err| {
             WsResponse::error(
@@ -254,18 +265,6 @@ pub(crate) async fn handle_auth(
                 format!("failed to initialize fs backend: {err}"),
             )
         })?;
-
-    let backend: Arc<dyn FsBackend> = Arc::new(
-        EmbeddedFsBackend::new(client, keyspace.clone())
-            .await
-            .map_err(|err| {
-                WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("failed to initialize fs backend: {err}"),
-                )
-            })?,
-    );
 
     Ok(WsSession {
         _tenant_handle: tenant_handle,
