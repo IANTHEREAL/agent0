@@ -47,12 +47,6 @@ fn apply_trusted_jwt_claims(
     for (key, value) in claims.iter_settings() {
         session.set_server_reserved_setting(key, value.clone())?;
     }
-    // Capture the raw JWT off-band — needed when db9-server needs to call
-    // db9-backend's `/internal/connect-token/exchange` to mint a
-    // fs-plane-audience token for fs9 v2 RPCs. Kept on a private field
-    // (not a setting) so `current_setting('request.jwt.*')` cannot
-    // enumerate it.
-    session.set_fs_exchange_bearer(claims.raw_token());
     Ok(())
 }
 
@@ -1193,53 +1187,5 @@ mod tests {
     fn extract_budget_params_no_jwt_claims_returns_none() {
         let claims = make_claims(&[]);
         assert!(super::extract_budget_params(&claims).is_none());
-    }
-
-    // ─── apply_trusted_jwt_claims tests ──────────────────────────────
-
-    fn fresh_session() -> crate::sql::Session {
-        let store = crate::storage::TikvStore::new_stub();
-        let obs = crate::observability::registry().tenant("apply_trusted_jwt_claims_test");
-        crate::sql::Session::new_with_database(store, obs, 999_002, 1, "testdb".to_string(), 0, 0)
-            .unwrap()
-    }
-
-    /// `raw_token()` on the claims must end up on the session's
-    /// `fs_exchange_bearer` private slot — that's what the fs9 v2 gRPC
-    /// backend forwards to db9-backend's exchange endpoint. If this
-    /// breaks, JuiceFS tenants silently lose authority to read/write
-    /// their volumes.
-    #[test]
-    fn apply_trusted_jwt_claims_plumbs_raw_token_to_session() {
-        let claims = crate::auth::VerifiedJwtClaims::from_settings_with_token(
-            std::collections::BTreeMap::new(),
-            "header.payload.signature".to_string(),
-        );
-        let mut session = fresh_session();
-        super::apply_trusted_jwt_claims(&mut session, &claims)
-            .expect("apply_trusted_jwt_claims should succeed on empty claims with token");
-
-        let bearer = session
-            .fs_exchange_bearer()
-            .expect("session should carry the raw JWT for fs9 v2 exchange");
-        assert_eq!(&*bearer, "header.payload.signature");
-    }
-
-    /// Connect-token / connect-key logins that didn't actually carry a
-    /// JWT (so `from_settings` is used instead of `from_settings_with_token`)
-    /// must leave `fs_exchange_bearer` unset. The fs9 v2 backend then
-    /// refuses to mint an fs-plane token rather than calling the
-    /// exchange endpoint with no caller authority.
-    #[test]
-    fn apply_trusted_jwt_claims_without_raw_token_leaves_bearer_unset() {
-        let claims = make_claims(&[("request.jwt.claim.tid", "tenant_x")]);
-        let mut session = fresh_session();
-        super::apply_trusted_jwt_claims(&mut session, &claims)
-            .expect("apply_trusted_jwt_claims should succeed");
-
-        assert!(
-            session.fs_exchange_bearer().is_none(),
-            "no raw token on claims → no bearer on session"
-        );
     }
 }

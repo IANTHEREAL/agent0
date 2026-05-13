@@ -169,12 +169,6 @@ pub struct Session {
     /// register/unregister this session's start_ts. Set for interactive
     /// SQL connections; None for worker/background sessions.
     active_txn_registry: Option<Arc<crate::worker::active_txn_registry::ActiveTxnRegistry>>,
-    /// Verbatim JWT carried by the connect-token used at login (if any).
-    /// Forwarded to db9-backend `/internal/connect-token/exchange` when
-    /// db9-server needs an `aud="fs-plane"` token to call fs9. NEVER
-    /// exposed as a SQL setting — keep it on a private field so
-    /// `current_setting()` cannot enumerate it.
-    fs_exchange_bearer: Option<Arc<str>>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -262,7 +256,6 @@ impl Session {
             local_session_auth_save: None,
             session_auth_savepoints: Vec::new(),
             active_txn_registry: None,
-            fs_exchange_bearer: None,
         })
     }
 
@@ -340,24 +333,7 @@ impl Session {
             local_session_auth_save: None,
             session_auth_savepoints: Vec::new(),
             active_txn_registry: None,
-            fs_exchange_bearer: None,
         })
-    }
-
-    /// Capture the verbatim JWT used to authenticate this session. db9-server
-    /// forwards it to db9-backend's `/internal/connect-token/exchange`
-    /// endpoint when minting an `aud="fs-plane"` token for fs9 calls.
-    /// Connect-key or password logins leave this `None` — those code paths
-    /// are not eligible to access JuiceFS tenants via the v2 backend.
-    pub(crate) fn set_fs_exchange_bearer(&mut self, token: Option<&str>) {
-        self.fs_exchange_bearer = token.map(Arc::from);
-    }
-
-    /// Borrow the captured JWT, if any. Internal-only — the gRPC fs9
-    /// client and any future exchange-token helpers read this; it MUST NOT
-    /// flow to SQL via `current_setting()`.
-    pub(crate) fn fs_exchange_bearer(&self) -> Option<Arc<str>> {
-        self.fs_exchange_bearer.clone()
     }
 
     /// Set the GC active transaction registry. Called once after construction

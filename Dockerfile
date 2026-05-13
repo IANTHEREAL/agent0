@@ -17,7 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libclang-dev \
         libssl-dev \
         libicu-dev \
-        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,15 +26,11 @@ COPY .cargo ./.cargo
 COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
-COPY proto ./proto
 
 ARG BUILD_GIT_HASH=""
 ARG BUILD_DATE=""
-# DB9_REQUIRE_PROTOC=1 makes proto-compile failure a hard error so we
-# never ship a release image that silently lost the fs9 v2 gRPC backend.
 ENV BUILD_GIT_HASH=${BUILD_GIT_HASH} \
-    BUILD_DATE=${BUILD_DATE} \
-    DB9_REQUIRE_PROTOC=1
+    BUILD_DATE=${BUILD_DATE}
 
 # `db9-server` depends on `auth9-core`, which lives in the private
 # `db9-ai/db9-auth` repo. Cargo needs HTTPS credentials to clone it

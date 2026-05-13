@@ -50,12 +50,6 @@ rmp-serde = "1"
 memcomparable = "0.2"
 prost = "0.12"
 
-# fs9 v2 gRPC client (FS V4 peer-mode). Matches the prost 0.12 already in
-# the dependency graph; bumping to tonic 0.12 would force prost 0.13 and a
-# vendor/tikv-client rebuild for no functional gain.
-tonic = { version = "0.10", features = ["transport", "codegen", "prost", "tls", "tls-roots"] }
-tokio-stream = "0.1"
-
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -127,9 +121,6 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 default = ["parquet"]
 parquet = ["dep:parquet", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast"]
 mock-storage = []
-
-[build-dependencies]
-tonic-build = { version = "0.10", default-features = false, features = ["transport", "prost"] }
 
 [dev-dependencies]
 proptest = "1.6"
