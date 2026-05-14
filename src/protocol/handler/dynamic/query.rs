@@ -1070,19 +1070,26 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             let store = executor.store();
 
             // Brief session lock to read db_id + search_path + is_superuser + bypass_rls
-            let (db_id, search_path, is_superuser, bypass_rls) = {
+            //
+            // session_user() (not current_user()) is the login role and matches
+            // what StatementRuntimeContext::from_session uses on the execution
+            // path. SET ROLE must not influence fs-plane scope.
+            let (db_id, search_path, is_superuser, bypass_rls, authenticated_role) = {
                 let session = state.session.lock().await;
                 (
                     session.current_database_id(),
                     session.search_path().to_vec(),
                     session.is_superuser(),
                     session.bypass_rls(),
+                    session.session_user().map(str::to_string),
                 )
             };
 
             // Extension context for fs9 schema inference during catalog prefetch.
             // Without this, fs9 backend acquisition fails because the statement
-            // scope has neither a cached backend nor a TiKV client.
+            // scope has neither a cached backend nor a TiKV client. JuiceFS
+            // tenants additionally need `authenticated_role` to derive scp at
+            // mint time — without it `init_juicefs_backend` rejects the call.
             let tenant_keyspace = executor.tenant_keyspace().to_string();
             let tikv_client = store.transaction_client();
             let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
@@ -1090,7 +1097,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 bypass_rls,
                 &tenant_keyspace,
             )
-            .with_tikv_client(tikv_client);
+            .with_tikv_client(tikv_client)
+            .with_authenticated_role(authenticated_role);
 
             // Temporary read-only transaction for catalog access
             match store.begin().await {

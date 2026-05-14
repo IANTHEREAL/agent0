@@ -72,6 +72,13 @@ impl VerifiedJwtClaims {
     }
 }
 
+/// Successful dispatch. `trusted_jwt_claims` is only populated on the
+/// JWT path; the other two login methods carry no IdP-verified claims.
+pub(crate) struct Db9AuthDispatchSuccess {
+    pub user: User,
+    pub trusted_jwt_claims: Option<VerifiedJwtClaims>,
+}
+
 pub(crate) async fn dispatch_db9_auth(
     auth_manager: &AuthManager,
     txn: &mut Transaction,
@@ -80,14 +87,20 @@ pub(crate) async fn dispatch_db9_auth(
     username: &str,
     password: &str,
 ) -> AnyhowResult<(
-    Option<User>,
-    Option<VerifiedJwtClaims>,
+    Option<Db9AuthDispatchSuccess>,
     Option<Db9AuthDispatchFailure>,
 )> {
+    let dispatch_password = |user: Option<User>| {
+        user.map(|user| Db9AuthDispatchSuccess {
+            user,
+            trusted_jwt_claims: None,
+        })
+    };
+    let _ = keyspace;
+
     match auth_mode {
         config::Db9AuthMode::Password => Ok((
-            auth_manager.authenticate(txn, username, password).await?,
-            None,
+            dispatch_password(auth_manager.authenticate(txn, username, password).await?),
             None,
         )),
         config::Db9AuthMode::Both | config::Db9AuthMode::Token => {
@@ -98,12 +111,13 @@ pub(crate) async fn dispatch_db9_auth(
             match material_kind {
                 Db9AuthMaterialKind::Password => {
                     if require_token {
-                        return Ok((None, None, Some(Db9AuthDispatchFailure::TokenRequired)));
+                        return Ok((None, Some(Db9AuthDispatchFailure::TokenRequired)));
                     }
 
                     Ok((
-                        auth_manager.authenticate(txn, username, password).await?,
-                        None,
+                        dispatch_password(
+                            auth_manager.authenticate(txn, username, password).await?,
+                        ),
                         None,
                     ))
                 }
@@ -111,36 +125,39 @@ pub(crate) async fn dispatch_db9_auth(
                     match verify_jwt_connect_token(token_material, keyspace, username).await {
                         Ok(claims) => {
                             let user = auth_manager.get_user(txn, username).await?;
-                            if user.is_none() {
-                                return Ok((
-                                    None,
-                                    None,
-                                    Some(Db9AuthDispatchFailure::JwtUserNotFound),
-                                ));
-                            }
-                            Ok((user, Some(claims), None))
+                            let Some(user) = user else {
+                                return Ok((None, Some(Db9AuthDispatchFailure::JwtUserNotFound)));
+                            };
+                            Ok((
+                                Some(Db9AuthDispatchSuccess {
+                                    user,
+                                    trusted_jwt_claims: Some(claims),
+                                }),
+                                None,
+                            ))
                         }
-                        Err(err) => Ok((None, None, Some(Db9AuthDispatchFailure::JwtFailed(err)))),
+                        Err(err) => Ok((None, Some(Db9AuthDispatchFailure::JwtFailed(err)))),
                     }
                 }
                 Db9AuthMaterialKind::ConnectKey => {
                     match verify_connect_key(token_material, keyspace, username).await {
                         Ok(()) => {
                             let user = auth_manager.get_user(txn, username).await?;
-                            if user.is_none() {
+                            let Some(user) = user else {
                                 return Ok((
-                                    None,
                                     None,
                                     Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound),
                                 ));
-                            }
-                            Ok((user, None, None))
+                            };
+                            Ok((
+                                Some(Db9AuthDispatchSuccess {
+                                    user,
+                                    trusted_jwt_claims: None,
+                                }),
+                                None,
+                            ))
                         }
-                        Err(err) => Ok((
-                            None,
-                            None,
-                            Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)),
-                        )),
+                        Err(err) => Ok((None, Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)))),
                     }
                 }
             }
@@ -323,7 +340,7 @@ static INTROSPECT_URL_DEPRECATED: AtomicBool = AtomicBool::new(false);
 /// to avoid scope-creeping this cache-bounding PR.
 static JWKS_CACHE: OnceLock<Mutex<JwksCacheState>> = OnceLock::new();
 
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -822,7 +839,7 @@ async fn verify_connect_key_legacy(
         })?;
 
     validate_connect_key_introspection(&info, tenant_id, expected_role, chrono::Utc::now())?;
-
+    let _ = expected_keyspace;
     Ok(())
 }
 

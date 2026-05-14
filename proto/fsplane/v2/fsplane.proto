@@ -1,0 +1,1332 @@
+syntax = "proto3";
+
+package fsplane.v2;
+
+option go_package = "github.com/db9-ai/fs9/gen/fsplane/v2;fsplanev2";
+
+// fsplane.v2 is the single authoritative gRPC contract between db9-server
+// (Rust tonic) and fs9 (Go). v1 is retired after migration. This is "the
+// real thing" — no hedging, no backwards-compat fields, no reserved
+// ranges on new messages.
+//
+// Transport & identity
+// --------------------
+// All RPCs are authenticated by a short-lived RS256 JWT carried in the
+// gRPC metadata key "authorization" as `Bearer <jwt>`. No credential
+// fields on the wire.
+//
+// The fs9 interceptor enforces, in order:
+//   A1. JWT signature (JWKS cached, 60s TTL) and `exp > now` with skew ≤ 30s.
+//   A2. `aud` matches the service: "fs-plane" for FsPlane, "fs-plane-admin"
+//       for FsPlaneAdmin. Mismatch → Status.code PERMISSION_DENIED,
+//       details = AuthFailureDetail{reason_class: "aud_mismatch"}.
+//   A3. `tid` claim derives `volume_id`: expected = "jfs_t_" + tid.
+//   A4. Request's `volume_id = 1` field (on every request) equals the
+//       expected derived value. Mismatch → AuthFailureDetail{
+//       reason_class: "volume_inaccessible", code: VOLUME_NOT_ACCESSIBLE}.
+//       Missing-volume and tid-mismatch return the same code/message —
+//       no existence oracle.
+//   A5. `scp` claim grants the requested mode:
+//         "fs:volume:<jfs_t_id>:r"   for read-only RPCs
+//         "fs:volume:<jfs_t_id>:rw"  for mutating RPCs
+//         "fs:admin"                 for FsPlaneAdmin RPCs (in addition
+//                                    to the aud=fs-plane-admin gate)
+//       The write/read classification is fixed by RPC method name and is
+//       documented in DESIGN.md §Q3; it MUST NOT be inferred from proto
+//       comments.
+//
+// Error model
+// -----------
+// Two distinct error shapes, matched to two distinct failure origins:
+//
+// 1. Interceptor rejections (auth/authz failures — the handler never
+//    ran). Transport: gRPC Status. Status.code ∈ {PERMISSION_DENIED,
+//    UNAUTHENTICATED, NOT_FOUND}. Status.message MUST come from a
+//    hardcoded allowlist of static strings — no fmt.Sprintf with tenant
+//    state. Status.details contains an `AuthFailureDetail` (below) with a
+//    reason_class token for client-side triage.
+//
+// 2. Handler domain errors (file not found, wrong owner, offset skew,
+//    etc.). Transport: response envelope via `oneof result`. On the
+//    happy path the server returns `Response{ meta | data | ... }`; on
+//    the error path it returns `Response{ error: FsError{...} }`. gRPC
+//    Status.code stays OK(0). Making error and success cases mutually
+//    exclusive at the proto layer prevents handler bugs where error
+//    fields are forgotten. Streaming RPCs additionally use gRPC Status
+//    for transport errors (deadline, connection reset); stream-level
+//    domain errors ride as a terminal WatchEvent/ReadAtResponse with
+//    `error` populated.
+//
+// See DESIGN.md §Q1 for the full contract.
+
+// =============================================================================
+// Services
+// =============================================================================
+
+// FsPlane is the tenant data-plane. aud = "fs-plane". Every request
+// carries `string volume_id = 1` and is gated by the interceptor per A1-A5
+// above.
+service FsPlane {
+  // --- Reads ---
+  rpc Stat(StatRequest)                       returns (StatResponse);
+  rpc BatchStat(BatchStatRequest)             returns (BatchStatResponse);
+  rpc BatchInlineRead(BatchInlineReadRequest) returns (BatchInlineReadResponse);
+  rpc Readdir(ReaddirRequest)                 returns (ReaddirResponse);
+  rpc ReadAt(ReadAtRequest)                   returns (stream ReadAtResponse);
+
+  // --- Unary writes ---
+  rpc PutFile(PutFileRequest)       returns (PutFileResponse);
+  rpc WriteAt(WriteAtRequest)       returns (WriteAtResponse);
+  rpc Truncate(TruncateRequest)     returns (TruncateResponse);
+
+  // --- Streaming multipart (proxy-staged) ---
+  rpc BeginWrite(BeginWriteRequest)           returns (BeginWriteResponse);
+  rpc WriteParts(stream WritePartRequest)     returns (WritePartsResponse);
+  rpc CommitWrite(CommitWriteRequest)         returns (CommitWriteResponse);
+  rpc AbortWrite(AbortWriteRequest)           returns (AbortWriteResponse);
+
+  // --- Presigned (capability-token, direct-to-S3) ---
+  rpc PrepareUpload(PrepareUploadRequest)     returns (PrepareUploadResponse);
+  rpc CompleteUpload(CompleteUploadRequest)   returns (CompleteUploadResponse);
+  rpc AbortUpload(AbortUploadRequest)         returns (AbortUploadResponse);
+  rpc PrepareDownload(PrepareDownloadRequest) returns (PrepareDownloadResponse);
+
+  // --- Lifecycle ---
+  rpc Delete(DeleteRequest)         returns (DeleteResponse);
+  rpc Mkdir(MkdirRequest)           returns (MkdirResponse);
+  rpc Rename(RenameRequest)         returns (RenameResponse);
+  rpc Symlink(SymlinkRequest)       returns (SymlinkResponse);
+  rpc Readlink(ReadlinkRequest)     returns (ReadlinkResponse);
+  rpc Chmod(ChmodRequest)           returns (ChmodResponse);
+
+  // --- Events ---
+  rpc Subscribe(SubscribeRequest)   returns (stream WatchEvent);
+
+  // --- Volume info ---
+  // Returns an advisory snapshot of the current effective per-mount setting
+  // for this volume — currently just `server_writeback`. For race-free
+  // discovery of the mode that ran a specific write/flush mutation, read
+  // that RPC's `server_writeback` response field. This snapshot may be stale
+  // relative to a later mutation because admin can switch stored intent
+  // between this call and the next mutation; the live mount only flips on
+  // eviction/remount. Routes through the standard data-plane auth +
+  // lazy-mount interceptor (fails closed if the tenant is not eligible to
+  // attach).
+  rpc GetVolumeInfo(GetVolumeInfoRequest) returns (GetVolumeInfoResponse);
+}
+
+// FsPlaneAdmin is the control-plane service, separated from FsPlane so the
+// interceptor can gate it by `aud = "fs-plane-admin"` at the service
+// boundary. This is defense-in-depth against scp-parser bugs that would
+// otherwise allow a data-plane JWT to reach admin RPCs via a crafted scp
+// claim. See DESIGN.md §Q2 for the ratification rationale and recorded
+// dissent.
+service FsPlaneAdmin {
+  rpc InitVolume(InitVolumeRequest)               returns (InitVolumeResponse);
+  rpc CloseVolume(CloseVolumeRequest)             returns (CloseVolumeResponse);
+  rpc AdvanceNextChunk(AdvanceNextChunkRequest)   returns (AdvanceNextChunkResponse);
+
+  // DestroyVolume retires a volume's METADATA. It does NOT delete S3
+  // objects; that responsibility belongs exclusively to ReapSliceGC, the
+  // cross-keyspace reaper that owns S3 object lifecycle for the entire
+  // clone family.
+  //
+  // Why: after TiKV BR clone (db9-backend #1401), multiple keyspaces share
+  // the same `format.Name` S3 prefix. Bulk-deleting a single keyspace's
+  // S3 footprint would nuke bytes still referenced by sibling branches —
+  // the destroy-side variant of the bug class fixed in fs9 #80. The only
+  // correct predicate for deleting an S3 object is "no keyspace in the
+  // clone family references it," and only the reaper has that view.
+  //
+  // The handler:
+  //   0. Refuses if `meta_url`'s keyspace param is present but does not
+  //      match `volume_id`. Returns InvalidArgument with reason
+  //      `keyspace_mismatch`.
+  //   1. Refuses if the volume is currently mounted in this fs9 process
+  //      (Manager.Peek non-nil) — caller must CloseVolume first. Returns
+  //      Status.code FailedPrecondition with reason `volume_busy`.
+  //   2. Refuses if the volume's meta engine reports any active sessions
+  //      from any client (defends against another fs9 pod, an external
+  //      JuiceFS mount, or a stuck session). Returns FailedPrecondition
+  //      with reason `volume_has_sessions`. Set `force = true` to bypass.
+  //   3. If `skip_meta_reset = false` (default), calls JuiceFS
+  //      meta.Reset() to wipe the volume's metadata in TiKV. After this
+  //      the keyspace contributes no refs to any future reaper union, so
+  //      slices that only this keyspace referenced become reaper-eligible.
+  //      Set `skip_meta_reset = true` when the caller will ARCHIVE the
+  //      keyspace via PD (kvengine's compaction filter handles meta
+  //      removal). Required on TiDB Cloud Serverless's
+  //      cloud-storage-engine, where the meta.Reset() codepath issues a
+  //      TiKV kv_delete_range RPC that panics with `unreachable!()` (only
+  //      unsafe_destroy_range is wired up there).
+  //
+  // Response fields `objects_deleted` / `objects_failed` are retained for
+  // wire stability but are ALWAYS zero — fs9 does not touch S3 in this
+  // RPC. Callers wanting to observe reclaimed storage should consume
+  // ReapSliceGC stats instead.
+  //
+  // Idempotent: a second DestroyVolume call after meta.Reset() is a
+  // no-op success.
+  //
+  // The PD-side keyspace state (DISABLED → ARCHIVED → TOMBSTONE) is NOT
+  // managed here; it is the caller's responsibility, since freeing TiKV
+  // regions requires a PD API call that fs9 has no other reason to make.
+  rpc DestroyVolume(DestroyVolumeRequest)         returns (DestroyVolumeResponse);
+
+  // ReapSliceGC runs one round of cross-keyspace slice garbage collection
+  // for the family identified by `format_name`. See the message comment
+  // on ReapSliceGCRequest for the full contract and the two invariants
+  // the caller (db9-backend cron) must uphold.
+  rpc ReapSliceGC(ReapSliceGCRequest)             returns (ReapSliceGCResponse);
+}
+
+// =============================================================================
+// Shared types
+// =============================================================================
+
+// FileMeta is the canonical file descriptor. Embedded in Stat/Readdir/
+// BatchStat/PutFile/WriteAt/Truncate/Mkdir/Chmod/CommitWrite/CompleteUpload/
+// PrepareDownload responses.
+message FileMeta {
+  // Byte length. For directories, backend-defined (typically 0 or block
+  // size).
+  uint64 size = 1;
+
+  // Modification time in nanoseconds since Unix epoch. Sourced from
+  // JuiceFS Inode.Mtime_nsec.
+  int64 mtime_ns = 2;
+
+  // POSIX permission bits (the low 9 bits: rwxrwxrwx). File type is
+  // carried by `is_dir` / `is_symlink`, not encoded in mode.
+  uint32 mode = 3;
+
+  bool is_dir = 4;
+
+  // `true` iff the inode is a symlink. Implementers: fs9's Stat handler
+  // must read the JuiceFS inode type bits (ISLNK) and populate this —
+  // current handler.go:189-194 hard-codes only `is_dir`, which will be
+  // fixed in the same change that lands v2. See DESIGN.md §FileMeta.
+  bool is_symlink = 5;
+
+  // Opaque monotonic version, computed as
+  //   version = (mtime_ns << 16) | structural_generation
+  // Clients SHOULD treat this as a single opaque uint64 for CAS-style
+  // "compare-and-swap" semantics on a file. MUST NOT decompose on the
+  // client side; the packing is a server-side implementation detail and
+  // may change. Comparison is `>`/`==`/`<` on the uint64.
+  //
+  // Phase 1 acceptance (fs_v4.md §6): fs9 Stat/Readdir handler MUST
+  // populate this; returning 0 is a bug. DESIGN.md §Q-version documents
+  // the rollout gate.
+  uint64 version = 6;
+}
+
+// FsError is the typed handler-level error surface. Returned only inside
+// response `oneof result` envelopes, NEVER via Status.details (interceptor
+// errors use AuthFailureDetail instead).
+message FsError {
+  FsErrorCode code = 1;
+
+  // Human-readable detail. Server MUST NOT include canonicalized paths,
+  // server-derived volume_ids, or any value not already supplied by the
+  // caller. Verbatim echo of caller-supplied tokens (upload_id, part
+  // number, requested offset) is permitted.
+  string message = 2;
+
+  // Structured error context. Keys are stable short tokens:
+  //   "upload_id"      = <string>
+  //   "offset"         = <decimal>
+  //   "expected_size"  = <decimal>
+  //   "part_number"    = <decimal>
+  // Absent keys mean "not applicable" to this error.
+  map<string, string> context = 3;
+}
+
+enum FsErrorCode {
+  FS_ERROR_UNSPECIFIED           = 0;
+
+  // --- Syscall-mirror set (v1 client.rs:937-947 evidence) ---
+  FS_ERROR_NOT_FOUND             = 1;  // ENOENT
+  FS_ERROR_PERMISSION_DENIED     = 2;  // EACCES — handler-level, e.g. JuiceFS ACL
+  FS_ERROR_ALREADY_EXISTS        = 3;  // EEXIST
+  FS_ERROR_NOT_DIRECTORY         = 4;  // ENOTDIR
+  FS_ERROR_IS_DIRECTORY          = 5;  // EISDIR
+  FS_ERROR_INVALID_ARGUMENT      = 6;  // EINVAL, malformed request payloads
+  FS_ERROR_NO_SPACE              = 7;  // ENOSPC — backend storage full
+  FS_ERROR_NOT_EMPTY             = 8;  // ENOTEMPTY
+  FS_ERROR_IO                    = 9;  // EIO — unclassified backend failure
+
+  // --- Size/quota (v1 conflated these with NO_SPACE; v2 separates) ---
+  FS_ERROR_TOO_LARGE             = 10; // EFBIG or server-imposed cap (PutFile
+                                       // > 4 MiB, ExpectedSize exceeded at
+                                       // WritePart).
+
+  // --- Cross-tenant / authz-adjacent ---
+  FS_ERROR_VOLUME_NOT_ACCESSIBLE = 11; // Collapses "volume does not exist"
+                                       // and "caller tid != volume tid" —
+                                       // no existence oracle. Typically
+                                       // emitted by interceptor (via
+                                       // AuthFailureDetail), but handlers
+                                       // may emit if lookup deferred.
+
+  // --- Multipart upload state (multipart_handler.go:55,113,125-148,454,563,646) ---
+  FS_ERROR_UPLOAD_BUSY           = 12; // Writing/Publishing collision —
+                                       // transient, retry same upload_id
+                                       // (mirrors gRPC Aborted).
+  FS_ERROR_UPLOAD_TERMINAL       = 13; // Committed/Aborted/Expired/Failed —
+                                       // rebegin with a fresh upload_id.
+  FS_ERROR_WRONG_OWNER           = 14; // Upload resource bound to a different
+                                       // session than the caller — client
+                                       // MUST NOT retry same upload_id.
+  FS_ERROR_OFFSET_MISMATCH       = 15; // WriteParts stream offset != server
+                                       // cumulative bytes_received, or
+                                       // CommitWrite total_size disagreement.
+
+  // --- Integrity-verification failures ---
+  FS_ERROR_DATA_LOSS             = 16; // sha256 accumulated over the staged
+                                       // content did not match the
+                                       // caller-supplied digest on
+                                       // CommitWrite / CompleteUpload.
+                                       // Client MUST NOT retry with the same
+                                       // bytes — the corruption happened on
+                                       // the caller side or in transit.
+
+  // FS_ERROR_OUT_OF_RANGE (Subscribe resume past retention) is signaled
+  // via a terminal WatchEvent whose `error` field carries one of the above
+  // codes plus context["reason"] = "resume_beyond_retention". Separate
+  // code not warranted.
+}
+
+// AuthFailureDetail is carried in gRPC Status.details for interceptor
+// rejections (A1-A5). Intentionally minimal and state-free so an
+// interceptor code path cannot accidentally embed canonicalized paths,
+// resolved volume IDs, or other server-derived values.
+//
+// reason_class is a stable short token, drawn from:
+//   "token_invalid"        — JWT signature or iat/nbf/exp malformed
+//   "token_expired"        — exp <= now
+//   "aud_mismatch"         — aud != expected service audience
+//   "volume_inaccessible"  — tid missing, or volume_id != "jfs_t_"+tid
+//   "scp_insufficient"     — scp does not cover the requested mode
+//   "quota_exceeded"       — tenant-level rate or size limit hit
+// Implementations MUST NOT introduce ad-hoc reason_class strings.
+message AuthFailureDetail {
+  FsErrorCode code = 1;     // typically PERMISSION_DENIED or
+                            // VOLUME_NOT_ACCESSIBLE
+  string reason_class = 2;
+}
+
+enum WriteMode {
+  WRITE_MODE_UNSPECIFIED = 0;
+  WRITE_MODE_REPLACE     = 1; // atomic rename-over target
+  WRITE_MODE_CREATE_ONLY = 2; // atomic rename with RENAME_NOREPLACE
+  WRITE_MODE_APPEND      = 3; // concat under flock at commit
+}
+
+message HeaderPair {
+  string name = 1;
+  string value = 2;
+}
+
+// =============================================================================
+// Reads
+// =============================================================================
+
+message StatRequest {
+  string volume_id = 1;
+  string path = 2;
+}
+
+message StatResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+}
+
+// BatchStat returns N entries for N requested paths in the same order.
+// Per-path success/failure is encoded inside BatchStatEntry, so the RPC
+// itself succeeds whenever the request is well-formed. Strictly
+// order-preserving: entries[i] corresponds to paths[i].
+message BatchStatRequest {
+  string volume_id = 1;
+  repeated string paths = 2;
+}
+
+message BatchStatResponse {
+  // Top-level error applies to the whole request (e.g., paths exceeds
+  // server cap → FS_ERROR_TOO_LARGE). Per-path errors live inside
+  // BatchStatEntry.
+  oneof result {
+    BatchStatPayload payload = 1;
+    FsError          error = 2;
+  }
+}
+
+message BatchStatPayload {
+  repeated BatchStatEntry entries = 1;
+}
+
+message BatchStatEntry {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+}
+
+// BatchInlineRead returns the content of N small files in one RPC, in the
+// same order as `paths`. Designed to replace client-side fan-out of N
+// individual ReadAt calls (each consuming a per-tid inflight slot at the
+// auth interceptor). One BatchInlineRead consumes one inflight slot; the
+// handler bounds its internal physical-read concurrency via a per-volume
+// fan-out gate so one batch cannot monopolize JuiceFS download capacity.
+//
+// Per-path success/failure is encoded inside BatchInlineReadEntry, so the
+// RPC itself succeeds whenever the request is well-formed AND fits the
+// fan-out gate. Strictly order-preserving: entries[i] ↔ paths[i].
+//
+// Top-level FsError vs gRPC Status:
+//   - whole-batch shape errors (paths > server max_paths, request budgets
+//     above server caps): top-level FsError{code: TOO_LARGE}.
+//   - per-path domain errors (NOT_FOUND, IS_DIRECTORY, file > max_file_bytes):
+//     per-entry FsError, batch envelope still successful.
+//   - fan-out gate exhaustion (server-side scheduling pushback): gRPC
+//     Status.code=ResourceExhausted with AuthFailureDetail{
+//     reason_class:"quota_exceeded"} — symmetric with the per-tid quota
+//     gate at interceptors_auth.go. Client RetryingFsClient::execute_retried
+//     handles backoff for the whole batch.
+message BatchInlineReadRequest {
+  string volume_id = 1;
+  repeated string paths = 2;
+  // Per-file content cap. 0 = server default. Server enforces
+  // min(request, server_cap). A file exceeding the effective cap becomes
+  // a per-entry FsError{code: TOO_LARGE}; the rest of the batch still
+  // returns content.
+  uint64 max_file_bytes = 3;
+  // Sum of returned `data` bytes across all successful entries. 0 =
+  // server default. Counts only data bytes — FileMeta overhead is bounded
+  // by MaxRecvMsgSize and is not subject to this cap. If the request
+  // value exceeds the server cap, top-level FS_ERROR_TOO_LARGE.
+  uint64 max_total_bytes = 4;
+}
+
+message BatchInlineReadResponse {
+  oneof result {
+    BatchInlineReadPayload payload = 1;
+    FsError                error   = 2;
+  }
+}
+
+message BatchInlineReadPayload {
+  repeated BatchInlineReadEntry entries = 1;
+}
+
+message BatchInlineReadEntry {
+  oneof result {
+    BatchInlineReadData data  = 1;
+    FsError             error = 2;
+  }
+}
+
+message BatchInlineReadData {
+  bytes    data = 1;
+  // FileMeta is included so callers (FUSE prefetch, cp/download) can
+  // populate their attribute cache without a follow-up Stat. Pattern
+  // mirrors ReadAtChunk first-chunk meta and DirEntry meta.
+  FileMeta meta = 2;
+}
+
+message ReaddirRequest {
+  string volume_id = 1;
+  string path = 2;
+}
+
+message ReaddirResponse {
+  oneof result {
+    ReaddirPayload payload = 1;
+    FsError        error = 2;
+  }
+}
+
+message ReaddirPayload {
+  repeated DirEntry entries = 1;
+}
+
+message DirEntry {
+  string name = 1;
+  FileMeta meta = 2;
+}
+
+message ReadAtRequest {
+  string volume_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  // 0 = read to end of file.
+  uint64 length = 4;
+}
+
+message ReadAtResponse {
+  // Exactly one of {chunk, error} populated per frame. A terminal frame
+  // carrying `error` ends the stream. Transport-level failures (deadline,
+  // cancel) still surface as gRPC Status.
+  oneof frame {
+    ReadAtChunk chunk = 1;
+    FsError     error = 2;
+  }
+}
+
+message ReadAtChunk {
+  bytes data = 1;
+  // Populated only on the first chunk of a successful stream.
+  FileMeta meta = 2;
+}
+
+// =============================================================================
+// Unary writes
+// =============================================================================
+
+message PutFileRequest {
+  string    volume_id = 1;
+  string    path      = 2;
+  WriteMode mode      = 3;
+  uint32    file_mode = 4;
+  uint32    umask     = 5;
+  // Rejected with FS_ERROR_TOO_LARGE if len(data) > 4 MiB. Use
+  // BeginWrite/WriteParts/CommitWrite or PrepareUpload for larger.
+  bytes     data      = 6;
+  // Optional SHA-256 of `data`. Verified only if present.
+  // Mismatch → FsError{code: INVALID_ARGUMENT, context["reason"]="sha256_mismatch"}.
+  // (A future FS_ERROR_DATA_LOSS code will land together with the
+  // verifier implementation.)
+  optional bytes sha256 = 7;
+}
+
+message PutFileResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message WriteAtRequest {
+  string volume_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  // MUST be true in v2; buffered-write mode is not part of the v2 contract.
+  //
+  // Effective durability for this RPC is mode-dependent; read
+  // `WriteAtResponse.server_writeback` from this RPC's successful response:
+  //   - server_writeback=false (default): on success fs9 has no further
+  //     server-side JuiceFS writeback gap behind this RPC return.
+  //   - server_writeback=true: success means accepted/flushed by JuiceFS
+  //     according to its writeback mode; object-store durability is NOT
+  //     guaranteed at RPC return.
+  //
+  // `FsPlane.GetVolumeInfo` is only an advisory snapshot and may race with
+  // admin mode flips between that query and this mutation.
+  bool flush = 5;
+}
+
+message WriteAtResponse {
+  oneof result {
+    WriteAtSuccess success = 1;
+    FsError        error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message WriteAtSuccess {
+  uint64   bytes_written = 1;
+  FileMeta meta          = 2;
+}
+
+message TruncateRequest {
+  string volume_id = 1;
+  string path = 2;
+  uint64 size = 3;
+}
+
+message TruncateResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+// =============================================================================
+// Streaming multipart writes
+// =============================================================================
+//
+// Two-phase: BeginWrite allocates an opaque upload_id, WriteParts streams
+// bytes (strict in-order, offset must equal server cumulative
+// bytes_received), CommitWrite publishes atomically. Server accepts
+// WritePartRequest.data up to 4 MiB per message. No part-size hint on
+// the wire — 4 MiB is a contract constant.
+
+message BeginWriteRequest {
+  string    volume_id = 1;
+  string    path      = 2;
+  WriteMode mode      = 3;
+  uint32    file_mode = 4;
+  uint32    umask     = 5;
+  // Optional upper bound on total bytes. Server fast-fails subsequent
+  // WritePart calls if cumulative would exceed this.
+  optional uint64 expected_size = 6;
+}
+
+message BeginWriteResponse {
+  oneof result {
+    BeginWriteSuccess success = 1;
+    FsError           error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message BeginWriteSuccess {
+  // Opaque, 128-bit random, unguessable.
+  string upload_id = 1;
+  // No expires_at — server is authoritative on TTL; clients MUST NOT
+  // compute "time remaining" from a wire value (clock-skew hazard).
+}
+
+// WritePartRequest: first message binds the stream to a specific
+// upload_id within a specific volume (interceptor checks A4). Subsequent
+// messages need only upload_id (the stream is already bound); the server
+// rejects frames whose upload_id differs from the first.
+message WritePartRequest {
+  // Required on the FIRST message; ignored on subsequent messages.
+  // Server validates volume_id against the JWT tid at stream-init.
+  string volume_id = 1;
+  // Required on every message.
+  string upload_id = 2;
+  // MUST equal the server's cumulative bytes_received; otherwise
+  // FsError{code: OFFSET_MISMATCH}. Strict in-order, no gaps, no overlap.
+  uint64 offset = 3;
+  bytes  data = 4;
+}
+
+message WritePartsResponse {
+  oneof result {
+    WritePartsSuccess success = 1;
+    FsError           error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message WritePartsSuccess {
+  uint64 bytes_received = 1;
+}
+
+message CommitWriteRequest {
+  string volume_id  = 1;
+  string upload_id  = 2;
+  // MUST equal server cumulative bytes_received; otherwise
+  // FsError{code: OFFSET_MISMATCH}.
+  uint64 total_size = 3;
+  // Optional SHA-256 of the full staged content. If set, server verifies
+  // before publish. Absence means "do not verify" — NOT "empty file".
+  optional bytes sha256 = 4;
+}
+
+message CommitWriteResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // For idempotent retries, this is the mode recorded by the original commit.
+  bool server_writeback = 3;
+}
+
+message AbortWriteRequest {
+  string volume_id = 1;
+  string upload_id = 2;
+}
+
+message AbortWriteResponse {
+  oneof result {
+    AbortWriteSuccess success = 1;
+    FsError           error = 2;
+  }
+}
+
+message AbortWriteSuccess {}
+
+// =============================================================================
+// Presigned (capability-token) writes — S3 multipart
+// =============================================================================
+//
+// fs9 v2 is JuiceFS-on-S3 only (see DESIGN.md §§scope (c)). PrepareUpload
+// mints S3 multipart presigned PUT URLs bound to tenant-scoped object keys
+// (`jfs_t_<tid>/<path>/<upload_id>/<part>`). The SigV4 signature binds
+// each URL to its specific object key, so a leaked URL cannot escape the
+// tenant's S3 namespace.
+//
+// Server caps TTL at min(JWT exp remaining, 60 min). Clients MUST NOT
+// cache URLs beyond `expires_at_unix_seconds`; after expiry, re-call
+// PrepareUpload for fresh URLs. The URL itself is the capability — NO
+// separate capability token is carried on the wire.
+
+message PrepareUploadRequest {
+  string    volume_id = 1;
+  string    path      = 2;
+  WriteMode mode      = 3;
+  uint32    file_mode = 4;
+  uint32    umask     = 5;
+  // Hint for part-size / max_parts selection. 0 = unknown.
+  uint64    size_hint = 6;
+}
+
+message PrepareUploadResponse {
+  oneof result {
+    PrepareUploadSuccess success = 1;
+    FsError              error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message PrepareUploadSuccess {
+  string upload_id = 1;
+  repeated PresignedPart parts = 2;
+  // Part size the server chose. All parts except possibly the last MUST
+  // be exactly this size.
+  uint64 part_size = 3;
+  // Unix seconds at which all presigned URLs expire. Server-enforced
+  // upper bound; clients MUST NOT extend.
+  int64  expires_at_unix_seconds = 4;
+}
+
+message PresignedPart {
+  uint32 part_number = 1;
+  // HTTP method to use — "PUT" in S3 multipart practice. Explicit here
+  // to avoid implicit coupling with the RPC name.
+  string method = 2;
+  string url = 3;
+  // Headers the client MUST include on the request. Typically includes
+  // Content-MD5, x-amz-content-sha256, x-amz-server-side-encryption.
+  repeated HeaderPair required_headers = 4;
+}
+
+message CompleteUploadRequest {
+  string volume_id = 1;
+  string upload_id = 2;
+  // Part order MUST match the presigned part_number sequence from
+  // PrepareUpload. Server verifies server-side.
+  repeated CompletedPart parts = 3;
+  // Optional SHA-256 of the assembled object. If present, server
+  // verifies before finalizing the S3 multipart.
+  optional bytes sha256 = 4;
+}
+
+message CompletedPart {
+  uint32 part_number = 1;
+  // etag from the S3 UploadPart response. Server verifies: empty or
+  // mismatched → FsError{code: INVALID_ARGUMENT}. Server also rejects
+  // etags for part_numbers outside the upload's presigned set.
+  string etag = 2;
+}
+
+message CompleteUploadResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message AbortUploadRequest {
+  string volume_id = 1;
+  string upload_id = 2;
+}
+
+message AbortUploadResponse {
+  oneof result {
+    AbortUploadSuccess success = 1;
+    FsError            error = 2;
+  }
+}
+
+message AbortUploadSuccess {}
+
+message PrepareDownloadRequest {
+  string volume_id = 1;
+  string path = 2;
+  uint64 offset = 3;
+  // 0 = whole file.
+  uint64 length = 4;
+}
+
+message PrepareDownloadResponse {
+  oneof result {
+    PrepareDownloadSuccess success = 1;
+    FsError                error = 2;
+  }
+}
+
+message PrepareDownloadSuccess {
+  // "GET" in S3 presigned-download practice. Explicit per PresignedPart.
+  string method = 1;
+  string url = 2;
+  repeated HeaderPair required_headers = 3;
+  FileMeta meta = 4;
+  int64 expires_at_unix_seconds = 5;
+}
+
+// =============================================================================
+// Lifecycle
+// =============================================================================
+
+message DeleteRequest {
+  string volume_id = 1;
+  string path = 2;
+}
+
+message DeleteResponse {
+  oneof result {
+    DeleteSuccess success = 1;
+    FsError       error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message DeleteSuccess {}
+
+message MkdirRequest {
+  string volume_id = 1;
+  string path = 2;
+  uint32 mode = 3;
+  uint32 umask = 4;
+  bool recursive = 5;
+}
+
+message MkdirResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message RenameRequest {
+  string volume_id = 1;
+  string old_path = 2;
+  string new_path = 3;
+}
+
+message RenameResponse {
+  oneof result {
+    RenameSuccess success = 1;
+    FsError       error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message RenameSuccess {}
+
+message SymlinkRequest {
+  string volume_id = 1;
+  string target = 2;
+  string link = 3;
+}
+
+message SymlinkResponse {
+  oneof result {
+    SymlinkSuccess success = 1;
+    FsError        error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message SymlinkSuccess {}
+
+message ReadlinkRequest {
+  string volume_id = 1;
+  string path = 2;
+}
+
+message ReadlinkResponse {
+  oneof result {
+    ReadlinkSuccess success = 1;
+    FsError         error = 2;
+  }
+}
+
+message ReadlinkSuccess {
+  string target = 1;
+}
+
+message ChmodRequest {
+  string volume_id = 1;
+  string path = 2;
+  uint32 mode = 3;
+}
+
+message ChmodResponse {
+  oneof result {
+    FileMeta meta = 1;
+    FsError  error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+//
+// Subscribe delivers mutation events over a server-streaming RPC backed by
+// Redis Streams (fs9 publishes, db9-server consumes). Resume semantics:
+//
+//   - `since_event_id = ""`  → tail from now (current high-water mark).
+//   - `since_event_id = X`   → resume from just after X. If X is older
+//                              than server retention (≥ 4 h, SEGMENT_TTL_SECS
+//                              = 14400 in redis_events.rs:37), the server
+//                              emits a terminal WatchEvent with
+//                              error.context["reason"] =
+//                              "resume_beyond_retention" and closes the
+//                              stream. Client MUST cold-resync before
+//                              re-subscribing.
+//
+// Scope: whole-volume. Client-side filtering is the only supported
+// filter; server-side path-prefix filtering is not part of the v2
+// contract (evidence: no consumer today; per-event string-compare
+// over Redis is non-free). If a real consumer needs it, a future field
+// gets added with a fresh number.
+//
+// Heartbeat: the server emits a WatchEvent{heartbeat} at least every 30 s
+// when no events are produced. Heartbeats carry `last_event_id` so idle
+// clients can advance their cursor without blocking on a real event.
+//
+// Exactly one emitter per tenant at any time (fs_v4.md §6.1).
+
+message SubscribeRequest {
+  string volume_id = 1;
+  // Resume token. Format: Redis Streams ID `<ms>-<seq>`. Server MUST
+  // reject malformed values with FsError{code: INVALID_ARGUMENT}; empty
+  // string means "tail from now".
+  string since_event_id = 2;
+
+  // Optional server-side path-prefix filter. Empty = whole volume.
+  // Evidence: db9-server notify.rs:265 `query(... path_prefix: Option<&str>, ...)`
+  // is the existing in-process consumer shape. Server validates: no `..`,
+  // no absolute paths escaping the volume root; malformed →
+  // FsError{code: INVALID_ARGUMENT}. Performance: per-event string-compare
+  // over the Redis Streams consumer — acceptable for anchored prefixes
+  // (most queries start with `/`); pathological leading-`*` patterns are
+  // forbidden.
+  optional string path_prefix = 3;
+}
+
+message WatchEvent {
+  oneof kind {
+    FsEvent   event     = 1;
+    Heartbeat heartbeat = 2;
+    // Terminal frame: stream is closing. Clients MUST stop consuming.
+    FsError   error     = 3;
+  }
+}
+
+message FsEvent {
+  // Redis Streams ID. Monotonic within a volume.
+  string event_id = 1;
+  FsEventType type = 2;
+  // The current / post-operation path. For RENAME this is the
+  // destination; for every other event type it's the affected path.
+  string path = 3;
+  // Populated only for RENAME: the source path the inode was renamed
+  // from. Clients receiving a RENAME MUST treat `path` as the new name
+  // and `old_path` as the previous name to update their caches.
+  //
+  // Field number 4 was previously named `target_path`, but the
+  // direction was ambiguous (name implied dst; value was src). Renamed
+  // pre-1.0 while the service has no stable clients.
+  string old_path = 4;
+  // Populated for CREATE / WRITE / MKDIR / RENAME (target inode); absent
+  // for DELETE.
+  FileMeta meta = 5;
+  int64 ts_ns = 6;
+}
+
+enum FsEventType {
+  FS_EVENT_TYPE_UNSPECIFIED = 0;
+  FS_EVENT_TYPE_CREATE      = 1;
+  FS_EVENT_TYPE_WRITE       = 2;
+  FS_EVENT_TYPE_DELETE      = 3;
+  FS_EVENT_TYPE_RENAME      = 4;
+  FS_EVENT_TYPE_MKDIR       = 5;
+}
+
+message Heartbeat {
+  // High-water-mark event_id at the time of heartbeat. Idle clients
+  // advance their resume cursor to this ID.
+  string last_event_id = 1;
+  int64 ts_ns = 2;
+}
+
+// =============================================================================
+// Volume info (data-plane handshake)
+// =============================================================================
+
+message GetVolumeInfoRequest {
+  string volume_id = 1;
+}
+
+message GetVolumeInfoResponse {
+  oneof result {
+    GetVolumeInfoSuccess success = 1;
+    FsError              error   = 2;
+  }
+}
+
+message GetVolumeInfoSuccess {
+  // Advisory snapshot of the live mount's effective server-side JuiceFS
+  // writeback setting. Lazy/data-plane clients may use this as a handshake,
+  // but for the race-free mode that ran a specific write/flush mutation,
+  // read that RPC's `server_writeback` response field.
+  bool server_writeback = 1;
+}
+
+// =============================================================================
+// Admin (FsPlaneAdmin service)
+// =============================================================================
+
+message InitVolumeRequest {
+  string volume_id = 1;
+  // JuiceFS meta URL (`tikv://<pd>?keyspace=<volume_id>...`).
+  //
+  // Whenever this field is non-empty, fs9 verifies the `keyspace=` query
+  // param (when present) appears exactly once, is non-empty, and equals
+  // `volume_id`. Violations are rejected with reason `keyspace_mismatch:`.
+  // This is a consistency check on admin's two inputs (volume_id and the
+  // URL's keyspace) — independent of any deployment configuration.
+  //
+  // Beyond that check, behavior depends on whether the deployment
+  // configures fs9 with a canonical meta URL builder:
+  //
+  //   builder configured (production with lazy-attach):
+  //     fs9 is the sole source of truth for the meta URL. It is computed
+  //     from `volume_id` alone, and JuiceFS receives that computed URL.
+  //     Any other content of this field is IGNORED — operators tuning
+  //     mount params (PD endpoints, TLS paths, gc-interval) configure
+  //     fs9, not this URL.
+  //
+  //   builder not configured (test fixtures, deployments without
+  //   lazy-attach):
+  //     this field is the only source of truth. After the keyspace
+  //     check, fs9 passes the URL through to JuiceFS unchanged.
+  string meta_url = 2;
+  // 0 = server default.
+  uint32 cache_size_mb = 3;
+  // Opt-in to relaxed performance mode: when true, fs9 mounts JuiceFS
+  // with server-side writeback enabled. Default (false) is the strict
+  // mode: fs9 mounts JuiceFS with writeback disabled, so a successful
+  // write/flush RPC has no hidden server-side writeback gap behind it.
+  //
+  // Admin-vs-admin mode changes are mount-time-only: a subsequent
+  // InitVolume with a different `server_writeback` returns
+  // FailedPrecondition (intent_conflict). Operator must CloseVolume and
+  // re-Init to switch modes.
+  //
+  // Admin-over-lazy reconcile is allowed when the live entry was opened
+  // lazily and carries no explicit ServerWriteback intent. The request
+  // updates stored intent and returns success; the live mount keeps the lazy
+  // mode until eviction/remount applies the stored admin intent. The
+  // rawstaging cache directory is segregated by mode so strict and relaxed
+  // state can never share local on-disk staging.
+  bool server_writeback = 4;
+}
+
+message InitVolumeResponse {
+  oneof result {
+    InitVolumeSuccess success = 1;
+    FsError           error = 2;
+  }
+}
+
+message InitVolumeSuccess {
+  // True if newly initialized, false if already active (idempotent).
+  bool created = 1;
+  // Echoes the live entry's effective server-side JuiceFS writeback setting.
+  // On fresh mounts and admin-vs-admin idempotent re-Init this equals the
+  // request value. On admin-over-lazy reconcile this may remain the
+  // lazy-mounted live value until a later CloseVolume or eviction remounts
+  // with the stored admin intent. Strict admin-vs-admin mode mismatches are
+  // rejected with intent_conflict.
+  bool server_writeback = 2;
+}
+
+message CloseVolumeRequest {
+  string volume_id = 1;
+}
+
+message CloseVolumeResponse {
+  oneof result {
+    CloseVolumeSuccess success = 1;
+    FsError            error = 2;
+  }
+}
+
+message CloseVolumeSuccess {}
+
+message AdvanceNextChunkRequest {
+  string volume_id = 1;
+  // Amount to add to the JuiceFS nextChunk counter. Use 1<<40 for
+  // standard post-clone safety margin. Must be non-negative.
+  int64 offset = 2;
+}
+
+message AdvanceNextChunkResponse {
+  oneof result {
+    AdvanceNextChunkSuccess success = 1;
+    FsError                 error = 2;
+  }
+  // Effective server-side writeback mode for a successful mutation result.
+  // Read from the mount lease that executed the mutation; ignore on error.
+  bool server_writeback = 3;
+}
+
+message AdvanceNextChunkSuccess {
+  int64 new_value = 1;
+  int64 old_value = 2;
+}
+
+message DestroyVolumeRequest {
+  string volume_id = 1;
+  // TiKV meta URL (`tikv://<pd>?keyspace=<volume_id>...`).
+  //
+  // Same regime-dependent rules as `InitVolumeRequest.meta_url` — see
+  // that field for details. In short: keyspace consistency is always
+  // checked; in builder-configured deployments fs9 ignores everything
+  // else in this field and JuiceFS receives the canonical URL,
+  // preventing an admin-supplied URL from `config.UpdateGlobal`-mutating
+  // process-wide TiKV state through JuiceFS's driver.
+  string meta_url = 2;
+  // When true, skip the active-session check. Use when destroying after
+  // a stuck-session situation or an unclean shutdown left ghost sessions.
+  bool force = 3;
+  // When true, skip the JuiceFS meta.Reset() step. Callers that
+  // immediately ARCHIVE the keyspace via PD set this — kvengine's
+  // compaction filter then handles meta removal, and we avoid issuing
+  // a TiKV kv_delete_range RPC (which panics on TiDB Cloud Serverless's
+  // cloud-storage-engine fork; only unsafe_destroy_range is wired up
+  // there).
+  //
+  // Response: meta_reset will be false in this mode. The caller MUST
+  // archive the keyspace itself.
+  //
+  // Note: this RPC no longer touches S3 objects regardless of this flag;
+  // S3 lifecycle is owned by ReapSliceGC.
+  bool skip_meta_reset = 4;
+}
+
+message DestroyVolumeResponse {
+  oneof result {
+    DestroyVolumeSuccess success = 1;
+    FsError              error = 2;
+  }
+}
+
+message DestroyVolumeSuccess {
+  // Retained for wire stability. ALWAYS zero: fs9 no longer touches S3
+  // objects in this RPC. S3 lifecycle is owned by ReapSliceGC.
+  uint64 objects_deleted = 1;
+  // Retained for wire stability. ALWAYS zero.
+  uint64 objects_failed = 2;
+  // True iff meta.Reset() was successfully invoked in this call. False
+  // when skip_meta_reset=true (caller will PD-archive the keyspace).
+  bool meta_reset = 3;
+}
+
+// =============================================================================
+// ReapSliceGC — cross-keyspace slice garbage collection
+// =============================================================================
+//
+// Why a separate RPC. After TiKV BR clone (db9-backend #1401), multiple
+// JuiceFS keyspaces share one S3 prefix (`format.Name`). The only correct
+// predicate for deleting an S3 object is "no keyspace in the clone family
+// references it"; this requires a view over the entire family, which
+// neither a JuiceFS mount nor a per-volume DestroyVolume has. fs9 #80 and
+// its destroy-side variant are both instances of trying to delete S3 from
+// a process that only sees one keyspace.
+//
+// ReapSliceGC takes the family as input. fs9 is stateless: it doesn't
+// store the family graph. The caller (db9-backend cron) computes the
+// family from its tenant DB on each invocation, sends it in, and fs9
+// executes the union-and-delete with the supplied view as the ground
+// truth for this run.
+//
+// Invariants the caller MUST uphold:
+//   I1. Before triggering JuiceFS BR for a new clone, the new keyspace
+//       MUST appear in `members` with status=PROVISIONING. ReapSliceGC
+//       fail-closes the entire family if any PROVISIONING member is
+//       present, so the in-flight BR cannot be raced by deletion.
+//   I2. A keyspace MUST remain in `members` (as ACTIVE) until its
+//       JuiceFS meta keyspace has been physically removed (PD
+//       archive_keyspace has completed — i.e., the
+//       tenant_purge_phase has advanced to ARCHIVE_JFS_META_KEYSPACE
+//       or beyond). Dropping a keyspace from the list while its meta
+//       is still readable causes the next reap to delete slices that
+//       keyspace still references; KEEPING it in the list after the
+//       meta is gone causes the reap to fail-closed on an unformatted
+//       ACTIVE member.
+//
+// db9-backend's existing state machine satisfies both invariants
+// directly:
+//   - `tenants.state = CLONING` is set in the same SQL transaction that
+//     creates the branch job (db.rs:1355), well before the BR worker
+//     advances to phase=RESTORING_JFS that triggers the actual BR. Map
+//     CLONING (with non-terminal branch_job phase) → PROVISIONING.
+//   - The tenant_purge_jobs pipeline (reconciler.rs) keeps the tenant
+//     row in the DB through DESTROY_VOLUME → ARCHIVE_SQL_KEYSPACE →
+//     ARCHIVE_JFS_META_KEYSPACE → REAP_S3_PREFIX → FINALIZE_TENANT.
+//     Exclude a member from `members` once its phase has reached
+//     ARCHIVE_JFS_META_KEYSPACE (meta keyspace archived in PD — meta
+//     client open would fail). The tenant ROW stays in the DB through
+//     REAP_S3_PREFIX so the cron's "any non-PURGED tenant for this
+//     format.Name" rule keeps targeting the prefix, but the row no
+//     longer contributes to `members` because there's no meta left to
+//     scan. See docs/design/slice_reaper.md §"Contract" item 2 for the
+//     full SQL filter; this comment and that doc MUST agree.
+
+message ReapSliceGCRequest {
+  // Required by the v2 protocol convention (`volume_id = 1` on every
+  // request message; see DESIGN.md §A4). The reaper operates on a whole
+  // family, not a single volume — set this to any one of the family
+  // members' volume_ids (typically the family root / source tenant's).
+  // fs9 uses it ONLY to satisfy the auth interceptor's tid→volume_id
+  // check; the reap work itself is driven by `format_name` + `members`.
+  string volume_id = 1;
+
+  // S3 prefix this reap targets, == JuiceFS format.Name shared across all
+  // members of the family.
+  string format_name = 2;
+
+  // Bucket URL — same shape as meta.Format.Bucket. fs9 builds the S3
+  // client from this plus its IRSA credentials, identically to mount/
+  // destroy code paths. Required: fs9 cross-validates against each
+  // ACTIVE member's loaded format and fails closed on mismatch
+  // (defense against a caller that accidentally mixes keyspaces from
+  // different storage tracts into one family).
+  string bucket = 3;
+
+  // Members of the clone family for this format_name. db9-backend
+  // computes from its tenants table on each cron tick (no fs9-side
+  // graph).
+  //
+  // An empty list is the FINAL-CLEANUP case: the last family member
+  // has been physically destroyed (PD archive_keyspace has completed)
+  // and no keyspace remains. The reaper falls back to `bucket` +
+  // `format_name` + `storage` to anchor an S3 client (members would
+  // otherwise be the only source of those fields) and treats EVERY
+  // object under the prefix older than the safety window as orphan
+  // — which is correct, since no keyspace references anything anymore.
+  repeated FamilyMember members = 4;
+
+  // Minimum age in seconds of an S3 object before it may be deleted.
+  // Load-bearing for correctness: covers
+  //   (a) the doWrite → commit-K window inside JuiceFS, and
+  //   (b) any lag between db9-backend updating its tenant state and
+  //       this RPC being issued.
+  // 0 → server default (24h). Set higher (e.g., 604800 = 7d) when
+  // db9-backend's PROVISIONING handoff is still being tightened up.
+  int64 safety_window_seconds = 5;
+
+  // If true, compute the orphan set and return stats but do NOT delete
+  // any S3 object. Use for pre-flight validation in ops.
+  bool dry_run = 6;
+
+  // JuiceFS storage type — value of meta.Format.Storage. In production
+  // fs9 deployments this is always "s3" (autoFormat hardcodes it);
+  // tests and self-hosted setups may pass "file" / "minio" / etc.
+  // Required: needed to synthesize an anchor format for the empty-
+  // members final-cleanup path. When `members` is non-empty AND at
+  // least one member has a loadable format, fs9 cross-validates
+  // `storage` against that member's `format.Storage` and fails closed
+  // on mismatch — same defense as for `bucket`.
+  string storage = 7;
+}
+
+message FamilyMember {
+  // PD keyspace name for this member.
+  string keyspace = 1;
+
+  // JuiceFS meta URL for opening a read-only scan session.
+  // (`tikv://<pd>?keyspace=<keyspace>` plus the standard mTLS params.)
+  string meta_url = 2;
+
+  // Lifecycle status. PROVISIONING fails the whole family closed.
+  FamilyMemberStatus status = 3;
+}
+
+enum FamilyMemberStatus {
+  FAMILY_MEMBER_STATUS_UNSPECIFIED = 0;
+  // BR clone is in flight or otherwise not yet committed. Reaper aborts
+  // the entire family run on encountering any PROVISIONING member.
+  FAMILY_MEMBER_STATUS_PROVISIONING = 1;
+  // Operational. Refs in this member's meta contribute to the live union.
+  FAMILY_MEMBER_STATUS_ACTIVE = 2;
+}
+
+message ReapSliceGCResponse {
+  oneof result {
+    ReapSliceGCSuccess success = 1;
+    FsError            error = 2;
+  }
+}
+
+message ReapSliceGCSuccess {
+  // Number of family members whose meta was scanned this run. When
+  // `fail_closed_provisioning = true`, this is 0 (no scan was attempted).
+  uint32 members_scanned = 1;
+  // Count of distinct slice IDs in the live union across all scanned
+  // members.
+  uint64 live_slice_count = 2;
+  // S3 objects listed under the prefix.
+  uint64 objects_listed = 3;
+  // S3 objects classified as orphan (not in union AND older than the
+  // safety window).
+  uint64 orphans_found = 4;
+  // S3 objects actually deleted. Equals `orphans_found` when
+  // `dry_run = false` and all deletes succeeded.
+  uint64 objects_deleted = 5;
+  // S3 delete failures. The handler tolerates per-object failures and
+  // surfaces the count so caller can retry on the next cron tick.
+  uint64 delete_failures = 6;
+  // True iff the reap was aborted because a PROVISIONING member was
+  // present in the request. All counters are zero in that case. NOTE:
+  // a response with this flag set is "did not look," NOT "looked and
+  // found nothing." Any caller predicate that decides forward progress
+  // on `objects_listed == 0` (e.g. db9-backend's REAP_S3_PREFIX phase
+  // advancement) MUST also require `fail_closed_provisioning == false`
+  // and `delete_failures == 0`. See docs/design/slice_reaper.md
+  // §"`REAP_S3_PREFIX` purge phase" for the full predicate.
+  bool fail_closed_provisioning = 7;
+  // Echoes the request's dry_run.
+  bool dry_run = 8;
+}

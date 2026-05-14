@@ -106,11 +106,7 @@ fn apply_budget_hard_guard_tightening(
     }
 }
 
-type AuthDispatchOutcome = (
-    Option<crate::auth::User>,
-    Option<VerifiedJwtClaims>,
-    Option<String>,
-);
+type AuthDispatchOutcome = (Option<crate::auth::Db9AuthDispatchSuccess>, Option<String>);
 
 fn default_database_bootstrap_owner() -> String {
     config::env_string("DB9_BOOTSTRAP_ADMIN_USER").unwrap_or_else(|| "admin".to_string())
@@ -409,9 +405,9 @@ impl DynamicPgHandler {
             password,
         )
         .await
-        .and_then(|(user, trusted_jwt_claims, failure)| {
-            if let Some(user) = user.as_ref() {
-                if !user.can_login {
+        .and_then(|(success, failure)| {
+            if let Some(success) = success.as_ref() {
+                if !success.user.can_login {
                     return Err(
                         crate::sql::error::SqlError::InvalidAuthorizationSpecification {
                             message: format!("role \"{}\" is not permitted to log in", username),
@@ -440,24 +436,24 @@ impl DynamicPgHandler {
                 None => None,
             };
 
-            Ok((user, trusted_jwt_claims, failure_reason))
+            Ok((success, failure_reason))
         });
 
         match auth_outcome {
-            Ok((Some(user), trusted_jwt_claims, _)) => {
+            Ok((Some(success), _)) => {
                 if let Err(e) = txn.rollback().await {
                     warn!("rollback failed after auth success: {}", e);
                 }
                 Ok(AuthResult {
                     is_authenticated: true,
-                    is_superuser: user.is_superuser,
-                    bypass_rls: user.bypass_rls,
-                    connection_limit: user.connection_limit,
-                    trusted_jwt_claims,
+                    is_superuser: success.user.is_superuser,
+                    bypass_rls: success.user.bypass_rls,
+                    connection_limit: success.user.connection_limit,
+                    trusted_jwt_claims: success.trusted_jwt_claims,
                     failure_reason: None,
                 })
             }
-            Ok((None, _, failure_reason)) => {
+            Ok((None, failure_reason)) => {
                 if let Err(e) = txn.rollback().await {
                     warn!("rollback failed after auth rejection: {}", e);
                 }

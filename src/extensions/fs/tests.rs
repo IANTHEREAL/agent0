@@ -1224,3 +1224,56 @@ async fn test_glob_csv_no_header_different_col_count_errors() {
     assert!(err.to_string().contains("glob schema mismatch"));
     cleanup(&dir);
 }
+
+#[test]
+fn reject_root_path_op_rejects_paths_clean_collapses_to_root() {
+    // Every input that fs9's server-side `path.Clean` collapses to
+    // "/" must be rejected, otherwise the gRPC `remove_recursive`
+    // walker would alias root via dot segments (`/.` → root on fs9)
+    // and unlink top-level entries before failing on the final
+    // delete. Includes pagefs `normalize_path`'s empty-segment roots
+    // (`/`, `//`, `///`, `""`) and the dot-segment aliases fs9
+    // collapses (`/.`, `/./`, `/.//.`).
+    for path in ["/", "//", "///", "", "/.", "/./", "/.//.", "/./."] {
+        let err = super::reject_root_path_op(path, "remove")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot remove root"),
+            "input `{path}` should be rejected, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn reject_root_path_op_uses_supplied_verb_in_message() {
+    let err = super::reject_root_path_op("/", "rename")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot rename root"),
+        "rename verb must reach the error message: {err}"
+    );
+}
+
+#[test]
+fn reject_root_path_op_accepts_non_root_paths() {
+    // Any path with at least one segment that is neither empty nor
+    // `.` stays non-root; mixed `.` and named segments still resolve
+    // to the named target on fs9 (`/./foo` → `/foo`).
+    for path in [
+        "/foo",
+        "foo",
+        "/foo/bar",
+        "/a/b/c/",
+        "/./foo",
+        "/foo/.",
+        "/foo/./bar",
+        "/.x",
+        "/x.",
+    ] {
+        super::reject_root_path_op(path, "remove").unwrap_or_else(|err| {
+            panic!("non-root path `{path}` was rejected: {err}");
+        });
+    }
+}

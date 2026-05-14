@@ -1175,6 +1175,7 @@ impl WorkerEngine {
                     let ext_ctx = background_statement_extension_context(
                         is_cron,
                         &entry.keyspace,
+                        &entry.username,
                         tikv_client.clone(),
                     );
                     let fut = crate::pool::run_with_statement_memory_scope(

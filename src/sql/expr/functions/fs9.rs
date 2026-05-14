@@ -438,8 +438,15 @@ pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
         Some(d) => d,
         None => return Ok(Value::Null),
     };
-    if data.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
-        return Err(anyhow!("fs9_write_at: data exceeds maximum file size"));
+    if data.len() > crate::extensions::fs::MAX_BYTES_PER_OFFSET_WRITE {
+        return Err(anyhow!(
+            "fs9_write_at: data ({} bytes) exceeds the per-call ceiling \
+             for offset writes ({} bytes). Offset writes use a unary RPC \
+             with no multipart fallback; for bulk writes use fs9_write or \
+             fs9_append.",
+            data.len(),
+            crate::extensions::fs::MAX_BYTES_PER_OFFSET_WRITE
+        ));
     }
     let client = get_client_sync()?;
     let written = run_async(client.write_file_at(&path, offset, &data))?;

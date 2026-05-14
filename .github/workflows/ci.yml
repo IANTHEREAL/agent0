@@ -13,6 +13,10 @@ env:
   PG_USER: admin
   PG_PASSWORD: admin
   REDIS_URL: redis://localhost:6379
+  # DB9_REQUIRE_PROTOC=1 makes proto-compile failure a hard error in
+  # build.rs. Set workflow-wide so every cargo invocation refuses to
+  # silently compile out the fs9 v2 gRPC backend when protoc is absent.
+  DB9_REQUIRE_PROTOC: "1"
 
 jobs:
   # -- Build (single release build, shared via artifact) --------------------
@@ -22,6 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (required by build.rs for fsplane.v2)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: runs-on/cache@v4
         with:
           path: ~/.cargo/registry
@@ -51,6 +57,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Install protoc (required by build.rs for fsplane.v2)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: runs-on/cache@v4
         with:
           path: ~/.cargo/registry
@@ -75,6 +83,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (required by build.rs for fsplane.v2)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: runs-on/cache@v4
         with:
           path: ~/.cargo/registry
@@ -159,6 +169,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (required by build.rs for fsplane.v2)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: runs-on/cache@v4
         with:
           path: ~/.cargo/registry

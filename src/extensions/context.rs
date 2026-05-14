@@ -52,6 +52,9 @@ pub(crate) struct ExtensionContextOpts {
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
     pub(crate) statement_state: Arc<ExtensionStatementState>,
+    /// PostgreSQL role of the authenticated user. Used to derive the
+    /// fs-plane `scp` claim (`fs:volume:jfs_t_<tid>:r|rw`).
+    pub(crate) authenticated_role: Option<String>,
 }
 
 impl ExtensionContextOpts {
@@ -65,6 +68,7 @@ impl ExtensionContextOpts {
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
+            authenticated_role: None,
         }
     }
 
@@ -78,6 +82,11 @@ impl ExtensionContextOpts {
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
             statement_state: Arc::new(ExtensionStatementState::default()),
+            // Cron sessions don't carry an authenticated role, so they
+            // can't reach JuiceFS tenants. fs9 access from cron fails at
+            // backend init with a clear error pending a
+            // service-principal cron path.
+            authenticated_role: None,
         }
     }
 
@@ -104,6 +113,11 @@ impl ExtensionContextOpts {
         self.statement_state = statement_state;
         self
     }
+
+    pub(crate) fn with_authenticated_role(mut self, role: Option<String>) -> Self {
+        self.authenticated_role = role;
+        self
+    }
 }
 
 pub(crate) struct ExtensionContext {
@@ -120,6 +134,7 @@ pub(crate) struct ExtensionContext {
     security_definer_superuser: Cell<bool>,
     statement_state: Arc<ExtensionStatementState>,
     tikv_client: Option<Arc<TransactionClient>>,
+    authenticated_role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -167,6 +182,7 @@ pub(crate) async fn with_context_opts<R>(
         security_definer_superuser: Cell::new(false),
         statement_state: opts.statement_state,
         tikv_client: opts.tikv_client,
+        authenticated_role: opts.authenticated_role,
     };
 
     // See `sql::query_context::with_query_context` for rationale.
@@ -275,6 +291,38 @@ pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
     CTX.try_with(|ctx| ctx.tikv_client.clone()).ok().flatten()
 }
 
+/// The principal (role + fs-plane access) fs9 should see for token
+/// minting on this call. Honours SECURITY DEFINER: when an SD-superuser
+/// function is executing, the call carries the owner's superuser
+/// authority, not the caller's login privilege. Symmetric with
+/// [`is_superuser`], which already factors in SD elevation.
+///
+/// `role` is identity, used for the `usr` claim and the cache key —
+/// it stays as the *actual* authenticated role even under SD elevation
+/// (the previous implementation fabricated the literal string
+/// `"admin"`, which broke audit trails and conflicted with custom
+/// `DB9_BOOTSTRAP_ADMIN_USER` deployments, PR #2547 review #1).
+///
+/// `access` is capability, derived from privilege facts via
+/// [`crate::auth::fs_plane_token::fs_plane_access_for`] — never from
+/// the role name. A superuser regardless of their name gets
+/// `ReadWrite`; `_db9_sys_readonly` gets `ReadOnly`; everything else
+/// fails closed (`None`), and the JuiceFS backend init surfaces that
+/// as a hard error rather than silently downgrading.
+pub(crate) fn effective_fs_plane_principal(
+) -> Option<crate::auth::fs_plane_token::Fs9Principal> {
+    use crate::auth::fs_plane_token::{fs_plane_access_for, Fs9Principal};
+
+    CTX.try_with(|ctx| {
+        let role = ctx.authenticated_role.clone()?;
+        let is_superuser = ctx.is_superuser || ctx.security_definer_superuser.get();
+        let access = fs_plane_access_for(is_superuser, &role)?;
+        Some(Fs9Principal { role, access })
+    })
+    .ok()
+    .flatten()
+}
+
 pub(crate) fn cached_fs_backend() -> Option<Arc<dyn SharedFsBackend>> {
     CTX.try_with(|ctx| ctx.statement_state.fs_backend.lock().clone())
         .ok()
@@ -380,4 +428,101 @@ pub(crate) fn cache_embedding(key: EmbeddingCacheKey, vector: Vec<f64>) -> Resul
     })
     .map_err(|_| anyhow!("embedding: extension context not available"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::auth::fs_plane_token::Fs9Access;
+
+    #[tokio::test]
+    async fn principal_falls_through_authenticated_role_as_readonly() {
+        let opts = ExtensionContextOpts::statement(false, false, "db9_tenant_x")
+            .with_authenticated_role(Some("_db9_sys_readonly".to_string()));
+        with_context_opts(opts, async {
+            let p = effective_fs_plane_principal().unwrap();
+            assert_eq!(p.role, "_db9_sys_readonly");
+            assert_eq!(p.access, Fs9Access::ReadOnly);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn principal_returns_none_without_authenticated_role() {
+        let opts = ExtensionContextOpts::statement(false, false, "db9_tenant_x");
+        with_context_opts(opts, async {
+            assert!(effective_fs_plane_principal().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn principal_returns_none_for_non_superuser_non_readonly_role() {
+        // Fail-closed: a non-superuser regular role has no fs-plane
+        // capability, regardless of name. JuiceFS backend init surfaces
+        // this as a hard error.
+        let opts = ExtensionContextOpts::statement(false, false, "db9_tenant_x")
+            .with_authenticated_role(Some("alice".to_string()));
+        with_context_opts(opts, async {
+            assert!(effective_fs_plane_principal().is_none());
+        })
+        .await;
+    }
+
+    /// PR #2547 review #1 regression: a deployment bootstrapped with
+    /// `DB9_BOOTSTRAP_ADMIN_USER=postgres` (or `svc_admin`, or any
+    /// custom `CREATE ROLE ... SUPERUSER`) must reach `ReadWrite`
+    /// fs-plane access without name-matching `"admin"`.
+    #[tokio::test]
+    async fn principal_grants_rw_to_any_superuser_regardless_of_name() {
+        for name in ["admin", "postgres", "svc_admin", "alice"] {
+            let opts = ExtensionContextOpts::statement(true, false, "db9_tenant_x")
+                .with_authenticated_role(Some(name.to_string()));
+            with_context_opts(opts, async move {
+                let p = effective_fs_plane_principal()
+                    .unwrap_or_else(|| panic!("superuser {name:?} should have a principal"));
+                assert_eq!(p.role, name);
+                assert_eq!(p.access, Fs9Access::ReadWrite);
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn principal_under_sd_elevates_to_rw_keeping_caller_role_as_identity() {
+        // Caller logged in as a non-superuser role. Inside a SECURITY
+        // DEFINER function owned by a superuser, the call carries
+        // superuser authority — so fs-plane access must be ReadWrite.
+        // The role string stays as the *actual* caller identity
+        // (`alice`), not the fabricated `"admin"` the old code used:
+        // identity belongs in `usr`/cache-key, capability in `scp`.
+        let opts = ExtensionContextOpts::statement(false, false, "db9_tenant_x")
+            .with_authenticated_role(Some("alice".to_string()));
+        with_context_opts(opts, async {
+            assert!(effective_fs_plane_principal().is_none(), "alice has no rw");
+            let _guard = enter_security_definer_superuser();
+            let p = effective_fs_plane_principal().unwrap();
+            assert_eq!(p.role, "alice", "identity preserved under SD");
+            assert_eq!(p.access, Fs9Access::ReadWrite, "SD grants rw capability");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn principal_restores_after_security_definer_drops() {
+        let opts = ExtensionContextOpts::statement(false, false, "db9_tenant_x")
+            .with_authenticated_role(Some("alice".to_string()));
+        with_context_opts(opts, async {
+            {
+                let _guard = enter_security_definer_superuser();
+                let p = effective_fs_plane_principal().unwrap();
+                assert_eq!(p.access, Fs9Access::ReadWrite);
+            }
+            // After SD drops, alice is back to non-superuser — no
+            // fs-plane capability.
+            assert!(effective_fs_plane_principal().is_none());
+        })
+        .await;
+    }
 }

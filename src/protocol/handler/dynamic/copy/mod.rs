@@ -631,6 +631,7 @@ mod tests {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            authenticated_role: None,
         };
 
         let result = with_copy_statement_context(&qctx, &runtime, async {
@@ -687,6 +688,7 @@ mod tests {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            authenticated_role: None,
         };
 
         let first = with_copy_statement_context(&qctx, &runtime, async {
@@ -731,6 +733,7 @@ mod tests {
             extension_statement_state: Arc::new(
                 crate::extensions::context::ExtensionStatementState::default(),
             ),
+            authenticated_role: None,
         };
 
         let result = with_copy_statement_context(&qctx, &runtime, async {

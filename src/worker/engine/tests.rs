@@ -21,8 +21,8 @@ fn idx(name: &str, state: IndexState) -> IndexDef {
 
 #[test]
 fn background_statement_extension_context_uses_fresh_statement_state_per_call() {
-    let first = background_statement_extension_context(true, "tenant_a", None);
-    let second = background_statement_extension_context(true, "tenant_a", None);
+    let first = background_statement_extension_context(true, "tenant_a", "admin", None);
+    let second = background_statement_extension_context(true, "tenant_a", "admin", None);
     assert_eq!(
         first.execution_kind,
         crate::extensions::context::ExecutionKind::Cron
@@ -36,11 +36,16 @@ fn background_statement_extension_context_uses_fresh_statement_state_per_call() 
         "each background statement must start with a fresh statement-scoped extension state"
     );
 
-    let interactive = background_statement_extension_context(false, "tenant_a", None);
+    let interactive = background_statement_extension_context(false, "tenant_a", "alice", None);
     assert_eq!(
         interactive.execution_kind,
         crate::extensions::context::ExecutionKind::Interactive
     );
+    // Cron path stays role-less (can't reach JuiceFS by design), interactive
+    // workers (AsyncTrigger / BgSql) carry the originating username so
+    // `init_juicefs_backend` can derive scp.
+    assert_eq!(first.authenticated_role, None);
+    assert_eq!(interactive.authenticated_role.as_deref(), Some("alice"));
 }
 
 #[test]

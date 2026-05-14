@@ -1,12 +1,17 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncBufRead;
 
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
+use crate::extensions::fs::normalizing::NormalizingFsBackend;
+
+const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,6 +93,31 @@ pub(crate) fn batch_inline_read_entry_too_large_error(
         "file too large for batch_inline_read: {} bytes exceeds limit {}",
         size, max_file_bytes
     )))
+}
+
+/// Pre-read gate every `FsBackend` read path must apply between
+/// `stat(path)` and the first byte read. Encodes the contract that
+/// embedded `pagefs` enforces at every read entry point: a read
+/// requires a regular file — not a directory, not a symlink. Without
+/// a shared, named statement of this contract the gRPC backend
+/// silently diverges, because fs9 v2 `Stat` is `Lstat` (returns the
+/// symlink's own info) while `ReadAt` follows the link — a short
+/// symlink can smuggle a cap-sized prefix of a huge target past a
+/// client-side size check. PR #2547 review #5.
+///
+/// Callers should `stat(path)` themselves so this helper is a pure
+/// in-process check that piggy-backs on data already on the wire (no
+/// extra RPC for code paths that were stat'ing anyway).
+pub(crate) fn ensure_readable_as_regular_file(info: &FsFileInfo, path: &str) -> Result<()> {
+    if info.is_dir {
+        return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+    }
+    if info.is_symlink {
+        return Err(anyhow!(EmbeddedFsError::InvalidInput(
+            "cannot read symlink as file; use readlink".to_string()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn batch_inline_read_payload_too_large_error(
@@ -309,15 +339,8 @@ pub(crate) trait FsBackend: Send + Sync {
         for (idx, path) in paths.iter().enumerate() {
             match self.stat(path).await {
                 Ok(info) => {
-                    if info.is_dir {
-                        entries[idx] = Some(Err(anyhow!(EmbeddedFsError::is_directory(path))));
-                        continue;
-                    }
-
-                    if info.is_symlink {
-                        entries[idx] = Some(Err(anyhow!(EmbeddedFsError::InvalidInput(
-                            "cannot read symlink as file; use readlink".to_string(),
-                        ))));
+                    if let Err(err) = ensure_readable_as_regular_file(&info, path) {
+                        entries[idx] = Some(Err(err));
                         continue;
                     }
 
@@ -511,6 +534,249 @@ fn refuse_if_external_fs9_configured_with(tenant_keyspace: &str, markers: &[Stri
     Ok(())
 }
 
+// ============================================================================
+// Per-tenant backend routing
+//
+// A single db9-server can host both embedded and JuiceFS tenants. Which
+// backend a given tenant uses is set at create time by db9-backend and
+// recorded as the presence of the `jfs_t_<id>` keyspace in PD:
+//   * keyspace ENABLED → JuiceFS tenant, must reach fs9 v2 over gRPC
+//   * keyspace absent  → embedded tenant, uses PageFS in `db9_tenant_<id>`
+//   * keyspace DISABLED/ARCHIVED/TOMBSTONE → tenant in teardown, fail-closed
+//
+// Resolution is intentionally uncached at the process level. The per-
+// statement `cached_fs_backend` keeps a bound `FsBackend` for the
+// lifetime of one SQL statement, so the PD probe runs at most once per
+// statement that touches fs9 — exactly when we want to re-observe PD
+// lifecycle transitions (ENABLED → DISABLED on `db9 delete`) without
+// waiting for a process restart.
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TenantBackendKind {
+    Embedded,
+    JuiceFs,
+}
+
+/// Probe PD for the tenant's JuiceFS keyspace state and map it to a
+/// backend kind. Never silently downgrades to embedded on a transient
+/// PD error — that would route JuiceFS reads to the wrong place.
+///
+/// No process-level cache: the only safe caching layer is per-statement
+/// (`acquire_statement_backend`), since the underlying invariant
+/// (keyspace lifecycle state) can change while the process lives. A
+/// process-level cache would lock in an `ENABLED` result and bypass the
+/// teardown guard after `db9 delete` moves the keyspace to `DISABLED`.
+pub(crate) async fn resolve_tenant_backend_kind(
+    tenant_keyspace: &str,
+) -> Result<TenantBackendKind> {
+    let jfs_keyspace = legacy_juicefs_keyspace_name(tenant_keyspace);
+    let pd_endpoints = pd_endpoints_from_env();
+    let state = query_pd_keyspace_state(&pd_endpoints, &jfs_keyspace).await?;
+    // PD lifecycle (db9-backend pd_client.rs §state machine):
+    //   absent → ENABLED → DISABLED → ARCHIVED → TOMBSTONE
+    // Absent = the tenant was never a JuiceFS tenant → embedded is the
+    // correct backend. Present-but-non-ENABLED = a JuiceFS tenant in
+    // teardown; routing to embedded would create a phantom data
+    // namespace under the same `db9_tenant_*` keyspace and hide the
+    // teardown state, so fail-closed.
+    match state.as_deref() {
+        None => Ok(TenantBackendKind::Embedded),
+        Some("ENABLED") => Ok(TenantBackendKind::JuiceFs),
+        Some(other) => anyhow::bail!(
+            "fs9: JuiceFS keyspace `{jfs_keyspace}` is in state `{other}` \
+             (expected ENABLED). Tenant `{tenant_keyspace}` is being torn down; \
+             refusing to route to the embedded backend, which would write to a \
+             distinct data namespace and mask the teardown state."
+        ),
+    }
+}
+
+fn parse_pd_endpoints(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn pd_endpoints_from_env() -> Vec<String> {
+    let raw = crate::config::env_string("PD_ENDPOINTS")
+        .unwrap_or_else(|| DEFAULT_PD_ENDPOINTS.to_string());
+    parse_pd_endpoints(&raw)
+}
+
+fn legacy_juicefs_keyspace_name(tenant_keyspace: &str) -> String {
+    let tenant_id =
+        crate::auth::tenant_id_from_keyspace(tenant_keyspace).unwrap_or(tenant_keyspace);
+    crate::extensions::fs::jfs_volume_id(tenant_id)
+}
+
+fn pd_base_url(pd_endpoint: &str) -> String {
+    let endpoint = pd_endpoint.trim().trim_end_matches('/');
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return endpoint.to_string();
+    }
+
+    if std::env::var("TIKV_CA_PATH").is_ok() {
+        format!("https://{endpoint}")
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+fn build_pd_probe_client() -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+
+    if let (Ok(ca), Ok(cert_path), Ok(key_path)) = (
+        std::env::var("TIKV_CA_PATH"),
+        std::env::var("TIKV_CERT_PATH"),
+        std::env::var("TIKV_KEY_PATH"),
+    ) {
+        let tls_config = build_pd_rustls_config(&ca, &cert_path, &key_path)?;
+        builder = builder.use_preconfigured_tls(tls_config);
+    }
+
+    builder
+        .build()
+        .context("failed to build PD HTTP client for fs9 routing")
+}
+
+/// Build the rustls `ClientConfig` for mTLS to PD directly, bypassing
+/// reqwest's `Identity::from_pem` (which on the `rustls-tls` feature
+/// only accepts PKCS#8 private keys — staging cert-manager emits
+/// PKCS#1 RSA keys, so `from_pem` silently fails inside the worker
+/// module too, but that path swallows the error with `return None`).
+/// `rustls_pemfile::private_key` accepts PKCS#1, PKCS#8 and SEC1.
+fn build_pd_rustls_config(
+    ca_path: &str,
+    cert_path: &str,
+    key_path: &str,
+) -> Result<rustls::ClientConfig> {
+    use rustls_pki_types::CertificateDer;
+
+    // CA → root store
+    let ca_pem = std::fs::read(ca_path)
+        .with_context(|| format!("failed to read PD CA cert for fs9 routing: {ca_path}"))?;
+    let mut ca_reader = std::io::BufReader::new(ca_pem.as_slice());
+    let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
+        .collect::<std::result::Result<_, _>>()
+        .context("failed to parse PD CA cert for fs9 routing")?;
+    if ca_certs.is_empty() {
+        anyhow::bail!("no CA certificates found in {ca_path}");
+    }
+    let mut root_store = rustls::RootCertStore::empty();
+    for c in ca_certs {
+        root_store
+            .add(c)
+            .context("failed to register PD CA cert in rustls root store")?;
+    }
+
+    // Client cert chain
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("failed to read PD client cert for fs9 routing: {cert_path}"))?;
+    let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
+    let client_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<_, _>>()
+        .context("failed to parse PD client cert for fs9 routing")?;
+    if client_certs.is_empty() {
+        anyhow::bail!("no client certificates found in {cert_path}");
+    }
+
+    // Client private key — handles PKCS#1 / PKCS#8 / SEC1
+    let key_pem = std::fs::read(key_path)
+        .with_context(|| format!("failed to read PD client key for fs9 routing: {key_path}"))?;
+    let mut key_reader = std::io::BufReader::new(key_pem.as_slice());
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("failed to parse PD client key for fs9 routing")?
+        .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
+
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, key)
+        .context("failed to build rustls ClientConfig for fs9 routing")
+}
+
+fn parse_pd_keyspace_state_response(
+    keyspace: &str,
+    endpoint: &str,
+    status: StatusCode,
+    body: &str,
+) -> Result<Option<String>> {
+    if status == StatusCode::NOT_FOUND
+        || (status == StatusCode::INTERNAL_SERVER_ERROR && pd_body_is_missing_keyspace(body))
+    {
+        return Ok(None);
+    }
+
+    if status.is_success() {
+        let body: serde_json::Value = serde_json::from_str(body).with_context(|| {
+            format!("PD keyspace probe for `{keyspace}` at `{endpoint}` returned invalid JSON")
+        })?;
+        let state = body
+            .get("state")
+            .and_then(|state| state.as_str())
+            .ok_or_else(|| {
+                anyhow!(
+                    "PD keyspace probe for `{keyspace}` at `{endpoint}` returned no string `state`"
+                )
+            })?;
+        return Ok(Some(state.to_string()));
+    }
+
+    Err(anyhow!(
+        "PD keyspace probe for `{keyspace}` at `{endpoint}` returned HTTP {status}: {body}"
+    ))
+}
+
+fn pd_body_is_missing_keyspace(body: &str) -> bool {
+    let body = body.trim();
+    body == "keyspace does not exist" || body == r#""keyspace does not exist""#
+}
+
+async fn query_pd_keyspace_state(
+    pd_endpoints: &[String],
+    keyspace: &str,
+) -> Result<Option<String>> {
+    if pd_endpoints.is_empty() {
+        anyhow::bail!("no PD endpoints available for fs9 tenant-backend probe");
+    }
+
+    let client = build_pd_probe_client()?;
+    let mut errors = Vec::new();
+    for endpoint in pd_endpoints {
+        let url = format!("{}/pd/api/v2/keyspaces/{}", pd_base_url(endpoint), keyspace);
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = match resp.text().await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        errors.push(format!(
+                            "`{endpoint}` failed to read PD response body for `{keyspace}`: {err}"
+                        ));
+                        continue;
+                    }
+                };
+                match parse_pd_keyspace_state_response(keyspace, endpoint, status, &body) {
+                    Ok(state) => return Ok(state),
+                    Err(err) => errors.push(err.to_string()),
+                }
+            }
+            Err(err) => errors.push(format!(
+                "`{endpoint}` failed to query PD keyspace `{keyspace}`: {err}"
+            )),
+        }
+    }
+
+    anyhow::bail!(
+        "failed to probe PD for keyspace `{}` via endpoints [{}]: {}",
+        keyspace,
+        pd_endpoints.join(", "),
+        errors.join("; ")
+    )
+}
+
 pub(crate) async fn ensure_embedded_backend_bootstrap_allowed(
     client: &Arc<tikv_client::TransactionClient>,
     tenant_keyspace: &str,
@@ -538,13 +804,144 @@ async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
              Ensure the caller wraps this in with_context_opts()."
         )
     })?;
+    let principal = crate::extensions::context::effective_fs_plane_principal();
+    init_backend_with_args(tenant_keyspace, client, principal).await
+}
 
-    ensure_embedded_backend_bootstrap_allowed(&client, tenant_keyspace).await?;
+/// Routing decision exposed to non-SQL callers (notably the WebSocket
+/// handler, which authenticates outside the ExtensionContext task-local).
+///
+/// Per-tenant routing: probes PD for the tenant's JuiceFS metadata
+/// keyspace (`jfs_t_<id>`). If present and ENABLED → JuiceFS → must
+/// route to `GrpcFsBackend` (requires v2 env config + authenticated
+/// role; partial config is a hard error, never a silent fallback to
+/// embedded). Absent → EmbeddedFsBackend, which has no role requirement
+/// so password / connect-key sessions on embedded tenants keep working.
+pub(crate) async fn init_backend_with_args(
+    tenant_keyspace: &str,
+    tikv_client: Arc<tikv_client::TransactionClient>,
+    authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
+) -> Result<Arc<dyn FsBackend>> {
+    let kind = resolve_tenant_backend_kind(tenant_keyspace).await?;
 
-    EmbeddedFsBackend::new(client, tenant_keyspace.to_string())
-        .await
-        .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
-        .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+    // Every leaf backend constructed here is wrapped in
+    // `NormalizingFsBackend` so callers cannot bypass path shaping by
+    // grabbing the inner directly. `acquire_statement_backend` caches
+    // the wrapped instance, so the cache and every fs9 entry point
+    // share one normalized contract.
+    let inner: Arc<dyn FsBackend> = match kind {
+        TenantBackendKind::JuiceFs => {
+            #[cfg(fsplane_v2_generated)]
+            {
+                init_juicefs_backend(tenant_keyspace, authenticated_principal).await?
+            }
+            #[cfg(not(fsplane_v2_generated))]
+            {
+                let _ = &authenticated_principal;
+                anyhow::bail!(
+                    "fs9: tenant `{tenant_keyspace}` is JuiceFS-backed but this db9-server \
+                     binary was built without the fs9 v2 gRPC backend (protoc missing at \
+                     build time and DB9_REQUIRE_PROTOC not set). Rebuild with protoc \
+                     installed."
+                );
+            }
+        }
+        TenantBackendKind::Embedded => {
+            let _ = &authenticated_principal;
+            ensure_embedded_backend_bootstrap_allowed(&tikv_client, tenant_keyspace).await?;
+            EmbeddedFsBackend::new(tikv_client, tenant_keyspace.to_string())
+                .await
+                .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
+                .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))?
+        }
+    };
+    Ok(Arc::new(NormalizingFsBackend::new(inner)) as Arc<dyn FsBackend>)
+}
+
+/// Instantiate the fs9 v2 gRPC backend for a tenant that PD has
+/// confirmed as JuiceFS-backed. Caller MUST have already verified
+/// tenant routing via `resolve_tenant_backend_kind` — this function
+/// has no "fall back to embedded" path. Any configuration / session
+/// gap is a hard error.
+#[cfg(fsplane_v2_generated)]
+async fn init_juicefs_backend(
+    tenant_keyspace: &str,
+    authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
+) -> Result<Arc<dyn FsBackend>> {
+    use crate::auth::fs_plane_token::Auth9MintConfig;
+    use crate::extensions::fs::grpc::client::{Auth9MintTokenProvider, GrpcFsBackend};
+    use crate::extensions::fs::grpc::connector::shared_channel;
+
+    // All four v2 env vars are required for JuiceFS tenants. Missing
+    // any of them is a hard error — silently degrading would route
+    // JuiceFS data to the embedded backend.
+    let endpoint = crate::config::env_string("FS9_GRPC_ENDPOINT");
+    let server_name = crate::config::env_string("FS9_GRPC_TLS_SERVER_NAME");
+    let sign_url = crate::config::env_string("AUTH9_SIGN_URL");
+    let api_key = crate::config::env_string("DB9_AUTH9_SERVICE_API_KEY");
+
+    let mut missing = Vec::new();
+    if endpoint.is_none() {
+        missing.push("FS9_GRPC_ENDPOINT");
+    }
+    if server_name.is_none() {
+        missing.push("FS9_GRPC_TLS_SERVER_NAME");
+    }
+    if sign_url.is_none() {
+        missing.push("AUTH9_SIGN_URL");
+    }
+    if api_key.is_none() {
+        missing.push("DB9_AUTH9_SERVICE_API_KEY");
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "fs9: tenant `{tenant_keyspace}` is JuiceFS-backed but the v2 gRPC \
+             configuration is incomplete: missing {}. Set all of \
+             {{FS9_GRPC_ENDPOINT, FS9_GRPC_TLS_SERVER_NAME, AUTH9_SIGN_URL, \
+             DB9_AUTH9_SERVICE_API_KEY}} on the db9-server deployment.",
+            missing.join(", ")
+        );
+    }
+
+    let mint_cfg = Auth9MintConfig::new(sign_url.unwrap(), api_key.unwrap());
+    let _ = (endpoint, server_name); // consumed by shared_channel via env
+
+    let principal = authenticated_principal.ok_or_else(|| {
+        anyhow!(
+            "fs9: tenant `{tenant_keyspace}` is JuiceFS-backed and requires \
+             an authenticated principal (role + access) to derive the \
+             fs-plane scp; caller did not provide one."
+        )
+    })?;
+    let tenant_id = crate::auth::tenant_id_from_keyspace(tenant_keyspace)
+        .ok_or_else(|| {
+            anyhow!(
+                "fs9: tenant keyspace '{tenant_keyspace}' lacks the db9_tenant_ \
+                 prefix; cannot derive tid claim."
+            )
+        })?
+        .to_string();
+
+    let channel = shared_channel().await?;
+    let cache = fs9_plane_token_cache();
+    let provider = Arc::new(Auth9MintTokenProvider::new(
+        cache,
+        mint_cfg,
+        tenant_id.clone(),
+        principal.role,
+        principal.access,
+    ));
+    let backend = GrpcFsBackend::new(channel, &tenant_id, provider);
+    Ok(Arc::new(backend) as Arc<dyn FsBackend>)
+}
+
+#[cfg(fsplane_v2_generated)]
+fn fs9_plane_token_cache() -> Arc<crate::auth::fs_plane_token::Fs9PlaneTokenCache> {
+    use crate::auth::fs_plane_token::Fs9PlaneTokenCache;
+    static CACHE: std::sync::OnceLock<Arc<Fs9PlaneTokenCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| Arc::new(Fs9PlaneTokenCache::new()))
+        .clone()
 }
 
 /// Acquire the authoritative fs9 backend for the current statement.
@@ -1367,5 +1764,152 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, vec!["/keep", "/keep/visible.txt"]);
         assert_eq!(result.total_dirs_scanned, 2);
+    }
+
+    // ── Tenant-backend routing helpers ────────────────────────────
+
+    #[test]
+    fn legacy_juicefs_keyspace_name_strips_db9_tenant_prefix() {
+        assert_eq!(
+            super::legacy_juicefs_keyspace_name("db9_tenant_ngq7d3atwl6n"),
+            "jfs_t_ngq7d3atwl6n"
+        );
+    }
+
+    #[test]
+    fn legacy_juicefs_keyspace_name_passthrough_when_no_prefix() {
+        // Defensive: should the caller pass a non-prefixed keyspace
+        // string (worker / test fixture), we still derive a stable
+        // jfs_t_* name rather than panic.
+        assert_eq!(
+            super::legacy_juicefs_keyspace_name("custom_keyspace"),
+            "jfs_t_custom_keyspace"
+        );
+    }
+
+    #[test]
+    fn parse_pd_keyspace_state_decodes_enabled() {
+        let body =
+            r#"{"id":346,"name":"jfs_t_x","state":"ENABLED","created_at":1,"state_changed_at":1}"#;
+        let state = super::parse_pd_keyspace_state_response(
+            "jfs_t_x",
+            "1.2.3.4:2379",
+            super::StatusCode::OK,
+            body,
+        )
+        .unwrap();
+        assert_eq!(state.as_deref(), Some("ENABLED"));
+    }
+
+    #[test]
+    fn parse_pd_keyspace_state_translates_404_to_none() {
+        let state = super::parse_pd_keyspace_state_response(
+            "jfs_t_missing",
+            "1.2.3.4:2379",
+            super::StatusCode::NOT_FOUND,
+            "",
+        )
+        .unwrap();
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn parse_pd_keyspace_state_translates_500_keyspace_does_not_exist_to_none() {
+        // Some PD versions return 500 with a body of "keyspace does
+        // not exist" instead of 404. Treat both as "absent" so an
+        // embedded-only tenant doesn't trip a fail-closed.
+        let state = super::parse_pd_keyspace_state_response(
+            "jfs_t_x",
+            "1.2.3.4:2379",
+            super::StatusCode::INTERNAL_SERVER_ERROR,
+            "keyspace does not exist",
+        )
+        .unwrap();
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn parse_pd_keyspace_state_500_with_other_body_errors() {
+        let err = super::parse_pd_keyspace_state_response(
+            "jfs_t_x",
+            "1.2.3.4:2379",
+            super::StatusCode::INTERNAL_SERVER_ERROR,
+            "etcd unavailable",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("HTTP 500"));
+    }
+
+    #[test]
+    fn parse_pd_keyspace_state_rejects_no_state_field() {
+        let body = r#"{"id":346,"name":"jfs_t_x"}"#;
+        let err = super::parse_pd_keyspace_state_response(
+            "jfs_t_x",
+            "1.2.3.4:2379",
+            super::StatusCode::OK,
+            body,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no string `state`"));
+    }
+
+    #[test]
+    fn parse_pd_endpoints_splits_csv() {
+        assert_eq!(
+            super::parse_pd_endpoints("a:1,b:2 , c:3"),
+            vec!["a:1", "b:2", "c:3"]
+        );
+        assert!(super::parse_pd_endpoints("").is_empty());
+        assert!(super::parse_pd_endpoints(",,, ").is_empty());
+    }
+
+    fn make_info(is_dir: bool, is_symlink: bool, size: u64) -> FsFileInfo {
+        FsFileInfo {
+            path: "/x".to_string(),
+            is_dir,
+            is_symlink,
+            size,
+            mode: 0o644,
+            generation: 1,
+            mtime: 0,
+            storage: if is_dir || is_symlink {
+                None
+            } else {
+                Some(FsStorage::Inline)
+            },
+            sealed: Some(false),
+        }
+    }
+
+    #[test]
+    fn ensure_readable_helper_accepts_regular_file() {
+        let info = make_info(false, false, 42);
+        super::ensure_readable_as_regular_file(&info, "/x").expect("regular file must be readable");
+    }
+
+    #[test]
+    fn ensure_readable_helper_rejects_directory_with_typed_error() {
+        let info = make_info(true, false, 0);
+        let err = super::ensure_readable_as_regular_file(&info, "/d").unwrap_err();
+        let typed = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("typed EmbeddedFsError expected");
+        assert!(matches!(typed, EmbeddedFsError::IsDirectory(_)));
+    }
+
+    /// PR #2547 review #5 — the gate must reject symlinks so a short
+    /// symlink can't smuggle a prefix of a huge target past the size
+    /// cap on fs9 v2 (Stat is Lstat, ReadAt follows).
+    #[test]
+    fn ensure_readable_helper_rejects_symlink_with_typed_error() {
+        let info = make_info(false, true, 11);
+        let err = super::ensure_readable_as_regular_file(&info, "/link").unwrap_err();
+        let typed = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("typed EmbeddedFsError expected");
+        assert!(matches!(
+            typed,
+            EmbeddedFsError::InvalidInput(msg) if msg == "cannot read symlink as file; use readlink"
+        ));
     }
 }

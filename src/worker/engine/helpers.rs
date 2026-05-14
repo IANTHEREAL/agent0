@@ -99,15 +99,26 @@ pub(super) fn parse_hnsw_merge_command(command: &str) -> Result<(u64, u64)> {
     Ok((table_id, index_id))
 }
 
+/// Build the extension context a worker statement runs in.
+///
+/// `username` is the originating principal captured at enqueue time
+/// (`TaskQueueEntry.username`). It's the same value the worker passes
+/// into `QueryContext` for `current_user`; threading it here also lets
+/// `init_juicefs_backend` derive the fs-plane scp without forcing every
+/// trigger / background-SQL call site to know the rule. Cron tasks
+/// don't carry a principal — they can't reach JuiceFS by design.
 pub(super) fn background_statement_extension_context(
     is_cron: bool,
     keyspace: &str,
+    username: &str,
     tikv_client: Option<Arc<tikv_client::TransactionClient>>,
 ) -> ExtensionContextOpts {
     if is_cron {
         ExtensionContextOpts::cron(keyspace).with_tikv_client(tikv_client)
     } else {
-        ExtensionContextOpts::statement(true, true, keyspace).with_tikv_client(tikv_client)
+        ExtensionContextOpts::statement(true, true, keyspace)
+            .with_tikv_client(tikv_client)
+            .with_authenticated_role(Some(username.to_string()))
     }
 }
 

@@ -282,10 +282,15 @@ fn parse_bytes(raw: &str) -> Option<usize> {
         return None;
     }
 
+    // `split` is used as a byte index into `s` below; iterate via
+    // `char_indices` (byte positions) rather than `chars().enumerate()`
+    // (char ordinals) so a non-ASCII char doesn't slice mid-codepoint
+    // and panic. parse_bytes inputs are expected to be ASCII config
+    // strings, but the failure mode should be "no parse" not a crash.
     let mut split = 0usize;
-    for (idx, c) in s.chars().enumerate() {
+    for (byte_idx, c) in s.char_indices() {
         if !(c.is_ascii_digit() || c == '_') {
-            split = idx;
+            split = byte_idx;
             break;
         }
     }

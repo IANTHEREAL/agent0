@@ -350,12 +350,8 @@ impl EmbeddedPageFs {
     }
 
     pub(crate) async fn remove(&self, path: &str) -> Result<()> {
+        crate::extensions::fs::reject_root_path_op(path, "remove")?;
         let normalized = normalize_path(path);
-        if normalized == "/" {
-            return Err(anyhow!(EmbeddedFsError::PermissionDenied(
-                "cannot remove root".to_string()
-            )));
-        }
 
         let mut txn = self.begin().await?;
         let (inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
@@ -399,12 +395,8 @@ impl EmbeddedPageFs {
     }
 
     pub(crate) async fn remove_recursive(&self, path: &str) -> Result<u64> {
+        crate::extensions::fs::reject_root_path_op(path, "remove")?;
         let normalized = normalize_path(path);
-        if normalized == "/" {
-            return Err(anyhow!(EmbeddedFsError::PermissionDenied(
-                "cannot remove root".to_string()
-            )));
-        }
 
         let mut txn = self.begin().await?;
         let (inode_id, inode) = resolve_path(&mut txn, &normalized).await?;
@@ -547,15 +539,10 @@ impl EmbeddedPageFs {
     }
 
     pub(crate) async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        crate::extensions::fs::reject_root_path_op(old_path, "rename")?;
         let old_normalized = normalize_path(old_path);
         let new_normalized = normalize_path(new_path);
         let new_has_trailing_slash = new_path.len() > 1 && new_path.ends_with('/');
-
-        if old_normalized == "/" {
-            return Err(anyhow!(EmbeddedFsError::PermissionDenied(
-                "cannot rename root".to_string(),
-            )));
-        }
 
         // No-op if paths are identical — but source must exist (POSIX: ENOENT)
         if old_normalized == new_normalized {

@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::auth::fs_plane_token::{fs_plane_access_for, Fs9Access, Fs9Principal};
 use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
-use crate::extensions::fs::backend::{ensure_embedded_backend_bootstrap_allowed, FsBackend};
+use crate::extensions::fs::backend::{init_backend_with_args, FsBackend};
 use crate::extensions::fs::config::fs9_config;
-use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
 use crate::extensions::fs::ws::tenant_from_keyspace;
 use crate::pool::{TenantHandle, TikvClientPool};
@@ -25,19 +25,33 @@ pub(crate) enum FsAccessMode {
     ReadWrite,
 }
 
-/// Centralized role → access-mode mapping.
-///
-/// Design constraints (locked 2026-03-27):
-/// - Single source of truth — no scattered role checks elsewhere.
-/// - Unknown roles fail-closed (reject).
-pub(crate) fn access_mode_for_role(role: &str) -> Result<FsAccessMode, String> {
-    match role {
-        "_db9_sys_readonly" => Ok(FsAccessMode::ReadOnly),
-        "admin" => Ok(FsAccessMode::ReadWrite),
-        _ => Err(format!(
-            "fs9: unknown role \"{role}\" — cannot determine access mode"
-        )),
+impl From<Fs9Access> for FsAccessMode {
+    fn from(value: Fs9Access) -> Self {
+        match value {
+            Fs9Access::ReadWrite => FsAccessMode::ReadWrite,
+            Fs9Access::ReadOnly => FsAccessMode::ReadOnly,
+        }
     }
+}
+
+/// Derive the WS session's access mode from privilege facts. Delegates
+/// to [`crate::auth::fs_plane_token::fs_plane_access_for`] — the same
+/// single source of truth that the SQL fs9 backend init consults — so
+/// SQL and WS share one rule. `is_superuser` lets a custom-named
+/// superuser (`postgres`, `svc_admin`, etc.) pass; name matching is
+/// reserved for the fixed system read-only role.
+pub(crate) fn access_mode_for_principal(
+    is_superuser: bool,
+    role: &str,
+) -> Result<FsAccessMode, String> {
+    fs_plane_access_for(is_superuser, role)
+        .map(FsAccessMode::from)
+        .ok_or_else(|| {
+            format!(
+                "fs9: role \"{role}\" has no fs-plane capability \
+                 (not a superuser and not the system read-only role)"
+            )
+        })
 }
 
 pub(crate) struct WsSession {
@@ -183,7 +197,7 @@ pub(crate) async fn handle_auth(
         WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
     })?;
 
-    let (user, _trusted_jwt_claims, failure) = match dispatch_db9_auth(
+    let (success, failure) = match dispatch_db9_auth(
         &auth_manager,
         &mut auth_txn,
         auth_mode,
@@ -204,8 +218,8 @@ pub(crate) async fn handle_auth(
         }
     };
 
-    let user = match user {
-        Some(user) => user,
+    let success = match success {
+        Some(s) => s,
         None => {
             let _ = auth_txn.rollback().await;
             let response = map_auth_failure(id, &actual_user, failure);
@@ -213,7 +227,7 @@ pub(crate) async fn handle_auth(
         }
     };
 
-    if !user.can_login {
+    if !success.user.can_login {
         let _ = auth_txn.rollback().await;
         return Err(WsResponse::error(
             id,
@@ -222,10 +236,12 @@ pub(crate) async fn handle_auth(
         ));
     }
 
-    // Determine fs access mode from the verified PG role identity.
-    // This is the single source of truth for read/write permissions on this session.
-    // Unknown roles are rejected (fail-closed).
-    let access_mode = match access_mode_for_role(&actual_user) {
+    // Determine fs access mode from verified privilege facts, not
+    // from the role name string. A custom-named superuser
+    // (`DB9_BOOTSTRAP_ADMIN_USER=postgres` or any later
+    // `CREATE ROLE ... SUPERUSER`) gets the same ReadWrite tier a
+    // session named `admin` would, matching SQL fs9_* perms.
+    let access_mode = match access_mode_for_principal(success.user.is_superuser, &actual_user) {
         Ok(mode) => mode,
         Err(msg) => {
             let _ = auth_txn.rollback().await;
@@ -245,7 +261,19 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    ensure_embedded_backend_bootstrap_allowed(&client, &keyspace)
+    // Plumb identity + capability together so the fs-plane mint sees
+    // both (and the gRPC backend reaches the same scope `access_mode`
+    // already enforces at WS layer). Two enforcement layers for one
+    // access decision.
+    let principal = Some(Fs9Principal {
+        role: actual_user.clone(),
+        access: match access_mode {
+            FsAccessMode::ReadWrite => Fs9Access::ReadWrite,
+            FsAccessMode::ReadOnly => Fs9Access::ReadOnly,
+        },
+    });
+
+    let backend = init_backend_with_args(&keyspace, client, principal)
         .await
         .map_err(|err| {
             WsResponse::error(
@@ -254,18 +282,6 @@ pub(crate) async fn handle_auth(
                 format!("failed to initialize fs backend: {err}"),
             )
         })?;
-
-    let backend: Arc<dyn FsBackend> = Arc::new(
-        EmbeddedFsBackend::new(client, keyspace.clone())
-            .await
-            .map_err(|err| {
-                WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("failed to initialize fs backend: {err}"),
-                )
-            })?,
-    );
 
     Ok(WsSession {
         _tenant_handle: tenant_handle,
@@ -536,24 +552,44 @@ mod tests {
     }
 
     #[test]
-    fn test_access_mode_admin_is_readwrite() {
+    fn test_access_mode_superuser_is_readwrite() {
+        // Capability, not name. Any superuser → ReadWrite.
         assert_eq!(
-            access_mode_for_role("admin").unwrap(),
+            access_mode_for_principal(true, "admin").unwrap(),
             FsAccessMode::ReadWrite
         );
     }
 
+    /// PR #2547 review #1 regression: a deployment bootstrapped with a
+    /// non-`admin` superuser name (or any later
+    /// `CREATE ROLE ... SUPERUSER`) must still pass the WS access-mode
+    /// gate. Previously WS rejected with `Eacces` because the role
+    /// string didn't literally match `"admin"`.
     #[test]
-    fn test_access_mode_readonly_role() {
+    fn test_access_mode_custom_named_superuser_is_readwrite() {
+        for role in ["postgres", "svc_admin", "alice", "ops_team"] {
+            assert_eq!(
+                access_mode_for_principal(true, role).unwrap(),
+                FsAccessMode::ReadWrite,
+                "superuser named {role:?} must be ReadWrite"
+            );
+        }
+    }
+
+    #[test]
+    fn test_access_mode_sys_readonly_role() {
         assert_eq!(
-            access_mode_for_role("_db9_sys_readonly").unwrap(),
+            access_mode_for_principal(false, "_db9_sys_readonly").unwrap(),
             FsAccessMode::ReadOnly
         );
     }
 
     #[test]
-    fn test_access_mode_unknown_role_rejected() {
-        let err = access_mode_for_role("mysterious_user").unwrap_err();
-        assert!(err.contains("unknown role"));
+    fn test_access_mode_non_superuser_other_role_rejected() {
+        let err = access_mode_for_principal(false, "mysterious_user").unwrap_err();
+        assert!(
+            err.contains("no fs-plane capability"),
+            "expected capability rejection, got: {err}"
+        );
     }
 }
