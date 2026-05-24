@@ -167,16 +167,22 @@ impl Session {
                 // semantics where transaction_timestamp = start of the BEGIN statement.
                 let ts = crate::sql::statement_time::statement_timestamp_millis_or_now();
                 let txn = self.store.begin().await?;
+                let start_ts_version = txn.start_timestamp().version();
                 self.savepoints.reset().await?;
                 self.reset_xact_advisory_savepoint_tracker().await;
                 // Register start_ts in GC active transaction registry before
                 // setting state to Active. This ensures the GC safepoint
                 // advancer sees this transaction before it can be affected.
                 if let Some(ref registry) = self.active_txn_registry {
-                    registry
-                        .register_connection(self.connection_id, txn.start_timestamp().version());
+                    registry.register_connection(self.connection_id, start_ts_version);
                 }
                 self.state = TransactionState::Active(txn);
+                // Publish the real start_ts to the per-statement memory scope so the
+                // expensive_query log can attribute peak memory to a txn. For
+                // autocommit simple-query this overrides the `0` placeholder that
+                // execute_single wrote before the txn existed (dispatch/mod.rs). The
+                // Idle-only arm guarantees we never re-publish on an already-Active txn.
+                crate::pool::set_current_statement_start_ts(start_ts_version);
                 self.settings.begin_transaction_settings();
                 self.extension_delta = super::ExtensionDelta::default();
                 self.extension_delta_savepoints.clear();

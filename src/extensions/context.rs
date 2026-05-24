@@ -309,8 +309,7 @@ pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
 /// `ReadWrite`; `_db9_sys_readonly` gets `ReadOnly`; everything else
 /// fails closed (`None`), and the JuiceFS backend init surfaces that
 /// as a hard error rather than silently downgrading.
-pub(crate) fn effective_fs_plane_principal(
-) -> Option<crate::auth::fs_plane_token::Fs9Principal> {
+pub(crate) fn effective_fs_plane_principal() -> Option<crate::auth::fs_plane_token::Fs9Principal> {
     use crate::auth::fs_plane_token::{fs_plane_access_for, Fs9Principal};
 
     CTX.try_with(|ctx| {

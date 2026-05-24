@@ -7,8 +7,9 @@ use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as StdMutex;
+use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
@@ -102,6 +103,11 @@ impl TenantMemoryAccountant {
         &self.keyspace
     }
 
+    /// Clone the keyspace handle for embedding in a statement scope.
+    pub fn keyspace_arc(&self) -> Arc<str> {
+        self.keyspace.clone()
+    }
+
     fn try_charge(
         &self,
         component: &str,
@@ -165,9 +171,15 @@ impl TenantMemoryAccountant {
         TenantMemoryReservation {
             accountant: self.clone(),
             charged_bytes: 0,
+            peak_bytes: 0,
+            peak_by_component_grow: SmallVec::new(),
         }
     }
 }
+
+/// Inline capacity for per-component peak tracking. Queries typically touch ≤ 8
+/// distinct component labels, so this stays heap-free in the common case.
+const PEAK_COMPONENT_CAP: usize = 8;
 
 /// RAII reservation over tenant aggregate memory budget.
 ///
@@ -177,6 +189,22 @@ impl TenantMemoryAccountant {
 pub struct TenantMemoryReservation {
     accountant: TenantMemoryAccountant,
     charged_bytes: usize,
+    /// High-water mark of `charged_bytes` over this reservation's life. Never
+    /// decreases on `shrink`; reset only by `split` or drop.
+    peak_bytes: usize,
+    /// Best-effort per-component attribution for the `expensive_query` log's
+    /// `component_grow_top` field — a forensic "which operator likely dominated"
+    /// hint, NOT an exact ledger.
+    ///
+    /// It is cumulative *grows*, not live bytes: `shrink` carries no component
+    /// label (memory ownership crosses operators — e.g. `HashAggregate` releases
+    /// rows that `collect_all` charged), so a component that grew 200 MB then
+    /// shrank 180 MB still reads 200 MB here, and only the dominant labels are
+    /// reliable. This is a deliberate trade-off, not a bug: enforcement runs on
+    /// the exact `charged_bytes` total, and exact per-component accounting would
+    /// require per-owner reservations that only pay off once db9 has disk spill.
+    /// See the architecture decision in issue #2559.
+    peak_by_component_grow: SmallVec<[(&'static str, usize); PEAK_COMPONENT_CAP]>,
 }
 
 impl TenantMemoryReservation {
@@ -185,6 +213,10 @@ impl TenantMemoryReservation {
         self.charged_bytes
     }
 
+    /// Charge-only grow with no peak tracking. Kept as a thin helper for tests
+    /// and callers that don't need the high-water mark; the hot path
+    /// (`try_grow_statement_memory_scope`) uses [`grow_with_peak`].
+    #[allow(dead_code)] // test helper
     pub fn grow(
         &mut self,
         component: &str,
@@ -196,6 +228,78 @@ impl TenantMemoryReservation {
         self.accountant.try_charge(component, delta)?;
         self.charged_bytes = self.charged_bytes.saturating_add(delta);
         Ok(())
+    }
+
+    /// Grow the reservation by `delta` and report the peak to use for the
+    /// expensive-query threshold check.
+    ///
+    /// - On **success**: `charged_bytes` and `peak_bytes` advance, the grow is
+    ///   recorded in `peak_by_component_grow`, and the returned peak is the new
+    ///   physical `peak_bytes`.
+    /// - On **quota-exceed**: `charged_bytes`, `peak_bytes`, and the component map
+    ///   are all left untouched — so the physical peak (used by the slow-query
+    ///   `peak_mb`) and the component breakdown never count un-charged bytes — but
+    ///   the returned peak is `max(peak_bytes, attempted)` so the caller still
+    ///   fires the log for the grow that hit the quota wall (edge case J).
+    pub fn grow_with_peak(
+        &mut self,
+        component: &'static str,
+        delta: usize,
+    ) -> (std::result::Result<(), crate::sql::error::SqlError>, usize) {
+        if delta == 0 {
+            return (Ok(()), self.peak_bytes);
+        }
+        let attempted = self.charged_bytes.saturating_add(delta);
+        match self.accountant.try_charge(component, delta) {
+            Ok(()) => {
+                self.charged_bytes = attempted;
+                self.peak_bytes = self.peak_bytes.max(attempted);
+                bump_component(&mut self.peak_by_component_grow, component, delta);
+                (Ok(()), self.peak_bytes)
+            }
+            Err(e) => {
+                // Charge rejected: leave charged_bytes, peak_bytes, and the
+                // component map untouched, so the physical peak (used by the
+                // slow-query `peak_mb`) and the component breakdown never count
+                // bytes that were not actually charged. Still report the
+                // *attempted* total so the caller's threshold check fires for the
+                // grow that hit the quota wall (edge case J) — that statement is
+                // exactly the one worth logging.
+                (Err(e), self.peak_bytes.max(attempted))
+            }
+        }
+    }
+
+    /// Peak `charged_bytes` reached over this reservation's life.
+    pub fn peak_bytes(&self) -> usize {
+        self.peak_bytes
+    }
+
+    /// Best-effort top-`n` components by cumulative grow, formatted
+    /// `label=NMB;label=NMB`. A forensic hint, not an exact breakdown — see
+    /// [`TenantMemoryReservation::peak_by_component_grow`] and issue #2559.
+    pub fn component_grow_top_n(&self, n: usize) -> String {
+        let mut v: Vec<_> = self.peak_by_component_grow.iter().collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
+        v.into_iter()
+            .take(n)
+            .map(|entry| format!("{}={}MB", entry.0, entry.1 / (1024 * 1024)))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// Reset per-attempt tracking at the start of a statement retry: clear the
+    /// component map and re-baseline `peak_bytes` to the current live
+    /// `charged_bytes`.
+    ///
+    /// The autocommit retry loops re-run the whole operator tree within ONE
+    /// statement scope. Without this, `peak_by_component_grow` accumulates across
+    /// attempts and `component_grow_top` is inflated by the retry count (and
+    /// contradicts `peak_mb`). Does NOT touch the one-shot log latch — the log
+    /// must still fire at most once per statement, not once per attempt.
+    pub fn reset_attempt_tracking(&mut self) {
+        self.peak_bytes = self.charged_bytes;
+        self.peak_by_component_grow.clear();
     }
 
     #[allow(dead_code)] // test helper
@@ -220,6 +324,11 @@ impl TenantMemoryReservation {
         Some(TenantMemoryReservation {
             accountant: self.accountant.clone(),
             charged_bytes: bytes,
+            // Peak is a per-statement high-water mark, not per-portal-lifetime:
+            // the split-off owner starts fresh while this reservation keeps its
+            // own peak.
+            peak_bytes: 0,
+            peak_by_component_grow: SmallVec::new(),
         })
     }
 }
@@ -234,7 +343,40 @@ impl Drop for TenantMemoryReservation {
 }
 
 struct StatementMemoryScope {
+    /// Lock-ordering rule: when the log path needs both the reservation peak and
+    /// `sql`/`start_ts`, lock `reservation` first, release it, *then* lock
+    /// `sql`/`start_ts`. The grow path only ever locks `reservation`. Never hold
+    /// two of these locks at once.
     reservation: std::sync::Mutex<TenantMemoryReservation>,
+    /// Normalized + redacted SQL of the running statement; set by the dispatch
+    /// layer after scope entry.
+    sql: std::sync::Mutex<Option<Arc<str>>>,
+    conn_id: i64,
+    keyspace: Arc<str>,
+    /// TiKV txn `start_ts`; set when the txn begins (see `Session::begin` and the
+    /// dispatch layer).
+    start_ts: std::sync::Mutex<Option<u64>>,
+    started_at: std::time::Instant,
+    /// One-shot latch: the first threshold crossing logs, the rest are silent.
+    expensive_logged: AtomicBool,
+    /// Peak threshold (bytes) read once at scope creation; `0` disables the log.
+    threshold_bytes: usize,
+}
+
+impl StatementMemoryScope {
+    fn new(accountant: TenantMemoryAccountant, conn_id: i64, threshold_bytes: usize) -> Self {
+        let keyspace = accountant.keyspace_arc();
+        Self {
+            reservation: std::sync::Mutex::new(accountant.reservation()),
+            sql: std::sync::Mutex::new(None),
+            conn_id,
+            keyspace,
+            start_ts: std::sync::Mutex::new(None),
+            started_at: std::time::Instant::now(),
+            expensive_logged: AtomicBool::new(false),
+            threshold_bytes,
+        }
+    }
 }
 
 tokio::task_local! {
@@ -248,38 +390,217 @@ tokio::task_local! {
 /// when the scope future completes.
 pub async fn run_with_statement_memory_scope<Fut>(
     accountant: Option<TenantMemoryAccountant>,
+    conn_id: i64,
     fut: Fut,
 ) -> Fut::Output
 where
     Fut: std::future::Future,
 {
     if let Some(accountant) = accountant {
-        let scope = Arc::new(StatementMemoryScope {
-            reservation: std::sync::Mutex::new(accountant.reservation()),
-        });
+        let scope = Arc::new(StatementMemoryScope::new(
+            accountant,
+            conn_id,
+            crate::observability::expensive_mem_threshold_bytes(),
+        ));
         STATEMENT_MEMORY_SCOPE.scope(scope, fut).await
     } else {
         fut.await
     }
 }
 
-/// Charge bytes against the current statement scope.
+/// Charge bytes against the current statement scope, tracking the per-statement
+/// peak and firing the `expensive_query` log the first time the peak crosses the
+/// configured threshold.
 ///
 /// Returns `Ok(())` when no statement scope is active (e.g. tests calling
 /// operator helpers directly).
+///
+/// `component` is `&'static str` because every call site passes a string literal
+/// or a `const &str`; the label is stored verbatim for `component_grow_top`.
+///
+/// Spawn contract: `STATEMENT_MEMORY_SCOPE` is a `tokio::task_local!`, so it does
+/// NOT propagate across `tokio::spawn` / `spawn_blocking`. Any future code that
+/// spawns a task and then allocates through this function must re-enter
+/// `run_with_statement_memory_scope` in the spawned task, or its memory will not
+/// be accounted to the originating statement.
 pub fn try_grow_statement_memory_scope(
-    component: &str,
+    component: &'static str,
     bytes: usize,
 ) -> std::result::Result<(), crate::sql::error::SqlError> {
     if bytes == 0 {
         return Ok(());
     }
+    let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) else {
+        return Ok(());
+    };
+
+    // Single lock acquisition: grow + peak read + (conditional) component
+    // snapshot. The no-cross fast path adds only a threshold compare and one
+    // relaxed atomic load over the lock that `grow` already required.
+    let (grow_result, peak, component_top_for_log) = {
+        let mut guard = scope.reservation.lock().unwrap_or_else(|e| e.into_inner());
+        let (res, peak) = guard.grow_with_peak(component, bytes);
+        let snapshot = if scope.threshold_bytes > 0
+            && peak >= scope.threshold_bytes
+            && !scope.expensive_logged.load(Ordering::Relaxed)
+        {
+            Some(guard.component_grow_top_n(3))
+        } else {
+            None
+        };
+        (res, peak, snapshot)
+    };
+
+    if let Some(top) = component_top_for_log {
+        // Latch: only the first crosser emits.
+        if !scope.expensive_logged.swap(true, Ordering::AcqRel) {
+            emit_expensive_query_log_with_top(&scope, peak, &top);
+        }
+    }
+
+    grow_result
+}
+
+/// Attach the SQL of the current statement to its memory scope (normalized +
+/// redacted). Called from the dispatch layer once the SQL is known. No-op when
+/// no scope is active or the SQL normalizes to empty.
+///
+/// Self-healing: if the peak already crossed the threshold before the SQL was
+/// known, the log is emitted now (the earlier crossing reset the latch).
+pub fn set_current_statement_sql(sql: &str) {
+    let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) else {
+        return;
+    };
+    // Hot path: this runs at dispatch for EVERY statement. When the log is
+    // disabled, skip normalization (and its env reads) entirely.
+    if scope.threshold_bytes == 0 {
+        return;
+    }
+    let normalized = crate::observability::normalize_sql_for_expensive_log(sql);
+    if normalized.is_empty() {
+        return;
+    }
+    {
+        let mut guard = scope.sql.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Arc::from(normalized));
+    }
+    maybe_emit_expensive_query_log(&scope);
+}
+
+/// Reset per-attempt peak/component tracking on the current statement scope at
+/// the start of a statement retry attempt. No-op when no scope is active. See
+/// [`TenantMemoryReservation::reset_attempt_tracking`].
+pub fn reset_statement_memory_attempt() {
     if let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) {
         let mut guard = scope.reservation.lock().unwrap_or_else(|e| e.into_inner());
-        guard.grow(component, bytes)
-    } else {
-        Ok(())
+        guard.reset_attempt_tracking();
     }
+}
+
+/// Publish the TiKV txn `start_ts` onto the current statement scope. No-op when
+/// no scope is active. The autocommit simple-query path writes this twice (a `0`
+/// placeholder from the dispatch layer, then the real value from
+/// `Session::begin`); last-write-wins.
+pub fn set_current_statement_start_ts(ts: u64) {
+    if let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) {
+        let mut guard = scope.start_ts.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(ts);
+    }
+}
+
+/// Snapshot the current statement scope's peak bytes, if a scope is active.
+/// Used to enrich the slow-query log with `peak_mb`.
+pub fn peak_bytes_snapshot() -> Option<usize> {
+    STATEMENT_MEMORY_SCOPE
+        .try_with(|scope| {
+            scope
+                .reservation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peak_bytes()
+        })
+        .ok()
+}
+
+/// Re-check the peak under the reservation lock and emit the `expensive_query`
+/// log if it has crossed the threshold and not yet been logged. Shared by the
+/// grow path and the `set_current_statement_sql` self-heal.
+fn maybe_emit_expensive_query_log(scope: &StatementMemoryScope) {
+    if scope.threshold_bytes == 0 || scope.expensive_logged.load(Ordering::Acquire) {
+        return;
+    }
+    let (peak, top) = {
+        let g = scope.reservation.lock().unwrap_or_else(|e| e.into_inner());
+        let peak = g.peak_bytes();
+        if peak < scope.threshold_bytes {
+            return;
+        }
+        (peak, g.component_grow_top_n(3))
+    };
+    if !scope.expensive_logged.swap(true, Ordering::AcqRel) {
+        emit_expensive_query_log_with_top(scope, peak, &top);
+    }
+}
+
+/// Emit one `expensive_query` log line.
+///
+/// Lock ordering: the caller has already released the `reservation` lock; here
+/// we lock only `sql` then `start_ts`, never holding two scope locks at once. If
+/// no SQL is attached yet, reset the latch and skip so a later grow or
+/// `set_current_statement_sql` can still report.
+fn emit_expensive_query_log_with_top(
+    scope: &StatementMemoryScope,
+    peak_bytes: usize,
+    component_grow_top: &str,
+) {
+    let sql = scope.sql.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sql_str: &str = sql.as_deref().unwrap_or("");
+    if sql_str.is_empty() {
+        scope.expensive_logged.store(false, Ordering::Release);
+        return;
+    }
+    let start_ts = scope
+        .start_ts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(0);
+
+    // No `tenant` label: db9 is multi-tenant, so that would be an unbounded
+    // Prometheus dimension. The tenant is on the log line below for drill-down.
+    metrics::counter!("db9_server_expensive_queries_total").increment(1);
+    tracing::warn!(
+        target: "expensive_query",
+        peak_mb = peak_bytes / (1024 * 1024),
+        latency_ms_so_far = scope.started_at.elapsed().as_millis() as u64,
+        tenant = %scope.keyspace,
+        conn_id = scope.conn_id,
+        start_ts = start_ts,
+        component_grow_top = %component_grow_top,
+        "expensive query (memory): {sql_str}",
+    );
+}
+
+/// Add `delta` to a component's cumulative grow, appending a new entry for a
+/// label not seen before. Linear scan over the live entries.
+///
+/// The distinct component-label set is small and finite (`&'static str` literals
+/// across the operators), so this stays inline for ≤ `PEAK_COMPONENT_CAP` labels
+/// and spills to a small, bounded heap `Vec` only for plans that touch more —
+/// never unbounded. Appending (rather than folding into the smallest slot) keeps
+/// every label's bytes under the *correct* label, including a large component
+/// that first appears late in a complex plan.
+fn bump_component(
+    v: &mut SmallVec<[(&'static str, usize); PEAK_COMPONENT_CAP]>,
+    component: &'static str,
+    delta: usize,
+) {
+    for entry in v.iter_mut() {
+        if entry.0 == component {
+            entry.1 = entry.1.saturating_add(delta);
+            return;
+        }
+    }
+    v.push((component, delta));
 }
 
 /// Release bytes from the current statement scope.
@@ -1639,7 +1960,7 @@ mod tests {
     #[tokio::test]
     async fn statement_scope_runtime_shrink_tracks_live_bytes() {
         let accountant = TenantMemoryAccountant::new_with_quota("ks_scope".to_string(), 128);
-        run_with_statement_memory_scope(Some(accountant.clone()), async {
+        run_with_statement_memory_scope(Some(accountant.clone()), 0, async {
             try_grow_statement_memory_scope("scope.grow", 100).expect("grow should succeed");
             assert_eq!(accountant.used_bytes(), 100);
             try_shrink_statement_memory_scope(40);
@@ -1647,6 +1968,287 @@ mod tests {
         })
         .await;
         assert_eq!(accountant.used_bytes(), 0);
+    }
+
+    // ── expensive_query peak tracking + log trigger ───────────────────
+
+    #[test]
+    fn peak_bytes_tracks_high_water_mark_and_ignores_shrink() {
+        let acc = TenantMemoryAccountant::unlimited("ks_peak".to_string());
+        let mut r = acc.reservation();
+
+        let (res, peak) = r.grow_with_peak("operators.a", 100);
+        res.expect("grow ok");
+        assert_eq!(peak, 100);
+        assert_eq!(r.peak_bytes(), 100);
+
+        let (res, peak) = r.grow_with_peak("operators.a", 50);
+        res.expect("grow ok");
+        assert_eq!(peak, 150);
+
+        // Shrink frees live bytes but must not lower the high-water mark.
+        r.shrink(120);
+        assert_eq!(r.charged_bytes(), 30);
+        assert_eq!(r.peak_bytes(), 150);
+    }
+
+    #[test]
+    fn component_grow_top_n_orders_largest_first_and_accumulates() {
+        let acc = TenantMemoryAccountant::unlimited("ks_comp".to_string());
+        let mut r = acc.reservation();
+        let _ = r.grow_with_peak("operators.small", 1024 * 1024);
+        let _ = r.grow_with_peak("operators.big", 8 * 1024 * 1024);
+        let _ = r.grow_with_peak("operators.mid", 4 * 1024 * 1024);
+        // Same label accumulates rather than creating a second entry.
+        let _ = r.grow_with_peak("operators.big", 1024 * 1024);
+
+        assert_eq!(
+            r.component_grow_top_n(2),
+            "operators.big=9MB;operators.mid=4MB"
+        );
+    }
+
+    #[test]
+    fn component_attribution_is_exact_beyond_inline_capacity() {
+        // A large component that first appears as the 9th+ distinct label must
+        // keep its own label, not fold into a small earlier one (#2559 P1).
+        let acc = TenantMemoryAccountant::unlimited("ks_many".to_string());
+        let mut r = acc.reservation();
+        for label in ["c.a", "c.b", "c.c", "c.d", "c.e", "c.f", "c.g", "c.h"] {
+            let _ = r.grow_with_peak(label, 1024 * 1024); // fills the inline slots
+        }
+        // The dominant component appears only after the inline slots are full.
+        let _ = r.grow_with_peak("operators.hash_aggregate.groups", 500 * 1024 * 1024);
+        assert_eq!(
+            r.component_grow_top_n(1),
+            "operators.hash_aggregate.groups=500MB",
+            "a large late-appearing component must keep its own label"
+        );
+    }
+
+    #[test]
+    fn grow_with_peak_reports_attempted_but_keeps_physical_peak_on_quota_exceed() {
+        // Default config has expensive threshold == tenant quota, so the grow
+        // that trips the quota is the one we most want logged. The RETURNED peak
+        // reflects the attempted total (so the caller's threshold check fires,
+        // edge case J), but the stored physical peak_bytes — fed to the
+        // slow-query peak_mb — excludes the rejected bytes, and the rejected grow
+        // is not attributed to any component.
+        let acc = TenantMemoryAccountant::new_with_quota("ks_quota".to_string(), 10 * 1024 * 1024);
+        let mut r = acc.reservation();
+
+        let (res, peak) = r.grow_with_peak("operators.ok", 4 * 1024 * 1024);
+        res.expect("first grow fits under quota");
+        assert_eq!(peak, 4 * 1024 * 1024);
+
+        let (res, peak) = r.grow_with_peak("operators.rejected", 20 * 1024 * 1024);
+        assert!(res.is_err(), "grow must exceed the 10 MiB quota");
+        assert_eq!(
+            peak,
+            24 * 1024 * 1024,
+            "returned peak reflects the attempted total"
+        );
+        assert_eq!(
+            r.charged_bytes(),
+            4 * 1024 * 1024,
+            "rejected grow must not charge"
+        );
+        assert_eq!(
+            r.peak_bytes(),
+            4 * 1024 * 1024,
+            "physical peak excludes the rejected attempt"
+        );
+        assert_eq!(
+            r.component_grow_top_n(2),
+            "operators.ok=4MB",
+            "rejected grow is not attributed to a component"
+        );
+    }
+
+    #[test]
+    fn reset_attempt_tracking_clears_components_and_rebaselines_peak() {
+        // Models the autocommit retry loop: each attempt re-runs the operators
+        // within one scope; reset_attempt_tracking prevents component_grow_top
+        // from inflating by the retry count.
+        let acc = TenantMemoryAccountant::unlimited("ks_retry".to_string());
+        let mut r = acc.reservation();
+        let _ = r.grow_with_peak("operators.hash_join.build", 100 * 1024 * 1024);
+        r.shrink(100 * 1024 * 1024); // attempt's operators release before retry
+        assert_eq!(r.peak_bytes(), 100 * 1024 * 1024);
+
+        r.reset_attempt_tracking();
+        assert_eq!(r.peak_bytes(), 0, "peak rebaselined to current live bytes");
+        assert_eq!(r.component_grow_top_n(1), "", "components cleared");
+
+        // The retry grows the same operator again — no carryover / no inflation.
+        let _ = r.grow_with_peak("operators.hash_join.build", 100 * 1024 * 1024);
+        assert_eq!(r.peak_bytes(), 100 * 1024 * 1024);
+        assert_eq!(r.component_grow_top_n(1), "operators.hash_join.build=100MB");
+    }
+
+    #[test]
+    fn split_resets_peak_on_new_owner() {
+        let acc = TenantMemoryAccountant::unlimited("ks_split".to_string());
+        let mut r = acc.reservation();
+        let _ = r.grow_with_peak("operators.a", 200);
+        assert_eq!(r.peak_bytes(), 200);
+
+        let split = r.split(50).expect("split within charged bytes");
+        assert_eq!(split.peak_bytes(), 0, "split-off owner starts fresh");
+        assert_eq!(split.charged_bytes(), 50);
+        // The original keeps its own peak.
+        assert_eq!(r.peak_bytes(), 200);
+        assert_eq!(r.charged_bytes(), 150);
+    }
+
+    /// Count `expensive_query`-target tracing events emitted while running `f`
+    /// on this thread. Uses a thread-local subscriber so it is isolated from
+    /// parallel tests and any global subscriber.
+    fn count_expensive_logs<F: FnOnce()>(f: F) -> usize {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone)]
+        struct CountingLayer(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "expensive_query" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountingLayer(count.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        count.load(Ordering::SeqCst)
+    }
+
+    /// Run `f` inside a statement scope with an explicit threshold (bypassing the
+    /// env-driven `expensive_mem_threshold_bytes()` OnceLock so tests are hermetic).
+    fn with_log_scope<F: FnOnce()>(threshold_bytes: usize, f: F) {
+        let acc = TenantMemoryAccountant::unlimited("ks_log".to_string());
+        let scope = Arc::new(StatementMemoryScope::new(acc, 7, threshold_bytes));
+        STATEMENT_MEMORY_SCOPE.sync_scope(scope, f);
+    }
+
+    #[test]
+    fn expensive_log_fires_once_at_threshold() {
+        let n = count_expensive_logs(|| {
+            with_log_scope(100, || {
+                set_current_statement_sql("SELECT count(*) FROM t GROUP BY x");
+                // peak: 60 (no log), 120 (crosses → log), 180 (latched).
+                try_grow_statement_memory_scope("operators.hash_aggregate.groups", 60).unwrap();
+                try_grow_statement_memory_scope("operators.hash_aggregate.groups", 60).unwrap();
+                try_grow_statement_memory_scope("operators.hash_aggregate.groups", 60).unwrap();
+            });
+        });
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn expensive_log_does_not_fire_without_sql() {
+        let n = count_expensive_logs(|| {
+            with_log_scope(100, || {
+                // No set_current_statement_sql: empty-SQL guard suppresses the log.
+                try_grow_statement_memory_scope("operators.sort.rows", 200).unwrap();
+                try_grow_statement_memory_scope("operators.sort.rows", 200).unwrap();
+            });
+        });
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn expensive_log_self_heals_when_sql_set_after_crossing() {
+        let n = count_expensive_logs(|| {
+            with_log_scope(100, || {
+                // Peak crosses the threshold before the SQL is known...
+                try_grow_statement_memory_scope("operators.sort.rows", 200).unwrap();
+                // ...and the setter self-heals by emitting immediately.
+                set_current_statement_sql("SELECT * FROM big ORDER BY x");
+            });
+        });
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn threshold_zero_disables_log() {
+        let n = count_expensive_logs(|| {
+            with_log_scope(0, || {
+                set_current_statement_sql("SELECT 1");
+                try_grow_statement_memory_scope("operators.sort.rows", 1_000_000).unwrap();
+            });
+        });
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn distinct_on_component_is_attributed_in_top_n() {
+        // C3 (#2557 v6): operators.distinct_on.hashset (distinct.rs:141) routes
+        // through the same hook as every other operator, so its peak must be
+        // attributable in component_top. Guards the call site the v5 §1 table missed.
+        let acc = TenantMemoryAccountant::unlimited("ks_distinct_on".to_string());
+        let mut r = acc.reservation();
+        let _ = r.grow_with_peak("operators.distinct.hashset", 2 * 1024 * 1024);
+        let _ = r.grow_with_peak("operators.distinct_on.hashset", 6 * 1024 * 1024);
+        assert_eq!(
+            r.component_grow_top_n(1),
+            "operators.distinct_on.hashset=6MB"
+        );
+    }
+
+    #[test]
+    fn expensive_log_carries_last_written_start_ts() {
+        // Edge case L: autocommit dual-write — execute_single writes a `0`
+        // placeholder, then Session::begin writes the real value; last-write-wins.
+        let captured = capture_expensive_log_start_ts(|| {
+            with_log_scope(100, || {
+                set_current_statement_sql("SELECT count(*) FROM t GROUP BY x");
+                set_current_statement_start_ts(0); // execute_single autocommit read (Idle)
+                set_current_statement_start_ts(12345); // Session::begin Idle→Active hook
+                try_grow_statement_memory_scope("operators.hash_aggregate.groups", 150).unwrap();
+            });
+        });
+        assert_eq!(captured, Some(12345));
+    }
+
+    /// Capture the `start_ts` field of the first `expensive_query` event emitted
+    /// while running `f` on this thread.
+    fn capture_expensive_log_start_ts<F: FnOnce()>(f: F) -> Option<u64> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone)]
+        struct StartTsLayer(Arc<std::sync::Mutex<Option<u64>>>);
+        struct Visitor<'a>(&'a mut Option<u64>);
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                if field.name() == "start_ts" {
+                    *self.0 = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _f: &tracing::field::Field, _v: &dyn std::fmt::Debug) {}
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StartTsLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "expensive_query" {
+                    let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                    event.record(&mut Visitor(&mut slot));
+                }
+            }
+        }
+
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let subscriber = tracing_subscriber::registry().with(StartTsLayer(slot.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        let captured = *slot.lock().unwrap_or_else(|e| e.into_inner());
+        captured
     }
 
     // ── idle-index stale-candidate tests ──────────────────────────────

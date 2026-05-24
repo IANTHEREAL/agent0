@@ -786,7 +786,9 @@ impl SimpleQueryHandler for DynamicPgHandler {
     {
         self.begin_query_tracking(&query.query);
         let memory_accountant = Some(self.auth().executor.tenant_memory_accountant().clone());
-        let result = on_query_with_tx_status_fix(self, memory_accountant, client, query).await;
+        let result =
+            on_query_with_tx_status_fix(self, memory_accountant, self.connection_id, client, query)
+                .await;
         let (in_txn, in_failed) = self.query_transaction_state().await;
         self.end_query_tracking(in_txn, in_failed);
         result
@@ -1259,6 +1261,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             self,
             &self.suspended_portals,
             memory_accountant,
+            self.connection_id,
             Some(&self.cancel_token),
             Some(state.session.as_ref()),
             client,

@@ -1530,6 +1530,7 @@ dependencies = [
  "serde_json",
  "serde_json_borrow",
  "sha2",
+ "smallvec",
  "socket2 0.6.3",
  "sqlparser",
  "stacker",

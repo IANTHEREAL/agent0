@@ -356,6 +356,10 @@ impl Executor {
         };
 
         for attempt in 0..max_attempts {
+            // Restart per-attempt peak/component tracking: the operator tree is
+            // re-run on each retry within one statement memory scope (see
+            // expensive_query log). No-op when no scope is active.
+            crate::pool::reset_statement_memory_attempt();
             if attempt > 0 {
                 if let Some(timeout) = retry_timeout {
                     if retry_start.elapsed() >= timeout {
@@ -381,6 +385,12 @@ impl Executor {
 
             let current_role = session.current_user().map(|u| u.to_string());
             let txn_snapshot_ts_version = session.active_txn_start_ts_version();
+            // Attach SQL + start_ts to the per-statement memory scope for the
+            // expensive_query log. session.begin() above ran first, so start_ts is
+            // already the real txn value here (the Session::begin hook also fires and
+            // writes the same value — last-write-wins).
+            crate::pool::set_current_statement_sql(sql);
+            crate::pool::set_current_statement_start_ts(txn_snapshot_ts_version.unwrap_or(0));
             let extension_txn_delta = session.extension_delta_snapshot();
             let res = crate::session_context::with_txn_snapshot_ts_version(
                 txn_snapshot_ts_version,

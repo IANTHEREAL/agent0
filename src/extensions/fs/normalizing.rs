@@ -57,9 +57,8 @@ use tokio::io::AsyncBufRead;
 
 use crate::extensions::fs::backend::{
     FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult, FsCreateUpload,
-    FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest,
-    FsReaddirResult, FsRecursiveReaddirOptions, FsRecursiveReaddirResult, FsWriteStream,
-    FsWriteStreamOptions,
+    FsFileInfo, FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest, FsReaddirResult,
+    FsRecursiveReaddirOptions, FsRecursiveReaddirResult, FsWriteStream, FsWriteStreamOptions,
 };
 use crate::extensions::fs::to_fs9_canonical_path;
 
@@ -342,7 +341,7 @@ mod tests {
     }
 
     impl RecordingBackend {
-        fn new() -> (Arc<PathRecorder>, Arc<dyn FsBackend>) {
+        fn new_pair() -> (Arc<PathRecorder>, Arc<dyn FsBackend>) {
             let rec = Arc::new(PathRecorder::default());
             let backend: Arc<dyn FsBackend> = Arc::new(Self { rec: rec.clone() });
             (rec, backend)
@@ -543,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_shapes_single_path_methods() {
-        let (rec, inner) = RecordingBackend::new();
+        let (rec, inner) = RecordingBackend::new_pair();
         let adapter = NormalizingFsBackend::new(inner);
 
         adapter.stat("tests/x").await.unwrap();
@@ -569,14 +568,12 @@ mod tests {
         }
         assert!(seen.iter().any(|(op, p)| op == "stat" && p == "/tests/x"));
         assert!(seen.iter().any(|(op, p)| op == "readdir" && p == "/dir"));
-        assert!(seen
-            .iter()
-            .any(|(op, p)| op == "read_file" && p == "/a/b"));
+        assert!(seen.iter().any(|(op, p)| op == "read_file" && p == "/a/b"));
     }
 
     #[tokio::test]
     async fn adapter_shapes_rename_both_paths() {
-        let (rec, inner) = RecordingBackend::new();
+        let (rec, inner) = RecordingBackend::new_pair();
         let adapter = NormalizingFsBackend::new(inner);
         adapter.rename("old/x", "new/y").await.unwrap();
         let seen = rec.snapshot();
@@ -590,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_does_not_reshape_symlink_target_or_upload_token() {
-        let (rec, inner) = RecordingBackend::new();
+        let (rec, inner) = RecordingBackend::new_pair();
         let adapter = NormalizingFsBackend::new(inner);
 
         adapter
@@ -611,9 +608,9 @@ mod tests {
             .iter()
             .any(|(op, p)| op == "symlink_target" && p == "../target/path"));
         // Upload tokens are credentials, not paths — must pass through.
-        assert!(seen.iter().any(
-            |(op, p)| op == "presign_upload_part_token" && p == "opaque-token"
-        ));
+        assert!(seen
+            .iter()
+            .any(|(op, p)| op == "presign_upload_part_token" && p == "opaque-token"));
         assert!(seen
             .iter()
             .any(|(op, p)| op == "abort_upload_token" && p == "opaque-token"));
@@ -621,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_shapes_each_path_in_batch_lists() {
-        let (rec, inner) = RecordingBackend::new();
+        let (rec, inner) = RecordingBackend::new_pair();
         let adapter = NormalizingFsBackend::new(inner);
         let _ = adapter
             .batch_stat(&[
@@ -649,16 +646,13 @@ mod tests {
     /// `/foo`. Both paths now reach inner as `/foo`.
     #[tokio::test]
     async fn adapter_collapses_dot_segments_for_mutating_ops() {
-        let (rec, inner) = RecordingBackend::new();
+        let (rec, inner) = RecordingBackend::new_pair();
         let adapter = NormalizingFsBackend::new(inner);
 
         adapter.write_file("/./foo", b"x", None).await.unwrap();
         adapter.remove("/foo/.").await.unwrap();
         adapter.remove_recursive("/foo/./bar").await.unwrap();
-        adapter
-            .rename("/old/./x", "/new/./y/.")
-            .await
-            .unwrap();
+        adapter.rename("/old/./x", "/new/./y/.").await.unwrap();
         adapter.chmod("/./foo", 0o600).await.unwrap();
         adapter.mkdir("/foo/./sub", true, None).await.unwrap();
         adapter.symlink("/./link", "../target").await.unwrap();
@@ -680,17 +674,14 @@ mod tests {
         assert_eq!(by_op("mkdir"), vec!["/foo/sub".to_string()]);
         // Link path canonicalized; target still passes through.
         assert_eq!(by_op("symlink_path"), vec!["/link".to_string()]);
-        assert_eq!(
-            by_op("symlink_target"),
-            vec!["../target".to_string()]
-        );
+        assert_eq!(by_op("symlink_target"), vec!["../target".to_string()]);
     }
 
     /// `..` segments must be refused before reaching either backend.
     /// Verifies both single-path and rename two-path code paths.
     #[tokio::test]
     async fn adapter_rejects_parent_traversal_on_mutators() {
-        let (_, inner) = RecordingBackend::new();
+        let (_, inner) = RecordingBackend::new_pair();
         let adapter = NormalizingFsBackend::new(inner);
 
         for op_name in ["write_file", "remove", "chmod", "rename_old", "rename_new"] {

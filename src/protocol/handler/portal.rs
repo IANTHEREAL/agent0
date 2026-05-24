@@ -43,6 +43,7 @@ pub(in crate::protocol::handler) fn update_tx_status_after_execution(
 pub(in crate::protocol::handler) async fn on_query_with_tx_status_fix<H, C>(
     handler: &H,
     statement_memory_accountant: Option<TenantMemoryAccountant>,
+    conn_id: i64,
     client: &mut C,
     query: pgwire::messages::simplequery::Query,
 ) -> PgWireResult<()>
@@ -52,7 +53,7 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
-    run_with_statement_memory_scope(statement_memory_accountant, async {
+    run_with_statement_memory_scope(statement_memory_accountant, conn_id, async {
         if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
             return Err(PgWireError::NotReadyForQuery);
         }
@@ -150,6 +151,7 @@ where
         handler,
         suspended_portals,
         statement_memory_accountant,
+        0, // conn_id: test-only wrapper, no client connection
         None,
         None,
         client,
@@ -162,6 +164,7 @@ pub(in crate::protocol::handler) async fn on_execute_with_tx_status_fix_with_gua
     handler: &H,
     suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
     statement_memory_accountant: Option<TenantMemoryAccountant>,
+    conn_id: i64,
     cancel_token: Option<&CancellationToken>,
     session: Option<&Mutex<Session>>,
     client: &mut C,
@@ -175,7 +178,7 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
-    run_with_statement_memory_scope(statement_memory_accountant, async {
+    run_with_statement_memory_scope(statement_memory_accountant, conn_id, async {
         if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
             return Err(PgWireError::NotReadyForQuery);
         }

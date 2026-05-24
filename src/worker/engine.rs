@@ -1153,8 +1153,9 @@ impl WorkerEngine {
 
         for attempt in 0..max_attempts {
             let mut txn = store.begin().await?;
+            let start_ts_version = txn.start_timestamp().version();
             let mut txn_guard = crate::worker::active_txn_registry::global_registry()
-                .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
+                .map(|registry| registry.track_worker_txn(start_ts_version));
             let mut sequence_values = crate::sql::sequences::SequenceSession::new();
 
             let task_fut = async {
@@ -1180,21 +1181,33 @@ impl WorkerEngine {
                     );
                     let fut = crate::pool::run_with_statement_memory_scope(
                         Some(statement_memory_accountant.clone()),
-                        with_context_opts(
-                            ext_ctx,
-                            query_context::with_scoped_query_context(
-                                &qctx,
-                                exec.execute_statement_on_txn(
-                                    &mut txn,
-                                    entry.db_id,
-                                    &mut sequence_values,
-                                    &search_path,
-                                    stmt,
-                                    None,
-                                    None,
+                        0, // background task: no client connection
+                        async {
+                            // Attach SQL + start_ts so a background statement that goes
+                            // expensive shows up in the expensive_query log. `entry.command`
+                            // is the raw SQL; start_ts is the worker txn's begin version.
+                            // Per-statement SQL (not the whole `entry.command`) so a
+                            // multi-statement background job attributes the log to the
+                            // statement that actually went expensive.
+                            crate::pool::set_current_statement_sql(&stmt.to_string());
+                            crate::pool::set_current_statement_start_ts(start_ts_version);
+                            with_context_opts(
+                                ext_ctx,
+                                query_context::with_scoped_query_context(
+                                    &qctx,
+                                    exec.execute_statement_on_txn(
+                                        &mut txn,
+                                        entry.db_id,
+                                        &mut sequence_values,
+                                        &search_path,
+                                        stmt,
+                                        None,
+                                        None,
+                                    ),
                                 ),
-                            ),
-                        ),
+                            )
+                            .await
+                        },
                     );
                     let _ = fut.await?;
                 }

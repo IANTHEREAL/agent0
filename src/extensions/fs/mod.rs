@@ -153,9 +153,9 @@ pub(crate) fn to_fs9_canonical_path(path: &str) -> Result<String> {
             "" | "." => continue,
             ".." => {
                 return Err(anyhow::anyhow!(
-                    crate::extensions::fs::embedded::types::EmbeddedFsError::InvalidInput(
-                        format!("path must not contain '..' segments: {path:?}"),
-                    )
+                    crate::extensions::fs::embedded::types::EmbeddedFsError::InvalidInput(format!(
+                        "path must not contain '..' segments: {path:?}"
+                    ),)
                 ));
             }
             _ => parts.push(seg),

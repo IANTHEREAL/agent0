@@ -255,6 +255,11 @@ impl Executor {
         }
 
         for attempt in 0..max_attempts {
+            // This loop re-runs the operator tree on each retry within one
+            // statement memory scope, so per-attempt peak/component tracking must
+            // restart each attempt (otherwise expensive_query's component_grow_top
+            // inflates by the retry count). No-op when no scope is active.
+            crate::pool::reset_statement_memory_attempt();
             // On retry iterations (after backoff), re-check wall-time ceiling.
             // This catches the case where backoff sleep pushed us past the deadline.
             if attempt > 0 {

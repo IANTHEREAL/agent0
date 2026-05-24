@@ -20,6 +20,12 @@ const DEFAULT_SLOW_MS: u64 = 200;
 const DEFAULT_MAX_SAMPLE_EVENTS: usize = 20_000;
 const DEFAULT_MAX_SAMPLE_GROUPS: usize = 50;
 const DEFAULT_MAX_SQL_LEN: usize = 512;
+// Expensive-query (memory) log. Threshold matches TiDB's `tidb_mem_quota_query`
+// default (1 GiB). SQL truncation is a separate, larger limit than the
+// slow-query log (which is high-volume) so rare forensic lines keep full
+// GROUP BY / WHERE context. See #2557.
+const DEFAULT_EXPENSIVE_MEM_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_EXPENSIVE_SQL_LEN: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
@@ -29,6 +35,12 @@ pub struct ObservabilityConfig {
     pub max_sample_events: usize,
     pub max_sample_groups: usize,
     pub max_sql_len: usize,
+    /// Peak per-statement memory (bytes) that triggers the `expensive_query`
+    /// log. `0` disables it. Independent of `enabled` (see
+    /// [`expensive_mem_threshold_bytes`]).
+    pub expensive_mem_threshold_bytes: u64,
+    /// SQL truncation length for the `expensive_query` log only.
+    pub expensive_sql_max_len: usize,
 }
 
 impl Default for ObservabilityConfig {
@@ -40,6 +52,8 @@ impl Default for ObservabilityConfig {
             max_sample_events: DEFAULT_MAX_SAMPLE_EVENTS,
             max_sample_groups: DEFAULT_MAX_SAMPLE_GROUPS,
             max_sql_len: DEFAULT_MAX_SQL_LEN,
+            expensive_mem_threshold_bytes: DEFAULT_EXPENSIVE_MEM_BYTES,
+            expensive_sql_max_len: DEFAULT_EXPENSIVE_SQL_LEN,
         }
     }
 }
@@ -85,6 +99,19 @@ impl ObservabilityConfig {
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.max_sql_len);
+        }
+        if let Ok(v) = env::var("DB9_OBS_EXPENSIVE_MEM_MB") {
+            // `0` is valid and disables the log, so do not filter it out.
+            if let Ok(mb) = v.parse::<u64>() {
+                cfg.expensive_mem_threshold_bytes = mb.saturating_mul(1024 * 1024);
+            }
+        }
+        if let Ok(v) = env::var("DB9_OBS_EXPENSIVE_SQL_LEN") {
+            cfg.expensive_sql_max_len = v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(cfg.expensive_sql_max_len);
         }
 
         cfg
@@ -314,7 +341,15 @@ impl TenantObservability {
             }
 
             if is_slow {
-                tracing::warn!(latency_ms = latency_us / 1000, ok, "slow query: {sql}");
+                // Bonus: enrich the slow-query log with the statement's peak memory
+                // (free, from the same accounting infrastructure as expensive_query).
+                let peak_mb = crate::pool::peak_bytes_snapshot().unwrap_or(0) / (1024 * 1024);
+                tracing::warn!(
+                    latency_ms = latency_us / 1000,
+                    peak_mb,
+                    ok,
+                    "slow query: {sql}"
+                );
             }
 
             if sql.contains('|') {
@@ -734,6 +769,37 @@ fn normalize_sql(s: &str, max_len: usize) -> String {
     } else {
         out
     }
+}
+
+/// Peak-memory threshold (bytes) that triggers the `expensive_query` log; `0`
+/// disables it. Read once at process start.
+///
+/// Deliberately independent of `DB9_OBS_ENABLED`: the expensive_query log is a
+/// rare forensic signal, not sampled observability, so it must fire whenever the
+/// memory threshold is crossed regardless of the observability toggle. Only
+/// `DB9_OBS_EXPENSIVE_MEM_MB=0` disables it.
+pub fn expensive_mem_threshold_bytes() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| ObservabilityConfig::from_env().expensive_mem_threshold_bytes as usize)
+}
+
+/// SQL truncation length for the `expensive_query` log. Read once at process
+/// start, consistent with [`expensive_mem_threshold_bytes`] — avoids re-reading
+/// the environment on the per-statement dispatch path.
+pub fn expensive_sql_max_len() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| ObservabilityConfig::from_env().expensive_sql_max_len)
+}
+
+/// Normalize + redact SQL for the `expensive_query` log, truncated at
+/// `DB9_OBS_EXPENSIVE_SQL_LEN` (a separate, larger limit than the slow-query
+/// log). Returns an empty string when there is nothing loggable.
+pub fn normalize_sql_for_expensive_log(sql: &str) -> String {
+    let normalized = normalize_sql(sql, expensive_sql_max_len());
+    if normalized.is_empty() {
+        return String::new();
+    }
+    redact_sensitive_sql(&normalized)
 }
 
 fn is_observability_system_sql(s: &str) -> bool {

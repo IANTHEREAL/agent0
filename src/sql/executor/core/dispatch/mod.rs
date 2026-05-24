@@ -121,6 +121,14 @@ impl Executor {
         crate::sql::query_context::with_scoped_query_context(
             &qctx,
             crate::txn::with_savepoints(savepoints, async {
+                // Attach SQL + start_ts to the per-statement memory scope for the
+                // expensive_query log. For autocommit simple-query the txn does not
+                // exist yet, so start_ts is a `0` placeholder here; Session::begin()
+                // overrides it with the real value once the txn is created.
+                crate::pool::set_current_statement_sql(sql);
+                crate::pool::set_current_statement_start_ts(
+                    session.active_txn_start_ts_version().unwrap_or(0),
+                );
                 let ctx = DispatchContext::new(sql, session);
 
                 // ── Phase 1: Failed-txn precheck (I1) ──────────────────

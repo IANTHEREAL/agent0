@@ -1158,7 +1158,7 @@ mod tests {
         let handle = TenantHandle::new_with_limits(0, existing_executor_bytes + row_bytes - 1);
         let accountant = handle.memory_accountant();
 
-        run_with_statement_memory_scope(Some(accountant.clone()), async {
+        run_with_statement_memory_scope(Some(accountant.clone()), 0, async {
             try_grow_statement_memory_scope("test.executor.buffer", existing_executor_bytes)
                 .expect("precharge should fit below quota");
             let err = decode_db9_select_chunks(
@@ -1191,7 +1191,7 @@ mod tests {
         let handle = TenantHandle::new_with_limits(0, existing_executor_bytes + row_bytes);
         let accountant = handle.memory_accountant();
 
-        run_with_statement_memory_scope(Some(accountant.clone()), async {
+        run_with_statement_memory_scope(Some(accountant.clone()), 0, async {
             try_grow_statement_memory_scope("test.executor.buffer", existing_executor_bytes)
                 .expect("precharge should fit below quota");
             let (rows, charged_bytes) = decode_db9_select_chunks(

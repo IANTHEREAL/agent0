@@ -94,6 +94,11 @@ globset = "0.4"
 cron = "0.15"
 jsongrep = "0.7"
 serde_json_borrow = "0.9"
+# Inline small vectors — used by the per-statement memory accountant to record
+# per-component peak grows without heap allocation in the common case (≤ 8
+# components per query). Already in the graph transitively; pinned explicitly so
+# a transitive bump can't drop it out from under us (#2557).
+smallvec = "1"
 
 # S3 object store (fs9 v2)
 aws-config = { version = "=1.8.13", default-features = false, features = ["rt-tokio", "rustls"] }
