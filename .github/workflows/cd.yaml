@@ -36,6 +36,9 @@ jobs:
       version_file: VERSION
       dockerfile: ./Dockerfile
       build_context: .
+      github_app_client_id: ${{ vars.CI_TRUST_APP_CLIENT_ID }}
+      github_app_repositories: |
+        db9-server
+        db9-auth
     secrets:
-      build_secrets: |
-        gh_token=${{ secrets.CROSS_REPO_TOKEN }}
+      github_app_private_key: ${{ secrets.CI_TRUST_APP_PRIVATE_KEY }}

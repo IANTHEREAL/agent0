@@ -39,10 +39,10 @@ ENV BUILD_GIT_HASH=${BUILD_GIT_HASH} \
 
 # `db9-server` depends on `auth9-core`, which lives in the private
 # `db9-ai/db9-auth` repo. Cargo needs HTTPS credentials to clone it
-# during dep resolution. The CD workflow forwards the token via the
-# `_sys9-dev-image.yml` `secrets.build_secrets` input as
-# `gh_token=${{ secrets.CROSS_REPO_TOKEN }}`. Mount it for this single
-# RUN; clear the config afterwards so no token survives the layer.
+# during dep resolution. The CD workflow now passes a short-lived
+# GitHub App token through the `_sys9-dev-image.yml` build secret
+# `secrets: gh_token` for this single RUN; clear the config afterwards
+# so no token survives the layer.
 RUN --mount=type=secret,id=gh_token,required=true \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
