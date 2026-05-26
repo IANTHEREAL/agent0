@@ -36,9 +36,9 @@ jobs:
       version_file: VERSION
       dockerfile: ./Dockerfile
       build_context: .
-      github_app_client_id: ${{ vars.CI_TRUST_APP_CLIENT_ID || secrets.CI_TRUST_APP_CLIENT_ID }}
+      github_app_client_id: ${{ vars.CI_TRUST_APP_CLIENT_ID }}
       github_app_repositories: |
         db9-server
         db9-auth
     secrets:
-      github_app_private_key: ${{ secrets.CI_TRUST_APP_PRIVATE_KEY || vars.CI_TRUST_APP_PRIVATE_KEY }}
+      github_app_private_key: ${{ secrets.CI_TRUST_APP_PRIVATE_KEY }}
