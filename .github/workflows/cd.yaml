@@ -19,13 +19,6 @@ jobs:
       registry_targets: |
         [
           {
-            "name": "dev",
-            "registry": "052750482888.dkr.ecr.us-west-2.amazonaws.com",
-            "repository": "sys9/db9",
-            "role_arn": "arn:aws:iam::052750482888:role/sys9-account-shared-artifacts-mirror-sync",
-            "allowed_account_ids": "052750482888"
-          },
-          {
             "name": "deployment",
             "registry": "274703560910.dkr.ecr.us-west-2.amazonaws.com",
             "repository": "sys9/db9",
