@@ -288,6 +288,7 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     let pd_endpoints = cli_args.pd_endpoints.unwrap_or_else(|| {
         env::var("PD_ENDPOINTS").unwrap_or_else(|_| DEFAULT_PD_ENDPOINTS.to_string())
     });
+    crate::extensions::fs::bind_juicefs_pd_endpoints(pd_endpoints.clone());
     let pg_port: u16 = cli_args.port.unwrap_or_else(|| {
         env::var("PG_PORT")
             .ok()

@@ -1,3 +1,10 @@
+// The in-process event ring, metrics registry, and event-persist enqueue here are
+// the embedded-era fs9 write/notify path, no longer reached after the JuiceFS-only
+// migration (#2567); only the Redis read path (`execute_fs9_events_from_redis`,
+// used by the `fs9_events()` TVF) stays live. Allow dead_code so the retained
+// write/notify machinery does not break `cargo clippy -D warnings`.
+#![allow(dead_code)]
+
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

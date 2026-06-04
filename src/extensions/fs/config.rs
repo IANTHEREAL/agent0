@@ -1,3 +1,9 @@
+// Embedded/PageFS + S3 fs9 configuration: no longer consumed by production routing
+// after the JuiceFS-only migration (#2567); retained for the deferred
+// embedded->JuiceFS data-migration track. Allow dead_code so `cargo clippy
+// -D warnings` stays green without deleting config we intend to revive.
+#![allow(dead_code)]
+
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::OnceLock;

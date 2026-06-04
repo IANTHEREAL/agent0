@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 use crate::model::{Row, TableSchema};
@@ -52,6 +52,8 @@ pub(crate) enum Fs9Mode {
 pub(crate) const MAX_BYTES_PER_FILE: usize = 100 * 1024 * 1024;
 pub(crate) const MAX_FILES_PER_GLOB: usize = 10_000;
 pub(crate) const MAX_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
+static JUICEFS_PD_ENDPOINTS_RAW: OnceLock<String> = OnceLock::new();
 
 /// Per-call ceiling for in-place offset writes (`fs9_write_at`). fs9 v2
 /// `WriteAt` is a unary RPC with no multipart variant, so any single
@@ -66,6 +68,65 @@ pub(crate) const MAX_BYTES_PER_OFFSET_WRITE: usize = 4 * 1024 * 1024;
 /// name fs9 manages.
 pub(crate) fn jfs_volume_id(tenant_id: &str) -> String {
     format!("jfs_t_{tenant_id}")
+}
+
+/// Canonicalize a raw PD endpoint string into the one normalized form every
+/// JuiceFS consumer must share: each segment trimmed, empty segments dropped,
+/// rejoined with `,` (falling back to the default when nothing remains).
+///
+/// This is what makes "one resolved PD source" actually hold end to end: the
+/// lifecycle guard (which parses the list) and `InitVolume.meta_url` (which
+/// interpolates the string verbatim into `tikv://{pd}?...`) both resolve to an
+/// identical endpoint set, regardless of incidental whitespace or empty
+/// segments in the operator-provided value (e.g. `"pd1:2379, pd2:2379"`).
+pub(crate) fn canonicalize_juicefs_pd_endpoints(raw: &str) -> String {
+    let joined = parse_juicefs_pd_endpoints(raw).join(",");
+    if joined.is_empty() {
+        DEFAULT_PD_ENDPOINTS.to_string()
+    } else {
+        joined
+    }
+}
+
+/// Bind the resolved process-wide PD endpoint list used by JuiceFS volume
+/// lifecycle checks and lazy InitVolume meta URLs. The value is canonicalized
+/// once here so every downstream consumer reads an identical endpoint set.
+pub(crate) fn bind_juicefs_pd_endpoints(raw: String) {
+    let normalized = canonicalize_juicefs_pd_endpoints(&raw);
+    if let Err(existing) = JUICEFS_PD_ENDPOINTS_RAW.set(normalized.clone()) {
+        if existing != normalized {
+            tracing::warn!(
+                existing,
+                requested = normalized,
+                "ignoring second JuiceFS PD endpoint binding"
+            );
+        }
+    }
+}
+
+/// Single runtime source of truth for the PD endpoint list used by JuiceFS
+/// lifecycle checks and lazy InitVolume meta URLs. Always canonical: the bound
+/// value is canonicalized at bind time, and the env/default fallback (used
+/// before `bind_juicefs_pd_endpoints`, e.g. in tests) is canonicalized here.
+pub(crate) fn juicefs_pd_endpoints_raw() -> String {
+    if let Some(bound) = JUICEFS_PD_ENDPOINTS_RAW.get() {
+        return bound.clone();
+    }
+    canonicalize_juicefs_pd_endpoints(
+        &crate::config::env_string("PD_ENDPOINTS").unwrap_or_default(),
+    )
+}
+
+pub(crate) fn parse_juicefs_pd_endpoints(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+pub(crate) fn juicefs_pd_endpoints() -> Vec<String> {
+    parse_juicefs_pd_endpoints(&juicefs_pd_endpoints_raw())
 }
 
 /// Reject mutating operations whose target path normalizes to the

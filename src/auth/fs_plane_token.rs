@@ -1,13 +1,15 @@
-//! Mints `aud="fs-plane"` JWTs by calling auth9 `POST /v1/jwt/sign`
-//! directly, with a process-wide cache keyed by `(tenant_id, role)`.
+//! Mints fs9 JWTs by calling auth9 `POST /v1/jwt/sign` directly, with a
+//! process-wide cache for data-plane tokens keyed by `(tenant_id, role)`.
 //!
 //! # Why this exists
 //!
-//! fs9 v2 requires every RPC to carry a JWT whose `aud="fs-plane"`,
-//! `tid=<tenant_id>`, and `scp` covers the requested mode. db9-server is
-//! **not** an issuer — auth9 holds the signing key. db9-server is a
-//! trusted service whose `X-API-Key` authorises it to ask auth9 for an
-//! `aud="fs-plane"` token; auth9 enforces the audience whitelist via
+//! fs9 v2 requires every data-plane RPC to carry a JWT whose
+//! `aud="fs-plane"`, `tid=<tenant_id>`, and `scp` covers the requested
+//! mode. Lazy volume materialization uses a separate short-lived
+//! `aud="fs-plane-admin"` token for `FsPlaneAdmin.InitVolume`.
+//! db9-server is **not** an issuer — auth9 holds the signing key.
+//! db9-server is a trusted service whose `X-API-Key` authorises it to ask
+//! auth9 for these fs9 tokens; auth9 enforces the audience whitelist via
 //! `services.db9-server.allowed_audiences`.
 //!
 //! Mint contract (see `docs/design/fs9_auth9_direct_mint.md`):
@@ -18,6 +20,9 @@
 //!     Content-Type: application/json
 //!   Body: { "aud": "fs-plane", "ttl_secs": 900,
 //!           "claims": { "tid", "usr", "scp" } }
+//!   Admin body: { "aud": "fs-plane-admin", "ttl_secs": 60,
+//!                 "claims": { "tid", "usr", "scp": "fs:admin",
+//!                             "sub": "db9-server" } }
 //!   200: { "token": "<jwt>", "expires_at": "<RFC3339>" }
 //!
 //! The minted token has no `sub` claim: fs9 v2 parses but never reads
@@ -43,11 +48,14 @@ use serde_json::{json, Value};
 
 /// Audience accepted by fs9 v2 interceptors.
 const FS_PLANE_AUDIENCE: &str = "fs-plane";
+const FS_PLANE_ADMIN_AUDIENCE: &str = "fs-plane-admin";
+const FS_PLANE_ADMIN_SCOPE: &str = "fs:admin";
 
 /// Requested TTL. auth9 may clamp lower via
 /// `services.db9-server.max_jwt_ttl_secs`; the cache honours
 /// `expires_at` from the response, not this request.
 const FS_PLANE_TTL_SECS: u64 = 900;
+const FS_PLANE_ADMIN_TTL_SECS: u64 = 60;
 
 /// HTTP request body for auth9 `POST /v1/jwt/sign`. Field names + types
 /// mirror `auth9-server::api::jwt::SignBody`.
@@ -262,15 +270,53 @@ async fn mint(
     role: &str,
     access: Fs9Access,
 ) -> Result<Fs9PlaneToken> {
-    let scp = fs_plane_scope_for_access(tenant_id, access);
-    let claims = json!({
+    let claims = fs_plane_claims(tenant_id, role, access);
+    mint_with_claims(cfg, FS_PLANE_AUDIENCE, FS_PLANE_TTL_SECS, claims).await
+}
+
+fn fs_plane_claims(tenant_id: &str, role: &str, access: Fs9Access) -> Value {
+    json!({
         "tid": tenant_id,
         "usr": format!("{tenant_id}.{role}"),
-        "scp": scp,
-    });
+        "scp": fs_plane_scope_for_access(tenant_id, access),
+    })
+}
+
+fn fs_plane_admin_claims(tenant_id: &str) -> Value {
+    json!({
+        "tid": tenant_id,
+        "usr": format!("{tenant_id}.admin"),
+        "scp": FS_PLANE_ADMIN_SCOPE,
+        "sub": "db9-server",
+    })
+}
+
+/// Mint a short-lived fs-plane-admin token for server-internal fs9 admin RPCs.
+///
+/// This is intentionally not cached: admin calls are rare and the narrower
+/// replay window matters more than avoiding one auth9 round trip.
+pub(crate) async fn mint_fs_plane_admin_token(
+    cfg: &Auth9MintConfig,
+    tenant_id: &str,
+) -> Result<Fs9PlaneToken> {
+    mint_with_claims(
+        cfg,
+        FS_PLANE_ADMIN_AUDIENCE,
+        FS_PLANE_ADMIN_TTL_SECS,
+        fs_plane_admin_claims(tenant_id),
+    )
+    .await
+}
+
+async fn mint_with_claims(
+    cfg: &Auth9MintConfig,
+    aud: &'static str,
+    ttl_secs: u64,
+    claims: Value,
+) -> Result<Fs9PlaneToken> {
     let body = SignBody {
-        aud: FS_PLANE_AUDIENCE,
-        ttl_secs: FS_PLANE_TTL_SECS,
+        aud,
+        ttl_secs,
         claims,
     };
 
@@ -287,10 +333,7 @@ async fn mint(
         // Don't echo the body verbatim — it may include caller-supplied
         // identifiers which are fine, but defense in depth keeps the
         // error small. The status alone is the actionable signal.
-        return Err(anyhow!(
-            "fs9: auth9 /v1/jwt/sign returned {status}: {}",
-            truncate(&text, 200)
-        ));
+        return Err(anyhow!("{}", sign_failure_message(status, &text, aud)));
     }
     let payload: SignResponse = resp
         .json()
@@ -331,6 +374,22 @@ fn truncate(s: &str, max: usize) -> String {
         }
         format!("{}…", &s[..cut])
     }
+}
+
+fn sign_failure_message(status: reqwest::StatusCode, body: &str, aud: &str) -> String {
+    let mut message = format!(
+        "fs9: auth9 /v1/jwt/sign for aud=\"{aud}\" returned {status}: {}",
+        truncate(body, 200)
+    );
+    if status == reqwest::StatusCode::FORBIDDEN
+        && (aud == FS_PLANE_AUDIENCE || aud == FS_PLANE_ADMIN_AUDIENCE)
+    {
+        message.push_str(
+            "; ensure auth9 services.db9-server.allowed_audiences includes \
+             [\"fs-plane\", \"fs-plane-admin\"]",
+        );
+    }
+    message
 }
 
 /// Lookup-then-mint with cache. Single entry point for callers (gRPC
@@ -506,6 +565,24 @@ mod tests {
         assert_eq!(scp, "fs:volume:jfs_t_tenant_abc:r");
     }
 
+    #[test]
+    fn data_plane_claims_include_tenant_user_and_scope() {
+        let claims = super::fs_plane_claims("tenant_abc", "alice", Fs9Access::ReadWrite);
+        assert_eq!(claims["tid"], "tenant_abc");
+        assert_eq!(claims["usr"], "tenant_abc.alice");
+        assert_eq!(claims["scp"], "fs:volume:jfs_t_tenant_abc:rw");
+        assert!(claims.get("sub").is_none());
+    }
+
+    #[test]
+    fn admin_claims_use_fixed_admin_scope() {
+        let claims = super::fs_plane_admin_claims("tenant_abc");
+        assert_eq!(claims["tid"], "tenant_abc");
+        assert_eq!(claims["usr"], "tenant_abc.admin");
+        assert_eq!(claims["scp"], "fs:admin");
+        assert_eq!(claims["sub"], "db9-server");
+    }
+
     /// PR #2547 review #1 regression: a deployment bootstrapped via
     /// `DB9_BOOTSTRAP_ADMIN_USER=postgres` (or `svc_admin`, or any
     /// custom `CREATE ROLE ... SUPERUSER`) must reach the same `rw`
@@ -585,6 +662,22 @@ mod tests {
         // Function must not panic and must produce a valid &str.
         assert!(out.starts_with('中'));
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn forbidden_sign_error_names_audience_allowlist_prereq() {
+        let msg = super::sign_failure_message(
+            reqwest::StatusCode::FORBIDDEN,
+            "audience_not_allowed",
+            super::FS_PLANE_ADMIN_AUDIENCE,
+        );
+        assert!(msg.contains("aud=\"fs-plane-admin\""), "{msg}");
+        assert!(
+            msg.contains("services.db9-server.allowed_audiences"),
+            "{msg}"
+        );
+        assert!(msg.contains("\"fs-plane\""), "{msg}");
+        assert!(msg.contains("\"fs-plane-admin\""), "{msg}");
     }
 
     #[test]

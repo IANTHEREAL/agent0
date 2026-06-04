@@ -1,3 +1,9 @@
+// Embedded/PageFS upload-token signing: no longer reached by production routing
+// after the JuiceFS-only migration (#2567); retained for the deferred
+// embedded->JuiceFS data-migration track. Allow dead_code so `cargo clippy
+// -D warnings` stays green without deleting code we intend to revive.
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;

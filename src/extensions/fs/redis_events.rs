@@ -10,6 +10,11 @@
 //! - Segment TTL: 4 hours after last write (consumer catch-up window).
 //! - Schema version field `v:1` for future evolution.
 
+// The event enqueue/write path here is the embedded-era fs9 notify path, no longer
+// reached after the JuiceFS-only migration (#2567); the Redis read path stays live.
+// Allow dead_code so the retained write path does not break `cargo clippy -D warnings`.
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;

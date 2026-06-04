@@ -5,10 +5,29 @@ use super::*;
 /// This is used by the Analyzer prefetch phase so it can resolve column names/types
 /// for dynamic schemas (directory listing vs file vs csv headers) while keeping
 /// analysis itself synchronous.
+///
+/// Schema inference is an analysis-time fs9 entry point: it opens the backend,
+/// can lazily materialize the JuiceFS volume, and reads file contents (CSV
+/// headers, parquet footers) to derive a schema. It MUST therefore enforce the
+/// same superuser authorization as every other fs9 SQL surface — otherwise
+/// catalog prefetch (and `EXPLAIN`, which analyzes but never executes) would
+/// open the backend and read fs9 IO for a non-superuser before the
+/// execution-time gate is ever reached.
+///
+/// Authorization is checked here (mirroring the parquet analysis path
+/// `parquet::reader::create_fs9_reader`); teardown/lifecycle fail-closed is
+/// enforced where the volume is actually opened, in
+/// `acquire_statement_backend` -> `init_backend`.
 pub(crate) async fn infer_table_function_schema(
     tenant: &str,
     mode: &Fs9Mode,
 ) -> Result<TableSchema> {
+    if !backend::is_backend_available() {
+        anyhow::bail!("fs9: TiKV storage backend not available");
+    }
+    if !crate::extensions::context::is_superuser() {
+        anyhow::bail!("fs9: permission denied (superuser required)");
+    }
     let backend = backend::acquire_statement_backend(tenant).await?;
     let backend = backend.as_ref();
 

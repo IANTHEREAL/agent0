@@ -8,10 +8,7 @@ use std::time::Duration;
 use tokio::io::AsyncBufRead;
 
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
-use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::normalizing::NormalizingFsBackend;
-
-const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -499,114 +496,51 @@ fn normalize_readdir_path(path: &str) -> String {
     }
 }
 
-fn legacy_juicefs_config_markers_with<F>(mut get_env: F) -> Vec<String>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    let mut markers = Vec::new();
-
-    if get_env("FS9_GRPC_PD_ENDPOINTS").is_some() {
-        markers.push("FS9_GRPC_PD_ENDPOINTS".to_string());
-    }
-
-    if let Some(value) = get_env("FS9_BACKEND") {
-        let normalized = value.trim().to_ascii_lowercase();
-        if !normalized.is_empty() && normalized != "embedded" {
-            markers.push(format!("FS9_BACKEND={value}"));
-        }
-    }
-
-    markers
-}
-
-fn legacy_juicefs_config_markers() -> Vec<String> {
-    legacy_juicefs_config_markers_with(crate::config::env_string)
-}
-
-fn refuse_if_external_fs9_configured_with(tenant_keyspace: &str, markers: &[String]) -> Result<()> {
-    if !markers.is_empty() {
-        anyhow::bail!(
-            "fs9: refusing to initialize embedded PageFS for tenant `{}` because this server is configured for external fs9 ({}). Embedded PageFS and external fs9 must not be mixed in one process.",
-            tenant_keyspace,
-            markers.join(", ")
-        );
-    }
-    Ok(())
-}
-
 // ============================================================================
-// Per-tenant backend routing
+// Tenant backend initialization
 //
-// A single db9-server can host both embedded and JuiceFS tenants. Which
-// backend a given tenant uses is set at create time by db9-backend and
-// recorded as the presence of the `jfs_t_<id>` keyspace in PD:
-//   * keyspace ENABLED → JuiceFS tenant, must reach fs9 v2 over gRPC
-//   * keyspace absent  → embedded tenant, uses PageFS in `db9_tenant_<id>`
-//   * keyspace DISABLED/ARCHIVED/TOMBSTONE → tenant in teardown, fail-closed
-//
-// Resolution is intentionally uncached at the process level. The per-
-// statement `cached_fs_backend` keeps a bound `FsBackend` for the
-// lifetime of one SQL statement, so the PD probe runs at most once per
-// statement that touches fs9 — exactly when we want to re-observe PD
-// lifecycle transitions (ENABLED → DISABLED on `db9 delete`) without
-// waiting for a process restart.
+// db9-server no longer probes PD for `jfs_t_*` keyspaces and no longer
+// accepts a process-wide embedded fallback. Control-plane backend_type owns
+// tenant intent; the server data path opens JuiceFS and materializes a missing
+// volume through FsPlaneAdmin before constructing the data-plane backend.
+// The one PD read retained here is a non-cached lifecycle guard:
+// absent/ENABLED may proceed, while DISABLED/ARCHIVED/TOMBSTONE fail closed
+// before InitVolume can resurrect a tenant under teardown.
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TenantBackendKind {
-    Embedded,
-    JuiceFs,
-}
-
-/// Probe PD for the tenant's JuiceFS keyspace state and map it to a
-/// backend kind. Never silently downgrades to embedded on a transient
-/// PD error — that would route JuiceFS reads to the wrong place.
-///
-/// No process-level cache: the only safe caching layer is per-statement
-/// (`acquire_statement_backend`), since the underlying invariant
-/// (keyspace lifecycle state) can change while the process lives. A
-/// process-level cache would lock in an `ENABLED` result and bypass the
-/// teardown guard after `db9 delete` moves the keyspace to `DISABLED`.
-pub(crate) async fn resolve_tenant_backend_kind(
-    tenant_keyspace: &str,
-) -> Result<TenantBackendKind> {
-    let jfs_keyspace = legacy_juicefs_keyspace_name(tenant_keyspace);
-    let pd_endpoints = pd_endpoints_from_env();
+pub(crate) async fn ensure_juicefs_lifecycle_allows_init(tenant_keyspace: &str) -> Result<()> {
+    let jfs_keyspace = juicefs_lifecycle_keyspace_name(tenant_keyspace);
+    let pd_endpoints = crate::extensions::fs::juicefs_pd_endpoints();
     let state = query_pd_keyspace_state(&pd_endpoints, &jfs_keyspace).await?;
-    // PD lifecycle (db9-backend pd_client.rs §state machine):
-    //   absent → ENABLED → DISABLED → ARCHIVED → TOMBSTONE
-    // Absent = the tenant was never a JuiceFS tenant → embedded is the
-    // correct backend. Present-but-non-ENABLED = a JuiceFS tenant in
-    // teardown; routing to embedded would create a phantom data
-    // namespace under the same `db9_tenant_*` keyspace and hide the
-    // teardown state, so fail-closed.
-    match state.as_deref() {
-        None => Ok(TenantBackendKind::Embedded),
-        Some("ENABLED") => Ok(TenantBackendKind::JuiceFs),
+    validate_juicefs_lifecycle_state(tenant_keyspace, &jfs_keyspace, state.as_deref())
+}
+
+pub(crate) async fn ensure_fs9_sql_surface_allowed(tenant_keyspace: &str) -> Result<()> {
+    if !is_backend_available() {
+        anyhow::bail!("fs9: TiKV storage backend not available");
+    }
+    if !crate::extensions::context::is_superuser() {
+        anyhow::bail!("fs9: permission denied (superuser required)");
+    }
+    ensure_juicefs_lifecycle_allows_init(tenant_keyspace).await
+}
+
+fn validate_juicefs_lifecycle_state(
+    tenant_keyspace: &str,
+    jfs_keyspace: &str,
+    state: Option<&str>,
+) -> Result<()> {
+    match state {
+        None | Some("ENABLED") => Ok(()),
         Some(other) => anyhow::bail!(
             "fs9: JuiceFS keyspace `{jfs_keyspace}` is in state `{other}` \
-             (expected ENABLED). Tenant `{tenant_keyspace}` is being torn down; \
-             refusing to route to the embedded backend, which would write to a \
-             distinct data namespace and mask the teardown state."
+             (expected absent or ENABLED). Tenant `{tenant_keyspace}` is being \
+             torn down; refusing to initialize or use the JuiceFS backend."
         ),
     }
 }
 
-fn parse_pd_endpoints(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn pd_endpoints_from_env() -> Vec<String> {
-    let raw = crate::config::env_string("PD_ENDPOINTS")
-        .unwrap_or_else(|| DEFAULT_PD_ENDPOINTS.to_string());
-    parse_pd_endpoints(&raw)
-}
-
-fn legacy_juicefs_keyspace_name(tenant_keyspace: &str) -> String {
+fn juicefs_lifecycle_keyspace_name(tenant_keyspace: &str) -> String {
     let tenant_id =
         crate::auth::tenant_id_from_keyspace(tenant_keyspace).unwrap_or(tenant_keyspace);
     crate::extensions::fs::jfs_volume_id(tenant_id)
@@ -639,15 +573,13 @@ fn build_pd_probe_client() -> Result<reqwest::Client> {
 
     builder
         .build()
-        .context("failed to build PD HTTP client for fs9 routing")
+        .context("failed to build PD HTTP client for fs9 lifecycle guard")
 }
 
 /// Build the rustls `ClientConfig` for mTLS to PD directly, bypassing
-/// reqwest's `Identity::from_pem` (which on the `rustls-tls` feature
-/// only accepts PKCS#8 private keys — staging cert-manager emits
-/// PKCS#1 RSA keys, so `from_pem` silently fails inside the worker
-/// module too, but that path swallows the error with `return None`).
-/// `rustls_pemfile::private_key` accepts PKCS#1, PKCS#8 and SEC1.
+/// reqwest's `Identity::from_pem` (which on the `rustls-tls` feature only
+/// accepts PKCS#8 private keys). `rustls_pemfile::private_key` accepts
+/// PKCS#1, PKCS#8 and SEC1.
 fn build_pd_rustls_config(
     ca_path: &str,
     cert_path: &str,
@@ -655,13 +587,12 @@ fn build_pd_rustls_config(
 ) -> Result<rustls::ClientConfig> {
     use rustls_pki_types::CertificateDer;
 
-    // CA → root store
     let ca_pem = std::fs::read(ca_path)
-        .with_context(|| format!("failed to read PD CA cert for fs9 routing: {ca_path}"))?;
+        .with_context(|| format!("failed to read PD CA cert for fs9 lifecycle guard: {ca_path}"))?;
     let mut ca_reader = std::io::BufReader::new(ca_pem.as_slice());
     let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
         .collect::<std::result::Result<_, _>>()
-        .context("failed to parse PD CA cert for fs9 routing")?;
+        .context("failed to parse PD CA cert for fs9 lifecycle guard")?;
     if ca_certs.is_empty() {
         anyhow::bail!("no CA certificates found in {ca_path}");
     }
@@ -672,29 +603,29 @@ fn build_pd_rustls_config(
             .context("failed to register PD CA cert in rustls root store")?;
     }
 
-    // Client cert chain
-    let cert_pem = std::fs::read(cert_path)
-        .with_context(|| format!("failed to read PD client cert for fs9 routing: {cert_path}"))?;
+    let cert_pem = std::fs::read(cert_path).with_context(|| {
+        format!("failed to read PD client cert for fs9 lifecycle guard: {cert_path}")
+    })?;
     let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
     let client_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<_, _>>()
-        .context("failed to parse PD client cert for fs9 routing")?;
+        .context("failed to parse PD client cert for fs9 lifecycle guard")?;
     if client_certs.is_empty() {
         anyhow::bail!("no client certificates found in {cert_path}");
     }
 
-    // Client private key — handles PKCS#1 / PKCS#8 / SEC1
-    let key_pem = std::fs::read(key_path)
-        .with_context(|| format!("failed to read PD client key for fs9 routing: {key_path}"))?;
+    let key_pem = std::fs::read(key_path).with_context(|| {
+        format!("failed to read PD client key for fs9 lifecycle guard: {key_path}")
+    })?;
     let mut key_reader = std::io::BufReader::new(key_pem.as_slice());
     let key = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed to parse PD client key for fs9 routing")?
+        .context("failed to parse PD client key for fs9 lifecycle guard")?
         .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
 
     rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_client_auth_cert(client_certs, key)
-        .context("failed to build rustls ClientConfig for fs9 routing")
+        .context("failed to build rustls ClientConfig for fs9 lifecycle guard")
 }
 
 fn parse_pd_keyspace_state_response(
@@ -739,7 +670,7 @@ async fn query_pd_keyspace_state(
     keyspace: &str,
 ) -> Result<Option<String>> {
     if pd_endpoints.is_empty() {
-        anyhow::bail!("no PD endpoints available for fs9 tenant-backend probe");
+        anyhow::bail!("no PD endpoints available for fs9 lifecycle guard");
     }
 
     let client = build_pd_probe_client()?;
@@ -777,26 +708,6 @@ async fn query_pd_keyspace_state(
     )
 }
 
-pub(crate) async fn ensure_embedded_backend_bootstrap_allowed(
-    client: &Arc<tikv_client::TransactionClient>,
-    tenant_keyspace: &str,
-) -> Result<()> {
-    // External-fs9 mode is an unconditional refusal: a server configured for
-    // external fs9 must not serve embedded for any tenant, including tenants
-    // that already have an embedded superblock from a prior config.
-    refuse_if_external_fs9_configured_with(tenant_keyspace, &legacy_juicefs_config_markers())?;
-
-    crate::extensions::fs::embedded::pagefs::probe_superblock_readonly(client)
-        .await
-        .map_err(|err| {
-            anyhow!(
-                "fs9: refusing to initialize embedded PageFS for tenant `{tenant_keyspace}` because existing embedded PageFS metadata is invalid or unavailable: {err}"
-            )
-        })?;
-
-    Ok(())
-}
-
 async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
     let client = crate::extensions::context::tikv_client().ok_or_else(|| {
         anyhow!(
@@ -808,68 +719,51 @@ async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
     init_backend_with_args(tenant_keyspace, client, principal).await
 }
 
-/// Routing decision exposed to non-SQL callers (notably the WebSocket
+/// Backend construction exposed to non-SQL callers (notably the WebSocket
 /// handler, which authenticates outside the ExtensionContext task-local).
 ///
-/// Per-tenant routing: probes PD for the tenant's JuiceFS metadata
-/// keyspace (`jfs_t_<id>`). If present and ENABLED → JuiceFS → must
-/// route to `GrpcFsBackend` (requires v2 env config + authenticated
-/// role; partial config is a hard error, never a silent fallback to
-/// embedded). Absent → EmbeddedFsBackend, which has no role requirement
-/// so password / connect-key sessions on embedded tenants keep working.
+/// db9-server routes fs9 to JuiceFS only. A missing JuiceFS volume is
+/// materialized through FsPlaneAdmin before data-plane RPCs run; it is never
+/// treated as a signal to open embedded PageFS metadata.
 pub(crate) async fn init_backend_with_args(
     tenant_keyspace: &str,
-    tikv_client: Arc<tikv_client::TransactionClient>,
+    _tikv_client: Arc<tikv_client::TransactionClient>,
     authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
 ) -> Result<Arc<dyn FsBackend>> {
-    let kind = resolve_tenant_backend_kind(tenant_keyspace).await?;
-
     // Every leaf backend constructed here is wrapped in
     // `NormalizingFsBackend` so callers cannot bypass path shaping by
     // grabbing the inner directly. `acquire_statement_backend` caches
     // the wrapped instance, so the cache and every fs9 entry point
     // share one normalized contract.
-    let inner: Arc<dyn FsBackend> = match kind {
-        TenantBackendKind::JuiceFs => {
-            #[cfg(fsplane_v2_generated)]
-            {
-                init_juicefs_backend(tenant_keyspace, authenticated_principal).await?
-            }
-            #[cfg(not(fsplane_v2_generated))]
-            {
-                let _ = &authenticated_principal;
-                anyhow::bail!(
-                    "fs9: tenant `{tenant_keyspace}` is JuiceFS-backed but this db9-server \
-                     binary was built without the fs9 v2 gRPC backend (protoc missing at \
-                     build time and DB9_REQUIRE_PROTOC not set). Rebuild with protoc \
-                     installed."
-                );
-            }
+    let inner: Arc<dyn FsBackend> = {
+        #[cfg(fsplane_v2_generated)]
+        {
+            init_juicefs_backend(tenant_keyspace, authenticated_principal).await?
         }
-        TenantBackendKind::Embedded => {
+        #[cfg(not(fsplane_v2_generated))]
+        {
             let _ = &authenticated_principal;
-            ensure_embedded_backend_bootstrap_allowed(&tikv_client, tenant_keyspace).await?;
-            EmbeddedFsBackend::new(tikv_client, tenant_keyspace.to_string())
-                .await
-                .map(|b| Arc::new(b) as Arc<dyn FsBackend>)
-                .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))?
+            anyhow::bail!(
+                "fs9: tenant `{tenant_keyspace}` requires JuiceFS but this db9-server \
+                 binary was built without the fs9 v2 gRPC backend (protoc missing at \
+                 build time and DB9_REQUIRE_PROTOC not set). Rebuild with protoc \
+                 installed."
+            );
         }
     };
     Ok(Arc::new(NormalizingFsBackend::new(inner)) as Arc<dyn FsBackend>)
 }
 
-/// Instantiate the fs9 v2 gRPC backend for a tenant that PD has
-/// confirmed as JuiceFS-backed. Caller MUST have already verified
-/// tenant routing via `resolve_tenant_backend_kind` — this function
-/// has no "fall back to embedded" path. Any configuration / session
-/// gap is a hard error.
+/// Instantiate the fs9 v2 gRPC backend for a tenant. This function has no
+/// "fall back to embedded" path. Any configuration / session gap is a hard
+/// error.
 #[cfg(fsplane_v2_generated)]
 async fn init_juicefs_backend(
     tenant_keyspace: &str,
     authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
 ) -> Result<Arc<dyn FsBackend>> {
     use crate::auth::fs_plane_token::Auth9MintConfig;
-    use crate::extensions::fs::grpc::client::{Auth9MintTokenProvider, GrpcFsBackend};
+    use crate::extensions::fs::grpc::admin::ensure_juicefs_volume;
     use crate::extensions::fs::grpc::connector::shared_channel;
 
     // All four v2 env vars are required for JuiceFS tenants. Missing
@@ -906,6 +800,41 @@ async fn init_juicefs_backend(
     let mint_cfg = Auth9MintConfig::new(sign_url.unwrap(), api_key.unwrap());
     let _ = (endpoint, server_name); // consumed by shared_channel via env
 
+    let channel = shared_channel().await?;
+    init_juicefs_backend_from_parts(
+        tenant_keyspace,
+        authenticated_principal,
+        channel,
+        mint_cfg,
+        |tenant_keyspace| async move { ensure_juicefs_lifecycle_allows_init(&tenant_keyspace).await },
+        |channel, mint_cfg, tenant_id| async move {
+            ensure_juicefs_volume(channel, &mint_cfg, &tenant_id).await
+        },
+    )
+    .await
+}
+
+#[cfg(fsplane_v2_generated)]
+async fn init_juicefs_backend_from_parts<L, LFut, E, EFut>(
+    tenant_keyspace: &str,
+    authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
+    channel: tonic::transport::Channel,
+    mint_cfg: crate::auth::fs_plane_token::Auth9MintConfig,
+    lifecycle_check: L,
+    ensure_volume: E,
+) -> Result<Arc<dyn FsBackend>>
+where
+    L: FnOnce(String) -> LFut,
+    LFut: std::future::Future<Output = Result<()>>,
+    E: FnOnce(
+        tonic::transport::Channel,
+        crate::auth::fs_plane_token::Auth9MintConfig,
+        String,
+    ) -> EFut,
+    EFut: std::future::Future<Output = Result<()>>,
+{
+    use crate::extensions::fs::grpc::client::{Auth9MintTokenProvider, GrpcFsBackend};
+
     let principal = authenticated_principal.ok_or_else(|| {
         anyhow!(
             "fs9: tenant `{tenant_keyspace}` is JuiceFS-backed and requires \
@@ -922,7 +851,9 @@ async fn init_juicefs_backend(
         })?
         .to_string();
 
-    let channel = shared_channel().await?;
+    lifecycle_check(tenant_keyspace.to_string()).await?;
+    ensure_volume(channel.clone(), mint_cfg.clone(), tenant_id.clone()).await?;
+
     let cache = fs9_plane_token_cache();
     let provider = Arc::new(Auth9MintTokenProvider::new(
         cache,
@@ -960,6 +891,10 @@ pub(crate) async fn acquire_statement_backend(tenant_keyspace: &str) -> Result<A
 
 #[cfg(test)]
 mod tests {
+    // Test helpers collect call-order via std::sync::Mutex<Vec<_>>; the
+    // disallowed_types lint targets production poisoning risk, not test fixtures.
+    // (Sweeps into the parking_lot migration tracked in #2335.)
+    #![allow(clippy::disallowed_types)]
     use super::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -1243,61 +1178,150 @@ mod tests {
     }
 
     #[test]
-    fn legacy_juicefs_config_detects_grpc_pd_endpoints() {
-        let markers = legacy_juicefs_config_markers_with(|key| match key {
-            "FS9_GRPC_PD_ENDPOINTS" => Some("pd:2379".to_string()),
-            _ => None,
-        });
-
-        assert_eq!(markers, vec!["FS9_GRPC_PD_ENDPOINTS".to_string()]);
+    fn juicefs_lifecycle_guard_allows_absent_and_enabled() {
+        for state in [None, Some("ENABLED")] {
+            validate_juicefs_lifecycle_state("db9_tenant_abc", "jfs_t_abc", state)
+                .expect("absent and ENABLED states should allow JuiceFS init");
+        }
     }
 
     #[test]
-    fn legacy_juicefs_config_detects_explicit_juicefs_backend() {
-        let markers = legacy_juicefs_config_markers_with(|key| match key {
-            "FS9_BACKEND" => Some("juicefs".to_string()),
-            _ => None,
-        });
-
-        assert_eq!(markers, vec!["FS9_BACKEND=juicefs".to_string()]);
+    fn juicefs_lifecycle_guard_rejects_teardown_states() {
+        for state in ["DISABLED", "ARCHIVED", "TOMBSTONE"] {
+            let err = validate_juicefs_lifecycle_state("db9_tenant_abc", "jfs_t_abc", Some(state))
+                .expect_err("teardown states must fail closed");
+            let msg = err.to_string();
+            assert!(msg.contains(state), "error should name state: {msg}");
+            assert!(
+                msg.contains("refusing to initialize"),
+                "error should explain fail-closed behavior: {msg}"
+            );
+        }
     }
 
     #[test]
-    fn legacy_juicefs_config_allows_explicit_embedded_backend() {
-        let markers = legacy_juicefs_config_markers_with(|key| match key {
-            "FS9_BACKEND" => Some("embedded".to_string()),
-            _ => None,
-        });
-
-        assert!(markers.is_empty());
-    }
-
-    #[test]
-    fn external_fs9_markers_refuse_bootstrap_even_with_existing_embedded_state() {
-        // Regression: a process configured for external fs9 must refuse embedded
-        // bootstrap unconditionally. The check must precede the superblock fast-path
-        // so a tenant that happens to have embedded data from a prior config does
-        // not silently bypass the "must not be mixed in one process" contract.
-        let err = refuse_if_external_fs9_configured_with(
-            "tenant_a",
-            &["FS9_BACKEND=juicefs".to_string()],
+    fn pd_keyspace_state_parser_treats_missing_as_absent() {
+        let parsed = parse_pd_keyspace_state_response(
+            "jfs_t_abc",
+            "pd:2379",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#""keyspace does not exist""#,
         )
-        .expect_err("external fs9 markers must block embedded bootstrap");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("FS9_BACKEND=juicefs"),
-            "error must surface the offending marker: {msg}"
-        );
-        assert!(
-            msg.contains("must not be mixed"),
-            "error must state the mixing-prohibition contract: {msg}"
+        .expect("missing keyspace body should parse");
+        assert_eq!(parsed, None);
+    }
+
+    #[cfg(fsplane_v2_generated)]
+    #[tokio::test]
+    async fn juicefs_backend_init_runs_lifecycle_then_materializes_volume() {
+        use crate::auth::fs_plane_token::{Auth9MintConfig, Fs9Access, Fs9Principal};
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        let calls = StdArc::new(StdMutex::new(Vec::new()));
+        let lifecycle_calls = calls.clone();
+        let ensure_calls = calls.clone();
+
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let principal = Fs9Principal {
+            role: "admin".to_string(),
+            access: Fs9Access::ReadWrite,
+        };
+        let mint_cfg =
+            Auth9MintConfig::new("https://auth.example/v1/jwt/sign".into(), "secret".into());
+
+        let _backend = init_juicefs_backend_from_parts(
+            "db9_tenant_abc",
+            Some(principal),
+            channel,
+            mint_cfg,
+            move |tenant_keyspace| {
+                let lifecycle_calls = lifecycle_calls.clone();
+                async move {
+                    lifecycle_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("lifecycle:{tenant_keyspace}"));
+                    Ok(())
+                }
+            },
+            move |_channel, mint_cfg, tenant_id| {
+                let ensure_calls = ensure_calls.clone();
+                async move {
+                    ensure_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("ensure:{tenant_id}:{}", mint_cfg.sign_url));
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("backend init should succeed with injected hooks");
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                "lifecycle:db9_tenant_abc".to_string(),
+                "ensure:abc:https://auth.example/v1/jwt/sign".to_string(),
+            ]
         );
     }
 
-    #[test]
-    fn no_external_fs9_markers_permits_bootstrap() {
-        refuse_if_external_fs9_configured_with("tenant_a", &[])
-            .expect("empty markers must permit embedded bootstrap");
+    #[cfg(fsplane_v2_generated)]
+    #[tokio::test]
+    async fn juicefs_backend_init_stops_before_materialize_when_lifecycle_rejects() {
+        use crate::auth::fs_plane_token::{Auth9MintConfig, Fs9Access, Fs9Principal};
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        let calls = StdArc::new(StdMutex::new(Vec::new()));
+        let lifecycle_calls = calls.clone();
+        let ensure_calls = calls.clone();
+
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let principal = Fs9Principal {
+            role: "admin".to_string(),
+            access: Fs9Access::ReadWrite,
+        };
+        let mint_cfg =
+            Auth9MintConfig::new("https://auth.example/v1/jwt/sign".into(), "secret".into());
+
+        let result = init_juicefs_backend_from_parts(
+            "db9_tenant_abc",
+            Some(principal),
+            channel,
+            mint_cfg,
+            move |tenant_keyspace| {
+                let lifecycle_calls = lifecycle_calls.clone();
+                async move {
+                    lifecycle_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("lifecycle:{tenant_keyspace}"));
+                    anyhow::bail!("teardown state")
+                }
+            },
+            move |_channel, _mint_cfg, tenant_id| {
+                let ensure_calls = ensure_calls.clone();
+                async move {
+                    ensure_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("ensure:{tenant_id}"));
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("lifecycle rejection must fail backend init"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("teardown state"));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["lifecycle:db9_tenant_abc".to_string()]
+        );
     }
 
     #[test]
@@ -1764,103 +1788,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, vec!["/keep", "/keep/visible.txt"]);
         assert_eq!(result.total_dirs_scanned, 2);
-    }
-
-    // ── Tenant-backend routing helpers ────────────────────────────
-
-    #[test]
-    fn legacy_juicefs_keyspace_name_strips_db9_tenant_prefix() {
-        assert_eq!(
-            super::legacy_juicefs_keyspace_name("db9_tenant_ngq7d3atwl6n"),
-            "jfs_t_ngq7d3atwl6n"
-        );
-    }
-
-    #[test]
-    fn legacy_juicefs_keyspace_name_passthrough_when_no_prefix() {
-        // Defensive: should the caller pass a non-prefixed keyspace
-        // string (worker / test fixture), we still derive a stable
-        // jfs_t_* name rather than panic.
-        assert_eq!(
-            super::legacy_juicefs_keyspace_name("custom_keyspace"),
-            "jfs_t_custom_keyspace"
-        );
-    }
-
-    #[test]
-    fn parse_pd_keyspace_state_decodes_enabled() {
-        let body =
-            r#"{"id":346,"name":"jfs_t_x","state":"ENABLED","created_at":1,"state_changed_at":1}"#;
-        let state = super::parse_pd_keyspace_state_response(
-            "jfs_t_x",
-            "1.2.3.4:2379",
-            super::StatusCode::OK,
-            body,
-        )
-        .unwrap();
-        assert_eq!(state.as_deref(), Some("ENABLED"));
-    }
-
-    #[test]
-    fn parse_pd_keyspace_state_translates_404_to_none() {
-        let state = super::parse_pd_keyspace_state_response(
-            "jfs_t_missing",
-            "1.2.3.4:2379",
-            super::StatusCode::NOT_FOUND,
-            "",
-        )
-        .unwrap();
-        assert!(state.is_none());
-    }
-
-    #[test]
-    fn parse_pd_keyspace_state_translates_500_keyspace_does_not_exist_to_none() {
-        // Some PD versions return 500 with a body of "keyspace does
-        // not exist" instead of 404. Treat both as "absent" so an
-        // embedded-only tenant doesn't trip a fail-closed.
-        let state = super::parse_pd_keyspace_state_response(
-            "jfs_t_x",
-            "1.2.3.4:2379",
-            super::StatusCode::INTERNAL_SERVER_ERROR,
-            "keyspace does not exist",
-        )
-        .unwrap();
-        assert!(state.is_none());
-    }
-
-    #[test]
-    fn parse_pd_keyspace_state_500_with_other_body_errors() {
-        let err = super::parse_pd_keyspace_state_response(
-            "jfs_t_x",
-            "1.2.3.4:2379",
-            super::StatusCode::INTERNAL_SERVER_ERROR,
-            "etcd unavailable",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("HTTP 500"));
-    }
-
-    #[test]
-    fn parse_pd_keyspace_state_rejects_no_state_field() {
-        let body = r#"{"id":346,"name":"jfs_t_x"}"#;
-        let err = super::parse_pd_keyspace_state_response(
-            "jfs_t_x",
-            "1.2.3.4:2379",
-            super::StatusCode::OK,
-            body,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("no string `state`"));
-    }
-
-    #[test]
-    fn parse_pd_endpoints_splits_csv() {
-        assert_eq!(
-            super::parse_pd_endpoints("a:1,b:2 , c:3"),
-            vec!["a:1", "b:2", "c:3"]
-        );
-        assert!(super::parse_pd_endpoints("").is_empty());
-        assert!(super::parse_pd_endpoints(",,, ").is_empty());
     }
 
     fn make_info(is_dir: bool, is_symlink: bool, size: u64) -> FsFileInfo {

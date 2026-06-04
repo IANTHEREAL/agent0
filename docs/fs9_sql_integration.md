@@ -300,12 +300,13 @@ methods: `stat`, `readdir`, `readdir_recursive`, `read_file`,
 multipart-upload set (`create_upload` / `presign_upload_part` /
 `complete_upload` / `abort_upload`) and `prepare_download`.
 
-Two concrete backends today, per tenant:
+Two backend implementations exist in the tree, but db9-server's fs9
+serving path is JuiceFS-only in current prod:
 
-| Kind | Backend | Selected when |
+| Kind | Backend | Serving status |
 |---|---|---|
-| `Embedded` | `EmbeddedFsBackend` over `EmbeddedPageFs` in TiKV (`src/extensions/fs/embedded/`) | tenant has no `jfs_t_<id>` PD keyspace |
-| `JuiceFs` | `GrpcFsBackend` via fs-plane (`src/extensions/fs/grpc/`) | PD reports `jfs_t_<id>` keyspace in state `ENABLED` |
+| Embedded | `EmbeddedFsBackend` over `EmbeddedPageFs` in TiKV (`src/extensions/fs/embedded/`) | legacy implementation retained for old metadata/tests; no longer selected by db9-server routing |
+| JuiceFS | `GrpcFsBackend` via fs-plane (`src/extensions/fs/grpc/`) | default and only db9-server fs9 serving backend |
 
 Both are wrapped by `NormalizingFsBackend`
 (`src/extensions/fs/normalizing.rs:129-133`) so path canonicalization
@@ -322,22 +323,41 @@ matrix it papers over is in §9.1.
 
 ### 3.3 Per-statement backend acquisition
 
-Every SQL entry point reuses `acquire_statement_backend`
-(`src/extensions/fs/backend.rs:951`). Behavior:
+Every byte-serving SQL entry point reuses `acquire_statement_backend`.
+Behavior:
 
-- On first call within a statement, probes PD to resolve the
-  `TenantBackendKind` (`backend.rs:570`
-  `resolve_tenant_backend_kind`), instantiates the backend, wraps it
-  in `NormalizingFsBackend`, and stores it in the per-statement
+- On first call within a statement, checks the JuiceFS PD keyspace
+  lifecycle for `jfs_t_<id>`, materializes a missing JuiceFS volume
+  with `FsPlaneAdmin.InitVolume`, instantiates `GrpcFsBackend`, wraps
+  it in `NormalizingFsBackend`, and stores it in the per-statement
   extension context (`ExtensionContext::cached_fs_backend`).
 - Subsequent calls within the same statement return the cached
   handle.
 - The cache is **statement-scoped, not process-scoped**. A new
-  statement re-probes PD. This is intentional — keyspace lifecycle
-  can change while the process lives (ENABLED → DISABLED on
-  `db9 delete`), and a process-wide cache would mask teardown
-  (`backend.rs:583-592`). It is also the routing-integrity gate
-  whose failure mode is a security event — see §7.2 / §8.1.
+  statement re-checks PD lifecycle. This is intentional — keyspace
+  lifecycle can change while the process lives (ENABLED → DISABLED on
+  `db9 delete`), and a process-wide InitVolume success cache would
+  mask teardown. The lifecycle check is a security boundary — see
+  §7.2 / §8.1.
+
+The db9-server PD read is not atomic with the remote
+`FsPlaneAdmin.InitVolume` call. It is an early fail-closed check and an
+operator-visible error surface, not the race-closing guard. Production
+deployments must run an fs9 build whose `InitVolume` handler re-reads
+the JuiceFS PD keyspace lifecycle immediately before creating or
+mounting a volume and rejects teardown states
+(`DISABLED`/`ARCHIVED`/`TOMBSTONE`). That fs9-side check is the only
+place the PD lifecycle and volume materialization can be made atomic.
+
+`fs9_events(...)` does not construct a filesystem backend because it
+reads the Redis event stream directly, but it must still call the same
+SQL fs9 gate before deriving `jfs_t_<id>` and reading events. That gate
+checks backend availability, superuser authorization, and the
+non-cached JuiceFS lifecycle guard. A tenant in
+`DISABLED`/`ARCHIVED`/`TOMBSTONE` must fail closed across byte-serving
+fs9 paths and event-stream SQL paths, and non-superusers must not be
+able to enumerate path/inode/size mutation history from the event
+stream.
 
 This caching layer is **not a transaction handle**. It only
 deduplicates backend construction; each backend method still opens
@@ -473,16 +493,15 @@ Tracked as a separate code-fix issue.
 
 ### 3.8 Backend acquisition error taxonomy
 
-Every fs9 SQL entry point routes through `acquire_statement_backend`
-(`src/extensions/fs/backend.rs:951`), which on first call probes PD
-via `resolve_tenant_backend_kind` (`backend.rs:570`). All errors
-below surface as raw `anyhow::Error` and therefore as SQLSTATE
-`XX000` to the client (§5.6, §11).
+Every fs9 SQL entry point routes through `acquire_statement_backend`,
+which on first call checks PD lifecycle and initializes the JuiceFS
+backend. All errors below surface as raw `anyhow::Error` and
+therefore as SQLSTATE `XX000` to the client (§5.6, §11).
 
 | Error string (substring) | Source | Class | Retry posture | Alerting |
 |---|---|---|---|---|
-| `PD keyspace probe ... HTTP {status}` | `backend.rs:727`, `:737` | Transient (PD slow/unreachable; mTLS material expired) | Retry with backoff, jittered. Affects **every** first-fs9-call per statement (§11; env invariants in §11.6). | Page on >0 rate for >1 min — every statement that touches fs9 fails until PD heals. **Also a security signal** (§7.2). |
-| `JuiceFS keyspace ... is in state '{X}' (expected ENABLED) ... refusing to route to the embedded backend` | `backend.rs:586-592` | Permanent for this tenant (PD reports teardown in progress) | Do not retry. Tenant is gone. | Per-tenant signal; investigate db9-backend lifecycle. |
+| `PD keyspace probe ... HTTP {status}` | `backend.rs` PD lifecycle guard | Transient (PD slow/unreachable; mTLS material expired) | Retry with backoff, jittered. Affects **every** first-fs9-call per statement (§11; env invariants in §11.6). | Page on >0 rate for >1 min — every statement that touches fs9 fails until PD heals. **Also a security signal** (§7.2). |
+| `JuiceFS keyspace ... is in state '{X}' (expected absent or ENABLED) ... refusing to initialize or route the JuiceFS backend` | `backend.rs` lifecycle validation | Permanent for this tenant (PD reports teardown in progress) | Do not retry. Tenant is gone. | Per-tenant signal; investigate db9-backend lifecycle. |
 | `fs9: tenant '{ks}' is JuiceFS-backed and requires an authenticated principal` | `backend.rs:909-915` | Permanent (caller path did not propagate auth) | Do not retry. | Indicates a wiring bug in the SQL entry path. Page. |
 | `fs9: tenant keyspace '{ks}' lacks the db9_tenant_ prefix; cannot derive tid claim` | `backend.rs:916-923` | Permanent (malformed tenant context) | Do not retry. | Page; likely pgwire username parse bug. |
 | `fs9: TiKV storage backend not available` | `fs9.rs:67` | Transient at startup; permanent otherwise | Retry once after backoff. | Should never appear post-startup; page. |
@@ -689,7 +708,7 @@ is the *reason*.
 |---|---|
 | Per-op TiKV txn boundaries | `src/extensions/fs/embedded/pagefs/write_impl.rs:33` (write); `read_impl.rs:5` (read) |
 | Per-statement backend acquisition (NOT a txn handle) | `src/extensions/fs/backend.rs:951` `acquire_statement_backend` |
-| Backend kind probe (fail-closed on non-ENABLED keyspace) | `src/extensions/fs/backend.rs:570` `resolve_tenant_backend_kind`; cross-link §7.2 |
+| JuiceFS lifecycle guard (fail-closed on teardown keyspace state) | `src/extensions/fs/backend.rs` lifecycle validation; cross-link §7.2 |
 | Path canonicalization at trait boundary | `src/extensions/fs/normalizing.rs:129-133`; helper at `src/extensions/fs/mod.rs:149`. **No bypass** between COPY/scalar/`read_parquet` — §8.3 |
 | SqlFsClient as the only SQL→backend boundary | `src/extensions/fs/sql_client.rs:14` (header is the contract) |
 | Sealed-file mutation rejection (embedded only) | `src/extensions/fs/embedded/pagefs/ops_impl.rs`; §6.1 |
@@ -922,16 +941,17 @@ keyspace-isolated. Per-backend layout:
 
 | Backend | Metadata | Data | Routed by |
 |---|---|---|---|
-| Embedded | TiKV under `db9_tenant_<id>`, prefix `_fs_*` (families `_fs_S` / `_fs_AI` / `_fs_I` / `_fs_D` / `_fs_B` / `_fs_P` / `_fs_L` / `_fs_M` / `_fs_T` / `_fs_O` / `_fs_AD`, `embedded/keys.rs:7-20`) | TiKV inline + S3 (Object/Pack) | absence of `jfs_t_<id>` PD keyspace |
-| JuiceFS | PD keyspace `jfs_t_<id>` (`extensions/fs/mod.rs:67`, `jfs_volume_id`) | configured S3 bucket via fs-plane gRPC (`grpc/client.rs:162`) | `jfs_t_<id>` keyspace ENABLED in PD |
+| Embedded | TiKV under `db9_tenant_<id>`, prefix `_fs_*` (families `_fs_S` / `_fs_AI` / `_fs_I` / `_fs_D` / `_fs_B` / `_fs_P` / `_fs_L` / `_fs_M` / `_fs_T` / `_fs_O` / `_fs_AD`, `embedded/keys.rs:7-20`) | TiKV inline + S3 (Object/Pack) | not selected by current db9-server routing |
+| JuiceFS | PD keyspace `jfs_t_<id>` (`extensions/fs/mod.rs`, `jfs_volume_id`) | configured S3 bucket via fs-plane gRPC (`grpc/client.rs`) | default db9-server fs9 backend; PD lifecycle absent/ENABLED may proceed, teardown states fail closed |
 
 Tenant is parsed from the pgwire username
 (`src/protocol/handler/tenant.rs::parse_tenant_username`); a single
-db9-server process can host both backends, decided per statement
-(§3.3, §3.8). Process-wide caches scoped to fs9: connection pools,
-config, and the fs-plane JWT cache (§8.7 / §11 KNOWN ISSUE).
+db9-server process serves fs9 through JuiceFS only (§3.3, §3.8).
+Process-wide caches scoped to fs9: connection pools, config, and the
+fs-plane JWT cache (§8.7 / §11 KNOWN ISSUE). There is no process-wide
+InitVolume success cache.
 
-### 7.1 Operator runbook — "which backend is tenant X on?"
+### 7.1 Operator runbook — "is tenant X allowed to initialize JuiceFS?"
 
 There is no in-band way today. The recipe:
 
@@ -942,42 +962,52 @@ There is no in-band way today. The recipe:
 3. Query PD's keyspace API at `/pd/api/v2/keyspaces/jfs_t_<id>`
    with the mTLS material from `TIKV_CA_PATH` / `TIKV_CERT_PATH` /
    `TIKV_KEY_PATH` (`backend.rs:631-697`).
-4. Interpret the `state` field per `backend.rs:583-592`:
-   - absent → embedded
-   - `ENABLED` → JuiceFS
+4. Interpret the `state` field:
+   - absent → db9-server may call `FsPlaneAdmin.InitVolume` to create/open an empty JuiceFS volume
+   - `ENABLED` → JuiceFS may open
    - any other state → tenant in teardown; fs9 calls fail-closed
+5. Confirm the deployed fs9 version enforces the same predicate inside
+   `FsPlaneAdmin.InitVolume`. Without that fs9-side backstop, a
+   teardown flip between db9-server's PD read and the admin RPC is a
+   TOCTOU window.
 
 OPEN: add a `SELECT fs9_backend_kind()` SQL function so operators
 have an in-band lever. Today the answer requires PD HTTP + mTLS
 plumbing.
 
-### 7.2 Misroute as a cross-tenant integrity event
+### 7.2 Lifecycle guard as a tenant-integrity boundary
 
-If `resolve_tenant_backend_kind` (`backend.rs:570-593`) ever returns
-the wrong state — PD bug, mTLS material pointing at the wrong PD
-cluster, env-var swap — the consequence is silent. Verified against
-master: there is **no cross-check** at the write path.
-`resolve_tenant_backend_kind` is consumed once at
-`backend.rs:825-849` and then discarded; neither embedded
-(`embedded/keys.rs:7-20`) nor gRPC (`grpc/client.rs:162`) asserts the
-other backend has no state for this tenant.
+If the PD lifecycle guard reads the wrong state — PD bug, mTLS
+material pointing at the wrong PD cluster, env-var swap — the
+consequence is security-significant. It can incorrectly allow a call to
+`FsPlaneAdmin.InitVolume` for a tenant in teardown, or incorrectly
+block a live tenant. The db9-server guard is intentionally non-cached
+at process scope; it runs before each backend construction and accepts
+only absent/ENABLED.
 
-Worst-case sequence: PD bug routes JFS tenant T to embedded for one
-statement → `_fs_*` keys land under `db9_tenant_T` → PD heals →
-JuiceFS reads succeed for the customer → shadow `_fs_*` data
-persists indefinitely (background maintenance, `pagefs.rs:1772`,
-only fires on the next misroute).
+This db9-server guard is necessary but not sufficient for teardown
+safety. A tenant can flip to `DISABLED` after db9-server reads PD and
+before the remote admin RPC executes. The production contract therefore
+requires fs9 to treat `InitVolume` as the race-closing lifecycle
+backstop: re-read PD in the handler, reject
+`DISABLED`/`ARCHIVED`/`TOMBSTONE`, and only then create or mount the
+volume. If that fs9 guarantee is absent, this db9-server PR must not be
+deployed as a lazy-materialization path.
 
 `PD_ENDPOINTS`, `TIKV_CA_PATH`, `TIKV_CERT_PATH`, `TIKV_KEY_PATH`
-are therefore security-boundary config. Drift detection is a
-security control — threat-model home is §8.1. This section owns
-only operational detection: PD probe error rate
-(`backend.rs:737`) is the only external signal of a misroute window
-today.
+are therefore security-boundary config. `PD_ENDPOINTS` is the single
+source for both the db9-server lifecycle probe and the
+`FsPlaneAdmin.InitVolume` JuiceFS meta URL; fs9-specific PD override
+env vars must not route materialization to a different PD cluster than
+the guard checked. Drift detection is a security control —
+threat-model home is §8.1. This section owns only operational
+detection: PD probe error rate (`backend.rs:737`) is the only external
+signal of a misroute window today.
 
-OPEN: add a structural invariant — at the embedded backend's first
-write per statement, re-check PD and refuse if PD reports ENABLED.
-Mirror check at gRPC backend's first call.
+The remaining trust boundary is fs9 itself for already-open data-plane
+sessions. db9-server checks lifecycle before constructing a backend;
+fs9 must continue to reject use of destroyed/closed volumes on later
+RPCs.
 
 ---
 
@@ -991,29 +1021,30 @@ Mirror check at gRPC backend's first call.
 | `COPY ... FROM 'fs9://...'` (CSV/TEXT) | `session.is_superuser()` before table-privilege | `src/protocol/handler/dynamic/copy/fs9.rs:134-140` |
 | `COPY ... FROM 'fs9://...'` (Parquet) | `session.is_superuser()` before table-privilege | `src/protocol/handler/dynamic/copy/fs9.rs:611-617` |
 | `read_parquet('fs9://...')` | `is_superuser()` before backend acquire | `src/extensions/parquet/reader.rs:42` |
-| `extensions.fs9(...)` TVF | **NONE — KNOWN ISSUE** | `src/sql/executor/extensions.rs:409-587` |
-| `extensions.fs9_jg(...)` TVF | **NONE — KNOWN ISSUE** | `src/sql/executor/extensions.rs:589-820` |
-| `fs9_events(...)` TVF | **NONE — KNOWN ISSUE** | `src/sql/executor/table_functions.rs:355-405` |
+| `extensions.fs9(...)` TVF | `ensure_fs9_sql_surface_allowed()` before stream/batch execution | `src/sql/executor/extensions.rs:409-587` |
+| `extensions.fs9(...)` schema inference (analyzer prefetch / `EXPLAIN`) | `is_superuser()` before backend acquire | `src/extensions/fs/table_function.rs:8` |
+| `extensions.fs9_jg(...)` TVF | `ensure_fs9_sql_surface_allowed()` before backend acquire | `src/sql/executor/extensions.rs:589-820` |
+| `fs9_events(...)` TVF | `ensure_fs9_sql_surface_allowed()` before Redis stream read | `src/sql/executor/table_functions.rs:355-405` |
 | `fs9_storage_stats()` TVF | **NONE — KNOWN ISSUE** | `src/sql/executor/table_functions.rs:406-411` |
 
-**KNOWN ISSUE: TVF privilege gap.** The four TVFs above have no
-`is_superuser` / `Privilege::` / `require_table_privilege` /
-`ext_permission_denied` check on their dispatch path. The `HTTP_*`
-TVF immediately above the FS9 dispatch at `extensions.rs:399` *does*
-gate — the omission is structurally visible.
+**KNOWN ISSUE: storage-stats TVF gap.** `fs9_storage_stats()` /
+`fs9_cached_storage_stats()` are retained embedded-era surfaces and do
+not yet share the JuiceFS SQL gate. They are tracked separately in
+#2569.
 
-Severity: **intra-tenant privilege escalation**. The TVFs use
-`self.tenant_keyspace()` (`table_functions.rs:397`, `:408`), so a
-tenant-A user cannot reach tenant-B via TVFs. But any role in a
-database with `CREATE EXTENSION fs9` enabled can read every file in
-their own tenant via `SELECT * FROM extensions.fs9('/secret/path')`.
-The sibling user manual `docs/fs9_extension.md:207` ("Permission
-required | Superuser only") is also wrong and must be corrected in
-lockstep.
-
-OPEN: is the missing gate an intentional relaxation, or an
-oversight that should be fixed with `ensure_permissions()` calls
-matching the HTTP TVF pattern at `extensions.rs:399`?
+Severity: **limited to the storage-stats TVFs**. Every file-reading and
+directory-listing fs9 surface — `extensions.fs9(...)` (including its
+analyzer schema inference), `extensions.fs9_jg(...)`, `fs9_events(...)`,
+the scalar `fs9_*` functions, and `COPY ... FROM 'fs9://...'` — now
+requires superuser before any backend open, volume materialization, or
+file read (see the table above). This matches the user manual
+`docs/fs9_extension.md:207` ("Permission required | Superuser only"),
+which is now accurate. The only residual gap is
+`fs9_storage_stats()` / `fs9_cached_storage_stats()`: they are
+tenant-scoped (`self.tenant_keyspace()`, `table_functions.rs:397`,
+`:408`), so a tenant-A user cannot reach tenant-B, and they expose
+aggregate storage **metadata** for the caller's own tenant, not file
+contents. Closing that last gate is tracked in #2569.
 
 ### 8.1 Trust model and crown-jewel secrets
 
@@ -1023,21 +1054,26 @@ matching the HTTP TVF pattern at `extensions.rs:399`?
 |---|---|---|
 | Data | host filesystem (host certs, /etc/passwd, configs) | TiKV-isolated per-tenant namespace — **strict win** |
 | Mint | n/a (no signing infrastructure) | process-scoped via `DB9_AUTH9_SERVICE_API_KEY` — **no PG analog** (neutral) |
-| Code-path | requires explicit grant of `pg_read_server_files` predefined role | scalars + COPY: `is_superuser` only (less granular than PG predefined-role); TVFs: ungated — **strict loss vs PG today** |
+| Code-path | requires explicit grant of `pg_read_server_files` predefined role | scalars + COPY + file-reading/listing TVFs: `is_superuser` only (less granular than PG predefined-role); only embedded-era storage-stats TVFs still ungated (#2569) — **weaker than PG, but narrowing** |
 
 **Crown-jewel secrets:**
 
-- `DB9_AUTH9_SERVICE_API_KEY` — `mint()` at
-  `src/auth/fs_plane_token.rs:259-304` takes `tenant_id` as a
-  parameter and constructs the `tid` claim from it; no per-request
+- `DB9_AUTH9_SERVICE_API_KEY` — `mint()` /
+  `mint_fs_plane_admin_token()` at
+  `src/auth/fs_plane_token.rs:259-304` take `tenant_id` as a
+  parameter and construct the `tid` claim from it; no per-request
   verification ties the claim to the requesting principal. A
   compromise (process memory disclosure suffices — no code
-  execution needed) can mint `aud="fs-plane"` rw tokens for ANY
-  tenant on the fs-plane.
+  execution needed) can mint `aud="fs-plane"` rw data-plane tokens
+  and short-lived `aud="fs-plane-admin"` admin tokens for ANY tenant
+  on fs9. The admin audience is used for `FsPlaneAdmin.InitVolume`
+  only and carries `scp="fs:admin"`.
 - `PD_ENDPOINTS` env (`src/extensions/fs/backend.rs:603-606`) +
   `TIKV_CA_PATH` / `TIKV_CERT_PATH` / `TIKV_KEY_PATH` — routing
-  integrity boundary. Misroute → silent cross-tenant shadow
-  namespace (see §7.2).
+  and materialization integrity boundary. Misroute can open/create the
+  wrong JuiceFS volume or block a live one; with an fs9 build that
+  lacks the `InitVolume` lifecycle backstop, it can also bypass
+  teardown protection (see §7.2).
 - TiKV API V2 keyspace prefix — applied **client-side** by
   `TikvStore`, not enforced by TiKV (design `33_fs_plane_*.md` §6.1:
   *"client-side key prefix encoding, not server-enforced access
@@ -1121,12 +1157,13 @@ fs9 access regardless of role"* — this is **wrong in two ways**:
    superuser-capable session gets `Fs9Access::ReadWrite` regardless
    of role name. Test at `:546-554` confirms a superuser named
    `_db9_sys_readonly` still gets `:rw`.
-2. **Embedded has no capability layer.** `_db9_sys_readonly` is
-   used **exclusively** for fs-plane JWT-scope minting
-   (`fs_plane_token.rs:242 SYS_READONLY_ROLE`). On embedded
-   backends, the only gate is `is_superuser()` — a non-superuser
-   session named `_db9_sys_readonly` cannot use fs9 at all (it fails
-   `ensure_permissions()`).
+2. **The retained embedded backend has no capability layer.**
+   `_db9_sys_readonly` is used **exclusively** for fs-plane JWT-scope
+   minting (`fs_plane_token.rs:242 SYS_READONLY_ROLE`). Current
+   production routing does not select embedded; if a legacy/test path
+   invokes it directly, the only gate is `is_superuser()` — a
+   non-superuser session named `_db9_sys_readonly` cannot use fs9 at
+   all (it fails `ensure_permissions()`).
 
 **Corrected statement:** *"On JuiceFS-backed tenants, a non-superuser
 session authenticated as `_db9_sys_readonly` is constrained to
@@ -1206,11 +1243,14 @@ TTL window: `FS_PLANE_TTL_SECS = 900` (`fs_plane_token.rs:50`),
 **~14 minutes** after issuance, returned to anyone matching
 `(tenant_id, role, access)`.
 
-**fs-plane does NOT validate volume state per RPC.** Design
-`33_fs_plane_*.md` §0.2 line 29: *"thin gRPC proxy ... no
+**The fs-plane data-plane does NOT validate volume state per RPC.**
+Design `33_fs_plane_*.md` §0.2 line 29: *"thin gRPC proxy ... no
 business-logic state — no generation tracking, no idempotency cache,
-no tenant metadata."* fs-plane trusts the JWT's `tid` claim
-end-to-end. Net enforcement boundary: **JWT expiry alone.**
+no tenant metadata."* Data-plane RPCs trust the JWT's `tid` claim
+end-to-end. The separate admin-plane `InitVolume` RPC is the required
+lifecycle backstop for materialization (§7.2); it does not invalidate
+already-issued data-plane JWTs. Net enforcement boundary for an
+already-open backend remains **JWT expiry alone**.
 
 Two consequences:
 
@@ -1260,14 +1300,12 @@ particular backend is wired in.
 Three reverts in ~two months on the same architectural decision is
 a signal worth surfacing. Structural causes:
 
-- **Per-statement PD probe on the fast path.**
-  `resolve_tenant_backend_kind` (`src/extensions/fs/backend.rs:570`)
-  is an HTTP call to PD on the first fs9 touch of every statement.
-  PD outage → fs9 outage even for embedded tenants whose backend
-  type is structurally fixed.
-- **Fail-closed on non-ENABLED keyspace** (`backend.rs:583-592`) is
-  correct but means a JuiceFS teardown bug surfaces as universal
-  fs9 failure for that tenant, not just for writes.
+- **Per-statement PD lifecycle check on the fast path.**
+  The JuiceFS initializer calls PD on the first fs9 touch of every
+  statement. PD outage → fs9 outage for that tenant until PD heals.
+- **Fail-closed on non-ENABLED keyspace** is correct but means a
+  JuiceFS teardown bug surfaces as universal fs9 failure for that
+  tenant, not just for writes.
 - **One trait, two semantics.** `FsBackend` papers over capability
   differences. The matrix the trait hides:
 
@@ -1330,7 +1368,7 @@ state (silent gloss) is not.
 | Change path canonicalization | `src/extensions/fs/normalizing.rs:129-133` + `mod.rs:149` |
 | `COPY FROM 'fs9://...'` | `src/protocol/handler/dynamic/copy/fs9.rs` |
 | `read_parquet('fs9://...')` | `src/extensions/parquet/reader.rs:34-50` + `fs9_reader.rs` (whole-file buffered — §3.6) |
-| Backend routing rules | `src/extensions/fs/backend.rs:570` (`resolve_tenant_backend_kind`) |
+| JuiceFS lifecycle/materialization rules | `src/extensions/fs/backend.rs` + `src/extensions/fs/grpc/admin.rs` |
 | Statement-scoped backend | `src/extensions/fs/backend.rs:951` (`acquire_statement_backend`) |
 | Per-tenant JWT minting | `src/auth/fs_plane_token.rs` (no invalidation — §8.7) |
 | Event stream / `fs9_events` | `src/extensions/fs/notify.rs`, `src/extensions/fs/redis_events.rs` |
@@ -1437,11 +1475,11 @@ Specific gaps:
 |---|---|---|
 | Glob truncation rate | `table_function.rs:108`, `glob_stream.rs:177`, `:284` | `warn!` only |
 | Read-budget rejection rate | `fs9.rs:33-39` | error to caller; no counter |
-| Backend resolution (embedded vs gRPC, per stmt) | `backend.rs:825-849` | no metric, no log |
+| JuiceFS lifecycle/materialization per statement | `backend.rs` + `grpc/admin.rs` | no metric, info/debug logs only for InitVolume result |
 | Redis event queue depth | `redis_events.rs:261` (`event_queue_depth()`) | function exists, **not wired to `metrics::gauge!`** |
 | GC backoff state, orphan-inode count | `pagefs.rs:1781` (`consecutive_maintenance_failures`) | private, per-task local; not exported |
 | Stats worker scan duration / staleness | `stats_worker.rs:88-103`, `:110` | info-log only |
-| PD probe error rate | `backend.rs:737` | error to caller; no counter — **security signal per §7.2** |
+| PD lifecycle probe error rate | `backend.rs` | error to caller; no counter — **security signal per §7.2** |
 | fs9 op latency by backend kind | — | no histogram; "is JuiceFS slower than embedded?" cannot be answered |
 
 Until those land, alerts must key on log-line substrings:
@@ -1466,7 +1504,9 @@ Until those land, alerts must key on log-line substrings:
 | `FS9_GC_MAX_BACKOFF_SECS` | default 600 | Cap on exponential backoff after failures | `config.rs:22`, `:162` |
 | `FS9_STATS_REFRESH_INTERVAL_SECS` | default 60 (floor 5) | Cached storage stats freshness | `stats_worker.rs:62-67` |
 | `FS9_NOTIFY_RING_CAPACITY` | default 10 000 | In-process event ring size; overflow surfaces via `oldest_seq` / `newest_seq` / `overflow` | `notify.rs:110-113` |
-| `PD_ENDPOINTS`, `TIKV_CA_PATH`, `TIKV_CERT_PATH`, `TIKV_KEY_PATH` | required for PD probes | **Security-boundary config** per §7.2 / §8.1; drift is a security incident, not just ops drift | `backend.rs:603-643` |
+| resolved PD endpoints (`--pd-endpoints` or `PD_ENDPOINTS`) + `TIKV_CA_PATH`, `TIKV_CERT_PATH`, `TIKV_KEY_PATH` | startup binds the resolved PD endpoint list once; same binding drives lifecycle probes and `InitVolume.meta_url` | **Security-boundary config** per §7.2 / §8.1; drift is a security incident, not just ops drift | `main.rs`, `fs/mod.rs`, `backend.rs`, `grpc/admin.rs` |
+| auth9 `services.db9-server.allowed_audiences` | must include `fs-plane` and `fs-plane-admin` | data-plane tokens use `aud="fs-plane"`; every lazy `InitVolume` uses a short-lived `aud="fs-plane-admin"` token before opening `GrpcFsBackend` | `fs_plane_token.rs`, `docs/design/fs9_auth9_direct_mint.md` |
+| fs9 `FsPlaneAdmin.InitVolume` lifecycle check | must reject `DISABLED`/`ARCHIVED`/`TOMBSTONE` immediately before mount/create | closes the TOCTOU between db9-server's early PD read and remote lazy materialization | `proto/fsplane/v2/fsplane.proto`, §7.2 |
 
 OPEN: most of these are env-only today (no SQL `SHOW` surface). An
 operator cannot tune what they cannot see; add a system TVF.

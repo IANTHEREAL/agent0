@@ -8,8 +8,10 @@ described in `fs9_v2_restore_progress.md`.
 ## Problem
 
 The fs9 v2 restore on `fsplane.v2` (#2545) wired the SQL/WS fs9 paths so
-db9-server forwards an `aud="fs-plane"` JWT to every fs9 RPC. To obtain
-that token, db9-server POSTs to db9-backend's
+db9-server forwards an `aud="fs-plane"` JWT to every fs9 data-plane RPC.
+Lazy JuiceFS volume materialization also needs a short-lived
+`aud="fs-plane-admin"` JWT for `FsPlaneAdmin.InitVolume`. To obtain the
+data-plane token, db9-server originally POSTed to db9-backend's
 `/internal/connect-token/exchange`, which turns around and calls auth9
 `POST /v1/jwt/sign`. db9-backend in this flow is **a pass-through
 translator**: it does not contribute an independent authority — it has
@@ -52,9 +54,10 @@ db9-server's role: **authenticator + token-requester**.
   password). All three produce the same downstream session shape.
 
 - *Token-requester*: at fs9-backend init time, db9-server asks auth9 to
-  sign an `aud="fs-plane"` JWT whose claims match the authenticated
-  session. db9-server's authority to ask is its `X-API-Key`; auth9's
-  authority to sign is its private key.
+  sign two JWT shapes: a short-lived `aud="fs-plane-admin"` token for
+  `FsPlaneAdmin.InitVolume`, and `aud="fs-plane"` data-plane JWTs whose
+  claims match the authenticated session. db9-server's authority to ask
+  is its `X-API-Key`; auth9's authority to sign is its private key.
 
 The capability "request fs-plane mint" was already present in this
 deployment, held by db9-backend. The change moves it to db9-server.
@@ -111,6 +114,22 @@ Body:
 }
 ```
 
+For `FsPlaneAdmin.InitVolume`, db9-server makes a separate mint:
+
+```
+Body:
+{
+  "aud": "fs-plane-admin",
+  "ttl_secs": 60,
+  "claims": {
+    "tid": "<tenant_id>",
+    "usr": "<tenant_id>.admin",
+    "scp": "fs:admin",
+    "sub": "db9-server"
+  }
+}
+```
+
 `aud` is a single string (auth9's `SignBody.aud: String`); a
 multi-audience variant is out of scope here.
 
@@ -144,10 +163,16 @@ Removed: `DB9_BACKEND_URL`, `DB9_SERVER_API_KEY` (exchange-path only).
 ## auth9 pre-requisite
 
 `db9-server`'s service entry in auth9 config (`services.db9-server`)
-must include `"fs-plane"` in `allowed_audiences`. This was previously
-on db9-backend's entry. Until that config lands, sign requests return
-`403 audience_not_allowed` and JuiceFS tenants surface a hard error at
-backend init — no silent fallback.
+must include both `"fs-plane"` and `"fs-plane-admin"` in
+`allowed_audiences`. This was previously on db9-backend's entry. Until
+that config lands, sign requests return `403 audience_not_allowed` and
+JuiceFS tenants surface a hard error at backend init — no silent
+fallback.
+
+Production sys9-platform auth9-server runtime config carries this
+prerequisite:
+`allowed_audiences = ["fs-plane", "fs-plane-admin"]` for
+`services.db9-server`.
 
 ## Invariants preserved
 
@@ -169,8 +194,8 @@ backend init — no silent fallback.
 Single-PR migration is safe because the exchange path is fully
 replaced, not gated:
 
-1. Land auth9 config update adding `fs-plane` to db9-server's
-   `allowed_audiences`. (Out-of-band; no code change.)
+1. Land auth9 config update adding `fs-plane` and `fs-plane-admin` to
+   db9-server's `allowed_audiences`. (Out-of-band; no code change.)
 2. Land this PR. Both code and deployment env vars switch in one go.
 3. Remove db9-backend's `/internal/connect-token/exchange` endpoint in
    a follow-up once no caller remains. (Tracked separately; not

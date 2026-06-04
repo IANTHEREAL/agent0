@@ -1,3 +1,8 @@
+// Embedded/PageFS streaming reader: no longer reached by production routing after
+// the JuiceFS-only migration (#2567); retained for the deferred embedded->JuiceFS
+// data-migration track. Allow dead_code so `cargo clippy -D warnings` stays green.
+#![allow(dead_code)]
+
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};

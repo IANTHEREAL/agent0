@@ -525,6 +525,7 @@ impl Executor {
             if !installed.enabled {
                 return Err(crate::extensions::ext_disabled("fs9"));
             }
+            fs::backend::ensure_fs9_sql_surface_allowed(self.tenant_keyspace()).await?;
 
             if let Fs9Mode::File {
                 path,
@@ -630,6 +631,7 @@ impl Executor {
             }
 
             let tenant = self.tenant_keyspace();
+            fs::backend::ensure_fs9_sql_surface_allowed(tenant).await?;
             let backend = fs::backend::acquire_statement_backend(tenant).await?;
 
             // Resolve files to process

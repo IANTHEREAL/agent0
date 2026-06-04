@@ -38,6 +38,72 @@ fn bridge_function_args(args: &[EvaluatedTableFunctionArg]) -> Vec<FunctionArg> 
         .collect()
 }
 
+fn fs9_events_redis_keyspace(tenant_keyspace: &str) -> String {
+    let tenant_id =
+        crate::auth::tenant_id_from_keyspace(tenant_keyspace).unwrap_or(tenant_keyspace);
+    crate::extensions::fs::jfs_volume_id(tenant_id)
+}
+
+async fn fs9_events_rows_from_parts<G, GFut, R, RFut>(
+    tenant_keyspace: &str,
+    evaluated_args: &[EvaluatedTableFunctionArg],
+    sql_gate: G,
+    read_events: R,
+) -> Result<Vec<Row>>
+where
+    G: FnOnce(String) -> GFut,
+    GFut: std::future::Future<Output = Result<()>>,
+    R: FnOnce(String, String, Option<String>, usize) -> RFut,
+    RFut: std::future::Future<Output = Result<Vec<Row>>>,
+{
+    sql_gate(tenant_keyspace.to_string()).await?;
+
+    // fs9_events(since_id [, path_prefix [, limit]])
+    let since_id = match evaluated_args.first() {
+        Some(arg) => match &arg.value {
+            Value::Text(s) => s.clone(),
+            Value::Null => "0".to_string(),
+            // Accept integers for backwards compatibility (convert to stream ID prefix).
+            Value::Int64(v) => v.to_string(),
+            Value::Int32(v) => v.to_string(),
+            _ => return Err(anyhow!("fs9_events: since_id must be text")),
+        },
+        None => "0".to_string(),
+    };
+    let path_prefix = match evaluated_args.get(1) {
+        Some(arg) => match &arg.value {
+            Value::Text(s) => Some(s.clone()),
+            Value::Null => None,
+            _ => return Err(anyhow!("fs9_events: path_prefix must be text")),
+        },
+        None => None,
+    };
+    let limit = match evaluated_args.get(2) {
+        Some(arg) => match &arg.value {
+            Value::Int64(v) if *v > 0 => *v as usize,
+            Value::Int32(v) if *v > 0 => *v as usize,
+            Value::Int64(v) => {
+                return Err(anyhow!(
+                    "fs9_events: limit must be a positive integer, got {}",
+                    v
+                ))
+            }
+            Value::Int32(v) => {
+                return Err(anyhow!(
+                    "fs9_events: limit must be a positive integer, got {}",
+                    v
+                ))
+            }
+            Value::Null => 10_000usize,
+            _ => return Err(anyhow!("fs9_events: limit must be an integer")),
+        },
+        None => 10_000usize,
+    };
+
+    let keyspace = fs9_events_redis_keyspace(tenant_keyspace);
+    read_events(keyspace, since_id, path_prefix, limit).await
+}
+
 pub(crate) fn chunk_text_rows(args: &[EvaluatedTableFunctionArg]) -> Result<Vec<Row>> {
     use crate::sql::chunker::{
         chunk_document, format_for_embedding, ChunkOptions, DEFAULT_MAX_CHARS,
@@ -353,56 +419,25 @@ impl Executor {
         let func_upper = func_part.to_ascii_uppercase();
 
         let rows = if func_upper == "FS9_EVENTS" {
-            // fs9_events(since_id [, path_prefix [, limit]])
-            let since_id = match evaluated_args.first() {
-                Some(arg) => match &arg.value {
-                    Value::Text(s) => s.clone(),
-                    Value::Null => "0".to_string(),
-                    // Accept integers for backwards compatibility (convert to stream ID prefix).
-                    Value::Int64(v) => v.to_string(),
-                    Value::Int32(v) => v.to_string(),
-                    _ => return Err(anyhow!("fs9_events: since_id must be text")),
+            fs9_events_rows_from_parts(
+                self.tenant_keyspace(),
+                &evaluated_args,
+                |tenant_keyspace| async move {
+                    crate::extensions::fs::backend::ensure_fs9_sql_surface_allowed(&tenant_keyspace)
+                        .await
                 },
-                None => "0".to_string(),
-            };
-            let path_prefix = match evaluated_args.get(1) {
-                Some(arg) => match &arg.value {
-                    Value::Text(s) => Some(s.as_str()),
-                    Value::Null => None,
-                    _ => return Err(anyhow!("fs9_events: path_prefix must be text")),
+                |keyspace, since_id, path_prefix, limit| async move {
+                    crate::extensions::fs::notify::execute_fs9_events_from_redis(
+                        &keyspace,
+                        &since_id,
+                        path_prefix.as_deref(),
+                        limit,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("{}", e))
                 },
-                None => None,
-            };
-            let limit = match evaluated_args.get(2) {
-                Some(arg) => match &arg.value {
-                    Value::Int64(v) if *v > 0 => *v as usize,
-                    Value::Int32(v) if *v > 0 => *v as usize,
-                    Value::Int64(v) => {
-                        return Err(anyhow!(
-                            "fs9_events: limit must be a positive integer, got {}",
-                            v
-                        ))
-                    }
-                    Value::Int32(v) => {
-                        return Err(anyhow!(
-                            "fs9_events: limit must be a positive integer, got {}",
-                            v
-                        ))
-                    }
-                    Value::Null => 10_000usize,
-                    _ => return Err(anyhow!("fs9_events: limit must be an integer")),
-                },
-                None => 10_000usize,
-            };
-            let keyspace = self.tenant_keyspace();
-            crate::extensions::fs::notify::execute_fs9_events_from_redis(
-                keyspace,
-                &since_id,
-                path_prefix,
-                limit,
             )
-            .await
-            .map_err(|e| anyhow!("{}", e))?
+            .await?
         } else if func_upper == "FS9_STORAGE_STATS" {
             // fs9_storage_stats() — no arguments, live scan
             let keyspace = self.tenant_keyspace();
@@ -599,9 +634,17 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_function_args, json_table_function_rows, EvaluatedTableFunctionArg};
-    use crate::model::Value;
+    // Test helpers collect call-order via std::sync::Mutex<Vec<_>>; the
+    // disallowed_types lint targets production poisoning risk, not test fixtures.
+    // (Sweeps into the parking_lot migration tracked in #2335.)
+    #![allow(clippy::disallowed_types)]
+    use super::{
+        bridge_function_args, fs9_events_redis_keyspace, fs9_events_rows_from_parts,
+        json_table_function_rows, EvaluatedTableFunctionArg,
+    };
+    use crate::model::{Row, Value};
     use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn bridge_function_args_preserves_named_and_unnamed_shape() {
@@ -634,6 +677,115 @@ mod tests {
             }
             other => panic!("expected named arg, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn fs9_events_redis_keyspace_uses_juicefs_volume_id() {
+        assert_eq!(
+            fs9_events_redis_keyspace("db9_tenant_agent-fs"),
+            "jfs_t_agent-fs"
+        );
+        assert_eq!(
+            fs9_events_redis_keyspace("tenant_without_prefix"),
+            "jfs_t_tenant_without_prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs9_events_runs_sql_gate_before_reading_stream() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle_calls = calls.clone();
+        let read_calls = calls.clone();
+        let args = vec![
+            EvaluatedTableFunctionArg {
+                name: None,
+                value: Value::Text("42-0".to_string()),
+            },
+            EvaluatedTableFunctionArg {
+                name: None,
+                value: Value::Text("/prefix".to_string()),
+            },
+            EvaluatedTableFunctionArg {
+                name: None,
+                value: Value::Int32(5),
+            },
+        ];
+
+        let rows = fs9_events_rows_from_parts(
+            "db9_tenant_abc",
+            &args,
+            move |tenant_keyspace| {
+                let lifecycle_calls = lifecycle_calls.clone();
+                async move {
+                    lifecycle_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("gate:{tenant_keyspace}"));
+                    Ok(())
+                }
+            },
+            move |keyspace, since_id, path_prefix, limit| {
+                let read_calls = read_calls.clone();
+                async move {
+                    read_calls.lock().unwrap().push(format!(
+                        "read:{keyspace}:{since_id}:{}:{limit}",
+                        path_prefix.as_deref().unwrap_or("")
+                    ));
+                    Ok(vec![Row::new(vec![Value::Text(keyspace)])])
+                }
+            },
+        )
+        .await
+        .expect("event stream should read after lifecycle allows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                "gate:db9_tenant_abc".to_string(),
+                "read:jfs_t_abc:42-0:/prefix:5".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fs9_events_stops_before_stream_read_when_sql_gate_rejects() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle_calls = calls.clone();
+        let read_calls = calls.clone();
+
+        let err = fs9_events_rows_from_parts(
+            "db9_tenant_abc",
+            &[],
+            move |tenant_keyspace| {
+                let lifecycle_calls = lifecycle_calls.clone();
+                async move {
+                    lifecycle_calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("gate:{tenant_keyspace}"));
+                    anyhow::bail!("teardown state")
+                }
+            },
+            move |keyspace, since_id, path_prefix, limit| {
+                let read_calls = read_calls.clone();
+                async move {
+                    read_calls.lock().unwrap().push(format!(
+                        "read:{keyspace}:{since_id}:{}:{limit}",
+                        path_prefix.as_deref().unwrap_or("")
+                    ));
+                    Ok(Vec::new())
+                }
+            },
+        )
+        .await
+        .expect_err("SQL gate rejection must stop fs9_events");
+
+        assert_eq!(err.to_string(), "teardown state");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["gate:db9_tenant_abc".to_string()]
+        );
     }
 
     #[test]

@@ -122,6 +122,17 @@ service FsPlane {
 // claim. See DESIGN.md §Q2 for the ratification rationale and recorded
 // dissent.
 service FsPlaneAdmin {
+  // InitVolume is the race-closing lifecycle backstop for lazy volume
+  // materialization. Callers may perform an early PD lifecycle read for
+  // fail-fast errors, but that read is not atomic with this RPC. Before
+  // creating or mounting a volume, fs9 MUST re-read the PD keyspace state for
+  // `volume_id` using its authoritative PD configuration and reject teardown
+  // states (DISABLED/ARCHIVED/TOMBSTONE) with FailedPrecondition. Absent and
+  // ENABLED are the only states that may proceed.
+  //
+  // This is intentionally an fs9-side contract: db9-server cannot make a PD
+  // read atomic with a remote InitVolume call. Deployments that lazy-materialize
+  // volumes from db9-server must run an fs9 build that enforces this guard.
   rpc InitVolume(InitVolumeRequest)               returns (InitVolumeResponse);
   rpc CloseVolume(CloseVolumeRequest)             returns (CloseVolumeResponse);
   rpc AdvanceNextChunk(AdvanceNextChunkRequest)   returns (AdvanceNextChunkResponse);

@@ -1,5 +1,10 @@
 // TODO(#2335): migrate to parking_lot — phase 2/3
 #![allow(clippy::disallowed_types)]
+// Embedded/PageFS fs9 backend: no longer reached by production routing after the
+// JuiceFS-only migration (#2567); retained for the deferred embedded->JuiceFS
+// data-migration track. dead_code is expected across this subtree — allow it so
+// `cargo clippy -D warnings` stays green without deleting code we intend to revive.
+#![allow(dead_code)]
 
 pub(crate) mod blob;
 pub(crate) mod bundle;

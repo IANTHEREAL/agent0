@@ -61,6 +61,9 @@ Environment:
   CLUSTER_NAME controls the TiKV cluster name when auto-starting.
   MANIFEST_PATH overrides the manifest path (same as --manifest).
   DB9_RUN_COP_PUSHDOWN_TESTS opt-in enables custom-CSE pushdown SQL cases (default: 0).
+  DB9_RUN_FS9_BACKEND_TESTS opt-in enables fs9 SQL cases that read/write data through a
+    live fs9 backend (default: 0). fs9 is JuiceFS-only (#2567); these cases require an fs9
+    v2 gRPC backend (FS9_GRPC_ENDPOINT + auth9), which the no-backend regression gate lacks.
 EOF
 }
 
@@ -87,6 +90,36 @@ is_db9_cop_pushdown_test() {
   local test_file="$1"
   case "$test_file" in
     tests/*pushdown*.sql) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+db9_fs9_backend_tests_enabled() {
+  local raw="${DB9_RUN_FS9_BACKEND_TESTS:-0}"
+  local raw_lc
+  raw_lc="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw_lc" in
+    1|true|t|yes|y|on) return 0 ;;
+    0|false|f|no|n|off) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# fs9 SQL/Python cases that drive a live fs9 backend (read/write file data). fs9 is
+# JuiceFS-only (#2567), so these need an fs9 v2 gRPC backend + auth9, which the
+# no-backend regression gate does not provide. Skipped unless
+# DB9_RUN_FS9_BACKEND_TESTS=1. Error-path fs9 cases that fail before reaching the
+# backend (e.g. 1494_copy_fs9_file_privilege_order) are NOT listed here and keep running;
+# the source-only invariant test (fs9_juicefs_only_source_invariants_2567.py) also keeps running.
+is_db9_fs9_backend_test() {
+  local test_file="$1"
+  case "$test_file" in
+    tests/244_fs9_parquet_integration.sql) return 0 ;;
+    tests/295_named_arg_syntax.sql) return 0 ;;
+    tests/304_fs9_sql_scalar_contract.sql) return 0 ;;
+    tests/plan_a_capability_matrix.sql) return 0 ;;
+    tests/fs9_ws_symlink_contract_1873.py) return 0 ;;
+    tests/fs9_ws_mode_on_create_1902.py) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -232,6 +265,10 @@ for test_file in "${SQL_TESTS[@]}"; do
     echo "INFO: skipping custom-CSE DB9 cop regression '$test_file' because DB9_RUN_COP_PUSHDOWN_TESTS is disabled."
     continue
   fi
+  if ! db9_fs9_backend_tests_enabled && is_db9_fs9_backend_test "$test_file"; then
+    echo "INFO: skipping fs9 backend regression '$test_file' because DB9_RUN_FS9_BACKEND_TESTS is disabled (JuiceFS-only fs9 needs an fs9 v2 gRPC backend; #2567)."
+    continue
+  fi
   REGRESSION_TESTS+=("$test_file")
 done
 
@@ -242,6 +279,16 @@ for test_file in "${REGRESSION_TESTS[@]}"; do
     exit 2
   fi
 done
+
+FILTERED_PYTHON_TESTS=()
+for test_file in "${PYTHON_TESTS[@]}"; do
+  if ! db9_fs9_backend_tests_enabled && is_db9_fs9_backend_test "$test_file"; then
+    echo "INFO: skipping fs9 backend regression '$test_file' because DB9_RUN_FS9_BACKEND_TESTS is disabled (JuiceFS-only fs9 needs an fs9 v2 gRPC backend; #2567)."
+    continue
+  fi
+  FILTERED_PYTHON_TESTS+=("$test_file")
+done
+PYTHON_TESTS=("${FILTERED_PYTHON_TESTS[@]}")
 
 for test_file in "${PYTHON_TESTS[@]}"; do
   if [[ ! -f "$ROOT_DIR/$test_file" ]]; then

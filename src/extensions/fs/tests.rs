@@ -23,6 +23,42 @@ use crate::extensions::fs::backend::{
 };
 use crate::model::Value;
 
+#[test]
+fn juicefs_pd_endpoint_parser_trims_and_drops_empty_entries() {
+    assert_eq!(
+        super::parse_juicefs_pd_endpoints(" pd1:2379, ,pd2:2379,, "),
+        vec!["pd1:2379".to_string(), "pd2:2379".to_string()]
+    );
+}
+
+#[test]
+fn juicefs_pd_endpoints_canonicalize_matches_parsed_list() {
+    // The canonical string fed to InitVolume.meta_url must resolve to the same
+    // endpoint set the lifecycle guard parses — no stray whitespace/empty
+    // segments — so the two never diverge.
+    for raw in [
+        "pd1:2379, ,pd2:2379,, ",
+        "pd1:2379,pd2:2379",
+        " pd1:2379 ,pd2:2379 ",
+    ] {
+        let canonical = super::canonicalize_juicefs_pd_endpoints(raw);
+        assert_eq!(canonical, "pd1:2379,pd2:2379");
+        assert_eq!(
+            super::parse_juicefs_pd_endpoints(&canonical),
+            super::parse_juicefs_pd_endpoints(raw)
+        );
+    }
+    // Nothing meaningful left -> fall back to the default endpoint.
+    assert_eq!(
+        super::canonicalize_juicefs_pd_endpoints("   ,, "),
+        super::DEFAULT_PD_ENDPOINTS
+    );
+    assert_eq!(
+        super::canonicalize_juicefs_pd_endpoints(""),
+        super::DEFAULT_PD_ENDPOINTS
+    );
+}
+
 struct TestLocalBackend;
 struct RecursiveListBackend;
 
@@ -395,9 +431,11 @@ async fn infer_table_function_schema_without_context_returns_error() {
         Ok(_) => panic!("expected missing context error"),
         Err(err) => err,
     };
+    // With no extension context the backend-availability pre-check fails closed
+    // before any backend open or file read.
     assert!(err
         .to_string()
-        .contains("fs9: TiKV client not available in extension context"));
+        .contains("fs9: TiKV storage backend not available"));
 }
 
 #[tokio::test]
@@ -459,6 +497,41 @@ async fn infer_table_function_schema_uses_cached_backend_without_tikv() {
         assert_eq!(schema.columns.len(), 4);
         assert_eq!(schema.columns[1].name, "name");
         assert_eq!(schema.columns[2].name, "age");
+    })
+    .await;
+
+    cleanup(&dir);
+}
+
+/// Regression: the analysis-time schema-inference path (used by catalog
+/// prefetch and `EXPLAIN`) must enforce the fs9 superuser gate BEFORE opening
+/// the backend or reading file contents. A non-superuser must be denied even
+/// though a backend is available — otherwise an unauthorized principal could
+/// trigger volume materialization and read fs9 data during analysis, bypassing
+/// the execution-time gate.
+#[tokio::test]
+async fn infer_table_function_schema_denies_non_superuser_before_io() {
+    let dir = unique_base("infer-authz");
+    let csv_path = dir.join("secret.csv");
+    fs::write(&csv_path, "name,age\nalice,30\n").expect("write secret.csv");
+    let mode = Fs9Mode::File {
+        path: csv_path.to_string_lossy().to_string(),
+        format: Some("csv".to_string()),
+        delimiter: None,
+        header: Some(true),
+    };
+
+    // is_superuser = false, but a backend IS available (cached) so we exercise
+    // the superuser check specifically, not the backend-availability check.
+    context::with_context(false, "db9_tenant_abc", async {
+        cache_test_local_backend();
+        let err = infer_table_function_schema("db9_tenant_abc", &mode)
+            .await
+            .expect_err("non-superuser must be denied at schema inference");
+        assert!(
+            err.to_string().contains("permission denied"),
+            "expected superuser gate denial, got: {err}"
+        );
     })
     .await;
 

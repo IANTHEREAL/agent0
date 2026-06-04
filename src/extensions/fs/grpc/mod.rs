@@ -25,6 +25,9 @@ pub(crate) mod proto {
 }
 
 #[cfg(fsplane_v2_generated)]
+pub(crate) mod admin;
+
+#[cfg(fsplane_v2_generated)]
 pub(crate) mod client;
 
 #[cfg(fsplane_v2_generated)]
