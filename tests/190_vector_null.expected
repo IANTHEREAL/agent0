@@ -1,17 +1,17 @@
 content|dist
 has vec|0
 null vec|NULL
-another|0.025368153802923787
+another|0.02536811254398652
 (3 rows)
 content|dist
 has vec|0
-another|0.025368153802923787
+another|0.02536811254398652
 null vec|NULL
 (3 rows)
 content|dist
 null vec|NULL
 has vec|0
-another|0.025368153802923787
+another|0.02536811254398652
 (3 rows)
 l2_distance
 NULL
@@ -21,5 +21,5 @@ NULL
 (1 row)
 content|dist
 has vec|0
-another|0.025368153802923787
+another|0.02536811254398652
 (2 rows)

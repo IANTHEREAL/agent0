@@ -2,7 +2,10 @@ use crate::model::Value;
 use crate::sql::expr::functions::embedding::{
     embed_query_text_with_cache, require_direct_embedding_superuser,
 };
-use crate::sql::vector::{parse_vector_text, validate_vector};
+use crate::sql::vector::{
+    parse_vector_text, pgvector_cosine_distance, pgvector_inner_product, pgvector_l2_distance,
+    pgvector_negative_inner_product, validate_vector,
+};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -11,6 +14,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("L2_DISTANCE", l2_distance_fn);
     map.insert("COSINE_DISTANCE", cosine_distance_fn);
     map.insert("INNER_PRODUCT", inner_product_fn);
+    map.insert("VECTOR_NEGATIVE_INNER_PRODUCT", negative_inner_product_fn);
     map.insert("VECTOR_DIMS", vector_dims);
     map.insert("VECTOR_NORM", vector_norm_fn);
     map.insert("L2_NORMALIZE", l2_normalize_fn);
@@ -18,6 +22,10 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("VEC_EMBED_COSINE_DISTANCE", vec_embed_cosine_distance_fn);
     map.insert("VEC_EMBED_L2_DISTANCE", vec_embed_l2_distance_fn);
     map.insert("VEC_EMBED_INNER_PRODUCT", vec_embed_inner_product_fn);
+    map.insert(
+        "VEC_EMBED_NEGATIVE_INNER_PRODUCT",
+        vec_embed_negative_inner_product_fn,
+    );
 }
 
 fn extract_vector(val: &Value) -> Result<Vec<f64>> {
@@ -49,16 +57,7 @@ fn l2_distance(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
         ));
     }
 
-    let sum: f64 = vec1
-        .iter()
-        .zip(vec2.iter())
-        .map(|(a, b)| {
-            let diff = a - b;
-            diff * diff
-        })
-        .sum();
-
-    Ok(sum.sqrt())
+    Ok(pgvector_l2_distance(vec1, vec2))
 }
 
 fn cosine_distance(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
@@ -70,24 +69,7 @@ fn cosine_distance(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
         ));
     }
 
-    let mut dot_product = 0.0;
-    let mut norm1 = 0.0;
-    let mut norm2 = 0.0;
-
-    for (a, b) in vec1.iter().zip(vec2.iter()) {
-        dot_product += a * b;
-        norm1 += a * a;
-        norm2 += b * b;
-    }
-
-    if norm1 == 0.0 || norm2 == 0.0 {
-        return Ok(1.0);
-    }
-
-    let cosine_similarity = dot_product / (norm1.sqrt() * norm2.sqrt());
-    let cosine_similarity = cosine_similarity.clamp(-1.0, 1.0);
-
-    Ok(1.0 - cosine_similarity)
+    Ok(pgvector_cosine_distance(vec1, vec2))
 }
 
 fn inner_product(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
@@ -99,8 +81,19 @@ fn inner_product(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
         ));
     }
 
-    let dot: f64 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
-    Ok(-dot)
+    Ok(pgvector_inner_product(vec1, vec2))
+}
+
+fn negative_inner_product(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
+    if vec1.len() != vec2.len() {
+        return Err(anyhow!(
+            "Vectors must have same dimensions ({} vs {})",
+            vec1.len(),
+            vec2.len()
+        ));
+    }
+
+    Ok(pgvector_negative_inner_product(vec1, vec2))
 }
 
 fn vector_norm(vec: &[f64]) -> f64 {
@@ -146,6 +139,21 @@ pub fn inner_product_fn(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Float64(prod))
 }
 
+pub fn negative_inner_product_fn(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!(
+            "vector_negative_inner_product requires exactly 2 arguments"
+        ));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let vec1 = extract_vector(&args[0])?;
+    let vec2 = extract_vector(&args[1])?;
+    let prod = negative_inner_product(&vec1, &vec2)?;
+    Ok(Value::Float64(prod))
+}
+
 pub fn vector_dims(args: Vec<Value>) -> Result<Value> {
     if args.is_empty() {
         return Err(anyhow!("vector_dims requires 1 argument"));
@@ -179,9 +187,12 @@ pub fn l2_normalize_fn(args: Vec<Value>) -> Result<Value> {
     let norm: f64 = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
     if norm == 0.0 {
         // pgvector returns zero vector for zero input
-        return Ok(Value::Vector(vec));
+        return Ok(Value::Vector(validate_vector(vec, 0)?));
     }
-    Ok(Value::Vector(vec.iter().map(|x| x / norm).collect()))
+    Ok(Value::Vector(validate_vector(
+        vec.iter().map(|x| x / norm).collect(),
+        0,
+    )?))
 }
 
 // ── Auto-query VEC_EMBED_* functions ──
@@ -266,6 +277,29 @@ pub fn vec_embed_inner_product_fn(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Float64(prod))
 }
 
+pub fn vec_embed_negative_inner_product_fn(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!(
+            "vec_embed_negative_inner_product requires exactly 2 arguments"
+        ));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    require_direct_embedding_superuser("vec_embed_negative_inner_product")?;
+    let vec1 = extract_vector(&args[0])?;
+    let target_dimensions = u32::try_from(vec1.len())
+        .map_err(|_| anyhow!("vector dimensions exceed supported range"))?;
+    let vec2 = match &args[1] {
+        Value::Text(text) => {
+            embed_text_to_vector("vec_embed_negative_inner_product", target_dimensions, text)?
+        }
+        other => extract_vector(other)?,
+    };
+    let prod = negative_inner_product(&vec1, &vec2)?;
+    Ok(Value::Float64(prod))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,7 +345,46 @@ mod tests {
             Value::Vector(vec![3.0, 4.0]),
         ])
         .unwrap();
+        assert_eq!(result, Value::Float64(11.0));
+    }
+
+    #[test]
+    fn test_negative_inner_product() {
+        let result = negative_inner_product_fn(vec![
+            Value::Vector(vec![1.0, 2.0]),
+            Value::Vector(vec![3.0, 4.0]),
+        ])
+        .unwrap();
         assert_eq!(result, Value::Float64(-11.0));
+    }
+
+    #[test]
+    fn test_cosine_distance_zero_vector_returns_nan() {
+        let result = cosine_distance_fn(vec![
+            Value::Vector(vec![0.0, 0.0, 0.0]),
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+        ])
+        .unwrap();
+        assert!(matches!(result, Value::Float64(f) if f.is_nan()));
+    }
+
+    #[test]
+    fn test_decimal_distances_match_pgvector_float4_accumulation() {
+        let left = Value::Vector(vec![0.4_f32 as f64, 0.5_f32 as f64, 0.6_f32 as f64]);
+        let right = Value::Vector(vec![0.1_f32 as f64, 0.2_f32 as f64, 0.3_f32 as f64]);
+
+        assert_eq!(
+            l2_distance_fn(vec![left.clone(), right.clone()]).unwrap(),
+            Value::Float64(0.5196152525944904)
+        );
+        assert_eq!(
+            cosine_distance_fn(vec![left.clone(), right.clone()]).unwrap(),
+            Value::Float64(0.02536811254398652)
+        );
+        assert_eq!(
+            inner_product_fn(vec![left, right]).unwrap(),
+            Value::Float64(0.320000022649765)
+        );
     }
 
     #[test]
@@ -366,8 +439,7 @@ mod tests {
         let result = l2_normalize_fn(vec![Value::Vector(vec![3.0, 4.0])]).unwrap();
         match result {
             Value::Vector(v) => {
-                assert!((v[0] - 0.6).abs() < 1e-10);
-                assert!((v[1] - 0.8).abs() < 1e-10);
+                assert_eq!(v, vec![0.6_f32 as f64, 0.8_f32 as f64]);
             }
             _ => panic!("Expected vector"),
         }
@@ -419,6 +491,11 @@ mod tests {
 
         let result = run_with_context(false, async {
             vec_embed_inner_product_fn(vec![Value::Null, Value::Text("x".into())]).unwrap()
+        });
+        assert_eq!(result, Value::Null);
+
+        let result = run_with_context(false, async {
+            vec_embed_negative_inner_product_fn(vec![Value::Null, Value::Text("x".into())]).unwrap()
         });
         assert_eq!(result, Value::Null);
     }

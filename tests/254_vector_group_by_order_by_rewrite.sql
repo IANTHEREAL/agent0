@@ -14,9 +14,7 @@ INSERT INTO vec_group_test (content, embedding) VALUES
 SELECT content, cosine_distance(embedding, '[0.1, 0.2, 0.3]') AS dist
 FROM vec_group_test
 GROUP BY id, content, embedding
-ORDER BY dist; -- db9 divergence: cosine_distance precision differs from pgvector
-
-\echo -- db9 divergence: cosine_distance precision differs from pgvector (PG: 0.02536811254398652, db9: 0.025368153802923787)
+ORDER BY dist;
 
 SELECT content, dist
 FROM (
@@ -24,9 +22,7 @@ FROM (
     FROM vec_group_test
     GROUP BY id, content, embedding
 ) AS g
-ORDER BY content, dist; -- db9 divergence: cosine_distance precision differs from pgvector
-
-\echo -- db9 divergence: cosine_distance precision differs from pgvector (PG: 0.02536811254398652, db9: 0.025368153802923787)
+ORDER BY content, dist;
 
 SELECT content, length(content) AS len
 FROM vec_group_test
@@ -36,8 +32,6 @@ ORDER BY len, content;
 SELECT content, COUNT(*) AS cnt, cosine_distance(embedding, '[0.1, 0.2, 0.3]') AS dist
 FROM vec_group_test
 GROUP BY content, embedding
-ORDER BY dist; -- db9 divergence: cosine_distance precision differs from pgvector
-
-\echo -- db9 divergence: cosine_distance precision differs from pgvector (PG: 0.02536811254398652, db9: 0.025368153802923787)
+ORDER BY dist;
 
 DROP TABLE vec_group_test;

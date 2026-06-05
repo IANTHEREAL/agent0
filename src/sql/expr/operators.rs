@@ -11,6 +11,7 @@
 
 use crate::model::Value;
 use crate::sql::error::SqlError;
+use crate::sql::vector::validate_vector;
 use anyhow::{anyhow, Result};
 use bigdecimal::BigDecimal;
 use dashmap::DashMap;
@@ -20,6 +21,10 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use super::numeric;
+
+fn vector_value(vec: Vec<f64>) -> Result<Value> {
+    Ok(Value::Vector(validate_vector(vec, 0)?))
+}
 
 /// Process-wide cache for compiled regexes used by `~`, `~*`, `!~`, `!~*` operators.
 /// Bounded: new entries are skipped (not cached) when the map is full.
@@ -401,9 +406,7 @@ pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
                     r.len()
                 ));
             }
-            Ok(Value::Vector(
-                l.iter().zip(r.iter()).map(|(a, b)| a + b).collect(),
-            ))
+            vector_value(l.iter().zip(r.iter()).map(|(a, b)| a + b).collect())
         }
         _ => Err(SqlError::Unsupported("Unsupported types for addition".into()).into()),
     }
@@ -422,9 +425,7 @@ pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
                 r.len()
             ));
         }
-        return Ok(Value::Vector(
-            l.iter().zip(r.iter()).map(|(a, b)| a - b).collect(),
-        ));
+        return vector_value(l.iter().zip(r.iter()).map(|(a, b)| a - b).collect());
     }
 
     let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
@@ -603,22 +604,22 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
 fn mul_values(left: Value, right: Value) -> Result<Value> {
     match (&left, &right) {
         (Value::Vector(v), Value::Float64(s)) | (Value::Float64(s), Value::Vector(v)) => {
-            return Ok(Value::Vector(v.iter().map(|x| x * s).collect()));
+            return vector_value(v.iter().map(|x| x * s).collect());
         }
         (Value::Vector(v), Value::Int32(s)) | (Value::Int32(s), Value::Vector(v)) => {
             let scalar = *s as f64;
-            return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
+            return vector_value(v.iter().map(|x| x * scalar).collect());
         }
         (Value::Vector(v), Value::Int64(s)) | (Value::Int64(s), Value::Vector(v)) => {
             let scalar = *s as f64;
-            return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
+            return vector_value(v.iter().map(|x| x * scalar).collect());
         }
         (Value::Vector(v), Value::Numeric(s)) | (Value::Numeric(s), Value::Vector(v)) => {
             use rust_decimal::prelude::ToPrimitive;
             let scalar = s
                 .to_f64()
                 .ok_or_else(|| anyhow!("numeric value out of range"))?;
-            return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
+            return vector_value(v.iter().map(|x| x * scalar).collect());
         }
         _ => {}
     }

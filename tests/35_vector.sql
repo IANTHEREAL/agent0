@@ -24,6 +24,9 @@ SELECT name, cosine_distance(embedding, '[1.0, 1.0, 1.0]') AS distance
 FROM embeddings
 ORDER BY distance;
 
+-- Test cosine_distance zero vector parity
+SELECT cosine_distance(CAST('[0.0, 0.0, 0.0]' AS vector), CAST('[1.0, 2.0, 3.0]' AS vector)) AS distance;
+
 -- Test inner product
 SELECT name, inner_product(embedding, '[1.0, 1.0, 1.0]') AS product
 FROM embeddings

@@ -267,6 +267,7 @@ pub fn format_vector_pg_text(vec: &[f64]) -> String {
         if i > 0 {
             out.push(',');
         }
+        let v = *v as f32;
         if v.fract() == 0.0 && v.is_finite() {
             write!(out, "{v:.0}").unwrap();
         } else {
@@ -1121,6 +1122,14 @@ mod tests {
     #[test]
     fn format_vector_pg_text_mixed() {
         assert_eq!(format_vector_pg_text(&[1.0, 2.5, 3.0]), "[1,2.5,3]");
+    }
+
+    #[test]
+    fn format_vector_pg_text_uses_float4_precision() {
+        assert_eq!(
+            format_vector_pg_text(&[0.10000000149011612, 0.40824830532073975]),
+            "[0.1,0.4082483]"
+        );
     }
 
     #[test]

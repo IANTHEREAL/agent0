@@ -242,6 +242,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
     );
     r.register(
+        "VECTOR_NEGATIVE_INNER_PRODUCT",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+    );
+    r.register(
         "COSINE_DISTANCE",
         FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
     );
@@ -264,6 +268,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "VEC_EMBED_INNER_PRODUCT",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+    );
+    r.register(
+        "VEC_EMBED_NEGATIVE_INNER_PRODUCT",
         FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
     );
 

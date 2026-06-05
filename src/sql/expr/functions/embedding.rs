@@ -7,6 +7,7 @@ use crate::model::Value;
 use crate::session_context::current_database_id;
 use crate::sql::embedding_options::parse_embed_text_json_options_dimensions;
 use crate::sql::error::SqlError;
+use crate::sql::vector::validate_vector;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -91,7 +92,7 @@ fn execute_embedding_call(
         }
     }
 
-    Ok(vector)
+    validate_vector(vector, config.dimensions)
 }
 
 pub(crate) fn embedding_call_internal(

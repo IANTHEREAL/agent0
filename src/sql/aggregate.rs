@@ -12,6 +12,11 @@ use crate::sql::expr::compare_values;
 #[cfg(test)]
 use crate::sql::names::function_name_upper;
 use crate::sql::pg_numeric::pg_numeric_div;
+use crate::sql::vector::validate_vector;
+
+fn vector_value(vec: Vec<f64>) -> Result<Value> {
+    Ok(Value::Vector(validate_vector(vec, 0)?))
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -269,7 +274,7 @@ impl Aggregator {
                 if *count == 0 {
                     Value::Null
                 } else if let Some(sv) = sum_vector {
-                    Value::Vector(sv.iter().map(|x| x / *count as f64).collect())
+                    vector_value(sv.iter().map(|x| x / *count as f64).collect())?
                 } else if let Some(sf) = sum_float {
                     Value::Float64(*sf / *count as f64)
                 } else {
@@ -506,9 +511,7 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
             if l.len() != r.len() {
                 return Err(anyhow!("cannot add vectors of different dimensions"));
             }
-            Ok(Value::Vector(
-                l.iter().zip(r.iter()).map(|(a, b)| a + b).collect(),
-            ))
+            vector_value(l.iter().zip(r.iter()).map(|(a, b)| a + b).collect())
         }
         _ => Err(SqlError::Unsupported("Unsupported types for SUM".into()).into()),
     }

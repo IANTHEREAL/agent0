@@ -142,6 +142,7 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
             | "VEC_EMBED_COSINE_DISTANCE"
             | "VEC_EMBED_L2_DISTANCE"
             | "VEC_EMBED_INNER_PRODUCT"
+            | "VEC_EMBED_NEGATIVE_INNER_PRODUCT"
             // HTTP extension functions perform network IO with observable
             // side effects; must never be constant-folded or accepted in
             // immutable contexts (e.g. generated columns).

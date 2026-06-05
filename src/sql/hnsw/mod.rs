@@ -24,6 +24,9 @@ use anyhow::anyhow;
 use tikv_client::Transaction;
 
 use crate::model::Value;
+use crate::sql::vector::{
+    pgvector_cosine_distance, pgvector_l2_distance, pgvector_negative_inner_product,
+};
 use crate::storage::{encode_pk_values, TikvStore};
 
 pub use storage::{metric_from_string, vec_f64_to_f32, HnswIndexHandle, HnswLabelMode, HnswMeta};
@@ -62,8 +65,8 @@ impl HnswDistanceMetric {
             || func_name.eq_ignore_ascii_case("vec_embed_cosine_distance")
         {
             Some(Self::Cosine)
-        } else if func_name.eq_ignore_ascii_case("inner_product")
-            || func_name.eq_ignore_ascii_case("vec_embed_inner_product")
+        } else if func_name.eq_ignore_ascii_case("vector_negative_inner_product")
+            || func_name.eq_ignore_ascii_case("vec_embed_negative_inner_product")
         {
             Some(Self::InnerProduct)
         } else {
@@ -74,7 +77,7 @@ impl HnswDistanceMetric {
     pub fn supports_deferred_embedding(func_name: &str) -> bool {
         func_name.eq_ignore_ascii_case("vec_embed_l2_distance")
             || func_name.eq_ignore_ascii_case("vec_embed_cosine_distance")
-            || func_name.eq_ignore_ascii_case("vec_embed_inner_product")
+            || func_name.eq_ignore_ascii_case("vec_embed_negative_inner_product")
     }
 
     pub fn deferred_embedding_function(self) -> (&'static str, &'static str) {
@@ -88,8 +91,8 @@ impl HnswDistanceMetric {
                 "vec_embed_cosine_distance(vector, text)",
             ),
             Self::InnerProduct => (
-                "vec_embed_inner_product",
-                "vec_embed_inner_product(vector, text)",
+                "vec_embed_negative_inner_product",
+                "vec_embed_negative_inner_product(vector, text)",
             ),
         }
     }
@@ -100,8 +103,8 @@ impl HnswDistanceMetric {
             // while SQL l2_distance() exposes Euclidean distance.
             Self::L2 => raw.max(0.0).sqrt(),
             Self::Cosine => raw,
-            // usearch IP distance is (1 - dot), while SQL inner_product()
-            // exposes the pgvector-compatible negative dot product.
+            // usearch IP distance is (1 - dot), while pgvector's <#> distance
+            // exposes the negative dot product.
             Self::InnerProduct => raw - 1.0,
         }
     }
@@ -112,32 +115,9 @@ impl HnswDistanceMetric {
     /// distances reflect the current row vectors, not stale graph entries.
     pub fn compute_distance(self, a: &[f64], b: &[f64]) -> f64 {
         match self {
-            Self::L2 => {
-                let sum_sq: f64 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
-                sum_sq.sqrt()
-            }
-            Self::Cosine => {
-                let (mut dot, mut norm_a, mut norm_b) = (0.0, 0.0, 0.0);
-                for (x, y) in a.iter().zip(b) {
-                    dot += x * y;
-                    norm_a += x * x;
-                    norm_b += y * y;
-                }
-                let denom = norm_a.sqrt() * norm_b.sqrt();
-                if denom == 0.0 {
-                    1.0
-                } else {
-                    // Clamp to [-1, 1] to handle floating-point imprecision,
-                    // matching the SQL cosine_distance() function.
-                    let sim = (dot / denom).clamp(-1.0, 1.0);
-                    1.0 - sim
-                }
-            }
-            Self::InnerProduct => {
-                // pgvector-compatible: negative dot product
-                let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-                -dot
-            }
+            Self::L2 => pgvector_l2_distance(a, b),
+            Self::Cosine => pgvector_cosine_distance(a, b),
+            Self::InnerProduct => pgvector_negative_inner_product(a, b),
         }
     }
 }
@@ -363,8 +343,8 @@ mod tests {
     #[test]
     fn deferred_embedding_function_supports_inner_product() {
         let (name, signature) = HnswDistanceMetric::InnerProduct.deferred_embedding_function();
-        assert_eq!(name, "vec_embed_inner_product");
-        assert_eq!(signature, "vec_embed_inner_product(vector, text)");
+        assert_eq!(name, "vec_embed_negative_inner_product");
+        assert_eq!(signature, "vec_embed_negative_inner_product(vector, text)");
     }
 
     // ── compute_distance tests ───────────────────────────────
@@ -402,7 +382,7 @@ mod tests {
     #[test]
     fn compute_distance_cosine_zero_vector() {
         let d = HnswDistanceMetric::Cosine.compute_distance(&[0.0, 0.0], &[1.0, 0.0]);
-        assert!((d - 1.0).abs() < 1e-10);
+        assert!(d.is_nan());
     }
 
     #[test]
@@ -410,5 +390,24 @@ mod tests {
         // pgvector-compatible: negative dot product
         let d = HnswDistanceMetric::InnerProduct.compute_distance(&[1.0, 2.0], &[3.0, 4.0]);
         assert!((d - (-11.0)).abs() < 1e-10); // -(1*3 + 2*4) = -11
+    }
+
+    #[test]
+    fn compute_distance_decimal_values_match_pgvector_float4_accumulation() {
+        let left = [0.4_f32 as f64, 0.5_f32 as f64, 0.6_f32 as f64];
+        let right = [0.1_f32 as f64, 0.2_f32 as f64, 0.3_f32 as f64];
+
+        assert_eq!(
+            HnswDistanceMetric::L2.compute_distance(&left, &right),
+            0.5196152525944904
+        );
+        assert_eq!(
+            HnswDistanceMetric::Cosine.compute_distance(&left, &right),
+            0.02536811254398652
+        );
+        assert_eq!(
+            HnswDistanceMetric::InnerProduct.compute_distance(&left, &right),
+            -0.320000022649765
+        );
     }
 }

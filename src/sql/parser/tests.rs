@@ -488,7 +488,7 @@ fn test_rewrite_vector_distance_l2() {
 #[test]
 fn test_rewrite_vector_distance_in_order_by() {
     let result = rewrite_vector_distance_ops("SELECT * FROM t ORDER BY v <#> '[1,0,0]' ASC");
-    assert!(result.contains("inner_product(v, '[1,0,0]')"));
+    assert!(result.contains("vector_negative_inner_product(v, '[1,0,0]')"));
 }
 
 #[test]
@@ -502,12 +502,12 @@ fn test_rewrite_vector_distance_with_comparison() {
     let result =
         rewrite_vector_distance_ops("SELECT * FROM t WHERE a <#> b < -0.2 ORDER BY a <#> b ASC");
     assert!(
-        result.contains("(inner_product(a, b)) < -0.2"),
+        result.contains("(vector_negative_inner_product(a, b)) < -0.2"),
         "got: {}",
         result
     );
     assert!(
-        result.contains("(inner_product(a, b)) ASC"),
+        result.contains("(vector_negative_inner_product(a, b)) ASC"),
         "got: {}",
         result
     );

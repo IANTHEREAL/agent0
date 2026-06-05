@@ -5,20 +5,59 @@ pub(crate) const MAX_VECTOR_DIMENSIONS: usize = 16000;
 
 pub(crate) fn validate_vector(vec: Vec<f64>, dim: u32) -> Result<Vec<f64>> {
     validate_vector_dimensions(vec.len(), dim)?;
-    for value in &vec {
-        validate_vector_element(*value)?;
-    }
-    Ok(vec)
+    vec.into_iter().map(normalize_vector_element).collect()
 }
 
-pub(crate) fn validate_vector_element(value: f64) -> Result<()> {
+pub(crate) fn normalize_vector_element(value: f64) -> Result<f64> {
     if value.is_nan() {
         return Err(anyhow!("NaN not allowed in vector"));
     }
-    if value.is_infinite() || value.abs() > f32::MAX as f64 {
+
+    let value_f32 = value as f32;
+    if !value_f32.is_finite() {
         return Err(anyhow!("infinite value not allowed in vector"));
     }
-    Ok(())
+    Ok(value_f32 as f64)
+}
+
+#[inline]
+fn accum_mul_float4(sum: &mut f32, left: f32, right: f32) {
+    *sum = left.mul_add(right, *sum);
+}
+
+pub(crate) fn pgvector_l2_distance(a: &[f64], b: &[f64]) -> f64 {
+    let mut sum = 0.0_f32;
+    for (x, y) in a.iter().zip(b) {
+        let diff = (*x as f32) - (*y as f32);
+        accum_mul_float4(&mut sum, diff, diff);
+    }
+    (sum as f64).sqrt()
+}
+
+pub(crate) fn pgvector_cosine_distance(a: &[f64], b: &[f64]) -> f64 {
+    let (mut dot, mut norm_a, mut norm_b) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for (x, y) in a.iter().zip(b) {
+        let x = *x as f32;
+        let y = *y as f32;
+        accum_mul_float4(&mut dot, x, y);
+        accum_mul_float4(&mut norm_a, x, x);
+        accum_mul_float4(&mut norm_b, y, y);
+    }
+
+    let similarity = (dot as f64) / ((norm_a as f64) * (norm_b as f64)).sqrt();
+    1.0 - similarity.clamp(-1.0, 1.0)
+}
+
+pub(crate) fn pgvector_inner_product(a: &[f64], b: &[f64]) -> f64 {
+    let mut dot = 0.0_f32;
+    for (x, y) in a.iter().zip(b) {
+        accum_mul_float4(&mut dot, *x as f32, *y as f32);
+    }
+    dot as f64
+}
+
+pub(crate) fn pgvector_negative_inner_product(a: &[f64], b: &[f64]) -> f64 {
+    -pgvector_inner_product(a, b)
 }
 
 pub(crate) fn parse_vector_text(input: &str, dim: u32) -> Result<Vec<f64>> {
@@ -111,6 +150,12 @@ mod tests {
     fn validate_vector_rejects_values_outside_float4_range() {
         let err = validate_vector(vec![f32::MAX as f64 * 2.0], 0).unwrap_err();
         assert_eq!(err.to_string(), "infinite value not allowed in vector");
+    }
+
+    #[test]
+    fn validate_vector_normalizes_elements_to_float4() {
+        let vec = validate_vector(vec![0.1, 1e-46], 0).unwrap();
+        assert_eq!(vec, vec![0.1_f32 as f64, 0.0]);
     }
 
     #[test]

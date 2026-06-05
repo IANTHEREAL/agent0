@@ -1,15 +1,13 @@
 content|dist
 doc1|0
 doc1|0
-doc2|0.025368153802923787
+doc2|0.02536811254398652
 (3 rows)
--- db9 divergence: cosine_distance precision differs from pgvector (PG: 0.02536811254398652, db9: 0.025368153802923787)
 content|dist
 doc1|0
 doc1|0
-doc2|0.025368153802923787
+doc2|0.02536811254398652
 (3 rows)
--- db9 divergence: cosine_distance precision differs from pgvector (PG: 0.02536811254398652, db9: 0.025368153802923787)
 content|len
 doc1|4
 doc1|4
@@ -17,6 +15,5 @@ doc2|4
 (3 rows)
 content|cnt|dist
 doc1|2|0
-doc2|1|0.025368153802923787
+doc2|1|0.02536811254398652
 (2 rows)
--- db9 divergence: cosine_distance precision differs from pgvector (PG: 0.02536811254398652, db9: 0.025368153802923787)

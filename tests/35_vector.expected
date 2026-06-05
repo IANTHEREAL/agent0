@@ -5,13 +5,16 @@ doc2|5.196152422706632
 (3 rows)
 name|distance
 doc2|0.013072457560346584
-doc1|0.07417990022744847
+doc1|0.07417990022744858
 doc3|0.42264973081037416
 (3 rows)
+distance
+NaN
+(1 row)
 name|product
-doc2|-15
-doc1|-6
-doc3|-1
+doc3|1
+doc1|6
+doc2|15
 (3 rows)
 name|dims
 doc1|3

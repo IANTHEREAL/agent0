@@ -113,6 +113,7 @@ fn is_non_immutable_generated_builtin(name: &str) -> bool {
             | "VEC_EMBED_COSINE_DISTANCE"
             | "VEC_EMBED_L2_DISTANCE"
             | "VEC_EMBED_INNER_PRODUCT"
+            | "VEC_EMBED_NEGATIVE_INNER_PRODUCT"
     )
 }
 

@@ -1110,12 +1110,23 @@ pub fn merge_search_results(
     merged.extend_from_slice(delta_results);
 
     // Sort by distance, deduplicate by label (keep closest).
-    merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| compare_distance_nan_last(a.1, b.1));
     let mut seen = HashSet::with_capacity(k);
     merged.retain(|(label, _)| seen.insert(*label));
     merged.truncate(k);
 
     merged
+}
+
+fn compare_distance_nan_last(left: f64, right: f64) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => left
+            .partial_cmp(&right)
+            .expect("non-NaN floats must be comparable"),
+    }
 }
 
 #[cfg(test)]

@@ -479,8 +479,7 @@ impl PhysicalOperator for HnswScanOperator {
                     (i, dist)
                 })
                 .collect();
-            row_distances
-                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            row_distances.sort_by(|a, b| compare_distance_nan_last(a.1, b.1));
 
             // Build distance_by_label BEFORE reordering — row_distances indices
             // refer to positions in the original `valid` array.
@@ -571,5 +570,16 @@ impl PhysicalOperator for HnswScanOperator {
         self.row_buffer.clear();
         self.opened = false;
         Ok(())
+    }
+}
+
+fn compare_distance_nan_last(left: f64, right: f64) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => left
+            .partial_cmp(&right)
+            .expect("non-NaN floats must be comparable"),
     }
 }

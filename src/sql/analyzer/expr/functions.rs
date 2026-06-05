@@ -608,9 +608,10 @@ impl<'a> Analyzer<'a> {
         match func_name {
             // Vector distance functions require vector arguments. This provides
             // parameter typing context for $N placeholders in extended protocol.
-            "COSINE_DISTANCE" | "L2_DISTANCE" | "INNER_PRODUCT" => {
-                self.coerce_args_to_vector(args, 2)
-            }
+            "COSINE_DISTANCE"
+            | "L2_DISTANCE"
+            | "INNER_PRODUCT"
+            | "VECTOR_NEGATIVE_INNER_PRODUCT" => self.coerce_args_to_vector(args, 2),
             "VECTOR_DIMS" | "VECTOR_NORM" | "L2_NORMALIZE" => self.coerce_args_to_vector(args, 1),
             "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
             "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
@@ -625,7 +626,10 @@ impl<'a> Analyzer<'a> {
             | "WEBSEARCH_TO_TSQUERY" => self.coerce_fts_text_signature(func_name, args),
             "EMBEDDING" => self.coerce_embedding_signature(func_name, args),
             "EMBED_TEXT" => self.coerce_embed_text_signature(func_name, args),
-            "VEC_EMBED_COSINE_DISTANCE" | "VEC_EMBED_L2_DISTANCE" | "VEC_EMBED_INNER_PRODUCT" => {
+            "VEC_EMBED_COSINE_DISTANCE"
+            | "VEC_EMBED_L2_DISTANCE"
+            | "VEC_EMBED_INNER_PRODUCT"
+            | "VEC_EMBED_NEGATIVE_INNER_PRODUCT" => {
                 self.coerce_vec_embed_signature(func_name, args)
             }
             "FS9_READ" | "FS9_WRITE" | "FS9_EXISTS" | "FS9_SIZE" | "FS9_MTIME" | "FS9_REMOVE"

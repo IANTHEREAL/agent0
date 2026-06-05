@@ -217,7 +217,7 @@ pub(super) fn rewrite_vector_distance_ops(sql: &str) -> String {
         }
         let func = match tok.text.as_str() {
             "<->" => "l2_distance",
-            "<#>" => "inner_product",
+            "<#>" => "vector_negative_inner_product",
             "<=>" => "cosine_distance",
             _ => continue,
         };
