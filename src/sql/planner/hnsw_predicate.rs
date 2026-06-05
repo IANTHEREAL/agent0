@@ -568,7 +568,7 @@ mod tests {
         let expr = TypedExpr::new(
             TypedExprKind::Constant(Value::Array(vec![
                 Value::Int32(1),
-                Value::Int64(2),
+                Value::Int32(2),
                 Value::Float64(3.0),
             ])),
             DataType::Array(Box::new(DataType::Float64)),
@@ -588,7 +588,7 @@ mod tests {
         let expr = TypedExpr::new(
             TypedExprKind::Constant(Value::Array(vec![
                 Value::Numeric(Decimal::from(1)),
-                Value::Int64(2),
+                Value::Int32(2),
                 Value::Float64(3.0),
             ])),
             DataType::Array(Box::new(DataType::Numeric {
@@ -605,6 +605,20 @@ mod tests {
                 Value::Float64(3.0)
             ]
         );
+    }
+
+    #[test]
+    fn extract_array_vector_rejects_bigint_elements() {
+        let expr = TypedExpr::new(
+            TypedExprKind::Constant(Value::Array(vec![
+                Value::Int32(1),
+                Value::Int64(2),
+                Value::Float64(3.0),
+            ])),
+            DataType::Array(Box::new(DataType::Int64)),
+        );
+
+        assert!(try_extract_constant_vector(&expr, 3).is_none());
     }
 
     // ── detect_hnsw_scan_opportunity tests ───────────────────

@@ -248,7 +248,7 @@ fn vector_cast_both_contexts() {
 fn vector_cast_accepts_numeric_arrays() {
     let arr = Value::Array(vec![
         Value::Int32(1),
-        Value::Int64(2),
+        Value::Float64(2.0),
         Value::Float64(3.5),
         Value::Numeric(Decimal::from_str_exact("4.25").unwrap()),
     ]);
@@ -260,6 +260,16 @@ fn vector_cast_accepts_numeric_arrays() {
     let expected = Value::Vector(vec![1.0, 2.0, 3.5, 4.25]);
     assert_eq!(explicit, expected);
     assert_eq!(assignment, expected);
+}
+
+#[test]
+fn vector_cast_rejects_bigint_arrays() {
+    let arr = Value::Array(vec![Value::Int64(1)]);
+    let err = cast(arr, &DataType::Vector(1), CastContext::Explicit).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("cannot cast type"));
+    assert!(message.contains("BIGINT"));
+    assert!(message.contains("vector(1)"));
 }
 
 #[test]

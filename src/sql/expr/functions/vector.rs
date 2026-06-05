@@ -1,7 +1,8 @@
-use crate::model::Value;
+use crate::model::{DataType, Value};
 use crate::sql::expr::functions::embedding::{
     embed_query_text_with_cache, require_direct_embedding_superuser,
 };
+use crate::sql::types::cast::vector_array_elem_to_f64;
 use crate::sql::vector::{
     parse_vector_text, pgvector_cosine_distance, pgvector_inner_product, pgvector_l2_distance,
     pgvector_negative_inner_product, validate_vector,
@@ -34,12 +35,8 @@ fn extract_vector(val: &Value) -> Result<Vec<f64>> {
         Value::Array(arr) => {
             let vec = arr
                 .iter()
-                .map(|v| match v {
-                    Value::Float64(f) => Ok(*f),
-                    Value::Int32(i) => Ok(*i as f64),
-                    Value::Int64(i) => Ok(*i as f64),
-                    _ => Err(anyhow!("Vector elements must be numeric")),
-                })
+                .cloned()
+                .map(|elem| vector_array_elem_to_f64(elem, &DataType::Vector(0)))
                 .collect::<Result<Vec<_>>>()?;
             validate_vector(vec, 0)
         }
@@ -428,10 +425,23 @@ mod tests {
     fn test_extract_from_array() {
         let result = vector_dims(vec![Value::Array(vec![
             Value::Float64(1.0),
-            Value::Float64(2.0),
+            Value::Int32(2),
         ])])
         .unwrap();
         assert_eq!(result, Value::Int32(2));
+    }
+
+    #[test]
+    fn test_extract_from_array_rejects_bigint_element() {
+        let err = l2_distance_fn(vec![
+            Value::Array(vec![Value::Int64(1)]),
+            Value::Vector(vec![1.0]),
+        ])
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("cannot cast type"));
+        assert!(message.contains("BIGINT"));
+        assert!(message.contains("vector(0)"));
     }
 
     #[test]

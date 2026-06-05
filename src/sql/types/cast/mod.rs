@@ -585,41 +585,40 @@ fn cast_to_array(val: Value, target: &DataType, context: CastContext) -> Result<
     }
 }
 
+pub(crate) fn vector_array_elem_to_f64(elem: Value, target: &DataType) -> Result<f64> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    match elem {
+        Value::Null => Err(anyhow!("array must not contain nulls")),
+        Value::Array(_) => Err(anyhow!("array must be 1-D")),
+        Value::Int32(i) => Ok(i as f64),
+        Value::Float64(f) => Ok(f),
+        Value::Numeric(d) => d.to_f64().ok_or_else(|| {
+            SqlError::NumericValueOutOfRange {
+                message: "numeric value out of range".into(),
+            }
+            .into()
+        }),
+        other => Err(SqlError::InvalidCast {
+            from: other.type_display_name(),
+            to: target.clone(),
+        }
+        .into()),
+    }
+}
+
 fn cast_to_vector(val: Value, target: &DataType) -> Result<Value> {
     let dim = match target {
         DataType::Vector(dim) => *dim,
         _ => unreachable!(),
     };
 
-    fn array_elem_to_f64(elem: Value, target: &DataType) -> Result<f64> {
-        use rust_decimal::prelude::ToPrimitive;
-
-        match elem {
-            Value::Null => Err(anyhow!("array must not contain nulls")),
-            Value::Array(_) => Err(anyhow!("array must be 1-D")),
-            Value::Int32(i) => Ok(i as f64),
-            Value::Int64(i) => Ok(i as f64),
-            Value::Float64(f) => Ok(f),
-            Value::Numeric(d) => d.to_f64().ok_or_else(|| {
-                SqlError::NumericValueOutOfRange {
-                    message: "numeric value out of range".into(),
-                }
-                .into()
-            }),
-            other => Err(SqlError::InvalidCast {
-                from: other.type_display_name(),
-                to: target.clone(),
-            }
-            .into()),
-        }
-    }
-
     match val {
         Value::Text(s) => Ok(Value::Vector(parse_vector_text(&s, dim)?)),
         Value::Array(elems) => {
             let vec = elems
                 .into_iter()
-                .map(|elem| array_elem_to_f64(elem, target))
+                .map(|elem| vector_array_elem_to_f64(elem, target))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Value::Vector(validate_vector(vec, dim)?))
         }
