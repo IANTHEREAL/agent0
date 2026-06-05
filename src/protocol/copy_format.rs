@@ -1192,4 +1192,10 @@ mod tests {
             Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
         );
     }
+
+    #[test]
+    fn parse_value_for_copy_validates_vector_input() {
+        let err = parse_value_for_copy("[Infinity,0,0]", &DataType::Vector(3)).unwrap_err();
+        assert_eq!(err.to_string(), "infinite value not allowed in vector");
+    }
 }

@@ -60,6 +60,7 @@ pub mod stats;
 pub(crate) mod table_functions;
 mod timezone;
 pub(crate) mod triggers;
+pub(crate) mod vector;
 
 pub(crate) use triggers::worker as trigger_worker;
 pub mod types;

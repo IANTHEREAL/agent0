@@ -7,6 +7,7 @@
 
 use crate::model::{ColumnDef, DataType, Value};
 use crate::sql::error::SqlError;
+use crate::sql::vector::{parse_vector_text, validate_vector};
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use sqlparser::ast::Expr;
@@ -589,61 +590,40 @@ fn cast_to_vector(val: Value, target: &DataType) -> Result<Value> {
         DataType::Vector(dim) => *dim,
         _ => unreachable!(),
     };
-    match val {
-        Value::Text(s) => {
-            const MAX_VECTOR_DIMENSIONS: usize = 16384;
-            let trimmed = s.trim();
-            if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-                return Err(SqlError::InvalidInputSyntax {
-                    type_name: "vector".into(),
-                    value: s,
+
+    fn array_elem_to_f64(elem: Value, target: &DataType) -> Result<f64> {
+        use rust_decimal::prelude::ToPrimitive;
+
+        match elem {
+            Value::Null => Err(anyhow!("array must not contain nulls")),
+            Value::Array(_) => Err(anyhow!("array must be 1-D")),
+            Value::Int32(i) => Ok(i as f64),
+            Value::Int64(i) => Ok(i as f64),
+            Value::Float64(f) => Ok(f),
+            Value::Numeric(d) => d.to_f64().ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "numeric value out of range".into(),
                 }
-                .into());
+                .into()
+            }),
+            other => Err(SqlError::InvalidCast {
+                from: other.type_display_name(),
+                to: target.clone(),
             }
-            // Reject modifier > MAX before parsing elements.
-            if dim as usize > MAX_VECTOR_DIMENSIONS {
-                return Err(anyhow!(
-                    "vector cannot have more than {} dimensions",
-                    MAX_VECTOR_DIMENSIONS
-                ));
-            }
-            let inner = &trimmed[1..trimmed.len() - 1];
-            if inner.trim().is_empty() {
-                return Err(anyhow!("vector must have at least 1 dimension"));
-            }
-            // Count elements before allocating: single pass, early break at MAX+1.
-            let elem_count = inner.split(',').take(MAX_VECTOR_DIMENSIONS + 1).count();
-            if elem_count > MAX_VECTOR_DIMENSIONS {
-                return Err(anyhow!(
-                    "vector cannot have more than {} dimensions",
-                    MAX_VECTOR_DIMENSIONS
-                ));
-            }
-            let vec: Vec<f64> = inner
-                .split(',')
-                .map(|e| e.trim().parse::<f64>())
-                .collect::<std::result::Result<Vec<f64>, _>>()
-                .map_err(|_| {
-                    anyhow::Error::from(SqlError::InvalidInputSyntax {
-                        type_name: "vector".into(),
-                        value: trimmed.to_string(),
-                    })
-                })?;
-            // dim == 0 means "any dimension" (bare `vector` without modifier).
-            if dim > 0 && vec.len() != dim as usize {
-                return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));
-            }
-            Ok(Value::Vector(vec))
+            .into()),
         }
-        Value::Vector(vec) => {
-            if vec.is_empty() {
-                return Err(anyhow!("vector must have at least 1 dimension"));
-            }
-            if dim > 0 && vec.len() != dim as usize {
-                return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));
-            }
-            Ok(Value::Vector(vec))
+    }
+
+    match val {
+        Value::Text(s) => Ok(Value::Vector(parse_vector_text(&s, dim)?)),
+        Value::Array(elems) => {
+            let vec = elems
+                .into_iter()
+                .map(|elem| array_elem_to_f64(elem, target))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::Vector(validate_vector(vec, dim)?))
         }
+        Value::Vector(vec) => Ok(Value::Vector(validate_vector(vec, dim)?)),
         v => cast_catchall(v, target, CastContext::Explicit),
     }
 }
@@ -1023,25 +1003,7 @@ pub(crate) fn parse_typed_value(val: &str, data_type: &DataType) -> Result<Value
                 })?;
             Ok(Value::Jsonb(parsed.to_string()))
         }
-        DataType::Vector(_) => {
-            if val.starts_with('[') && val.ends_with(']') {
-                let inner = &val[1..val.len() - 1];
-                let elements: std::result::Result<Vec<f64>, _> =
-                    inner.split(',').map(|s| s.trim().parse::<f64>()).collect();
-                elements.map(Value::Vector).map_err(|_| {
-                    anyhow::Error::from(SqlError::InvalidInputSyntax {
-                        type_name: "vector".into(),
-                        value: val.to_string(),
-                    })
-                })
-            } else {
-                Err(SqlError::InvalidInputSyntax {
-                    type_name: "vector".into(),
-                    value: val.to_string(),
-                }
-                .into())
-            }
-        }
+        DataType::Vector(dim) => Ok(Value::Vector(parse_vector_text(val, *dim)?)),
         DataType::Numeric { scale, .. } => {
             let mut d = Decimal::from_str(trimmed).map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {

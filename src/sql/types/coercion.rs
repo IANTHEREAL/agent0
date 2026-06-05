@@ -287,8 +287,10 @@ pub fn is_assignment_compatible(from: &DataType, to: &DataType) -> bool {
     }
     if let (DataType::Vector(from_dim), DataType::Vector(to_dim)) = (from, to) {
         return match (*from_dim, *to_dim) {
-            (_, 0) => true,
-            (0, _) => false,
+            // Bare `vector` has no typmod. pgvector allows vector -> vector(n)
+            // assignment through its vector(vector, typmod) cast; runtime cast
+            // enforces the actual dimensions.
+            (0, _) | (_, 0) => true,
             (lhs, rhs) => lhs == rhs,
         };
     }
@@ -680,8 +682,8 @@ mod tests {
     }
 
     #[test]
-    fn assignment_compatibility_rejects_unknown_vector_to_concrete_vector() {
-        assert!(!is_assignment_compatible(
+    fn assignment_compatibility_allows_bare_vector_to_concrete_vector() {
+        assert!(is_assignment_compatible(
             &DataType::Vector(0),
             &DataType::Vector(1024)
         ));

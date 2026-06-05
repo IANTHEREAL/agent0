@@ -166,33 +166,12 @@ fn try_extract_constant_vector(expr: &TypedExpr) -> Option<Vec<Value>> {
 
 /// Parse a text string like `"[1,0,0]"` into a vector of f64 values.
 /// Returns `None` if the text is not a valid vector literal.
-/// Matches the runtime parsing in `cast_to_vector` (types/cast/mod.rs:580-620)
-/// but only used at plan time for constant extraction.
+/// Matches runtime vector input validation but only used at plan time for
+/// constant extraction.
 fn parse_text_as_vector(s: &str) -> Option<Vec<Value>> {
-    const MAX_DIMENSIONS: usize = 16384;
-    let trimmed = s.trim();
-    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-        return None;
-    }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    if inner.trim().is_empty() {
-        return None;
-    }
-    // Bound allocation: reject before parsing if too many elements.
-    let elem_count = inner.split(',').take(MAX_DIMENSIONS + 1).count();
-    if elem_count > MAX_DIMENSIONS {
-        return None;
-    }
-    inner
-        .split(',')
-        .map(|tok| {
-            tok.trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|f| f.is_finite())
-                .map(Value::Float64)
-        })
-        .collect()
+    crate::sql::vector::parse_vector_text(s, 0)
+        .ok()
+        .map(|vec| vec.into_iter().map(Value::Float64).collect())
 }
 
 /// Variant of `try_extract_constant_vector` that also handles Text constants

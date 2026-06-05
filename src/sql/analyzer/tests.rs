@@ -2741,6 +2741,26 @@ fn analyze_insert_accepts_multidimensional_array_assignment_by_base_element_type
 }
 
 #[test]
+fn analyze_insert_accepts_array_cast_to_bare_vector_for_vector_typmod_column() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "documents",
+            vec![
+                ("content", DataType::Text, false),
+                ("embedding", DataType::Vector(3), true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO documents (content, embedding) VALUES \
+         ('database docs', ARRAY[0.2, 0.1, 0.4]::vector)",
+    );
+    let result = analyzer.analyze_statement(&stmt);
+    assert!(result.is_ok(), "unexpected analyzer error: {result:?}");
+}
+
+#[test]
 fn analyze_insert_values_preserves_quoted_target_columns() {
     let catalog = MockCatalog::builder()
         .table(

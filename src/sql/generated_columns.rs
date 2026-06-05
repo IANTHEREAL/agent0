@@ -1,4 +1,4 @@
-use crate::model::{ColumnDef, TableSchema};
+use crate::model::{ColumnDef, DataType, TableSchema};
 use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
 use crate::sql::ddl::coerce_ddl_expr_to_column;
 use crate::sql::error::SqlError;
@@ -67,6 +67,18 @@ pub(crate) fn compile_generated_column(
 }
 
 fn coerce_generated_expr_to_column(expr: TypedExpr, col: &ColumnDef) -> Result<TypedExpr> {
+    if matches!(
+        (&expr.data_type, &col.data_type),
+        (DataType::Vector(0), DataType::Vector(target_dim)) if *target_dim > 0
+    ) {
+        return Err(SqlError::DataTypeMismatch {
+            message: format!(
+                "column \"{}\" is of type {} but generation expression is of type {}",
+                col.name, col.data_type, expr.data_type
+            ),
+        }
+        .into());
+    }
     coerce_ddl_expr_to_column(expr, col, "generation expression")
 }
 

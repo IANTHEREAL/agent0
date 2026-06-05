@@ -263,25 +263,9 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 })?;
             Ok(Value::Jsonb(parsed.to_string()))
         }
-        DataType::Vector(_) => {
-            if unescaped.starts_with('[') && unescaped.ends_with(']') {
-                let inner = &unescaped[1..unescaped.len() - 1];
-                let elements: Result<Vec<f64>, _> =
-                    inner.split(',').map(|s| s.trim().parse::<f64>()).collect();
-                elements.map(Value::Vector).map_err(|_| {
-                    anyhow::Error::from(SqlError::InvalidInputSyntax {
-                        type_name: "vector".into(),
-                        value: unescaped.clone(),
-                    })
-                })
-            } else {
-                Err(SqlError::InvalidInputSyntax {
-                    type_name: "vector".into(),
-                    value: unescaped.clone(),
-                }
-                .into())
-            }
-        }
+        DataType::Vector(dim) => Ok(Value::Vector(crate::sql::vector::parse_vector_text(
+            &unescaped, *dim,
+        )?)),
         DataType::Numeric { scale, .. } => {
             let mut d = Decimal::from_str(trimmed).map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
@@ -554,6 +538,11 @@ mod tests {
         let vec_col = test_col("v", DataType::Vector(3));
         let got = coerce_value_for_column(Value::Text("[1, 2, 3]".into()), &vec_col).unwrap();
         assert_eq!(got, Value::Vector(vec![1.0, 2.0, 3.0]));
+
+        let vec_nan = parse_value_for_copy("[NaN,0,0]", &DataType::Vector(3))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(vec_nan, "NaN not allowed in vector");
 
         let vec_bad = coerce_value_for_column(Value::Text("not-a-vector".into()), &vec_col)
             .unwrap_err()

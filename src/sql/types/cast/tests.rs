@@ -244,6 +244,119 @@ fn vector_cast_both_contexts() {
     assert_eq!(assignment, expected);
 }
 
+#[test]
+fn vector_cast_accepts_numeric_arrays() {
+    let arr = Value::Array(vec![
+        Value::Int32(1),
+        Value::Int64(2),
+        Value::Float64(3.5),
+        Value::Numeric(Decimal::from_str_exact("4.25").unwrap()),
+    ]);
+    let target = DataType::Vector(4);
+
+    let explicit = cast(arr.clone(), &target, CastContext::Explicit).unwrap();
+    let assignment = cast(arr, &target, CastContext::Assignment).unwrap();
+
+    let expected = Value::Vector(vec![1.0, 2.0, 3.5, 4.25]);
+    assert_eq!(explicit, expected);
+    assert_eq!(assignment, expected);
+}
+
+#[test]
+fn vector_cast_rejects_array_dimension_mismatch() {
+    let arr = Value::Array(vec![Value::Float64(1.0), Value::Float64(2.0)]);
+    let err = cast(arr, &DataType::Vector(3), CastContext::Explicit).unwrap_err();
+    assert!(err.to_string().contains("expected 3 dimensions, not 2"));
+}
+
+#[test]
+fn vector_cast_rejects_non_numeric_array_elements() {
+    let arr = Value::Array(vec![Value::Float64(1.0), Value::Text("x".into())]);
+    let err = cast(arr, &DataType::Vector(2), CastContext::Explicit).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("cannot cast type"));
+    assert!(message.contains("vector(2)"));
+}
+
+#[test]
+fn vector_cast_rejects_invalid_elements_from_all_vector_inputs() {
+    let target = DataType::Vector(3);
+
+    let text_nan = cast(
+        Value::Text("[NaN,0,0]".into()),
+        &target,
+        CastContext::Explicit,
+    )
+    .unwrap_err();
+    assert_eq!(text_nan.to_string(), "NaN not allowed in vector");
+
+    let array_inf = cast(
+        Value::Array(vec![
+            Value::Float64(f64::INFINITY),
+            Value::Float64(0.0),
+            Value::Float64(0.0),
+        ]),
+        &target,
+        CastContext::Explicit,
+    )
+    .unwrap_err();
+    assert_eq!(
+        array_inf.to_string(),
+        "infinite value not allowed in vector"
+    );
+
+    let array_float4_overflow = cast(
+        Value::Array(vec![
+            Value::Float64(f32::MAX as f64 * 2.0),
+            Value::Float64(0.0),
+            Value::Float64(0.0),
+        ]),
+        &target,
+        CastContext::Explicit,
+    )
+    .unwrap_err();
+    assert_eq!(
+        array_float4_overflow.to_string(),
+        "infinite value not allowed in vector"
+    );
+
+    let vector_nan = cast(
+        Value::Vector(vec![f64::NAN, 0.0, 0.0]),
+        &target,
+        CastContext::Assignment,
+    )
+    .unwrap_err();
+    assert_eq!(vector_nan.to_string(), "NaN not allowed in vector");
+}
+
+#[test]
+fn vector_cast_rejects_array_nulls_and_nested_arrays() {
+    let null_err = cast(
+        Value::Array(vec![Value::Null]),
+        &DataType::Vector(0),
+        CastContext::Explicit,
+    )
+    .unwrap_err();
+    assert_eq!(null_err.to_string(), "array must not contain nulls");
+
+    let nested_err = cast(
+        Value::Array(vec![Value::Array(vec![Value::Int32(1)])]),
+        &DataType::Vector(0),
+        CastContext::Explicit,
+    )
+    .unwrap_err();
+    assert_eq!(nested_err.to_string(), "array must be 1-D");
+}
+
+#[test]
+fn parse_typed_value_validates_vector_elements_and_dimensions() {
+    let dim_err = parse_typed_value("[1,2]", &DataType::Vector(3)).unwrap_err();
+    assert_eq!(dim_err.to_string(), "expected 3 dimensions, not 2");
+
+    let inf_err = parse_typed_value("[Infinity,0,0]", &DataType::Vector(3)).unwrap_err();
+    assert_eq!(inf_err.to_string(), "infinite value not allowed in vector");
+}
+
 // ---- Null ----
 #[test]
 fn null_cast_any_context() {

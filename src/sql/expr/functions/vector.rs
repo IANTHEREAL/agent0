@@ -2,6 +2,7 @@ use crate::model::Value;
 use crate::sql::expr::functions::embedding::{
     embed_query_text_with_cache, require_direct_embedding_superuser,
 };
+use crate::sql::vector::{parse_vector_text, validate_vector};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -21,34 +22,20 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
 
 fn extract_vector(val: &Value) -> Result<Vec<f64>> {
     match val {
-        Value::Vector(vec) => Ok(vec.clone()),
-        Value::Array(arr) => arr
-            .iter()
-            .map(|v| match v {
-                Value::Float64(f) => Ok(*f),
-                Value::Int32(i) => Ok(*i as f64),
-                Value::Int64(i) => Ok(*i as f64),
-                _ => Err(anyhow!("Vector elements must be numeric")),
-            })
-            .collect(),
-        Value::Text(s) => {
-            let s = s.trim();
-            if !s.starts_with('[') || !s.ends_with(']') {
-                return Err(anyhow!("Invalid vector format: expected [...]"));
-            }
-            let inner = &s[1..s.len() - 1];
-            if inner.is_empty() {
-                return Ok(Vec::new());
-            }
-            inner
-                .split(',')
-                .map(|elem| {
-                    elem.trim()
-                        .parse::<f64>()
-                        .map_err(|_| anyhow!("Invalid vector element: {}", elem))
+        Value::Vector(vec) => validate_vector(vec.clone(), 0),
+        Value::Array(arr) => {
+            let vec = arr
+                .iter()
+                .map(|v| match v {
+                    Value::Float64(f) => Ok(*f),
+                    Value::Int32(i) => Ok(*i as f64),
+                    Value::Int64(i) => Ok(*i as f64),
+                    _ => Err(anyhow!("Vector elements must be numeric")),
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            validate_vector(vec, 0)
         }
+        Value::Text(s) => parse_vector_text(s, 0),
         _ => Err(anyhow!("Expected vector, array, or text type")),
     }
 }

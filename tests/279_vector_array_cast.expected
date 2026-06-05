@@ -1,0 +1,5 @@
+content|vector_dims
+string literal|3
+array cast|3
+array cast typmod|3
+(3 rows)
