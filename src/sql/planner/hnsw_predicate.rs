@@ -122,27 +122,31 @@ fn try_extract_vector_column_name(expr: &TypedExpr) -> Option<(&str, u32)> {
         }
         TypedExprKind::Cast {
             expr,
-            target_type: DataType::Vector(_),
+            target_type: DataType::Vector(target_dim),
             ..
-        } => try_extract_vector_column_name(expr),
+        } => {
+            let (column_name, column_dim) = try_extract_vector_column_name(expr)?;
+            vector_cast_preserves_dimension(*target_dim, column_dim)
+                .then_some((column_name, column_dim))
+        }
         _ => None,
     }
 }
 
-fn try_extract_constant_vector(expr: &TypedExpr) -> Option<Vec<Value>> {
+fn vector_cast_preserves_dimension(target_dim: u32, source_dim: u32) -> bool {
+    target_dim == 0 || target_dim == source_dim
+}
+
+fn try_extract_constant_vector(expr: &TypedExpr, target_dimensions: u32) -> Option<Vec<Value>> {
+    let vec = try_extract_vector_constant_by_expr_type(expr)?;
+    validated_query_vector(vec, target_dimensions)
+}
+
+fn try_extract_vector_constant_by_expr_type(expr: &TypedExpr) -> Option<Vec<f64>> {
     match &expr.kind {
-        TypedExprKind::Constant(Value::Vector(values)) => {
-            Some(values.iter().copied().map(Value::Float64).collect())
+        TypedExprKind::Constant(value @ (Value::Vector(_) | Value::Array(_))) => {
+            cast_constant_to_vector(value.clone(), &DataType::Vector(0))
         }
-        TypedExprKind::Constant(Value::Array(values)) => values
-            .iter()
-            .map(|v| match v {
-                Value::Float64(f) => Some(Value::Float64(*f)),
-                Value::Int64(i) => Some(Value::Float64(*i as f64)),
-                Value::Int32(i) => Some(Value::Float64(*i as f64)),
-                _ => None,
-            })
-            .collect(),
         // Handle text-literal vector syntax: '[1,0,0]'::vector produces
         // Cast(Constant(Text("[1,0,0]")), Vector(N)). We handle this in the
         // Cast arm (below) rather than as a bare Constant(Text) to avoid
@@ -150,28 +154,54 @@ fn try_extract_constant_vector(expr: &TypedExpr) -> Option<Vec<Value>> {
         TypedExprKind::Cast {
             expr, target_type, ..
         } => {
-            // When the Cast target is Vector and the inner expr is a text
-            // literal, parse the text as a vector at plan time.
-            if matches!(target_type, DataType::Vector(_)) {
-                if let TypedExprKind::Constant(Value::Text(s)) = &expr.kind {
-                    return parse_text_as_vector(s);
-                }
+            if let DataType::Vector(_) = target_type {
+                let value = try_extract_vector_cast_input(expr)?;
+                return cast_constant_to_vector(value, target_type);
             }
             // Otherwise recurse into the inner expression.
-            try_extract_constant_vector(expr)
+            try_extract_vector_constant_by_expr_type(expr)
         }
         _ => None,
     }
+}
+
+fn try_extract_vector_cast_input(expr: &TypedExpr) -> Option<Value> {
+    match &expr.kind {
+        TypedExprKind::Constant(value) => Some(value.clone()),
+        TypedExprKind::Cast {
+            target_type: DataType::Vector(_),
+            ..
+        } => try_extract_vector_constant_by_expr_type(expr).map(Value::Vector),
+        _ => None,
+    }
+}
+
+fn cast_constant_to_vector(value: Value, target_type: &DataType) -> Option<Vec<f64>> {
+    use crate::sql::types::{cast::cast, CastContext};
+
+    match cast(value, target_type, CastContext::Explicit).ok()? {
+        Value::Vector(vec) => Some(vec),
+        _ => None,
+    }
+}
+
+fn validated_query_vector(vec: Vec<f64>, target_dimensions: u32) -> Option<Vec<Value>> {
+    crate::sql::vector::validate_vector(vec, target_dimensions)
+        .ok()
+        .map(|vec| vec.into_iter().map(Value::Float64).collect())
 }
 
 /// Parse a text string like `"[1,0,0]"` into a vector of f64 values.
 /// Returns `None` if the text is not a valid vector literal.
 /// Matches runtime vector input validation but only used at plan time for
 /// constant extraction.
-fn parse_text_as_vector(s: &str) -> Option<Vec<Value>> {
-    crate::sql::vector::parse_vector_text(s, 0)
-        .ok()
-        .map(|vec| vec.into_iter().map(Value::Float64).collect())
+#[cfg(test)]
+fn parse_text_as_vector(s: &str, target_dimensions: u32) -> Option<Vec<Value>> {
+    cast_constant_to_vector(
+        Value::Text(s.to_string()),
+        &DataType::Vector(target_dimensions),
+    )
+    .map(|vec| vec.into_iter().map(Value::Float64).collect())
 }
 
 /// Variant of `try_extract_constant_vector` that also handles Text constants
@@ -184,7 +214,7 @@ fn try_extract_constant_vector_or_text(
     target_dimensions: u32,
 ) -> Option<HnswQueryVector> {
     // First try the normal vector extraction path.
-    if let Some(v) = try_extract_constant_vector(expr) {
+    if let Some(v) = try_extract_constant_vector(expr, target_dimensions) {
         return Some(HnswQueryVector::Constant(v));
     }
     // For VEC_EMBED_* distance functions the second arg is a Text literal.
@@ -206,6 +236,7 @@ mod tests {
     use super::*;
     use crate::model::{ColumnDef, IndexDef};
     use crate::sql::analyzer::types::{FunctionKind, ResolvedFunction};
+    use rust_decimal::Decimal;
 
     fn vector_column(name: &str, dim: u32) -> ColumnDef {
         ColumnDef::new(name, DataType::Vector(dim), false)
@@ -229,6 +260,55 @@ mod tests {
         }
     }
 
+    fn vector_column_ref(column: &str, dim: u32) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 0,
+                column_name: column.to_string(),
+            },
+            DataType::Vector(dim),
+        )
+    }
+
+    fn cast_expr(expr: TypedExpr, target_type: DataType) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(expr),
+                target_type: target_type.clone(),
+                cast_context: crate::sql::types::CastContext::Explicit,
+            },
+            target_type,
+        )
+    }
+
+    fn vector_constant(values: &[f64]) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::Constant(Value::Vector(values.to_vec())),
+            DataType::Vector(values.len() as u32),
+        )
+    }
+
+    fn l2_order_expr(left: TypedExpr, right: TypedExpr) -> TypedOrderByExpr {
+        TypedOrderByExpr {
+            expr: TypedExpr::new(
+                TypedExprKind::FunctionCall {
+                    func: ResolvedFunction {
+                        name: "l2_distance".to_string(),
+                        kind: FunctionKind::Builtin,
+                        return_type: DataType::Float64,
+                    },
+                    args: vec![left, right],
+                    order_by: vec![],
+                    filter: None,
+                },
+                DataType::Float64,
+            ),
+            asc: true,
+            nulls_first: false,
+        }
+    }
+
     fn vec_embed_order_expr(column: &str, dim: u32, text: &str) -> TypedOrderByExpr {
         TypedOrderByExpr {
             expr: TypedExpr::new(
@@ -239,14 +319,7 @@ mod tests {
                         return_type: DataType::Float64,
                     },
                     args: vec![
-                        TypedExpr::new(
-                            TypedExprKind::ColumnRef {
-                                scope_depth: 0,
-                                column_index: 0,
-                                column_name: column.to_string(),
-                            },
-                            DataType::Vector(dim),
-                        ),
+                        vector_column_ref(column, dim),
                         TypedExpr::new(
                             TypedExprKind::Constant(Value::Text(text.to_string())),
                             DataType::Text,
@@ -266,7 +339,7 @@ mod tests {
 
     #[test]
     fn parse_text_vector_standard() {
-        let v = parse_text_as_vector("[1,0,0]").unwrap();
+        let v = parse_text_as_vector("[1,0,0]", 3).unwrap();
         assert_eq!(
             v,
             vec![
@@ -279,7 +352,7 @@ mod tests {
 
     #[test]
     fn parse_text_vector_with_whitespace() {
-        let v = parse_text_as_vector("  [ 1 , 2 , 3 ]  ").unwrap();
+        let v = parse_text_as_vector("  [ 1 , 2 , 3 ]  ", 3).unwrap();
         assert_eq!(
             v,
             vec![
@@ -292,7 +365,7 @@ mod tests {
 
     #[test]
     fn parse_text_vector_negative() {
-        let v = parse_text_as_vector("[-1,0.5,1]").unwrap();
+        let v = parse_text_as_vector("[-1,0.5,1]", 3).unwrap();
         assert_eq!(
             v,
             vec![
@@ -305,27 +378,67 @@ mod tests {
 
     #[test]
     fn parse_text_vector_empty_brackets() {
-        assert!(parse_text_as_vector("[]").is_none());
+        assert!(parse_text_as_vector("[]", 0).is_none());
     }
 
     #[test]
     fn parse_text_vector_non_numeric() {
-        assert!(parse_text_as_vector("[a,b,c]").is_none());
+        assert!(parse_text_as_vector("[a,b,c]", 3).is_none());
     }
 
     #[test]
     fn parse_text_vector_nan_rejected() {
-        assert!(parse_text_as_vector("[NaN,0,0]").is_none());
+        assert!(parse_text_as_vector("[NaN,0,0]", 3).is_none());
     }
 
     #[test]
     fn parse_text_vector_inf_rejected() {
-        assert!(parse_text_as_vector("[inf,0,0]").is_none());
+        assert!(parse_text_as_vector("[inf,0,0]", 3).is_none());
     }
 
     #[test]
     fn parse_text_vector_not_brackets() {
-        assert!(parse_text_as_vector("hello").is_none());
+        assert!(parse_text_as_vector("hello", 3).is_none());
+    }
+
+    // ── try_extract_vector_column_name tests ────────────────────
+
+    #[test]
+    fn extract_vector_column_ref() {
+        let expr = vector_column_ref("vec", 3);
+
+        assert_eq!(try_extract_vector_column_name(&expr), Some(("vec", 3)));
+    }
+
+    #[test]
+    fn extract_vector_column_cast_accepts_same_dimension() {
+        let expr = cast_expr(vector_column_ref("vec", 3), DataType::Vector(3));
+
+        assert_eq!(try_extract_vector_column_name(&expr), Some(("vec", 3)));
+    }
+
+    #[test]
+    fn extract_vector_column_cast_accepts_unconstrained_vector() {
+        let expr = cast_expr(vector_column_ref("vec", 3), DataType::Vector(0));
+
+        assert_eq!(try_extract_vector_column_name(&expr), Some(("vec", 3)));
+    }
+
+    #[test]
+    fn extract_vector_column_cast_rejects_dimension_change() {
+        let expr = cast_expr(vector_column_ref("vec", 3), DataType::Vector(2));
+
+        assert!(try_extract_vector_column_name(&expr).is_none());
+    }
+
+    #[test]
+    fn extract_vector_column_nested_cast_rejects_dimension_change() {
+        let expr = cast_expr(
+            cast_expr(vector_column_ref("vec", 3), DataType::Vector(3)),
+            DataType::Vector(2),
+        );
+
+        assert!(try_extract_vector_column_name(&expr).is_none());
     }
 
     // ── try_extract_constant_vector tests ────────────────────
@@ -344,8 +457,70 @@ mod tests {
             },
             DataType::Vector(3),
         );
-        let v = try_extract_constant_vector(&expr).unwrap();
+        let v = try_extract_constant_vector(&expr, 3).unwrap();
         assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn extract_text_vector_cast_validates_cast_dimensions_before_index_dimensions() {
+        // Simulates: '[1,2,3]'::vector(2) used against a vector(3) index.
+        // The explicit cast is invalid, so HNSW extraction must not bypass it.
+        let expr = TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Text("[1,2,3]".to_string())),
+                    DataType::Text,
+                )),
+                target_type: DataType::Vector(2),
+                cast_context: crate::sql::types::CastContext::Explicit,
+            },
+            DataType::Vector(2),
+        );
+
+        assert!(try_extract_constant_vector(&expr, 3).is_none());
+    }
+
+    #[test]
+    fn extract_array_vector_cast_validates_cast_dimensions_before_index_dimensions() {
+        // Simulates: ARRAY[1,2,3]::vector(2) used against a vector(3) index.
+        let expr = TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int32(1),
+                        Value::Int32(2),
+                        Value::Int32(3),
+                    ])),
+                    DataType::Array(Box::new(DataType::Int32)),
+                )),
+                target_type: DataType::Vector(2),
+                cast_context: crate::sql::types::CastContext::Explicit,
+            },
+            DataType::Vector(2),
+        );
+
+        assert!(try_extract_constant_vector(&expr, 3).is_none());
+    }
+
+    #[test]
+    fn extract_vector_cast_still_requires_index_dimension_match() {
+        let expr = TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int32(1),
+                        Value::Int32(2),
+                        Value::Int32(3),
+                    ])),
+                    DataType::Array(Box::new(DataType::Int32)),
+                )),
+                target_type: DataType::Vector(3),
+                cast_context: crate::sql::types::CastContext::Explicit,
+            },
+            DataType::Vector(3),
+        );
+
+        assert!(try_extract_constant_vector(&expr, 2).is_none());
     }
 
     #[test]
@@ -356,10 +531,129 @@ mod tests {
             TypedExprKind::Constant(Value::Text("[1,0,0]".to_string())),
             DataType::Text,
         );
-        assert!(try_extract_constant_vector(&expr).is_none());
+        assert!(try_extract_constant_vector(&expr, 3).is_none());
+    }
+
+    #[test]
+    fn extract_array_vector_validates_elements() {
+        let nan = TypedExpr::new(
+            TypedExprKind::Constant(Value::Array(vec![
+                Value::Float64(f64::NAN),
+                Value::Float64(0.0),
+                Value::Float64(0.0),
+            ])),
+            DataType::Array(Box::new(DataType::Float64)),
+        );
+        assert!(try_extract_constant_vector(&nan, 3).is_none());
+
+        let inf = TypedExpr::new(
+            TypedExprKind::Constant(Value::Array(vec![
+                Value::Float64(f64::INFINITY),
+                Value::Float64(0.0),
+                Value::Float64(0.0),
+            ])),
+            DataType::Array(Box::new(DataType::Float64)),
+        );
+        assert!(try_extract_constant_vector(&inf, 3).is_none());
+    }
+
+    #[test]
+    fn extract_array_vector_validates_dimensions() {
+        let expr = TypedExpr::new(
+            TypedExprKind::Constant(Value::Array(vec![Value::Float64(1.0), Value::Float64(2.0)])),
+            DataType::Array(Box::new(DataType::Float64)),
+        );
+        assert!(try_extract_constant_vector(&expr, 3).is_none());
+
+        let expr = TypedExpr::new(
+            TypedExprKind::Constant(Value::Array(vec![
+                Value::Int32(1),
+                Value::Int64(2),
+                Value::Float64(3.0),
+            ])),
+            DataType::Array(Box::new(DataType::Float64)),
+        );
+        assert_eq!(
+            try_extract_constant_vector(&expr, 3).unwrap(),
+            vec![
+                Value::Float64(1.0),
+                Value::Float64(2.0),
+                Value::Float64(3.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_array_vector_uses_runtime_vector_cast_rules() {
+        let expr = TypedExpr::new(
+            TypedExprKind::Constant(Value::Array(vec![
+                Value::Numeric(Decimal::from(1)),
+                Value::Int64(2),
+                Value::Float64(3.0),
+            ])),
+            DataType::Array(Box::new(DataType::Numeric {
+                precision: None,
+                scale: None,
+            })),
+        );
+
+        assert_eq!(
+            try_extract_constant_vector(&expr, 3).unwrap(),
+            vec![
+                Value::Float64(1.0),
+                Value::Float64(2.0),
+                Value::Float64(3.0)
+            ]
+        );
     }
 
     // ── detect_hnsw_scan_opportunity tests ───────────────────
+
+    #[test]
+    fn detect_hnsw_scan_rejects_column_side_vector_cast_dimension_change() {
+        let schema = TableSchema::new(
+            "public.docs".to_string(),
+            1,
+            vec![vector_column("vec", 3)],
+            vec![],
+        );
+        let order_expr = l2_order_expr(
+            cast_expr(vector_column_ref("vec", 3), DataType::Vector(2)),
+            vector_constant(&[1.0, 2.0, 3.0]),
+        );
+
+        assert!(detect_hnsw_scan_opportunity(
+            &schema,
+            &[order_expr],
+            Some(1),
+            &[hnsw_index("vec", "l2")],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn detect_hnsw_scan_accepts_column_side_noop_vector_cast() {
+        let schema = TableSchema::new(
+            "public.docs".to_string(),
+            1,
+            vec![vector_column("vec", 3)],
+            vec![],
+        );
+        let order_expr = l2_order_expr(
+            cast_expr(vector_column_ref("vec", 3), DataType::Vector(3)),
+            vector_constant(&[1.0, 2.0, 3.0]),
+        );
+
+        let params = detect_hnsw_scan_opportunity(
+            &schema,
+            &[order_expr],
+            Some(1),
+            &[hnsw_index("vec", "l2")],
+        )
+        .expect("same-dimension cast should remain eligible for HNSW");
+
+        assert_eq!(params.index_name, "idx_vec");
+    }
 
     #[test]
     fn detect_hnsw_scan_carries_pending_embedding_dimensions() {
