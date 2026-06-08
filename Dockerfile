@@ -47,6 +47,7 @@ RUN --mount=type=secret,id=gh_token,required=true \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" \
+    && cargo clean --release -p db9-server \
     && cargo build --release \
     && cp target/release/db9-server /usr/local/bin/db9-server \
     && git config --global --unset url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf
