@@ -201,21 +201,20 @@ impl Executor {
 
             if let Some(system_store) = crate::worker::get_system_store() {
                 let mut sys_txn = system_store.begin().await?;
-                let queue_entries = system_store
-                    .scan_due_queue_entries(&mut sys_txn, i64::MAX, u32::MAX)
+                // Bounded: read pending AsyncTrigger identities from the V2 index
+                // (+ gated legacy) — never a global due-queue scan of command
+                // payloads. The async-trigger `task_id` doubles as its enqueue
+                // timestamp, which is all this metric needs.
+                let task_ids = system_store
+                    .pending_async_trigger_task_ids(&mut sys_txn, self.tenant_keyspace())
                     .await?;
-                for (_key, entry) in queue_entries {
-                    if entry.task_type != crate::worker::types::TaskType::AsyncTrigger
-                        || entry.keyspace != self.tenant_keyspace()
-                    {
-                        continue;
-                    }
+                for task_id in task_ids {
                     pending += 1;
-                    if now_ms >= entry.task_id {
-                        latency_sum_ms += (now_ms - entry.task_id) as u64;
+                    if now_ms >= task_id {
+                        latency_sum_ms += (now_ms - task_id) as u64;
                         latency_cnt += 1;
                     }
-                    if entry.task_id >= cutoff_recent_ms {
+                    if task_id >= cutoff_recent_ms {
                         events_last_min += 1;
                     }
                 }

@@ -54,6 +54,20 @@ pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
 pub(super) const GC_INSTANCE_STATE_PREFIX: &[u8] = b"_gc_instance_";
 pub(super) const WORKER_BG_TASK_SEQ_PREFIX: &[u8] = b"_worker_bg_task_seq_";
+/// V2 due-queue (global). Same key STRUCTURE as `_worker_queue_` so the
+/// priority/fire_time ordering, scan bounds, and fire_time decode are reusable,
+/// but a distinct prefix: old binaries only read `_worker_queue_`, so the
+/// shrunk descriptor VALUE written here is invisible to them — making the
+/// rollout/rollback safe. See issue #2576.
+pub(super) const WORKER_QUEUE_V2_PREFIX: &[u8] = b"_wq_due_v2_";
+/// V2 payload range (global): the large `command`/`username`/`schedule` of
+/// split task types, keyed by full due identity so it is 1:1 with the due
+/// entry and never participates in a due-queue scan.
+pub(super) const WORKER_PAYLOAD_V2_PREFIX: &[u8] = b"_wq_payload_v2_";
+/// V2 worker queue secondary index (global). Keyspace/db lead so every
+/// task-targeted or tenant-targeted operation is a bounded prefix scan that
+/// never reads the (potentially large) due-queue value. See issue #2576.
+pub(super) const WORKER_QUEUE_INDEX_V2_PREFIX: &[u8] = b"_wq_idx_v2_";
 
 // ============================================================================
 // Migration keys
@@ -424,12 +438,18 @@ pub fn encode_worker_registry_prefix() -> Vec<u8> {
     WORKER_REGISTRY_PREFIX.to_vec()
 }
 
-/// Encode a worker queue key (global).
+/// Encode a worker queue key (global). LEGACY V1 layout.
 ///
 /// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}_{task_type:u8}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
 ///
 /// Priority byte comes first so lower values (higher priority) sort first.
 /// Fire time uses memcomparable encoding so earlier times sort first (handles negative values correctly).
+///
+/// Production no longer *writes* V1 keys (all enqueues go through the V2 layout
+/// via `put_task_v2`); it only reads/migrates pre-existing V1 keys, for which
+/// `encode_worker_queue_prefix` / `_scan_end` / `decode_worker_queue_fire_time`
+/// suffice. This full encoder is retained for tests that seed legacy entries.
+#[cfg(test)]
 pub fn encode_worker_queue_key(
     priority: u8,
     fire_time_ms: i64,
@@ -438,9 +458,30 @@ pub fn encode_worker_queue_key(
     db_id: u64,
     task_id: i64,
 ) -> Result<Vec<u8>> {
-    let mut key =
-        Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8 + 1 + 2 + keyspace.len() + 1 + 8 + 8);
-    key.extend_from_slice(WORKER_QUEUE_PREFIX);
+    encode_due_key_with_prefix(
+        WORKER_QUEUE_PREFIX,
+        priority,
+        fire_time_ms,
+        task_type,
+        keyspace,
+        db_id,
+        task_id,
+    )
+}
+
+/// Shared due-key encoder for both the V1 (`_worker_queue_`) and V2
+/// (`_wq_due_v2_`) prefixes — identical structure, different namespace.
+fn encode_due_key_with_prefix(
+    prefix: &[u8],
+    priority: u8,
+    fire_time_ms: i64,
+    task_type: u8,
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(prefix.len() + 1 + 8 + 1 + 2 + keyspace.len() + 1 + 8 + 8);
+    key.extend_from_slice(prefix);
     key.push(priority);
     key.extend(memcomparable::to_vec(&fire_time_ms)?);
     key.push(task_type);
@@ -458,14 +499,103 @@ pub fn encode_worker_queue_prefix() -> Vec<u8> {
     WORKER_QUEUE_PREFIX.to_vec()
 }
 
-/// Encode the exclusive upper bound for a worker queue range scan.
-///
-/// Used to scan all queue entries with a given priority and fire_time.
+/// Encode the exclusive upper bound for a LEGACY worker queue range scan.
+/// Used by the worker tick's byte-safe legacy dequeue during the V2 migration
+/// window (`scan_due_legacy_bytesafe`).
 /// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}` (no keyspace/db_id/task_id)
 pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Result<Vec<u8>> {
-    let mut key = Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8);
-    key.extend_from_slice(WORKER_QUEUE_PREFIX);
+    encode_due_scan_end_with_prefix(WORKER_QUEUE_PREFIX, priority, fire_time_ms)
+}
+
+fn encode_due_scan_end_with_prefix(
+    prefix: &[u8],
+    priority: u8,
+    fire_time_ms: i64,
+) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(prefix.len() + 1 + 8);
+    key.extend_from_slice(prefix);
     key.push(priority);
+    key.extend(memcomparable::to_vec(&fire_time_ms)?);
+    Ok(key)
+}
+
+// --- V2 due queue (`_wq_due_v2_`) ---------------------------------------------
+
+/// Encode a V2 due-queue key (same structure as the V1 worker queue key).
+pub fn encode_wq_due_v2_key(
+    priority: u8,
+    fire_time_ms: i64,
+    task_type: u8,
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+) -> Result<Vec<u8>> {
+    encode_due_key_with_prefix(
+        WORKER_QUEUE_V2_PREFIX,
+        priority,
+        fire_time_ms,
+        task_type,
+        keyspace,
+        db_id,
+        task_id,
+    )
+}
+
+/// Encode the prefix for all V2 due-queue keys (global).
+pub fn encode_wq_due_v2_prefix() -> Vec<u8> {
+    WORKER_QUEUE_V2_PREFIX.to_vec()
+}
+
+/// True if `key` is a V2 due-queue key (vs a legacy `_worker_queue_` key). Used
+/// by the worker dequeue to decode fire_time and clean up with the right layout.
+pub fn is_wq_due_v2_key(key: &[u8]) -> bool {
+    key.starts_with(WORKER_QUEUE_V2_PREFIX)
+}
+
+/// Exclusive upper bound for a V2 due-queue range scan at a given priority/time.
+pub fn encode_wq_due_v2_scan_end(priority: u8, fire_time_ms: i64) -> Result<Vec<u8>> {
+    encode_due_scan_end_with_prefix(WORKER_QUEUE_V2_PREFIX, priority, fire_time_ms)
+}
+
+/// Decode fire_time_ms from a V2 due-queue key (claim binding).
+pub fn decode_wq_due_v2_fire_time(key: &[u8]) -> Option<i64> {
+    decode_due_fire_time_with_prefix(WORKER_QUEUE_V2_PREFIX, key)
+}
+
+fn decode_due_fire_time_with_prefix(prefix: &[u8], key: &[u8]) -> Option<i64> {
+    use memcomparable::Deserializer;
+    if key.len() < prefix.len() + 1 + 8 || !key.starts_with(prefix) {
+        return None;
+    }
+    let offset = prefix.len() + 1;
+    let payload = &key[offset..];
+    let mut deserializer = Deserializer::new(payload);
+    serde::Deserialize::deserialize(&mut deserializer).ok()
+}
+
+// --- V2 payload range (`_wq_payload_v2_`) -------------------------------------
+
+/// Encode a V2 payload key, identity-keyed by full due identity (incl.
+/// fire_time) so it is 1:1 with the due entry and collision-free across the
+/// split task types' differing task_id schemes.
+pub fn encode_wq_payload_v2_key(
+    task_type: u8,
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+    fire_time_ms: i64,
+) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(
+        WORKER_PAYLOAD_V2_PREFIX.len() + 1 + 2 + keyspace.len() + 1 + 8 + 1 + 8 + 8,
+    );
+    key.extend_from_slice(WORKER_PAYLOAD_V2_PREFIX);
+    key.push(task_type);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
     key.extend(memcomparable::to_vec(&fire_time_ms)?);
     Ok(key)
 }
@@ -483,6 +613,151 @@ pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
     let payload = &key[offset..];
     let mut deserializer = Deserializer::new(payload);
     serde::Deserialize::deserialize(&mut deserializer).ok()
+}
+
+// ============================================================================
+// V2 worker queue secondary index (issue #2576)
+//
+// Layout: `_wq_idx_v2_{keyspace_len:u16 be}{keyspace}_{db_id:be8}_{task_type:u8}{task_id:be8}{fire_time:memcomparable}`
+//
+// Keyspace/db lead so every task-targeted or tenant-targeted operation is a
+// bounded prefix scan; `fire_time` in the tail makes the index multi-valued so
+// distinct due entries for the same (keyspace, db, task_type, task_id) that
+// differ in fire_time — e.g. a cron job's successive requeues — each get their
+// own row instead of overwriting. NOTE: this disambiguates only when fire_time
+// differs; two enqueues sharing the full (task_type, task_id, fire_time) identity
+// still collide (e.g. two async-trigger activations in the same millisecond,
+// where task_id and fire_time are both derived from the same wall clock — a
+// pre-existing identity collision, not introduced by V2). The index VALUE is a
+// single `priority` byte, which together with the key fields reconstructs the
+// exact due-queue key without ever reading the (large) due-queue value.
+// ============================================================================
+
+/// Length of the fixed tail after the `{keyspace}_{db_id}_` prefix:
+/// task_type(1) + task_id(8) + fire_time(memcomparable i64 = 8).
+const WQ_INDEX_TAIL_LEN: usize = 1 + 8 + 8;
+
+fn wq_index_key_head(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        WORKER_QUEUE_INDEX_V2_PREFIX.len() + 2 + keyspace.len() + 1 + 8 + 1 + WQ_INDEX_TAIL_LEN,
+    );
+    key.extend_from_slice(WORKER_QUEUE_INDEX_V2_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key
+}
+
+/// Full V2 index key for one due entry.
+pub fn encode_wq_index_key(
+    keyspace: &str,
+    db_id: u64,
+    task_type: u8,
+    task_id: i64,
+    fire_time_ms: i64,
+) -> Result<Vec<u8>> {
+    let mut key = wq_index_key_head(keyspace, db_id);
+    key.push(task_type);
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key.extend(memcomparable::to_vec(&fire_time_ms)?);
+    Ok(key)
+}
+
+/// Prefix matching every V2 index row for one keyspace (all dbs, all task
+/// types). Used by the per-keyspace async-trigger stats metric.
+pub fn encode_wq_index_prefix_keyspace(keyspace: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_QUEUE_INDEX_V2_PREFIX.len() + 2 + keyspace.len() + 1);
+    key.extend_from_slice(WORKER_QUEUE_INDEX_V2_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key
+}
+
+/// Prefix matching every V2 index row for one (keyspace, db_id) — all task
+/// types. Used by DROP DATABASE queue reap.
+pub fn encode_wq_index_prefix_db(keyspace: &str, db_id: u64) -> Vec<u8> {
+    wq_index_key_head(keyspace, db_id)
+}
+
+/// Prefix matching every V2 index row for one (keyspace, db_id, task_type).
+/// Used by cron reconciliation.
+pub fn encode_wq_index_prefix_db_type(keyspace: &str, db_id: u64, task_type: u8) -> Vec<u8> {
+    let mut key = wq_index_key_head(keyspace, db_id);
+    key.push(task_type);
+    key
+}
+
+/// Prefix matching every V2 index row for one (keyspace, db_id, task_type,
+/// task_id). Used by per-task lookup (schedule replace / unschedule / dedup).
+pub fn encode_wq_index_prefix_task(
+    keyspace: &str,
+    db_id: u64,
+    task_type: u8,
+    task_id: i64,
+) -> Vec<u8> {
+    let mut key = wq_index_key_head(keyspace, db_id);
+    key.push(task_type);
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key
+}
+
+/// Decoded components of a V2 index row.
+pub struct WqIndexEntry {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub task_type: u8,
+    pub task_id: i64,
+    pub fire_time_ms: i64,
+}
+
+/// Decode a V2 index key back into its components. Returns `None` if the key is
+/// malformed or carries a non-UTF-8 keyspace.
+pub fn decode_wq_index_key(key: &[u8]) -> Option<WqIndexEntry> {
+    let p = WORKER_QUEUE_INDEX_V2_PREFIX.len();
+    if key.len() < p + 2 {
+        return None;
+    }
+    if !key.starts_with(WORKER_QUEUE_INDEX_V2_PREFIX) {
+        return None;
+    }
+    let ks_len = u16::from_be_bytes(key[p..p + 2].try_into().ok()?) as usize;
+    let ks_start = p + 2;
+    let ks_end = ks_start + ks_len;
+    // layout after keyspace: '_' db_id(8) '_' task_type(1) task_id(8) fire_time(8)
+    let expected_len = ks_end + 1 + 8 + 1 + WQ_INDEX_TAIL_LEN;
+    if key.len() != expected_len {
+        return None;
+    }
+    let keyspace = std::str::from_utf8(&key[ks_start..ks_end])
+        .ok()?
+        .to_string();
+    let mut cursor = ks_end;
+    if key[cursor] != b'_' {
+        return None;
+    }
+    cursor += 1;
+    let db_id = u64::from_be_bytes(key[cursor..cursor + 8].try_into().ok()?);
+    cursor += 8;
+    if key[cursor] != b'_' {
+        return None;
+    }
+    cursor += 1;
+    let task_type = key[cursor];
+    cursor += 1;
+    let task_id = i64::from_be_bytes(key[cursor..cursor + 8].try_into().ok()?);
+    cursor += 8;
+    let mut de = memcomparable::Deserializer::new(&key[cursor..cursor + 8]);
+    let fire_time_ms: i64 = serde::Deserialize::deserialize(&mut de).ok()?;
+    Some(WqIndexEntry {
+        keyspace,
+        db_id,
+        task_type,
+        task_id,
+        fire_time_ms,
+    })
 }
 
 // ============================================================================
@@ -856,6 +1131,127 @@ mod tests {
         assert_ne!(key_a, key_b);
         assert_ne!(key_a, key_c);
         assert_ne!(key_b, key_c);
+    }
+
+    // ── V2 worker queue (issue #2576) ────────────────────────────────────
+
+    #[test]
+    fn wq_due_v2_key_shares_structure_with_v1_but_distinct_prefix() {
+        let v1 = encode_worker_queue_key(3, 1234567890, 0x01, "tenant_a", 42, 7).unwrap();
+        let v2 = encode_wq_due_v2_key(3, 1234567890, 0x01, "tenant_a", 42, 7).unwrap();
+        // Distinct prefixes so an old binary (reads only `_worker_queue_`) never
+        // sees a V2 descriptor value it cannot deserialize.
+        assert!(v1.starts_with(WORKER_QUEUE_PREFIX));
+        assert!(v2.starts_with(WORKER_QUEUE_V2_PREFIX));
+        assert!(!v1.starts_with(WORKER_QUEUE_V2_PREFIX));
+        // Bodies after their prefixes are byte-identical (same ordering scheme).
+        assert_eq!(
+            &v1[WORKER_QUEUE_PREFIX.len()..],
+            &v2[WORKER_QUEUE_V2_PREFIX.len()..]
+        );
+    }
+
+    #[test]
+    fn wq_due_v2_fire_time_roundtrips_and_orders() {
+        let pos = encode_wq_due_v2_key(3, 1234567890, 1, "t", 42, 7).unwrap();
+        let neg = encode_wq_due_v2_key(3, -987654321, 1, "t", 42, 7).unwrap();
+        assert_eq!(decode_wq_due_v2_fire_time(&pos), Some(1234567890));
+        assert_eq!(decode_wq_due_v2_fire_time(&neg), Some(-987654321));
+        // A V1 key must not decode as a V2 key (prefix guard).
+        let v1 = encode_worker_queue_key(3, 1000, 1, "t", 42, 7).unwrap();
+        assert_eq!(decode_wq_due_v2_fire_time(&v1), None);
+        // Earlier fire_time sorts first within a priority band.
+        let early = encode_wq_due_v2_key(5, 1000, 1, "t", 1, 1).unwrap();
+        let late = encode_wq_due_v2_key(5, 2000, 1, "t", 1, 1).unwrap();
+        assert!(early < late);
+    }
+
+    #[test]
+    fn wq_due_v2_scan_end_bounds_priority_band() {
+        let end = encode_wq_due_v2_scan_end(5, 1000).unwrap();
+        let inside = encode_wq_due_v2_key(5, 1000, 1, "k", 1, 2).unwrap();
+        assert!(inside.starts_with(&end));
+        let later = encode_wq_due_v2_scan_end(5, 1001).unwrap();
+        assert!(end < later);
+    }
+
+    #[test]
+    fn wq_index_key_roundtrips() {
+        let key = encode_wq_index_key("tenant_a", 42, 0x02, 7, 1234567890).unwrap();
+        let decoded = decode_wq_index_key(&key).expect("decode");
+        assert_eq!(decoded.keyspace, "tenant_a");
+        assert_eq!(decoded.db_id, 42);
+        assert_eq!(decoded.task_type, 0x02);
+        assert_eq!(decoded.task_id, 7);
+        assert_eq!(decoded.fire_time_ms, 1234567890);
+
+        // Negative fire_time roundtrips too (memcomparable tail).
+        let neg = encode_wq_index_key("t", 1, 0x01, 9, -5).unwrap();
+        assert_eq!(decode_wq_index_key(&neg).unwrap().fire_time_ms, -5);
+    }
+
+    #[test]
+    fn wq_index_prefix_containment_is_hierarchical() {
+        let ks = encode_wq_index_prefix_keyspace("ks");
+        let db = encode_wq_index_prefix_db("ks", 7);
+        let db_type = encode_wq_index_prefix_db_type("ks", 7, 0x01);
+        let task = encode_wq_index_prefix_task("ks", 7, 0x01, 99);
+        let full = encode_wq_index_key("ks", 7, 0x01, 99, 1000).unwrap();
+
+        assert!(db.starts_with(&ks));
+        assert!(db_type.starts_with(&db));
+        assert!(task.starts_with(&db_type));
+        assert!(full.starts_with(&task));
+
+        // A different db / task_type / task_id must NOT match the narrower prefix.
+        let other_db = encode_wq_index_key("ks", 8, 0x01, 99, 1000).unwrap();
+        assert!(!other_db.starts_with(&db));
+        let other_type = encode_wq_index_key("ks", 7, 0x02, 99, 1000).unwrap();
+        assert!(!other_type.starts_with(&db_type));
+        let other_task = encode_wq_index_key("ks", 7, 0x01, 100, 1000).unwrap();
+        assert!(!other_task.starts_with(&task));
+    }
+
+    #[test]
+    fn wq_index_is_multi_valued_by_fire_time() {
+        // Same (ks, db, type, task_id), different fire_time ⇒ distinct index rows,
+        // both under the per-task prefix. This is what prevents silent overwrite
+        // for cron requeues and same-ms async-trigger task_ids.
+        let a = encode_wq_index_key("ks", 1, 0x01, 5, 1000).unwrap();
+        let b = encode_wq_index_key("ks", 1, 0x01, 5, 2000).unwrap();
+        let task_prefix = encode_wq_index_prefix_task("ks", 1, 0x01, 5);
+        assert_ne!(a, b);
+        assert!(a.starts_with(&task_prefix));
+        assert!(b.starts_with(&task_prefix));
+    }
+
+    #[test]
+    fn wq_payload_key_is_unique_per_due_identity() {
+        let p1 = encode_wq_payload_v2_key(0x01, "ks", 1, 5, 1000).unwrap();
+        let p2 = encode_wq_payload_v2_key(0x01, "ks", 1, 5, 2000).unwrap();
+        let p3 = encode_wq_payload_v2_key(0x10, "ks", 1, 5, 1000).unwrap();
+        assert_ne!(p1, p2, "different fire_time ⇒ different payload key");
+        assert_ne!(p1, p3, "different task_type ⇒ different payload key");
+        assert!(p1.starts_with(WORKER_PAYLOAD_V2_PREFIX));
+    }
+
+    #[test]
+    fn v2_prefixes_are_mutually_disjoint() {
+        // No V2 prefix is a prefix of another, and none collide with V1 — so a
+        // scan of one range never bleeds into another.
+        let prefixes: [&[u8]; 4] = [
+            WORKER_QUEUE_PREFIX,
+            WORKER_QUEUE_V2_PREFIX,
+            WORKER_PAYLOAD_V2_PREFIX,
+            WORKER_QUEUE_INDEX_V2_PREFIX,
+        ];
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                if i != j {
+                    assert!(!a.starts_with(b), "{a:?} must not start with {b:?}");
+                }
+            }
+        }
     }
 
     #[test]

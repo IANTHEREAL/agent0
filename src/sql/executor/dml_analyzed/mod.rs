@@ -580,8 +580,8 @@ impl Executor {
             );
             let result: Result<bool, anyhow::Error> = async {
                 let mut txn = store.begin().await?;
-                let existing = store
-                    .scan_queue_entries_for_task(
+                let already_pending = store
+                    .task_has_pending(
                         &mut txn,
                         &keyspace,
                         db_id,
@@ -589,14 +589,12 @@ impl Executor {
                         crate::worker::types::TaskType::AutoAnalyze,
                     )
                     .await?;
-                if existing.is_empty() {
+                if !already_pending {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as i64;
-                    store
-                        .put_worker_queue_entry(&mut txn, &entry, now_ms)
-                        .await?;
+                    store.put_task_v2(&mut txn, &entry, now_ms).await?;
                     store
                         .update_registry_task_types(
                             &mut txn,

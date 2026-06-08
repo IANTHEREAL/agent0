@@ -845,7 +845,7 @@ pub async fn execute_create_index(
             let now_ms = chrono::Utc::now().timestamp_millis();
             let mut sys_txn = system_store.begin().await?;
             system_store
-                .put_worker_queue_entry(&mut sys_txn, &entry, now_ms)
+                .put_task_v2(&mut sys_txn, &entry, now_ms)
                 .await?;
             system_store
                 .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_DDL, 0)

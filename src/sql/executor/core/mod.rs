@@ -271,7 +271,7 @@ impl Executor {
                             );
                             let fire_time = chrono::Utc::now().timestamp_millis();
                             system_store
-                                .put_worker_queue_entry(&mut txn, &entry, fire_time)
+                                .put_task_v2(&mut txn, &entry, fire_time)
                                 .await?;
                             system_store
                                 .update_registry_task_types(
@@ -363,7 +363,7 @@ impl Executor {
                         entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
                         let mut txn = system_store.begin().await?;
                         system_store
-                            .put_worker_queue_entry(&mut txn, &entry, fire_time_ms)
+                            .put_task_v2(&mut txn, &entry, fire_time_ms)
                             .await?;
                         system_store
                             .update_registry_task_types(

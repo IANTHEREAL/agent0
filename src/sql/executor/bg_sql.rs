@@ -93,7 +93,7 @@ async fn execute_bg_launch(
 
     let mut sys_txn = system_store.begin().await?;
     system_store
-        .put_worker_queue_entry(&mut sys_txn, &entry, fire_time)
+        .put_task_v2(&mut sys_txn, &entry, fire_time)
         .await?;
     system_store
         .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_SQL, 0)
@@ -151,12 +151,12 @@ async fn execute_bg_result(keyspace: &str, db_id: u64, args: &[Value]) -> Result
         return Ok(Value::Text(result_text));
     }
 
-    let queue_keys = system_store
-        .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, task_id, TaskType::BgSql)
+    let pending = system_store
+        .task_has_pending(&mut sys_txn, keyspace, db_id, task_id, TaskType::BgSql)
         .await?;
     sys_txn.commit().await?;
 
-    if !queue_keys.is_empty() {
+    if pending {
         Ok(Value::Text("pending".to_string()))
     } else {
         Ok(Value::Text("not found".to_string()))

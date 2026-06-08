@@ -8,7 +8,7 @@ use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
-use crate::storage::{CronRunClaimStatus, TikvStore};
+use crate::storage::{CronRunClaimStatus, TikvStore, WqIndexRow};
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 
@@ -177,10 +177,38 @@ impl WorkerEngine {
         let now_ms = now_epoch_ms();
 
         let mut txn = self.system_store.begin().await?;
-        let due_entries = self
+        // V2 descriptors (small values) up to `now`.
+        let mut due_entries: Vec<(Vec<u8>, DueItem)> = self
             .system_store
-            .scan_due_queue_entries(&mut txn, now_ms, 1000)
-            .await?;
+            .scan_due_v2(&mut txn, now_ms, 1000)
+            .await?
+            .into_iter()
+            .map(|(key, descriptor)| (key, DueItem::V2(descriptor)))
+            .collect();
+        // Migration window only: an OLD binary may still enqueue legacy
+        // `_worker_queue_` entries during a rolling deploy. The new binary
+        // executes them IN PLACE (never moves them to V2), sharing the same
+        // worker-claim identity as the old binary so an entry is processed once
+        // and deleted from its single namespace. V1 drains naturally: cron
+        // requeues its next fire as V2, one-shots are executed and deleted.
+        // Byte-safe (key scan + per-key point-get); gated so it is one empty RPC
+        // once V1 is drained. NOTE: V2 is scanned first up to the limit and
+        // legacy only fills the remainder, so legacy drains opportunistically
+        // (not on a fixed schedule); a sustained backlog of >=limit due V2
+        // entries deprioritizes it — acceptable since old-binary writes cease
+        // once the deploy completes.
+        if due_entries.len() < 1000 && self.system_store.legacy_queue_has_entries(&mut txn).await? {
+            let remaining = (1000 - due_entries.len()) as u32;
+            let legacy = self
+                .system_store
+                .scan_due_legacy_bytesafe(&mut txn, now_ms, remaining)
+                .await?;
+            due_entries.extend(
+                legacy
+                    .into_iter()
+                    .map(|(key, entry)| (key, DueItem::Legacy(entry))),
+            );
+        }
         txn.commit().await?;
 
         self.metrics.sample_tick(
@@ -281,16 +309,27 @@ impl WorkerEngine {
     /// Reconcile cron jobs for a single (keyspace, db_id).
     /// Returns (enqueued_count, cleaned_count).
     async fn reconcile_cron_for_db(&self, keyspace: &str, db_id: u64) -> Result<(u32, u32)> {
-        // 1. Scan existing cron queue entries from the system store
+        // 1. Existing cron entries. The V2 index is a bounded prefix scan that
+        //    reads only tiny index values; the gated legacy scan covers pre-V2
+        //    `_worker_queue_` entries (never indexed into V2) so reconcile does
+        //    NOT re-enqueue a V2 copy of a job that still has a legacy entry —
+        //    which would double-fire it during a rolling deploy.
         let mut txn = self.system_store.begin().await?;
-        let existing_queue = self
+        let existing_rows = self
             .system_store
-            .scan_cron_queue_entries_for_db(&mut txn, keyspace, db_id)
+            .index_rows_for_db_type(&mut txn, keyspace, db_id, TaskType::Cron)
+            .await?;
+        let legacy_entries = self
+            .system_store
+            .legacy_entries_for_db_type(&mut txn, keyspace, db_id, TaskType::Cron)
             .await?;
         txn.commit().await?;
 
-        let existing_job_ids: HashSet<i64> =
-            existing_queue.iter().map(|(_, task_id)| *task_id).collect();
+        let existing_job_ids: HashSet<i64> = existing_rows
+            .iter()
+            .map(|r| r.task_id)
+            .chain(legacy_entries.iter().map(|(_, task_id)| *task_id))
+            .collect();
 
         // 2. Acquire tenant store and check cron state
         let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
@@ -301,17 +340,32 @@ impl WorkerEngine {
 
         if !cron_enabled {
             tenant_txn.commit().await?;
-            // Cron disabled but registry has cron bit — clean up all queue entries
-            if !existing_queue.is_empty() {
+            // Cron disabled but registry has cron bit — clean up all queue
+            // entries across BOTH layers.
+            let total = existing_rows.len() + legacy_entries.len();
+            if total > 0 {
                 let mut sys_txn = self.system_store.begin().await?;
-                for (key, _) in &existing_queue {
+                for r in &existing_rows {
+                    self.system_store
+                        .delete_task_v2(
+                            &mut sys_txn,
+                            &r.due_key,
+                            &r.keyspace,
+                            r.db_id,
+                            r.task_type,
+                            r.task_id,
+                            r.fire_time_ms,
+                        )
+                        .await?;
+                }
+                for (key, _) in &legacy_entries {
                     self.system_store
                         .delete_worker_queue_entry(&mut sys_txn, key)
                         .await?;
                 }
                 sys_txn.commit().await?;
             }
-            return Ok((0, existing_queue.len() as u32));
+            return Ok((0, total as u32));
         }
 
         // 3. Load active cron jobs from tenant store
@@ -359,29 +413,46 @@ impl WorkerEngine {
                 )
                 .with_schedule(job.schedule.clone());
                 self.system_store
-                    .put_worker_queue_entry(&mut sys_txn, &queue_entry, next_fire)
+                    .put_task_v2(&mut sys_txn, &queue_entry, next_fire)
                     .await?;
                 enqueued += 1;
             }
             sys_txn.commit().await?;
         }
 
-        // 5. Cleanup orphans: queue entries whose job_id is not in active jobs
-        let orphan_keys: Vec<Vec<u8>> = existing_queue
-            .into_iter()
+        // 5. Cleanup orphans across BOTH layers: queue entries whose job_id is
+        //    not in active jobs.
+        let orphan_rows: Vec<&WqIndexRow> = existing_rows
+            .iter()
+            .filter(|r| !active_job_ids.contains(&r.task_id))
+            .collect();
+        let orphan_legacy: Vec<&(Vec<u8>, i64)> = legacy_entries
+            .iter()
             .filter(|(_, task_id)| !active_job_ids.contains(task_id))
-            .map(|(key, _)| key)
             .collect();
 
-        if !orphan_keys.is_empty() {
+        if !orphan_rows.is_empty() || !orphan_legacy.is_empty() {
             let mut sys_txn = self.system_store.begin().await?;
-            for key in &orphan_keys {
+            for r in &orphan_rows {
+                self.system_store
+                    .delete_task_v2(
+                        &mut sys_txn,
+                        &r.due_key,
+                        &r.keyspace,
+                        r.db_id,
+                        r.task_type,
+                        r.task_id,
+                        r.fire_time_ms,
+                    )
+                    .await?;
+            }
+            for (key, _) in &orphan_legacy {
                 self.system_store
                     .delete_worker_queue_entry(&mut sys_txn, key)
                     .await?;
             }
             sys_txn.commit().await?;
-            cleaned = orphan_keys.len() as u32;
+            cleaned = (orphan_rows.len() + orphan_legacy.len()) as u32;
         }
 
         Ok((enqueued, cleaned))
@@ -641,7 +712,7 @@ impl WorkerEngine {
         config: &WorkerConfig,
         metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
-        entry: TaskQueueEntry,
+        due: DueItem,
         shutdown_signal: CancellationToken,
     ) -> Result<()> {
         Self::claim_and_execute_core(
@@ -650,22 +721,77 @@ impl WorkerEngine {
             config,
             metrics,
             queue_key,
-            entry,
+            due,
             shutdown_signal,
             Self::finalize_cron_run,
         )
         .await
     }
 
+    /// Delete a due entry using the correct layout: V2 removes the descriptor,
+    /// index, and (split-type) payload together; legacy removes just the
+    /// `_worker_queue_` key.
+    async fn delete_due_entry(
+        system_store: &Arc<TikvStore>,
+        txn: &mut tikv_client::Transaction,
+        is_v2: bool,
+        due_key: &[u8],
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+    ) -> Result<()> {
+        if is_v2 {
+            system_store
+                .delete_task_v2(
+                    txn,
+                    due_key,
+                    &entry.keyspace,
+                    entry.db_id,
+                    entry.task_type.to_bitmask(),
+                    entry.task_id,
+                    fire_time_ms,
+                )
+                .await
+        } else {
+            system_store.delete_worker_queue_entry(txn, due_key).await
+        }
+    }
+
+    /// Release a just-won worker claim (used when we decline to execute after
+    /// claiming — e.g. the entry was concurrently deleted).
+    async fn release_claim(
+        system_store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        task_type: TaskType,
+    ) -> Result<()> {
+        let mut txn = system_store.begin().await?;
+        system_store
+            .delete_worker_claim(&mut txn, keyspace, db_id, task_id, fire_time_ms, task_type)
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     /// Core implementation of claim_and_execute, parameterized over the finalize
     /// function so tests can inject failures in the real code path.
+    ///
+    /// Handles both V2 descriptors and (during the migration window) legacy
+    /// `_worker_queue_` entries. A legacy entry is executed IN PLACE and deleted
+    /// from V1 — never moved to V2 — so an entry exists in a single namespace and
+    /// the shared worker claim makes it execute-once even across an old+new
+    /// binary deploy. A post-claim existence re-check closes the
+    /// read-before/claim-after-release window: if the entry was deleted by
+    /// another replica (or unschedule / DROP DATABASE reap) since the tick
+    /// scanned it, we release the claim and skip rather than re-execute.
     async fn claim_and_execute_core<F, Fut>(
         system_store: &Arc<TikvStore>,
         pool: &Arc<TikvClientPool>,
         config: &WorkerConfig,
         metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
-        entry: TaskQueueEntry,
+        due: DueItem,
         shutdown_signal: CancellationToken,
         finalize_fn: F,
     ) -> Result<()>
@@ -673,18 +799,28 @@ impl WorkerEngine {
         F: FnOnce(Arc<TikvStore>, u64, CronRun, CronRunStatus, Option<String>, i64, i64) -> Fut,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let queue_fire_time_ms = crate::storage::decode_worker_queue_fire_time(&queue_key)
-            .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
+        // The due key carries the prefix (V2 `_wq_due_v2_` vs legacy
+        // `_worker_queue_`); decode fire_time and clean up accordingly.
+        let is_v2 = crate::storage::is_wq_due_v2_key(&queue_key);
+        let queue_fire_time_ms = if is_v2 {
+            crate::storage::decode_wq_due_v2_fire_time(&queue_key)
+        } else {
+            crate::storage::decode_worker_queue_fire_time(&queue_key)
+        }
+        .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
         let scheduled_minute = queue_fire_time_ms.div_euclid(60_000);
-        let claim = WorkerClaim::new(config.worker_id.clone(), entry.task_type);
+        let task_type = due.task_type();
+        let (claim_keyspace, claim_db_id, claim_task_id) =
+            (due.keyspace().to_string(), due.db_id(), due.task_id());
+        let claim = WorkerClaim::new(config.worker_id.clone(), task_type);
 
         let mut txn = system_store.begin().await?;
         let claimed = system_store
             .try_claim_worker_task(
                 &mut txn,
-                &entry.keyspace,
-                entry.db_id,
-                entry.task_id,
+                &claim_keyspace,
+                claim_db_id,
+                claim_task_id,
                 queue_fire_time_ms,
                 &claim,
             )
@@ -697,6 +833,99 @@ impl WorkerEngine {
             return Ok(());
         }
         txn.commit().await?;
+
+        // Post-claim existence re-check: if the due key was deleted since the
+        // tick scanned it — by another replica that executed it first, by
+        // unschedule, or by a DROP DATABASE reap — do NOT execute. This makes
+        // execution at-most-once across concurrent replicas (the shared claim
+        // alone only blocks *simultaneous* execution, not read-before /
+        // claim-after-release re-execution).
+        let still_present = {
+            let mut rtxn = system_store.begin().await?;
+            let present = rtxn.get(queue_key.clone()).await?.is_some();
+            rtxn.rollback().await.ok();
+            present
+        };
+        if !still_present {
+            Self::release_claim(
+                system_store,
+                &claim_keyspace,
+                claim_db_id,
+                claim_task_id,
+                queue_fire_time_ms,
+                task_type,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Hydrate the full entry now that we own the claim and confirmed it
+        // exists. Legacy entries carry the command inline; split V2 types fetch
+        // the command/username/schedule out-of-line by exact identity.
+        let entry: TaskQueueEntry = match due {
+            DueItem::Legacy(e) => e,
+            DueItem::V2(descriptor) => {
+                let payload = if descriptor.needs_payload() {
+                    let mut ptxn = system_store.begin().await?;
+                    let p = system_store
+                        .get_task_payload_v2(
+                            &mut ptxn,
+                            task_type.to_bitmask(),
+                            &claim_keyspace,
+                            claim_db_id,
+                            claim_task_id,
+                            queue_fire_time_ms,
+                        )
+                        .await?;
+                    ptxn.rollback().await.ok();
+                    p
+                } else {
+                    None
+                };
+                match descriptor.into_entry(payload) {
+                    Some(e) => e,
+                    None => {
+                        // Descriptor present but payload missing. put_task_v2 /
+                        // delete_task_v2 write/remove descriptor+index+payload
+                        // atomically, so the normal cause is a concurrent delete
+                        // that already removed the descriptor too (no-op below).
+                        // If instead the descriptor genuinely persists without a
+                        // payload (corruption), tear down the orphaned
+                        // descriptor+index here so we do NOT re-claim it every
+                        // tick forever; then release the claim and skip.
+                        let mut ctxn = system_store.begin().await?;
+                        system_store
+                            .delete_task_v2(
+                                &mut ctxn,
+                                &queue_key,
+                                &claim_keyspace,
+                                claim_db_id,
+                                task_type.to_bitmask(),
+                                claim_task_id,
+                                queue_fire_time_ms,
+                            )
+                            .await?;
+                        system_store
+                            .delete_worker_claim(
+                                &mut ctxn,
+                                &claim_keyspace,
+                                claim_db_id,
+                                claim_task_id,
+                                queue_fire_time_ms,
+                                task_type,
+                            )
+                            .await?;
+                        ctxn.commit().await?;
+                        warn!(
+                            "V2 task payload missing after claim; cleaned orphaned descriptor and skipped: \
+                             keyspace={} db_id={} task_id={} type={:?} fire_time={}",
+                            claim_keyspace, claim_db_id, claim_task_id, task_type, queue_fire_time_ms
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        };
 
         let (cron_run, keep_queue_entry) = if entry.task_type == TaskType::Cron {
             Self::claim_and_record_cron_run(pool, &entry, scheduled_minute).await?
@@ -787,7 +1016,7 @@ impl WorkerEngine {
         if !keep_queue_entry {
             if entry.task_type == TaskType::HnswMerge {
                 // HnswMerge uses deterministic fire_time=0 → concurrent DML can
-                // overwrite the same queue key with a new nonce. Read-compare-delete
+                // overwrite the same descriptor with a new nonce. Read-compare-delete
                 // ensures we only remove the entry we actually processed.
                 //
                 // Only delete the queue entry on SUCCESS. On failure (e.g., S3 not
@@ -797,24 +1026,45 @@ impl WorkerEngine {
                 // until the 600s periodic sweep re-enqueues.
                 if exec_result.is_ok() {
                     if let Some(current_bytes) = txn.get(queue_key.clone()).await? {
-                        let current =
-                            TaskQueueEntry::deserialize_compat(&current_bytes).map_err(|e| {
-                                anyhow::anyhow!("Failed to deserialize worker queue entry: {e}")
-                            })?;
-                        if current.nonce == entry.nonce {
-                            system_store
-                                .delete_worker_queue_entry(&mut txn, &queue_key)
-                                .await?;
+                        // V2 value is a descriptor carrying the nonce inline; a
+                        // legacy value is a full entry. Compare from whichever.
+                        let current_nonce = if is_v2 {
+                            TaskDescriptorV2::decode(&current_bytes)
+                                .map(|d| d.nonce)
+                                .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?
+                        } else {
+                            TaskQueueEntry::deserialize_compat(&current_bytes)
+                                .map(|e| e.nonce)
+                                .map_err(|e| {
+                                    anyhow!("Failed to deserialize worker queue entry: {e}")
+                                })?
+                        };
+                        if current_nonce == entry.nonce {
+                            Self::delete_due_entry(
+                                system_store,
+                                &mut txn,
+                                is_v2,
+                                &queue_key,
+                                &entry,
+                                queue_fire_time_ms,
+                            )
+                            .await?;
                         }
                         // nonce mismatch → DML overwrote → skip delete, next tick handles it
                     }
                 }
             } else {
                 // Non-HnswMerge: these tasks never share deterministic keys with DML,
-                // so unconditional delete is safe (original behavior preserved).
-                system_store
-                    .delete_worker_queue_entry(&mut txn, &queue_key)
-                    .await?;
+                // so unconditional delete is safe.
+                Self::delete_due_entry(
+                    system_store,
+                    &mut txn,
+                    is_v2,
+                    &queue_key,
+                    &entry,
+                    queue_fire_time_ms,
+                )
+                .await?;
             }
         }
 
@@ -823,7 +1073,7 @@ impl WorkerEngine {
                 if let Some(schedule) = next_entry.schedule.as_deref() {
                     if let Ok(next_fire) = compute_next_fire_time(schedule) {
                         system_store
-                            .put_worker_queue_entry(&mut txn, &next_entry, next_fire)
+                            .put_task_v2(&mut txn, &next_entry, next_fire)
                             .await?;
                     }
                 }
@@ -1518,7 +1768,7 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
                     let enqueue_result: Result<()> = async {
                         let mut sys_txn = system_store.begin().await?;
                         system_store
-                            .put_worker_queue_entry(&mut sys_txn, &entry, 0)
+                            .put_task_v2(&mut sys_txn, &entry, 0)
                             .await?;
                         sys_txn.commit().await?;
                         Ok(())
@@ -1809,7 +2059,7 @@ pub(crate) async fn enqueue_storage_scan(
     let fire_time = now_epoch_ms();
     let mut txn = system_store.begin().await?;
     system_store
-        .put_worker_queue_entry(&mut txn, &entry, fire_time)
+        .put_task_v2(&mut txn, &entry, fire_time)
         .await?;
     txn.commit().await?;
     crate::worker::wake_worker();

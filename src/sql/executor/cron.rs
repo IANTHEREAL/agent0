@@ -360,19 +360,16 @@ async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) -> Re
 
     let result = async {
         let mut sys_txn = system_store.begin().await?;
-        let old_keys = system_store
-            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job.job_id, TaskType::Cron)
+        // Replace any existing entry for this job via the V2 index (+ legacy
+        // during the migration window) — never a global due-queue scan.
+        system_store
+            .delete_task_all_layers(&mut sys_txn, keyspace, db_id, job.job_id, TaskType::Cron)
             .await?;
-        for key in old_keys {
-            system_store
-                .delete_worker_queue_entry(&mut sys_txn, &key)
-                .await?;
-        }
         system_store
             .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_CRON, 0)
             .await?;
         system_store
-            .put_worker_queue_entry(&mut sys_txn, &entry, next_fire)
+            .put_task_v2(&mut sys_txn, &entry, next_fire)
             .await?;
         sys_txn.commit().await?;
         Ok::<(), anyhow::Error>(())
@@ -391,14 +388,9 @@ async fn dequeue_cron_from_worker(keyspace: &str, db_id: u64, job_id: i64) {
 
     let result = async {
         let mut sys_txn = system_store.begin().await?;
-        let old_keys = system_store
-            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job_id, TaskType::Cron)
+        system_store
+            .delete_task_all_layers(&mut sys_txn, keyspace, db_id, job_id, TaskType::Cron)
             .await?;
-        for key in old_keys {
-            system_store
-                .delete_worker_queue_entry(&mut sys_txn, &key)
-                .await?;
-        }
         sys_txn.commit().await?;
         Ok::<(), anyhow::Error>(())
     }

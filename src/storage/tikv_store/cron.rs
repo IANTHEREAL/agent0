@@ -46,21 +46,102 @@ impl TikvStore {
         }
     }
 
+    /// Byte-safe full scan of the `[prefix, prefix++0xFF)` range: page keys via
+    /// `scan_keys` (1024 at a time), then point-get each value individually.
+    ///
+    /// Mirrors the worker-queue legacy drain (`scan_legacy_filtered`): no single
+    /// RPC frame ever carries more than one value (each ≤ raft-entry-max-size), so
+    /// a prefix holding many large values — e.g. cron jobs whose `command` is large
+    /// user SQL — never builds a >64 MiB gRPC scan frame the way an unbounded
+    /// `scan(.., SCAN_LIMIT)` would. Returns `(key, raw_value)` pairs in key order.
+    async fn scan_prefix_values_bytesafe(
+        &self,
+        txn: &mut Transaction,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut end = prefix.to_vec();
+        end.push(0xFF);
+        let mut out = Vec::new();
+        let mut cursor = prefix.to_vec();
+        loop {
+            let range: BoundRange = (cursor.clone()..end.clone()).into();
+            let keys: Vec<Vec<u8>> = tikv_op!(txn.scan_keys(range, 1024).await)?
+                .map(Vec::from)
+                .collect();
+            let n = keys.len();
+            if n == 0 {
+                break;
+            }
+            let mut last = Vec::new();
+            for key in keys {
+                last = key.clone();
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                if let Some(val) = tikv_op!(txn.get(key.clone()).await)? {
+                    out.push((key, val.to_vec()));
+                }
+            }
+            if n < 1024 || last.is_empty() {
+                break;
+            }
+            cursor = last;
+            cursor.push(0);
+        }
+        Ok(out)
+    }
+
+    /// Byte-safe paged scan returning only the keys under `[prefix, prefix++0xFF)`
+    /// (values are never read). For delete-by-prefix paths that need the keys but
+    /// never the (potentially large) values.
+    async fn scan_prefix_keys_bytesafe(
+        &self,
+        txn: &mut Transaction,
+        prefix: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut end = prefix.to_vec();
+        end.push(0xFF);
+        let mut out = Vec::new();
+        let mut cursor = prefix.to_vec();
+        loop {
+            let range: BoundRange = (cursor.clone()..end.clone()).into();
+            let keys: Vec<Vec<u8>> = tikv_op!(txn.scan_keys(range, 1024).await)?
+                .map(Vec::from)
+                .collect();
+            let n = keys.len();
+            if n == 0 {
+                break;
+            }
+            let mut last = Vec::new();
+            for key in keys {
+                last = key.clone();
+                if key.starts_with(prefix) {
+                    out.push(key);
+                }
+            }
+            if n < 1024 || last.is_empty() {
+                break;
+            }
+            cursor = last;
+            cursor.push(0);
+        }
+        Ok(out)
+    }
+
+    /// List all cron jobs for a database.
+    ///
+    /// Uses a byte-safe scan (see [`Self::scan_prefix_values_bytesafe`]): the
+    /// cron job VALUE carries the unbounded user `command`, so an unbounded
+    /// `scan(.., SCAN_LIMIT)` here would build a single >64 MiB gRPC frame once a
+    /// db accumulates enough large-command jobs and wedge every caller
+    /// (schedule/unschedule/reconcile/`cron.job` view). Same bug class as the
+    /// worker-queue scans fixed for #2576, in the cron-catalog access path.
     pub async fn list_cron_jobs(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<CronJob>> {
         let prefix = encode_cron_job_prefix_v2(db_id);
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
-
-        let mut jobs = Vec::new();
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if !key.starts_with(&prefix) {
-                continue;
-            }
-            let job: CronJob = deserialize_cron_job(pair.value())?;
-            jobs.push(job);
+        let pairs = self.scan_prefix_values_bytesafe(txn, &prefix).await?;
+        let mut jobs = Vec::with_capacity(pairs.len());
+        for (_key, val) in pairs {
+            jobs.push(deserialize_cron_job(&val)?);
         }
         Ok(jobs)
     }
@@ -266,21 +347,16 @@ impl TikvStore {
         db_id: u64,
         job_id: i64,
     ) -> Result<()> {
+        // Byte-safe: cron run values can be large (captured `return_message`), so
+        // collect (key, value) via paged point-gets rather than one unbounded
+        // `scan(.., SCAN_LIMIT)` frame.
         let prefix = encode_cron_run_prefix_v2(db_id);
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
-
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if !key.starts_with(&prefix) {
-                continue;
-            }
+        let pairs = self.scan_prefix_values_bytesafe(txn, &prefix).await?;
+        for (key, val) in pairs {
             let run: CronRun =
-                bincode::deserialize(pair.value()).context("Failed to deserialize cron run")?;
+                bincode::deserialize(&val).context("Failed to deserialize cron run")?;
             if run.job_id == job_id {
-                txn_delete(txn, key.to_vec()).await?;
+                txn_delete(txn, key).await?;
             }
         }
         Ok(())
@@ -352,16 +428,13 @@ impl TikvStore {
             encode_cron_running_guard_prefix_v2(db_id),
         ];
 
+        // Byte-safe: the cron-job prefix holds values carrying unbounded user
+        // `command`. Delete by KEY only (no value reads), so DROP DATABASE cleanup
+        // can never build a >64 MiB scan frame — the failure that previously left
+        // large-command cron jobs un-droppable (no SQL recovery path).
         for prefix in &prefixes {
-            let mut end = prefix.clone();
-            end.push(0xFF);
-            let range: BoundRange = (prefix.clone()..end).into();
-            let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
-            for pair in pairs {
-                let key: &[u8] = pair.key().as_ref().into();
-                if key.starts_with(prefix) {
-                    txn_delete(txn, key.to_vec()).await?;
-                }
+            for key in self.scan_prefix_keys_bytesafe(txn, prefix).await? {
+                txn_delete(txn, key).await?;
             }
         }
 
@@ -467,5 +540,99 @@ mod tests {
     fn deserialize_cron_job_rejects_invalid_payload() {
         let err = deserialize_cron_job(&[1, 2, 3, 4]).unwrap_err().to_string();
         assert!(err.contains("Failed to deserialize cron job"));
+    }
+
+    /// Regression: many large `command`s in one database must not build a single
+    /// >64 MiB gRPC scan frame in `list_cron_jobs` / `find_cron_job_by_name` /
+    /// `delete_all_cron_data`. Before the byte-safe scan fix these raised
+    /// `OutOfRange: message length too large`, wedging cron globally and leaving
+    /// the jobs un-droppable. Reverting the fix makes this test fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn cron_catalog_scans_are_byte_safe_over_large_commands() {
+        let pd_endpoints = std::env::var("PD_ENDPOINTS")
+            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let system_keyspace = format!(
+            "_sys_cron_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let cfg = crate::worker::config::WorkerConfig {
+            enabled: true,
+            system_keyspace,
+            ..Default::default()
+        };
+        let store = crate::worker::init_system_store(pd_endpoints, &cfg)
+            .await
+            .expect("init system store")
+            .expect("system store present when enabled");
+
+        let db_id = 987_654_u64;
+        // 14 jobs x ~5 MiB command = ~70 MiB total, comfortably over the 64 MiB
+        // gRPC frame cap an unbounded `scan(.., SCAN_LIMIT)` would hit.
+        let big = "x".repeat(5 * 1024 * 1024);
+        let n: i64 = 14;
+        {
+            let mut txn = store.begin().await.expect("begin");
+            for job_id in 1..=n {
+                let job = CronJob {
+                    job_id,
+                    schedule: "* * * * *".to_string(),
+                    command: format!("SELECT '{big}'"),
+                    nodename: "localhost".to_string(),
+                    nodeport: 5433,
+                    database: "regress".to_string(),
+                    username: "admin".to_string(),
+                    active: true,
+                    jobname: Some(format!("big_{job_id}")),
+                    max_runtime_ms: None,
+                };
+                store
+                    .put_cron_job(&mut txn, db_id, &job)
+                    .await
+                    .expect("put_cron_job");
+            }
+            txn.commit().await.expect("commit puts");
+        }
+
+        // list / find must be byte-safe (no OutOfRange frame).
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let jobs = store
+                .list_cron_jobs(&mut txn, db_id)
+                .await
+                .expect("list_cron_jobs must be byte-safe over large commands");
+            assert_eq!(jobs.len(), n as usize);
+            let found = store
+                .find_cron_job_by_name(&mut txn, db_id, "big_7", "admin")
+                .await
+                .expect("find_cron_job_by_name must be byte-safe");
+            assert!(found.is_some());
+            txn.commit().await.ok();
+        }
+
+        // delete_all_cron_data must clean up without reading the large values.
+        {
+            let mut txn = store.begin().await.expect("begin");
+            store
+                .delete_all_cron_data(&mut txn, db_id)
+                .await
+                .expect("delete_all_cron_data must be byte-safe");
+            txn.commit().await.expect("commit delete");
+        }
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let jobs = store
+                .list_cron_jobs(&mut txn, db_id)
+                .await
+                .expect("list after delete");
+            assert!(jobs.is_empty(), "all cron jobs must be deleted");
+            txn.commit().await.ok();
+        }
     }
 }

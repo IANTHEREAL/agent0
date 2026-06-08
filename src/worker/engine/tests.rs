@@ -474,26 +474,26 @@ async fn finalize_failure_in_claim_and_execute_releases_claim_and_requeues_cron(
     .with_schedule("*/5 * * * *".to_string());
 
     let fire_time_ms = crate::worker::now_epoch_ms();
-    let queue_key = {
+    let (queue_key, descriptor) = {
         let mut txn = system_store.begin().await.unwrap();
         system_store
-            .put_worker_queue_entry(&mut txn, &entry, fire_time_ms)
+            .put_task_v2(&mut txn, &entry, fire_time_ms)
             .await
             .unwrap();
         txn.commit().await.unwrap();
 
-        // Read back the queue key
+        // Read back the V2 due descriptor + key
         let mut txn2 = system_store.begin().await.unwrap();
         let entries = system_store
-            .scan_due_queue_entries(&mut txn2, i64::MAX, 1000)
+            .scan_due_v2(&mut txn2, i64::MAX, 1000)
             .await
             .unwrap();
-        let (key, _) = entries
+        let (key, descriptor) = entries
             .into_iter()
-            .find(|(_, e)| e.task_id == task_id && e.keyspace == keyspace)
+            .find(|(_, d)| d.task_id == task_id && d.keyspace == keyspace)
             .expect("queue entry must exist");
         txn2.rollback().await.ok();
-        key
+        (key, descriptor)
     };
 
     // Call the REAL claim_and_execute code path with injected finalize failure
@@ -503,7 +503,7 @@ async fn finalize_failure_in_claim_and_execute_releases_claim_and_requeues_cron(
         &cfg,
         &metrics,
         queue_key,
-        entry.clone(),
+        DueItem::V2(descriptor),
         CancellationToken::new(),
         |_store, _db_id, _run, _status, _msg, _start, _end| async {
             Err(anyhow!("injected: TiKV write error in finalize_cron_run"))
@@ -531,15 +531,15 @@ async fn finalize_failure_in_claim_and_execute_releases_claim_and_requeues_cron(
         "INVARIANT VIOLATED: worker claim must be deleted after cleanup"
     );
 
-    // Next cron fire MUST be requeued (new queue entry with future fire time)
+    // Next cron fire MUST be requeued (new V2 descriptor with future fire time)
     let queue = system_store
-        .scan_due_queue_entries(&mut txn, i64::MAX, 1000)
+        .scan_due_v2(&mut txn, i64::MAX, 1000)
         .await
         .unwrap();
     assert!(
-        queue.iter().any(|(_, e)| e.task_id == task_id
-            && e.keyspace == keyspace
-            && e.task_type == TaskType::Cron),
+        queue.iter().any(|(_, d)| d.task_id == task_id
+            && d.keyspace == keyspace
+            && d.task_type == TaskType::Cron),
         "INVARIANT VIOLATED: next cron fire must be requeued after cleanup"
     );
 
@@ -996,6 +996,8 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "reconcile_incomplete_cic_indexes_for_db",
         // [claim] Pessimistic claim attempt: 1 key check + commit.
         "claim_and_execute_core",
+        // [claim] Release a just-won claim: single key delete + immediate commit.
+        "release_claim",
         // [lookup] Reads cron state + records run; bounded by single job lookup + commit.
         "claim_and_record_cron_run",
         // [lookup] Point read: checks cron enabled + loads single job; commit.

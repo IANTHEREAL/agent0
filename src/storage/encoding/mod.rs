@@ -32,7 +32,13 @@ pub use data_keys::{
 };
 pub use metadata_keys::decode_worker_queue_fire_time;
 #[cfg(test)]
-pub use metadata_keys::decode_worker_queue_task_type;
+pub use metadata_keys::{decode_worker_queue_task_type, encode_worker_queue_key};
+pub use metadata_keys::{
+    decode_wq_due_v2_fire_time, decode_wq_index_key, encode_wq_due_v2_key, encode_wq_due_v2_prefix,
+    encode_wq_due_v2_scan_end, encode_wq_index_key, encode_wq_index_prefix_db,
+    encode_wq_index_prefix_db_type, encode_wq_index_prefix_keyspace, encode_wq_index_prefix_task,
+    encode_wq_payload_v2_key, is_wq_due_v2_key,
+};
 pub use metadata_keys::{
     encode_collation_key_v2, encode_collation_prefix_v2, encode_cron_claim_key_v2,
     encode_cron_claim_prefix_v2, encode_cron_enabled_key_v2, encode_cron_job_key_v2,
@@ -57,8 +63,8 @@ pub use metadata_keys::{
     encode_tsc_key_v2, encode_type_key_v2, encode_type_prefix_v2, encode_view_bindings_key_v2,
     encode_view_bindings_prefix_v2, encode_view_key_v2, encode_view_prefix_v2,
     encode_worker_bg_result_key, encode_worker_bg_task_seq_key, encode_worker_claim_key,
-    encode_worker_claim_prefix, encode_worker_queue_key, encode_worker_queue_prefix,
-    encode_worker_queue_scan_end, encode_worker_registry_key, encode_worker_registry_prefix,
+    encode_worker_claim_prefix, encode_worker_queue_prefix, encode_worker_queue_scan_end,
+    encode_worker_registry_key, encode_worker_registry_prefix,
 };
 pub(crate) use metadata_keys::{
     encode_comment_column_key_v2, encode_comment_extension_key_v2, encode_comment_function_key_v2,

@@ -588,6 +588,36 @@ impl Executor {
                 );
             }
 
+            // Step 3.5: Reap worker-queue entries for this database from the
+            // global system keyspace. The binary-format range destroyed in
+            // Step 3 only covers `d_{db_id}_*`; cron/bg/trigger queue entries
+            // live under the global worker prefixes and would otherwise leak.
+            // Bounded prefix scan of the V2 index (+ gated legacy), no global
+            // due-queue scan. See issue #2576.
+            if let Some(system_store) = crate::worker::get_system_store() {
+                // MUST use tenant_keyspace() (the logical tenant string every
+                // enqueue site embeds as entry.keyspace), NOT store().keyspace()
+                // — the latter is the API-v2 connection keyspace, which for the
+                // default tenant is "DEFAULT" while queue rows are keyed under
+                // "default", so the reap prefix would never match and leak them.
+                let keyspace = self.tenant_keyspace().to_string();
+                // Self-contained + batched: manages its own bounded transactions.
+                let reap = system_store.reap_db_queue_entries(&keyspace, db_id).await;
+                match reap {
+                    Ok(n) if n > 0 => tracing::info!(
+                        "DROP DATABASE '{}': reaped {} worker queue entries for db_id={}",
+                        cmd.name,
+                        n,
+                        db_id
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "DROP DATABASE '{}': worker queue reap failed for db_id={}: {}",
+                        cmd.name, db_id, e
+                    ),
+                }
+            }
+
             // Step 4: Finalize the dropping guard — remove the registry entry.
             // This allows the (keyspace, db_id) to be reused if the same
             // database name is re-created.
