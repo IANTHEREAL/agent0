@@ -191,8 +191,8 @@ impl WorkerEngine {
         // worker-claim identity as the old binary so an entry is processed once
         // and deleted from its single namespace. V1 drains naturally: cron
         // requeues its next fire as V2, one-shots are executed and deleted.
-        // Byte-safe (key scan + per-key point-get); gated so it is one empty RPC
-        // once V1 is drained. NOTE: V2 is scanned first up to the limit and
+        // Byte-safe (one legacy value per RPC); gated so it is one empty RPC once
+        // V1 is drained. NOTE: V2 is scanned first up to the limit and
         // legacy only fills the remainder, so legacy drains opportunistically
         // (not on a fixed schedule); a sustained backlog of >=limit due V2
         // entries deprioritizes it — acceptable since old-binary writes cease

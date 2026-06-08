@@ -483,12 +483,10 @@ impl TikvStore {
         Ok(results)
     }
 
-    /// Byte-safe scan of due LEGACY (`_worker_queue_`) entries: fetch due keys
-    /// only (`scan_keys`), then read each value with an individual point-get
-    /// (each value ≤ raft-entry-max-size, so no scan frame approaches the 64 MiB
-    /// gRPC cap). Used by the worker tick during the migration window to execute
-    /// V1 entries an old binary may still enqueue; after V1 drains this returns
-    /// empty (the caller gates on `legacy_queue_has_entries`).
+    /// Byte-safe scan of due LEGACY (`_worker_queue_`) entries: fetch exactly
+    /// one key/value pair per RPC. Used by the worker tick during the migration
+    /// window to execute V1 entries an old binary may still enqueue; after V1
+    /// drains this returns empty (the caller gates on `legacy_queue_has_entries`).
     pub async fn scan_due_legacy_bytesafe(
         &self,
         txn: &mut Transaction,
@@ -507,20 +505,23 @@ impl TikvStore {
             let mut start = encode_worker_queue_prefix();
             start.push(priority);
             let end = encode_worker_queue_scan_end(priority, due_exclusive)?;
-            let range: BoundRange = (start.clone()..end).into();
-            let remaining = (limit as usize - results.len()) as u32;
-            let keys: Vec<Vec<u8>> = tikv_op!(txn.scan_keys(range, remaining).await)?
-                .map(Vec::from)
-                .collect();
-            for key in keys {
+            let mut cursor = start.clone();
+            while results.len() < limit as usize {
+                let range: BoundRange = (cursor.clone()..end.clone()).into();
+                let mut pairs = tikv_op!(txn.scan(range, 1).await)?;
+                let Some(pair) = pairs.next() else {
+                    break;
+                };
+                let key: &[u8] = pair.key().as_ref().into();
                 if !key.starts_with(&start) {
-                    continue;
+                    break;
                 }
-                if let Some(val) = tikv_op!(txn.get(key.clone()).await)? {
-                    let entry = TaskQueueEntry::deserialize_compat(&val)
-                        .context("Failed to deserialize worker queue entry")?;
-                    results.push((key, entry));
-                }
+                let key = key.to_vec();
+                let entry = TaskQueueEntry::deserialize_compat(pair.value())
+                    .context("Failed to deserialize worker queue entry")?;
+                results.push((key.clone(), entry));
+                cursor = key;
+                cursor.push(0);
             }
         }
         Ok(results)
@@ -540,9 +541,9 @@ impl TikvStore {
     }
 
     /// Byte-safe scan of legacy (`_worker_queue_`) entries matching `pred`:
-    /// fetch keys only, point-get each value, filter. Used by targeted ops
-    /// during the migration window; callers gate on `legacy_queue_has_entries`
-    /// so this is never invoked once V1 is drained.
+    /// fetch one key/value pair per RPC, then filter. Used by targeted ops during
+    /// the migration window; callers gate on `legacy_queue_has_entries` so this
+    /// is never invoked once V1 is drained.
     async fn scan_legacy_filtered<F>(
         &self,
         txn: &mut Transaction,
@@ -558,31 +559,21 @@ impl TikvStore {
         let mut cursor = prefix.clone();
         loop {
             let range: BoundRange = (cursor.clone()..upper.clone()).into();
-            let keys: Vec<Vec<u8>> = tikv_op!(txn.scan_keys(range, 1024).await)?
-                .map(Vec::from)
-                .collect();
-            let n = keys.len();
-            if n == 0 {
+            let mut pairs = tikv_op!(txn.scan(range, 1).await)?;
+            let Some(pair) = pairs.next() else {
+                break;
+            };
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
                 break;
             }
-            let mut last = Vec::new();
-            for key in keys {
-                last = key.clone();
-                if !key.starts_with(&prefix) {
-                    continue;
-                }
-                if let Some(val) = tikv_op!(txn.get(key.clone()).await)? {
-                    let entry = TaskQueueEntry::deserialize_compat(&val)
-                        .context("Failed to deserialize worker queue entry")?;
-                    if pred(&entry) {
-                        out.push((key, entry));
-                    }
-                }
+            let key = key.to_vec();
+            let entry = TaskQueueEntry::deserialize_compat(pair.value())
+                .context("Failed to deserialize worker queue entry")?;
+            if pred(&entry) {
+                out.push((key.clone(), entry));
             }
-            if n < 1024 || last.is_empty() {
-                break;
-            }
-            cursor = last;
+            cursor = key;
             cursor.push(0);
         }
         Ok(out)
@@ -699,7 +690,7 @@ impl TikvStore {
         const DELETE_BATCH: usize = 256;
 
         // Phase 1: collect the work-list (byte-safe: 1-byte index values + gated
-        // key-only legacy scan).
+        // one-value legacy scan).
         let (index_rows, legacy_keys) = {
             let mut txn = self.begin().await?;
             let idx = self.index_rows_for_db(&mut txn, keyspace, db_id).await?;
