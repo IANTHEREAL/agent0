@@ -2,9 +2,9 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::model::{Row, TableSchema, Value};
+use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
+use crate::sql::expr::typed_eval::{coerce_limit_value, eval_const_usize, eval_typed_expr};
 use crate::sql::query_context::QueryContext;
 
 #[derive(Debug)]
@@ -163,31 +163,17 @@ fn evaluate_limit_bound(
     qctx: &QueryContext,
     clause: &str,
 ) -> Result<Option<usize>> {
+    // Delegate to the shared coercion so the Limit operator and the analyzed
+    // executor agree on PG-parity semantics — including text→bigint coercion for
+    // parameterized `LIMIT $1` / quoted `LIMIT '1'` (db9-ai/db9-server#2497).
     let value = eval_typed_expr(expr, &Row::new(vec![]), qctx)?;
-    let n = match value {
-        Value::Int32(v) => i64::from(v),
-        Value::Int64(v) => v,
-        // PG 17 parity: NULL means "no bound" (LIMIT NULL ≡ LIMIT ALL, OFFSET NULL ≡ OFFSET 0)
-        Value::Null => return Ok(None),
-        other => {
-            return Err(anyhow!(
-                "{clause} must evaluate to a non-negative integer, got: {:?}",
-                other
-            ))
-        }
-    };
-    if n < 0 {
-        return Err(anyhow!("{clause} must not be negative"));
-    }
-    usize::try_from(n)
-        .map(Some)
-        .map_err(|_| anyhow!("{clause} is too large"))
+    coerce_limit_value(value, clause)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ColumnDef, DataType};
+    use crate::model::{ColumnDef, DataType, Value};
     use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
     use crate::sql::query_context::QueryContext;
 
@@ -270,6 +256,89 @@ mod tests {
         let limit_expr = TypedExpr::new(TypedExprKind::Parameter { index: 0 }, DataType::Int64);
         let err = evaluate_limit_bound(&limit_expr, &qctx, "LIMIT").unwrap_err();
         assert!(err.to_string().contains("must not be negative"));
+    }
+
+    // #2497 regression: parameterized `LIMIT $1` / quoted `LIMIT '1'` reaches the
+    // bound evaluator as `Value::Text` and must coerce to bigint like PostgreSQL,
+    // including PG-exact error wording. Oracle captured against PostgreSQL.
+
+    #[test]
+    fn coerce_limit_text_integer_is_accepted() {
+        assert_eq!(
+            coerce_limit_value(Value::Text("1".to_string()), "LIMIT").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            coerce_limit_value(Value::Text("0".to_string()), "OFFSET").unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn coerce_limit_text_trims_surrounding_whitespace() {
+        // PG: `LIMIT '  2  '` => 2 (bigint input trims whitespace).
+        assert_eq!(
+            coerce_limit_value(Value::Text("  2  ".to_string()), "LIMIT").unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn coerce_limit_text_non_integer_is_invalid_syntax() {
+        // PG: `invalid input syntax for type bigint: "1.5"` — and the message
+        // echoes the original (untrimmed) string, never a Rust ParseIntError.
+        for bad in ["1.5", "abc", ""] {
+            let err = coerce_limit_value(Value::Text(bad.to_string()), "LIMIT")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!("invalid input syntax for type bigint: \"{bad}\"")
+            );
+        }
+        let err = coerce_limit_value(Value::Text(" x ".to_string()), "LIMIT")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "invalid input syntax for type bigint: \" x \"");
+    }
+
+    #[test]
+    fn coerce_limit_text_overflow_is_out_of_range() {
+        // PG: `value "9223372036854775808" is out of range for type bigint`
+        // (i64::MAX + 1) — a distinct class from invalid syntax.
+        let err = coerce_limit_value(Value::Text("9223372036854775808".to_string()), "LIMIT")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "value \"9223372036854775808\" is out of range for type bigint"
+        );
+    }
+
+    #[test]
+    fn coerce_limit_text_negative_uses_clause_specific_message() {
+        // PG: `LIMIT '-1'` => "LIMIT must not be negative" (parse, then sign check).
+        let err = coerce_limit_value(Value::Text("-1".to_string()), "LIMIT")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "LIMIT must not be negative");
+        let err = coerce_limit_value(Value::Text("-1".to_string()), "OFFSET")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "OFFSET must not be negative");
+    }
+
+    #[test]
+    fn coerce_limit_null_and_ints_unchanged() {
+        assert_eq!(coerce_limit_value(Value::Null, "LIMIT").unwrap(), None);
+        assert_eq!(
+            coerce_limit_value(Value::Int64(5), "LIMIT").unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            coerce_limit_value(Value::Int32(7), "OFFSET").unwrap(),
+            Some(7)
+        );
     }
 
     #[tokio::test]

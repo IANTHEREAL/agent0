@@ -106,32 +106,66 @@ pub(crate) fn eval_const_usize(expr: &TypedExpr, null_as_zero: bool) -> Result<u
 ///
 /// Unlike the former `eval_const_usize` (which only handles constants), this
 /// evaluates the expression against the provided `QueryContext`, resolving
-/// bound parameters at execution time. Returns `Ok(None)` for NULL
-/// (PG parity: NULL = ALL/no-bound for LIMIT, NULL = 0 for OFFSET).
-pub(crate) fn eval_limit_bound(expr: &TypedExpr, qctx: &QueryContext) -> Result<Option<usize>> {
+/// bound parameters at execution time. `clause` is `"LIMIT"` or `"OFFSET"` and
+/// is used only for PG-parity error wording. See [`coerce_limit_value`].
+pub(crate) fn eval_limit_bound(
+    expr: &TypedExpr,
+    qctx: &QueryContext,
+    clause: &str,
+) -> Result<Option<usize>> {
     let value = eval_typed_expr(expr, &Row::new(vec![]), qctx)?;
-    match value {
-        Value::Int32(v) => {
-            if v < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(Some(v as usize))
-            }
+    coerce_limit_value(value, clause)
+}
+
+/// Coerce an evaluated LIMIT/OFFSET value to an optional row bound, matching
+/// PostgreSQL semantics.
+///
+/// - Integer types are taken directly.
+/// - `NULL` means "no bound" (PG: `LIMIT NULL` ≡ `LIMIT ALL`, `OFFSET NULL` ≡ 0).
+/// - Text is coerced to `bigint` exactly as PG's `int8` input does — surrounding
+///   whitespace is trimmed for parsing. This is what makes a parameterized
+///   `LIMIT $1` (bound as text) and the simple-query `LIMIT '1'` form work
+///   (db9-ai/db9-server#2497); both previously failed because the value reached
+///   here as [`Value::Text`] and hit the catch-all error.
+/// - Any other type is rejected with the existing error.
+///
+/// A negative value yields `"{clause} must not be negative"` and an out-of-`usize`
+/// value yields a too-large error, both matching PostgreSQL's clause-specific
+/// wording.
+pub(crate) fn coerce_limit_value(value: Value, clause: &str) -> Result<Option<usize>> {
+    let n: i64 = match value {
+        Value::Int32(v) => i64::from(v),
+        Value::Int64(v) => v,
+        Value::Null => return Ok(None),
+        Value::Text(s) => parse_limit_bigint_text(&s)?,
+        other => {
+            return Err(anyhow!(
+                "{clause} must evaluate to a non-negative integer, got: {:?}",
+                other
+            ))
         }
-        Value::Int64(v) => {
-            if v < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                usize::try_from(v)
-                    .map(Some)
-                    .map_err(|_| anyhow!("LIMIT/OFFSET value is too large"))
+    };
+    if n < 0 {
+        return Err(anyhow!("{clause} must not be negative"));
+    }
+    usize::try_from(n)
+        .map(Some)
+        .map_err(|_| anyhow!("{clause} value is too large"))
+}
+
+/// Parse a text LIMIT/OFFSET value the way PostgreSQL's `int8` input does:
+/// trim surrounding whitespace, then parse. Failure wording matches PG exactly
+/// and never leaks Rust's `ParseIntError`; the original (untrimmed) string is
+/// echoed, as PG does. Overflow is reported distinctly from invalid syntax.
+fn parse_limit_bigint_text(s: &str) -> Result<i64> {
+    match s.trim().parse::<i64>() {
+        Ok(v) => Ok(v),
+        Err(e) => match e.kind() {
+            std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                Err(anyhow!("value \"{s}\" is out of range for type bigint"))
             }
-        }
-        Value::Null => Ok(None),
-        other => Err(anyhow!(
-            "LIMIT/OFFSET must evaluate to a non-negative integer, got: {:?}",
-            other
-        )),
+            _ => Err(anyhow!("invalid input syntax for type bigint: \"{s}\"")),
+        },
     }
 }
 

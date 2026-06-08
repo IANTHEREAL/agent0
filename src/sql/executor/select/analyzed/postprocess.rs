@@ -95,13 +95,13 @@ impl Executor {
             let limit = deferred_limit
                 .as_ref()
                 .and_then(|(l, _)| l.as_ref())
-                .map(|e| eval_limit_bound(e, &qctx))
+                .map(|e| eval_limit_bound(e, &qctx, "LIMIT"))
                 .transpose()?
                 .flatten();
             let offset = deferred_limit
                 .as_ref()
                 .and_then(|(_, o)| o.as_ref())
-                .map(|e| eval_limit_bound(e, &qctx))
+                .map(|e| eval_limit_bound(e, &qctx, "OFFSET"))
                 .transpose()?
                 .flatten()
                 .unwrap_or(0);
@@ -124,12 +124,12 @@ impl Executor {
             if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
                 let limit = limit_expr
                     .as_ref()
-                    .map(|e| eval_limit_bound(e, &qctx))
+                    .map(|e| eval_limit_bound(e, &qctx, "LIMIT"))
                     .transpose()?
                     .flatten();
                 let offset = offset_expr
                     .as_ref()
-                    .map(|e| eval_limit_bound(e, &qctx))
+                    .map(|e| eval_limit_bound(e, &qctx, "OFFSET"))
                     .transpose()?
                     .flatten()
                     .unwrap_or(0);

@@ -1,0 +1,34 @@
+n|n10
+1|10
+2|20
+(2 rows)
+n|n10
+4|40
+5|50
+(2 rows)
+n|n10
+1|10
+2|20
+(2 rows)
+n|n10
+1|10
+2|20
+3|30
+4|40
+5|50
+(5 rows)
+n|n10
+2|20
+3|30
+(2 rows)
+psql:tests/2497_limit_text_param.sql:27: ERROR:  invalid input syntax for type bigint: "1.5"
+LINE 1: ...CT n, n * 10 AS n10 FROM limit_param ORDER BY n LIMIT '1.5';
+                                                                 ^
+psql:tests/2497_limit_text_param.sql:30: ERROR:  invalid input syntax for type bigint: "abc"
+LINE 1: ...CT n, n * 10 AS n10 FROM limit_param ORDER BY n LIMIT 'abc';
+                                                                 ^
+psql:tests/2497_limit_text_param.sql:33: ERROR:  value "9223372036854775808" is out of range for type bigint
+LINE 1: ..., n * 10 AS n10 FROM limit_param ORDER BY n LIMIT '922337203...
+                                                             ^
+psql:tests/2497_limit_text_param.sql:36: ERROR:  LIMIT must not be negative
+psql:tests/2497_limit_text_param.sql:39: ERROR:  OFFSET must not be negative
