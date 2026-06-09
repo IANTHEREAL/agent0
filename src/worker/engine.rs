@@ -325,27 +325,20 @@ impl WorkerEngine {
     /// Reconcile cron jobs for a single (keyspace, db_id).
     /// Returns (enqueued_count, cleaned_count).
     async fn reconcile_cron_for_db(&self, keyspace: &str, db_id: u64) -> Result<(u32, u32)> {
-        // 1. Existing cron entries. The V2 index is a bounded prefix scan that
-        //    reads only tiny index values; the gated legacy scan covers pre-V2
-        //    `_worker_queue_` entries (never indexed into V2) so reconcile does
-        //    NOT re-enqueue a V2 copy of a job that still has a legacy entry —
-        //    which would double-fire it during a rolling deploy.
+        // 1. Existing cron entries. Startup reconciliation must stay bounded:
+        //    it runs before the worker tick loop, so scanning legacy
+        //    `_worker_queue_` here can block all cron execution when a migrated
+        //    fleet still has a large V1 backlog. Legacy entries are drained by
+        //    tick() opportunistically; duplicate V1/V2 entries for the same
+        //    scheduled minute are suppressed by the tenant cron run claim.
         let mut txn = self.system_store.begin().await?;
         let existing_rows = self
             .system_store
             .index_rows_for_db_type(&mut txn, keyspace, db_id, TaskType::Cron)
             .await?;
-        let legacy_entries = self
-            .system_store
-            .legacy_entries_for_db_type(&mut txn, keyspace, db_id, TaskType::Cron)
-            .await?;
         txn.commit().await?;
 
-        let existing_job_ids: HashSet<i64> = existing_rows
-            .iter()
-            .map(|r| r.task_id)
-            .chain(legacy_entries.iter().map(|(_, task_id)| *task_id))
-            .collect();
+        let existing_job_ids: HashSet<i64> = existing_rows.iter().map(|r| r.task_id).collect();
 
         // 2. Acquire tenant store and check cron state
         let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
@@ -356,9 +349,11 @@ impl WorkerEngine {
 
         if !cron_enabled {
             tenant_txn.commit().await?;
-            // Cron disabled but registry has cron bit — clean up all queue
-            // entries across BOTH layers.
-            let total = existing_rows.len() + legacy_entries.len();
+            // Cron disabled but registry has cron bit — clean up bounded V2
+            // entries. Legacy V1 entries, if any, are intentionally left to the
+            // tick path/catalog checks so startup cannot be blocked by a global
+            // legacy scan.
+            let total = existing_rows.len();
             if total > 0 {
                 let mut sys_txn = self.system_store.begin().await?;
                 for r in &existing_rows {
@@ -372,11 +367,6 @@ impl WorkerEngine {
                             r.task_id,
                             r.fire_time_ms,
                         )
-                        .await?;
-                }
-                for (key, _) in &legacy_entries {
-                    self.system_store
-                        .delete_worker_queue_entry(&mut sys_txn, key)
                         .await?;
                 }
                 sys_txn.commit().await?;
@@ -436,18 +426,15 @@ impl WorkerEngine {
             sys_txn.commit().await?;
         }
 
-        // 5. Cleanup orphans across BOTH layers: queue entries whose job_id is
-        //    not in active jobs.
+        // 5. Cleanup bounded V2 orphans: queue entries whose job_id is not in
+        //    active jobs. Legacy V1 orphan cleanup would require a global
+        //    `_worker_queue_` scan and is left to execution-time catalog checks.
         let orphan_rows: Vec<&WqIndexRow> = existing_rows
             .iter()
             .filter(|r| !active_job_ids.contains(&r.task_id))
             .collect();
-        let orphan_legacy: Vec<&(Vec<u8>, i64)> = legacy_entries
-            .iter()
-            .filter(|(_, task_id)| !active_job_ids.contains(task_id))
-            .collect();
 
-        if !orphan_rows.is_empty() || !orphan_legacy.is_empty() {
+        if !orphan_rows.is_empty() {
             let mut sys_txn = self.system_store.begin().await?;
             for r in &orphan_rows {
                 self.system_store
@@ -462,13 +449,8 @@ impl WorkerEngine {
                     )
                     .await?;
             }
-            for (key, _) in &orphan_legacy {
-                self.system_store
-                    .delete_worker_queue_entry(&mut sys_txn, key)
-                    .await?;
-            }
             sys_txn.commit().await?;
-            cleaned = (orphan_rows.len() + orphan_legacy.len()) as u32;
+            cleaned = orphan_rows.len() as u32;
         }
 
         Ok((enqueued, cleaned))

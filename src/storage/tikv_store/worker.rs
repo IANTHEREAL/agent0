@@ -656,11 +656,10 @@ impl TikvStore {
     }
 
     /// Legacy (`_worker_queue_`) entries for one (keyspace, db_id, task_type),
-    /// as `(legacy_due_key, task_id)`. Gated by `legacy_queue_has_entries` so it
-    /// is a single key-only RPC once V1 is drained. Used by cron reconciliation
-    /// to see pending pre-V2 entries that are intentionally never indexed into
-    /// V2 — without this, reconcile would re-enqueue a V2 copy of a job that
-    /// still has a legacy entry and double-fire it during a rolling deploy.
+    /// as `(legacy_due_key, task_id)`. Test-only guard for migration-window
+    /// behavior; production startup paths must not call this helper because it
+    /// scans the whole legacy queue.
+    #[cfg(test)]
     pub async fn legacy_entries_for_db_type(
         &self,
         txn: &mut Transaction,
@@ -1484,15 +1483,16 @@ mod tests {
             .task_has_pending(&mut txn, &ks, db_id, 21, TaskType::Cron)
             .await
             .unwrap());
-        // Cron reconciliation relies on this to avoid re-enqueuing a V2 copy of a
-        // job that still has a legacy entry (which would double-fire it).
+        // The migration helper can still find legacy cron entries for explicit
+        // maintenance/testing paths, but startup cron reconciliation must not
+        // call it because it scans the whole legacy queue.
         let legacy_cron = store
             .legacy_entries_for_db_type(&mut txn, &ks, db_id, TaskType::Cron)
             .await
             .unwrap();
         assert!(
             legacy_cron.iter().any(|(_, jid)| *jid == 21),
-            "reconcile must see the legacy cron job via legacy_entries_for_db_type"
+            "legacy_entries_for_db_type must still find the seeded legacy cron job"
         );
         assert!(
             store

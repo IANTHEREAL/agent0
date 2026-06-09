@@ -404,6 +404,36 @@ fn worker_engine_shutdown_is_wired_into_run_loop_and_task_guards() {
 }
 
 #[test]
+fn cron_startup_reconciliation_does_not_scan_legacy_worker_queue() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let reconcile_fn = prod_source
+        .split("async fn reconcile_cron_for_db")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn reconcile_incomplete_cic_indexes")
+                .next()
+        })
+        .expect("reconcile_cron_for_db must exist before CIC reconciliation");
+
+    assert!(
+        reconcile_fn.contains(".index_rows_for_db_type("),
+        "cron startup reconciliation must use the bounded V2 identity index"
+    );
+    assert!(
+        !reconcile_fn.contains(".legacy_entries_for_db_type("),
+        "cron startup reconciliation must not scan legacy _worker_queue_"
+    );
+    assert!(
+        !reconcile_fn.contains(".delete_worker_queue_entry("),
+        "cron startup reconciliation must not delete legacy entries by scanning _worker_queue_"
+    );
+}
+
+#[test]
 fn storage_size_scan_tracks_its_long_lived_read_transaction() {
     let source = include_str!("../engine.rs");
     let prod_source = source
