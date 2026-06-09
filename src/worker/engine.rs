@@ -1,5 +1,5 @@
 use crate::cron::process_list::{get_process_list, RunningCronJob};
-use crate::cron::types::{CronRun, CronRunStatus};
+use crate::cron::types::{CronJob, CronRun, CronRunStatus};
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
 use crate::pool::TikvClientPool;
@@ -74,6 +74,22 @@ impl ActiveJobGuard {
 impl Drop for ActiveJobGuard {
     fn drop(&mut self) {
         self.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn cron_queue_entry_matches_job(entry: &TaskQueueEntry, job: &CronJob) -> bool {
+    entry.task_type == TaskType::Cron
+        && entry.task_id == job.job_id
+        && entry.command == job.command
+        && entry.username == job.username
+        && entry.schedule.as_deref() == Some(job.schedule.as_str())
+}
+
+fn keep_queue_entry_for_claim_status(claim_status: CronRunClaimStatus) -> Option<bool> {
+    match claim_status {
+        CronRunClaimStatus::Claimed => None,
+        CronRunClaimStatus::AlreadyClaimedForMinute => Some(false),
+        CronRunClaimStatus::BlockedByRunningGuard => Some(true),
     }
 }
 
@@ -1138,18 +1154,6 @@ impl WorkerEngine {
                 return Ok((None, false));
             }
 
-            let claim_status = store
-                .try_claim_cron_run(&mut txn, entry.db_id, entry.task_id, scheduled_minute)
-                .await?;
-            match claim_status {
-                CronRunClaimStatus::Claimed => {}
-                CronRunClaimStatus::AlreadyClaimedForMinute
-                | CronRunClaimStatus::BlockedByRunningGuard => {
-                    // Keep the queue entry so the cron trigger can be retried later.
-                    return Ok((None, true));
-                }
-            }
-
             let Some(job) = store
                 .get_cron_job(&mut txn, entry.db_id, entry.task_id)
                 .await?
@@ -1158,6 +1162,22 @@ impl WorkerEngine {
             };
             if !job.active {
                 return Ok((None, false));
+            }
+            if !cron_queue_entry_matches_job(entry, &job) {
+                warn!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    job_id = entry.task_id,
+                    "skipping stale cron queue entry whose payload no longer matches catalog job"
+                );
+                return Ok((None, false));
+            }
+
+            let claim_status = store
+                .try_claim_cron_run(&mut txn, entry.db_id, entry.task_id, scheduled_minute)
+                .await?;
+            if let Some(keep_queue_entry) = keep_queue_entry_for_claim_status(claim_status) {
+                return Ok((None, keep_queue_entry));
             }
 
             let Some(db_def) = store.get_database_by_id(&mut txn, entry.db_id).await? else {

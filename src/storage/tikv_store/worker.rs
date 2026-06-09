@@ -278,6 +278,35 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Delete every V2 row for one task by identity. This is bounded by that
+    /// task's V2 index rows and never scans the legacy `_worker_queue_` layer.
+    pub async fn delete_task_v2_by_identity(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        task_type: TaskType,
+    ) -> Result<usize> {
+        let rows = self
+            .index_rows_for_task(txn, keyspace, db_id, task_id, task_type)
+            .await?;
+        let deleted = rows.len();
+        for r in rows {
+            self.delete_task_v2(
+                txn,
+                &r.due_key,
+                &r.keyspace,
+                r.db_id,
+                r.task_type,
+                r.task_id,
+                r.fire_time_ms,
+            )
+            .await?;
+        }
+        Ok(deleted)
+    }
+
     /// Fetch the out-of-line payload for a split-type V2 task, by full identity.
     pub async fn get_task_payload_v2(
         &self,
@@ -581,7 +610,9 @@ impl TikvStore {
 
     /// Delete every queue entry for one task across BOTH layers: V2 (via index)
     /// and, during the migration window, legacy. Returns the number deleted.
-    /// Used by cron schedule-replace and unschedule. No global due-queue scan.
+    /// Test-only guard for migration-window behavior; production SQL hot paths
+    /// use `delete_task_v2_by_identity` instead.
+    #[cfg(test)]
     pub async fn delete_task_all_layers(
         &self,
         txn: &mut Transaction,

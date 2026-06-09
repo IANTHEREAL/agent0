@@ -366,10 +366,17 @@ async fn enqueue_cron_to_worker(
     let result = async {
         let mut sys_txn = system_store.begin().await?;
         if replace_existing {
-            // Existing cron jobs may have an old fire time in either V2 or the
-            // migration-window legacy queue, so replace must clean first.
+            // SQL paths must not scan the global legacy worker queue. A stale
+            // legacy cron entry is rejected against the cron catalog by the
+            // worker when it becomes due, then deleted in place.
             system_store
-                .delete_task_all_layers(&mut sys_txn, keyspace, db_id, job.job_id, TaskType::Cron)
+                .delete_task_v2_by_identity(
+                    &mut sys_txn,
+                    keyspace,
+                    db_id,
+                    job.job_id,
+                    TaskType::Cron,
+                )
                 .await?;
         }
         system_store
@@ -396,7 +403,7 @@ async fn dequeue_cron_from_worker(keyspace: &str, db_id: u64, job_id: i64) {
     let result = async {
         let mut sys_txn = system_store.begin().await?;
         system_store
-            .delete_task_all_layers(&mut sys_txn, keyspace, db_id, job_id, TaskType::Cron)
+            .delete_task_v2_by_identity(&mut sys_txn, keyspace, db_id, job_id, TaskType::Cron)
             .await?;
         sys_txn.commit().await?;
         Ok::<(), anyhow::Error>(())
@@ -662,11 +669,28 @@ mod tests {
         let source = include_str!("cron.rs");
         assert!(
             source.contains("enqueue_cron_to_worker(keyspace, db_id, &job, false).await?"),
-            "new cron jobs must skip delete_task_all_layers; a freshly allocated job_id has no existing worker entry"
+            "new cron jobs must skip queue deletion; a freshly allocated job_id has no existing worker entry"
         );
         assert!(
             source.contains("enqueue_cron_to_worker(keyspace, db_id, &existing_job, true).await?"),
-            "schedule replacement must still clean existing worker entries"
+            "schedule replacement must still clean existing V2 worker entries"
+        );
+    }
+
+    #[test]
+    fn cron_sql_paths_do_not_scan_legacy_worker_queue() {
+        let source = include_str!("cron.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("cron.rs must contain #[cfg(test)] tests");
+        assert!(
+            prod_source.contains(".delete_task_v2_by_identity("),
+            "cron replace/unschedule must delete via bounded V2 identity index"
+        );
+        assert!(
+            !prod_source.contains(".delete_task_all_layers("),
+            "cron SQL paths must not scan legacy _worker_queue_ on replace/unschedule"
         );
     }
 }

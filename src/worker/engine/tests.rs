@@ -19,6 +19,102 @@ fn idx(name: &str, state: IndexState) -> IndexDef {
     }
 }
 
+fn test_cron_job() -> crate::cron::types::CronJob {
+    crate::cron::types::CronJob {
+        job_id: 42,
+        schedule: "0 0 1 1 *".to_string(),
+        command: "SELECT 1".to_string(),
+        nodename: String::new(),
+        nodeport: 0,
+        database: "postgres".to_string(),
+        username: "admin".to_string(),
+        active: true,
+        jobname: Some("codex".to_string()),
+        max_runtime_ms: None,
+    }
+}
+
+fn test_cron_queue_entry(job: &crate::cron::types::CronJob) -> TaskQueueEntry {
+    TaskQueueEntry::new(
+        "tenant_a".to_string(),
+        1,
+        job.job_id,
+        TaskType::Cron,
+        job.command.clone(),
+        job.username.clone(),
+        128,
+    )
+    .with_schedule(job.schedule.clone())
+}
+
+#[test]
+fn cron_queue_entry_must_match_current_catalog_job() {
+    let job = test_cron_job();
+    let entry = test_cron_queue_entry(&job);
+    assert!(super::cron_queue_entry_matches_job(&entry, &job));
+
+    let mut changed_command = job.clone();
+    changed_command.command = "SELECT 2".to_string();
+    assert!(!super::cron_queue_entry_matches_job(
+        &entry,
+        &changed_command
+    ));
+
+    let mut changed_schedule = job.clone();
+    changed_schedule.schedule = "0 0 2 1 *".to_string();
+    assert!(!super::cron_queue_entry_matches_job(
+        &entry,
+        &changed_schedule
+    ));
+
+    let mut changed_owner = job.clone();
+    changed_owner.username = "other_user".to_string();
+    assert!(!super::cron_queue_entry_matches_job(&entry, &changed_owner));
+}
+
+#[test]
+fn already_claimed_cron_minute_deletes_duplicate_due_row() {
+    assert_eq!(
+        super::keep_queue_entry_for_claim_status(CronRunClaimStatus::Claimed),
+        None
+    );
+    assert_eq!(
+        super::keep_queue_entry_for_claim_status(CronRunClaimStatus::AlreadyClaimedForMinute),
+        Some(false),
+        "same-minute duplicate due rows must be deleted, not retried forever"
+    );
+    assert_eq!(
+        super::keep_queue_entry_for_claim_status(CronRunClaimStatus::BlockedByRunningGuard),
+        Some(true),
+        "running-guard blocks should keep the due row so it can retry after the active run"
+    );
+}
+
+#[test]
+fn cron_claim_stale_check_precedes_same_minute_claim() {
+    let source = include_str!("../engine.rs");
+    let fn_body = source
+        .split("async fn claim_and_record_cron_run(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn load_next_cron_queue_entry(").next())
+        .expect("claim_and_record_cron_run must exist before load_next_cron_queue_entry");
+
+    let job_lookup = fn_body
+        .find(".get_cron_job(")
+        .expect("cron claim path must load the catalog job");
+    let stale_check = fn_body
+        .find("cron_queue_entry_matches_job")
+        .expect("cron claim path must reject stale queue payloads");
+    let claim = fn_body
+        .find(".try_claim_cron_run(")
+        .expect("cron claim path must claim the scheduled minute");
+
+    assert!(
+        job_lookup < claim && stale_check < claim,
+        "stale legacy cron entries must be rejected before AlreadyClaimedForMinute can keep them"
+    );
+}
+
 #[test]
 fn background_statement_extension_context_uses_fresh_statement_state_per_call() {
     let first = background_statement_extension_context(true, "tenant_a", "admin", None);
