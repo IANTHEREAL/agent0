@@ -10,3 +10,4 @@ chrono = "0.4"
 chrono-tz = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
+hex = "0.4"

@@ -176,6 +176,133 @@ def test_sqlalchemy_join_subquery_prepared_and_vector_ops():
                 ).fetchall()
                 assert rows == [(100, "target-hit", "target-owner")]
 
+            # scalar/text/numeric/datetime function pushdown correctness
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    f"""
+                    CREATE TABLE {SCHEMA_NAME}.func_pushdown_rows (
+                      id INTEGER PRIMARY KEY,
+                      v VARCHAR,
+                      n INTEGER,
+                      score DOUBLE,
+                      created_at TIMESTAMP
+                    )
+                    """
+                )
+                conn.exec_driver_sql(
+                    f"CREATE INDEX idx_func_pushdown_rows_n ON {SCHEMA_NAME}.func_pushdown_rows(n)"
+                )
+                conn.exec_driver_sql(
+                    f"""
+                    INSERT INTO {SCHEMA_NAME}.func_pushdown_rows (id, v, n, score, created_at)
+                    VALUES
+                      (200, '  B  ', 20, 20.6, '2024-01-02 12:34:56'),
+                      (201, NULL, NULL, NULL, NULL)
+                    """
+                )
+
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                          lower(btrim(v)) AS lower_trimmed,
+                          upper(btrim(v)) AS upper_trimmed,
+                          length(v) AS length_v,
+                          char_length(v) AS char_length_v,
+                          character_length(v) AS character_length_v,
+                          substr(v, 3, 1) AS substr_v,
+                          substring(v, 3, 1) AS substring_v,
+                          btrim(v) AS trimmed_v,
+                          ltrim(v) AS ltrim_v,
+                          rtrim(v) AS rtrim_v,
+                          strpos(v, 'B') AS pos_b,
+                          abs(n) AS abs_n,
+                          ceil(score) AS ceil_score,
+                          ceiling(score) AS ceiling_score,
+                          floor(score) AS floor_score,
+                          round(score) AS round_score,
+                          coalesce(NULL, btrim(v)) AS coalesced_v,
+                          nullif(btrim(v), 'z') AS nullif_keep,
+                          date_part('day', created_at) AS day_part,
+                          date_trunc('hour', created_at) AS hour_bucket
+                        FROM {SCHEMA_NAME}.func_pushdown_rows
+                        WHERE n = 20
+                        LIMIT 1
+                        """
+                    )
+                ).fetchall()
+                assert rows == [
+                    (
+                        "b",
+                        "B",
+                        5,
+                        5,
+                        5,
+                        "B",
+                        "B",
+                        "B",
+                        "B  ",
+                        "  B",
+                        3,
+                        20,
+                        21.0,
+                        21.0,
+                        20.0,
+                        21.0,
+                        "B",
+                        "B",
+                        2.0,
+                        datetime(2024, 1, 2, 12, 0, 0),
+                    )
+                ]
+
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                          lower(v) AS lower_v,
+                          upper(v) AS upper_v,
+                          length(v) AS length_v,
+                          substr(v, 1, 1) AS substr_v,
+                          btrim(v) AS trimmed_v,
+                          ltrim(v) AS ltrim_v,
+                          rtrim(v) AS rtrim_v,
+                          strpos(v, 'B') AS pos_b,
+                          abs(n) AS abs_n,
+                          ceil(score) AS ceil_score,
+                          floor(score) AS floor_score,
+                          round(score) AS round_score,
+                          coalesce(v, 'fallback') AS coalesced_v,
+                          nullif('same', 'same') AS nullif_same,
+                          date_part('day', created_at) AS day_part,
+                          date_trunc('hour', created_at) AS hour_bucket
+                        FROM {SCHEMA_NAME}.func_pushdown_rows
+                        WHERE id = 201
+                        """
+                    )
+                ).fetchall()
+                assert rows == [
+                    (
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "fallback",
+                        None,
+                        None,
+                        None,
+                    )
+                ]
+
             # vector column / insert / distance / index / filter
             with engine.begin() as conn:
                 conn.exec_driver_sql(

@@ -1,0 +1,13 @@
+db9.enable_cop_pushdown
+off
+(1 row)
+psql:tests/580_pushdown_rejected_agg_guc.sql:2: ERROR:  unrecognized configuration parameter "db9.enable_cop_agg_pushdown"
+HINT: use "db9.enable_cop_pushdown" as the only public DB9 Cop pushdown switch; aggregate functions currently stay local.
+psql:tests/580_pushdown_rejected_agg_guc.sql:3: ERROR:  unrecognized configuration parameter "db9.enable_cop_agg_pushdown"
+HINT: use "db9.enable_cop_pushdown" as the only public DB9 Cop pushdown switch; aggregate functions currently stay local.
+psql:tests/580_pushdown_rejected_agg_guc.sql:4: ERROR:  unrecognized configuration parameter "db9.enable_cop_agg_pushdown"
+HINT: use "db9.enable_cop_pushdown" as the only public DB9 Cop pushdown switch; aggregate functions currently stay local.
+psql:tests/580_pushdown_rejected_agg_guc.sql:5: ERROR:  unrecognized configuration parameter "db9.enable_cop_agg_pushdown"
+HINT: use "db9.enable_cop_pushdown" as the only public DB9 Cop pushdown switch; aggregate functions currently stay local.
+psql:tests/580_pushdown_rejected_agg_guc.sql:6: ERROR:  unrecognized configuration parameter "db9.enable_cop_agg_pushdown"
+HINT: use "db9.enable_cop_pushdown" as the only public DB9 Cop pushdown switch; aggregate functions currently stay local.

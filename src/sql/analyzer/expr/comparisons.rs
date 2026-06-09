@@ -154,9 +154,9 @@ impl<'a> Analyzer<'a> {
         };
         let e = self.analyze_expr(expr)?;
         let p = self.analyze_expr(pattern)?;
-        let esc = escape_char.map(|c| {
+        let esc = escape_char.as_ref().map(|escape| {
             Box::new(TypedExpr::new(
-                TypedExprKind::Constant(Value::Text(c.to_string())),
+                TypedExprKind::Constant(Value::Text(escape.clone())),
                 DataType::Text,
             ))
         });

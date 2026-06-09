@@ -1,0 +1,6 @@
+Limit
+Index Scan using db9_cop_array_function_smoke_n_idx on db9_cop_array_function_smoke
+DB9 Cop Access: point (20)
+array_function_projection_stays_local|1
+t|t|t|t
+array_function_parity|0

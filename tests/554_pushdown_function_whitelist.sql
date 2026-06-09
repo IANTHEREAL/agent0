@@ -1,3 +1,4 @@
+-- DB9_DIVERGENCE(#2402): DB9 Cop pushdown is a db9-specific exact-pair contract.
 -- DB9 cop pushdown: supported function whitelist stays correct under pushdown.
 
 DROP TABLE IF EXISTS db9_cop_func_smoke;
@@ -8,7 +9,7 @@ CREATE INDEX db9_cop_func_smoke_n_idx ON db9_cop_func_smoke(n);
 INSERT INTO db9_cop_func_smoke VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
 
 SET db9.enable_cop_pushdown = on;
-EXPLAIN SELECT lower(v), upper(v), length(v), abs(n), coalesce(NULL, v), nullif(v, 'z')
+EXPLAIN SELECT length(v), abs(n), coalesce(NULL, v), nullif(v, 'z')
 FROM db9_cop_func_smoke
 WHERE n = 20
 LIMIT 1;

@@ -1,0 +1,14 @@
+string_projection_pushes|1
+string_local_only_projection_stays_local|1
+regex_operator_projection_stays_local|1
+regex_imatch_projection_stays_local|1
+regex_function_projection_stays_local|1
+alpha beta-xy-20|alpha beta/xy/20|alpha|beta|xyxy|yx|Alpha Beta|120|A|00xy|xy00|alpha BETA|AlphA BetA|7|bb|"select"|'xy'|'xy'|alpha xy|xy/'xy'/"select"
+t|t|t|t|f
+XlphX bXtX|alpha beta|{alpha,beta}|{alpha}
+string_projection_parity|0
+regex_operator_projection_parity|0
+regex_function_parity|0
+like_escape_pushes|1
+ilike_escape_pushes|1
+Escape string must be empty or one character.

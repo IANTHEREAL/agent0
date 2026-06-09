@@ -1,0 +1,6 @@
+json_scalar_projection_stays_local|1
+json_extended_projection_stays_local|1
+object|object|2|2|t
+1|t|t|t
+json_scalar_parity|0
+json_extended_parity|0

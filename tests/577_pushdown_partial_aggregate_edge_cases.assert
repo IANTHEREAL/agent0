@@ -1,0 +1,32 @@
+aggregate_edges_local_on
+Sort
+Sort Key: g ASC
+HashAggregate
+Group Key: g
+Seq Scan on agg_pushdown_edge
+aggregate_edges_partial_pushdown|0
+NULL|1|20|false|false|20|20
+1|1|10|true|true|10|10
+2|0|NULL|NULL|NULL|NULL|NULL
+aggregate_edges_local_off
+aggregate_edge_parity|0
+aggregate_empty_local_on
+HashAggregate
+Seq Scan on agg_pushdown_edge
+aggregate_empty_partial_pushdown|0
+0|0|NULL|NULL|NULL|NULL|NULL
+aggregate_empty_local_off
+aggregate_empty_parity|0
+aggregate_composite_local_on
+Sort
+Sort Key: g1 ASC, g2 ASC
+HashAggregate
+Group Key: g1, g2
+Seq Scan on agg_pushdown_edge_composite
+aggregate_composite_partial_pushdown|0
+NULL|1|2|1|10|true|true|10|10
+NULL|2|1|1|20|false|false|20|20
+1|NULL|2|1|30|true|true|30|30
+1|2|1|0|NULL|NULL|NULL|NULL|NULL
+aggregate_composite_local_off
+aggregate_composite_parity|0

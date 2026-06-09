@@ -5,6 +5,7 @@ use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::classify::needs_async;
+use crate::sql::expr::functions::regex::invalid_regular_expression_error;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 
@@ -140,7 +141,7 @@ pub(crate) fn eval_srf(
                         pattern
                     };
                     let re = regex::Regex::new(&regex_pattern)
-                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                        .map_err(|e| invalid_regular_expression_error(&e))?;
 
                     let mut parts = Vec::new();
                     let mut last_end = 0usize;
@@ -192,7 +193,7 @@ pub(crate) fn eval_srf(
                         pattern
                     };
                     let re = regex::Regex::new(&regex_pattern)
-                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                        .map_err(|e| invalid_regular_expression_error(&e))?;
 
                     let mut out = Vec::new();
                     if global {
@@ -966,7 +967,16 @@ mod tests {
             &QueryContext::from_task_locals(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Invalid regex pattern"));
+        assert_eq!(
+            err.to_string(),
+            "invalid regular expression: brackets [] not balanced"
+        );
+        assert_eq!(
+            err.downcast_ref::<crate::sql::error::SqlError>()
+                .expect("sql error")
+                .sqlstate(),
+            "2201B"
+        );
     }
 
     #[test]

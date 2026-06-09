@@ -19,7 +19,7 @@ use super::statistics::TableStatistics;
 use super::{
     extract_constant_usize, join_keys, selectivity, DEFAULT_ESTIMATED_ROWS, DEFAULT_JOIN_SEL,
 };
-use crate::model::TableSchema;
+use crate::model::{DataType, TableSchema};
 use crate::sql::analyzer::types::{JoinCondition, JoinType};
 use crate::sql::planner::hnsw_predicate::{detect_hnsw_scan_opportunity, estimate_hnsw_scan_cost};
 use std::collections::HashMap;
@@ -41,6 +41,7 @@ pub struct PlanningContext {
     pub table_schemas: HashMap<String, TableSchema>,
     pub enable_db9_cop_pushdown: bool,
     pub txn_dirty_table_ids: std::collections::HashSet<u64>,
+    pub statement_dirty_table_ids: std::collections::HashSet<u64>,
 }
 
 impl PlanningContext {
@@ -61,6 +62,7 @@ impl PlanningContext {
                 })
                 .unwrap_or(false),
             txn_dirty_table_ids: (*crate::session_context::current_txn_dirty_table_ids()).clone(),
+            statement_dirty_table_ids: crate::session_context::current_statement_dirty_table_ids(),
         }
     }
 
@@ -75,6 +77,21 @@ impl PlanningContext {
     }
 }
 
+fn table_schema_contains_vector_columns(schema: &TableSchema) -> bool {
+    schema
+        .columns
+        .iter()
+        .any(|column| data_type_contains_vector(&column.data_type))
+}
+
+fn data_type_contains_vector(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Vector(_) => true,
+        DataType::Array(elem_type) => data_type_contains_vector(elem_type),
+        _ => false,
+    }
+}
+
 /// Converts a [`LogicalPlan`] into a [`PhysicalPlan`].
 pub struct PhysicalPlanner;
 
@@ -86,7 +103,11 @@ impl PhysicalPlanner {
             let base_table_keys: std::collections::HashSet<String> = ctx
                 .table_schemas
                 .iter()
-                .filter(|(_, schema)| !ctx.txn_dirty_table_ids.contains(&schema.table_id))
+                .filter(|(_, schema)| {
+                    !ctx.txn_dirty_table_ids.contains(&schema.table_id)
+                        && !ctx.statement_dirty_table_ids.contains(&schema.table_id)
+                        && !table_schema_contains_vector_columns(schema)
+                })
                 .map(|(key, _)| key.clone())
                 .collect();
             if base_table_keys.is_empty() {

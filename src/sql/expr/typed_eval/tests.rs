@@ -30,6 +30,22 @@ fn const_expr(val: Value, dt: DataType) -> TypedExpr {
     TypedExpr::new(TypedExprKind::Constant(val), dt)
 }
 
+fn builtin_call(name: &str, return_type: DataType, args: Vec<TypedExpr>) -> TypedExpr {
+    TypedExpr::new(
+        TypedExprKind::FunctionCall {
+            func: ResolvedFunction {
+                name: name.into(),
+                kind: FunctionKind::Builtin,
+                return_type: return_type.clone(),
+            },
+            args,
+            order_by: vec![],
+            filter: None,
+        },
+        return_type,
+    )
+}
+
 fn col_ref(index: usize, name: &str, dt: DataType) -> TypedExpr {
     TypedExpr::new(
         TypedExprKind::ColumnRef {
@@ -38,6 +54,25 @@ fn col_ref(index: usize, name: &str, dt: DataType) -> TypedExpr {
             column_name: name.to_string(),
         },
         dt,
+    )
+}
+
+fn bad_chr_expr() -> TypedExpr {
+    builtin_call(
+        "chr",
+        DataType::Text,
+        vec![const_expr(Value::Int32(-1), DataType::Int32)],
+    )
+}
+
+fn bad_chr_predicate() -> TypedExpr {
+    TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(bad_chr_expr()),
+            op: BinaryOp::Eq,
+            right: Box::new(const_expr(Value::Text(String::new()), DataType::Text)),
+        },
+        DataType::Boolean,
     )
 }
 
@@ -131,6 +166,436 @@ fn typed_builtin_current_date_uses_query_context() {
 }
 
 #[test]
+fn typed_builtin_current_date_uses_session_timezone() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_704_151_800_000,
+        1_704_151_800_000,
+        Arc::from("Asia/Shanghai"),
+    );
+
+    let expr = func_call("CURRENT_DATE", vec![], DataType::Date);
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Date(crate::model::date::parse_date_days("2024-01-02").unwrap())
+    );
+}
+
+#[test]
+fn typed_builtin_current_time_uses_query_context_timezone() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_123,
+        Arc::from("Asia/Shanghai"),
+    );
+
+    let expr = func_call("CURRENT_TIME", vec![], DataType::Time);
+    let expected_millis =
+        (qctx.transaction_timestamp_ms + 8 * 60 * 60 * 1000).rem_euclid(24 * 60 * 60 * 1000);
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Time(expected_millis * 1000)
+    );
+}
+
+#[test]
+fn typed_builtin_localtime_aliases_current_time() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_123,
+        Arc::from("Asia/Shanghai"),
+    );
+
+    let expr = func_call("LOCALTIME", vec![], DataType::Time);
+    let expected_millis =
+        (qctx.transaction_timestamp_ms + 8 * 60 * 60 * 1000).rem_euclid(24 * 60 * 60 * 1000);
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Time(expected_millis * 1000)
+    );
+}
+
+#[test]
+fn typed_builtin_date_timestamptz_uses_session_timezone() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("Asia/Shanghai"),
+    );
+    let Value::Timestamp(ts_tz) =
+        crate::sql::expr::parse_timestamp_string("2024-01-01 23:30:00+00").unwrap()
+    else {
+        panic!("timestamptz literal should parse as Value::Timestamp");
+    };
+
+    let expr = func_call(
+        "date",
+        vec![const_expr(Value::Timestamp(ts_tz), DataType::TimestampTz)],
+        DataType::Date,
+    );
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Date(crate::model::date::parse_date_days("2024-01-02").unwrap())
+    );
+}
+
+#[test]
+fn typed_builtin_age_timestamptz_uses_session_timezone() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("Asia/Shanghai"),
+    );
+    let Value::Timestamp(end_ts) =
+        crate::sql::expr::parse_timestamp_string("2024-03-01 00:30:00+08").unwrap()
+    else {
+        panic!("timestamptz literal should parse as Value::Timestamp");
+    };
+    let Value::Timestamp(start_ts) =
+        crate::sql::expr::parse_timestamp_string("2024-02-01 00:30:00+08").unwrap()
+    else {
+        panic!("timestamptz literal should parse as Value::Timestamp");
+    };
+
+    let expr = func_call(
+        "age",
+        vec![
+            const_expr(Value::Timestamp(end_ts), DataType::TimestampTz),
+            const_expr(Value::Timestamp(start_ts), DataType::TimestampTz),
+        ],
+        DataType::Interval,
+    );
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Interval(crate::model::IntervalValue::new(1, 0))
+    );
+}
+
+#[test]
+fn typed_builtin_to_char_supports_temporal_overloads() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("Asia/Shanghai"),
+    );
+    let Value::Timestamp(ts_tz) =
+        crate::sql::expr::parse_timestamp_string("2024-01-02 00:00:00+00").unwrap()
+    else {
+        panic!("timestamptz literal should parse as Value::Timestamp");
+    };
+
+    let time_expr = func_call(
+        "TO_CHAR",
+        vec![
+            const_expr(
+                Value::Time(12 * 3_600_000_000 + 34 * 60 * 1_000_000 + 56 * 1_000_000),
+                DataType::Time,
+            ),
+            const_expr(Value::Text("HH24:MI:SS".into()), DataType::Text),
+        ],
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&time_expr, &row, &qctx).unwrap(),
+        Value::Text("12:34:56".into())
+    );
+
+    let interval_expr = func_call(
+        "TO_CHAR",
+        vec![
+            const_expr(
+                Value::Interval(crate::model::IntervalValue::new(0, 3_723_000)),
+                DataType::Interval,
+            ),
+            const_expr(Value::Text("HH24:MI:SS".into()), DataType::Text),
+        ],
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&interval_expr, &row, &qctx).unwrap(),
+        Value::Text("01:02:03".into())
+    );
+
+    let timestamptz_expr = func_call(
+        "TO_CHAR",
+        vec![
+            const_expr(Value::Timestamp(ts_tz), DataType::TimestampTz),
+            const_expr(Value::Text("YYYY-MM-DD HH24:MI:SS".into()), DataType::Text),
+        ],
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&timestamptz_expr, &row, &qctx).unwrap(),
+        Value::Text("2024-01-02 08:00:00".into())
+    );
+}
+
+#[test]
+fn typed_builtin_date_part_extract_and_trunc_use_session_timezone_for_timestamptz() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("Asia/Shanghai"),
+    );
+    let Value::Timestamp(ts_tz) =
+        crate::sql::expr::parse_timestamp_string("2024-01-01 23:30:00+00").unwrap()
+    else {
+        panic!("timestamptz literal should parse as Value::Timestamp");
+    };
+
+    let date_part_day = func_call(
+        "DATE_PART",
+        vec![
+            const_expr(Value::Text("day".into()), DataType::Text),
+            const_expr(Value::Timestamp(ts_tz), DataType::TimestampTz),
+        ],
+        DataType::Float64,
+    );
+    assert_eq!(
+        eval_typed_expr(&date_part_day, &row, &qctx).unwrap(),
+        Value::Float64(2.0)
+    );
+
+    let extract_epoch = func_call(
+        "EXTRACT",
+        vec![
+            const_expr(Value::Text("epoch".into()), DataType::Text),
+            const_expr(Value::Timestamp(ts_tz), DataType::TimestampTz),
+        ],
+        DataType::Numeric {
+            precision: None,
+            scale: None,
+        },
+    );
+    assert_eq!(
+        eval_typed_expr(&extract_epoch, &row, &qctx).unwrap(),
+        Value::Numeric(rust_decimal::Decimal::from_i128_with_scale(
+            1_704_151_800_000_000,
+            6
+        ))
+    );
+
+    let date_trunc_day = func_call(
+        "DATE_TRUNC",
+        vec![
+            const_expr(Value::Text("day".into()), DataType::Text),
+            const_expr(Value::Timestamp(ts_tz), DataType::TimestampTz),
+        ],
+        DataType::TimestampTz,
+    );
+    let Value::Timestamp(expected) =
+        crate::sql::expr::parse_timestamp_string("2024-01-01 16:00:00+00").unwrap()
+    else {
+        panic!("expected timestamptz literal should parse as Value::Timestamp");
+    };
+    assert_eq!(
+        eval_typed_expr(&date_trunc_day, &row, &qctx).unwrap(),
+        Value::Timestamp(expected)
+    );
+}
+
+#[test]
+fn typed_builtin_localtimestamp_uses_query_context_timezone() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_123,
+        Arc::from("Asia/Shanghai"),
+    );
+
+    let expr = func_call("LOCALTIMESTAMP", vec![], DataType::Timestamp);
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Timestamp(qctx.transaction_timestamp_ms + 8 * 60 * 60 * 1000)
+    );
+}
+
+#[test]
+fn typed_builtin_make_date_constructs_date() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "MAKE_DATE",
+        vec![
+            const_expr(Value::Int32(2024), DataType::Int32),
+            const_expr(Value::Int32(1), DataType::Int32),
+            const_expr(Value::Int32(2), DataType::Int32),
+        ],
+        DataType::Date,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Date(19_724)
+    );
+}
+
+#[test]
+fn typed_builtin_make_time_constructs_time() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "MAKE_TIME",
+        vec![
+            const_expr(Value::Int32(8), DataType::Int32),
+            const_expr(Value::Int32(15), DataType::Int32),
+            const_expr(Value::Float64(23.5), DataType::Float64),
+        ],
+        DataType::Time,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Time(29_723_500_000)
+    );
+}
+
+#[test]
+fn typed_builtin_make_timestamp_constructs_timestamp() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "MAKE_TIMESTAMP",
+        vec![
+            const_expr(Value::Int32(2024), DataType::Int32),
+            const_expr(Value::Int32(1), DataType::Int32),
+            const_expr(Value::Int32(2), DataType::Int32),
+            const_expr(Value::Int32(8), DataType::Int32),
+            const_expr(Value::Int32(15), DataType::Int32),
+            const_expr(Value::Float64(23.5), DataType::Float64),
+        ],
+        DataType::Timestamp,
+    );
+    let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+        .unwrap()
+        .and_hms_micro_opt(8, 15, 23, 500_000)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Timestamp(expected)
+    );
+}
+
+#[test]
+fn typed_builtin_make_interval_accepts_numeric_seconds() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "MAKE_INTERVAL",
+        vec![
+            const_expr(Value::Int32(0), DataType::Int32),
+            const_expr(Value::Int32(0), DataType::Int32),
+            const_expr(Value::Int32(0), DataType::Int32),
+            const_expr(Value::Int32(2), DataType::Int32),
+            const_expr(Value::Int32(3), DataType::Int32),
+            const_expr(Value::Int32(4), DataType::Int32),
+            const_expr(
+                Value::Numeric(rust_decimal::Decimal::new(55, 1)),
+                DataType::Numeric {
+                    precision: None,
+                    scale: None,
+                },
+            ),
+        ],
+        DataType::Interval,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Interval(crate::model::IntervalValue::new(0, 183_845_500))
+    );
+}
+
+#[test]
+fn typed_builtin_to_timestamp_constructs_timestamptz_from_epoch_seconds() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "TO_TIMESTAMP",
+        vec![const_expr(
+            Value::Float64(1_704_187_323.5),
+            DataType::Float64,
+        )],
+        DataType::TimestampTz,
+    );
+    let expected = chrono::DateTime::from_timestamp(1_704_187_323, 500_000_000)
+        .unwrap()
+        .timestamp_millis();
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Timestamp(expected)
+    );
+}
+
+#[test]
+fn typed_builtin_age_two_arg_matches_postgres_symbolic_interval() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let start = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
+        .unwrap()
+        .and_hms_milli_opt(12, 34, 56, 789)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let end = chrono::NaiveDate::from_ymd_opt(2024, 5, 1)
+        .unwrap()
+        .and_hms_opt(8, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let expr = func_call(
+        "AGE",
+        vec![
+            const_expr(Value::Timestamp(end), DataType::Timestamp),
+            const_expr(Value::Timestamp(start), DataType::Timestamp),
+        ],
+        DataType::Interval,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Interval(crate::model::IntervalValue::new(
+            1,
+            16 * 24 * 60 * 60 * 1000 + 19 * 60 * 60 * 1000 + 25 * 60 * 1000 + 3_211,
+        ))
+    );
+}
+
+#[test]
 fn typed_builtin_pg_backend_pid_uses_query_context() {
     let row = empty_row();
     let qctx = QueryContext::new(
@@ -210,6 +675,177 @@ fn typed_builtin_unknown_function_errors() {
     assert!(err
         .to_string()
         .contains("unknown function: definitely_not_a_real_function"));
+}
+
+#[test]
+fn typed_builtin_sha256_returns_bytes() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "sha256",
+        vec![const_expr(Value::Bytes(b"hello".to_vec()), DataType::Bytes)],
+        DataType::Bytes,
+    );
+
+    let value = eval_typed_expr(&expr, &row, &qctx).unwrap();
+    let Value::Bytes(bytes) = value else {
+        panic!("expected bytea result, got {value:?}");
+    };
+    assert_eq!(
+        hex::encode(bytes),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+}
+
+#[test]
+fn typed_builtin_digest_returns_bytes() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "digest",
+        vec![
+            const_expr(Value::Text("hello".into()), DataType::Text),
+            const_expr(Value::Text("sha256".into()), DataType::Text),
+        ],
+        DataType::Bytes,
+    );
+
+    let value = eval_typed_expr(&expr, &row, &qctx).unwrap();
+    let Value::Bytes(bytes) = value else {
+        panic!("expected bytea result, got {value:?}");
+    };
+    assert_eq!(
+        hex::encode(bytes),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+}
+
+#[test]
+fn typed_builtin_digest_unknown_algorithm_errors() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = func_call(
+        "digest",
+        vec![
+            const_expr(Value::Text("abc".into()), DataType::Text),
+            const_expr(Value::Text(" sha256 ".into()), DataType::Text),
+        ],
+        DataType::Bytes,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert_eq!(
+        err.to_string(),
+        "Cannot use \" sha256 \": No such hash algorithm"
+    );
+    assert_eq!(sql_err.sqlstate(), "22023");
+}
+
+#[test]
+fn typed_builtin_digest_evaluates_args_before_null_short_circuit() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let null_data_expr = func_call(
+        "digest",
+        vec![
+            const_expr(Value::Null, DataType::Text),
+            TypedExpr::new(
+                TypedExprKind::BinaryOp {
+                    left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+                    op: BinaryOp::Div,
+                    right: Box::new(const_expr(Value::Int64(0), DataType::Int64)),
+                },
+                DataType::Int64,
+            ),
+        ],
+        DataType::Bytes,
+    );
+
+    let err = eval_typed_expr(&null_data_expr, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::DivisionByZero));
+    assert_eq!(err.to_string(), "division by zero");
+
+    let null_algorithm_expr = func_call(
+        "digest",
+        vec![
+            func_call(
+                "chr",
+                vec![const_expr(Value::Int32(-1), DataType::Int32)],
+                DataType::Text,
+            ),
+            const_expr(Value::Null, DataType::Text),
+        ],
+        DataType::Bytes,
+    );
+
+    let err = eval_typed_expr(&null_algorithm_expr, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::InvalidParameterValue { .. }));
+    assert_eq!(err.to_string(), "character number must be positive");
+}
+
+#[test]
+fn typed_builtin_hashes_follow_pg_overloads() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let Value::Timestamp(ts) =
+        crate::sql::expr::parse_timestamp_string("2024-01-02 03:04:05.678").unwrap()
+    else {
+        panic!("timestamp literal should parse as Value::Timestamp");
+    };
+
+    let md5_expr = func_call(
+        "md5",
+        vec![const_expr(Value::Text("hello".into()), DataType::Text)],
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&md5_expr, &row, &qctx).unwrap(),
+        Value::Text("5d41402abc4b2a76b9719d911017c592".into())
+    );
+
+    let md5_timestamp_expr = func_call(
+        "md5",
+        vec![const_expr(Value::Timestamp(ts), DataType::Timestamp)],
+        DataType::Text,
+    );
+    let md5_timestamp_err = eval_typed_expr(&md5_timestamp_expr, &row, &qctx).unwrap_err();
+    let sql_err = md5_timestamp_err
+        .downcast_ref::<SqlError>()
+        .expect("md5(timestamp) should preserve SQLSTATE");
+    assert_eq!(sql_err.sqlstate(), "42883");
+
+    let sha256_expr = func_call(
+        "sha256",
+        vec![const_expr(Value::Bytes(b"hello".to_vec()), DataType::Bytes)],
+        DataType::Bytes,
+    );
+    let Value::Bytes(sha256_bytes) = eval_typed_expr(&sha256_expr, &row, &qctx).unwrap() else {
+        panic!("sha256(bytea) should return bytea");
+    };
+    assert_eq!(
+        hex::encode(sha256_bytes),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+
+    let digest_expr = func_call(
+        "digest",
+        vec![
+            const_expr(Value::Bytes(b"hello".to_vec()), DataType::Bytes),
+            const_expr(Value::Text("sha256".into()), DataType::Text),
+        ],
+        DataType::Bytes,
+    );
+    let Value::Bytes(digest_bytes) = eval_typed_expr(&digest_expr, &row, &qctx).unwrap() else {
+        panic!("digest(bytea, 'sha256') should return bytea");
+    };
+    assert_eq!(
+        hex::encode(digest_bytes),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
 }
 
 // ── ColumnRef ───────────────────────────────────────────
@@ -384,6 +1020,100 @@ fn test_or_short_circuit() {
 }
 
 #[test]
+fn test_boolean_pg_fold_prechecks_runtime_guarded_constants() {
+    let qctx = test_qctx();
+
+    let runtime_false_and_bad_const = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(col_ref(0, "flag", DataType::Boolean)),
+            op: BinaryOp::And,
+            right: Box::new(bad_chr_predicate()),
+        },
+        DataType::Boolean,
+    );
+    let err = eval_typed_expr(
+        &runtime_false_and_bad_const,
+        &make_row(vec![Value::Boolean(false)]),
+        &qctx,
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "character number must be positive");
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "22023"
+    );
+
+    let runtime_true_or_bad_const = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(col_ref(0, "flag", DataType::Boolean)),
+            op: BinaryOp::Or,
+            right: Box::new(bad_chr_predicate()),
+        },
+        DataType::Boolean,
+    );
+    let err = eval_typed_expr(
+        &runtime_true_or_bad_const,
+        &make_row(vec![Value::Boolean(true)]),
+        &qctx,
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "character number must be positive");
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "22023"
+    );
+}
+
+#[test]
+fn test_boolean_pg_fold_determining_constants_skip_runtime_errors() {
+    let row = make_row(vec![Value::Float64(-1.0)]);
+    let qctx = test_qctx();
+
+    let sqrt_col_gt_zero = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(builtin_call(
+                "sqrt",
+                DataType::Float64,
+                vec![col_ref(0, "value", DataType::Float64)],
+            )),
+            op: BinaryOp::Gt,
+            right: Box::new(const_expr(Value::Float64(0.0), DataType::Float64)),
+        },
+        DataType::Boolean,
+    );
+
+    let and_false = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(sqrt_col_gt_zero.clone()),
+            op: BinaryOp::And,
+            right: Box::new(const_expr(Value::Boolean(false), DataType::Boolean)),
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&and_false, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let or_true = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(sqrt_col_gt_zero),
+            op: BinaryOp::Or,
+            right: Box::new(const_expr(Value::Boolean(true), DataType::Boolean)),
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&or_true, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
 fn test_string_concat() {
     let row = empty_row();
     let qctx = test_qctx();
@@ -514,6 +1244,29 @@ fn test_cast_regtype_to_text_uses_postgres_display_name() {
     );
 }
 
+#[test]
+fn test_cast_text_to_interval_accepts_fractional_seconds() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let cast_expr = TypedExpr::new(
+        TypedExprKind::Cast {
+            expr: Box::new(const_expr(
+                Value::Text("5.5 seconds".into()),
+                DataType::Text,
+            )),
+            target_type: DataType::Interval,
+            cast_context: CastContext::Explicit,
+        },
+        DataType::Interval,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&cast_expr, &row, &qctx).unwrap(),
+        Value::Interval(crate::model::IntervalValue::from_millis(5_500))
+    );
+}
+
 // ── IsTest ──────────────────────────────────────────────
 
 #[test]
@@ -586,6 +1339,13 @@ fn test_is_true_false() {
 fn test_between() {
     let row = empty_row();
     let qctx = test_qctx();
+    let bad_high = || {
+        builtin_call(
+            "sqrt",
+            DataType::Float64,
+            vec![const_expr(Value::Float64(-1.0), DataType::Float64)],
+        )
+    };
 
     let between = TypedExpr::new(
         TypedExprKind::Between {
@@ -614,6 +1374,104 @@ fn test_between() {
         eval_typed_expr(&not_between, &row, &qctx).unwrap(),
         Value::Boolean(false)
     );
+
+    let null_low_false_high = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Int64(5), DataType::Int64)),
+            low: Box::new(const_expr(Value::Null, DataType::Int64)),
+            high: Box::new(const_expr(Value::Int64(3), DataType::Int64)),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&null_low_false_high, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let null_low_true_high = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Int64(5), DataType::Int64)),
+            low: Box::new(const_expr(Value::Null, DataType::Int64)),
+            high: Box::new(const_expr(Value::Int64(10), DataType::Int64)),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&null_low_true_high, &row, &qctx).unwrap(),
+        Value::Null
+    );
+
+    let short_circuit_false_high_error = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Float64(1.0), DataType::Float64)),
+            low: Box::new(const_expr(Value::Float64(10.0), DataType::Float64)),
+            high: Box::new(bad_high()),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&short_circuit_false_high_error, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let not_between_short_circuit_high_error = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Float64(1.0), DataType::Float64)),
+            low: Box::new(const_expr(Value::Float64(10.0), DataType::Float64)),
+            high: Box::new(bad_high()),
+            negated: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&not_between_short_circuit_high_error, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let true_low_evaluates_high = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Float64(20.0), DataType::Float64)),
+            low: Box::new(const_expr(Value::Float64(10.0), DataType::Float64)),
+            high: Box::new(bad_high()),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert!(eval_typed_expr(&true_low_evaluates_high, &row, &qctx)
+        .unwrap_err()
+        .to_string()
+        .contains("square root"));
+
+    let null_low_evaluates_high = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Float64(1.0), DataType::Float64)),
+            low: Box::new(const_expr(Value::Null, DataType::Float64)),
+            high: Box::new(bad_high()),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert!(eval_typed_expr(&null_low_evaluates_high, &row, &qctx)
+        .unwrap_err()
+        .to_string()
+        .contains("square root"));
+
+    let null_value_evaluates_high = TypedExpr::new(
+        TypedExprKind::Between {
+            expr: Box::new(const_expr(Value::Null, DataType::Float64)),
+            low: Box::new(const_expr(Value::Float64(10.0), DataType::Float64)),
+            high: Box::new(bad_high()),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert!(eval_typed_expr(&null_value_evaluates_high, &row, &qctx)
+        .unwrap_err()
+        .to_string()
+        .contains("square root"));
 }
 
 // ── InList ──────────────────────────────────────────────
@@ -675,6 +1533,43 @@ fn test_in_list_with_null() {
         DataType::Boolean,
     );
     assert_eq!(eval_typed_expr(&in_null, &row, &qctx).unwrap(), Value::Null);
+}
+
+#[test]
+fn test_in_list_prechecks_foldable_items_before_runtime_short_circuit() {
+    let row = make_row(vec![Value::Text("safe".into())]);
+    let qctx = test_qctx();
+
+    let in_list = TypedExpr::new(
+        TypedExprKind::InList {
+            expr: Box::new(col_ref(0, "value", DataType::Text)),
+            list: vec![
+                const_expr(Value::Text("safe".into()), DataType::Text),
+                bad_chr_expr(),
+            ],
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    let err = eval_typed_expr(&in_list, &row, &qctx).unwrap_err();
+    assert_eq!(err.to_string(), "character number must be positive");
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "22023"
+    );
+
+    let null_lhs = TypedExpr::new(
+        TypedExprKind::InList {
+            expr: Box::new(col_ref(0, "value", DataType::Text)),
+            list: vec![bad_chr_expr()],
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    let err = eval_typed_expr(&null_lhs, &make_row(vec![Value::Null]), &qctx).unwrap_err();
+    assert_eq!(err.to_string(), "character number must be positive");
 }
 
 // ── ScalarArrayCmp ──────────────────────────────────────
@@ -853,6 +1748,282 @@ fn test_like() {
         eval_typed_expr(&ilike, &row, &qctx).unwrap(),
         Value::Boolean(true)
     );
+
+    let ilike_with_uppercase_escape = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("x_".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("xA_".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("A".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ilike_with_uppercase_escape, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let like_default_escape = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("A_20".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("A\\_20".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&like_default_escape, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let ilike_default_escape = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("A%Twenty".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("a\\%twenty".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ilike_default_escape, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let like_empty_escape = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("A_20".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("A\\_20".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text(String::new()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&like_empty_escape, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let like_multibyte_escape = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("A_20".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("Añ_20".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("ñ".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&like_multibyte_escape, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let like_invalid_escape = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("xx".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    let err = eval_typed_expr(&like_invalid_escape, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::InvalidEscapeString { .. }));
+    assert_eq!(sql_err.sqlstate(), "22025");
+    assert_eq!(err.to_string(), "invalid escape string");
+
+    let pattern_null = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Null, DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("xx".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&pattern_null, &row, &qctx).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn test_ilike_does_not_expand_unicode_characters() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let unicode_single_char = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("\u{0130}".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("_".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&unicode_single_char, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let unicode_two_char_pattern = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("\u{0130}".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("i_".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&unicode_two_char_pattern, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let unicode_simple_match = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("\u{0130}".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("i".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&unicode_simple_match, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    let unicode_does_not_expand_to_two_chars = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("\u{00DF}".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("ss".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&unicode_does_not_expand_to_two_chars, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let unicode_sigma_match = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("\u{03A3}".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("\u{03C3}".into()), DataType::Text)),
+            escape: None,
+            case_insensitive: true,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&unicode_sigma_match, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn test_like_null_escape_returns_null() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    for (case_insensitive, negated) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let expr = TypedExpr::new(
+            TypedExprKind::Like {
+                expr: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+                pattern: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+                escape: Some(Box::new(const_expr(Value::Null, DataType::Text))),
+                case_insensitive,
+                negated,
+            },
+            DataType::Boolean,
+        );
+        assert_eq!(eval_typed_expr(&expr, &row, &qctx).unwrap(), Value::Null);
+    }
+}
+
+#[test]
+fn test_like_trailing_escape_after_consumed_input_returns_false() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("a".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("a\\".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("\\".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn test_like_trailing_escape_errors_when_matching_unconsumed_input() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let expr = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Text("a\\".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("a\\".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("\\".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("LIKE pattern must not end with escape character"),
+        "unexpected error: {err}"
+    );
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::InvalidEscapeString { .. }));
+    assert_eq!(sql_err.sqlstate(), "22025");
 }
 
 // ── Case ────────────────────────────────────────────────
@@ -936,6 +2107,67 @@ fn test_coalesce() {
         eval_typed_expr(&coalesce, &row, &qctx).unwrap(),
         Value::Int64(42)
     );
+}
+
+#[test]
+fn test_coalesce_prechecks_fold_candidates_after_runtime_arg() {
+    let row = make_row(vec![Value::Text("safe".into())]);
+    let qctx = test_qctx();
+
+    let constant_guard = TypedExpr::new(
+        TypedExprKind::Coalesce(vec![
+            const_expr(Value::Text("safe".into()), DataType::Text),
+            builtin_call(
+                "chr",
+                DataType::Text,
+                vec![const_expr(Value::Int32(-1), DataType::Int32)],
+            ),
+        ]),
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&constant_guard, &row, &qctx).unwrap(),
+        Value::Text("safe".into())
+    );
+
+    let runtime_guard = TypedExpr::new(
+        TypedExprKind::Coalesce(vec![
+            col_ref(0, "nickname", DataType::Text),
+            builtin_call(
+                "chr",
+                DataType::Text,
+                vec![const_expr(Value::Int32(-1), DataType::Int32)],
+            ),
+        ]),
+        DataType::Text,
+    );
+    let err = eval_typed_expr(&runtime_guard, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::InvalidParameterValue { .. }));
+    assert_eq!(sql_err.sqlstate(), "22023");
+
+    let nested_fold_error = TypedExpr::new(
+        TypedExprKind::Coalesce(vec![
+            col_ref(0, "nickname", DataType::Text),
+            builtin_call(
+                "left",
+                DataType::Text,
+                vec![
+                    col_ref(0, "nickname", DataType::Text),
+                    builtin_call(
+                        "abs",
+                        DataType::Int32,
+                        vec![const_expr(Value::Int32(i32::MIN), DataType::Int32)],
+                    ),
+                ],
+            ),
+        ]),
+        DataType::Text,
+    );
+    let err = eval_typed_expr(&nested_fold_error, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::NumericValueOutOfRange { .. }));
+    assert_eq!(sql_err.sqlstate(), "22003");
 }
 
 // ── NullIf ──────────────────────────────────────────────
@@ -1089,6 +2321,71 @@ fn test_pg_typeof_null_column_returns_declared_type() {
     assert_eq!(
         eval_typed_expr(&pg_typeof, &row, &qctx).unwrap(),
         Value::Text("timestamp with time zone".into())
+    );
+}
+
+#[test]
+fn test_json_functions_use_typed_timestamptz_timezone() {
+    let row = empty_row();
+    let qctx = QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("Asia/Shanghai"),
+    );
+    let ts = const_expr(Value::Timestamp(1_699_992_800_000), DataType::TimestampTz);
+
+    assert_eq!(
+        eval_typed_expr(
+            &builtin_call("TO_JSON", DataType::Json, vec![ts.clone()]),
+            &row,
+            &qctx,
+        )
+        .unwrap(),
+        Value::Json("\"2023-11-15T04:13:20+08:00\"".into())
+    );
+    assert_eq!(
+        eval_typed_expr(
+            &builtin_call("TO_JSONB", DataType::Jsonb, vec![ts.clone()]),
+            &row,
+            &qctx,
+        )
+        .unwrap(),
+        Value::Jsonb("\"2023-11-15T04:13:20+08:00\"".into())
+    );
+    assert_eq!(
+        eval_typed_expr(
+            &builtin_call("JSON_BUILD_ARRAY", DataType::Json, vec![ts.clone()]),
+            &row,
+            &qctx,
+        )
+        .unwrap(),
+        Value::Json("[\"2023-11-15T04:13:20+08:00\"]".into())
+    );
+
+    let row_arg = TypedExpr::new(
+        TypedExprKind::Row(vec![ts]),
+        DataType::UserDefined("record".into()),
+    );
+    assert_eq!(
+        eval_typed_expr(
+            &builtin_call("TO_JSON", DataType::Json, vec![row_arg.clone()]),
+            &row,
+            &qctx,
+        )
+        .unwrap(),
+        Value::Json("{\"f1\":\"2023-11-15T04:13:20+08:00\"}".into())
+    );
+    assert_eq!(
+        eval_typed_expr(
+            &builtin_call("ROW_TO_JSON", DataType::Json, vec![row_arg]),
+            &row,
+            &qctx,
+        )
+        .unwrap(),
+        Value::Json("{\"f1\":\"2023-11-15T04:13:20+08:00\"}".into())
     );
 }
 
@@ -1333,6 +2630,25 @@ fn test_bitwise_and() {
 }
 
 #[test]
+fn test_bitwise_xor() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let bw_xor = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(const_expr(Value::Int32(5), DataType::Int32)),
+            op: BinaryOp::BitwiseXor,
+            right: Box::new(const_expr(Value::Int32(3), DataType::Int32)),
+        },
+        DataType::Int32,
+    );
+    assert_eq!(
+        eval_typed_expr(&bw_xor, &row, &qctx).unwrap(),
+        Value::Int32(6)
+    );
+}
+
+#[test]
 fn test_bitwise_not() {
     let row = empty_row();
     let qctx = test_qctx();
@@ -1360,7 +2676,7 @@ fn test_shift_left_basic() {
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
             op: BinaryOp::ShiftLeft,
-            right: Box::new(const_expr(Value::Int64(3), DataType::Int64)),
+            right: Box::new(const_expr(Value::Int32(3), DataType::Int32)),
         },
         DataType::Int64,
     );
@@ -1375,7 +2691,7 @@ fn test_shift_right_basic() {
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(Value::Int64(16), DataType::Int64)),
             op: BinaryOp::ShiftRight,
-            right: Box::new(const_expr(Value::Int64(2), DataType::Int64)),
+            right: Box::new(const_expr(Value::Int32(2), DataType::Int32)),
         },
         DataType::Int64,
     );
@@ -1383,11 +2699,10 @@ fn test_shift_right_basic() {
 }
 
 #[test]
-fn test_shift_excessive_amount_errors() {
+fn test_shift_large_amounts_use_masked_counts_like_pg() {
     let row = empty_row();
     let qctx = test_qctx();
 
-    // Int8 shift count is 0..63
     let shl_64 = TypedExpr::new(
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
@@ -1396,13 +2711,11 @@ fn test_shift_excessive_amount_errors() {
         },
         DataType::Int64,
     );
-    let err = eval_typed_expr(&shl_64, &row, &qctx).unwrap_err();
-    assert!(matches!(
-        err.downcast_ref::<SqlError>(),
-        Some(SqlError::NumericValueOutOfRange { .. })
-    ));
+    assert_eq!(
+        eval_typed_expr(&shl_64, &row, &qctx).unwrap(),
+        Value::Int64(1)
+    );
 
-    // Int4 shift count is 0..31
     let shl_32 = TypedExpr::new(
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(Value::Int32(1), DataType::Int32)),
@@ -1411,45 +2724,67 @@ fn test_shift_excessive_amount_errors() {
         },
         DataType::Int32,
     );
-    let err = eval_typed_expr(&shl_32, &row, &qctx).unwrap_err();
-    assert!(matches!(
-        err.downcast_ref::<SqlError>(),
-        Some(SqlError::NumericValueOutOfRange { .. })
-    ));
+    assert_eq!(
+        eval_typed_expr(&shl_32, &row, &qctx).unwrap(),
+        Value::Int32(1)
+    );
 
-    // Shift right by a huge amount should also error.
-    let shr_100 = TypedExpr::new(
+    let shl_33 = TypedExpr::new(
         TypedExprKind::BinaryOp {
-            left: Box::new(const_expr(Value::Int64(42), DataType::Int64)),
+            left: Box::new(const_expr(Value::Int32(1), DataType::Int32)),
+            op: BinaryOp::ShiftLeft,
+            right: Box::new(const_expr(Value::Int32(33), DataType::Int32)),
+        },
+        DataType::Int32,
+    );
+    assert_eq!(
+        eval_typed_expr(&shl_33, &row, &qctx).unwrap(),
+        Value::Int32(2)
+    );
+
+    let shr_65 = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(const_expr(Value::Int64(2), DataType::Int64)),
             op: BinaryOp::ShiftRight,
-            right: Box::new(const_expr(Value::Int64(100), DataType::Int64)),
+            right: Box::new(const_expr(Value::Int32(65), DataType::Int32)),
         },
         DataType::Int64,
     );
-    let err = eval_typed_expr(&shr_100, &row, &qctx).unwrap_err();
-    assert!(matches!(
-        err.downcast_ref::<SqlError>(),
-        Some(SqlError::NumericValueOutOfRange { .. })
-    ));
+    assert_eq!(
+        eval_typed_expr(&shr_65, &row, &qctx).unwrap(),
+        Value::Int64(1)
+    );
 }
 
 #[test]
-fn test_shift_negative_amount_errors() {
+fn test_shift_negative_amounts_use_masked_counts_like_pg() {
     let row = empty_row();
     let qctx = test_qctx();
     let shl_neg = TypedExpr::new(
         TypedExprKind::BinaryOp {
-            left: Box::new(const_expr(Value::Int64(42), DataType::Int64)),
+            left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
             op: BinaryOp::ShiftLeft,
-            right: Box::new(const_expr(Value::Int64(-1), DataType::Int64)),
+            right: Box::new(const_expr(Value::Int32(-1), DataType::Int32)),
         },
         DataType::Int64,
     );
-    let err = eval_typed_expr(&shl_neg, &row, &qctx).unwrap_err();
-    assert!(matches!(
-        err.downcast_ref::<SqlError>(),
-        Some(SqlError::NumericValueOutOfRange { .. })
-    ));
+    assert_eq!(
+        eval_typed_expr(&shl_neg, &row, &qctx).unwrap(),
+        Value::Int64(1_i64 << 63)
+    );
+
+    let shr_neg = TypedExpr::new(
+        TypedExprKind::BinaryOp {
+            left: Box::new(const_expr(Value::Int32(1), DataType::Int32)),
+            op: BinaryOp::ShiftRight,
+            right: Box::new(const_expr(Value::Int32(-1), DataType::Int32)),
+        },
+        DataType::Int32,
+    );
+    assert_eq!(
+        eval_typed_expr(&shr_neg, &row, &qctx).unwrap(),
+        Value::Int32(0)
+    );
 }
 
 #[test]
@@ -1476,7 +2811,7 @@ fn test_shift_upper_bound_ok() {
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
             op: BinaryOp::ShiftLeft,
-            right: Box::new(const_expr(Value::Int64(63), DataType::Int64)),
+            right: Box::new(const_expr(Value::Int32(63), DataType::Int32)),
         },
         DataType::Int64,
     );
@@ -1494,7 +2829,7 @@ fn test_shift_null_propagation() {
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
             op: BinaryOp::ShiftLeft,
-            right: Box::new(const_expr(Value::Null, DataType::Int64)),
+            right: Box::new(const_expr(Value::Null, DataType::Int32)),
         },
         DataType::Int64,
     );
@@ -1672,6 +3007,55 @@ fn typed_builtin_current_setting_missing_ok_still_errors_without_snapshot() {
     assert!(err
         .to_string()
         .contains("unrecognized configuration parameter \"missing.setting\""));
+}
+
+#[test]
+fn typed_builtin_current_setting_rejected_public_guc_still_errors_with_missing_ok() {
+    let row = empty_row();
+    let mut qctx = test_qctx();
+    qctx.settings_snapshot = Some(Arc::new(HashMap::new()));
+
+    let expr = func_call(
+        "CURRENT_SETTING",
+        vec![
+            const_expr(
+                Value::Text("db9.enable_cop_agg_pushdown".to_string()),
+                DataType::Text,
+            ),
+            const_expr(Value::Boolean(true), DataType::Boolean),
+        ],
+        DataType::Text,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unrecognized configuration parameter \"db9.enable_cop_agg_pushdown\""));
+    assert!(msg.contains("db9.enable_cop_pushdown"));
+}
+
+#[test]
+fn typed_builtin_set_config_null_reset_rejected_public_guc_errors() {
+    let row = empty_row();
+    let mut qctx = test_qctx();
+    qctx.settings_snapshot = Some(Arc::new(HashMap::new()));
+
+    let expr = func_call(
+        "SET_CONFIG",
+        vec![
+            const_expr(
+                Value::Text("db9.enable_cop_agg_pushdown".to_string()),
+                DataType::Text,
+            ),
+            const_expr(Value::Null, DataType::Text),
+            const_expr(Value::Boolean(false), DataType::Boolean),
+        ],
+        DataType::Text,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unrecognized configuration parameter \"db9.enable_cop_agg_pushdown\""));
+    assert!(msg.contains("db9.enable_cop_pushdown"));
 }
 
 #[test]
@@ -2048,6 +3432,189 @@ fn test_position_function() {
 }
 
 #[test]
+fn test_array_position_start_argument() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let array_type = DataType::Array(Box::new(DataType::Text));
+    let expr = func_call(
+        "array_position",
+        vec![
+            const_expr(
+                Value::Array(vec![
+                    Value::Text("a".into()),
+                    Value::Text("b".into()),
+                    Value::Text("b".into()),
+                ]),
+                array_type,
+            ),
+            const_expr(Value::Text("b".into()), DataType::Text),
+            const_expr(Value::Int32(3), DataType::Int32),
+        ],
+        DataType::Int32,
+    );
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Int32(3)
+    );
+
+    let null_start = func_call(
+        "array_position",
+        vec![
+            const_expr(
+                Value::Array(vec![Value::Text("a".into())]),
+                DataType::Array(Box::new(DataType::Text)),
+            ),
+            const_expr(Value::Text("a".into()), DataType::Text),
+            const_expr(Value::Null, DataType::Int32),
+        ],
+        DataType::Int32,
+    );
+    assert!(eval_typed_expr(&null_start, &row, &qctx)
+        .unwrap_err()
+        .to_string()
+        .contains("initial position must not be null"));
+}
+
+#[test]
+fn test_array_position_remove_append_prepend_multidimensional_errors() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let array_type = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32))));
+
+    let multidimensional = const_expr(
+        Value::Array(vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+        ]),
+        array_type.clone(),
+    );
+
+    let position = func_call(
+        "array_position",
+        vec![
+            multidimensional.clone(),
+            const_expr(Value::Int32(1), DataType::Int32),
+        ],
+        DataType::Int32,
+    );
+    let err = eval_typed_expr(&position, &row, &qctx).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "0A000"
+    );
+    assert_eq!(
+        err.to_string(),
+        "searching for elements in multidimensional arrays is not supported"
+    );
+
+    let remove = func_call(
+        "array_remove",
+        vec![
+            multidimensional.clone(),
+            const_expr(Value::Int32(1), DataType::Int32),
+        ],
+        array_type.clone(),
+    );
+    let err = eval_typed_expr(&remove, &row, &qctx).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "0A000"
+    );
+    assert_eq!(
+        err.to_string(),
+        "removing elements from multidimensional arrays is not supported"
+    );
+
+    let append = func_call(
+        "array_append",
+        vec![
+            multidimensional.clone(),
+            const_expr(Value::Int32(5), DataType::Int32),
+        ],
+        array_type.clone(),
+    );
+    let err = eval_typed_expr(&append, &row, &qctx).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "22000"
+    );
+    assert_eq!(
+        err.to_string(),
+        "argument must be empty or one-dimensional array"
+    );
+
+    let prepend = func_call(
+        "array_prepend",
+        vec![
+            const_expr(Value::Int32(5), DataType::Int32),
+            multidimensional,
+        ],
+        array_type,
+    );
+    let err = eval_typed_expr(&prepend, &row, &qctx).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "22000"
+    );
+    assert_eq!(
+        err.to_string(),
+        "argument must be empty or one-dimensional array"
+    );
+}
+
+#[test]
+fn test_array_cat_mixed_rank_runtime_matches_postgres() {
+    let row = empty_row();
+    let qctx = test_qctx();
+    let array_type_1d = DataType::Array(Box::new(DataType::Int32));
+    let array_type_2d = DataType::Array(Box::new(array_type_1d.clone()));
+
+    let one_d = const_expr(
+        Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+        array_type_1d.clone(),
+    );
+    let two_d = const_expr(
+        Value::Array(vec![
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+            Value::Array(vec![Value::Int32(5), Value::Int32(6)]),
+        ]),
+        array_type_2d.clone(),
+    );
+
+    let left_result = func_call(
+        "array_cat",
+        vec![one_d.clone(), two_d.clone()],
+        array_type_2d.clone(),
+    );
+    assert_eq!(
+        eval_typed_expr(&left_result, &row, &qctx).unwrap(),
+        Value::Array(vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+            Value::Array(vec![Value::Int32(5), Value::Int32(6)]),
+        ])
+    );
+
+    let right_result = func_call("array_cat", vec![two_d, one_d], array_type_2d);
+    assert_eq!(
+        eval_typed_expr(&right_result, &row, &qctx).unwrap(),
+        Value::Array(vec![
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+            Value::Array(vec![Value::Int32(5), Value::Int32(6)]),
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+        ])
+    );
+}
+
+#[test]
 fn test_substring_function() {
     let row = empty_row();
     let qctx = test_qctx();
@@ -2249,12 +3816,11 @@ fn test_modulo_by_zero() {
         DataType::Int64,
     );
     let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("by zero"),
-        "expected 'by zero' error, got: {}",
-        err
-    );
+    assert!(matches!(
+        err.downcast_ref::<SqlError>(),
+        Some(SqlError::DivisionByZero)
+    ));
+    assert_eq!(err.to_string(), "division by zero");
 }
 
 // ── AT TIME ZONE ──────────────────────────────────────
@@ -2445,6 +4011,131 @@ fn test_similar_to() {
         eval_typed_expr(&not_similar, &row, &qctx).unwrap(),
         Value::Boolean(true)
     );
+
+    let similar_empty_escape = TypedExpr::new(
+        TypedExprKind::SimilarTo {
+            expr: Box::new(const_expr(Value::Text("a_c".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("a\\_c".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text(String::new()),
+                DataType::Text,
+            ))),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&similar_empty_escape, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+
+    let similar_invalid_pattern = TypedExpr::new(
+        TypedExprKind::SimilarTo {
+            expr: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("[".into()), DataType::Text)),
+            escape: None,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    let err = eval_typed_expr(&similar_invalid_pattern, &row, &qctx).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid regular expression: brackets [] not balanced"
+    );
+    assert_eq!(
+        err.downcast_ref::<SqlError>()
+            .expect("sql error")
+            .sqlstate(),
+        "2201B"
+    );
+}
+
+#[test]
+fn test_like_null_source_invalid_escape_errors_before_null_short_circuit() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let expr = TypedExpr::new(
+        TypedExprKind::Like {
+            expr: Box::new(const_expr(Value::Null, DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("xx".into()),
+                DataType::Text,
+            ))),
+            case_insensitive: false,
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::InvalidEscapeString { .. }));
+    assert_eq!(sql_err.sqlstate(), "22025");
+    assert_eq!(err.to_string(), "invalid escape string");
+
+    let pattern_null = TypedExpr::new(
+        TypedExprKind::SimilarTo {
+            expr: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            pattern: Box::new(const_expr(Value::Null, DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("xx".into()),
+                DataType::Text,
+            ))),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&pattern_null, &row, &qctx).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn test_similar_to_null_source_invalid_escape_errors_before_null_short_circuit() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let expr = TypedExpr::new(
+        TypedExprKind::SimilarTo {
+            expr: Box::new(const_expr(Value::Null, DataType::Text)),
+            pattern: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+            escape: Some(Box::new(const_expr(
+                Value::Text("xx".into()),
+                DataType::Text,
+            ))),
+            negated: false,
+        },
+        DataType::Boolean,
+    );
+
+    let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+    let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+    assert!(matches!(sql_err, SqlError::InvalidEscapeString { .. }));
+    assert_eq!(sql_err.sqlstate(), "22025");
+    assert_eq!(err.to_string(), "invalid escape string");
+}
+
+#[test]
+fn test_similar_to_null_escape_returns_null() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    for negated in [false, true] {
+        let expr = TypedExpr::new(
+            TypedExprKind::SimilarTo {
+                expr: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+                pattern: Box::new(const_expr(Value::Text("abc".into()), DataType::Text)),
+                escape: Some(Box::new(const_expr(Value::Null, DataType::Text))),
+                negated,
+            },
+            DataType::Boolean,
+        );
+        assert_eq!(eval_typed_expr(&expr, &row, &qctx).unwrap(), Value::Null);
+    }
 }
 
 #[test]

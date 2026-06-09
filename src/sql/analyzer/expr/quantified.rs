@@ -92,8 +92,8 @@ impl<'a> Analyzer<'a> {
     /// Analyze `x <op> ANY(rhs)` expressions.
     ///
     /// Handles subquery forms, literal array optimizations (`= ANY(ARRAY[...])` to
-    /// `IN (...)`), `<> ANY` via `ScalarArrayCmp`, column-reference arrays via
-    /// `ARRAY_POSITION`, and parameter type inference for Prisma-style `= ANY($1)`.
+    /// `IN (...)`), `<> ANY` via `ScalarArrayCmp`, non-literal arrays via
+    /// `__DB9_EQ_ANY`, and parameter type inference for Prisma-style `= ANY($1)`.
     pub(super) fn analyze_any_op(
         &mut self,
         left: &Expr,
@@ -240,8 +240,10 @@ impl<'a> Analyzer<'a> {
         }
 
         // General case: `x = ANY(array_col)` where array_col is a column reference
-        // or other non-literal array expression.
-        // Convert to: ARRAY_POSITION(array_col, x) IS NOT NULL
+        // or other non-literal array expression. Use a dedicated helper instead
+        // of ARRAY_POSITION(... ) IS NOT NULL because ANY uses SQL equality
+        // three-valued logic, while array_position uses IS NOT DISTINCT FROM
+        // semantics for NULL needles.
         if matches!(compare_op, BinaryOperator::Eq)
             && (matches!(right_expr.data_type, DataType::Array(_))
                 || matches!(
@@ -275,16 +277,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
 
-            let array_pos =
-                self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
-            return Ok(TypedExpr::new(
-                TypedExprKind::IsTest {
-                    expr: Box::new(array_pos),
-                    test: IsTestKind::Null,
-                    negated: true, // IS NOT NULL
-                },
-                DataType::Boolean,
-            ));
+            return self.make_function_call("__DB9_EQ_ANY", vec![right_expr, left_expr]);
         }
 
         // Infer array type for unresolved parameters in = ANY() context.
@@ -297,16 +290,7 @@ impl<'a> Analyzer<'a> {
                     self.resolve_param_type(*index, &array_type)?;
                     let right_fixed =
                         TypedExpr::new(TypedExprKind::Parameter { index: *index }, array_type);
-                    let array_pos =
-                        self.make_function_call("ARRAY_POSITION", vec![right_fixed, left_expr])?;
-                    return Ok(TypedExpr::new(
-                        TypedExprKind::IsTest {
-                            expr: Box::new(array_pos),
-                            test: IsTestKind::Null,
-                            negated: true,
-                        },
-                        DataType::Boolean,
-                    ));
+                    return self.make_function_call("__DB9_EQ_ANY", vec![right_fixed, left_expr]);
                 }
             }
         }

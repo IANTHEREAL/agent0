@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::model::Value;
 use crate::sql::advisory_locks::AdvisoryLockMode;
+use crate::sql::error::SqlError;
 pub(crate) use crate::sql::session::settings::public_setting_value;
 use crate::storage::TikvStore;
 
@@ -376,6 +377,11 @@ impl QueryContext {
     pub(crate) fn current_setting_lookup(qctx: &QueryContext, name: &str) -> CurrentSettingLookup {
         let canonical =
             crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
+        if let Some(err) =
+            crate::sql::session::settings::SessionSettings::rejected_public_guc_error(canonical)
+        {
+            return CurrentSettingLookup::Rejected(err);
+        }
         if let Some(value) = Self::current_setting_snapshot(canonical) {
             return CurrentSettingLookup::Found(value);
         }
@@ -504,9 +510,10 @@ impl QueryContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum CurrentSettingLookup {
     Found(String),
+    Rejected(SqlError),
     Missing,
     NoSnapshot,
 }
@@ -781,6 +788,24 @@ mod tests {
                 QueryContext::current_setting_snapshot("timezone").as_deref(),
                 Some("UTC")
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn current_setting_lookup_rejects_rejected_public_guc() {
+        let qctx = QueryContext::for_tests();
+        with_scoped_query_context(&qctx, async {
+            match QueryContext::current_setting_lookup(&qctx, "db9.enable_cop_agg_pushdown") {
+                CurrentSettingLookup::Rejected(err) => {
+                    let msg = err.to_string();
+                    assert!(msg.contains(
+                        "unrecognized configuration parameter \"db9.enable_cop_agg_pushdown\""
+                    ));
+                    assert!(msg.contains("db9.enable_cop_pushdown"));
+                }
+                other => panic!("expected rejected public guc, got: {other:?}"),
+            }
         })
         .await;
     }

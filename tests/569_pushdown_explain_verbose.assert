@@ -1,9 +1,9 @@
 Index Scan using db9_cop_verbose_smoke_n_idx on db9_cop_verbose_smoke
 DB9 Cop Access: point (20)
-DB9 Cop Output: lower
+DB9 Cop Output: length
 DB9 Cop Limit: 1
 Seq Scan on db9_cop_verbose_smoke
-Filter: (lower(v) = 'b'::text)
-DB9 Cop Filter: (lower(v) = 'b'::text)
+Filter: (length(v) = 1)
+DB9 Cop Filter: (length(v) = 1)
 DB9 Cop Output: id
 DB9 Cop Limit: 1

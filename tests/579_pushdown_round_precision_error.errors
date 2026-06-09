@@ -1,0 +1,4 @@
+function round(double precision, bigint) does not exist
+function trunc(double precision, bigint) does not exist
+function round(double precision, bigint) does not exist
+function trunc(double precision, bigint) does not exist

@@ -778,7 +778,10 @@ pub(crate) fn parse_time_string(s: &str) -> Option<i64> {
         (0, 0)
     };
 
-    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+    if !(0..=24).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+        return None;
+    }
+    if hours == 24 && (minutes != 0 || seconds != 0 || micros != 0) {
         return None;
     }
 

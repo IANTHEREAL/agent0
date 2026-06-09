@@ -2,9 +2,26 @@
 ///
 /// These functions are intentionally small and allocation-light, and they mirror
 /// the behavior used throughout the project (single quotes doubled inside
-/// string literals; identifiers quoted when required).
+/// string literals; backslashes use PostgreSQL escape-string syntax;
+/// identifiers quoted when required).
 pub(crate) fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    let mut escaped = String::with_capacity(value.len());
+    let mut has_backslash = false;
+    for ch in value.chars() {
+        match ch {
+            '\'' => escaped.push_str("''"),
+            '\\' => {
+                has_backslash = true;
+                escaped.push_str("\\\\");
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    if has_backslash {
+        format!("E'{escaped}'")
+    } else {
+        format!("'{escaped}'")
+    }
 }
 
 pub(crate) fn quote_ident(ident: &str) -> String {
@@ -226,6 +243,12 @@ mod tests {
     #[test]
     fn quote_literal_doubles_single_quotes() {
         assert_eq!(quote_literal("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn quote_literal_uses_escape_syntax_for_backslashes() {
+        assert_eq!(quote_literal("a\\b"), r"E'a\\b'");
+        assert_eq!(quote_literal("a\\'b"), r"E'a\\''b'");
     }
 
     #[test]

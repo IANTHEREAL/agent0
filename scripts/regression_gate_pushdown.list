@@ -14,9 +14,28 @@ tests/568_pushdown_timezone_bucket_fallback.sql
 tests/569_pushdown_explain_verbose.sql
 tests/570_pushdown_secondary_index_row_fetch.sql
 tests/571_pushdown_copy_txn_visibility.sql
+tests/571_pushdown_partial_aggregate_grouped.sql
+tests/572_pushdown_temporal_scalars.sql
+tests/573_pushdown_interval_scalars.sql
+tests/574_pushdown_json_scalars.sql
+tests/575_pushdown_operator_expressions.sql
 tests/575_prepared_pushdown_txn_visibility.sql
+tests/576_pushdown_array_operators.sql
 tests/576_pushdown_copy_secondary_index_visibility.sql
+tests/577_pushdown_partial_aggregate_edge_cases.sql
 tests/577_pushdown_update_delete_txn_visibility.sql
+tests/578_pushdown_array_function_parity.sql
+tests/579_pushdown_abs_min_error.sql
+tests/579_pushdown_exp_power_error.sql
+tests/579_pushdown_mod_zero_error.sql
+tests/579_pushdown_operator_math_proof.sql
+tests/579_pushdown_round_precision_error.sql
+tests/579_pushdown_width_overlay_error.sql
+tests/579_pushdown_partial_aggregate_typed_matrix.sql
+tests/579_pushdown_string_regex.sql
+tests/580_pushdown_rejected_agg_guc.sql
+tests/582_pushdown_pg17_edge_parity.sql
+tests/583_pushdown_array_carrier_contract.sql
 
 [python]
 

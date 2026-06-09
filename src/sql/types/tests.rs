@@ -39,6 +39,61 @@ fn test_function_registry_min_max() {
 }
 
 #[test]
+fn test_function_registry_sign_matches_pg_return_types() {
+    let reg = global_registry();
+    assert_eq!(
+        reg.resolve_return_type("SIGN", &[DataType::Int32]),
+        Some(DataType::Float64)
+    );
+    assert_eq!(
+        reg.resolve_return_type("SIGN", &[DataType::Int64]),
+        Some(DataType::Float64)
+    );
+    assert_eq!(
+        reg.resolve_return_type("SIGN", &[DataType::Float64]),
+        Some(DataType::Float64)
+    );
+    assert_eq!(
+        reg.resolve_return_type(
+            "SIGN",
+            &[DataType::Numeric {
+                precision: Some(5),
+                scale: Some(2),
+            }]
+        ),
+        Some(DataType::Numeric {
+            precision: None,
+            scale: None,
+        })
+    );
+}
+
+#[test]
+fn test_function_registry_mod_matches_pg_overloads() {
+    let reg = global_registry();
+    let numeric = DataType::Numeric {
+        precision: None,
+        scale: None,
+    };
+    assert_eq!(
+        reg.resolve_return_type("MOD", &[DataType::Int32, DataType::Int32]),
+        Some(DataType::Int32)
+    );
+    assert_eq!(
+        reg.resolve_return_type("MOD", &[DataType::Int32, DataType::Int64]),
+        Some(DataType::Int64)
+    );
+    assert_eq!(
+        reg.resolve_return_type("MOD", &[numeric.clone(), numeric.clone()]),
+        Some(numeric)
+    );
+    assert_eq!(
+        reg.resolve_return_type("MOD", &[DataType::Float64, DataType::Float64]),
+        None
+    );
+}
+
+#[test]
 fn test_ts_rank_registry_supports_pg_overloads() {
     let reg = global_registry();
     let ts_rank = reg.get("TS_RANK").expect("TS_RANK must exist");

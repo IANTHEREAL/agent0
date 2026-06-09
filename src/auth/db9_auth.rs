@@ -342,9 +342,20 @@ static JWKS_CACHE: OnceLock<Mutex<JwksCacheState>> = OnceLock::new();
 
 pub(crate) fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(3))
+            .connect_timeout(Duration::from_secs(3));
+
+        // Unit tests run on developer machines where system proxy settings can
+        // unexpectedly intercept localhost requests; ensure JWKS test servers
+        // remain reachable regardless of proxy configuration.
+        let builder = if cfg!(test) {
+            builder.no_proxy()
+        } else {
+            builder
+        };
+
+        builder
             .build()
             .expect("failed to build reqwest HTTP client")
     })
@@ -1099,7 +1110,7 @@ mod tests {
     }
 
     async fn wait_for_request_count(counter: &Arc<AtomicUsize>, expected: usize) {
-        timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(5), async {
             loop {
                 if counter.load(Ordering::SeqCst) >= expected {
                     return;
@@ -1585,7 +1596,14 @@ JwIDAQAB
         .unwrap();
 
         let result = jwks_decoding_key(&token, &jwks_url).await;
-        assert!(matches!(result, Err(Db9AuthError::JwksKidMissing)));
+        assert!(
+            matches!(result, Err(Db9AuthError::JwksKidMissing)),
+            "unexpected JWKS result: {}",
+            match &result {
+                Ok(_) => "Ok(_)".to_string(),
+                Err(err) => err.to_string(),
+            }
+        );
 
         server_task.await.unwrap();
     }

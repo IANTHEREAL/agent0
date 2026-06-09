@@ -1,6 +1,9 @@
 //! PostgreSQL-compatible `BYTEA` operations used by the SQL expression evaluator.
 
-use anyhow::{anyhow, Result};
+use crate::sql::error::SqlError;
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::Result;
 
 /// PostgreSQL `bytea_output` session setting: controls text-format rendering of `BYTEA` values.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,6 +143,14 @@ pub(crate) fn encode_escape(bytes: &[u8]) -> String {
 
 /// PostgreSQL `decode(string, 'escape')`: parse the legacy escape format into raw bytes.
 pub(crate) fn decode_escape(s: &str) -> Result<Vec<u8>> {
+    fn invalid_bytea_input() -> anyhow::Error {
+        SqlError::InvalidInputSyntax {
+            type_name: "bytea".to_string(),
+            value: String::new(),
+        }
+        .into()
+    }
+
     let input = s.as_bytes();
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0usize;
@@ -153,8 +164,7 @@ pub(crate) fn decode_escape(s: &str) -> Result<Vec<u8>> {
 
         // Backslash escape.
         if i + 1 >= input.len() {
-            out.push(b'\\');
-            break;
+            return Err(invalid_bytea_input());
         }
 
         match input[i + 1] {
@@ -162,35 +172,23 @@ pub(crate) fn decode_escape(s: &str) -> Result<Vec<u8>> {
                 out.push(b'\\');
                 i += 2;
             }
-            b'0'..=b'9' => {
-                // Octal escape sequence. PostgreSQL produces 3 digits; accept 1-3 digits for
-                // leniency (matching many client expectations).
-                let mut oct = 0u16;
-                let mut digits = 0u8;
-                let mut j = i + 1;
-                while j < input.len() && digits < 3 {
-                    let d = input[j];
-                    if !d.is_ascii_digit() {
-                        break;
-                    }
-                    if d > b'7' {
-                        return Err(anyhow!("invalid escape sequence"));
-                    }
-                    oct = (oct << 3) | u16::from(d - b'0');
-                    digits += 1;
-                    j += 1;
+            b'0'..=b'7' => {
+                if i + 3 >= input.len()
+                    || !matches!(input[i + 2], b'0'..=b'7')
+                    || !matches!(input[i + 3], b'0'..=b'7')
+                {
+                    return Err(invalid_bytea_input());
                 }
-                if digits == 0 || oct > 0xff {
-                    return Err(anyhow!("invalid escape sequence"));
+                let oct = u16::from(input[i + 1] - b'0') << 6
+                    | u16::from(input[i + 2] - b'0') << 3
+                    | u16::from(input[i + 3] - b'0');
+                if oct > u16::from(u8::MAX) {
+                    return Err(invalid_bytea_input());
                 }
                 out.push(oct as u8);
-                i = j;
+                i += 4;
             }
-            _ => {
-                // Unknown escape: treat the backslash as a literal (best-effort decoding).
-                out.push(b'\\');
-                i += 1;
-            }
+            _ => return Err(invalid_bytea_input()),
         }
     }
 
@@ -199,7 +197,8 @@ pub(crate) fn decode_escape(s: &str) -> Result<Vec<u8>> {
 
 /// PostgreSQL `substring(bytea from start [for count])`.
 ///
-/// `start` is 1-based. Values <= 0 behave like 1. Negative/zero lengths are treated as 0.
+/// `start` is 1-based. For `start <= 0`, PostgreSQL shrinks the effective
+/// length using the same rule as text substring (`len + start - 1`).
 ///
 /// This function takes ownership of `bytes` so callers can avoid extra allocations.
 pub(crate) fn substring(mut bytes: Vec<u8>, start: i64, count: Option<i64>) -> Vec<u8> {
@@ -215,7 +214,11 @@ pub(crate) fn substring(mut bytes: Vec<u8>, start: i64, count: Option<i64>) -> V
 
     let mut end = bytes.len();
     if let Some(count) = count {
-        let count = count.max(0) as usize;
+        let count = if start <= 0 {
+            count.saturating_add(start).saturating_sub(1).max(0) as usize
+        } else {
+            count.max(0) as usize
+        };
         end = start_idx.saturating_add(count).min(bytes.len());
     }
 
@@ -228,52 +231,45 @@ pub(crate) fn substring(mut bytes: Vec<u8>, start: i64, count: Option<i64>) -> V
 
 /// PostgreSQL `overlay(bytea placing bytea from start [for count])`.
 ///
-/// `start` is 1-based. Values <= 0 return the input unchanged.
+/// `start` is 1-based. Values <= 0 should error, matching PostgreSQL.
 /// When `count` is not provided, it defaults to `placing.len()`.
 ///
 /// This function mutates `base` in-place where possible to minimize allocations/copies.
 pub(crate) fn overlay(
-    mut base: Vec<u8>,
+    base: Vec<u8>,
     placing: &[u8],
     start: i64,
     count: Option<i64>,
-) -> Vec<u8> {
-    if start <= 0 {
-        return base;
+) -> Result<Vec<u8>> {
+    if start <= 0 || count.is_some_and(|value| value < 0) {
+        return Err(SqlError::SubstringError {
+            message: "negative substring length not allowed".into(),
+        }
+        .into());
     }
+    let replacement_len = i64::try_from(placing.len()).unwrap_or(i64::MAX);
+    let count = count.unwrap_or(replacement_len);
+    let suffix_start = overlay_suffix_start(start, count)?;
+    let mut prefix = substring(base.clone(), 1, Some(start.saturating_sub(1)));
+    let suffix = substring(base, suffix_start, None);
+    prefix.extend_from_slice(placing);
+    prefix.extend_from_slice(&suffix);
+    Ok(prefix)
+}
 
-    let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
-    let replace_len = count
-        .map(|n| usize::try_from(n.max(0)).unwrap_or(usize::MAX))
-        .unwrap_or_else(|| placing.len());
-
-    let original_len = base.len();
-    let prefix_len = original_len.min(start_idx);
-    let suffix_start = original_len.min(start_idx.saturating_add(replace_len));
-    let suffix_len = original_len - suffix_start;
-
-    let new_len = prefix_len + placing.len() + suffix_len;
-    let removed_len = suffix_start - prefix_len;
-
-    // Fast-path: pure replacement with equal lengths (common in UUIDv7 construction).
-    if placing.len() == removed_len && prefix_len < original_len {
-        base[prefix_len..suffix_start].copy_from_slice(placing);
-        return base;
-    }
-
-    if new_len > original_len {
-        base.resize(new_len, 0);
-    }
-
-    let dest_suffix_start = prefix_len + placing.len();
-    base.copy_within(suffix_start..original_len, dest_suffix_start);
-
-    if new_len < original_len {
-        base.truncate(new_len);
-    }
-
-    base[prefix_len..prefix_len + placing.len()].copy_from_slice(placing);
-    base
+fn overlay_suffix_start(start: i64, count: i64) -> Result<i64> {
+    let start = i32::try_from(start).map_err(|_| SqlError::NumericValueOutOfRange {
+        message: "integer out of range".into(),
+    })?;
+    let count = i32::try_from(count).map_err(|_| SqlError::NumericValueOutOfRange {
+        message: "integer out of range".into(),
+    })?;
+    let suffix_start = start
+        .checked_add(count)
+        .ok_or(SqlError::NumericValueOutOfRange {
+            message: "integer out of range".into(),
+        })?;
+    Ok(i64::from(suffix_start))
 }
 
 #[cfg(test)]
@@ -312,21 +308,47 @@ mod tests {
         assert_eq!(substring(vec![1, 2, 3, 4], 3, None), vec![3, 4]);
         assert_eq!(substring(vec![1, 2, 3, 4], 3, Some(1)), vec![3]);
         assert_eq!(substring(vec![1, 2, 3, 4], 10, None), Vec::<u8>::new());
+        assert_eq!(substring(vec![1, 2, 3], 0, Some(3)), vec![1, 2]);
+        assert_eq!(substring(vec![1, 2, 3], -1, Some(4)), vec![1, 2]);
     }
 
     #[test]
     fn overlay_bytea_replace_and_insert() {
         // Replace 2 bytes starting at position 2.
         assert_eq!(
-            overlay(vec![0x00, 0x11, 0x22, 0x33], &[0xaa, 0xbb], 2, Some(2)),
+            overlay(vec![0x00, 0x11, 0x22, 0x33], &[0xaa, 0xbb], 2, Some(2)).unwrap(),
             vec![0x00, 0xaa, 0xbb, 0x33]
         );
 
         // Insert past the end appends.
         assert_eq!(
-            overlay(vec![0x00, 0x11], &[0xaa], 10, Some(1)),
+            overlay(vec![0x00, 0x11], &[0xaa], 10, Some(1)).unwrap(),
             vec![0x00, 0x11, 0xaa]
         );
+
+        let err = overlay(vec![0x01, 0x02, 0x03], &[0xff], 2, Some(-1)).unwrap_err();
+        assert_eq!(err.to_string(), "negative substring length not allowed");
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::SubstringError { .. }));
+        assert_eq!(sql_err.sqlstate(), "22011");
+
+        let err = overlay(vec![0x01, 0x02, 0x03], &[0xff], 0, None).unwrap_err();
+        assert_eq!(err.to_string(), "negative substring length not allowed");
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::SubstringError { .. }));
+        assert_eq!(sql_err.sqlstate(), "22011");
+
+        let overflow_err = overlay(
+            vec![0x01, 0x02, 0x03],
+            &[0xff],
+            i64::from(i32::MAX),
+            Some(1),
+        )
+        .unwrap_err();
+        assert_eq!(overflow_err.to_string(), "integer out of range");
+        let sql_err = overflow_err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::NumericValueOutOfRange { .. }));
+        assert_eq!(sql_err.sqlstate(), "22003");
     }
 
     #[test]
@@ -352,6 +374,18 @@ mod tests {
     fn escape_decode_rejects_invalid_octal() {
         assert!(decode_escape(r"\8").is_err());
         assert!(decode_escape(r"\999").is_err());
+        assert!(decode_escape(r"\1").is_err());
+        assert!(decode_escape(r"\12").is_err());
+        assert!(decode_escape(r"\400").is_err());
+        assert!(decode_escape(r"\777").is_err());
+        assert!(decode_escape(r"\x").is_err());
+        assert!(decode_escape(r"\").is_err());
+    }
+
+    #[test]
+    fn escape_decode_accepts_three_digit_octal_and_escaped_backslash() {
+        assert_eq!(decode_escape(r"\123").unwrap(), vec![0o123]);
+        assert_eq!(decode_escape(r"\\").unwrap(), br"\".to_vec());
     }
 
     #[test]

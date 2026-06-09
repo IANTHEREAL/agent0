@@ -47,7 +47,11 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "EXTRACT",
-        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+        FunctionSignature::fixed(DataType::Numeric {
+            precision: None,
+            scale: None,
+        })
+        .with_args(2, Some(2)),
     );
     r.register(
         "AGE",
@@ -63,7 +67,7 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "TO_TIMESTAMP",
-        FunctionSignature::fixed(DataType::TimestampTz).with_args(1, Some(2)),
+        FunctionSignature::fixed(DataType::TimestampTz).with_args(1, Some(1)),
     );
     r.register(
         "TO_NUMBER",

@@ -176,8 +176,29 @@ pub struct IntervalValue {
 }
 
 impl IntervalValue {
+    pub const NEG_INFINITY: Self = Self {
+        months: i32::MIN,
+        millis: i64::MIN,
+    };
+    pub const POS_INFINITY: Self = Self {
+        months: i32::MAX,
+        millis: i64::MAX,
+    };
+
     pub fn new(months: i32, millis: i64) -> Self {
         Self { months, millis }
+    }
+
+    pub fn infinity(negative: bool) -> Self {
+        if negative {
+            Self::NEG_INFINITY
+        } else {
+            Self::POS_INFINITY
+        }
+    }
+
+    pub fn is_infinite(self) -> bool {
+        matches!(self, Self::NEG_INFINITY | Self::POS_INFINITY)
     }
 
     pub fn from_millis(millis: i64) -> Self {
@@ -191,6 +212,12 @@ impl IntervalValue {
     /// Convert to total milliseconds (approximate, for legacy compat)
     /// Uses 30 days per month approximation
     pub fn to_millis_approx(self) -> i64 {
+        if self == Self::POS_INFINITY {
+            return i64::MAX;
+        }
+        if self == Self::NEG_INFINITY {
+            return i64::MIN;
+        }
         (self.months as i64) * 30 * 24 * 60 * 60 * 1000 + self.millis
     }
 }
@@ -217,6 +244,13 @@ impl std::ops::Sub for IntervalValue {
 
 impl fmt::Display for IntervalValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Self::POS_INFINITY {
+            return f.write_str("infinity");
+        }
+        if *self == Self::NEG_INFINITY {
+            return f.write_str("-infinity");
+        }
+
         let mut parts = Vec::new();
         if self.months != 0 {
             let years = self.months / 12;
@@ -225,34 +259,36 @@ impl fmt::Display for IntervalValue {
                 parts.push(format!(
                     "{} year{}",
                     years,
-                    if years.abs() != 1 { "s" } else { "" }
+                    if years == 1 { "" } else { "s" }
                 ));
             }
             if mons != 0 {
-                parts.push(format!(
-                    "{} mon{}",
-                    mons,
-                    if mons.abs() != 1 { "s" } else { "" }
-                ));
+                parts.push(format!("{} mon{}", mons, if mons == 1 { "" } else { "s" }));
             }
         }
         let ms = self.millis;
         let days = ms / (1000 * 60 * 60 * 24);
         let remaining = ms % (1000 * 60 * 60 * 24);
         if days != 0 {
-            parts.push(format!(
-                "{} day{}",
-                days,
-                if days.abs() != 1 { "s" } else { "" }
-            ));
+            parts.push(format!("{} day{}", days, if days == 1 { "" } else { "s" }));
         }
         if remaining != 0 || parts.is_empty() {
-            let sign = if remaining < 0 { "-" } else { "" };
+            let negative = remaining < 0;
             let abs_rem = remaining.unsigned_abs();
             let hours = abs_rem / (1000 * 60 * 60);
             let mins = (abs_rem % (1000 * 60 * 60)) / (1000 * 60);
             let secs = (abs_rem % (1000 * 60)) / 1000;
-            parts.push(format!("{sign}{hours:02}:{mins:02}:{secs:02}"));
+            let millis = abs_rem % 1000;
+            let sign = if negative { "-" } else { "" };
+            if millis == 0 {
+                parts.push(format!("{sign}{hours:02}:{mins:02}:{secs:02}"));
+            } else {
+                let mut fraction = format!("{millis:03}");
+                while fraction.ends_with('0') {
+                    fraction.pop();
+                }
+                parts.push(format!("{sign}{hours:02}:{mins:02}:{secs:02}.{fraction}"));
+            }
         }
         write!(f, "{}", parts.join(" "))
     }
@@ -276,6 +312,35 @@ pub fn format_vector_pg_text(vec: &[f64]) -> String {
     }
     out.push(']');
     out
+}
+
+fn pg_array_text_needs_quotes(s: &str) -> bool {
+    s.is_empty()
+        || s.eq_ignore_ascii_case("NULL")
+        || s.chars().any(char::is_whitespace)
+        || s.chars()
+            .any(|ch| matches!(ch, '{' | '}' | ',' | '"' | '\\'))
+}
+
+fn format_pg_array_text_element(s: &str) -> String {
+    if !pg_array_text_needs_quotes(s) {
+        return s.to_string();
+    }
+
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn format_float64_pg_text(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value == f64::INFINITY {
+        "Infinity".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 /// A single value
@@ -372,9 +437,9 @@ impl fmt::Display for Value {
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Int32(i) => write!(f, "{i}"),
             Value::Int64(i) => write!(f, "{i}"),
-            Value::Float64(v) => write!(f, "{v}"),
+            Value::Float64(v) => write!(f, "{}", format_float64_pg_text(*v)),
             Value::Text(s) => write!(f, "{s}"),
-            Value::Bytes(b) => write!(f, "{b:?}"),
+            Value::Bytes(b) => write!(f, "\\x{}", hex::encode(b)),
             Value::Timestamp(ts) => write!(f, "{ts}"),
             Value::Interval(iv) => write!(f, "{iv}"),
             Value::Time(micros) => {
@@ -409,7 +474,7 @@ impl fmt::Display for Value {
                         write!(f, ",")?;
                     }
                     match elem {
-                        Value::Text(s) => write!(f, "\"{}\"", s.replace('"', "\\\""))?,
+                        Value::Text(s) => write!(f, "{}", format_pg_array_text_element(s))?,
                         v => write!(f, "{v}")?,
                     }
                 }
@@ -1135,6 +1200,70 @@ mod tests {
     #[test]
     fn format_vector_pg_text_empty() {
         assert_eq!(format_vector_pg_text(&[]), "[]");
+    }
+
+    #[test]
+    fn format_text_array_uses_pg_simple_text_lexemes() {
+        let value = Value::Array(vec![
+            Value::Text("alpha".into()),
+            Value::Text("beta".into()),
+        ]);
+        assert_eq!(value.to_string(), "{alpha,beta}");
+    }
+
+    #[test]
+    fn format_text_array_quotes_special_text_lexemes() {
+        let value = Value::Array(vec![
+            Value::Text(String::new()),
+            Value::Text("NULL".into()),
+            Value::Text("two words".into()),
+            Value::Text("a,b".into()),
+            Value::Text("a\"b".into()),
+            Value::Text("a\\b".into()),
+        ]);
+        assert_eq!(
+            value.to_string(),
+            r#"{"","NULL","two words","a,b","a\"b","a\\b"}"#
+        );
+    }
+
+    #[test]
+    fn format_bytes_uses_pg_hex_text() {
+        let value = Value::Bytes(vec![0x00, 0x01, 0xff]);
+        assert_eq!(value.to_string(), "\\x0001ff");
+    }
+
+    #[test]
+    fn format_float_special_values_uses_pg_text() {
+        assert_eq!(Value::Float64(f64::INFINITY).to_string(), "Infinity");
+        assert_eq!(Value::Float64(f64::NEG_INFINITY).to_string(), "-Infinity");
+        assert_eq!(Value::Float64(f64::NAN).to_string(), "NaN");
+    }
+
+    #[test]
+    fn format_interval_preserves_fractional_seconds() {
+        let value = IntervalValue::new(
+            1,
+            16 * 24 * 60 * 60 * 1000 + 19 * 60 * 60 * 1000 + 25 * 60 * 1000 + 3_211,
+        );
+        assert_eq!(value.to_string(), "1 mon 16 days 19:25:03.211");
+    }
+
+    #[test]
+    fn format_interval_infinity_uses_pg_text() {
+        assert_eq!(IntervalValue::infinity(false).to_string(), "infinity");
+        assert_eq!(IntervalValue::infinity(true).to_string(), "-infinity");
+        assert_eq!(IntervalValue::infinity(false).to_millis_approx(), i64::MAX);
+        assert_eq!(IntervalValue::infinity(true).to_millis_approx(), i64::MIN);
+    }
+
+    #[test]
+    fn format_interval_negative_single_units_use_pg_plural_forms() {
+        assert_eq!(IntervalValue::new(-1, 0).to_string(), "-1 mons");
+        assert_eq!(
+            IntervalValue::new(0, -(24 * 60 * 60 * 1000)).to_string(),
+            "-1 days"
+        );
     }
 
     #[test]

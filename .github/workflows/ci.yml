@@ -139,7 +139,7 @@ jobs:
     timeout-minutes: 30
     services:
       redis:
-        image: redis:7
+        image: public.ecr.aws/docker/library/redis:7
         ports:
           - 6379:6379
         options: >-
@@ -191,7 +191,7 @@ jobs:
     timeout-minutes: 25
     services:
       redis:
-        image: redis:7
+        image: public.ecr.aws/docker/library/redis:7
         ports:
           - 6379:6379
         options: >-
@@ -326,7 +326,7 @@ jobs:
     timeout-minutes: 20
     services:
       redis:
-        image: redis:7
+        image: public.ecr.aws/docker/library/redis:7
         ports:
           - 6379:6379
         options: >-
@@ -400,7 +400,7 @@ jobs:
     timeout-minutes: 30
     services:
       redis:
-        image: redis:7
+        image: public.ecr.aws/docker/library/redis:7
         ports:
           - 6379:6379
         options: >-

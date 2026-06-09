@@ -20,6 +20,7 @@ use sqlparser::ast::BinaryOperator;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use super::functions::regex::{invalid_fancy_regular_expression_error, translate_pg_regex_escapes};
 use super::numeric;
 
 fn vector_value(vec: Vec<f64>) -> Result<Value> {
@@ -29,15 +30,17 @@ fn vector_value(vec: Vec<f64>) -> Result<Value> {
 /// Process-wide cache for compiled regexes used by `~`, `~*`, `!~`, `!~*` operators.
 /// Bounded: new entries are skipped (not cached) when the map is full.
 const MAX_REGEX_CACHE_SIZE: usize = 256;
+const MAX_RECURSION_DEPTH: usize = 64;
 
-static REGEX_CACHE: std::sync::LazyLock<DashMap<String, regex::Regex>> =
+static REGEX_CACHE: std::sync::LazyLock<DashMap<String, fancy_regex::Regex>> =
     std::sync::LazyLock::new(DashMap::new);
 
-fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex> {
+fn get_or_compile_regex(pattern: &str) -> Result<fancy_regex::Regex> {
     if let Some(re) = REGEX_CACHE.get(pattern) {
         return Ok(re.clone());
     }
-    let re = regex::Regex::new(pattern).map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+    let re =
+        fancy_regex::Regex::new(pattern).map_err(|e| invalid_fancy_regular_expression_error(&e))?;
     // Soft cap: skip insert when full. Under concurrency, len() is approximate
     // so the cache may transiently exceed MAX_REGEX_CACHE_SIZE — acceptable
     // since it's a memory budget hint, not a hard invariant.
@@ -57,14 +60,16 @@ fn eval_regex_op(
     negate: bool,
 ) -> Result<Value> {
     let text = value_to_text(left);
-    let pattern = value_to_text(right);
+    let pattern = translate_pg_regex_escapes(&value_to_text(right))?;
     let pattern = if case_insensitive {
-        format!("(?i){}", pattern)
+        format!("(?is){}", pattern)
     } else {
-        pattern
+        format!("(?s){}", pattern)
     };
     let re = get_or_compile_regex(&pattern)?;
-    let matched = re.is_match(&text);
+    let matched = re
+        .is_match(&text)
+        .map_err(|e| invalid_fancy_regular_expression_error(&e))?;
     Ok(Value::Boolean(if negate { !matched } else { matched }))
 }
 
@@ -83,6 +88,14 @@ fn eval_json_exists(left: Value, right: Value) -> Result<Value> {
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
     Ok(Value::Boolean(super::super::jsonb::exists(&json_val, &key)))
+}
+
+fn array_recursion_depth_error() -> anyhow::Error {
+    anyhow!("array value is too deep")
+}
+
+fn json_recursion_depth_error() -> anyhow::Error {
+    anyhow!("json value is too deep")
 }
 
 /// Sort with fallible comparison. Propagates the first comparison error.
@@ -261,14 +274,7 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
 
         BinaryOperator::PGOverlap => match (&left, &right) {
             (Value::Array(l), Value::Array(r)) => {
-                for lv in l {
-                    for rv in r {
-                        if compare_values(lv, rv)? == 0 {
-                            return Ok(Value::Boolean(true));
-                        }
-                    }
-                }
-                Ok(Value::Boolean(false))
+                Ok(Value::Boolean(crate::sql::expr::array_overlap_pg(l, r)?))
             }
             _ => Err(anyhow!("&& operator requires array operands")),
         },
@@ -793,7 +799,7 @@ impl PartialOrd for JsonbComparableValue {
 
 impl Ord for JsonbComparableValue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match compare_jsonb_value(self, other) {
+        match compare_jsonb_value(self, other, 0) {
             x if x < 0 => std::cmp::Ordering::Less,
             0 => std::cmp::Ordering::Equal,
             _ => std::cmp::Ordering::Greater,
@@ -858,6 +864,10 @@ pub(crate) mod test_counters {
 }
 
 pub(crate) fn parse_jsonb_comparable_value(raw: &str) -> Result<JsonbComparableValue> {
+    parse_jsonb_comparable_value_inner(raw, 0)
+}
+
+fn parse_jsonb_comparable_value_inner(raw: &str, depth: usize) -> Result<JsonbComparableValue> {
     #[cfg(test)]
     test_counters::increment();
 
@@ -894,20 +904,26 @@ pub(crate) fn parse_jsonb_comparable_value(raw: &str) -> Result<JsonbComparableV
             Ok(JsonbComparableValue::String(s))
         }
         b'[' => {
+            if depth >= MAX_RECURSION_DEPTH {
+                return Err(json_recursion_depth_error());
+            }
             let values: Vec<Box<RawValue>> =
                 serde_json::from_str(trimmed).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
             let mut out = Vec::with_capacity(values.len());
             for v in values {
-                out.push(parse_jsonb_comparable_value(v.get())?);
+                out.push(parse_jsonb_comparable_value_inner(v.get(), depth + 1)?);
             }
             Ok(JsonbComparableValue::Array(out))
         }
         b'{' => {
+            if depth >= MAX_RECURSION_DEPTH {
+                return Err(json_recursion_depth_error());
+            }
             let values: BTreeMap<String, Box<RawValue>> =
                 serde_json::from_str(trimmed).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
             let mut out = Vec::with_capacity(values.len());
             for (k, v) in values {
-                out.push((k, parse_jsonb_comparable_value(v.get())?));
+                out.push((k, parse_jsonb_comparable_value_inner(v.get(), depth + 1)?));
             }
             Ok(JsonbComparableValue::Object(out))
         }
@@ -967,7 +983,11 @@ fn compare_jsonb_number(left: &str, right: &str) -> i8 {
 }
 
 /// Compare two JSONB values using PostgreSQL ordering semantics.
-fn compare_jsonb_value(left: &JsonbComparableValue, right: &JsonbComparableValue) -> i8 {
+fn compare_jsonb_value(
+    left: &JsonbComparableValue,
+    right: &JsonbComparableValue,
+    depth: usize,
+) -> i8 {
     let lp = jsonb_type_priority(left);
     let rp = jsonb_type_priority(right);
     if lp != rp {
@@ -981,9 +1001,12 @@ fn compare_jsonb_value(left: &JsonbComparableValue, right: &JsonbComparableValue
         }
         (JsonbComparableValue::String(l), JsonbComparableValue::String(r)) => l.cmp(r) as i8,
         (JsonbComparableValue::Array(l), JsonbComparableValue::Array(r)) => {
+            if depth >= MAX_RECURSION_DEPTH {
+                return 0;
+            }
             // Element-wise, then length.
             for (le, re) in l.iter().zip(r.iter()) {
-                let c = compare_jsonb_value(le, re);
+                let c = compare_jsonb_value(le, re, depth + 1);
                 if c != 0 {
                     return c;
                 }
@@ -991,6 +1014,9 @@ fn compare_jsonb_value(left: &JsonbComparableValue, right: &JsonbComparableValue
             l.len().cmp(&r.len()) as i8
         }
         (JsonbComparableValue::Object(l), JsonbComparableValue::Object(r)) => {
+            if depth >= MAX_RECURSION_DEPTH {
+                return 0;
+            }
             // PG: compare pair count, then key-by-key (sorted), then values.
             match l.len().cmp(&r.len()) {
                 std::cmp::Ordering::Equal => {}
@@ -1001,7 +1027,7 @@ fn compare_jsonb_value(left: &JsonbComparableValue, right: &JsonbComparableValue
                     std::cmp::Ordering::Equal => {}
                     o => return o as i8,
                 }
-                let c = compare_jsonb_value(lv, rv);
+                let c = compare_jsonb_value(lv, rv, depth + 1);
                 if c != 0 {
                     return c;
                 }
@@ -1016,11 +1042,11 @@ fn compare_jsonb_value(left: &JsonbComparableValue, right: &JsonbComparableValue
 fn compare_jsonb_pg(left: &str, right: &str) -> Result<i8> {
     let lv = parse_jsonb_comparable_value(left)?;
     let rv = parse_jsonb_comparable_value(right)?;
-    Ok(compare_jsonb_value(&lv, &rv))
+    Ok(compare_jsonb_value(&lv, &rv, 0))
 }
 
 /// Compare two values of the same type. Returns -1, 0, or 1.
-fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
+fn compare_same_type(left: &Value, right: &Value, depth: usize) -> Result<i8> {
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(l.cmp(r) as i8),
         (Value::Int64(l), Value::Int64(r)) => Ok(l.cmp(r) as i8),
@@ -1034,9 +1060,12 @@ fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
         (Value::Numeric(l), Value::Numeric(r)) => Ok(l.cmp(r) as i8),
         (Value::Time(l), Value::Time(r)) => Ok(l.cmp(r) as i8),
         (Value::Array(l), Value::Array(r)) => {
+            if depth >= MAX_RECURSION_DEPTH {
+                return Err(array_recursion_depth_error());
+            }
             let min_len = l.len().min(r.len());
             for i in 0..min_len {
-                let ord = compare_values(&l[i], &r[i])?;
+                let ord = compare_array_elements(&l[i], &r[i], depth + 1)?;
                 if ord != 0 {
                     return Ok(ord);
                 }
@@ -1129,11 +1158,24 @@ fn compare_uint64_and_positive_float64(left: u64, right: f64) -> std::cmp::Order
     ((left as u128) << shift).cmp(&(significand as u128))
 }
 
+fn compare_array_elements(left: &Value, right: &Value, depth: usize) -> Result<i8> {
+    match (left, right) {
+        (Value::Null, Value::Null) => Ok(0),
+        (Value::Null, _) => Ok(1),
+        (_, Value::Null) => Ok(-1),
+        _ => compare_values_inner(left, right, depth),
+    }
+}
+
 /// Compare two values. Returns:
 /// - 0: equal
 /// - 1: left > right
 /// - -1: left < right
 pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
+    compare_values_inner(left, right, 0)
+}
+
+fn compare_values_inner(left: &Value, right: &Value, depth: usize) -> Result<i8> {
     // Phase 1: Incomparable types (early error)
     match (left, right) {
         (Value::Json(_), _) | (_, Value::Json(_)) => {
@@ -1154,10 +1196,11 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
 
     // Phase 3: Same-type fast path (no cloning)
     // For Numeric, ignore scale differences — Decimal::cmp is scale-independent.
-    if left.data_type() == right.data_type()
+    if matches!((left, right), (Value::Array(_), Value::Array(_)))
+        || left.data_type() == right.data_type()
         || matches!((left, right), (Value::Numeric(_), Value::Numeric(_)))
     {
-        return compare_same_type(left, right);
+        return compare_same_type(left, right, depth);
     }
 
     // Phase 4: Preserve exact mixed integer/float comparisons without lossy
@@ -1174,6 +1217,12 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         }
         (Value::Float64(left), Value::Int64(right)) => {
             return Ok(compare_int64_and_float64(*right, *left).reverse() as i8)
+        }
+        (Value::Numeric(_), Value::Float64(right)) if right.is_infinite() => {
+            return Ok(if right.is_sign_positive() { -1 } else { 1 });
+        }
+        (Value::Float64(left), Value::Numeric(_)) if left.is_infinite() => {
+            return Ok(if left.is_sign_positive() { 1 } else { -1 });
         }
         _ => {}
     }
@@ -1260,6 +1309,23 @@ pub fn compare_order_by_values_collated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+
+    fn deeply_nested_array(depth: usize) -> Value {
+        let mut value = Value::Int32(1);
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    fn deeply_nested_json(depth: usize) -> serde_json::Value {
+        let mut value = serde_json::Value::Number(serde_json::Number::from(1));
+        for _ in 0..depth {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        value
+    }
 
     #[test]
     fn test_add_interval_to_timestamp_millis_min_does_not_panic() {
@@ -1420,6 +1486,53 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_values_rejects_excessive_array_depth() {
+        let deep = deeply_nested_array(MAX_RECURSION_DEPTH + 1);
+        let err = compare_values(&deep, &deep).unwrap_err();
+        assert_eq!(err.to_string(), "array value is too deep");
+    }
+
+    #[test]
+    fn test_compare_values_array_null_elements_sort_after_non_null_like_pg() {
+        assert_eq!(
+            compare_values(
+                &Value::Array(vec![Value::Null]),
+                &Value::Array(vec![Value::Int32(1)]),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Array(vec![Value::Int32(1), Value::Null]),
+                &Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Array(vec![Value::Int32(1)]),
+                &Value::Array(vec![Value::Int32(1), Value::Null]),
+            )
+            .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_pg_overlap_flattens_nested_array_elements() {
+        let left = Value::Array(vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(3), Value::Int32(4)]),
+        ]);
+        let right = Value::Array(vec![Value::Int32(2), Value::Int32(9)]);
+
+        let result = eval_binary_op(left, &BinaryOperator::PGOverlap, right).unwrap();
+        assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
     fn test_compare_values_mixed_int_float_follow_float_nan_ordering() {
         assert_eq!(
             compare_values(&Value::Int64(1), &Value::Float64(f64::NAN)).unwrap(),
@@ -1428,6 +1541,34 @@ mod tests {
         assert_eq!(
             compare_values(&Value::Float64(f64::NAN), &Value::Int64(1)).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn test_compare_values_mixed_numeric_float_infinity() {
+        assert_eq!(
+            compare_values(
+                &Value::Float64(f64::INFINITY),
+                &Value::Numeric(Decimal::from(1)),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Float64(f64::NEG_INFINITY),
+                &Value::Numeric(Decimal::from(1)),
+            )
+            .unwrap(),
+            -1
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Numeric(Decimal::from(1)),
+                &Value::Float64(f64::INFINITY),
+            )
+            .unwrap(),
+            -1
         );
     }
 
@@ -1455,6 +1596,13 @@ mod tests {
         let close_a = Value::Jsonb("9007199254740992.0000000000000000001".into());
         let close_b = Value::Jsonb("9007199254740992.0000000000000000002".into());
         assert_eq!(compare_values(&close_a, &close_b).unwrap(), -1);
+    }
+
+    #[test]
+    fn test_parse_jsonb_comparable_value_rejects_excessive_depth() {
+        let deep = deeply_nested_json(MAX_RECURSION_DEPTH + 1);
+        let err = parse_jsonb_comparable_value(&deep.to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "json value is too deep");
     }
 
     #[test]
@@ -1505,9 +1653,123 @@ mod tests {
             &BinaryOperator::PGRegexMatch,
             Value::Text("[".into()),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("Invalid regex pattern"));
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid regular expression: brackets [] not balanced"
+        );
+        assert_eq!(
+            err.downcast_ref::<crate::sql::error::SqlError>()
+                .expect("sql error")
+                .sqlstate(),
+            "2201B"
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_uses_pg_default_newline_mode() {
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("a\nb".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text("a.b".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_treats_pg_b_escape_as_backspace() {
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("foo".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(r"\bfoo\b".into()),
+            )
+            .unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("\u{0008}foo\u{0008}".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(r"\bfoo\b".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_supports_pg_lookaround_and_backrefs() {
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("ab".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text("a(?=b)".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("aa".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(r"(.)\1".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_supports_pg_word_boundary_escapes() {
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("foo".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(r"\mfoo\M".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("foo!".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(r"foo\y".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_binary_op(
+                Value::Text("foo!".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(r"foo\Y".into()),
+            )
+            .unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_rejects_rust_only_pg_invalid_syntax() {
+        for pattern in [r"(?i:a)", r"(?U)a+", r"\p{L}", r"\x{41}", r"(?P<x>a)"] {
+            let err = eval_binary_op(
+                Value::Text("A".into()),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text(pattern.into()),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<crate::sql::error::SqlError>()
+                    .expect("sql error")
+                    .sqlstate(),
+                "2201B"
+            );
+        }
     }
 
     #[test]

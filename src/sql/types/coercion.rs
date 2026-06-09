@@ -104,20 +104,21 @@ pub fn is_implicitly_coercible(from: &DataType, to: &DataType) -> bool {
     if let (DataType::Numeric { .. }, DataType::Numeric { .. }) = (from, to) {
         return true;
     }
-    // Integer-family (smallint, int, bigint, oid) widens implicitly into
-    // any larger numeric-category target: int → bigint, int → dp, int →
-    // numeric, etc. This matches PG's implicit-cast entries for the
-    // integer types.
-    if matches!(from, DataType::Int32 | DataType::Int64 | DataType::Oid)
-        && matches!(
-            to,
-            DataType::Int32
-                | DataType::Int64
-                | DataType::Oid
-                | DataType::Float64
-                | DataType::Numeric { .. }
-        )
-    {
+    // Integer-family values widen implicitly into larger numeric-category
+    // targets. Do not allow downcasts such as int8 -> int4; PostgreSQL does
+    // not use those during function overload resolution.
+    if matches!(
+        (from, to),
+        (DataType::Int32, DataType::Int64)
+            | (DataType::Int32, DataType::Oid)
+            | (DataType::Int32, DataType::Float64)
+            | (DataType::Int32, DataType::Numeric { .. })
+            | (DataType::Int64, DataType::Float64)
+            | (DataType::Int64, DataType::Numeric { .. })
+            | (DataType::Oid, DataType::Int64)
+            | (DataType::Oid, DataType::Float64)
+            | (DataType::Oid, DataType::Numeric { .. })
+    ) {
         return true;
     }
     false
@@ -378,7 +379,16 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 _ => None,
             }
         }
-        "Multiply" | "Divide" | "Modulo" | "PGExp" | "*" | "/" | "%" | "^" => {
+        "Modulo" | "%" => {
+            if matches!(left, DataType::Float64) || matches!(right, DataType::Float64) {
+                None
+            } else if is_numeric(left) && is_numeric(right) {
+                common_type(left, right)
+            } else {
+                None
+            }
+        }
+        "Multiply" | "Divide" | "PGExp" | "*" | "/" | "^" => {
             if is_numeric(left) && is_numeric(right) {
                 common_type(left, right)
             } else if is_numeric(left) && matches!(right, DataType::Vector(_)) {
@@ -418,9 +428,17 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
         "And" | "Or" | "AND" | "OR" => Some(DataType::Boolean),
 
         // JSON operators
-        "Arrow" | "->" => Some(DataType::Jsonb),
+        "Arrow" | "->" => match left {
+            DataType::Json => Some(DataType::Json),
+            DataType::Jsonb => Some(DataType::Jsonb),
+            _ => None,
+        },
         "LongArrow" | "->>" => Some(DataType::Text),
-        "HashArrow" | "#>" => Some(DataType::Jsonb),
+        "HashArrow" | "#>" => match left {
+            DataType::Json => Some(DataType::Json),
+            DataType::Jsonb => Some(DataType::Jsonb),
+            _ => None,
+        },
         "HashLongArrow" | "#>>" => Some(DataType::Text),
         "HashMinus" | "#-" => match (left, right) {
             (DataType::Jsonb, DataType::Array(_)) => Some(DataType::Jsonb),
@@ -677,6 +695,26 @@ mod tests {
         // Text vs Jsonb: the non-text side wins (text literal cast to jsonb).
         assert_eq!(
             comparison_target_type(&DataType::Jsonb, &DataType::Text),
+            Some(DataType::Jsonb)
+        );
+    }
+
+    #[test]
+    fn binary_op_result_type_json_access_preserves_input_json_family() {
+        assert_eq!(
+            binary_op_result_type("->", &DataType::Json, &DataType::Text),
+            Some(DataType::Json)
+        );
+        assert_eq!(
+            binary_op_result_type("->", &DataType::Jsonb, &DataType::Text),
+            Some(DataType::Jsonb)
+        );
+        assert_eq!(
+            binary_op_result_type("#>", &DataType::Json, &DataType::Text),
+            Some(DataType::Json)
+        );
+        assert_eq!(
+            binary_op_result_type("#>", &DataType::Jsonb, &DataType::Text),
             Some(DataType::Jsonb)
         );
     }

@@ -62,6 +62,12 @@ pub(crate) const GUC_RUNTIME_DEFAULT: u32 = 1 << 2;
 #[allow(dead_code)]
 pub(crate) const GUC_NO_RESET_ALL: u32 = 1 << 3;
 
+// Intentionally rejected stale public DB9 Cop setting. Unknown dotted names
+// still follow the generic custom-GUC compatibility path; this exact legacy
+// public name is carved out so SHOW/current_setting/SET/RESET all expose the
+// current one-switch contract consistently.
+const REJECTED_PUBLIC_GUC_DB9_ENABLE_COP_AGG_PUSHDOWN: &str = "db9.enable_cop_agg_pushdown";
+
 // ── GucDef ───────────────────────────────────────────────────────────────
 
 /// Declarative definition of a single GUC parameter.
@@ -199,6 +205,18 @@ pub(crate) fn public_setting_value(canonical: &str, value: String) -> String {
 }
 
 impl SessionSettings {
+    pub(crate) fn rejected_public_guc_error(name: &str) -> Option<SqlError> {
+        match name {
+            REJECTED_PUBLIC_GUC_DB9_ENABLE_COP_AGG_PUSHDOWN => Some(SqlError::UndefinedObject(
+                format!(
+                    "unrecognized configuration parameter \"{}\"\nHINT: use \"db9.enable_cop_pushdown\" as the only public DB9 Cop pushdown switch; aggregate functions currently stay local.",
+                    name
+                ),
+            )),
+            _ => None,
+        }
+    }
+
     fn default_search_path() -> Vec<String> {
         vec!["$user".to_string(), "public".to_string()]
     }
@@ -447,6 +465,10 @@ impl SessionSettings {
 
     pub(crate) fn validate_and_normalize_value(name: &str, value: &str) -> Result<String> {
         let canonical = Self::canonical_setting_name(name);
+
+        if let Some(err) = Self::rejected_public_guc_error(canonical) {
+            return Err(err.into());
+        }
 
         // Look up the GUC definition.
         if let Some(def) = find_guc_def(canonical) {

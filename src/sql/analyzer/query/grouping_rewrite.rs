@@ -271,7 +271,7 @@ impl<'a> Analyzer<'a> {
                 negated: *negated,
                 expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
                 pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
-                escape_char: *escape_char,
+                escape_char: escape_char.clone(),
             }),
             Expr::ILike {
                 negated,
@@ -282,7 +282,7 @@ impl<'a> Analyzer<'a> {
                 negated: *negated,
                 expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
                 pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
-                escape_char: *escape_char,
+                escape_char: escape_char.clone(),
             }),
             Expr::SimilarTo {
                 negated,
@@ -293,7 +293,7 @@ impl<'a> Analyzer<'a> {
                 negated: *negated,
                 expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
                 pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
-                escape_char: *escape_char,
+                escape_char: escape_char.clone(),
             }),
             Expr::RLike {
                 negated,

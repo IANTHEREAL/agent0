@@ -63,6 +63,26 @@
  abcNUMdefNUM
 (1 row)
 
+ replace_p_partial_newline
+---------------------------
+ X<NL>X
+(1 row)
+
+ replace_w_inverse_partial_newline
+-----------------------------------
+ XXX
+(1 row)
+
+ replace_p_anchor_mode
+-----------------------
+ a<NL>b
+(1 row)
+
+ replace_w_anchor_mode
+-----------------------
+ a<NL>X
+(1 row)
+
  first_match 
 -------------
  {123}
@@ -140,4 +160,3 @@ NOTICE:  table "log_entries" does not exist, skipping
 ------------------------------------
  Regular expression tests completed
 (1 row)
-

@@ -1,6 +1,8 @@
 use crate::model::Value;
+use crate::sql::error::SqlError;
+use crate::sql::expr::{simple_unicode_lower_char, simple_unicode_upper_char};
 use crate::sql::quoting;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 use super::SqlFn;
@@ -33,6 +35,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("ASCII", ascii);
     map.insert("CHR", chr);
     map.insert("STRPOS", strpos);
+    map.insert("STARTS_WITH", starts_with);
     map.insert("SPLIT_PART", split_part);
     map.insert("TRANSLATE", translate);
     map.insert("QUOTE_IDENT", quote_ident);
@@ -46,7 +49,9 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
 
 pub fn upper(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
-        Some(Value::Text(s)) => Ok(Value::Text(s.to_uppercase())),
+        Some(Value::Text(s)) => Ok(Value::Text(
+            s.chars().map(simple_unicode_upper_char).collect(),
+        )),
         Some(v) => Ok(v),
         None => Ok(Value::Null),
     }
@@ -54,7 +59,9 @@ pub fn upper(args: Vec<Value>) -> Result<Value> {
 
 pub fn lower(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
-        Some(Value::Text(s)) => Ok(Value::Text(s.to_lowercase())),
+        Some(Value::Text(s)) => Ok(Value::Text(
+            s.chars().map(simple_unicode_lower_char).collect(),
+        )),
         Some(v) => Ok(v),
         None => Ok(Value::Null),
     }
@@ -101,7 +108,8 @@ pub fn concat_ws(args: Vec<Value>) -> Result<Value> {
     let sep = match iter.next() {
         Some(Value::Text(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
-        _ => String::new(),
+        Some(v) => v.to_string(),
+        None => String::new(),
     };
     let parts: Vec<String> = iter
         .filter_map(|v| match v {
@@ -120,11 +128,20 @@ pub fn left(args: Vec<Value>) -> Result<Value> {
         _ => return Ok(Value::Null),
     };
     let n = match iter.next() {
-        Some(Value::Int32(n)) => n.max(0) as usize,
-        Some(Value::Int64(n)) => n.max(0) as usize,
+        Some(Value::Int32(n)) => i64::from(n),
+        Some(Value::Int64(n)) => n,
         _ => return Ok(Value::Null),
     };
-    Ok(Value::Text(s.chars().take(n).collect()))
+    let chars: Vec<char> = s.chars().collect();
+    let result = if n >= 0 {
+        let keep = usize::try_from(n).unwrap_or(usize::MAX).min(chars.len());
+        chars[..keep].iter().collect()
+    } else {
+        let trim = usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX);
+        let keep = chars.len().saturating_sub(trim);
+        chars[..keep].iter().collect()
+    };
+    Ok(Value::Text(result))
 }
 
 pub fn right(args: Vec<Value>) -> Result<Value> {
@@ -134,20 +151,44 @@ pub fn right(args: Vec<Value>) -> Result<Value> {
         _ => return Ok(Value::Null),
     };
     let n = match iter.next() {
-        Some(Value::Int32(n)) => n.max(0) as usize,
-        Some(Value::Int64(n)) => n.max(0) as usize,
+        Some(Value::Int32(n)) => i64::from(n),
+        Some(Value::Int64(n)) => n,
         _ => return Ok(Value::Null),
     };
     let chars: Vec<char> = s.chars().collect();
-    let start = chars.len().saturating_sub(n);
+    let start = if n >= 0 {
+        let len = usize::try_from(n).unwrap_or(usize::MAX);
+        chars.len().saturating_sub(len)
+    } else {
+        usize::try_from(n.unsigned_abs())
+            .unwrap_or(usize::MAX)
+            .min(chars.len())
+    };
     Ok(Value::Text(chars[start..].iter().collect()))
 }
 
 pub fn trim(args: Vec<Value>) -> Result<Value> {
-    match args.into_iter().next() {
-        Some(Value::Text(s)) => Ok(Value::Text(s.trim().to_string())),
-        Some(Value::Null) => Ok(Value::Null),
-        _ => Ok(Value::Null),
+    let mut iter = args.into_iter();
+    let s = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let chars_to_trim = match iter.next() {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(chars)) => Some(chars),
+        Some(_) => return Ok(Value::Null),
+    };
+
+    match chars_to_trim {
+        Some(chars) => {
+            let char_set: std::collections::HashSet<char> = chars.chars().collect();
+            Ok(Value::Text(
+                s.trim_matches(|c| char_set.contains(&c)).to_string(),
+            ))
+        }
+        None => Ok(Value::Text(s.trim_matches(' ').to_string())),
     }
 }
 
@@ -158,10 +199,12 @@ pub fn btrim(args: Vec<Value>) -> Result<Value> {
         Some(Value::Null) => return Ok(Value::Null),
         _ => return Ok(Value::Null),
     };
-    let chars_to_trim: Option<String> = iter.next().and_then(|v| match v {
-        Value::Text(s) => Some(s),
-        _ => None,
-    });
+    let chars_to_trim = match iter.next() {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(chars)) => Some(chars),
+        Some(_) => return Ok(Value::Null),
+    };
 
     match chars_to_trim {
         Some(chars) => {
@@ -170,7 +213,7 @@ pub fn btrim(args: Vec<Value>) -> Result<Value> {
                 s.trim_matches(|c| char_set.contains(&c)).to_string(),
             ))
         }
-        None => Ok(Value::Text(s.trim().to_string())),
+        None => Ok(Value::Text(s.trim_matches(' ').to_string())),
     }
 }
 
@@ -178,12 +221,15 @@ pub fn ltrim(args: Vec<Value>) -> Result<Value> {
     let mut iter = args.into_iter();
     let s = match iter.next() {
         Some(Value::Text(s)) => s,
+        Some(Value::Null) => return Ok(Value::Null),
         _ => return Ok(Value::Null),
     };
-    let chars_to_trim: Option<String> = iter.next().and_then(|v| match v {
-        Value::Text(s) => Some(s),
-        _ => None,
-    });
+    let chars_to_trim = match iter.next() {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(chars)) => Some(chars),
+        Some(_) => return Ok(Value::Null),
+    };
     match chars_to_trim {
         Some(chars) => {
             let char_set: std::collections::HashSet<char> = chars.chars().collect();
@@ -191,7 +237,7 @@ pub fn ltrim(args: Vec<Value>) -> Result<Value> {
                 s.trim_start_matches(|c| char_set.contains(&c)).to_string(),
             ))
         }
-        None => Ok(Value::Text(s.trim_start().to_string())),
+        None => Ok(Value::Text(s.trim_start_matches(' ').to_string())),
     }
 }
 
@@ -199,12 +245,15 @@ pub fn rtrim(args: Vec<Value>) -> Result<Value> {
     let mut iter = args.into_iter();
     let s = match iter.next() {
         Some(Value::Text(s)) => s,
+        Some(Value::Null) => return Ok(Value::Null),
         _ => return Ok(Value::Null),
     };
-    let chars_to_trim: Option<String> = iter.next().and_then(|v| match v {
-        Value::Text(s) => Some(s),
-        _ => None,
-    });
+    let chars_to_trim = match iter.next() {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(chars)) => Some(chars),
+        Some(_) => return Ok(Value::Null),
+    };
     match chars_to_trim {
         Some(chars) => {
             let char_set: std::collections::HashSet<char> = chars.chars().collect();
@@ -212,7 +261,7 @@ pub fn rtrim(args: Vec<Value>) -> Result<Value> {
                 s.trim_end_matches(|c| char_set.contains(&c)).to_string(),
             ))
         }
-        None => Ok(Value::Text(s.trim_end().to_string())),
+        None => Ok(Value::Text(s.trim_end_matches(' ').to_string())),
     }
 }
 
@@ -228,8 +277,9 @@ pub fn lpad(args: Vec<Value>) -> Result<Value> {
         _ => return Ok(Value::Null),
     };
     let fill = match iter.next() {
+        None => " ".to_string(),
         Some(Value::Text(s)) => s,
-        _ => " ".to_string(),
+        _ => return Ok(Value::Null),
     };
     let char_count = s.chars().count();
     if char_count >= len {
@@ -264,8 +314,9 @@ pub fn rpad(args: Vec<Value>) -> Result<Value> {
         _ => return Ok(Value::Null),
     };
     let fill = match iter.next() {
+        None => " ".to_string(),
         Some(Value::Text(s)) => s,
-        _ => " ".to_string(),
+        _ => return Ok(Value::Null),
     };
     let char_count = s.chars().count();
     if char_count >= len {
@@ -306,7 +357,7 @@ pub fn repeat(args: Vec<Value>) -> Result<Value> {
 }
 
 /// Check that a string output of `byte_len` bytes won't exceed MAX_STRING_OUTPUT_BYTES.
-fn check_output_byte_size(byte_len: usize) -> Result<()> {
+pub(crate) fn check_output_byte_size(byte_len: usize) -> Result<()> {
     if byte_len > MAX_STRING_OUTPUT_BYTES {
         anyhow::bail!("requested length too large");
     }
@@ -349,12 +400,15 @@ pub fn replace(args: Vec<Value>) -> Result<Value> {
     };
     let from = match iter.next() {
         Some(Value::Text(s)) => s,
-        _ => return Ok(Value::Text(s)),
+        _ => return Ok(Value::Null),
     };
     let to = match iter.next() {
         Some(Value::Text(s)) => s,
-        _ => String::new(),
+        _ => return Ok(Value::Null),
     };
+    if from.is_empty() {
+        return Ok(Value::Text(s));
+    }
     Ok(Value::Text(s.replace(&from, &to)))
 }
 
@@ -375,10 +429,10 @@ pub fn initcap(args: Vec<Value>) -> Result<Value> {
                     capitalize_next = true;
                     result.push(c);
                 } else if capitalize_next {
-                    result.extend(c.to_uppercase());
+                    result.push(simple_unicode_upper_char(c));
                     capitalize_next = false;
                 } else {
-                    result.extend(c.to_lowercase());
+                    result.push(simple_unicode_lower_char(c));
                 }
             }
             Ok(Value::Text(result))
@@ -399,13 +453,42 @@ pub fn ascii(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn chr(args: Vec<Value>) -> Result<Value> {
+    fn chr_from_code(n: i64) -> Result<Value> {
+        if n < 0 {
+            return Err(SqlError::InvalidParameterValue {
+                message: "character number must be positive".into(),
+            }
+            .into());
+        }
+        if n == 0 {
+            return Err(SqlError::ValueTooLarge {
+                message: "null character not permitted".into(),
+            }
+            .into());
+        }
+
+        let code = u32::try_from(n).map_err(|_| SqlError::ValueTooLarge {
+            message: format!("requested character too large for encoding: {n}"),
+        })?;
+        if code > 0x10FFFF {
+            return Err(SqlError::ValueTooLarge {
+                message: format!("requested character too large for encoding: {n}"),
+            }
+            .into());
+        }
+        char::from_u32(code)
+            .map(|c| Value::Text(c.to_string()))
+            .ok_or_else(|| {
+                SqlError::ValueTooLarge {
+                    message: format!("requested character not valid for encoding: {n}"),
+                }
+                .into()
+            })
+    }
+
     match args.into_iter().next() {
-        Some(Value::Int32(n)) => char::from_u32(n as u32)
-            .map(|c| Value::Text(c.to_string()))
-            .ok_or_else(|| anyhow::anyhow!("Invalid character code: {}", n)),
-        Some(Value::Int64(n)) => char::from_u32(n as u32)
-            .map(|c| Value::Text(c.to_string()))
-            .ok_or_else(|| anyhow::anyhow!("Invalid character code: {}", n)),
+        Some(Value::Int32(n)) => chr_from_code(i64::from(n)),
+        Some(Value::Int64(n)) => chr_from_code(n),
         _ => Ok(Value::Null),
     }
 }
@@ -418,7 +501,7 @@ pub fn strpos(args: Vec<Value>) -> Result<Value> {
     };
     let needle = match iter.next() {
         Some(Value::Text(s)) => s,
-        _ => return Ok(Value::Int32(0)),
+        _ => return Ok(Value::Null),
     };
     match haystack.find(&needle) {
         Some(pos) => {
@@ -427,6 +510,21 @@ pub fn strpos(args: Vec<Value>) -> Result<Value> {
         }
         None => Ok(Value::Int32(0)),
     }
+}
+
+pub fn starts_with(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let s = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let prefix = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    Ok(Value::Boolean(s.starts_with(&prefix)))
 }
 
 pub fn split_part(args: Vec<Value>) -> Result<Value> {
@@ -440,16 +538,34 @@ pub fn split_part(args: Vec<Value>) -> Result<Value> {
         _ => return Ok(Value::Null),
     };
     let field_num = match iter.next() {
-        Some(Value::Int32(n)) => n,
-        Some(Value::Int64(n)) => n as i32,
+        Some(Value::Int32(n)) => i64::from(n),
+        Some(Value::Int64(n)) => n,
         _ => return Ok(Value::Null),
     };
-    if field_num <= 0 {
+    if field_num == 0 {
+        return Err(SqlError::InvalidParameterValue {
+            message: "field position must not be zero".into(),
+        }
+        .into());
+    }
+    if delimiter.is_empty() {
+        return Ok(Value::Text(if field_num.abs() == 1 {
+            s
+        } else {
+            String::new()
+        }));
+    }
+
+    let parts: Vec<&str> = s.split(&delimiter).collect();
+    let idx = if field_num > 0 {
+        field_num - 1
+    } else {
+        parts.len() as i64 + field_num
+    };
+    if idx < 0 || idx >= parts.len() as i64 {
         return Ok(Value::Text(String::new()));
     }
-    let parts: Vec<&str> = s.split(&delimiter).collect();
-    let idx = (field_num - 1) as usize;
-    Ok(Value::Text(parts.get(idx).unwrap_or(&"").to_string()))
+    Ok(Value::Text(parts[idx as usize].to_string()))
 }
 
 pub fn translate(args: Vec<Value>) -> Result<Value> {
@@ -460,11 +576,11 @@ pub fn translate(args: Vec<Value>) -> Result<Value> {
     };
     let from = match iter.next() {
         Some(Value::Text(s)) => s,
-        _ => return Ok(Value::Text(s)),
+        _ => return Ok(Value::Null),
     };
     let to = match iter.next() {
         Some(Value::Text(s)) => s,
-        _ => String::new(),
+        _ => return Ok(Value::Null),
     };
     let from_chars: Vec<char> = from.chars().collect();
     let to_chars: Vec<char> = to.chars().collect();
@@ -536,7 +652,7 @@ pub fn substring(args: Vec<Value>) -> Result<Value> {
             // Regex mode: SUBSTRING(string FROM pattern) — 2 args, second is text
             if let (Some(Value::Text(ref pattern)), None) = (&from_val, &for_val) {
                 let re = regex::Regex::new(pattern)
-                    .map_err(|e| anyhow::anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                    .map_err(|e| super::regex::invalid_regular_expression_error(&e))?;
                 if let Some(caps) = re.captures(&s) {
                     if caps.len() > 1 {
                         return Ok(caps
@@ -554,39 +670,95 @@ pub fn substring(args: Vec<Value>) -> Result<Value> {
 
             // Positional mode
             let start = match &from_val {
-                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
-                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                Some(Value::Int32(n)) => i64::from(*n),
+                Some(Value::Int64(n)) => *n,
                 Some(Value::Null) => return Ok(Value::Null),
-                Some(_) => 0,
+                Some(other) => {
+                    let type_name = other
+                        .data_type()
+                        .map(|t| t.pg_display_name())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(anyhow!(
+                        "substring position must be integer, got {}",
+                        type_name
+                    ));
+                }
                 None => 0,
             };
             let len = match for_val {
-                Some(Value::Int32(n)) => Some(n.max(0) as usize),
-                Some(Value::Int64(n)) => Some(n.max(0) as usize),
+                Some(Value::Int32(n)) if n < 0 => {
+                    return Err(SqlError::SubstringError {
+                        message: "negative substring length not allowed".into(),
+                    }
+                    .into());
+                }
+                Some(Value::Int64(n)) if n < 0 => {
+                    return Err(SqlError::SubstringError {
+                        message: "negative substring length not allowed".into(),
+                    }
+                    .into());
+                }
+                Some(Value::Int32(n)) => Some(i64::from(n)),
+                Some(Value::Int64(n)) => Some(n),
                 Some(Value::Null) => return Ok(Value::Null),
-                _ => None,
+                Some(other) => {
+                    let type_name = other
+                        .data_type()
+                        .map(|t| t.pg_display_name())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(anyhow!(
+                        "substring length must be integer, got {}",
+                        type_name
+                    ));
+                }
+                None => None,
             };
-            let chars: Vec<char> = s.chars().collect();
-            let result: String = if let Some(l) = len {
-                chars.iter().skip(start).take(l).collect()
-            } else {
-                chars.iter().skip(start).collect()
-            };
-            Ok(Value::Text(result))
+            Ok(Value::Text(substring_text_positional_pg(&s, start, len)))
         }
         Value::Bytes(bytes) => {
             let start = match &from_val {
                 Some(Value::Int32(n)) => i64::from(*n),
                 Some(Value::Int64(n)) => *n,
                 Some(Value::Null) => return Ok(Value::Null),
-                Some(_) => return Ok(Value::Null),
+                Some(other) => {
+                    let type_name = other
+                        .data_type()
+                        .map(|t| t.pg_display_name())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(anyhow!(
+                        "substring position must be integer, got {}",
+                        type_name
+                    ));
+                }
                 None => 0,
             };
             let count = match for_val {
-                Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
-                Some(Value::Int64(n)) => Some(n.max(0)),
+                Some(Value::Int32(n)) if n < 0 => {
+                    return Err(SqlError::SubstringError {
+                        message: "negative substring length not allowed".into(),
+                    }
+                    .into());
+                }
+                Some(Value::Int64(n)) if n < 0 => {
+                    return Err(SqlError::SubstringError {
+                        message: "negative substring length not allowed".into(),
+                    }
+                    .into());
+                }
+                Some(Value::Int32(n)) => Some(i64::from(n)),
+                Some(Value::Int64(n)) => Some(n),
                 Some(Value::Null) => return Ok(Value::Null),
-                _ => None,
+                Some(other) => {
+                    let type_name = other
+                        .data_type()
+                        .map(|t| t.pg_display_name())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(anyhow!(
+                        "substring length must be integer, got {}",
+                        type_name
+                    ));
+                }
+                None => None,
             };
             Ok(Value::Bytes(crate::sql::bytea::substring(
                 bytes, start, count,
@@ -615,37 +787,105 @@ pub fn overlay(args: Vec<Value>) -> Result<Value> {
         Some(Value::Int32(n)) => i64::from(n),
         Some(Value::Int64(n)) => n,
         Some(Value::Null) => return Ok(Value::Null),
-        _ => return Ok(Value::Null),
+        Some(other) => {
+            let type_name = other
+                .data_type()
+                .map(|t| t.pg_display_name())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(anyhow!("overlay start must be integer, got {}", type_name));
+        }
+        None => return Ok(Value::Null),
     };
     let count = match iter.next() {
-        Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
-        Some(Value::Int64(n)) => Some(n.max(0)),
+        Some(Value::Int32(n)) => Some(i64::from(n)),
+        Some(Value::Int64(n)) => Some(n),
         Some(Value::Null) => return Ok(Value::Null),
         None => None,
-        _ => return Ok(Value::Null),
+        Some(other) => {
+            let type_name = other
+                .data_type()
+                .map(|t| t.pg_display_name())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(anyhow!("overlay count must be integer, got {}", type_name));
+        }
     };
-
     match (base, placing) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(s), Value::Text(placing)) => {
-            let start = (start - 1).max(0) as usize;
-            let rep_len = placing.chars().count();
-            let count = count
-                .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-                .unwrap_or(rep_len);
-
-            let chars: Vec<char> = s.chars().collect();
-            let mut result = String::new();
-            result.extend(chars.iter().take(start));
-            result.push_str(&placing);
-            result.extend(chars.iter().skip(start + count));
-            Ok(Value::Text(result))
+            Ok(Value::Text(overlay_text_pg(&s, &placing, start, count)?))
         }
         (Value::Bytes(base), Value::Bytes(placing)) => Ok(Value::Bytes(
-            crate::sql::bytea::overlay(base, &placing, start, count),
+            crate::sql::bytea::overlay(base, &placing, start, count)?,
         )),
         _ => Ok(Value::Null),
     }
+}
+
+fn substring_text_positional_pg(text: &str, start: i64, len: Option<i64>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let start_idx = if start <= 1 {
+        0
+    } else {
+        usize::try_from(start.saturating_sub(1)).unwrap_or(usize::MAX)
+    };
+
+    match len {
+        Some(len) if len <= 0 => String::new(),
+        Some(len) if start <= 0 => {
+            let adjusted = len.saturating_add(start).saturating_sub(1);
+            if adjusted <= 0 {
+                String::new()
+            } else {
+                chars
+                    .iter()
+                    .take(usize::try_from(adjusted).unwrap_or(usize::MAX))
+                    .collect()
+            }
+        }
+        Some(len) => chars
+            .iter()
+            .skip(start_idx)
+            .take(usize::try_from(len).unwrap_or(usize::MAX))
+            .collect(),
+        None => chars.iter().skip(start_idx).collect(),
+    }
+}
+
+fn overlay_text_pg(base: &str, placing: &str, start: i64, count: Option<i64>) -> Result<String> {
+    // PostgreSQL reports "negative substring length" for non-positive start
+    // positions and negative counts here instead of clamping them.
+    if start <= 0 || count.is_some_and(|value| value < 0) {
+        return Err(SqlError::SubstringError {
+            message: "negative substring length not allowed".into(),
+        }
+        .into());
+    }
+
+    let replacement_len = i64::try_from(placing.chars().count()).unwrap_or(i64::MAX);
+    let count = count.unwrap_or(replacement_len);
+    let suffix_start = overlay_suffix_start(start, count)?;
+    let prefix = substring_text_positional_pg(base, 1, Some(start.saturating_sub(1)));
+    let suffix = substring_text_positional_pg(base, suffix_start, None);
+    let mut result = String::with_capacity(prefix.len() + placing.len() + suffix.len());
+    result.push_str(&prefix);
+    result.push_str(placing);
+    result.push_str(&suffix);
+    Ok(result)
+}
+
+fn overlay_suffix_start(start: i64, count: i64) -> Result<i64> {
+    let start = i32::try_from(start).map_err(|_| SqlError::NumericValueOutOfRange {
+        message: "integer out of range".into(),
+    })?;
+    let count = i32::try_from(count).map_err(|_| SqlError::NumericValueOutOfRange {
+        message: "integer out of range".into(),
+    })?;
+    let suffix_start = start
+        .checked_add(count)
+        .ok_or(SqlError::NumericValueOutOfRange {
+            message: "integer out of range".into(),
+        })?;
+    Ok(i64::from(suffix_start))
 }
 
 /// POSITION(substring IN string)
@@ -697,10 +937,81 @@ mod tests {
     }
 
     #[test]
+    fn test_chr_zero_rejected() {
+        let err = chr(vec![Value::Int32(0)]).unwrap_err();
+        assert!(err.to_string().contains("null character not permitted"));
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert_eq!(sql_err.sqlstate(), "54000");
+    }
+
+    #[test]
+    fn test_chr_error_sqlstates_match_pg() {
+        let err = chr(vec![Value::Int32(-1)]).unwrap_err();
+        assert_eq!(err.to_string(), "character number must be positive");
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert_eq!(sql_err.sqlstate(), "22023");
+
+        let err = chr(vec![Value::Int32(55_296)]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "requested character not valid for encoding: 55296"
+        );
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert_eq!(sql_err.sqlstate(), "54000");
+
+        let err = chr(vec![Value::Int32(1_114_112)]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "requested character too large for encoding: 1114112"
+        );
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert_eq!(sql_err.sqlstate(), "54000");
+    }
+
+    #[test]
+    fn test_quote_literal_formats_bytea_using_pg_text() {
+        assert_eq!(
+            quote_literal(vec![Value::Bytes(vec![0x00, 0x01, 0xff])]).unwrap(),
+            Value::Text(r"E'\\x0001ff'".into())
+        );
+        assert_eq!(
+            quote_literal(vec![Value::Text("a\\b".into())]).unwrap(),
+            Value::Text(r"E'a\\b'".into())
+        );
+        assert_eq!(
+            quote_nullable(vec![Value::Text("a\\b".into())]).unwrap(),
+            Value::Text(r"E'a\\b'".into())
+        );
+    }
+
+    #[test]
+    fn test_string_functions_render_float_special_values_as_pg_text() {
+        assert_eq!(
+            concat(vec![
+                Value::Float64(f64::INFINITY),
+                Value::Text("|".into()),
+                Value::Float64(f64::NEG_INFINITY),
+                Value::Text("|".into()),
+                Value::Float64(f64::NAN),
+            ])
+            .unwrap(),
+            Value::Text("Infinity|-Infinity|NaN".into())
+        );
+        assert_eq!(
+            quote_literal(vec![Value::Float64(f64::INFINITY)]).unwrap(),
+            Value::Text("'Infinity'".into())
+        );
+    }
+
+    #[test]
     fn test_upper() {
         assert_eq!(
             upper(vec![Value::Text("hello".into())]).unwrap(),
             Value::Text("HELLO".into())
+        );
+        assert_eq!(
+            upper(vec![Value::Text("\u{00DF}".into())]).unwrap(),
+            Value::Text("\u{00DF}".into())
         );
     }
 
@@ -709,6 +1020,21 @@ mod tests {
         assert_eq!(
             lower(vec![Value::Text("HELLO".into())]).unwrap(),
             Value::Text("hello".into())
+        );
+        assert_eq!(
+            lower(vec![Value::Text("\u{0130}".into())]).unwrap(),
+            Value::Text("i".into())
+        );
+    }
+
+    #[test]
+    fn test_initcap_unicode_simple_mapping() {
+        assert_eq!(
+            initcap(vec![Value::Text(
+                "\u{0130}\u{00DF} \u{0149} \u{FB03} \u{03C3}\u{03A3}".into()
+            )])
+            .unwrap(),
+            Value::Text("\u{0130}\u{00DF} \u{0149} \u{FB03} \u{03A3}\u{03C3}".into())
         );
     }
 
@@ -734,6 +1060,20 @@ mod tests {
     }
 
     #[test]
+    fn test_concat_ws_stringifies_non_text_separator() {
+        assert_eq!(
+            concat_ws(vec![
+                Value::Int32(7),
+                Value::Text("alpha".into()),
+                Value::Null,
+                Value::Bytes(vec![0xde, 0xad]),
+            ])
+            .unwrap(),
+            Value::Text("alpha7\\xdead".into())
+        );
+    }
+
+    #[test]
     fn test_left_right() {
         assert_eq!(
             left(vec![Value::Text("hello".into()), Value::Int32(3)]).unwrap(),
@@ -743,6 +1083,14 @@ mod tests {
             right(vec![Value::Text("hello".into()), Value::Int32(3)]).unwrap(),
             Value::Text("llo".into())
         );
+        assert_eq!(
+            left(vec![Value::Text("AbC".into()), Value::Int32(-1)]).unwrap(),
+            Value::Text("Ab".into())
+        );
+        assert_eq!(
+            right(vec![Value::Text("AbC".into()), Value::Int32(-1)]).unwrap(),
+            Value::Text("bC".into())
+        );
     }
 
     #[test]
@@ -751,6 +1099,135 @@ mod tests {
             trim(vec![Value::Text("  hello  ".into())]).unwrap(),
             Value::Text("hello".into())
         );
+        assert_eq!(
+            trim(vec![Value::Text("\thello\t".into())]).unwrap(),
+            Value::Text("\thello\t".into())
+        );
+        assert_eq!(
+            btrim(vec![Value::Text("\tabc\t".into())]).unwrap(),
+            Value::Text("\tabc\t".into())
+        );
+        assert_eq!(
+            ltrim(vec![Value::Text("\tabc".into())]).unwrap(),
+            Value::Text("\tabc".into())
+        );
+        assert_eq!(
+            rtrim(vec![Value::Text("abc\t".into())]).unwrap(),
+            Value::Text("abc\t".into())
+        );
+        assert_eq!(
+            btrim(vec![Value::Text(" abc ".into()), Value::Null]).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_substring_pg_start_and_length_edge_cases() {
+        assert_eq!(
+            substring(vec![
+                Value::Text("abc".into()),
+                Value::Int32(0),
+                Value::Int32(3)
+            ])
+            .unwrap(),
+            Value::Text("ab".into())
+        );
+        assert_eq!(
+            substring(vec![
+                Value::Text("abc".into()),
+                Value::Int32(-1),
+                Value::Int32(4)
+            ])
+            .unwrap(),
+            Value::Text("ab".into())
+        );
+        let err = substring(vec![
+            Value::Text("abc".into()),
+            Value::Int32(2),
+            Value::Int32(-1),
+        ])
+        .unwrap_err();
+        assert_eq!(err.to_string(), "negative substring length not allowed");
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::SubstringError { .. }));
+        assert_eq!(sql_err.sqlstate(), "22011");
+
+        let err = substring(vec![Value::Text("abc".into()), Value::Boolean(true)]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("substring position must be integer"));
+    }
+
+    #[test]
+    fn test_substring_regex_invalid_pattern_preserves_sqlstate() {
+        let err = substring(vec![Value::Text("abc".into()), Value::Text("([".into())]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid regular expression: brackets [] not balanced"
+        );
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("substring regex error should preserve SQLSTATE");
+        assert_eq!(sql_err.sqlstate(), "2201B");
+    }
+
+    #[test]
+    fn test_overlay_pg_start_and_length_edge_cases() {
+        let err = overlay(vec![
+            Value::Text("abcdef".into()),
+            Value::Text("Z".into()),
+            Value::Int32(2),
+            Value::Int32(-1),
+        ])
+        .unwrap_err();
+        assert_eq!(err.to_string(), "negative substring length not allowed");
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::SubstringError { .. }));
+        assert_eq!(sql_err.sqlstate(), "22011");
+
+        let err = overlay(vec![
+            Value::Text("abcdef".into()),
+            Value::Text("Z".into()),
+            Value::Int32(0),
+        ])
+        .unwrap_err();
+        assert_eq!(err.to_string(), "negative substring length not allowed");
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::SubstringError { .. }));
+        assert_eq!(sql_err.sqlstate(), "22011");
+
+        let overflow_err = overlay(vec![
+            Value::Text("abcdef".into()),
+            Value::Text("Z".into()),
+            Value::Int32(i32::MAX),
+            Value::Int32(1),
+        ])
+        .unwrap_err();
+        assert_eq!(overflow_err.to_string(), "integer out of range");
+        let sql_err = overflow_err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::NumericValueOutOfRange { .. }));
+        assert_eq!(sql_err.sqlstate(), "22003");
+
+        let start_type_err = overlay(vec![
+            Value::Text("abcdef".into()),
+            Value::Text("Z".into()),
+            Value::Boolean(true),
+        ])
+        .unwrap_err();
+        assert!(start_type_err
+            .to_string()
+            .contains("overlay start must be integer"));
+
+        let count_type_err = overlay(vec![
+            Value::Text("abcdef".into()),
+            Value::Text("Z".into()),
+            Value::Int32(2),
+            Value::Boolean(true),
+        ])
+        .unwrap_err();
+        assert!(count_type_err
+            .to_string()
+            .contains("overlay count must be integer"));
     }
 
     #[test]
@@ -780,6 +1257,179 @@ mod tests {
             .unwrap(),
             Value::Text("heLLo".into())
         );
+        assert_eq!(
+            replace(vec![
+                Value::Text("abc".into()),
+                Value::Text(String::new()),
+                Value::Text("x".into()),
+            ])
+            .unwrap(),
+            Value::Text("abc".into())
+        );
+    }
+
+    #[test]
+    fn test_pushed_string_functions_propagate_nullable_args() {
+        assert_eq!(
+            lpad(vec![Value::Text("xy".into()), Value::Int32(4), Value::Null]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            rpad(vec![Value::Text("xy".into()), Value::Int32(4), Value::Null]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            replace(vec![
+                Value::Text("alpha beta".into()),
+                Value::Null,
+                Value::Text("BETA".into()),
+            ])
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            replace(vec![
+                Value::Text("alpha beta".into()),
+                Value::Text("beta".into()),
+                Value::Null,
+            ])
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            strpos(vec![Value::Text("alpha beta".into()), Value::Null]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            translate(vec![
+                Value::Text("alpha beta".into()),
+                Value::Null,
+                Value::Text("AB".into()),
+            ])
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            translate(vec![
+                Value::Text("alpha beta".into()),
+                Value::Text("ab".into()),
+                Value::Null,
+            ])
+            .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_starts_with() {
+        assert_eq!(
+            starts_with(vec![
+                Value::Text("alphabet".into()),
+                Value::Text("alpha".into()),
+            ])
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            starts_with(vec![
+                Value::Text("alphabet".into()),
+                Value::Text("beta".into()),
+            ])
+            .unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            starts_with(vec![Value::Text("abc".into()), Value::Text(String::new())]).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            starts_with(vec![Value::Null, Value::Text("a".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            starts_with(vec![Value::Text("abc".into()), Value::Null]).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_split_part_matches_pg_negative_index_semantics() {
+        assert_eq!(
+            split_part(vec![
+                Value::Text("a,b,c".into()),
+                Value::Text(",".into()),
+                Value::Int32(-1),
+            ])
+            .unwrap(),
+            Value::Text("c".into())
+        );
+        assert_eq!(
+            split_part(vec![
+                Value::Text("a,b,c".into()),
+                Value::Text(",".into()),
+                Value::Int32(-2),
+            ])
+            .unwrap(),
+            Value::Text("b".into())
+        );
+        assert_eq!(
+            split_part(vec![
+                Value::Text("a,b,c".into()),
+                Value::Text(",".into()),
+                Value::Int32(-4),
+            ])
+            .unwrap(),
+            Value::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn test_split_part_zero_rejects_with_pg_error() {
+        let err = split_part(vec![
+            Value::Text("a,b,c".into()),
+            Value::Text(",".into()),
+            Value::Int32(0),
+        ])
+        .unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("sql error");
+        assert!(matches!(sql_err, SqlError::InvalidParameterValue { .. }));
+        assert_eq!(err.to_string(), "field position must not be zero");
+    }
+
+    #[test]
+    fn test_split_part_empty_delimiter_matches_pg() {
+        assert_eq!(
+            split_part(vec![
+                Value::Text("abc".into()),
+                Value::Text(String::new()),
+                Value::Int32(1),
+            ])
+            .unwrap(),
+            Value::Text("abc".into())
+        );
+        assert_eq!(
+            split_part(vec![
+                Value::Text("abc".into()),
+                Value::Text(String::new()),
+                Value::Int32(2),
+            ])
+            .unwrap(),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            split_part(vec![
+                Value::Text("abc".into()),
+                Value::Text(String::new()),
+                Value::Int32(-1),
+            ])
+            .unwrap(),
+            Value::Text("abc".into())
+        );
+    }
+
+    #[test]
+    fn test_string_registry_includes_starts_with() {
+        assert!(crate::sql::expr::functions::get_registry().contains_key("STARTS_WITH"));
     }
 
     #[test]
@@ -876,7 +1526,7 @@ mod tests {
         // where 2*n == MAX+1 → should fail (one byte over).
         let max = super::MAX_STRING_OUTPUT_BYTES;
         let n = (max / 2) + 1; // 2 * n = max + 1 (since max is odd, max/2 rounds down)
-        let result = repeat(vec![Value::Text("ab".into()), Value::Int64(n as i64)]);
+        let result = repeat(vec![Value::Text("ab".into()), Value::Int32(n as i32)]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

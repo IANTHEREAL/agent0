@@ -40,6 +40,13 @@ pub fn format_timestamp_millis(
     is_timestamptz: bool,
     timezone: &str,
 ) -> Result<String> {
+    if ts_millis == i64::MAX {
+        return Ok("infinity".to_owned());
+    }
+    if ts_millis == i64::MIN {
+        return Ok("-infinity".to_owned());
+    }
+
     let seconds = ts_millis.div_euclid(1000);
     let millis = ts_millis.rem_euclid(1000) as u32;
     let nanos = millis * 1_000_000;
@@ -233,6 +240,18 @@ mod tests {
     fn formats_epoch_zero_without_fraction() {
         let s = format_timestamp_millis(0, false, "UTC").unwrap();
         assert_eq!(s, "1970-01-01 00:00:00");
+    }
+
+    #[test]
+    fn formats_timestamp_infinity() {
+        assert_eq!(
+            format_timestamp_millis(i64::MAX, false, "UTC").unwrap(),
+            "infinity"
+        );
+        assert_eq!(
+            format_timestamp_millis(i64::MIN, false, "UTC").unwrap(),
+            "-infinity"
+        );
     }
 
     #[test]

@@ -1,0 +1,18 @@
+grouped_safe_local_on
+Sort
+Sort Key: g ASC
+HashAggregate
+Group Key: g
+Seq Scan on agg_pushdown_demo
+grouped_safe_partial_pushdown|0
+1|2|t|10|20
+2|2|f|30|40
+3|2|f|50|50
+avg_float_partial_pushdown|0
+sum_float_partial_pushdown|0
+min_text_partial_pushdown|0
+text_group_key_partial_pushdown|0
+grouped_safe_local_off
+grouped_safe_parity|0
+unsafe_aggregate_parity|0
+unsafe_text_group_key_parity|0

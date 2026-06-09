@@ -8,5 +8,14 @@ DB9 Cop Limit: 2
 3|2024-01-03 23:59:59+00
 Filter: (timezone('UTC'::text, created_tz) >= 1704153600000)
 Seq Scan on db9_cop_timestamptz_smoke
+2
+3
+date_timestamptz_stays_local|1
+2024-01-02
+date_timestamptz_parity|0
+age_timestamptz_stays_local|1
+age_timestamptz_nested_stays_local|1
+1 mon
+age_timestamptz_parity|0
 timestamptz_range_parity|0
 timestamptz_at_time_zone_parity|0

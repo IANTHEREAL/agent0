@@ -198,8 +198,16 @@ pub struct Db9Type {
 pub struct Db9Null {}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Db9IntervalValue {
+    #[prost(int32, tag = "1")]
+    pub months: i32,
+    #[prost(int64, tag = "2")]
+    pub millis: i64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Db9Value {
-    #[prost(oneof = "db9_value::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "db9_value::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub kind: ::core::option::Option<db9_value::Kind>,
 }
 /// Nested message and enum types in `Db9Value`.
@@ -227,6 +235,8 @@ pub mod db9_value {
         /// Milliseconds since Unix epoch, interpreted as TIMESTAMPTZ.
         #[prost(int64, tag = "9")]
         TimestamptzValue(i64),
+        #[prost(message, tag = "10")]
+        IntervalValue(super::Db9IntervalValue),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]

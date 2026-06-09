@@ -297,19 +297,33 @@ pub fn numeric_div(left: NumericValue, right: NumericValue) -> Result<NumericVal
 
 pub fn numeric_mod(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     if right.is_zero() {
-        return Err(anyhow!("Modulo by zero"));
+        return Err(SqlError::DivisionByZero.into());
     }
 
     let (l, r) = NumericValue::promote_pair(left, right)?;
     match (l, r) {
-        // checked_rem returns None for MIN % -1, but PG returns 0.
+        // PostgreSQL returns zero for integer modulo by -1, including INT_MIN.
+        (NumericValue::Int32(_), NumericValue::Int32(-1)) => Ok(NumericValue::Int32(0)),
         (NumericValue::Int32(a), NumericValue::Int32(b)) => {
-            Ok(NumericValue::Int32(a.checked_rem(b).unwrap_or(0)))
+            a.checked_rem(b).map(NumericValue::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            })
         }
+        (NumericValue::Int64(_), NumericValue::Int64(-1)) => Ok(NumericValue::Int64(0)),
         (NumericValue::Int64(a), NumericValue::Int64(b)) => {
-            Ok(NumericValue::Int64(a.checked_rem(b).unwrap_or(0)))
+            a.checked_rem(b).map(NumericValue::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            })
         }
-        (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a % b)),
+        (NumericValue::Float64(_), NumericValue::Float64(_)) => {
+            Err(SqlError::Unsupported("Unsupported types for modulo".into()).into())
+        }
         (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
             Ok(NumericValue::Decimal(checked_decimal_rem(a, b)?))
         }
@@ -394,11 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn test_mod_by_zero_error_message() {
-        let err = numeric_mod(NumericValue::Int32(1), NumericValue::Int32(0))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(err, "Modulo by zero");
+    fn test_mod_int_min_by_minus_one_returns_zero() {
+        let int32 = numeric_mod(NumericValue::Int32(i32::MIN), NumericValue::Int32(-1)).unwrap();
+        assert!(matches!(int32, NumericValue::Int32(0)));
+
+        let int64 = numeric_mod(NumericValue::Int64(i64::MIN), NumericValue::Int64(-1)).unwrap();
+        assert!(matches!(int64, NumericValue::Int64(0)));
+    }
+
+    #[test]
+    fn test_mod_by_zero_returns_division_by_zero_sql_error() {
+        let err = numeric_mod(NumericValue::Int32(1), NumericValue::Int32(0)).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SqlError>(),
+            Some(SqlError::DivisionByZero)
+        ));
+        assert_eq!(err.to_string(), "division by zero");
     }
 
     #[test]

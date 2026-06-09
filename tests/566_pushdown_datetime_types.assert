@@ -11,8 +11,16 @@ DB9 Cop Access: point (1704355200000)
 DB9 Cop Output: id, created_tz
 DB9 Cop Limit: 1
 4|2024-01-04 08:00:00+00
-Filter: (date_trunc('day'::text, created_at) = 1704153600000)
-Seq Scan on db9_cop_datetime_smoke
+date_trunc_timestamp_pushes|1
+2
+date_part_trunc_timestamp_pushes|1
+2|2|2024-01-02 12:00:00
+date_part_infinity_timestamp_pushes|1
+5|Infinity|Infinity|Infinity|NULL|infinity|NULL|infinity
+6|-Infinity|-Infinity|-Infinity|NULL|-infinity|NULL|-infinity
+5|Infinity|Infinity|Infinity|NULL|infinity|NULL|infinity
+6|-Infinity|-Infinity|-Infinity|NULL|-infinity|NULL|-infinity
 datetime_range_parity|0
 datetime_timestamptz_parity|0
 datetime_date_trunc_parity|0
+datetime_part_trunc_projection_parity|0

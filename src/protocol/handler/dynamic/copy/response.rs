@@ -1,8 +1,6 @@
 //! COPY TO STDOUT response building.
 
-use super::super::super::errors::{
-    error_info, pg_error_message, sqlstate_for_executor_error, user_error,
-};
+use super::super::super::errors::{error_info, executor_error_info};
 use super::super::DynamicPgHandler;
 use crate::sql::ExecuteResult;
 use futures::{Sink, SinkExt};
@@ -13,8 +11,7 @@ use pgwire::messages::PgWireBackendMessage;
 use std::fmt::Debug;
 
 fn map_copy_to_executor_error(err: anyhow::Error) -> PgWireError {
-    let sqlstate = sqlstate_for_executor_error(&err);
-    user_error(sqlstate, pg_error_message(&err, sqlstate))
+    PgWireError::UserError(Box::new(executor_error_info(&err)))
 }
 
 impl DynamicPgHandler {

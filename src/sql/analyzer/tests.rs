@@ -2,14 +2,18 @@
 //!
 //! Uses `MockCatalog` and `sqlparser` to test expression and query analysis.
 
+use rust_decimal::Decimal;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::model::{ColumnDef, DataType, UserTypeKind};
+use crate::model::{ColumnDef, DataType, IntervalValue, Row, UserTypeKind, Value};
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::scope::Scope;
 use crate::sql::analyzer::types::*;
 use crate::sql::analyzer::{Analyzer, AnalyzerError};
+use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::query_context::QueryContext;
+use std::sync::Arc;
 
 /// Extract the `AnalyzedSelect` from a query, panicking if it's not a SELECT.
 fn expect_select(query: &AnalyzedQuery) -> &AnalyzedSelect {
@@ -139,6 +143,27 @@ fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
 }
 
+fn analyze_expr_with_products(sql: &str) -> Result<TypedExpr, AnalyzerError> {
+    let catalog = test_catalog();
+    let mut scope = Scope::new();
+    scope.allow_aggregates = true;
+    scope.allow_windows = true;
+    scope.add_table(
+        "products",
+        &[
+            ("product_id".to_string(), DataType::Int32, None),
+            ("name".to_string(), DataType::Text, None),
+            ("price".to_string(), DataType::Float64, None),
+            (
+                "tags".to_string(),
+                DataType::Array(Box::new(DataType::Text)),
+                None,
+            ),
+        ],
+    );
+    Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
+}
+
 fn analyze_expr_with_vector_column(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     let catalog = MockCatalog::builder()
         .table(
@@ -162,6 +187,21 @@ fn analyze_expr_with_vector_column(sql: &str) -> Result<TypedExpr, AnalyzerError
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
+}
+
+fn empty_row() -> Row {
+    Row { values: vec![] }
+}
+
+fn test_qctx() -> QueryContext {
+    QueryContext::new(
+        1,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("UTC"),
+    )
 }
 
 /// Like analyze_expr_with_users, but with aggregates disallowed (simulates WHERE context).
@@ -213,6 +253,164 @@ fn analyze_float_literal() {
 fn analyze_numeric_literal() {
     let expr = analyze_expr_with_users("3.14").unwrap();
     assert!(matches!(expr.data_type, DataType::Numeric { .. }));
+}
+
+#[test]
+fn analyze_interval_literal_accepts_fractional_seconds() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT interval '5.5 seconds'");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+
+    match &select.projection[0].expr.kind {
+        TypedExprKind::Constant(Value::Interval(iv)) => {
+            assert_eq!(*iv, IntervalValue::from_millis(5_500));
+        }
+        other => panic!(
+            "expected constant interval literal, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_interval_literal_accepts_fractional_months() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT interval '1.5 months'");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+
+    match &select.projection[0].expr.kind {
+        TypedExprKind::Constant(Value::Interval(iv)) => {
+            assert_eq!(*iv, IntervalValue::new(1, 15 * 24 * 60 * 60 * 1000));
+        }
+        other => panic!(
+            "expected constant interval literal, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_interval_literal_accepts_fractional_years_with_even_month_rounding() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT interval '1.5 years', interval '0.375 years'");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+
+    match &select.projection[0].expr.kind {
+        TypedExprKind::Constant(Value::Interval(iv)) => {
+            assert_eq!(*iv, IntervalValue::from_months(18));
+        }
+        other => panic!(
+            "expected constant interval literal, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    match &select.projection[1].expr.kind {
+        TypedExprKind::Constant(Value::Interval(iv)) => {
+            assert_eq!(*iv, IntervalValue::from_months(4));
+        }
+        other => panic!(
+            "expected constant interval literal, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_interval_literal_accepts_mixed_unit_and_clock_components() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat(
+        "SELECT interval '1 day 02:03:04', interval '1 year 1 day 02:03:04'",
+    );
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    let mixed_millis = ((24 + 2) * 60 * 60 + 3 * 60 + 4) * 1000;
+
+    match &select.projection[0].expr.kind {
+        TypedExprKind::Constant(Value::Interval(iv)) => {
+            assert_eq!(*iv, IntervalValue::from_millis(mixed_millis));
+        }
+        other => panic!(
+            "expected constant interval literal, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    match &select.projection[1].expr.kind {
+        TypedExprKind::Constant(Value::Interval(iv)) => {
+            assert_eq!(*iv, IntervalValue::new(12, mixed_millis));
+        }
+        other => panic!(
+            "expected constant interval literal, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_make_interval_fractional_seconds_preserve_epoch() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT extract(epoch from make_interval(secs => 5.5))");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+
+    assert_eq!(
+        eval_typed_expr(&select.projection[0].expr, &empty_row(), &test_qctx()).unwrap(),
+        Value::Numeric(Decimal::new(55, 1))
+    );
+}
+
+#[test]
+fn analyze_make_interval_fractional_seconds_matches_interval_literal() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query =
+        parse_query_with_compat("SELECT make_interval(secs => 5.5) = interval '5.5 seconds'");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+
+    assert_eq!(
+        eval_typed_expr(&select.projection[0].expr, &empty_row(), &test_qctx()).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn analyze_make_interval_rejects_duplicate_named_args() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT make_interval(secs => 1, secs => 2)");
+
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::SqlStructure(ref msg)
+            if msg == "argument name \"secs\" used more than once"
+    ));
+
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42601");
+}
+
+#[test]
+fn analyze_make_interval_rejects_duplicate_slot_between_positional_and_named_args() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT make_interval(1, years => 2)");
+
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::FunctionNotFound { .. }));
+
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
 }
 
 #[test]
@@ -357,6 +555,51 @@ fn analyze_json_access_chain_reassociates_to_json_access_nodes() {
     };
     assert_eq!(*inner_op, JsonAccessOp::Arrow);
     assert_eq!(text_literal_value(inner_path), Some("a"));
+}
+
+#[test]
+fn analyze_json_access_arrow_preserves_json_result_type() {
+    let expr = analyze_expr_with_users(r#"'{"a":{"y":2,"x":1}}'::json -> 'a'"#).unwrap();
+    assert_eq!(expr.data_type, DataType::Json);
+
+    match &expr.kind {
+        TypedExprKind::JsonAccess { operator, path, .. } => {
+            assert_eq!(*operator, JsonAccessOp::Arrow);
+            assert_eq!(text_literal_value(path), Some("a"));
+        }
+        other => panic!("expected JsonAccess, got {:?}", other),
+    }
+}
+
+#[test]
+fn analyze_json_access_hash_arrow_preserves_json_result_type() {
+    let expr = analyze_expr_with_users(r#"'{"b":2,"a":{"y":2,"x":1}}'::json #> '{a}'"#).unwrap();
+    assert_eq!(expr.data_type, DataType::Json);
+
+    match &expr.kind {
+        TypedExprKind::JsonAccess { operator, path, .. } => {
+            assert_eq!(*operator, JsonAccessOp::HashArrow);
+            assert_eq!(text_literal_value(path), Some("{a}"));
+        }
+        other => panic!("expected JsonAccess, got {:?}", other),
+    }
+}
+
+#[test]
+fn analyze_json_hash_minus_requires_jsonb_input() {
+    let err = analyze_expr_with_users(r#"'{"a":1,"b":2}'::json #- '{a}'"#).unwrap_err();
+    match err {
+        AnalyzerError::OperatorTypeMismatch {
+            operator,
+            left,
+            right,
+        } => {
+            assert_eq!(operator, "#-");
+            assert_eq!(left, "json");
+            assert_eq!(right, "unknown");
+        }
+        other => panic!("expected OperatorTypeMismatch, got {:?}", other),
+    }
 }
 
 #[test]
@@ -566,6 +809,22 @@ fn analyze_ne_any_array_uses_scalar_array_cmp() {
             assert!(*use_or); // ANY = OR semantics
         }
         _ => panic!("expected ScalarArrayCmp, got {:?}", expr.kind),
+    }
+}
+
+#[test]
+fn analyze_eq_any_array_column_uses_three_valued_helper() {
+    let expr = analyze_expr_with_products("name = ANY(tags)").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, args, .. } => {
+            assert_eq!(func.name, "__DB9_EQ_ANY");
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0].data_type, DataType::Array(Box::new(DataType::Text)));
+            assert_eq!(args[1].data_type, DataType::Text);
+        }
+        other => panic!("expected __DB9_EQ_ANY FunctionCall, got {:?}", other),
     }
 }
 
@@ -868,6 +1127,47 @@ fn analyze_ilike() {
     ));
 }
 
+#[test]
+fn analyze_like_unknown_literals_resolve_to_text() {
+    let expr = analyze_expr_with_users("name LIKE '%john%' ESCAPE '!'").unwrap();
+    match expr.kind {
+        TypedExprKind::Like {
+            pattern,
+            escape: Some(escape),
+            ..
+        } => {
+            assert_eq!(pattern.data_type, DataType::Text);
+            assert_eq!(escape.data_type, DataType::Text);
+        }
+        other => panic!("expected LIKE expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn analyze_like_preserves_empty_and_multibyte_escape_literals() {
+    let empty_expr = analyze_expr_with_users("name LIKE '%john%' ESCAPE ''").unwrap();
+    match empty_expr.kind {
+        TypedExprKind::Like {
+            escape: Some(escape),
+            ..
+        } => {
+            assert_eq!(text_literal_value(&escape), Some(""));
+        }
+        other => panic!("expected LIKE expression, got {other:?}"),
+    }
+
+    let multibyte_expr = analyze_expr_with_users("name LIKE '%john%' ESCAPE 'ñ'").unwrap();
+    match multibyte_expr.kind {
+        TypedExprKind::Like {
+            escape: Some(escape),
+            ..
+        } => {
+            assert_eq!(text_literal_value(&escape), Some("ñ"));
+        }
+        other => panic!("expected LIKE expression, got {other:?}"),
+    }
+}
+
 // ── CASE ────────────────────────────────────────────────────
 
 #[test]
@@ -935,6 +1235,21 @@ fn analyze_scalar_function() {
 }
 
 #[test]
+fn analyze_starts_with_accepts_text_args() {
+    let expr = analyze_expr_with_users("STARTS_WITH(name, 'al')").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, args, .. } => {
+            assert_eq!(func.name, "STARTS_WITH");
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0].data_type, DataType::Text);
+            assert_eq!(args[1].data_type, DataType::Text);
+        }
+        _ => panic!("expected FunctionCall"),
+    }
+}
+
+#[test]
 fn analyze_aggregate_function() {
     let expr = analyze_expr_with_users("COUNT(id)").unwrap();
     assert_eq!(expr.data_type, DataType::Int64);
@@ -984,6 +1299,34 @@ fn analyze_width_bucket_accepts_int4_count() {
     let expr =
         analyze_expr_with_users("width_bucket(5::float8, 0::float8, 10::float8, 4)").unwrap();
     assert_eq!(expr.data_type, DataType::Int32);
+}
+
+#[test]
+fn analyze_mod_mixed_integer_width_returns_bigint() {
+    let expr = analyze_expr_with_users("mod(5::int, 2::bigint)").unwrap();
+    assert_eq!(expr.data_type, DataType::Int64);
+
+    let expr = analyze_expr_with_users("mod(5::bigint, 2::int)").unwrap();
+    assert_eq!(expr.data_type, DataType::Int64);
+}
+
+#[test]
+fn analyze_mod_preserves_numeric_and_rejects_float8() {
+    let expr = analyze_expr_with_users("mod(5::numeric, 2::numeric)").unwrap();
+    assert!(matches!(expr.data_type, DataType::Numeric { .. }));
+
+    let err = analyze_expr_with_users("mod(1.0::float8, 0.5::float8)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. }
+            if name.eq_ignore_ascii_case("MOD")
+    ));
+
+    let err = analyze_expr_with_users("1.0::float8 % 0.5::float8").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, .. } if operator == "%"
+    ));
 }
 
 #[test]
@@ -1211,6 +1554,54 @@ fn analyze_quote_ident_rejects_null_cast_to_int() {
 }
 
 #[test]
+fn analyze_sha256_returns_bytea() {
+    let expr = analyze_expr_with_users("sha256('hello')").unwrap();
+    assert_eq!(expr.data_type, DataType::Bytes);
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, .. } => {
+            assert_eq!(func.name, "SHA256");
+        }
+        _ => panic!("expected FunctionCall"),
+    }
+}
+
+#[test]
+fn analyze_sha256_rejects_text_argument() {
+    let err = analyze_expr_with_users("sha256('hello'::text)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound {
+            ref name,
+            ref arg_types
+        } if name.eq_ignore_ascii_case("sha256") && arg_types == &[DataType::Text]
+    ));
+}
+
+#[test]
+fn analyze_digest_returns_bytea() {
+    let expr = analyze_expr_with_users("digest('hello', 'sha256')").unwrap();
+    assert_eq!(expr.data_type, DataType::Bytes);
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, .. } => {
+            assert_eq!(func.name, "DIGEST");
+        }
+        _ => panic!("expected FunctionCall"),
+    }
+}
+
+#[test]
+fn analyze_to_timestamp_rejects_text_format_overload() {
+    let err = analyze_expr_with_users("to_timestamp('2024-01-02', 'YYYY-MM-DD')").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound {
+            ref name,
+            ref arg_types
+        } if name == "to_timestamp" && arg_types.len() == 2
+    ));
+}
+
+#[test]
 fn analyze_pg_get_indexdef_coerces_column_no_and_pretty() {
     let expr = analyze_expr_with_users("pg_get_indexdef(1, '1', 'true')").unwrap();
     assert_eq!(expr.data_type, DataType::Text);
@@ -1258,6 +1649,47 @@ fn analyze_substring_normalized() {
 }
 
 #[test]
+fn analyze_pg_int4_builtins_accept_unknown_string_literals() {
+    let expr = analyze_expr_with_users("left(name, '2')").unwrap();
+    assert_eq!(expr.data_type, DataType::Text);
+
+    let expr = analyze_expr_with_users("make_date('2024', '3', '15')").unwrap();
+    assert_eq!(expr.data_type, DataType::Date);
+
+    let expr = analyze_expr_with_users("make_time('1', '2', '3.5')").unwrap();
+    assert_eq!(expr.data_type, DataType::Time);
+}
+
+#[test]
+fn analyze_pg_int4_builtins_reject_bigint_literals() {
+    for sql in [
+        "left(name, 2::bigint)",
+        "right(name, -1::bigint)",
+        "repeat(name, 3::bigint)",
+        "lpad(name, 5::bigint)",
+        "rpad(name, 5::bigint)",
+        "chr(65::bigint)",
+        "split_part('a,b,c', ',', 2::bigint)",
+        "substr('abc', 2::bigint)",
+        "substring('abc' FROM 2::bigint FOR 1::bigint)",
+        "overlay('abcdef' placing 'Z' from 2::bigint for 1::bigint)",
+        "make_date(2024::bigint, 3::bigint, 15::bigint)",
+        "make_time(1::bigint, 2::bigint, 3.5)",
+        "make_timestamp(2024::bigint, 3::bigint, 15::bigint, 12::bigint, 34::bigint, 56.789)",
+        "make_interval(1::bigint, 2::bigint, 0::bigint, 3::bigint, 4::bigint, 5::bigint, 6.5)",
+        "array_position(ARRAY[1,2,3], 2, 1::bigint)",
+        "round(score, 1::bigint)",
+        "trunc(score, 1::bigint)",
+    ] {
+        let err = analyze_expr_with_users(sql).unwrap_err();
+        assert!(
+            matches!(err, AnalyzerError::FunctionNotFound { .. }),
+            "expected FunctionNotFound for {sql}, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn analyze_trim_normalized() {
     let expr = analyze_expr_with_users("TRIM(BOTH ' ' FROM name)").unwrap();
     assert_eq!(expr.data_type, DataType::Text);
@@ -1272,10 +1704,16 @@ fn analyze_trim_normalized() {
 #[test]
 fn analyze_extract_normalized() {
     let expr = analyze_expr_with_users("EXTRACT(YEAR FROM created_at)").unwrap();
-    assert_eq!(expr.data_type, DataType::Float64);
+    assert_eq!(
+        expr.data_type,
+        DataType::Numeric {
+            precision: None,
+            scale: None,
+        }
+    );
     match &expr.kind {
         TypedExprKind::FunctionCall { func, args, .. } => {
-            assert_eq!(func.name, "DATE_PART");
+            assert_eq!(func.name, "EXTRACT");
             assert_eq!(args.len(), 2);
         }
         _ => panic!("expected FunctionCall (normalized from EXTRACT syntax)"),
@@ -3508,19 +3946,29 @@ fn analyze_explicit_cast_plus_literal_stays_42883() {
 
 #[test]
 fn analyze_param_bitxor_literal_reports_ambiguous_operator() {
-    // sqlparser 0.40 doesn't parse `#` as BitwiseXor in PG dialect,
-    // so we construct the AST directly to exercise the ambiguity path.
     use sqlparser::ast::{self as ast, BinaryOperator};
     let catalog = test_catalog();
     let expr = ast::Expr::BinaryOp {
         left: Box::new(ast::Expr::Value(ast::Value::Placeholder("$1".into()))),
-        op: BinaryOperator::BitwiseXor,
+        op: BinaryOperator::PGBitwiseXor,
         right: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString("1".into()))),
     };
     let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
     let err = analyzer.analyze_expr(&expr).unwrap_err();
     let sql: crate::sql::error::SqlError = err.into();
     assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_pg_bitxor_select_resolves_to_integer() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT 5 # 3 AS v");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 1);
+    assert_eq!(result.output_schema[0].0, "v");
+    assert_eq!(result.output_schema[0].1, DataType::Int32);
 }
 
 #[test]
@@ -3636,6 +4084,42 @@ fn analyze_unknown_shr_unknown_reports_42725() {
 }
 
 #[test]
+fn analyze_shift_uses_pg_int4_count_signature() {
+    let expr = analyze_expr_with_users("1::bigint << 1").unwrap();
+    assert_eq!(expr.data_type, DataType::Int64);
+    match expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => {
+            assert_eq!(op, BinaryOp::ShiftLeft);
+            assert_eq!(left.data_type, DataType::Int64);
+            assert_eq!(right.data_type, DataType::Int32);
+        }
+        other => panic!("expected shift expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn analyze_shift_rejects_explicit_bigint_count_like_pg() {
+    for sql in ["1::integer << 1::bigint", "1::bigint << 1::bigint"] {
+        let err = analyze_expr_with_users(sql).unwrap_err();
+        let sql_err: crate::sql::error::SqlError = err.into();
+        assert_eq!(sql_err.sqlstate(), "42883", "{sql}");
+    }
+}
+
+#[test]
+fn analyze_array_dimension_rejects_explicit_bigint_like_pg() {
+    for sql in [
+        "array_length(ARRAY[1,2], 1::bigint)",
+        "array_upper(ARRAY[1,2], 1::bigint)",
+        "array_lower(ARRAY[1,2], 1::bigint)",
+    ] {
+        let err = analyze_expr_with_users(sql).unwrap_err();
+        let sql_err: crate::sql::error::SqlError = err.into();
+        assert_eq!(sql_err.sqlstate(), "42883", "{sql}");
+    }
+}
+
+#[test]
 fn analyze_param_exp_literal_reports_42725() {
     let catalog = test_catalog();
     let stmt = parse_statement("SELECT $1 ^ '1'");
@@ -3653,6 +4137,64 @@ fn analyze_literal_concat_literal_resolves_to_text() {
     let result = analyzer.analyze_query(&query).unwrap();
     assert_eq!(result.output_schema.len(), 1);
     assert_eq!(result.output_schema[0].1, DataType::Text);
+}
+
+#[test]
+fn analyze_string_function_literals_resolve_to_text_for_pushdown_safe_calls() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "SELECT \
+            concat(name, '-', email) AS concat_out, \
+            concat_ws('/', name, NULL, email) AS concat_ws_out, \
+            position('b' IN name) AS position_out, \
+            format('%s/%L', email, email) AS format_out \
+         FROM users",
+    );
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&analyzed);
+
+    let TypedExprKind::FunctionCall {
+        args: concat_args, ..
+    } = &sel.projection[0].expr.kind
+    else {
+        panic!("expected concat projection to analyze as FunctionCall");
+    };
+    assert_eq!(concat_args[1].data_type, DataType::Text);
+    assert_eq!(text_literal_value(&concat_args[1]), Some("-"));
+
+    let TypedExprKind::FunctionCall {
+        args: concat_ws_args,
+        ..
+    } = &sel.projection[1].expr.kind
+    else {
+        panic!("expected concat_ws projection to analyze as FunctionCall");
+    };
+    assert_eq!(concat_ws_args[0].data_type, DataType::Text);
+    assert_eq!(text_literal_value(&concat_ws_args[0]), Some("/"));
+    assert!(concat_ws_args[2].is_null_constant());
+    assert_eq!(concat_ws_args[2].data_type, DataType::Text);
+
+    let TypedExprKind::FunctionCall {
+        func,
+        args: position_args,
+        ..
+    } = &sel.projection[2].expr.kind
+    else {
+        panic!("expected position projection to analyze as FunctionCall");
+    };
+    assert!(func.name.eq_ignore_ascii_case("STRPOS"));
+    assert_eq!(position_args[1].data_type, DataType::Text);
+    assert_eq!(text_literal_value(&position_args[1]), Some("b"));
+
+    let TypedExprKind::FunctionCall {
+        args: format_args, ..
+    } = &sel.projection[3].expr.kind
+    else {
+        panic!("expected format projection to analyze as FunctionCall");
+    };
+    assert_eq!(format_args[0].data_type, DataType::Text);
+    assert_eq!(text_literal_value(&format_args[0]), Some("%s/%L"));
 }
 
 #[test]
@@ -3845,6 +4387,93 @@ fn analyze_pg_typeof_returns_regtype() {
         q.output_schema[0].1,
         DataType::UserDefined("pg_catalog.regtype".to_string())
     );
+}
+
+#[test]
+fn analyze_sign_matches_postgres_return_types() {
+    let catalog = test_catalog();
+    let stmt = parse_statement(
+        "SELECT sign(-42::integer), sign(-42::bigint), sign(-42.5::double precision), sign(-42.5::numeric)",
+    );
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+
+    assert_eq!(q.output_schema[0].1, DataType::Float64);
+    assert_eq!(q.output_schema[1].1, DataType::Float64);
+    assert_eq!(q.output_schema[2].1, DataType::Float64);
+    assert_eq!(
+        q.output_schema[3].1,
+        DataType::Numeric {
+            precision: None,
+            scale: None,
+        }
+    );
+}
+
+#[test]
+fn analyze_array_cat_matches_postgres_return_types() {
+    let catalog = test_catalog();
+    let stmt = parse_statement(
+        "SELECT array_cat(ARRAY[1], ARRAY[2::bigint]), array_cat(ARRAY[NULL], ARRAY[1]), array_cat(ARRAY[NULL], ARRAY[NULL])",
+    );
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+
+    assert_eq!(
+        q.output_schema[0].1,
+        DataType::Array(Box::new(DataType::Int64))
+    );
+    assert_eq!(
+        q.output_schema[1].1,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+    assert_eq!(
+        q.output_schema[2].1,
+        DataType::Array(Box::new(DataType::Text))
+    );
+}
+
+#[test]
+fn analyze_array_cat_matches_postgres_mixed_rank_return_types() {
+    let catalog = test_catalog();
+    let stmt = parse_statement(
+        "SELECT array_cat(ARRAY[1,2], ARRAY[[3,4],[5,6]]), array_cat(ARRAY[[3,4],[5,6]], ARRAY[1,2])",
+    );
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+
+    let expected = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32))));
+    assert_eq!(q.output_schema[0].1, expected);
+    assert_eq!(q.output_schema[1].1, expected);
+}
+
+#[test]
+fn analyze_array_cat_rejects_scalar_and_incompatible_arrays_like_pg() {
+    for sql in [
+        "SELECT array_cat(ARRAY[1], 3)",
+        "SELECT array_cat(ARRAY[1], ARRAY['2'])",
+    ] {
+        let catalog = test_catalog();
+        let stmt = parse_statement(sql);
+        let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+        let err = analyzer.analyze_statement(&stmt).unwrap_err();
+        assert!(
+            matches!(err, AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("array_cat")),
+            "expected array_cat FunctionNotFound for {sql}, got {err:?}"
+        );
+    }
 }
 
 #[test]

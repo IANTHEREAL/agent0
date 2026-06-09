@@ -2,10 +2,14 @@
 
 use super::*;
 use crate::model::DataType;
+use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::types::*;
+use crate::sql::analyzer::Analyzer;
 use crate::sql::optimizer::logical_plan::{LogicalPlan, PlanSchema};
 use crate::sql::optimizer::logical_planner::LogicalPlanner;
 use crate::sql::optimizer::statistics::ColumnStatistics;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 
 fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
@@ -29,6 +33,15 @@ fn simple_projection(name: &str, dt: DataType) -> AnalyzedProjection {
     AnalyzedProjection {
         expr: simple_column(name, dt),
         output_name: name.to_string(),
+    }
+}
+
+fn parse_query(sql: &str) -> sqlparser::ast::Query {
+    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+        .unwrap_or_else(|err| panic!("failed to parse {sql:?}: {err}"));
+    match statements.pop() {
+        Some(sqlparser::ast::Statement::Query(query)) if statements.is_empty() => *query,
+        other => panic!("expected a single query statement, got {other:?}"),
     }
 }
 
@@ -1751,6 +1764,80 @@ fn test_db9_cop_folding_seq_filter_project_limit() {
 }
 
 #[test]
+fn test_db9_cop_folding_regexp_split_to_array_exact_query_shape() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "task457_runtime_probe",
+            vec![
+                ("id", DataType::Int32, false),
+                ("n", DataType::Int32, false),
+                ("txt", DataType::Text, false),
+                ("ts", DataType::Timestamp, false),
+                ("ts2", DataType::Timestamp, false),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "SELECT regexp_split_to_array(txt, E'\\\\s+') AS value \
+         FROM task457_runtime_probe \
+         WHERE n = 20 \
+         LIMIT 1",
+    );
+    let analyzed = analyzer
+        .analyze_query(&query)
+        .expect("task457 regsplit query should analyze");
+    let logical = LogicalPlanner::build(&analyzed)
+        .expect("task457 regsplit query should build a logical plan");
+
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert(
+        crate::sql::optimizer::schema_map_key(
+            "public.task457_runtime_probe",
+            Some("task457_runtime_probe"),
+        ),
+        TableSchema::new(
+            "public.task457_runtime_probe".to_string(),
+            52,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("n", DataType::Int32, false),
+                ColumnDef::new("txt", DataType::Text, false),
+                ColumnDef::new("ts", DataType::Timestamp, false),
+                ColumnDef::new("ts2", DataType::Timestamp, false),
+            ],
+            vec![0],
+        ),
+    );
+
+    let physical = PhysicalPlanner::plan(&logical, &ctx);
+    match &physical.node {
+        PhysicalNode::Limit { input, .. } => match &input.node {
+            PhysicalNode::Project {
+                input: project_input,
+                ..
+            } => match &project_input.node {
+                PhysicalNode::Db9Cop { ops, .. } => {
+                    assert_eq!(
+                        ops.len(),
+                        1,
+                        "only the filter should be pushed for local-only regexp_split_to_array"
+                    );
+                    assert!(matches!(
+                        ops[0],
+                        crate::sql::optimizer::physical_plan::Db9CopOp::Filter { .. }
+                    ));
+                }
+                other => panic!("expected Db9Cop under local Project, got {other:?}"),
+            },
+            other => panic!("expected local Project under outer Limit, got {other:?}"),
+        },
+        other => panic!("expected outer Limit, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_db9_cop_folding_bounded_range_limit() {
     let schema = make_schema_with_index();
     let mut ctx = PlanningContext::empty();
@@ -1769,7 +1856,7 @@ fn test_db9_cop_folding_bounded_range_limit() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Gt,
             right: Box::new(simple_constant(
-                crate::model::Value::Int32(100),
+                crate::model::Value::Int64(100),
                 DataType::Int64,
             )),
         },
@@ -1786,26 +1873,19 @@ fn test_db9_cop_folding_bounded_range_limit() {
     let physical = PhysicalPlanner::plan(&logical, &ctx);
     match &physical.node {
         PhysicalNode::Limit { input, .. } => match &input.node {
-            PhysicalNode::Db9Cop {
-                scan: crate::sql::optimizer::physical_plan::Db9CopScan::Index { scan_type },
-                ops,
-                ..
-            } => {
-                assert!(matches!(
-                    scan_type,
-                    crate::sql::planner::ScanType::IndexBoundedRangeScan { .. }
-                ));
-                assert_eq!(ops.len(), 2);
-                assert!(matches!(
-                    ops[0],
-                    crate::sql::optimizer::physical_plan::Db9CopOp::Filter { .. }
-                ));
-                assert!(matches!(
-                    ops[1],
-                    crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 10 }
-                ));
-            }
-            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
+            PhysicalNode::Filter { input, .. } => match &input.node {
+                PhysicalNode::IndexScan { scan_type, .. } => {
+                    assert!(matches!(
+                        scan_type,
+                        crate::sql::planner::ScanType::IndexBoundedRangeScan { .. }
+                    ));
+                }
+                other => panic!(
+                    "expected IndexScan under outer Limit filter, got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected Filter under outer Limit, got {:?}", other),
         },
         other => panic!(
             "expected outer Limit for bounded range plan, got {:?}",
@@ -1856,26 +1936,19 @@ fn test_db9_cop_folding_prefix_range_limit() {
     let physical = PhysicalPlanner::plan(&logical, &ctx);
     match &physical.node {
         PhysicalNode::Limit { input, .. } => match &input.node {
-            PhysicalNode::Db9Cop {
-                scan: crate::sql::optimizer::physical_plan::Db9CopScan::Index { scan_type },
-                ops,
-                ..
-            } => {
-                assert!(matches!(
-                    scan_type,
-                    crate::sql::planner::ScanType::IndexRangeScan { .. }
-                ));
-                assert_eq!(ops.len(), 2);
-                assert!(matches!(
-                    ops[0],
-                    crate::sql::optimizer::physical_plan::Db9CopOp::Filter { .. }
-                ));
-                assert!(matches!(
-                    ops[1],
-                    crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 5 }
-                ));
-            }
-            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
+            PhysicalNode::Filter { input, .. } => match &input.node {
+                PhysicalNode::IndexScan { scan_type, .. } => {
+                    assert!(matches!(
+                        scan_type,
+                        crate::sql::planner::ScanType::IndexRangeScan { .. }
+                    ));
+                }
+                other => panic!(
+                    "expected IndexScan under outer Limit filter, got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected Filter under outer Limit, got {:?}", other),
         },
         other => panic!(
             "expected outer Limit for prefix range plan, got {:?}",
@@ -1939,6 +2012,89 @@ fn test_db9_cop_folding_keeps_offset_limit_local() {
             ));
         }
         other => panic!("expected outer Limit, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_db9_cop_folding_skips_statement_dirty_tables() {
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert(
+        "users".to_string(),
+        TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+                unique: true,
+                is_serial: false,
+                default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
+                collation: None,
+                is_dropped: false,
+            }],
+            vec![0],
+        ),
+    );
+    ctx.statement_dirty_table_ids.insert(1);
+
+    let scan = LogicalPlan::scan(
+        "users".to_string(),
+        None,
+        PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+    );
+    let physical = PhysicalPlanner::plan(&scan, &ctx);
+
+    assert!(
+        matches!(
+            physical.node,
+            crate::sql::optimizer::physical_plan::PhysicalNode::SeqScan { .. }
+        ),
+        "statement-dirty table must not fold to Db9Cop, got {:?}",
+        physical.node
+    );
+}
+
+#[test]
+fn test_db9_cop_folding_skips_tables_with_vector_columns() {
+    let mut ctx = PlanningContext::empty();
+    ctx.enable_db9_cop_pushdown = true;
+    ctx.table_schemas.insert(
+        "users".to_string(),
+        TableSchema::new(
+            "users".to_string(),
+            1,
+            vec![
+                crate::model::ColumnDef::new("id", DataType::Int64, false).primary_key(),
+                crate::model::ColumnDef::new("embedding", DataType::Vector(3), true),
+            ],
+            vec![0],
+        ),
+    );
+
+    let scan = LogicalPlan::scan(
+        "users".to_string(),
+        None,
+        PlanSchema::from_columns(vec![
+            ("id".to_string(), DataType::Int64),
+            ("embedding".to_string(), DataType::Vector(3)),
+        ]),
+    );
+    let logical = scan.project(
+        vec![simple_projection("id", DataType::Int64)],
+        PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+    );
+
+    let physical = PhysicalPlanner::plan(&logical, &ctx);
+    match physical.node {
+        PhysicalNode::Project { input, .. } => {
+            assert!(matches!(input.node, PhysicalNode::SeqScan { .. }));
+        }
+        other => panic!("expected local Project over SeqScan for vector tables, got {other:?}"),
     }
 }
 

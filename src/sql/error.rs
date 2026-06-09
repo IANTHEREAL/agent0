@@ -76,8 +76,17 @@ pub enum SqlError {
     #[error("invalid input syntax for type {type_name}: \"{value}\"")]
     InvalidInputSyntax { type_name: String, value: String },
 
+    #[error("{message}")]
+    InvalidRegularExpression { message: String },
+
     #[error("cannot cast type {from} to {to}")]
     InvalidCast { from: String, to: DataType },
+
+    #[error("{message}")]
+    ArraySubscriptError { message: String },
+
+    #[error("{message}")]
+    ArrayDimensionError { message: String },
 
     // Constraint violations
     #[error("{message}")]
@@ -105,7 +114,19 @@ pub enum SqlError {
     NumericValueOutOfRange { message: String },
 
     #[error("{message}")]
+    DatetimeFieldOverflow { message: String },
+
+    #[error("{message}")]
     InvalidArgumentForLogarithm { message: String },
+
+    #[error("{message}")]
+    InvalidArgumentForPowerFunction { message: String },
+
+    #[error("{message}")]
+    InvalidArgumentForWidthBucket { message: String },
+
+    #[error("{message}")]
+    SubstringError { message: String },
 
     #[error("value too long for type character varying({max_length})")]
     StringDataRightTruncation { max_length: u64 },
@@ -217,6 +238,9 @@ pub enum SqlError {
     InvalidParameterValue { message: String },
 
     #[error("{message}")]
+    InvalidEscapeString { message: String },
+
+    #[error("{message}")]
     NullValueNotAllowed { message: String },
 
     // Dependency errors
@@ -295,12 +319,19 @@ impl SqlError {
             Self::AmbiguousColumn(_) => "42702",
             Self::FunctionNotFound(_) => "42883",
             Self::InvalidInputSyntax { .. } => "22P02",
+            Self::InvalidRegularExpression { .. } => "2201B",
             Self::InvalidCast { .. } => "42846",
+            Self::ArraySubscriptError { .. } => "2202E",
+            Self::ArrayDimensionError { .. } => "22000",
             Self::UniqueViolation { .. } => "23505",
             Self::NotNullViolation { .. } => "23502",
             Self::CheckViolation { .. } => "23514",
             Self::NumericValueOutOfRange { .. } => "22003",
+            Self::DatetimeFieldOverflow { .. } => "22008",
             Self::InvalidArgumentForLogarithm { .. } => "2201E",
+            Self::InvalidArgumentForPowerFunction { .. } => "2201F",
+            Self::InvalidArgumentForWidthBucket { .. } => "2201G",
+            Self::SubstringError { .. } => "22011",
             Self::StringDataRightTruncation { .. } => "22001",
             Self::DivisionByZero => "22012",
             Self::RetryTimeout { .. } => "57014",
@@ -329,6 +360,7 @@ impl SqlError {
             Self::DuplicateObject(_) => "42710",
             Self::CantChangeRuntimeParam { .. } => "55P02",
             Self::InvalidParameterValue { .. } => "22023",
+            Self::InvalidEscapeString { .. } => "22025",
             Self::NullValueNotAllowed { .. } => "22004",
             Self::DependentObjectsStillExist { .. } => "2BP01",
             Self::ObjectInUse { .. } => "55006",
@@ -514,6 +546,34 @@ mod tests {
             }
             .sqlstate(),
             "23514"
+        );
+        assert_eq!(
+            SqlError::DatetimeFieldOverflow {
+                message: "date field value out of range".into()
+            }
+            .sqlstate(),
+            "22008"
+        );
+        assert_eq!(
+            SqlError::SubstringError {
+                message: "negative substring length not allowed".into()
+            }
+            .sqlstate(),
+            "22011"
+        );
+        assert_eq!(
+            SqlError::ArraySubscriptError {
+                message: "cannot concatenate incompatible arrays".into()
+            }
+            .sqlstate(),
+            "2202E"
+        );
+        assert_eq!(
+            SqlError::ArrayDimensionError {
+                message: "argument must be empty or one-dimensional array".into()
+            }
+            .sqlstate(),
+            "22000"
         );
         assert_eq!(SqlError::DivisionByZero.sqlstate(), "22012");
         assert_eq!(SqlError::LockTimeout.sqlstate(), "55P03");

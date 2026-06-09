@@ -124,6 +124,11 @@ pub enum Value {
 - `as_uuid() -> Result<uuid::Uuid>` -- Cheap conversion for UUID.
 - `Display` impl -- PostgreSQL-compatible text representation for all types.
 
+`Value::Display` is used for local human-readable rendering, not pgwire row encoding. Wire `DataRow`
+text/binary output still goes through the Protocol Layer encoders, but some user-visible SQL errors
+reuse `Value::Display` for `DETAIL` text (for example unique-violation keys), so formatting changes
+here are externally visible even when row output stays unchanged.
+
 ### IntervalValue
 
 PostgreSQL-compatible interval representation with separate month and sub-month components:
@@ -523,7 +528,7 @@ Tests are located in each source file:
 | Task | Where to look |
 |------|---------------|
 | Add a new data type | Add variant to `DataType` enum (append only!) and corresponding `Value` variant in `src/model/mod.rs`. Update `Display` impls for both. Then update `src/protocol/handler/encode/types.rs` for wire mapping. |
-| Add type-specific formatting | `src/model/mod.rs` -- `Value::Display` impl for text output; `src/protocol/handler/encode/value.rs` for wire encoding |
+| Add type-specific formatting | `crates/db9-model/src/lib.rs` -- `Value::Display` impl for local text rendering and user-visible `DETAIL` strings; `src/protocol/handler/encode/value.rs` for row wire encoding |
 | Add a new schema object | Define struct in `src/model/mod.rs` with `Serialize`/`Deserialize` derives. Add storage methods in `src/storage/tikv_store/`. |
 | Fix date parsing | `src/model/date.rs` -- `parse_date_days()` |
 | Fix timestamp formatting | `src/model/timestamp.rs` -- `format_timestamp_millis()` or `TimeZoneSpec::format_timestamptz()` |

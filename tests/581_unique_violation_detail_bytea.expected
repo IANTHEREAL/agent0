@@ -1,0 +1,4 @@
+psql:tests/581_unique_violation_detail_bytea.sql:11: ERROR:  duplicate key value violates unique constraint "unique_detail_bytea_insert_payload_key"
+DETAIL:  Key (payload)=(\x0001ff) already exists.
+psql:tests/581_unique_violation_detail_bytea.sql:23: ERROR:  duplicate key value violates unique constraint "unique_detail_bytea_payload_idx"
+DETAIL:  Key (payload)=(\x5c78) already exists.

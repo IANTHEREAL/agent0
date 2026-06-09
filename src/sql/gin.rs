@@ -362,14 +362,20 @@ pub(crate) fn extract_gin_token_hashes_from_row(
 /// The containment check is order-independent, so we just hash element values.
 pub(crate) fn extract_array_gin_tokens(arr: &[Value]) -> Vec<u64> {
     let mut tokens = Vec::with_capacity(arr.len());
-    for elem in arr {
-        if !matches!(elem, Value::Null) {
-            tokens.push(hash_array_element(elem));
-        }
-    }
+    extract_array_gin_tokens_inner(arr, &mut tokens);
     tokens.sort_unstable();
     tokens.dedup();
     tokens
+}
+
+fn extract_array_gin_tokens_inner(arr: &[Value], tokens: &mut Vec<u64>) {
+    for elem in arr {
+        match elem {
+            Value::Null => {}
+            Value::Array(nested) => extract_array_gin_tokens_inner(nested, tokens),
+            other => tokens.push(hash_array_element(other)),
+        }
+    }
 }
 
 fn hash_array_element(val: &Value) -> u64 {
@@ -600,6 +606,20 @@ mod tests {
         for t in contained_tokens {
             assert!(container_tokens.contains(&t));
         }
+    }
+
+    #[test]
+    fn array_tokens_flatten_nested_arrays_to_leaf_values() {
+        let nested = vec![
+            Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
+            Value::Array(vec![Value::Int32(2), Value::Int32(3)]),
+        ];
+        let flattened = vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)];
+
+        assert_eq!(
+            extract_array_gin_tokens(&nested),
+            extract_array_gin_tokens(&flattened)
+        );
     }
 
     #[test]

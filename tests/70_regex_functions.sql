@@ -1,3 +1,4 @@
+-- PG_PARITY: PostgreSQL-compatible regular expression behavior.
 -- Regular Expression Functions Tests
 
 SELECT 'hello world' ~ 'hello' AS matches;
@@ -15,6 +16,10 @@ SELECT REGEXP_REPLACE('foo bar foo', 'foo', 'baz') AS replace_first;
 SELECT REGEXP_REPLACE('foo bar foo', 'foo', 'baz', 'g') AS replace_all;
 SELECT REGEXP_REPLACE('Hello World', '[aeiou]', '*', 'gi') AS vowels_replaced;
 SELECT REGEXP_REPLACE('abc123def456', '[0-9]+', 'NUM', 'g') AS numbers_replaced;
+SELECT REPLACE(REGEXP_REPLACE('a' || CHR(10) || 'b', '.', 'X', 'gp'), CHR(10), '<NL>') AS replace_p_partial_newline;
+SELECT REPLACE(REGEXP_REPLACE('a' || CHR(10) || 'b', '.', 'X', 'gw'), CHR(10), '<NL>') AS replace_w_inverse_partial_newline;
+SELECT REPLACE(REGEXP_REPLACE('a' || CHR(10) || 'b', '^b$', 'X', 'gp'), CHR(10), '<NL>') AS replace_p_anchor_mode;
+SELECT REPLACE(REGEXP_REPLACE('a' || CHR(10) || 'b', '^b$', 'X', 'gw'), CHR(10), '<NL>') AS replace_w_anchor_mode;
 
 SELECT REGEXP_MATCHES('abc 123 def 456', '[0-9]+') AS first_match;
 SELECT REGEXP_MATCHES('abc 123 def 456', '[0-9]+', 'g') AS all_matches;

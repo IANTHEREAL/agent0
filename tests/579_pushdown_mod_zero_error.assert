@@ -1,0 +1,3 @@
+DB9 Cop Output: mod_zero_out, mod_mixed_out, mod_int_min_out, mod_bigint_min_out
+mod_mixed_out|mod_int_min_out|mod_bigint_min_out
+1|0|0

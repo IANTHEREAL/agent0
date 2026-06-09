@@ -1,0 +1,9 @@
+numeric_array_projection_stays_local|1
+uuid_array_projection_stays_local|1
+json_array_projection_stays_local|1
+jsonb_array_projection_stays_local|1
+numeric_array_eq_stays_local|1
+date_array_eq_stays_local|1
+time_array_eq_stays_local|1
+uuid_array_eq_stays_local|1
+jsonb_array_eq_stays_local|1

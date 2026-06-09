@@ -454,21 +454,24 @@ def test_jsonb_set_function(jsonb_table, schema, db):
             result = json.loads(result)
         assert result == {"nested": {}}
 
-    # Empty path on object/array — PG 17 behavior: return unchanged (no-op).
-    # Each error case uses a fresh connection to avoid transaction state bleeding.
+    # Empty path leaves object/array documents unchanged, matching PostgreSQL.
     with db.engine.connect() as conn2:
-        result = _sql(
-            conn2,
-            """SELECT jsonb_set('{"a":1}'::jsonb, '{}', '42')""",
-        ).scalar_one()
-        if isinstance(result, str):
-            result = json.loads(result)
-        assert result == {"a": 1}  # unchanged
+        for target, expected in (
+            ("'{\"a\":1}'", {"a": 1}),
+            ("'[1,2]'", [1, 2]),
+        ):
+            result = _sql(
+                conn2,
+                f"""SELECT jsonb_set({target}::jsonb, '{{}}', '42')""",
+            ).scalar_one()
+            if isinstance(result, str):
+                result = json.loads(result)
+            assert result == expected
 
-    # Empty path on scalar — PG 17 behavior: error "cannot set path in scalar"
-    with db.engine.connect() as error_conn:
+    # Empty path on a scalar target is an error in PostgreSQL.
+    with db.engine.connect() as conn3:
         with pytest.raises(Exception) as exc_info:
-            _sql(error_conn, """SELECT jsonb_set('"hello"'::jsonb, '{}', '42')""")
+            _sql(conn3, """SELECT jsonb_set('"hello"'::jsonb, '{}', '42')""")
         assert "cannot set path in scalar" in str(exc_info.value)
 
 

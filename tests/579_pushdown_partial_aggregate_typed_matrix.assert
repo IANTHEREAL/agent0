@@ -1,0 +1,24 @@
+typed_bigint_partial_pushdown|0
+10000000000|30000000000|10000000000|20000000000
+20000000000|70000000000|30000000000|40000000000
+typed_bool_partial_pushdown|0
+false|false|false
+true|false|true
+typed_date_partial_pushdown|0
+2024-01-10|2024-01-01|2024-01-05
+2024-01-20|2024-01-11|2024-01-15
+typed_time_partial_pushdown|0
+08:00:00|07:00:00|08:30:00
+09:30:00|09:00:00|10:45:00
+typed_timestamp_partial_pushdown|0
+2024-01-10 08:00:00|2024-01-10 07:00:00|2024-01-10 08:30:00
+2024-01-20 09:30:00|2024-01-20 09:00:00|2024-01-20 10:45:00
+typed_timestamptz_partial_pushdown|0
+2024-01-10 08:00:00|2024-01-10 07:00:00|2024-01-10 08:30:00
+2024-01-20 09:30:00|2024-01-20 09:00:00|2024-01-20 10:45:00
+typed_bigint_parity|0
+typed_bool_parity|0
+typed_date_parity|0
+typed_time_parity|0
+typed_timestamp_parity|0
+typed_timestamptz_parity|0

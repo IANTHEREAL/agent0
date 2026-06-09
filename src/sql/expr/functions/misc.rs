@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use super::SqlFn;
 
+const MAX_FORMAT_OUTPUT_BYTES: usize = 1_073_741_823; // 1GB - 1
+
 pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("COALESCE", coalesce);
     map.insert("NULLIF", nullif);
@@ -81,6 +83,13 @@ fn format_specifier_error(spec: char) -> anyhow::Error {
     )
 }
 
+fn check_format_output_byte_size(byte_len: usize) -> Result<()> {
+    if byte_len > MAX_FORMAT_OUTPUT_BYTES {
+        anyhow::bail!("requested length too large");
+    }
+    Ok(())
+}
+
 pub fn format_fn(args: Vec<Value>) -> Result<Value> {
     if args.is_empty() {
         return Ok(Value::Null);
@@ -119,11 +128,11 @@ pub fn format_fn(args: Vec<Value>) -> Result<Value> {
             i += 1;
         }
         if i < chars.len() && chars[i] == '$' && i > pos_start {
-            let idx: usize = chars[pos_start..i]
-                .iter()
-                .collect::<String>()
-                .parse()
-                .map_err(|_| anyhow!("invalid format() argument index"))?;
+            let idx = chars[pos_start..i].iter().try_fold(0usize, |acc, &c| {
+                acc.checked_mul(10)
+                    .and_then(|value| value.checked_add(c.to_digit(10).unwrap() as usize))
+                    .ok_or_else(|| anyhow!("invalid format() argument index"))
+            })?;
             if idx == 0 {
                 return Err(anyhow!("format() argument index starts at 1"));
             }
@@ -139,20 +148,44 @@ pub fn format_fn(args: Vec<Value>) -> Result<Value> {
             i += 1;
         }
 
-        let width_start = i;
-        while i < chars.len() && chars[i].is_ascii_digit() {
+        let mut dynamic_width = false;
+        let mut dynamic_width_position: Option<usize> = None;
+        let width: Option<usize> = if i < chars.len() && chars[i] == '*' {
+            dynamic_width = true;
             i += 1;
-        }
-        let width: Option<usize> = if i > width_start {
-            Some(
-                chars[width_start..i]
+            let width_pos_start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '$' && i > width_pos_start {
+                let idx: usize = chars[width_pos_start..i]
                     .iter()
                     .collect::<String>()
                     .parse()
-                    .map_err(|_| anyhow!("invalid format() width"))?,
-            )
-        } else {
+                    .map_err(|_| anyhow!("invalid format() width"))?;
+                if idx == 0 {
+                    return Err(anyhow!("format() argument index starts at 1"));
+                }
+                dynamic_width_position = Some(idx - 1);
+                i += 1;
+            }
             None
+        } else {
+            let width_start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > width_start {
+                Some(
+                    chars[width_start..i]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .map_err(|_| anyhow!("invalid format() width"))?,
+                )
+            } else {
+                None
+            }
         };
 
         if i < chars.len() && chars[i] == '.' {
@@ -168,8 +201,37 @@ pub fn format_fn(args: Vec<Value>) -> Result<Value> {
             return Err(format_specifier_error(ty));
         }
 
+        let mut width = width;
+        if dynamic_width {
+            let width_index = match dynamic_width_position {
+                Some(idx) => {
+                    next_arg_index = next_arg_index.max(idx.saturating_add(1));
+                    idx
+                }
+                None => {
+                    let idx = next_arg_index;
+                    next_arg_index += 1;
+                    idx
+                }
+            };
+            let width_arg = fmt_args
+                .get(width_index)
+                .ok_or_else(|| anyhow!("too few arguments for format()"))?;
+            let mut width_value = format_width_arg(width_arg)?;
+            if width_value < 0 {
+                left_align = true;
+                width_value = width_value
+                    .checked_neg()
+                    .ok_or_else(|| anyhow!("invalid format() width"))?;
+            }
+            width =
+                Some(usize::try_from(width_value).map_err(|_| anyhow!("invalid format() width"))?);
+        }
+
         let arg_index = match positional {
             Some(idx) => {
+                // PostgreSQL resets the implicit cursor after the value
+                // argument, even if a positional width argument was consumed.
                 next_arg_index = idx.saturating_add(1);
                 idx
             }
@@ -185,21 +247,39 @@ pub fn format_fn(args: Vec<Value>) -> Result<Value> {
         let mut rendered = format_arg_as_string(arg, ty)?;
 
         if let Some(w) = width {
-            let len = rendered.chars().count();
+            let len = rendered.chars().take(w).count();
             if len < w {
-                let pad = " ".repeat(w - len);
+                let pad_len = w - len;
+                let padded_len = rendered.len().saturating_add(pad_len);
+                check_format_output_byte_size(out.len().saturating_add(padded_len))?;
+                let pad = " ".repeat(pad_len);
                 if left_align {
                     rendered.push_str(&pad);
                 } else {
-                    rendered = format!("{pad}{rendered}");
+                    let mut padded = String::with_capacity(padded_len);
+                    padded.push_str(&pad);
+                    padded.push_str(&rendered);
+                    rendered = padded;
                 }
+            } else {
+                check_format_output_byte_size(out.len().saturating_add(rendered.len()))?;
             }
+        } else {
+            check_format_output_byte_size(out.len().saturating_add(rendered.len()))?;
         }
 
         out.push_str(&rendered);
     }
 
     Ok(Value::Text(out))
+}
+
+fn format_width_arg(arg: &Value) -> Result<i64> {
+    match arg {
+        Value::Int32(value) => Ok(i64::from(*value)),
+        Value::Int64(value) => Ok(*value),
+        _ => Err(anyhow!("format() width argument must be integer")),
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +356,95 @@ mod tests {
             ])
             .unwrap(),
             Value::Text("B A          B xy   ".into())
+        );
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("|%*s|%-*s|".into()),
+                Value::Int32(3),
+                Value::Text("x".into()),
+                Value::Int64(4),
+                Value::Text("y".into()),
+            ])
+            .unwrap(),
+            Value::Text("|  x|y   |".into())
+        );
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("|%1$*2$s|".into()),
+                Value::Text("x".into()),
+                Value::Int32(3),
+            ])
+            .unwrap(),
+            Value::Text("|  x|".into())
+        );
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("%1$s|%s".into()),
+                Value::Text("x".into()),
+                Value::Text("y".into()),
+                Value::Text("z".into()),
+            ])
+            .unwrap(),
+            Value::Text("x|y".into())
+        );
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("%2$s|%s".into()),
+                Value::Text("x".into()),
+                Value::Text("y".into()),
+                Value::Text("z".into()),
+            ])
+            .unwrap(),
+            Value::Text("y|z".into())
+        );
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("|%1$*2$s|%s|".into()),
+                Value::Text("x".into()),
+                Value::Int32(3),
+                Value::Text("y".into()),
+            ])
+            .unwrap(),
+            Value::Text("|  x|3|".into())
+        );
+        assert_eq!(
+            format_fn(vec![Value::Text("%L".into()), Value::Text("a\\b".into())]).unwrap(),
+            Value::Text(r"E'a\\b'".into())
+        );
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("%s|%L".into()),
+                Value::Float64(f64::INFINITY),
+                Value::Float64(f64::NEG_INFINITY),
+            ])
+            .unwrap(),
+            Value::Text("Infinity|'-Infinity'".into())
+        );
+        let err = format_fn(vec![
+            Value::Text("%1073741824s".into()),
+            Value::Text("x".into()),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("requested length too large"));
+        let err = format_fn(vec![
+            Value::Text("%*s".into()),
+            Value::Int64(1_073_741_824),
+            Value::Text("x".into()),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_format_renders_bytea_using_pg_text() {
+        assert_eq!(
+            format_fn(vec![
+                Value::Text("%s/%L".into()),
+                Value::Bytes(vec![0xde, 0xad]),
+                Value::Bytes(vec![0xbe, 0xef]),
+            ])
+            .unwrap(),
+            Value::Text(r"\xdead/E'\\xbeef'".into())
         );
     }
 }

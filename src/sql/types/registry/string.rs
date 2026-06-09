@@ -6,6 +6,7 @@ use crate::model::DataType;
 pub(super) fn register(r: &mut super::FunctionRegistry) {
     let text = DataType::Text;
     let int = DataType::Int32;
+    let boolean = DataType::Boolean;
 
     // String functions — single text arg
     r.register(
@@ -75,10 +76,28 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
             .with_arg_types(vec![text.clone()]),
     );
     r.register(
-        "SHA256",
+        "MD5",
         FunctionSignature::fixed(text.clone())
             .with_args(1, Some(1))
-            .with_arg_types(vec![text.clone()]),
+            .with_arg_types(vec![DataType::Bytes]),
+    );
+    r.register(
+        "SHA256",
+        FunctionSignature::fixed(DataType::Bytes)
+            .with_args(1, Some(1))
+            .with_arg_types(vec![DataType::Bytes]),
+    );
+    r.register(
+        "DIGEST",
+        FunctionSignature::fixed(DataType::Bytes)
+            .with_args(2, Some(2))
+            .with_arg_types(vec![text.clone(), text.clone()]),
+    );
+    r.register(
+        "DIGEST",
+        FunctionSignature::fixed(DataType::Bytes)
+            .with_args(2, Some(2))
+            .with_arg_types(vec![DataType::Bytes, text.clone()]),
     );
     r.register(
         "QUOTE_IDENT",
@@ -139,6 +158,12 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     r.register(
         "STRPOS",
         FunctionSignature::fixed(int.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![text.clone(), text.clone()]),
+    );
+    r.register(
+        "STARTS_WITH",
+        FunctionSignature::fixed(boolean)
             .with_args(2, Some(2))
             .with_arg_types(vec![text.clone(), text.clone()]),
     );

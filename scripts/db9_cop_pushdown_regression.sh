@@ -8,22 +8,12 @@ PG_DSN="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
 
 cd "$REPO_ROOT"
 
-python3 scripts/integration_test.py --dsn "$PG_DSN" \
-  tests/550_pushdown_seq_scan.sql \
-  tests/551_pushdown_index_scan.sql \
-  tests/552_pushdown_projection_pruning.sql \
-  tests/553_pushdown_limit.sql \
-  tests/554_pushdown_function_whitelist.sql \
-  tests/555_pushdown_fallback.sql \
-  tests/556_pushdown_in_list_access.sql \
-  tests/557_pushdown_prefix_access.sql \
-  tests/562_pushdown_txn_schema_consistency.sql \
-  tests/566_pushdown_datetime_types.sql \
-  tests/567_pushdown_timestamptz_fallback.sql \
-  tests/568_pushdown_timezone_bucket_fallback.sql \
-  tests/569_pushdown_explain_verbose.sql \
-  tests/570_pushdown_secondary_index_row_fetch.sql \
-  tests/571_pushdown_copy_txn_visibility.sql \
-  tests/575_prepared_pushdown_txn_visibility.sql \
-  tests/576_pushdown_copy_secondary_index_visibility.sql \
-  tests/577_pushdown_update_delete_txn_visibility.sql
+mapfile -t SQL_TESTS < <(
+  awk '
+    /^\[sql\]$/ { in_sql = 1; next }
+    /^\[/ { in_sql = 0 }
+    in_sql && NF && $0 !~ /^#/ { print }
+  ' scripts/regression_gate_pushdown.list
+)
+
+python3 scripts/integration_test.py --dsn "$PG_DSN" "${SQL_TESTS[@]}"

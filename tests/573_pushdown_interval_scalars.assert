@@ -1,0 +1,4 @@
+age_interval_projection_pushes|1
+make_interval_projection_stays_local|1
+2 mons 13 days 12:34:56|1 year 2 mons 3 days 04:05:06
+interval_scalar_parity|0

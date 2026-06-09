@@ -181,6 +181,12 @@ impl FunctionRegistry {
         let sigs = self.functions.get(&name.to_uppercase())?;
         select_overload(sigs, arg_types)
     }
+
+    pub fn arity_supported(&self, name: &str, arg_count: usize) -> bool {
+        self.functions
+            .get(&name.to_uppercase())
+            .is_some_and(|sigs| sigs.iter().any(|sig| sig_accepts_arity(sig, arg_count)))
+    }
 }
 
 /// Pick the best-matching overload for the given argument types,
@@ -201,7 +207,10 @@ fn select_overload<'a>(
 ) -> Option<&'a FunctionSignature> {
     if sigs.len() == 1 {
         // Fast path: single overload, behavior identical to the
-        // pre-refactor single-sig registry.
+        // pre-refactor single-sig registry. Some builtins still have
+        // incomplete registry overload coverage even though runtime supports
+        // the PG surface (e.g. length(bytea)); strict validation belongs in
+        // per-function analyzer rules until those overloads are registered.
         return sigs.first();
     }
     let mut best: Option<(u32, &FunctionSignature)> = None;
@@ -214,7 +223,7 @@ fn select_overload<'a>(
             _ => best = Some((score, sig)),
         }
     }
-    best.map(|(_, s)| s).or_else(|| sigs.first())
+    best.map(|(_, s)| s)
 }
 
 /// `None` means the overload doesn't accept these argument types at
@@ -227,6 +236,9 @@ fn select_overload<'a>(
 /// dp before numeric, so SIGN(int) picks dp — matching PG's preferred
 /// numeric-category type).
 fn overload_match_score(sig: &FunctionSignature, actual: &[DataType]) -> Option<u32> {
+    if !sig_accepts_arity(sig, actual.len()) {
+        return None;
+    }
     if sig.arg_types.is_empty() {
         // Polymorphic / unrestricted — last-resort fallback.
         return Some(1);
@@ -238,6 +250,10 @@ fn overload_match_score(sig: &FunctionSignature, actual: &[DataType]) -> Option<
     for (decl, act) in sig.arg_types.iter().zip(actual) {
         if decl == act {
             score += 10;
+        } else if matches!(act, DataType::Unknown) {
+            // PostgreSQL can coerce unknown string literals to any candidate
+            // function argument type. Keep this below exact matches so concrete
+            // overloads still win, and let registration order break ties.
         } else if super::coercion::is_implicitly_coercible(act, decl) {
             // Implicit cast matches but doesn't earn the +10 bonus, so
             // exact-match overloads outrank coerced-match overloads.
@@ -246,6 +262,10 @@ fn overload_match_score(sig: &FunctionSignature, actual: &[DataType]) -> Option<
         }
     }
     Some(score)
+}
+
+fn sig_accepts_arity(sig: &FunctionSignature, arg_count: usize) -> bool {
+    arg_count >= sig.min_args && sig.max_args.is_none_or(|max| arg_count <= max)
 }
 
 pub fn global_registry() -> &'static FunctionRegistry {

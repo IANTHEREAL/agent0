@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use super::encode::encode_value;
-use super::errors::{pg_error_message, sqlstate_for_executor_error};
+use super::errors::{executor_error_info, pg_error_message, sqlstate_for_executor_error};
 use super::params::{count_sql_parameters, decode_parameters};
 use super::portal::{
     max_suspended_portal_buffer_rows, max_suspended_portals, on_execute_with_tx_status_fix,
@@ -358,6 +358,12 @@ fn test_sqlstate_for_executor_error() {
             "22003",
         ),
         (
+            SqlError::InvalidEscapeString {
+                message: "invalid escape string".into(),
+            },
+            "22025",
+        ),
+        (
             SqlError::StringDataRightTruncation { max_length: 10u64 },
             "22001",
         ),
@@ -427,6 +433,21 @@ fn test_sqlstate_for_executor_error() {
             expected_code
         );
     }
+}
+
+#[test]
+fn test_executor_error_info_sets_escape_hint() {
+    let err: anyhow::Error = SqlError::InvalidEscapeString {
+        message: "invalid escape string".into(),
+    }
+    .into();
+    let error_info = executor_error_info(&err);
+    assert_eq!(error_info.code, "22025");
+    assert_eq!(error_info.message, "invalid escape string");
+    assert_eq!(
+        error_info.hint.as_deref(),
+        Some("Escape string must be empty or one character.")
+    );
 }
 
 #[test]
@@ -3409,6 +3430,147 @@ fn test_encode_value_interval_binary_preserves_days_and_remainder() {
     assert_eq!(data.get_i64(), (3 * 3_600_000 + 123) * 1000);
     assert_eq!(data.get_i32(), 2);
     assert_eq!(data.get_i32(), 2);
+}
+
+#[test]
+fn test_encode_value_time_binary_preserves_24_hour_boundary() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "t".to_string(),
+        None,
+        None,
+        Type::TIME,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Time(86_400_000_000),
+        Some(&DataType::Time),
+        tz,
+        FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 8);
+    assert_eq!(data.get_i64(), 86_400_000_000);
+}
+
+#[test]
+fn test_encode_value_numeric_infinity_binary_uses_pg_special_header() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "n".to_string(),
+        None,
+        None,
+        Type::NUMERIC,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Float64(f64::INFINITY),
+        Some(&crate::model::DataType::Numeric {
+            precision: None,
+            scale: None,
+        }),
+        tz,
+        FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 8);
+    assert_eq!(data.get_i16(), 0);
+    assert_eq!(data.get_i16(), 0);
+    assert_eq!(data.get_u16(), 0xD000);
+    assert_eq!(data.get_u16(), 0x0020);
+}
+
+#[test]
+fn test_encode_value_date_infinity_binary_uses_pg_sentinel() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "d".to_string(),
+        None,
+        None,
+        Type::DATE,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Date(crate::model::date::DATE_POS_INFINITY_DAYS),
+        Some(&crate::model::DataType::Date),
+        tz,
+        FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 4);
+    assert_eq!(data.get_i32(), i32::MAX);
+}
+
+#[test]
+fn test_encode_value_timestamp_infinity_binary_uses_pg_sentinel() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "ts".to_string(),
+        None,
+        None,
+        Type::TIMESTAMP,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Timestamp(i64::MAX),
+        Some(&crate::model::DataType::Timestamp),
+        tz,
+        FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 8);
+    assert_eq!(data.get_i64(), i64::MAX);
+}
+
+#[test]
+fn test_encode_value_int64_timestamp_neg_infinity_binary_uses_pg_sentinel() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "ts".to_string(),
+        None,
+        None,
+        Type::TIMESTAMP,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Int64(i64::MIN),
+        Some(&crate::model::DataType::Timestamp),
+        tz,
+        FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 8);
+    assert_eq!(data.get_i64(), i64::MIN);
 }
 
 #[test]

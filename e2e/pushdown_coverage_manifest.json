@@ -1,0 +1,462 @@
+{
+  "point_access": "DB9 Cop Access: point (20)",
+  "select_filter": "n = 20",
+  "suites": [
+    {
+      "name": "operator",
+      "comment": "Admitted logical, comparison, predicate, unary, LIKE, bitwise, and shift operators on the exact pair.",
+      "base_table": "pushdown_operator_rows",
+      "setup_sql": [
+        "CREATE TABLE {schema}.pushdown_operator_rows (\n                id INTEGER PRIMARY KEY,\n                n INTEGER NOT NULL,\n                n2 BIGINT NOT NULL,\n                like_txt TEXT NOT NULL,\n                ilike_txt TEXT NOT NULL,\n                flag BOOLEAN NOT NULL,\n                maybe_flag BOOLEAN,\n                marker TEXT\n            )",
+        "CREATE INDEX idx_pushdown_operator_rows_n ON {schema}.pushdown_operator_rows(n)",
+        "INSERT INTO {schema}.pushdown_operator_rows (id, n, n2, like_txt, ilike_txt, flag, maybe_flag, marker)\n            VALUES\n                (1, 10, 33, 'A_10', 'tmpAlpha', TRUE, FALSE, NULL),\n                (2, 20, 65, 'A_20', 'A%Twenty', TRUE, NULL, NULL),\n                (3, 30, 99, 'AB30', 'tmpThirty', FALSE, TRUE, NULL)",
+        "ANALYZE {schema}.pushdown_operator_rows"
+      ],
+      "cases": [
+        {
+          "name": "logical_and",
+          "expr": "flag AND (n = 20)",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "logical_or",
+          "expr": "flag OR (n = 99)",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "logical_not",
+          "expr": "NOT flag",
+          "expected_sql": "FALSE"
+        },
+        {
+          "name": "eq",
+          "expr": "n = 20",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "not_eq",
+          "expr": "n <> 10",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "lt",
+          "expr": "n < 21",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "lte",
+          "expr": "n <= 20",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "gt",
+          "expr": "n > 19",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "gte",
+          "expr": "n >= 20",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_null",
+          "expr": "maybe_flag IS NULL",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_not_null",
+          "expr": "ilike_txt IS NOT NULL",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_distinct_from",
+          "expr": "maybe_flag IS DISTINCT FROM TRUE",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_not_distinct_from",
+          "expr": "maybe_flag IS NOT DISTINCT FROM NULL",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "between",
+          "expr": "n BETWEEN 10 AND 20",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "not_between",
+          "expr": "n NOT BETWEEN 21 AND 30",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "in_list",
+          "expr": "n IN (10, 20, 30)",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "not_in",
+          "expr": "n NOT IN (10, 30)",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_true",
+          "expr": "flag IS TRUE",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_not_true",
+          "expr": "maybe_flag IS NOT TRUE",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_false",
+          "expr": "flag IS FALSE",
+          "expected_sql": "FALSE"
+        },
+        {
+          "name": "is_not_false",
+          "expr": "flag IS NOT FALSE",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_unknown",
+          "expr": "maybe_flag IS UNKNOWN",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "is_not_unknown",
+          "expr": "flag IS NOT UNKNOWN",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "like",
+          "expr": "like_txt LIKE 'A!_%' ESCAPE '!'",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "not_like",
+          "expr": "like_txt NOT LIKE 'z%'",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "ilike",
+          "expr": "ilike_txt ILIKE 'a!%%' ESCAPE '!'",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "not_ilike",
+          "expr": "ilike_txt NOT ILIKE 'tmp%'",
+          "expected_sql": "TRUE"
+        },
+        {
+          "name": "unary_plus",
+          "expr": "+n",
+          "expected_sql": "20"
+        },
+        {
+          "name": "unary_minus",
+          "expr": "-n",
+          "expected_sql": "-20"
+        },
+        {
+          "name": "bitwise_not",
+          "expr": "~n",
+          "expected_sql": "-21"
+        },
+        {
+          "name": "bitwise_and",
+          "expr": "n & 12",
+          "expected_sql": "4"
+        },
+        {
+          "name": "bitwise_or",
+          "expr": "n | 3",
+          "expected_sql": "23"
+        },
+        {
+          "name": "bitwise_xor",
+          "expr": "n # 7",
+          "expected_sql": "19"
+        },
+        {
+          "name": "shift_left",
+          "expr": "n << 1",
+          "expected_sql": "40"
+        },
+        {
+          "name": "shift_right",
+          "expr": "n >> 2",
+          "expected_sql": "5"
+        }
+      ],
+      "update_strategy": "direct_filter"
+    },
+    {
+      "name": "math_conditional",
+      "comment": "Admitted math and conditional functions on the exact pair.",
+      "base_table": "pushdown_math_conditional_rows",
+      "setup_sql": [
+        "CREATE TABLE {schema}.pushdown_math_conditional_rows (\n                id INTEGER PRIMARY KEY,\n                n INTEGER NOT NULL,\n                maybe_txt TEXT,\n                fallback_txt TEXT,\n                neg_big BIGINT NOT NULL,\n                f8 DOUBLE PRECISION NOT NULL,\n                maybe_precision INTEGER,\n                cmp_big BIGINT,\n                marker TEXT\n            )",
+        "CREATE INDEX idx_pushdown_math_conditional_rows_n ON {schema}.pushdown_math_conditional_rows(n)",
+        "INSERT INTO {schema}.pushdown_math_conditional_rows (\n                id, n, maybe_txt, fallback_txt, neg_big, f8, maybe_precision, cmp_big, marker\n            )\n            VALUES\n                (1, 10, 'present', 'fallback-a', -10, 12.34, 1, 10, NULL),\n                (2, 20, NULL, 'Alpha', -20, 12.34, NULL, 99, NULL),\n                (3, 30, NULL, NULL, -30, 56.78, 2, NULL, NULL)",
+        "ANALYZE {schema}.pushdown_math_conditional_rows"
+      ],
+      "cases": [
+        {
+          "name": "abs",
+          "expr": "ABS(neg_big)",
+          "expected_sql": "20"
+        },
+        {
+          "name": "round",
+          "expr": "ROUND(f8)",
+          "expected_sql": "12"
+        },
+        {
+          "name": "trunc",
+          "expr": "TRUNC(f8)",
+          "expected_sql": "12"
+        },
+        {
+          "name": "coalesce",
+          "expr": "COALESCE(maybe_txt, fallback_txt, 'ultimate')",
+          "expected_sql": "'Alpha'"
+        },
+        {
+          "name": "nullif",
+          "expr": "NULLIF(fallback_txt, maybe_txt)",
+          "expected_sql": "'Alpha'"
+        }
+      ],
+      "update_strategy": "direct_filter"
+    },
+    {
+      "name": "string_regex_hash",
+      "comment": "Admitted string, hashing, and decode functions on the exact pair. Regex predicate operators stay local and are covered by dedicated local-only proofs.",
+      "base_table": "pushdown_string_regex_hash_rows",
+      "setup_sql": [
+        "CREATE TABLE {schema}.pushdown_string_regex_hash_rows (\n                id INTEGER PRIMARY KEY,\n                n INTEGER NOT NULL,\n                txt TEXT NOT NULL,\n                txt2 TEXT NOT NULL,\n                trim_txt TEXT NOT NULL,\n                csv_txt TEXT NOT NULL,\n                ident_txt TEXT NOT NULL,\n                char_code INTEGER NOT NULL,\n                null_txt TEXT,\n                hex_txt TEXT NOT NULL,\n                bytes_val BYTEA NOT NULL,\n                marker TEXT\n            )",
+        "CREATE INDEX idx_pushdown_string_regex_hash_rows_n ON {schema}.pushdown_string_regex_hash_rows(n)",
+        "INSERT INTO {schema}.pushdown_string_regex_hash_rows (\n                id, n, txt, txt2, trim_txt, csv_txt, ident_txt, char_code, null_txt, hex_txt, bytes_val, marker\n            )\n            VALUES\n                (1, 10, 'before value', 'pq', '  before value  ', 'u,v,w', 'plain_name', 66, 'fallback', '7061', '\\x7061'::bytea, NULL),\n                (2, 20, 'alpha beta', 'xy', '  alpha beta  ', 'aa,bb,cc', 'select', 65, NULL, '6162', '\\x6162'::bytea, NULL),\n                (3, 30, 'omega zone', 'zz', '  omega zone  ', 'dd,ee,ff', 'mixedCase', 67, 'tail', '7a7a', '\\x7a7a'::bytea, NULL)",
+        "ANALYZE {schema}.pushdown_string_regex_hash_rows"
+      ],
+      "cases": [
+        {
+          "name": "length",
+          "expr": "length(txt)",
+          "expected_sql": "10"
+        },
+        {
+          "name": "char_length",
+          "expr": "char_length(txt)",
+          "expected_sql": "10"
+        },
+        {
+          "name": "character_length",
+          "expr": "character_length(txt)",
+          "expected_sql": "10"
+        },
+        {
+          "name": "trim",
+          "expr": "trim(trim_txt)",
+          "expected_sql": "'alpha beta'"
+        },
+        {
+          "name": "btrim",
+          "expr": "btrim(trim_txt)",
+          "expected_sql": "'alpha beta'"
+        },
+        {
+          "name": "ltrim",
+          "expr": "ltrim(trim_txt)",
+          "expected_sql": "'alpha beta  '"
+        },
+        {
+          "name": "rtrim",
+          "expr": "rtrim(trim_txt)",
+          "expected_sql": "'  alpha beta'"
+        },
+        {
+          "name": "left",
+          "expr": "left(txt, 5)",
+          "expected_sql": "'alpha'"
+        },
+        {
+          "name": "right",
+          "expr": "right(txt, 4)",
+          "expected_sql": "'beta'"
+        },
+        {
+          "name": "substring",
+          "expr": "substring(txt from 7 for 4)",
+          "expected_sql": "'beta'"
+        },
+        {
+          "name": "substr",
+          "expr": "substr(txt, 7, 4)",
+          "expected_sql": "'beta'"
+        },
+        {
+          "name": "reverse",
+          "expr": "reverse(txt2)",
+          "expected_sql": "'yx'"
+        },
+        {
+          "name": "ascii",
+          "expr": "ascii(txt2)",
+          "expected_sql": "120"
+        },
+        {
+          "name": "chr",
+          "expr": "chr(char_code)",
+          "expected_sql": "'A'"
+        },
+        {
+          "name": "strpos",
+          "expr": "strpos(txt, 'b')",
+          "expected_sql": "7"
+        },
+        {
+          "name": "strpos_null_needle",
+          "expr": "strpos(txt, null_txt)",
+          "expected_sql": "NULL"
+        },
+        {
+          "name": "position",
+          "expr": "position('b' IN txt)",
+          "expected_sql": "7"
+        },
+        {
+          "name": "split_part",
+          "expr": "split_part(csv_txt, ',', 2)",
+          "expected_sql": "'bb'"
+        },
+        {
+          "name": "md5",
+          "expr": "md5(txt2)",
+          "expected_sql": "'3e44107170a520582ade522fa73c1d15'"
+        },
+        {
+          "name": "md5_null",
+          "expr": "md5(null_txt)",
+          "expected_sql": "NULL"
+        },
+        {
+          "name": "sha256",
+          "expr": "sha256(txt2)",
+          "expected_sql": "decode('769a4e6d0003189c7e96c5d9b7e810a0d11c3a12832527ec94b0f86d277f51ca', 'hex')"
+        },
+        {
+          "name": "sha256_null",
+          "expr": "sha256(null_txt)",
+          "expected_sql": "NULL"
+        },
+        {
+          "name": "digest",
+          "expr": "digest(txt2, 'sha256')",
+          "expected_sql": "decode('769a4e6d0003189c7e96c5d9b7e810a0d11c3a12832527ec94b0f86d277f51ca', 'hex')"
+        },
+        {
+          "name": "decode",
+          "expr": "decode(hex_txt, 'hex')",
+          "expected_sql": "decode('6162', 'hex')"
+        }
+      ],
+      "update_strategy": "direct_filter"
+    },
+    {
+      "name": "array",
+      "comment": "Admitted array functions on the exact pair. Array containment and overlap operators stay local on the current exact pair.",
+      "base_table": "pushdown_array_rows",
+      "setup_sql": [
+        "CREATE TABLE {schema}.pushdown_array_rows (\n                id INTEGER PRIMARY KEY,\n                n INTEGER NOT NULL,\n                tags TEXT[] NOT NULL,\n                more_tags TEXT[] NOT NULL,\n                ints INTEGER[] NOT NULL,\n                matrix INTEGER[][] NOT NULL,\n                csv_txt TEXT NOT NULL,\n                marker TEXT\n            )",
+        "CREATE INDEX idx_pushdown_array_rows_n ON {schema}.pushdown_array_rows(n)",
+        "INSERT INTO {schema}.pushdown_array_rows (id, n, tags, more_tags, ints, matrix, csv_txt, marker)\n            VALUES\n                (1, 10, ARRAY['alpha', 'beta'], ARRAY['beta', 'gamma'], ARRAY[10, 20], ARRAY[[10, 20], [30, 40]], 'x,y', NULL),\n                (2, 20, ARRAY['alpha', 'sql', 'rust'], ARRAY['sql', 'cop'], ARRAY[20, 30, 40], ARRAY[[20, 30], [40, 50]], 'aa,bb,cc', NULL),\n                (3, 30, ARRAY['omega', 'zone'], ARRAY['zone'], ARRAY[30, 40], ARRAY[[30, 40], [50, 60]], 'dd,ee', NULL)",
+        "ANALYZE {schema}.pushdown_array_rows"
+      ],
+      "cases": [
+        {
+          "name": "array_length",
+          "expr": "array_length(tags, 1)",
+          "expected_sql": "3"
+        },
+        {
+          "name": "array_upper",
+          "expr": "array_upper(tags, 1)",
+          "expected_sql": "3"
+        },
+        {
+          "name": "array_lower",
+          "expr": "array_lower(tags, 1)",
+          "expected_sql": "1"
+        },
+        {
+          "name": "array_length_dim2",
+          "expr": "array_length(matrix, 2)",
+          "expected_sql": "2"
+        },
+        {
+          "name": "array_upper_dim2",
+          "expr": "array_upper(matrix, 2)",
+          "expected_sql": "2"
+        },
+        {
+          "name": "array_lower_dim2",
+          "expr": "array_lower(matrix, 2)",
+          "expected_sql": "1"
+        },
+        {
+          "name": "cardinality",
+          "expr": "cardinality(tags)",
+          "expected_sql": "3"
+        },
+        {
+          "name": "cardinality_matrix",
+          "expr": "cardinality(matrix)",
+          "expected_sql": "4"
+        },
+        {
+          "name": "array_position",
+          "expr": "array_position(tags, 'sql')",
+          "expected_sql": "2"
+        },
+        {
+          "name": "array_cat",
+          "expr": "array_cat(tags, ARRAY['cop'])",
+          "expected_sql": "ARRAY['alpha', 'sql', 'rust', 'cop']"
+        },
+        {
+          "name": "array_cat_null_left",
+          "expr": "array_cat(NULL::TEXT[], tags)",
+          "expected_sql": "ARRAY['alpha', 'sql', 'rust']"
+        },
+        {
+          "name": "array_cat_null_right",
+          "expr": "array_cat(tags, NULL::TEXT[])",
+          "expected_sql": "ARRAY['alpha', 'sql', 'rust']"
+        },
+        {
+          "name": "array_append",
+          "expr": "array_append(tags, 'cop')",
+          "expected_sql": "ARRAY['alpha', 'sql', 'rust', 'cop']"
+        },
+        {
+          "name": "array_prepend",
+          "expr": "array_prepend('cop', tags)",
+          "expected_sql": "ARRAY['cop', 'alpha', 'sql', 'rust']"
+        },
+        {
+          "name": "array_remove",
+          "expr": "array_remove(tags, 'sql')",
+          "expected_sql": "ARRAY['alpha', 'rust']"
+        },
+        {
+          "name": "string_to_array",
+          "expr": "string_to_array(csv_txt, ',')",
+          "expected_sql": "ARRAY['aa', 'bb', 'cc']"
+        }
+      ],
+      "update_strategy": "projected_match_by_id"
+    }
+  ]
+}

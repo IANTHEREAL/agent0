@@ -171,7 +171,7 @@ fn is_known_builtin_function(name: &str) -> bool {
         // Window functions
         | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "NTILE"
         // Math functions
-        | "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNC" | "TRUNCATE" | "SQRT" | "CBRT"
+        | "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNC" | "SQRT" | "CBRT"
         | "POWER" | "POW" | "EXP" | "LN" | "LOG" | "LOG10" | "SIGN" | "MOD" | "PI" | "RANDOM"
         | "DEGREES" | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2"
         | "GREATEST" | "LEAST" | "NULLIF" | "COALESCE"

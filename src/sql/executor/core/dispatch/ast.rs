@@ -279,6 +279,14 @@ impl Executor {
                                 )]);
                             }
 
+                            if let Some(err) =
+                                crate::sql::session::settings::SessionSettings::rejected_public_guc_error(
+                                    &var_name,
+                                )
+                            {
+                                return Err(err.into());
+                            }
+
                             let value = match session.show_setting_value(&var_name) {
                                 Some(v) => v,
                                 None if var_name.contains('.') => String::new(),
@@ -647,6 +655,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unrecognized configuration parameter"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_show_rejected_public_guc_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SHOW db9.enable_cop_agg_pushdown";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized configuration parameter"));
+        assert!(err.contains("db9.enable_cop_pushdown"));
     }
 
     #[tokio::test]

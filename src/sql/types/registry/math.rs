@@ -4,7 +4,13 @@ use super::FunctionSignature;
 use crate::model::DataType;
 
 pub(super) fn register(r: &mut super::FunctionRegistry) {
+    let int32 = DataType::Int32;
+    let int64 = DataType::Int64;
     let f64 = DataType::Float64;
+    let numeric = DataType::Numeric {
+        precision: None,
+        scale: None,
+    };
 
     // Polymorphic math functions (SameAsArg) — no arg_types
     r.register(
@@ -13,51 +19,133 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "CEIL",
-        FunctionSignature::same_as_arg(0).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "CEIL",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
     );
     r.register(
         "CEILING",
-        FunctionSignature::same_as_arg(0).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "CEILING",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
     );
     r.register(
         "FLOOR",
-        FunctionSignature::same_as_arg(0).with_args(1, Some(1)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "FLOOR",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
     );
     r.register(
         "ROUND",
-        FunctionSignature::same_as_arg(0).with_args(1, Some(2)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "ROUND",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
+    );
+    r.register(
+        "ROUND",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![numeric.clone(), int32.clone()]),
     );
     r.register(
         "TRUNC",
-        FunctionSignature::same_as_arg(0).with_args(1, Some(2)),
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
     );
     r.register(
-        "TRUNCATE",
-        FunctionSignature::same_as_arg(0).with_args(1, Some(2)),
+        "TRUNC",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
+    );
+    r.register(
+        "TRUNC",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![numeric.clone(), int32.clone()]),
     );
     r.register(
         "MOD",
-        FunctionSignature::same_as_arg(0).with_args(2, Some(2)),
+        FunctionSignature::fixed(int32.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![int32.clone(), int32.clone()]),
+    );
+    r.register(
+        "MOD",
+        FunctionSignature::fixed(int64.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![int32.clone(), int64.clone()]),
+    );
+    r.register(
+        "MOD",
+        FunctionSignature::fixed(int64.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![int64.clone(), int32.clone()]),
+    );
+    r.register(
+        "MOD",
+        FunctionSignature::fixed(int64.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![int64.clone(), int64.clone()]),
+    );
+    r.register(
+        "MOD",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![numeric.clone(), numeric.clone()]),
     );
 
     // Float64 functions — known arg types
-    r.register(
-        "POWER",
-        FunctionSignature::fixed(f64.clone())
-            .with_args(2, Some(2))
-            .with_arg_types(vec![f64.clone(), f64.clone()]),
-    );
-    r.register(
-        "POW",
-        FunctionSignature::fixed(f64.clone())
-            .with_args(2, Some(2))
-            .with_arg_types(vec![f64.clone(), f64.clone()]),
-    );
+    for name in ["POWER", "POW"] {
+        r.register(
+            name,
+            FunctionSignature::fixed(f64.clone())
+                .with_args(2, Some(2))
+                .with_arg_types(vec![f64.clone(), f64.clone()]),
+        );
+        r.register(
+            name,
+            FunctionSignature::fixed(numeric.clone())
+                .with_args(2, Some(2))
+                .with_arg_types(vec![numeric.clone(), numeric.clone()]),
+        );
+    }
     r.register(
         "SQRT",
         FunctionSignature::fixed(f64.clone())
             .with_args(1, Some(1))
             .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "SQRT",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
     );
     r.register(
         "CBRT",
@@ -72,7 +160,25 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
             .with_arg_types(vec![f64.clone()]),
     );
     r.register(
+        "EXP",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
+    );
+    r.register(
         "LN",
+        FunctionSignature::fixed(f64.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "LN",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
+    );
+    r.register(
+        "LOG",
         FunctionSignature::fixed(f64.clone())
             .with_args(1, Some(1))
             .with_arg_types(vec![f64.clone()]),
@@ -80,14 +186,32 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     r.register(
         "LOG",
         FunctionSignature::fixed(f64.clone())
-            .with_args(1, Some(2))
+            .with_args(2, Some(2))
             .with_arg_types(vec![f64.clone(), f64.clone()]),
+    );
+    r.register(
+        "LOG",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
+    );
+    r.register(
+        "LOG",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(2, Some(2))
+            .with_arg_types(vec![numeric.clone(), numeric.clone()]),
     );
     r.register(
         "LOG10",
         FunctionSignature::fixed(f64.clone())
             .with_args(1, Some(1))
             .with_arg_types(vec![f64.clone()]),
+    );
+    r.register(
+        "LOG10",
+        FunctionSignature::fixed(numeric.clone())
+            .with_args(1, Some(1))
+            .with_arg_types(vec![numeric.clone()]),
     );
     r.register(
         "DEGREES",
@@ -144,23 +268,6 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
             .with_arg_types(vec![f64.clone(), f64.clone()]),
     );
 
-    // SIGN per PostgreSQL 16.13: two concrete overloads in pg_proc —
-    //   sign(double precision) -> double precision
-    //   sign(numeric)          -> numeric
-    // Registered as two distinct overloads so:
-    //   * pg_catalog.pg_proc emits two rows (matching PG exactly);
-    //   * overload resolution picks dp for int/bigint/float inputs
-    //     (int-to-dp is implicit in PG) and numeric for numeric inputs;
-    //   * numeric input resolves to a bare `numeric` return type —
-    //     no typmod leak into view/catalog metadata, matching
-    //     PG's behavior for CREATE VIEW v AS SELECT sign(x::numeric(p,s)).
-    // Registration order matters: the dp overload is registered first
-    // so it wins the tie for integer inputs (PG's numeric-category
-    // preference routes int → dp rather than int → numeric).
-    let numeric = DataType::Numeric {
-        precision: None,
-        scale: None,
-    };
     r.register(
         "SIGN",
         FunctionSignature::fixed(f64.clone())

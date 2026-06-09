@@ -20,6 +20,7 @@ mod tests;
 use crate::model::{DataType, Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::expr::operators::compare_values;
+use crate::sql::expr::traverse::for_each_child;
 use crate::sql::expr::typed_fold::is_fold_candidate;
 use crate::sql::query_context::QueryContext;
 use crate::sql::types::cast;
@@ -28,8 +29,26 @@ use anyhow::{anyhow, Result};
 use arithmetic::{eval_binary, eval_unary};
 pub use helpers::init_postmaster_start_time;
 use helpers::{
-    eval_array_index, eval_function_call, eval_timezone, to_sqlparser_json_op, value_to_text,
+    eval_age_with_timestamptz, eval_array_index, eval_date_part_with_timestamptz,
+    eval_date_timestamptz, eval_date_trunc_with_timestamptz, eval_function_call,
+    eval_hash_function_call, eval_json_function_call, eval_timezone, eval_to_char_with_typed_args,
+    to_sqlparser_json_op, value_to_text,
 };
+
+fn invalid_escape_string_error() -> anyhow::Error {
+    crate::sql::error::SqlError::InvalidEscapeString {
+        message: "invalid escape string".to_owned(),
+    }
+    .into()
+}
+
+fn escape_string_from_value(value: Value) -> Result<String> {
+    let escape = value_to_text(&value);
+    if escape.chars().count() > 1 {
+        return Err(invalid_escape_string_error());
+    }
+    Ok(escape)
+}
 
 /// Evaluate a typed expression against a row.
 ///
@@ -293,17 +312,37 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
         } => {
             let val = eval_typed_expr(inner, row, qctx)?;
             let low_val = eval_typed_expr(low, row, qctx)?;
-            let high_val = eval_typed_expr(high, row, qctx)?;
 
-            // SQL three-valued logic: any NULL → NULL
-            if val == Value::Null || low_val == Value::Null || high_val == Value::Null {
-                return Ok(Value::Null);
+            let ge_low = if matches!(val, Value::Null) || matches!(low_val, Value::Null) {
+                None
+            } else {
+                Some(compare_values(&val, &low_val)? >= 0)
+            };
+
+            // PG rewrites BETWEEN to left-to-right boolean comparisons. Once
+            // the lower comparison proves the result false, the high bound is
+            // not evaluated.
+            if matches!(ge_low, Some(false)) {
+                return Ok(Value::Boolean(*negated));
             }
 
-            let ge_low = compare_values(&val, &low_val)? >= 0;
-            let le_high = compare_values(&val, &high_val)? <= 0;
-            let result = ge_low && le_high;
-            Ok(Value::Boolean(if *negated { !result } else { result }))
+            let high_val = eval_typed_expr(high, row, qctx)?;
+            let le_high = if matches!(val, Value::Null) || matches!(high_val, Value::Null) {
+                None
+            } else {
+                Some(compare_values(&val, &high_val)? <= 0)
+            };
+
+            let result = match (ge_low, le_high) {
+                (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+
+            match result {
+                Some(result) => Ok(Value::Boolean(if *negated { !result } else { result })),
+                None => Ok(Value::Null),
+            }
         }
 
         TypedExprKind::InList {
@@ -311,6 +350,11 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             list,
             negated,
         } => {
+            precheck_foldable_subtrees(inner, row, qctx)?;
+            for item_expr in list {
+                precheck_foldable_subtrees(item_expr, row, qctx)?;
+            }
+
             let val = eval_typed_expr(inner, row, qctx)?;
             // ANY/ALL over empty array is vacuously false/true regardless of LHS.
             if list.is_empty() {
@@ -398,20 +442,26 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             let val = eval_typed_expr(inner, row, qctx)?;
             let pat_val = eval_typed_expr(pattern, row, qctx)?;
 
-            if val == Value::Null || pat_val == Value::Null {
+            if pat_val == Value::Null {
                 return Ok(Value::Null);
             }
 
-            let s = value_to_text(&val);
             let p = value_to_text(&pat_val);
             let esc = match escape {
                 Some(esc_expr) => {
                     let esc_val = eval_typed_expr(esc_expr, row, qctx)?;
-                    value_to_text(&esc_val).chars().next()
+                    if esc_val == Value::Null {
+                        return Ok(Value::Null);
+                    }
+                    Some(escape_string_from_value(esc_val)?)
                 }
-                None => None,
+                None => Some("\\".to_owned()),
             };
-            let matched = crate::sql::expr::like_match(&s, &p, esc, *case_insensitive);
+            if val == Value::Null {
+                return Ok(Value::Null);
+            }
+            let s = value_to_text(&val);
+            let matched = crate::sql::expr::like_match(&s, &p, esc.as_deref(), *case_insensitive)?;
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
 
@@ -424,20 +474,26 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             let val = eval_typed_expr(inner, row, qctx)?;
             let pat_val = eval_typed_expr(pattern, row, qctx)?;
 
-            if val == Value::Null || pat_val == Value::Null {
+            if pat_val == Value::Null {
                 return Ok(Value::Null);
             }
 
-            let s = value_to_text(&val);
             let p = value_to_text(&pat_val);
             let esc = match escape {
                 Some(esc_expr) => {
                     let esc_val = eval_typed_expr(esc_expr, row, qctx)?;
-                    value_to_text(&esc_val).chars().next()
+                    if esc_val == Value::Null {
+                        return Ok(Value::Null);
+                    }
+                    Some(escape_string_from_value(esc_val)?)
                 }
-                None => None,
+                None => Some("\\".to_owned()),
             };
-            let matched = crate::sql::expr::similar_to_match(&s, &p, esc)?;
+            if val == Value::Null {
+                return Ok(Value::Null);
+            }
+            let s = value_to_text(&val);
+            let matched = crate::sql::expr::similar_to_match(&s, &p, esc.as_deref())?;
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
 
@@ -475,23 +531,7 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
         }
 
         TypedExprKind::Coalesce(exprs) => {
-            // PostgreSQL folds row-independent constant arguments in COALESCE
-            // before execution. This can raise errors (e.g. `1/0`) even if
-            // short-circuiting would skip the branch at runtime, unless a
-            // preceding argument is a known non-NULL constant.
-            let mut has_proven_non_null_constant = false;
-            for e in exprs {
-                if has_proven_non_null_constant {
-                    break;
-                }
-                if !is_fold_candidate(e) {
-                    continue;
-                }
-                let v = eval_typed_expr(e, row, qctx)?;
-                if v != Value::Null {
-                    has_proven_non_null_constant = true;
-                }
-            }
+            precheck_coalesce_foldable_subtrees(exprs, row, qctx)?;
 
             for e in exprs {
                 let val = eval_typed_expr(e, row, qctx)?;
@@ -557,26 +597,53 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
                 return eval_timezone(&args[0], &args[1], row, qctx);
             }
 
-            // Preserve ROW(...) structural semantics for JSON conversion helpers.
-            if args.len() == 1
-                && (func.name.eq_ignore_ascii_case("TO_JSONB")
-                    || func.name.eq_ignore_ascii_case("ROW_TO_JSON"))
-                && matches!(args[0].kind, TypedExprKind::Row(_))
+            if func.name.eq_ignore_ascii_case("DATE")
+                && args.len() == 1
+                && matches!(args[0].data_type, DataType::TimestampTz)
             {
-                if let TypedExprKind::Row(items) = &args[0].kind {
-                    let mut obj = serde_json::Map::new();
-                    for (i, item) in items.iter().enumerate() {
-                        let v = eval_typed_expr(item, row, qctx)?;
-                        obj.insert(
-                            format!("f{}", i + 1),
-                            crate::sql::expr::functions::json::value_to_json(&v),
-                        );
-                    }
-                    if func.name.eq_ignore_ascii_case("TO_JSONB") {
-                        return Ok(Value::Jsonb(serde_json::Value::Object(obj).to_string()));
-                    }
-                    return Ok(Value::Json(serde_json::Value::Object(obj).to_string()));
-                }
+                return eval_date_timestamptz(&args[0], row, qctx);
+            }
+
+            if func.name.eq_ignore_ascii_case("AGE")
+                && !args.is_empty()
+                && args
+                    .iter()
+                    .any(|arg| matches!(arg.data_type, DataType::TimestampTz))
+            {
+                return eval_age_with_timestamptz(args, row, qctx);
+            }
+
+            if func.name.eq_ignore_ascii_case("TO_CHAR") && args.len() == 2 {
+                return eval_to_char_with_typed_args(&args[0], &args[1], row, qctx);
+            }
+
+            if args.len() == 2
+                && matches!(args[1].data_type, DataType::TimestampTz)
+                && (func.name.eq_ignore_ascii_case("DATE_PART")
+                    || func.name.eq_ignore_ascii_case("EXTRACT"))
+            {
+                return eval_date_part_with_timestamptz(
+                    &args[0],
+                    &args[1],
+                    row,
+                    qctx,
+                    func.name.eq_ignore_ascii_case("EXTRACT"),
+                );
+            }
+
+            if func.name.eq_ignore_ascii_case("DATE_TRUNC")
+                && args.len() == 2
+                && matches!(args[1].data_type, DataType::TimestampTz)
+            {
+                return eval_date_trunc_with_timestamptz(&args[0], &args[1], row, qctx);
+            }
+
+            if let Some(result) = eval_hash_function_call(&func.name, args, row, qctx) {
+                return result;
+            }
+
+            if let Some(result) = eval_json_function_call(&func.name, args, row, qctx) {
+                return result;
             }
 
             let arg_vals: Vec<Value> = args
@@ -651,6 +718,106 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             eval_typed_expr(inner, row, qctx)
         }
     }
+}
+
+pub(super) fn precheck_foldable_subtrees(
+    expr: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<()> {
+    if is_fold_candidate(expr) {
+        eval_typed_expr(expr, row, qctx)?;
+        return Ok(());
+    }
+
+    match &expr.kind {
+        TypedExprKind::BinaryOp {
+            left,
+            op: op @ (BinaryOp::And | BinaryOp::Or),
+            right,
+        } => {
+            let _ = boolean_fold_short_circuit_value(op, left, right, row, qctx)?;
+            Ok(())
+        }
+        TypedExprKind::Coalesce(exprs) => precheck_coalesce_foldable_subtrees(exprs, row, qctx),
+        _ => {
+            let mut result = Ok(());
+            for_each_child(expr, &mut |child| {
+                if result.is_ok() {
+                    result = precheck_foldable_subtrees(child, row, qctx);
+                }
+            });
+            result
+        }
+    }
+}
+
+fn precheck_coalesce_foldable_subtrees(
+    exprs: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<()> {
+    // PostgreSQL simplifies COALESCE arguments left-to-right and stops once a
+    // known non-NULL constant is found. Before that point, foldable subtrees
+    // inside runtime arguments can still raise planner-time errors.
+    for expr in exprs {
+        if is_fold_candidate(expr) {
+            let value = eval_typed_expr(expr, row, qctx)?;
+            if value != Value::Null {
+                break;
+            }
+        } else {
+            precheck_foldable_subtrees(expr, row, qctx)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn boolean_fold_short_circuit_value(
+    op: &BinaryOp,
+    left: &TypedExpr,
+    right: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<Option<Value>> {
+    if let Some(value) = boolean_fold_arg(op, left, row, qctx)? {
+        return Ok(Some(value));
+    }
+    boolean_fold_arg(op, right, row, qctx)
+}
+
+fn boolean_fold_arg(
+    op: &BinaryOp,
+    expr: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<Option<Value>> {
+    if let TypedExprKind::BinaryOp {
+        left,
+        op: nested_op,
+        right,
+    } = &expr.kind
+    {
+        if nested_op == op {
+            return boolean_fold_short_circuit_value(op, left, right, row, qctx);
+        }
+    }
+
+    if is_fold_candidate(expr) {
+        let value = eval_typed_expr(expr, row, qctx)?;
+        let determines = match (op, &value) {
+            (BinaryOp::And, Value::Boolean(false)) => true,
+            (BinaryOp::Or, Value::Boolean(true)) => true,
+            (BinaryOp::And | BinaryOp::Or, Value::Boolean(_) | Value::Null) => false,
+            (BinaryOp::And, _) => return Err(anyhow!("AND requires boolean operands")),
+            (BinaryOp::Or, _) => return Err(anyhow!("OR requires boolean operands")),
+            _ => false,
+        };
+        return Ok(determines.then_some(value));
+    }
+
+    precheck_foldable_subtrees(expr, row, qctx)?;
+    Ok(None)
 }
 
 /// Evaluate a single comparison for ScalarArrayCmp.

@@ -31,6 +31,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Int32).with_args(2, Some(3)),
     );
     r.register(
+        "__DB9_EQ_ANY",
+        FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(2)),
+    );
+    r.register(
         "ARRAY_POSITIONS",
         FunctionSignature::fixed(DataType::Array(Box::new(DataType::Int32))).with_args(2, Some(2)),
     );

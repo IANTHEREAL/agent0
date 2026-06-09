@@ -316,6 +316,9 @@ pub(super) fn try_execute_current_setting_select(
     };
 
     let var_name = var_name.to_lowercase();
+    if let Some(err) = SessionSettings::rejected_public_guc_error(&var_name) {
+        return Err(err.into());
+    }
     let value = match session.show_setting_value(&var_name) {
         Some(v) => Value::Text(v),
         None if missing_ok => Value::Null,
@@ -540,5 +543,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unrecognized configuration parameter"));
+    }
+
+    #[test]
+    fn current_setting_fast_path_rejects_rejected_public_guc() {
+        let mut session = make_session();
+        let query = parse_query("SELECT current_setting('db9.enable_cop_agg_pushdown')");
+        let err = try_execute_current_setting_select(&mut session, &query)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized configuration parameter"));
+        assert!(err.contains("db9.enable_cop_pushdown"));
     }
 }

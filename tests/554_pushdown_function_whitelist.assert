@@ -1,6 +1,6 @@
 Index Scan using db9_cop_func_smoke_n_idx on db9_cop_func_smoke
 DB9 Cop Access: point (20)
-DB9 Cop Output: lower, upper, length, abs, coalesce, nullif
+DB9 Cop Output: length, abs, coalesce, nullif
 DB9 Cop Limit: 1
 b|B|1|20|b|b
 function_parity|0

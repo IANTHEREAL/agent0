@@ -382,7 +382,10 @@ pub fn parse_time_string(s: &str) -> Option<i64> {
         (0, 0)
     };
 
-    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+    if !(0..=24).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+        return None;
+    }
+    if hours == 24 && (minutes != 0 || seconds != 0 || micros != 0) {
         return None;
     }
 
@@ -520,8 +523,14 @@ mod tests {
         let got =
             coerce_value_for_column(Value::Text("01:02:03.004005".into()), &time_col).unwrap();
         assert_eq!(got, Value::Time(3_723_004_005));
+        let got = coerce_value_for_column(Value::Text("24:00:00".into()), &time_col).unwrap();
+        assert_eq!(got, Value::Time(86_400_000_000));
 
         let time_bad = coerce_value_for_column(Value::Text("99:99".into()), &time_col)
+            .unwrap_err()
+            .to_string();
+        assert!(time_bad.contains("invalid input syntax for type time"));
+        let time_bad = coerce_value_for_column(Value::Text("24:00:00.000001".into()), &time_col)
             .unwrap_err()
             .to_string();
         assert!(time_bad.contains("invalid input syntax for type time"));

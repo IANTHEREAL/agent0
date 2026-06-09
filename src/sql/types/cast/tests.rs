@@ -738,6 +738,22 @@ fn jsonb_to_text_canonical() {
     assert_eq!(result, Value::Text(r#"{"a": 2, "b": 1}"#.into()));
 }
 
+#[test]
+fn array_to_text_cast_matches_pg_text_array_lexemes() {
+    let result = cast(
+        Value::Array(vec![
+            Value::Text("alpha".into()),
+            Value::Text("beta".into()),
+            Value::Text("NULL".into()),
+            Value::Text("a,b".into()),
+        ]),
+        &DataType::Text,
+        CastContext::Explicit,
+    )
+    .unwrap();
+    assert_eq!(result, Value::Text(r#"{alpha,beta,"NULL","a,b"}"#.into()));
+}
+
 // ---- JSONB → JSON canonicalization ----
 #[test]
 fn jsonb_to_json_canonical() {
@@ -780,8 +796,14 @@ fn test_coerce_timestamp_time_array_vector_from_text() {
     let time_col = test_col("t", DataType::Time);
     let got = coerce_value_for_column(Value::Text("01:02:03.004005".into()), &time_col).unwrap();
     assert_eq!(got, Value::Time(3_723_004_005));
+    let got = coerce_value_for_column(Value::Text("24:00:00".into()), &time_col).unwrap();
+    assert_eq!(got, Value::Time(86_400_000_000));
 
     let time_bad = coerce_value_for_column(Value::Text("99:99".into()), &time_col)
+        .unwrap_err()
+        .to_string();
+    assert!(time_bad.contains("invalid input syntax for type time"));
+    let time_bad = coerce_value_for_column(Value::Text("24:00:00.000001".into()), &time_col)
         .unwrap_err()
         .to_string();
     assert!(time_bad.contains("invalid input syntax for type time"));

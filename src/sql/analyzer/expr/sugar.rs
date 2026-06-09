@@ -66,7 +66,7 @@ impl<'a> Analyzer<'a> {
                     DataType::Text,
                 );
                 let date_expr = self.analyze_expr(expr)?;
-                self.make_function_call("DATE_PART", vec![field_const, date_expr])
+                self.make_function_call("EXTRACT", vec![field_const, date_expr])
             }
 
             Expr::AtTimeZone {

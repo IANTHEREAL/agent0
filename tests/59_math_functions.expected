@@ -70,6 +70,18 @@ sign_neg
 sign_zero
 0
 (1 row)
+sign_int_type
+double precision
+(1 row)
+sign_bigint_type
+double precision
+(1 row)
+sign_float_type
+double precision
+(1 row)
+sign_numeric_type
+numeric
+(1 row)
 sign_typeof_int
 double precision
 (1 row)

@@ -11,7 +11,7 @@ use crate::sql::embedding_options::parse_embed_text_json_options_dimensions;
 use crate::sql::expr::static_eval::eval_static_typed_expr;
 use crate::sql::names::function_name_upper;
 use crate::sql::query_context::QueryContext;
-use crate::sql::types::coercion::comparison_target_type;
+use crate::sql::types::coercion::{common_type, comparison_target_type, is_implicitly_coercible};
 use crate::sql::types::registry::global_registry;
 
 use crate::sql::analyzer::error::AnalyzerError;
@@ -34,7 +34,11 @@ fn is_implicitly_compatible(arg_type: &DataType, target: &DataType) -> bool {
         ),
         DataType::Float64 => matches!(
             arg_type,
-            DataType::Float64 | DataType::Int32 | DataType::Int64 | DataType::Oid
+            DataType::Float64
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Oid
+                | DataType::Numeric { .. }
         ),
         DataType::Int64 | DataType::Oid => {
             matches!(arg_type, DataType::Int64 | DataType::Int32 | DataType::Oid)
@@ -114,7 +118,81 @@ fn embed_text_dimensions(expr: &TypedExpr) -> Result<Option<u32>, AnalyzerError>
     }
 }
 
+fn array_rank_and_base(data_type: &DataType) -> Option<(usize, DataType)> {
+    let mut rank = 0_usize;
+    let mut current = data_type;
+    while let DataType::Array(inner) = current {
+        rank += 1;
+        current = inner.as_ref();
+    }
+    (rank > 0).then(|| (rank, current.clone()))
+}
+
+fn array_type_with_rank(base: DataType, rank: usize) -> DataType {
+    (0..rank).fold(base, |acc, _| DataType::Array(Box::new(acc)))
+}
+
+fn array_literal_all_semantically_unknown(analyzer: &Analyzer, expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::ArrayLiteral(elems) => elems.iter().all(|elem| {
+            analyzer.is_semantically_unknown(elem)
+                || array_literal_all_semantically_unknown(analyzer, elem)
+        }),
+        _ => analyzer.is_semantically_unknown(expr),
+    }
+}
+
+fn array_cat_common_base_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    if matches!(left, DataType::Unknown) && matches!(right, DataType::Unknown) {
+        return Some(DataType::Text);
+    }
+    if matches!(left, DataType::Unknown) {
+        return Some(right.clone());
+    }
+    if matches!(right, DataType::Unknown) {
+        return Some(left.clone());
+    }
+
+    let common = common_type(left, right)?;
+    if is_implicitly_coercible(left, &common) && is_implicitly_coercible(right, &common) {
+        Some(common)
+    } else {
+        None
+    }
+}
+
+fn array_cat_effective_type(analyzer: &Analyzer, expr: &TypedExpr) -> Option<DataType> {
+    let (rank, base) = array_rank_and_base(&expr.data_type)?;
+    let base = if array_literal_all_semantically_unknown(analyzer, expr) {
+        DataType::Unknown
+    } else {
+        base
+    };
+    Some(array_type_with_rank(base, rank))
+}
+
+fn array_cat_return_type(analyzer: &Analyzer, args: &[TypedExpr]) -> Option<DataType> {
+    let [left, right] = args else {
+        return None;
+    };
+    let left_type = array_cat_effective_type(analyzer, left)?;
+    let right_type = array_cat_effective_type(analyzer, right)?;
+    let (left_rank, left_base) = array_rank_and_base(&left_type)?;
+    let (right_rank, right_base) = array_rank_and_base(&right_type)?;
+
+    let common_base = array_cat_common_base_type(&left_base, &right_base)?;
+    let rank = match left_rank.cmp(&right_rank) {
+        std::cmp::Ordering::Equal => left_rank,
+        std::cmp::Ordering::Less if left_rank + 1 == right_rank => right_rank,
+        std::cmp::Ordering::Greater if right_rank + 1 == left_rank => left_rank,
+        _ => return None,
+    };
+
+    Some(array_type_with_rank(common_base, rank))
+}
+
 fn refine_function_return_type(
+    analyzer: &Analyzer,
     func_name: &str,
     args: &[TypedExpr],
     return_type: DataType,
@@ -132,6 +210,21 @@ fn refine_function_return_type(
             .flatten()
             .map(DataType::Vector)
             .unwrap_or(return_type)),
+        "MOD"
+            if args.len() == 2
+                && matches!(
+                    (&args[0].data_type, &args[1].data_type),
+                    (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32)
+                ) =>
+        {
+            Ok(DataType::Int64)
+        }
+        "ARRAY_CAT" => {
+            array_cat_return_type(analyzer, args).ok_or_else(|| AnalyzerError::FunctionNotFound {
+                name: func_name.to_string(),
+                arg_types: args.iter().map(error_display_arg_type).collect(),
+            })
+        }
         _ => Ok(return_type),
     }
 }
@@ -357,7 +450,7 @@ impl<'a> Analyzer<'a> {
                 return Ok(TypedExpr::new(
                     TypedExprKind::Row(analyzed_args),
                     DataType::UserDefined("record".to_string()),
-                ))
+                ));
             }
             _ => {}
         }
@@ -393,7 +486,7 @@ impl<'a> Analyzer<'a> {
             // Validate argument count — PG treats arity mismatch as
             // "function name(arg_types) does not exist" (SQLSTATE 42883).
             let arg_count = analyzed_args.len();
-            if arg_count < sig.min_args || sig.max_args.is_some_and(|max| arg_count > max) {
+            if !registry.arity_supported(&func_name, arg_count) {
                 return Err(AnalyzerError::FunctionNotFound {
                     name: func_name.to_lowercase(),
                     arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
@@ -431,6 +524,40 @@ impl<'a> Analyzer<'a> {
                 }
             }
 
+            if func_name == "SHA256" && !matches!(arg_types.first(), Some(DataType::Bytes)) {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_lowercase(),
+                    arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
+                });
+            }
+
+            if func_name == "MD5"
+                && !matches!(
+                    arg_types.first(),
+                    Some(DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Bytes)
+                )
+            {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_lowercase(),
+                    arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
+                });
+            }
+
+            if func_name == "DIGEST"
+                && !(matches!(
+                    arg_types.first(),
+                    Some(DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Bytes)
+                ) && matches!(
+                    arg_types.get(1),
+                    Some(DataType::Text | DataType::Varchar(_) | DataType::Name)
+                ))
+            {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_lowercase(),
+                    arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
+                });
+            }
+
             // Reject window-only functions used without OVER clause.
             // Functions like ROW_NUMBER(), RANK() are meaningless without a window.
             if sig.is_window && !sig.is_aggregate && func.over.is_none() {
@@ -451,7 +578,8 @@ impl<'a> Analyzer<'a> {
                     name: func_name.clone(),
                     arg_types: arg_types.clone(),
                 })?;
-            let return_type = refine_function_return_type(&func_name, &analyzed_args, return_type)?;
+            let return_type =
+                refine_function_return_type(self, &func_name, &analyzed_args, return_type)?;
 
             let resolved = ResolvedFunction {
                 name: func_name.clone(),
@@ -557,6 +685,13 @@ impl<'a> Analyzer<'a> {
             ));
         }
 
+        if func_name == "TRUNCATE" {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_lowercase(),
+                arg_types: analyzed_args.iter().map(error_display_arg_type).collect(),
+            });
+        }
+
         // Unknown function -- treat as opaque call returning Text.
         // The runtime function registry (eval_expr) handles many pg-specific functions
         // that aren't registered in the type registry. Rather than hard-failing at
@@ -605,6 +740,23 @@ impl<'a> Analyzer<'a> {
         args: Vec<TypedExpr>,
         func: &Function,
     ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        self.apply_function_arg_context_impl(func_name, args, Some(func))
+    }
+
+    fn apply_function_arg_context_for_builtin(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        self.apply_function_arg_context_impl(func_name, args, None)
+    }
+
+    fn apply_function_arg_context_impl(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        func: Option<&Function>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
         match func_name {
             // Vector distance functions require vector arguments. This provides
             // parameter typing context for $N placeholders in extended protocol.
@@ -613,17 +765,36 @@ impl<'a> Analyzer<'a> {
             | "INNER_PRODUCT"
             | "VECTOR_NEGATIVE_INNER_PRODUCT" => self.coerce_args_to_vector(args, 2),
             "VECTOR_DIMS" | "VECTOR_NORM" | "L2_NORMALIZE" => self.coerce_args_to_vector(args, 1),
-            "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
-            "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
-            "PG_GET_SERIAL_SEQUENCE" => {
-                self.coerce_pg_get_serial_sequence_signature(func, func_name, args)
+            "DATE_TRUNC" | "DATE_PART" | "EXTRACT" => {
+                self.coerce_text_arg_indices(func_name, args, &[0])
             }
+            "TO_CHAR" => self.coerce_text_arg_indices(func_name, args, &[1]),
+            "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
+            "SHA256" => self.coerce_sha256_signature(args),
+            "DIGEST" => self.coerce_digest_signature(func_name, args),
+            "ARRAY_POSITION" => self.coerce_array_position_signature(func_name, args),
+            "ARRAY_LENGTH" | "ARRAY_UPPER" | "ARRAY_LOWER" => {
+                self.coerce_array_dimension_signature(func_name, args)
+            }
+            "ARRAY_APPEND" => self.coerce_array_element_signature(func_name, args, 0, 1, None),
+            "ARRAY_PREPEND" => self.coerce_array_element_signature(func_name, args, 1, 0, None),
+            "ARRAY_REMOVE" => self.coerce_array_element_signature(func_name, args, 0, 1, None),
+            "ARRAY_TO_STRING" => self.coerce_array_to_string_signature(func_name, args),
+            "STRING_TO_ARRAY" | "REGEXP_SPLIT_TO_ARRAY" => {
+                self.coerce_string_to_array_signature(func_name, args)
+            }
+            "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
+            "PG_GET_SERIAL_SEQUENCE" => match func {
+                Some(func) => self.coerce_pg_get_serial_sequence_signature(func, func_name, args),
+                None => Ok(args),
+            },
             "TO_REGTYPE" | "TO_REGCLASS" => self.coerce_to_regtype_signature(func_name, args),
             "TO_TSVECTOR"
             | "PLAINTO_TSQUERY"
             | "PHRASETO_TSQUERY"
             | "TO_TSQUERY"
             | "WEBSEARCH_TO_TSQUERY" => self.coerce_fts_text_signature(func_name, args),
+            "CONCAT" | "CONCAT_WS" | "FORMAT" => self.coerce_variadic_string_unknown_literals(args),
             "EMBEDDING" => self.coerce_embedding_signature(func_name, args),
             "EMBED_TEXT" => self.coerce_embed_text_signature(func_name, args),
             "VEC_EMBED_COSINE_DISTANCE"
@@ -639,8 +810,82 @@ impl<'a> Analyzer<'a> {
             }
             "HTTP_GET" | "HTTP_HEAD" | "HTTP_DELETE" | "HTTP_POST" | "HTTP_PUT" | "HTTP_PATCH"
             | "HTTP" => self.coerce_http_signature(func_name, args),
-            "MAKE_INTERVAL" => self.reorder_make_interval_named_args(args, func),
+            "MAKE_INTERVAL" => match func {
+                Some(func) => self
+                    .reorder_make_interval_named_args(args, func)
+                    .and_then(|args| {
+                        self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| {
+                            match idx {
+                                0..=5 => Some(DataType::Int32),
+                                6 => Some(DataType::Float64),
+                                _ => None,
+                            }
+                        })
+                    }),
+                None => {
+                    self.coerce_specific_arg_types_strict(
+                        func_name,
+                        args,
+                        &|idx, _args| match idx {
+                            0..=5 => Some(DataType::Int32),
+                            6 => Some(DataType::Float64),
+                            _ => None,
+                        },
+                    )
+                }
+            },
             "WIDTH_BUCKET" => self.coerce_width_bucket_signature(func_name, args),
+            "LEFT" | "RIGHT" | "REPEAT" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0 => Some(DataType::Text),
+                    1 => Some(DataType::Int32),
+                    _ => None,
+                })
+            }
+            "LPAD" | "RPAD" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0 => Some(DataType::Text),
+                    1 => Some(DataType::Int32),
+                    2 => Some(DataType::Text),
+                    _ => None,
+                })
+            }
+            "CHR" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0 => Some(DataType::Int32),
+                    _ => None,
+                })
+            }
+            "SPLIT_PART" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0 | 1 => Some(DataType::Text),
+                    2 => Some(DataType::Int32),
+                    _ => None,
+                })
+            }
+            "SUBSTRING" => self.coerce_substring_signature(func_name, args, true),
+            "SUBSTR" => self.coerce_substring_signature(func_name, args, false),
+            "OVERLAY" => self.coerce_overlay_signature(func_name, args),
+            "MAKE_DATE" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0..=2 => Some(DataType::Int32),
+                    _ => None,
+                })
+            }
+            "MAKE_TIME" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0 | 1 => Some(DataType::Int32),
+                    2 => Some(DataType::Float64),
+                    _ => None,
+                })
+            }
+            "MAKE_TIMESTAMP" => {
+                self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+                    0..=4 => Some(DataType::Int32),
+                    5 => Some(DataType::Float64),
+                    _ => None,
+                })
+            }
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -673,6 +918,272 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn coerce_variadic_string_unknown_literals(
+        &mut self,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        args.into_iter()
+            .map(|arg| {
+                if arg.data_type == DataType::Unknown
+                    && !matches!(&arg.kind, TypedExprKind::Parameter { .. })
+                {
+                    self.coerce_if_needed(arg, &DataType::Text)
+                } else {
+                    Ok(arg)
+                }
+            })
+            .collect()
+    }
+
+    fn coerce_digest_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 2 {
+            return Ok(args);
+        }
+        self.coerce_specific_arg_types(func_name, args, &|idx, args| match idx {
+            0 if args[0].data_type == DataType::Unknown
+                || matches!(&args[0].kind, TypedExprKind::Constant(Value::Null)) =>
+            {
+                Some(DataType::Text)
+            }
+            1 => Some(DataType::Text),
+            _ => None,
+        })
+    }
+
+    fn coerce_sha256_signature(
+        &mut self,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 1 {
+            return Ok(args);
+        }
+        let mut iter = args.into_iter();
+        let arg = iter.next().expect("checked arity");
+        if self.is_unresolved_param(&arg)
+            || arg.is_null_constant()
+            || arg.data_type == DataType::Unknown
+            || matches!(&arg.kind, TypedExprKind::Constant(Value::Text(_)))
+        {
+            return Ok(vec![self.coerce_if_needed(arg, &DataType::Bytes)?]);
+        }
+        Ok(vec![arg])
+    }
+
+    fn coerce_array_position_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        let coerced = self.coerce_array_element_signature(func_name, args, 0, 1, Some(2))?;
+        if coerced.len() <= 2 {
+            return Ok(coerced);
+        }
+        self.coerce_specific_arg_types_strict(func_name, coerced, &|idx, _args| {
+            (idx == 2).then_some(DataType::Int32)
+        })
+    }
+
+    fn coerce_array_to_string_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        self.coerce_text_arg_indices(func_name, args, &[1, 2])
+    }
+
+    fn coerce_string_to_array_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        self.coerce_text_arg_indices(func_name, args, &[0, 1, 2])
+    }
+
+    fn coerce_text_arg_indices(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        text_arg_indices: &[usize],
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        self.coerce_specific_arg_types(func_name, args, &|idx, _args| {
+            text_arg_indices.contains(&idx).then_some(DataType::Text)
+        })
+    }
+
+    fn coerce_array_element_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        array_idx: usize,
+        elem_idx: usize,
+        passthrough_idx: Option<usize>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        self.coerce_specific_arg_types(func_name, args, &|idx, args| {
+            if Some(idx) == passthrough_idx {
+                return None;
+            }
+            if idx != elem_idx {
+                return None;
+            }
+            match args.get(array_idx).map(|arg| &arg.data_type) {
+                Some(DataType::Array(elem_type)) => Some(elem_type.as_ref().clone()),
+                _ => None,
+            }
+        })
+    }
+
+    fn coerce_specific_arg_types<F>(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        target_type_for_index: &F,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError>
+    where
+        F: Fn(usize, &[TypedExpr]) -> Option<DataType>,
+    {
+        let original_args = args.clone();
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            let Some(target) = target_type_for_index(idx, &original_args) else {
+                coerced.push(arg);
+                continue;
+            };
+            if self.is_unresolved_param(&arg)
+                || arg.is_null_constant()
+                || arg.data_type == DataType::Unknown
+            {
+                coerced.push(self.coerce_if_needed(arg, &target)?);
+            } else if matches!(arg.kind, TypedExprKind::Parameter { .. }) {
+                if is_implicitly_compatible(&arg.data_type, &target) {
+                    coerced.push(self.coerce_if_needed(arg, &target)?);
+                } else {
+                    return Err(AnalyzerError::FunctionNotFound {
+                        name: func_name.to_lowercase(),
+                        arg_types,
+                    });
+                }
+            } else {
+                coerced.push(arg);
+            }
+        }
+        Ok(coerced)
+    }
+
+    fn coerce_specific_arg_types_strict<F>(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        target_type_for_index: &F,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError>
+    where
+        F: Fn(usize, &[TypedExpr]) -> Option<DataType>,
+    {
+        let original_args = args.clone();
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            let Some(target) = target_type_for_index(idx, &original_args) else {
+                coerced.push(arg);
+                continue;
+            };
+
+            if self.is_unresolved_param(&arg)
+                || arg.is_null_constant()
+                || self.is_semantically_unknown(&arg)
+            {
+                coerced.push(self.coerce_if_needed(arg, &target)?);
+            } else if matches!(arg.kind, TypedExprKind::Parameter { .. }) {
+                if is_implicitly_compatible(&arg.data_type, &target) {
+                    coerced.push(self.coerce_if_needed(arg, &target)?);
+                } else {
+                    return Err(AnalyzerError::FunctionNotFound {
+                        name: func_name.to_lowercase(),
+                        arg_types,
+                    });
+                }
+            } else if is_implicitly_compatible(&arg.data_type, &target) {
+                coerced.push(self.coerce_if_needed(arg, &target)?);
+            } else {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_lowercase(),
+                    arg_types,
+                });
+            }
+        }
+        Ok(coerced)
+    }
+
+    fn coerce_substring_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+        allow_regex_mode: bool,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if !(2..=3).contains(&args.len()) {
+            return Ok(args);
+        }
+
+        let first_target = if matches!(
+            args.first().map(|arg| &arg.data_type),
+            Some(DataType::Bytes)
+        ) {
+            DataType::Bytes
+        } else {
+            DataType::Text
+        };
+        let regex_mode = allow_regex_mode
+            && matches!(first_target, DataType::Text)
+            && args.len() == 2
+            && (self.is_semantically_unknown(&args[1])
+                || matches!(
+                    args[1].data_type,
+                    DataType::Text | DataType::Varchar(_) | DataType::Name
+                ));
+
+        self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| {
+            if idx == 0 {
+                return Some(first_target.clone());
+            }
+            if regex_mode {
+                return (idx == 1).then_some(DataType::Text);
+            }
+            match idx {
+                1 | 2 => Some(DataType::Int32),
+                _ => None,
+            }
+        })
+    }
+
+    fn coerce_overlay_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if !(3..=4).contains(&args.len()) {
+            return Ok(args);
+        }
+
+        let first_target = if matches!(
+            args.first().map(|arg| &arg.data_type),
+            Some(DataType::Bytes)
+        ) {
+            DataType::Bytes
+        } else {
+            DataType::Text
+        };
+
+        self.coerce_specific_arg_types_strict(func_name, args, &|idx, _args| match idx {
+            0 | 1 => Some(first_target.clone()),
+            2 | 3 => Some(DataType::Int32),
+            _ => None,
+        })
+    }
+
     /// Reorder named arguments for MAKE_INTERVAL to positional order.
     ///
     /// PostgreSQL parameter order: years(0), months(1), weeks(2), days(3),
@@ -684,6 +1195,8 @@ impl<'a> Analyzer<'a> {
         args: Vec<TypedExpr>,
         func: &Function,
     ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        let func_name = function_name_upper(func);
+
         // If no named args, return as-is (pure positional or zero-arg call).
         let has_named = func
             .args
@@ -714,6 +1227,13 @@ impl<'a> Analyzer<'a> {
             DataType::Float64,
         );
         let mut slots: [Option<TypedExpr>; 7] = Default::default();
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum SlotSource {
+            Positional,
+            Named,
+        }
+        let mut slot_sources: [Option<SlotSource>; 7] = Default::default();
+        let arg_types: Vec<DataType> = args.iter().map(|arg| arg.data_type.clone()).collect();
 
         // The analyzed args are in the same order as func.args (names discarded).
         // Walk func.args to recover the mapping.
@@ -728,8 +1248,21 @@ impl<'a> Analyzer<'a> {
                             param_name
                         ))
                     })?;
+                    if let Some(prev_source) = slot_sources[slot] {
+                        return match prev_source {
+                            SlotSource::Named => Err(AnalyzerError::SqlStructure(format!(
+                                "argument name \"{}\" used more than once",
+                                param_name
+                            ))),
+                            SlotSource::Positional => Err(AnalyzerError::FunctionNotFound {
+                                name: func_name.to_lowercase(),
+                                arg_types: arg_types.clone(),
+                            }),
+                        };
+                    }
                     if slot < slots.len() {
                         slots[slot] = Some(args[arg_idx].clone());
+                        slot_sources[slot] = Some(SlotSource::Named);
                     }
                     arg_idx += 1;
                 }
@@ -738,6 +1271,7 @@ impl<'a> Analyzer<'a> {
                     // which is already validated by validate_no_positional_after_named).
                     if arg_idx < 7 {
                         slots[arg_idx] = Some(args[arg_idx].clone());
+                        slot_sources[arg_idx] = Some(SlotSource::Positional);
                     }
                     arg_idx += 1;
                 }
@@ -890,6 +1424,46 @@ impl<'a> Analyzer<'a> {
             coerced.push(arg);
         } else {
             coerced.push(self.coerce_if_needed(arg, &target_count)?);
+        }
+        Ok(coerced)
+    }
+
+    /// PostgreSQL publishes array_length/array_upper/array_lower as
+    /// `(anyarray, int4) -> int4`; bigint dimensions are not implicitly
+    /// narrowed.
+    fn coerce_array_dimension_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 2 {
+            return Ok(args);
+        }
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(2);
+        let mut iter = args.into_iter();
+        coerced.push(iter.next().expect("checked arity"));
+
+        let dim = iter.next().expect("checked arity");
+        let target = DataType::Int32;
+        let dim_ok = dim.data_type == target
+            || self.is_unresolved_param(&dim)
+            || dim.is_null_constant()
+            || dim.data_type == DataType::Unknown
+            || (matches!(dim.kind, TypedExprKind::Parameter { .. })
+                && is_implicitly_compatible(&dim.data_type, &target));
+        if !dim_ok {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_lowercase(),
+                arg_types,
+            });
+        }
+
+        if dim.data_type == target {
+            coerced.push(dim);
+        } else {
+            coerced.push(self.coerce_if_needed(dim, &target)?);
         }
         Ok(coerced)
     }
@@ -1541,10 +2115,11 @@ impl<'a> Analyzer<'a> {
     /// Used for syntax sugar normalization (SUBSTRING -> FunctionCall, etc.).
     /// These are known builtins, so we can rely on the registry.
     pub(in crate::sql::analyzer) fn make_function_call(
-        &self,
+        &mut self,
         name: &str,
         args: Vec<TypedExpr>,
     ) -> Result<TypedExpr, AnalyzerError> {
+        let args = self.apply_function_arg_context_for_builtin(name, args)?;
         let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
 
         let registry = global_registry();
@@ -1554,7 +2129,7 @@ impl<'a> Analyzer<'a> {
                 name: name.to_string(),
                 arg_types: arg_types.clone(),
             })?;
-        let return_type = refine_function_return_type(name, &args, return_type)?;
+        let return_type = refine_function_return_type(self, name, &args, return_type)?;
 
         let func = ResolvedFunction {
             name: name.to_string(),

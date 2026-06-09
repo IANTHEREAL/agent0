@@ -3,7 +3,7 @@
 //! Contains function call dispatch, timezone evaluation, array indexing,
 //! JSON operator mapping, and string conversion utilities.
 
-use crate::model::{Row, Value};
+use crate::model::{DataType, Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
 use crate::sql::executor::{
@@ -11,9 +11,15 @@ use crate::sql::executor::{
 };
 use crate::sql::query_context::{CurrentSettingLookup, QueryContext};
 use anyhow::{anyhow, Result};
-use std::sync::OnceLock;
+use chrono::Offset;
+use std::sync::{Arc, OnceLock};
 
 use super::eval_typed_expr;
+use crate::sql::expr::functions::datetime::format_to_char_value;
+use crate::sql::expr::functions::json::{
+    format_jsonb_pg, render_json_text_pg_from_value, render_json_timestamptz_millis,
+    render_jsonb_text_pg_from_value, value_to_json,
+};
 
 /// Process start time as epoch milliseconds, set once from main().
 static POSTMASTER_START_TIME_MS: OnceLock<i64> = OnceLock::new();
@@ -39,6 +45,370 @@ fn postmaster_start_time_ms() -> i64 {
 }
 
 pub(super) use crate::sql::expr::helpers::value_to_text;
+
+fn eval_hash_input_arg(
+    function_name: &str,
+    expr: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+    allow_text: bool,
+    allow_bytes: bool,
+) -> Result<Option<Vec<u8>>> {
+    let text_like = matches!(
+        expr.data_type,
+        DataType::Text | DataType::Name | DataType::Varchar(_)
+    );
+    let bytes = matches!(expr.data_type, DataType::Bytes);
+    if !(allow_bytes && bytes || allow_text && text_like) {
+        return Err(SqlError::FunctionNotFound(format!(
+            "{}({})",
+            function_name.to_lowercase(),
+            expr.data_type.pg_display_name()
+        ))
+        .into());
+    }
+
+    let value = eval_typed_expr(expr, row, qctx)?;
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let timezone = effective_timezone(qctx);
+    Ok(Some(
+        crate::sql::expr::functions::encoding::hash_input_bytes_with_type(
+            value,
+            &expr.data_type,
+            timezone.as_ref(),
+        ),
+    ))
+}
+
+pub(super) fn eval_hash_function_call(
+    name: &str,
+    args: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+) -> Option<Result<Value>> {
+    match name.to_ascii_uppercase().as_str() {
+        "MD5" if args.len() == 1 => Some(
+            match eval_hash_input_arg(name, &args[0], row, qctx, true, true) {
+                Ok(Some(data)) => {
+                    crate::sql::expr::functions::encoding::md5(vec![Value::Bytes(data)])
+                }
+                Ok(None) => Ok(Value::Null),
+                Err(err) => Err(err),
+            },
+        ),
+        "SHA256" if args.len() == 1 => Some(
+            match eval_hash_input_arg(name, &args[0], row, qctx, false, true) {
+                Ok(Some(data)) => {
+                    crate::sql::expr::functions::encoding::sha256(vec![Value::Bytes(data)])
+                }
+                Ok(None) => Ok(Value::Null),
+                Err(err) => Err(err),
+            },
+        ),
+        "DIGEST" if args.len() == 2 => Some(
+            match eval_hash_input_arg(name, &args[0], row, qctx, true, true) {
+                Ok(data) => match eval_typed_expr(&args[1], row, qctx) {
+                    Ok(algorithm) => match data {
+                        Some(data) => crate::sql::expr::functions::encoding::digest(vec![
+                            Value::Bytes(data),
+                            algorithm,
+                        ]),
+                        None => Ok(Value::Null),
+                    },
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
+            },
+        ),
+        _ => None,
+    }
+}
+
+pub(super) fn eval_json_function_call(
+    name: &str,
+    args: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+) -> Option<Result<Value>> {
+    match name.to_ascii_uppercase().as_str() {
+        "TO_JSON" if args.len() == 1 => Some(eval_json_scalar_call(&args[0], row, qctx, false)),
+        "TO_JSONB" if args.len() == 1 => Some(eval_json_scalar_call(&args[0], row, qctx, true)),
+        "ROW_TO_JSON" if !args.is_empty() => Some(eval_row_to_json_call(args, row, qctx, false)),
+        "JSON_BUILD_ARRAY" => Some(eval_json_build_array(args, row, qctx, false)),
+        "JSONB_BUILD_ARRAY" => Some(eval_json_build_array(args, row, qctx, true)),
+        "JSON_BUILD_OBJECT" => Some(eval_json_build_object(args, row, qctx, false)),
+        "JSONB_BUILD_OBJECT" => Some(eval_json_build_object(args, row, qctx, true)),
+        _ => None,
+    }
+}
+
+fn eval_json_scalar_call(
+    arg: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+    jsonb: bool,
+) -> Result<Value> {
+    if let TypedExprKind::Row(items) = &arg.kind {
+        return eval_row_items_to_json(items, row, qctx, jsonb);
+    }
+
+    let value = eval_typed_expr(arg, row, qctx)?;
+    let rendered = if jsonb {
+        render_jsonb_text_for_typed_value(&value, &arg.data_type, qctx)
+    } else {
+        render_json_text_for_typed_value(&value, &arg.data_type, qctx)
+    }?;
+
+    if jsonb {
+        Ok(Value::Jsonb(crate::sql::jsonb::format_jsonb_pg_str(
+            &rendered,
+        )))
+    } else {
+        Ok(Value::Json(rendered))
+    }
+}
+
+fn eval_row_to_json_call(
+    args: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+    jsonb: bool,
+) -> Result<Value> {
+    if let TypedExprKind::Row(items) = &args[0].kind {
+        return eval_row_items_to_json(items, row, qctx, jsonb);
+    }
+
+    let value = eval_typed_expr(&args[0], row, qctx)?;
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let Value::Array(values) = &value {
+        let element_type = match &args[0].data_type {
+            crate::model::DataType::Array(inner) => Some(inner.as_ref()),
+            _ => None,
+        };
+        let mut rendered_fields = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let rendered = if let Some(data_type) = element_type {
+                if jsonb {
+                    render_jsonb_text_for_typed_value(value, data_type, qctx)
+                } else {
+                    render_json_text_for_typed_value(value, data_type, qctx)
+                }
+            } else if jsonb {
+                render_jsonb_text_pg_from_value(value)
+            } else {
+                render_json_text_pg_from_value(value)
+            }?;
+            rendered_fields.push(format!(
+                "{}:{}",
+                serde_json::Value::String(format!("f{}", index + 1)),
+                rendered
+            ));
+        }
+        let raw = format!("{{{}}}", rendered_fields.join(","));
+        return if jsonb {
+            Ok(Value::Jsonb(crate::sql::jsonb::format_jsonb_pg_str(&raw)))
+        } else {
+            Ok(Value::Json(raw))
+        };
+    }
+
+    let rendered = if jsonb {
+        render_jsonb_text_for_typed_value(&value, &args[0].data_type, qctx)
+    } else {
+        render_json_text_for_typed_value(&value, &args[0].data_type, qctx)
+    }?;
+
+    if jsonb {
+        Ok(Value::Jsonb(crate::sql::jsonb::format_jsonb_pg_str(
+            &rendered,
+        )))
+    } else {
+        Ok(Value::Json(rendered))
+    }
+}
+
+fn eval_row_items_to_json(
+    items: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+    jsonb: bool,
+) -> Result<Value> {
+    let mut rendered_fields = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let value = eval_typed_expr(item, row, qctx)?;
+        let rendered = if jsonb {
+            render_jsonb_text_for_typed_value(&value, &item.data_type, qctx)
+        } else {
+            render_json_text_for_typed_value(&value, &item.data_type, qctx)
+        }?;
+        rendered_fields.push(format!(
+            "{}:{}",
+            serde_json::Value::String(format!("f{}", index + 1)),
+            rendered
+        ));
+    }
+
+    let raw = format!("{{{}}}", rendered_fields.join(","));
+    if jsonb {
+        Ok(Value::Jsonb(crate::sql::jsonb::format_jsonb_pg_str(&raw)))
+    } else {
+        Ok(Value::Json(raw))
+    }
+}
+
+fn eval_json_build_array(
+    args: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+    jsonb: bool,
+) -> Result<Value> {
+    if jsonb {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = eval_typed_expr(arg, row, qctx)?;
+            values.push(jsonb_value_for_typed_value(&value, &arg.data_type, qctx)?);
+        }
+        return Ok(Value::Jsonb(format_jsonb_pg(&serde_json::Value::Array(
+            values,
+        ))?));
+    }
+
+    let mut rendered = Vec::with_capacity(args.len());
+    for arg in args {
+        let value = eval_typed_expr(arg, row, qctx)?;
+        let rendered_item = render_json_text_for_typed_value(&value, &arg.data_type, qctx)?;
+        rendered.push(rendered_item);
+    }
+
+    Ok(Value::Json(format!("[{}]", rendered.join(", "))))
+}
+
+fn eval_json_build_object(
+    args: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+    jsonb: bool,
+) -> Result<Value> {
+    if !args.len().is_multiple_of(2) {
+        return Err(SqlError::InvalidParameterValue {
+            message: "argument list must have even number of elements".into(),
+        }
+        .into());
+    }
+
+    if jsonb {
+        let mut object = serde_json::Map::new();
+        for (i, chunk) in args.chunks(2).enumerate() {
+            let key = eval_typed_expr(&chunk[0], row, qctx)?;
+            if matches!(key, Value::Null) {
+                return Err(SqlError::InvalidParameterValue {
+                    message: format!("argument {}: key must not be null", i * 2 + 1),
+                }
+                .into());
+            }
+
+            let key_str = match key {
+                Value::Text(s) => s,
+                v => v.to_string(),
+            };
+            let value = eval_typed_expr(&chunk[1], row, qctx)?;
+            object.insert(
+                key_str,
+                jsonb_value_for_typed_value(&value, &chunk[1].data_type, qctx)?,
+            );
+        }
+        return Ok(Value::Jsonb(format_jsonb_pg(&serde_json::Value::Object(
+            object,
+        ))?));
+    }
+
+    let mut rendered_pairs = Vec::with_capacity(args.len() / 2);
+    for chunk in args.chunks(2) {
+        let key = eval_typed_expr(&chunk[0], row, qctx)?;
+        if matches!(key, Value::Null) {
+            return Err(SqlError::NullValueNotAllowed {
+                message: "null value not allowed for object key".into(),
+            }
+            .into());
+        }
+
+        let key_str = match key {
+            Value::Text(s) => s,
+            v => v.to_string(),
+        };
+        let value = eval_typed_expr(&chunk[1], row, qctx)?;
+        let rendered_value = render_json_text_for_typed_value(&value, &chunk[1].data_type, qctx)?;
+        let rendered_key = serde_json::to_string(&key_str).unwrap_or_else(|_| "\"\"".into());
+        rendered_pairs.push(format!("{} : {}", rendered_key, rendered_value));
+    }
+
+    Ok(Value::Json(format!("{{{}}}", rendered_pairs.join(", "))))
+}
+
+fn jsonb_value_for_typed_value(
+    value: &Value,
+    data_type: &DataType,
+    qctx: &QueryContext,
+) -> Result<serde_json::Value> {
+    match (value, data_type) {
+        (Value::Timestamp(ts), DataType::TimestampTz) => Ok(serde_json::Value::String(
+            render_json_timestamptz_millis(*ts, qctx.timezone.as_ref()),
+        )),
+        (Value::Array(values), DataType::Array(inner)) => Ok(serde_json::Value::Array(
+            values
+                .iter()
+                .map(|value| jsonb_value_for_typed_value(value, inner, qctx))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        _ => value_to_json(value),
+    }
+}
+
+fn render_json_text_for_typed_value(
+    value: &Value,
+    data_type: &crate::model::DataType,
+    qctx: &QueryContext,
+) -> Result<String> {
+    match (value, data_type) {
+        (Value::Timestamp(ts), crate::model::DataType::TimestampTz) => Ok(
+            serde_json::Value::String(render_json_timestamptz_millis(*ts, qctx.timezone.as_ref()))
+                .to_string(),
+        ),
+        (Value::Array(values), crate::model::DataType::Array(inner)) => {
+            let rendered = values
+                .iter()
+                .map(|value| render_json_text_for_typed_value(value, inner, qctx))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!("[{}]", rendered.join(",")))
+        }
+        _ => render_json_text_pg_from_value(value),
+    }
+}
+
+fn render_jsonb_text_for_typed_value(
+    value: &Value,
+    data_type: &crate::model::DataType,
+    qctx: &QueryContext,
+) -> Result<String> {
+    match (value, data_type) {
+        (Value::Timestamp(ts), crate::model::DataType::TimestampTz) => Ok(
+            serde_json::Value::String(render_json_timestamptz_millis(*ts, qctx.timezone.as_ref()))
+                .to_string(),
+        ),
+        (Value::Array(values), crate::model::DataType::Array(inner)) => {
+            let rendered = values
+                .iter()
+                .map(|value| render_jsonb_text_for_typed_value(value, inner, qctx))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!("[{}]", rendered.join(",")))
+        }
+        _ => render_jsonb_text_pg_from_value(value),
+    }
+}
 
 /// Evaluate array indexing (1-based, PostgreSQL convention).
 pub(super) fn eval_array_index(arr_val: Value, idx_val: Value) -> Result<Value> {
@@ -106,9 +476,22 @@ pub(super) fn eval_function_call(
             return Ok(Value::Timestamp(ts));
         }
         "CURRENT_DATE" => {
-            let days =
-                crate::model::date::timestamp_millis_to_date_days(qctx.transaction_timestamp_ms)?;
+            let days = crate::model::date::timestamp_millis_to_date_days(
+                session_local_timestamp_millis(qctx.transaction_timestamp_ms, qctx)?,
+            )?;
             return Ok(Value::Date(days));
+        }
+        "CURRENT_TIME" | "LOCALTIME" => {
+            return Ok(Value::Time(current_time_micros(
+                qctx.transaction_timestamp_ms,
+                qctx,
+            )?));
+        }
+        "LOCALTIMESTAMP" => {
+            return Ok(Value::Timestamp(session_local_timestamp_millis(
+                qctx.transaction_timestamp_ms,
+                qctx,
+            )?));
         }
         "PG_BACKEND_PID" => {
             // PostgreSQL exposes pg_backend_pid() as int4.
@@ -126,7 +509,7 @@ pub(super) fn eval_function_call(
         "CURRENT_SCHEMA" => {
             return Ok(Value::Text(
                 crate::session_context::current_search_path_first_schema(),
-            ))
+            ));
         }
         "CURRENT_SCHEMAS" => {
             // current_schemas(bool) → text[]
@@ -270,6 +653,7 @@ pub(super) fn eval_function_call(
             };
             match QueryContext::current_setting_lookup(qctx, canonical) {
                 CurrentSettingLookup::Found(v) => return Ok(Value::Text(v)),
+                CurrentSettingLookup::Rejected(err) => return Err(err.into()),
                 CurrentSettingLookup::Missing if missing_ok => return Ok(Value::Null),
                 CurrentSettingLookup::Missing | CurrentSettingLookup::NoSnapshot => {}
             }
@@ -309,12 +693,17 @@ pub(super) fn eval_function_call(
                     }
                 }
                 Some(_) | None => {
-                    return Err(anyhow!("argument of set_config must be type boolean"))
+                    return Err(anyhow!("argument of set_config must be type boolean"));
                 }
             };
 
             let canonical =
                 crate::sql::session::settings::SessionSettings::canonical_setting_name(&name);
+            if let Some(err) =
+                crate::sql::session::settings::SessionSettings::rejected_public_guc_error(canonical)
+            {
+                return Err(err.into());
+            }
 
             // NULL value → RESET: return boot-default value (PG parity).
             // Guard: reserved pseudo-GUCs must be rejected even on NULL reset.
@@ -421,6 +810,246 @@ pub(super) fn eval_function_call(
     }
 }
 
+fn local_naive_datetime_from_timestamptz_millis(
+    ts_millis: i64,
+    qctx: &QueryContext,
+) -> Result<chrono::NaiveDateTime> {
+    let timezone = effective_timezone(qctx);
+    let tz = crate::model::timestamp::TimeZoneSpec::try_parse(timezone.as_ref())?;
+    let utc = chrono::DateTime::from_timestamp_millis(ts_millis)
+        .ok_or_else(|| anyhow!("invalid timestamp"))?;
+    Ok(match tz {
+        crate::model::timestamp::TimeZoneSpec::Fixed(offset) => {
+            utc.with_timezone(&offset).naive_local()
+        }
+        crate::model::timestamp::TimeZoneSpec::Named(tz) => utc.with_timezone(&tz).naive_local(),
+    })
+}
+
+fn local_naive_datetime_to_timestamptz_millis(
+    naive: chrono::NaiveDateTime,
+    qctx: &QueryContext,
+) -> Result<i64> {
+    let timezone = effective_timezone(qctx);
+    let tz = crate::model::timestamp::TimeZoneSpec::try_parse(timezone.as_ref())?;
+    tz.timestamp_millis_from_local_datetime(naive)
+}
+
+fn value_to_naive_datetime_with_context(
+    value: &Value,
+    data_type: &crate::model::DataType,
+    qctx: &QueryContext,
+) -> Result<chrono::NaiveDateTime> {
+    if matches!(data_type, crate::model::DataType::TimestampTz) {
+        return match value {
+            Value::Timestamp(ts) => local_naive_datetime_from_timestamptz_millis(*ts, qctx),
+            Value::Date(days) => crate::model::date::date_days_to_naive_date(*days)?
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| anyhow!("invalid date")),
+            Value::Text(s) => match crate::sql::expr::parse_timestamp_string(s)? {
+                Value::Timestamp(ts) => local_naive_datetime_from_timestamptz_millis(ts, qctx),
+                _ => Err(anyhow!("invalid timestamptz text")),
+            },
+            Value::Null => Err(anyhow!("AGE cannot take NULL directly")),
+            other => Err(anyhow!("AGE cannot convert {:?} to timestamp", other)),
+        };
+    }
+
+    match value {
+        Value::Timestamp(ts) => chrono::DateTime::from_timestamp_millis(*ts)
+            .ok_or_else(|| anyhow!("invalid timestamp"))
+            .map(|dt| dt.naive_utc()),
+        Value::Date(days) => crate::model::date::date_days_to_naive_date(*days)?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow!("invalid date")),
+        Value::Text(s) => match crate::sql::expr::parse_timestamp_string(s)? {
+            Value::Timestamp(ts) => chrono::DateTime::from_timestamp_millis(ts)
+                .ok_or_else(|| anyhow!("invalid timestamp"))
+                .map(|dt| dt.naive_utc()),
+            _ => Err(anyhow!("invalid timestamp text")),
+        },
+        Value::Null => Err(anyhow!("AGE cannot take NULL directly")),
+        other => Err(anyhow!("AGE cannot convert {:?} to timestamp", other)),
+    }
+}
+
+pub(super) fn eval_date_timestamptz(
+    arg: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<Value> {
+    let value = eval_typed_expr(arg, row, qctx)?;
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Timestamp(ts) => {
+            let local = local_naive_datetime_from_timestamptz_millis(ts, qctx)?;
+            Ok(Value::Date(crate::model::date::naive_date_to_days(
+                local.date(),
+            )?))
+        }
+        Value::Date(days) => Ok(Value::Date(days)),
+        Value::Text(s) => match crate::sql::expr::parse_timestamp_string(&s)? {
+            Value::Timestamp(ts) => {
+                let local = local_naive_datetime_from_timestamptz_millis(ts, qctx)?;
+                Ok(Value::Date(crate::model::date::naive_date_to_days(
+                    local.date(),
+                )?))
+            }
+            _ => Err(anyhow!("DATE() cannot convert text to timestamptz")),
+        },
+        other => Err(anyhow!("DATE() cannot convert {:?} to date", other)),
+    }
+}
+
+pub(super) fn eval_age_with_timestamptz(
+    args: &[TypedExpr],
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<Value> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(anyhow!("AGE requires 1 or 2 arguments"));
+    }
+
+    let end_val = eval_typed_expr(&args[0], row, qctx)?;
+    if matches!(end_val, Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let start_val = if args.len() == 2 {
+        let start_val = eval_typed_expr(&args[1], row, qctx)?;
+        if matches!(start_val, Value::Null) {
+            return Ok(Value::Null);
+        }
+        Some(start_val)
+    } else {
+        None
+    };
+
+    let age_args = match &start_val {
+        Some(start_val) => vec![end_val.clone(), start_val.clone()],
+        None => vec![end_val.clone()],
+    };
+    if let Some(interval) = crate::sql::expr::functions::datetime::age_infinite_interval(&age_args)?
+    {
+        return Ok(Value::Interval(interval));
+    }
+
+    let end_ts = value_to_naive_datetime_with_context(&end_val, &args[0].data_type, qctx)?;
+    let start_ts = match start_val {
+        Some(start_val) => {
+            value_to_naive_datetime_with_context(&start_val, &args[1].data_type, qctx)?
+        }
+        None => local_naive_datetime_from_timestamptz_millis(qctx.transaction_timestamp_ms, qctx)?,
+    };
+
+    Ok(Value::Interval(
+        crate::sql::expr::functions::datetime::age_interval(end_ts, start_ts)?,
+    ))
+}
+
+pub(super) fn eval_date_part_with_timestamptz(
+    field_expr: &TypedExpr,
+    source_expr: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+    return_numeric: bool,
+) -> Result<Value> {
+    let field = match eval_typed_expr(field_expr, row, qctx)? {
+        Value::Text(s) => s.trim().to_owned(),
+        Value::Null => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let source = eval_typed_expr(source_expr, row, qctx)?;
+    if matches!(source, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if matches!(source, Value::Timestamp(ts) if ts == i64::MAX || ts == i64::MIN) {
+        return crate::sql::expr::functions::datetime::eval_date_part_common(
+            vec![Value::Text(field), source],
+            return_numeric,
+        );
+    }
+
+    let local_dt = value_to_naive_datetime_with_context(&source, &source_expr.data_type, qctx)?;
+    let ts = if field.eq_ignore_ascii_case("epoch") {
+        local_naive_datetime_to_timestamptz_millis(local_dt, qctx)?
+    } else {
+        local_dt.and_utc().timestamp_millis()
+    };
+
+    crate::sql::expr::functions::datetime::eval_date_part_common(
+        vec![Value::Text(field), Value::Timestamp(ts)],
+        return_numeric,
+    )
+}
+
+pub(super) fn eval_date_trunc_with_timestamptz(
+    field_expr: &TypedExpr,
+    source_expr: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<Value> {
+    let field = match eval_typed_expr(field_expr, row, qctx)? {
+        Value::Text(s) => s.trim().to_owned(),
+        Value::Null => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let source = eval_typed_expr(source_expr, row, qctx)?;
+    if matches!(source, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if matches!(source, Value::Timestamp(ts) if ts == i64::MAX || ts == i64::MIN) {
+        return crate::sql::expr::functions::datetime::eval_date_trunc(vec![
+            Value::Text(field),
+            source,
+        ]);
+    }
+
+    let local_dt = value_to_naive_datetime_with_context(&source, &source_expr.data_type, qctx)?;
+    let local_ts = local_dt.and_utc().timestamp_millis();
+    let truncated = crate::sql::expr::functions::datetime::eval_date_trunc(vec![
+        Value::Text(field),
+        Value::Timestamp(local_ts),
+    ])?;
+    let Value::Timestamp(truncated_local_ts) = truncated else {
+        return Ok(truncated);
+    };
+    let truncated_local_dt = chrono::DateTime::from_timestamp_millis(truncated_local_ts)
+        .ok_or_else(|| anyhow!("invalid timestamp"))?
+        .naive_utc();
+    Ok(Value::Timestamp(
+        local_naive_datetime_to_timestamptz_millis(truncated_local_dt, qctx)?,
+    ))
+}
+
+pub(super) fn eval_to_char_with_typed_args(
+    value_expr: &TypedExpr,
+    pattern_expr: &TypedExpr,
+    row: &Row,
+    qctx: &QueryContext,
+) -> Result<Value> {
+    let value = eval_typed_expr(value_expr, row, qctx)?;
+    let pattern = match eval_typed_expr(pattern_expr, row, qctx)? {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        other => return Err(anyhow!("TO_CHAR format must be text, got {:?}", other)),
+    };
+
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    match format_to_char_value(
+        &value,
+        Some(&value_expr.data_type),
+        Some(qctx.timezone.as_ref()),
+        &pattern,
+    )? {
+        Some(text) => Ok(Value::Text(text)),
+        None => Ok(Value::Null),
+    }
+}
+
 fn split_qualified_function_name(name: &str) -> (Option<&str>, &str) {
     match name.rsplit_once('.') {
         Some((schema, func)) => (Some(schema), func),
@@ -459,6 +1088,31 @@ fn normalize_search_path_entries(mut entries: Vec<String>) -> Result<Vec<String>
         entries.push("public".to_string());
     }
     Ok(entries)
+}
+
+pub(super) fn effective_timezone(qctx: &QueryContext) -> Arc<str> {
+    qctx.timezone.clone()
+}
+
+fn session_local_timestamp_millis(ts_millis: i64, qctx: &QueryContext) -> Result<i64> {
+    let timezone = effective_timezone(qctx);
+    let tz = crate::model::timestamp::TimeZoneSpec::try_parse(timezone.as_ref())?;
+    let utc = chrono::DateTime::from_timestamp_millis(ts_millis)
+        .ok_or_else(|| anyhow!("invalid timestamp"))?;
+    let offset_ms = match tz {
+        crate::model::timestamp::TimeZoneSpec::Fixed(offset) => {
+            i64::from(offset.local_minus_utc()) * 1000
+        }
+        crate::model::timestamp::TimeZoneSpec::Named(tz) => {
+            i64::from(utc.with_timezone(&tz).offset().fix().local_minus_utc()) * 1000
+        }
+    };
+    Ok(ts_millis + offset_ms)
+}
+
+fn current_time_micros(ts_millis: i64, qctx: &QueryContext) -> Result<i64> {
+    let local_ts = session_local_timestamp_millis(ts_millis, qctx)?;
+    Ok(local_ts.rem_euclid(24 * 60 * 60 * 1000) * 1000)
 }
 
 /// Evaluate TIMEZONE(zone, timestamp) with type-aware direction.

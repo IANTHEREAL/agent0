@@ -705,9 +705,17 @@ impl Executor {
                     &rn.name,
                     &rn.original,
                 )?;
-                // PostgreSQL errors on unknown parameters (SQLSTATE 42704).
-                // Dotted names (custom GUC namespaces like `db9.foo`) are exempt —
-                // PG silently accepts `RESET ns.key` even when the key is unknown.
+                if let Some(err) =
+                    crate::sql::session::settings::SessionSettings::rejected_public_guc_error(
+                        &rn.name,
+                    )
+                {
+                    return Err(err.into());
+                }
+                // PostgreSQL errors on unknown bare parameters (SQLSTATE 42704).
+                // Unknown dotted names (custom GUC namespaces like `db9.foo`) are
+                // still exempt, but explicitly rejected stale public names are
+                // handled by the guard above.
                 if !rn.name.contains('.') && session.show_setting_value(&rn.name).is_none() {
                     // Use original token text (case-preserved) for the error
                     // message, stripping surrounding SQL double-quotes so the
@@ -1006,6 +1014,26 @@ mod tests {
             "expected unrecognized parameter error, got: {msg}"
         );
         // Verify SQLSTATE is 42704
+        let sql_err = err
+            .downcast_ref::<crate::sql::error::SqlError>()
+            .expect("must be SqlError");
+        assert_eq!(sql_err.sqlstate(), "42704");
+    }
+
+    #[test]
+    fn execute_reset_rejected_public_agg_pushdown_guc_errors() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err =
+            Executor::execute_reset(&mut session, "RESET db9.enable_cop_agg_pushdown").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognized configuration parameter \"db9.enable_cop_agg_pushdown\""),
+            "expected rejected public GUC error, got: {msg}"
+        );
+        assert!(
+            msg.contains("db9.enable_cop_pushdown"),
+            "expected one-switch hint, got: {msg}"
+        );
         let sql_err = err
             .downcast_ref::<crate::sql::error::SqlError>()
             .expect("must be SqlError");

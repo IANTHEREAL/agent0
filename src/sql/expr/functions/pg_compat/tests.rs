@@ -44,6 +44,10 @@ fn test_quote_literal() {
         quote_literal(vec![Value::Text("it's".into())]).unwrap(),
         Value::Text("'it''s'".into())
     );
+    assert_eq!(
+        quote_literal(vec![Value::Text("a\\b".into())]).unwrap(),
+        Value::Text(r"E'a\\b'".into())
+    );
 }
 
 #[test]
@@ -55,6 +59,10 @@ fn test_quote_nullable() {
     assert_eq!(
         quote_nullable(vec![Value::Text("hello".into())]).unwrap(),
         Value::Text("'hello'".into())
+    );
+    assert_eq!(
+        quote_nullable(vec![Value::Text("a\\b".into())]).unwrap(),
+        Value::Text(r"E'a\\b'".into())
     );
 }
 

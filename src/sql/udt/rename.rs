@@ -331,16 +331,14 @@ fn rewrite_query_type_casts(
             | AstExpr::TryCast { data_type, .. }
             | AstExpr::SafeCast { data_type, .. }
             | AstExpr::TypedString { data_type, .. } => {
-                if rewrite_type_in_datatype(
+                changed |= rewrite_type_in_datatype(
                     data_type,
                     &old_schema,
                     &old_name,
                     &new_schema,
                     &new_name,
                     allow_unqualified_type_match,
-                ) {
-                    changed = true;
-                }
+                );
             }
             _ => {}
         }
@@ -374,16 +372,14 @@ pub(super) fn rewrite_expr_type_casts(
             | AstExpr::TryCast { data_type, .. }
             | AstExpr::SafeCast { data_type, .. }
             | AstExpr::TypedString { data_type, .. } => {
-                if rewrite_type_in_datatype(
+                changed |= rewrite_type_in_datatype(
                     data_type,
                     &old_schema,
                     &old_name,
                     &new_schema,
                     &new_name,
                     allow_unqualified_type_match,
-                ) {
-                    changed = true;
-                }
+                );
             }
             _ => {}
         }

@@ -1,0 +1,6 @@
+round_float8_ties_projection_folds|1
+round_float8_ties_parity|0
+round_float8_tie_value|1|2
+round_float8_tie_value|2|4
+round_float8_tie_value|3|-2
+round_float8_tie_value|4|-4

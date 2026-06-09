@@ -10,7 +10,7 @@ use crate::sql::expr::operators::eval_binary_op;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::BinaryOperator;
 
-use super::eval_typed_expr;
+use super::{boolean_fold_short_circuit_value, eval_typed_expr};
 use crate::sql::query_context::QueryContext;
 
 /// Evaluate a binary operation with short-circuit for AND/OR.
@@ -24,6 +24,9 @@ pub(super) fn eval_binary(
     // Short-circuit AND/OR (critical for correctness and performance)
     match op {
         BinaryOp::And => {
+            if let Some(value) = boolean_fold_short_circuit_value(op, left, right, row, qctx)? {
+                return Ok(value);
+            }
             let lv = eval_typed_expr(left, row, qctx)?;
             match &lv {
                 Value::Boolean(false) => return Ok(Value::Boolean(false)),
@@ -35,6 +38,9 @@ pub(super) fn eval_binary(
             }
         }
         BinaryOp::Or => {
+            if let Some(value) = boolean_fold_short_circuit_value(op, left, right, row, qctx)? {
+                return Ok(value);
+            }
             let lv = eval_typed_expr(left, row, qctx)?;
             match &lv {
                 Value::Boolean(true) => return Ok(Value::Boolean(true)),
@@ -271,10 +277,10 @@ pub(super) fn eval_bitwise_op(
 
 /// Evaluate a shift operation (<< or >>).
 ///
-/// Validates the shift amount to prevent panics or masking semantics.
+/// PostgreSQL-compatible shift semantics for the typed evaluator.
 ///
-/// PostgreSQL treats shift counts as bounded by the underlying integer width
-/// (int4: 0..31, int8: 0..63). Out-of-range shift counts should error.
+/// PostgreSQL applies C-level wrapping shift semantics for signed integer
+/// counts, so negative and oversized counts are reduced by the integer width.
 pub(super) fn eval_shift_op(
     left: Value,
     right: Value,
@@ -294,32 +300,20 @@ pub(super) fn eval_shift_op(
 
     match left {
         Value::Int32(l) => {
-            if !(0..32).contains(&shift) {
-                return Err(SqlError::NumericValueOutOfRange {
-                    message: format!("shift count {} out of range for integer", shift),
-                }
-                .into());
-            }
             let s = shift as u32;
             let result = if is_left {
-                l.checked_shl(s).unwrap()
+                l.wrapping_shl(s)
             } else {
-                l.checked_shr(s).unwrap()
+                l.wrapping_shr(s)
             };
             Ok(Value::Int32(result))
         }
         Value::Int64(l) => {
-            if !(0..64).contains(&shift) {
-                return Err(SqlError::NumericValueOutOfRange {
-                    message: format!("shift count {} out of range for bigint", shift),
-                }
-                .into());
-            }
             let s = shift as u32;
             let result = if is_left {
-                l.checked_shl(s).unwrap()
+                l.wrapping_shl(s)
             } else {
-                l.checked_shr(s).unwrap()
+                l.wrapping_shr(s)
             };
             Ok(Value::Int64(result))
         }

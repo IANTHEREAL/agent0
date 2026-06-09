@@ -97,6 +97,12 @@ impl<'a> Analyzer<'a> {
         {
             let resolve_type = if typed_op == BinaryOp::Concat && l.data_type != DataType::Jsonb {
                 DataType::Text
+            } else if matches!(typed_op, BinaryOp::ShiftLeft | BinaryOp::ShiftRight)
+                && matches!(l.data_type, DataType::Int32 | DataType::Int64)
+            {
+                // PostgreSQL exposes int4 << int4 -> int4 and int8 << int4 -> int8.
+                // The shift count is int4 even for bigint left operands.
+                DataType::Int32
             } else if typed_op == BinaryOp::Sub && l.data_type == DataType::Jsonb {
                 // jsonb - text (delete key), jsonb - int (delete by index)
                 // Unknown string literals should resolve to Text, not Jsonb.
@@ -139,12 +145,16 @@ impl<'a> Analyzer<'a> {
         if let TypedExprKind::Parameter { index } = &r.kind {
             if !l.is_null_constant() && !matches!(&l.kind, TypedExprKind::Parameter { .. }) {
                 let was_unresolved = self.is_unresolved_param(&r);
-                self.resolve_param_type(*index, &l.data_type)?;
+                let target_type = if matches!(typed_op, BinaryOp::ShiftLeft | BinaryOp::ShiftRight)
+                    && matches!(l.data_type, DataType::Int32 | DataType::Int64)
+                {
+                    DataType::Int32
+                } else {
+                    l.data_type.clone()
+                };
+                self.resolve_param_type(*index, &target_type)?;
                 if was_unresolved {
-                    r = TypedExpr::new(
-                        TypedExprKind::Parameter { index: *index },
-                        l.data_type.clone(),
-                    );
+                    r = TypedExpr::new(TypedExprKind::Parameter { index: *index }, target_type);
                 }
             }
         }
@@ -232,11 +242,16 @@ impl<'a> Analyzer<'a> {
             .or_else(|| {
                 // Bitwise operators return the common numeric type
                 match &typed_op {
-                    BinaryOp::BitwiseAnd
-                    | BinaryOp::BitwiseOr
-                    | BinaryOp::BitwiseXor
-                    | BinaryOp::ShiftLeft
-                    | BinaryOp::ShiftRight => common_type(&l.data_type, &r.data_type),
+                    BinaryOp::BitwiseAnd | BinaryOp::BitwiseOr | BinaryOp::BitwiseXor => {
+                        common_type(&l.data_type, &r.data_type)
+                    }
+                    BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
+                        match (&l.data_type, &r.data_type) {
+                            (DataType::Int32, DataType::Int32) => Some(DataType::Int32),
+                            (DataType::Int64, DataType::Int32) => Some(DataType::Int64),
+                            _ => None,
+                        }
+                    }
                     BinaryOp::Custom(_) => common_type(&l.data_type, &r.data_type),
                     _ => None,
                 }
@@ -273,6 +288,7 @@ impl<'a> Analyzer<'a> {
                 {
                     None
                 }
+                BinaryOp::ShiftLeft | BinaryOp::ShiftRight => None,
                 _ => common_type(&l.data_type, &r.data_type),
             };
 
@@ -356,6 +372,7 @@ impl<'a> Analyzer<'a> {
             SqlOp::BitwiseAnd => BinaryOp::BitwiseAnd,
             SqlOp::BitwiseOr => BinaryOp::BitwiseOr,
             SqlOp::BitwiseXor => BinaryOp::BitwiseXor,
+            SqlOp::PGBitwiseXor => BinaryOp::BitwiseXor,
             SqlOp::PGBitwiseShiftLeft => BinaryOp::ShiftLeft,
             SqlOp::PGBitwiseShiftRight => BinaryOp::ShiftRight,
             SqlOp::PGRegexMatch => BinaryOp::RegexMatch,
@@ -520,11 +537,14 @@ impl<'a> Analyzer<'a> {
         &mut self,
         expr: &Expr,
         pattern: &Expr,
-        escape: &Option<char>,
+        escape: &Option<String>,
         case_insensitive: bool,
         negated: bool,
     ) -> Result<TypedExpr, AnalyzerError> {
         let mut e = self.analyze_expr(expr)?;
+        if self.is_semantically_unknown(&e) {
+            e = self.coerce_if_needed(e, &DataType::Text)?;
+        }
         if let TypedExprKind::Parameter { index } = &e.kind {
             let was_unresolved = self.is_unresolved_param(&e);
             self.resolve_param_type(*index, &DataType::Text)?;
@@ -534,6 +554,9 @@ impl<'a> Analyzer<'a> {
         }
 
         let mut p = self.analyze_expr(pattern)?;
+        if self.is_semantically_unknown(&p) {
+            p = self.coerce_if_needed(p, &DataType::Text)?;
+        }
         if let TypedExprKind::Parameter { index } = &p.kind {
             let was_unresolved = self.is_unresolved_param(&p);
             self.resolve_param_type(*index, &DataType::Text)?;
@@ -541,9 +564,9 @@ impl<'a> Analyzer<'a> {
                 p = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
             }
         }
-        let esc = escape.map(|c| {
+        let esc = escape.as_ref().map(|escape| {
             Box::new(TypedExpr::new(
-                TypedExprKind::Constant(Value::Text(c.to_string())),
+                TypedExprKind::Constant(Value::Text(escape.clone())),
                 DataType::Text,
             ))
         });

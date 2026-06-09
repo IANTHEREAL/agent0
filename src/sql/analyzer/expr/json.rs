@@ -184,31 +184,33 @@ impl<'a> Analyzer<'a> {
             | ast::JsonOperator::HashArrow
             | ast::JsonOperator::HashLongArrow
             | ast::JsonOperator::HashMinus => {
-                // Validate left operand is JSON/JSONB (PG compat)
-                match &l.data_type {
-                    DataType::Json | DataType::Jsonb => {}
-                    other => {
-                        let op_str = match operator {
-                            ast::JsonOperator::Arrow => "->",
-                            ast::JsonOperator::LongArrow => "->>",
-                            ast::JsonOperator::HashArrow => "#>",
-                            ast::JsonOperator::HashLongArrow => "#>>",
-                            ast::JsonOperator::HashMinus => "#-",
-                            _ => "json_op",
-                        };
-                        // PG reports bare string literals as type "unknown".
-                        let right_type =
-                            if matches!(&r.kind, TypedExprKind::Constant(Value::Text(_))) {
-                                "unknown".to_string()
-                            } else {
-                                r.data_type.pg_display_name()
-                            };
-                        return Err(AnalyzerError::OperatorTypeMismatch {
-                            operator: op_str.to_string(),
-                            left: other.pg_display_name(),
-                            right: right_type,
-                        });
-                    }
+                // Validate left operand. PostgreSQL defines `#-` for jsonb,
+                // while the read-only accessors support both json and jsonb.
+                let left_supported = match operator {
+                    ast::JsonOperator::HashMinus => matches!(&l.data_type, DataType::Jsonb),
+                    _ => matches!(&l.data_type, DataType::Json | DataType::Jsonb),
+                };
+                if !left_supported {
+                    let other = &l.data_type;
+                    let op_str = match operator {
+                        ast::JsonOperator::Arrow => "->",
+                        ast::JsonOperator::LongArrow => "->>",
+                        ast::JsonOperator::HashArrow => "#>",
+                        ast::JsonOperator::HashLongArrow => "#>>",
+                        ast::JsonOperator::HashMinus => "#-",
+                        _ => "json_op",
+                    };
+                    // PG reports bare string literals as type "unknown".
+                    let right_type = if matches!(&r.kind, TypedExprKind::Constant(Value::Text(_))) {
+                        "unknown".to_string()
+                    } else {
+                        r.data_type.pg_display_name()
+                    };
+                    return Err(AnalyzerError::OperatorTypeMismatch {
+                        operator: op_str.to_string(),
+                        left: other.pg_display_name(),
+                        right: right_type,
+                    });
                 }
                 let json_op = match operator {
                     ast::JsonOperator::Arrow => JsonAccessOp::Arrow,
@@ -219,9 +221,8 @@ impl<'a> Analyzer<'a> {
                     _ => unreachable!(),
                 };
                 let dt = match json_op {
-                    JsonAccessOp::Arrow | JsonAccessOp::HashArrow | JsonAccessOp::HashMinus => {
-                        DataType::Jsonb
-                    }
+                    JsonAccessOp::Arrow | JsonAccessOp::HashArrow => l.data_type.clone(),
+                    JsonAccessOp::HashMinus => DataType::Jsonb,
                     JsonAccessOp::LongArrow | JsonAccessOp::HashLongArrow => DataType::Text,
                 };
                 Ok(TypedExpr::new(

@@ -1770,6 +1770,32 @@ mod tests {
         assert!(settings.enable_cop_pushdown());
     }
 
+    #[test]
+    fn db9_enable_cop_agg_pushdown_is_rejected_as_public_guc() {
+        let mut settings = SessionSettings::new_with_defaults(0, 0);
+        let err = settings
+            .set_known_setting("db9.enable_cop_agg_pushdown", "on".to_string())
+            .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("unrecognized configuration parameter \"db9.enable_cop_agg_pushdown\""),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("db9.enable_cop_pushdown"),
+            "expected one-switch hint, got: {}",
+            msg
+        );
+        assert_eq!(
+            settings
+                .show_value("db9.enable_cop_agg_pushdown")
+                .as_deref(),
+            None
+        );
+    }
+
     // ── statement_timeout hard cap tests ────────────────────────────────
 
     #[test]

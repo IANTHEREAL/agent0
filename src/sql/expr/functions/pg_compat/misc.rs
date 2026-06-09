@@ -245,15 +245,124 @@ pub fn pg_partition_ancestors(_args: Vec<Value>) -> Result<Value> {
     Ok(Value::Null)
 }
 
+fn pg_hash_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(4);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(6);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(8);
+    *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(16);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(19);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(4);
+    *b = b.wrapping_add(*a);
+}
+
+fn pg_hash_final(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(14));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(11));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(25));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(16));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(4));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(14));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(24));
+}
+
+fn pg_hash_bytes(bytes: &[u8]) -> u32 {
+    let len = bytes.len() as u32;
+    let mut a = 0x9e37_79b9_u32.wrapping_add(len).wrapping_add(3_923_095);
+    let mut b = a;
+    let mut c = a;
+    let mut offset = 0usize;
+    let mut remaining = bytes.len();
+
+    while remaining >= 12 {
+        a = a.wrapping_add(u32::from_le_bytes(
+            bytes[offset..offset + 4].try_into().unwrap(),
+        ));
+        b = b.wrapping_add(u32::from_le_bytes(
+            bytes[offset + 4..offset + 8].try_into().unwrap(),
+        ));
+        c = c.wrapping_add(u32::from_le_bytes(
+            bytes[offset + 8..offset + 12].try_into().unwrap(),
+        ));
+        pg_hash_mix(&mut a, &mut b, &mut c);
+        offset += 12;
+        remaining -= 12;
+    }
+
+    let tail = &bytes[offset..];
+    if remaining == 11 {
+        c = c.wrapping_add((tail[10] as u32) << 24);
+    }
+    if remaining >= 10 {
+        c = c.wrapping_add((tail[9] as u32) << 16);
+    }
+    if remaining >= 9 {
+        c = c.wrapping_add((tail[8] as u32) << 8);
+    }
+    if remaining >= 8 {
+        b = b.wrapping_add((tail[7] as u32) << 24);
+    }
+    if remaining >= 7 {
+        b = b.wrapping_add((tail[6] as u32) << 16);
+    }
+    if remaining >= 6 {
+        b = b.wrapping_add((tail[5] as u32) << 8);
+    }
+    if remaining >= 5 {
+        b = b.wrapping_add(tail[4] as u32);
+    }
+    if remaining >= 4 {
+        a = a.wrapping_add((tail[3] as u32) << 24);
+    }
+    if remaining >= 3 {
+        a = a.wrapping_add((tail[2] as u32) << 16);
+    }
+    if remaining >= 2 {
+        a = a.wrapping_add((tail[1] as u32) << 8);
+    }
+    if remaining >= 1 {
+        a = a.wrapping_add(tail[0] as u32);
+    }
+
+    pg_hash_final(&mut a, &mut b, &mut c);
+    c
+}
+
 pub fn hashtext(args: Vec<Value>) -> Result<Value> {
     let text = match args.into_iter().next() {
         Some(Value::Text(s)) => s,
         Some(Value::Null) | None => return Ok(Value::Null),
         Some(v) => v.to_string(),
     };
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    let h = hasher.finish();
-    Ok(Value::Int32(h as i32))
+    Ok(Value::Int32(pg_hash_bytes(text.as_bytes()) as i32))
+}
+
+#[cfg(test)]
+mod hashtext_tests {
+    use super::*;
+
+    #[test]
+    fn hashtext_matches_pg_for_hello() {
+        assert_eq!(
+            hashtext(vec![Value::Text("hello".to_string())]).unwrap(),
+            Value::Int32(-1_870_292_951)
+        );
+    }
 }

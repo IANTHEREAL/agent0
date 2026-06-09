@@ -241,6 +241,17 @@ impl DataRowEncoder {
         self.encode_field_with_type_and_format(value, &data_type, format)
     }
 
+    /// Encode a pre-serialized field payload.
+    ///
+    /// The caller is responsible for producing bytes that match the column's
+    /// declared PostgreSQL type and format.
+    pub fn encode_raw_field(&mut self, value: &[u8]) -> PgWireResult<()> {
+        self.row_buffer.put_i32(value.len() as i32);
+        self.row_buffer.put_slice(value);
+        self.col_index += 1;
+        Ok(())
+    }
+
     pub fn finish(self) -> PgWireResult<DataRow> {
         Ok(DataRow::new(self.row_buffer, self.col_index as i16))
     }

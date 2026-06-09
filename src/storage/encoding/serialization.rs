@@ -316,8 +316,152 @@ fn split_relation_name(full_name: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{default_owner, ColumnDef, DataType, IndexDef};
+    use crate::model::{CheckConstraint, ColumnDef, DataType, ForeignKeyConstraint, IndexDef};
     use crate::worker::types::IndexState;
+
+    #[derive(serde::Serialize)]
+    struct TableSchemaWithFutureField<'a> {
+        name: &'a str,
+        table_id: u64,
+        columns: &'a [ColumnDef],
+        version: u64,
+        pk_constraint_name: &'a Option<String>,
+        pk_indices: &'a [usize],
+        indexes: &'a [IndexDef],
+        check_constraints: &'a [CheckConstraint],
+        foreign_keys: &'a [ForeignKeyConstraint],
+        owner: &'a str,
+        rls_enabled: bool,
+        rls_force: bool,
+        future_field: &'static str,
+    }
+
+    impl<'a> From<&'a TableSchema> for TableSchemaWithFutureField<'a> {
+        fn from(schema: &'a TableSchema) -> Self {
+            Self {
+                name: &schema.name,
+                table_id: schema.table_id,
+                columns: &schema.columns,
+                version: schema.version,
+                pk_constraint_name: &schema.pk_constraint_name,
+                pk_indices: &schema.pk_indices,
+                indexes: &schema.indexes,
+                check_constraints: &schema.check_constraints,
+                foreign_keys: &schema.foreign_keys,
+                owner: &schema.owner,
+                rls_enabled: schema.rls_enabled,
+                rls_force: schema.rls_force,
+                future_field: "hello",
+            }
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct TableSchemaWithoutCheckConstraints<'a> {
+        name: &'a str,
+        table_id: u64,
+        columns: &'a [ColumnDef],
+        version: u64,
+        pk_constraint_name: &'a Option<String>,
+        pk_indices: &'a [usize],
+        indexes: &'a [IndexDef],
+        foreign_keys: &'a [ForeignKeyConstraint],
+        owner: &'a str,
+        rls_enabled: bool,
+        rls_force: bool,
+    }
+
+    impl<'a> From<&'a TableSchema> for TableSchemaWithoutCheckConstraints<'a> {
+        fn from(schema: &'a TableSchema) -> Self {
+            Self {
+                name: &schema.name,
+                table_id: schema.table_id,
+                columns: &schema.columns,
+                version: schema.version,
+                pk_constraint_name: &schema.pk_constraint_name,
+                pk_indices: &schema.pk_indices,
+                indexes: &schema.indexes,
+                foreign_keys: &schema.foreign_keys,
+                owner: &schema.owner,
+                rls_enabled: schema.rls_enabled,
+                rls_force: schema.rls_force,
+            }
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct IndexDefWithoutConstraintFlag<'a> {
+        name: &'a str,
+        id: u64,
+        columns: &'a [String],
+        unique: bool,
+        method: &'a Option<String>,
+        predicate: &'a Option<String>,
+        expressions: &'a [String],
+        state: IndexState,
+        hnsw_m: Option<u16>,
+        hnsw_ef_construction: Option<u16>,
+        hnsw_distance_metric: &'a Option<String>,
+    }
+
+    impl<'a> From<&'a IndexDef> for IndexDefWithoutConstraintFlag<'a> {
+        fn from(index: &'a IndexDef) -> Self {
+            Self {
+                name: &index.name,
+                id: index.id,
+                columns: &index.columns,
+                unique: index.unique,
+                method: &index.method,
+                predicate: &index.predicate,
+                expressions: &index.expressions,
+                state: index.state,
+                hnsw_m: index.hnsw_m,
+                hnsw_ef_construction: index.hnsw_ef_construction,
+                hnsw_distance_metric: &index.hnsw_distance_metric,
+            }
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct TableSchemaWithLegacyIndexes<'a> {
+        name: &'a str,
+        table_id: u64,
+        columns: &'a [ColumnDef],
+        version: u64,
+        pk_constraint_name: &'a Option<String>,
+        pk_indices: &'a [usize],
+        indexes: Vec<IndexDefWithoutConstraintFlag<'a>>,
+        check_constraints: &'a [CheckConstraint],
+        foreign_keys: &'a [ForeignKeyConstraint],
+        owner: &'a str,
+        rls_enabled: bool,
+        rls_force: bool,
+    }
+
+    impl<'a> From<&'a TableSchema> for TableSchemaWithLegacyIndexes<'a> {
+        fn from(schema: &'a TableSchema) -> Self {
+            Self {
+                name: &schema.name,
+                table_id: schema.table_id,
+                columns: &schema.columns,
+                version: schema.version,
+                pk_constraint_name: &schema.pk_constraint_name,
+                pk_indices: &schema.pk_indices,
+                indexes: schema.indexes.iter().map(Into::into).collect(),
+                check_constraints: &schema.check_constraints,
+                foreign_keys: &schema.foreign_keys,
+                owner: &schema.owner,
+                rls_enabled: schema.rls_enabled,
+                rls_force: schema.rls_force,
+            }
+        }
+    }
+
+    fn schema_v2_bytes(payload: Vec<u8>) -> Vec<u8> {
+        let mut data = Vec::from(SCHEMA_MAGIC_V2);
+        data.extend_from_slice(&payload);
+        data
+    }
 
     fn sample_schema() -> TableSchema {
         let mut schema = TableSchema::new(
@@ -380,16 +524,8 @@ mod tests {
     fn v2_tolerates_unknown_fields() {
         // Simulate a future binary that added a field — msgpack named-map ignores unknowns.
         let schema = sample_schema();
-        let json = serde_json::to_value(&schema).unwrap();
-        let mut map: serde_json::Map<String, serde_json::Value> = json.as_object().unwrap().clone();
-        map.insert(
-            "future_field".into(),
-            serde_json::Value::String("hello".into()),
-        );
-        // Re-encode via msgpack named map
-        let payload = rmp_serde::to_vec_named(&map).unwrap();
-        let mut data = Vec::from(SCHEMA_MAGIC_V2);
-        data.extend_from_slice(&payload);
+        let payload = rmp_serde::to_vec_named(&TableSchemaWithFutureField::from(&schema)).unwrap();
+        let data = schema_v2_bytes(payload);
         let decoded = deserialize_schema(&data).unwrap();
         assert_eq!(decoded.name, "public.users");
     }
@@ -397,12 +533,9 @@ mod tests {
     #[test]
     fn v2_tolerates_missing_default_fields() {
         let schema = sample_schema();
-        let json = serde_json::to_value(&schema).unwrap();
-        let mut map: serde_json::Map<String, serde_json::Value> = json.as_object().unwrap().clone();
-        map.remove("check_constraints");
-        let payload = rmp_serde::to_vec_named(&map).unwrap();
-        let mut data = Vec::from(SCHEMA_MAGIC_V2);
-        data.extend_from_slice(&payload);
+        let payload =
+            rmp_serde::to_vec_named(&TableSchemaWithoutCheckConstraints::from(&schema)).unwrap();
+        let data = schema_v2_bytes(payload);
         let decoded = deserialize_schema(&data).unwrap();
         assert!(decoded.check_constraints.is_empty());
     }
@@ -620,20 +753,9 @@ mod tests {
             s
         };
 
-        let mut json = serde_json::to_value(&schema).unwrap();
-        let indexes = json
-            .as_object_mut()
-            .unwrap()
-            .get_mut("indexes")
-            .and_then(serde_json::Value::as_array_mut)
-            .unwrap();
-        for index in indexes {
-            index.as_object_mut().unwrap().remove("is_constraint");
-        }
-
-        let payload = rmp_serde::to_vec_named(json.as_object().unwrap()).unwrap();
-        let mut data = Vec::from(SCHEMA_MAGIC_V2);
-        data.extend_from_slice(&payload);
+        let payload =
+            rmp_serde::to_vec_named(&TableSchemaWithLegacyIndexes::from(&schema)).unwrap();
+        let data = schema_v2_bytes(payload);
 
         let decoded = deserialize_schema(&data).unwrap();
         let plain = decoded
@@ -658,11 +780,15 @@ mod tests {
 
     #[test]
     fn schema_deser_cache_prevents_reparse() {
-        let data = serialize_schema(&sample_schema()).unwrap();
+        let mut schema = sample_schema();
+        // Avoid colliding with other tests that use the default sample schema
+        // bytes while this test temporarily mutates the cache entry.
+        schema.name = "public.schema_cache_test_users".to_owned();
+        let data = serialize_schema(&schema).unwrap();
 
         // First call: cache miss → full parse + hydrate + insert.
         let first = deserialize_schema(&data).unwrap();
-        assert_eq!(first.name, "public.users");
+        assert_eq!(first.name, schema.name);
         assert!(
             SCHEMA_DESER_CACHE.get(data.as_slice()).is_some(),
             "entry must be cached after first deserialize"

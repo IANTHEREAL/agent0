@@ -103,6 +103,16 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     "XX000"
 }
 
+pub(super) fn pg_error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    let sql_err = err.downcast_ref::<SqlError>()?;
+    match sql_err {
+        SqlError::InvalidEscapeString { message } if message == "invalid escape string" => {
+            Some("Escape string must be empty or one character.")
+        }
+        _ => None,
+    }
+}
+
 /// Produce a PostgreSQL-compatible error message for executor errors.
 ///
 /// TiKV transaction errors are replaced with standard PostgreSQL messages
@@ -126,6 +136,19 @@ pub(super) fn pg_error_message(err: &anyhow::Error, sqlstate: &str) -> String {
         "40P01" => "deadlock detected".to_string(),
         _ => err.to_string(),
     }
+}
+
+pub(super) fn executor_error_info(err: &anyhow::Error) -> ErrorInfo {
+    let sqlstate = sqlstate_for_executor_error(err);
+    let mut error_info = ErrorInfo::new(
+        "ERROR".to_string(),
+        sqlstate.to_string(),
+        pg_error_message(err, sqlstate),
+    );
+    if let Some(hint) = pg_error_hint(err) {
+        error_info.hint = Some(hint.to_string());
+    }
+    error_info
 }
 
 fn find_unqualified_identifier_position(query: &str, ident: &str) -> Option<usize> {
