@@ -135,7 +135,7 @@ async fn execute_schedule(
             existing_job.username = current_user.to_string();
             existing_job.active = true;
             store.put_cron_job(txn, db_id, &existing_job).await?;
-            enqueue_cron_to_worker(keyspace, db_id, &existing_job).await?;
+            enqueue_cron_to_worker(keyspace, db_id, &existing_job, true).await?;
             return Ok(Value::Int64(existing_job.job_id));
         }
     }
@@ -154,7 +154,7 @@ async fn execute_schedule(
         max_runtime_ms: None,
     };
     store.put_cron_job(txn, db_id, &job).await?;
-    enqueue_cron_to_worker(keyspace, db_id, &job).await?;
+    enqueue_cron_to_worker(keyspace, db_id, &job, false).await?;
     Ok(Value::Int64(job_id))
 }
 
@@ -329,7 +329,7 @@ async fn execute_alter_job(
     }
 
     store.put_cron_job(txn, db_id, &job).await?;
-    enqueue_cron_to_worker(keyspace, db_id, &job).await?;
+    enqueue_cron_to_worker(keyspace, db_id, &job, true).await?;
     Ok(Value::Null)
 }
 
@@ -341,7 +341,12 @@ fn compute_cron_next_fire(schedule: &str) -> Result<i64> {
     Ok(next.timestamp_millis())
 }
 
-async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) -> Result<()> {
+async fn enqueue_cron_to_worker(
+    keyspace: &str,
+    db_id: u64,
+    job: &CronJob,
+    replace_existing: bool,
+) -> Result<()> {
     let system_store = get_system_store()
         .ok_or_else(|| anyhow!("worker subsystem is disabled; cannot enqueue cron job"))?;
 
@@ -360,11 +365,13 @@ async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) -> Re
 
     let result = async {
         let mut sys_txn = system_store.begin().await?;
-        // Replace any existing entry for this job via the V2 index (+ legacy
-        // during the migration window) — never a global due-queue scan.
-        system_store
-            .delete_task_all_layers(&mut sys_txn, keyspace, db_id, job.job_id, TaskType::Cron)
-            .await?;
+        if replace_existing {
+            // Existing cron jobs may have an old fire time in either V2 or the
+            // migration-window legacy queue, so replace must clean first.
+            system_store
+                .delete_task_all_layers(&mut sys_txn, keyspace, db_id, job.job_id, TaskType::Cron)
+                .await?;
+        }
         system_store
             .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_CRON, 0)
             .await?;
@@ -648,5 +655,18 @@ mod tests {
     fn cancel_dispatch_recognized() {
         assert!(try_execute_cron_scalar_function("cron.cancel", &[]).is_some());
         assert!(try_execute_cron_scalar_function("CRON.CANCEL", &[]).is_some());
+    }
+
+    #[test]
+    fn new_schedule_enqueue_does_not_delete_legacy_queue_layers() {
+        let source = include_str!("cron.rs");
+        assert!(
+            source.contains("enqueue_cron_to_worker(keyspace, db_id, &job, false).await?"),
+            "new cron jobs must skip delete_task_all_layers; a freshly allocated job_id has no existing worker entry"
+        );
+        assert!(
+            source.contains("enqueue_cron_to_worker(keyspace, db_id, &existing_job, true).await?"),
+            "schedule replacement must still clean existing worker entries"
+        );
     }
 }
