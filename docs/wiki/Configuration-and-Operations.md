@@ -110,7 +110,7 @@ Parsing rules: `--flag value` and `--flag=value` syntax supported. `--` stops pa
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DB9_TENANT_QPS_LIMIT` | `0` (disabled) | Per-tenant QPS rate limit |
-| `DB9_TENANT_MEMORY_QUOTA_BYTES` | `0` (unlimited) | Per-tenant aggregate memory quota |
+| `DB9_TENANT_MEMORY_QUOTA_BYTES` | `1073741824` (1 GiB; `0` disables — **no pod-OOM protection**, see #2555) | Per-tenant aggregate memory quota |
 
 #### Observability
 

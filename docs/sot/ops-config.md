@@ -96,7 +96,7 @@
 | `DB9_TCP_KEEPALIVE_IDLE_MS` | `60000` | `src/config.rs`, `src/main.rs` | TCP keepalive idle time for pgwire sockets; `0` disables keepalive. |
 | `DB9_MAX_CONNECTIONS` | `1000` | `src/config.rs`, `src/main.rs` | Enforced with a connection semaphore; excess connections receive SQLSTATE `53300`. |
 | `DB9_TENANT_QPS_LIMIT` | `0` (disabled) | `src/pool.rs` | Per-tenant QPS limiter. |
-| `DB9_TENANT_MEMORY_QUOTA_BYTES` | `1073741824` (1 GiB; `0` = unlimited) | `src/pool.rs` | Per-tenant aggregate statement memory quota, shared across all sessions/workers for the keyspace; enforced on the exact aggregate total. |
+| `DB9_TENANT_MEMORY_QUOTA_BYTES` | `1073741824` (1 GiB; `0` disables) | `src/pool.rs` | Per-tenant aggregate statement memory quota, shared across all sessions/workers for the keyspace; enforced on the exact aggregate total. **WARNING:** `0` disables the gate entirely, so no accounting precision can prevent a pod OOM (the #2555 operational root cause); production must set a non-zero quota (`pod_budget / max_concurrent_tenants`). `quota_bytes == 0` is logged once at startup. |
 | `DB9_OBS_EXPENSIVE_MEM_MB` | `1024` (1 GiB; `0` disables) | `src/observability.rs` | Peak per-statement memory (MB) that triggers the `expensive_query` log. Independent of `DB9_OBS_ENABLED`. |
 | `DB9_OBS_EXPENSIVE_SQL_LEN` | `4096` | `src/observability.rs` | SQL truncation length for the `expensive_query` log (separate from the slow-query `DB9_OBS_MAX_SQL_LEN`). |
 

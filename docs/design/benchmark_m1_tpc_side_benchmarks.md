@@ -340,7 +340,12 @@ Important local note:
 
 - on db9, prefer `DB9_TENANT_MEMORY_QUOTA_BYTES=0` and
   `DB9_STATEMENT_TIMEOUT_MS=0` during this local `TPC-C` compare, otherwise
-  `prepare` may fail on memory quota or statement timeout before the run begins
+  `prepare` may fail on memory quota or statement timeout before the run begins.
+  **This is local-benchmark-only.** `DB9_TENANT_MEMORY_QUOTA_BYTES=0` disables
+  the per-tenant memory gate entirely and removes all pod-OOM protection; it
+  must never be used in a shared/production deployment (it was the #2555
+  operational root cause). In production set an explicit non-zero quota
+  (`pod_budget / max_concurrent_tenants`).
 
 ### TPC-C Correctness Validation
 

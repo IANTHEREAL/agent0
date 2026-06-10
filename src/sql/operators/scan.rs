@@ -1,9 +1,13 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
+use super::charged_rows::{ChargedPkBuffer, ChargedRowBuffer};
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema, Value};
+use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
+use crate::sql::memory::estimate_values_payload_size;
 use crate::sql::projection::fill_row_defaults;
+use crate::storage::RowScanCursor;
 
 const OPERATOR_BATCH_FETCH_SIZE: usize = 256;
 
@@ -13,12 +17,30 @@ const OPERATOR_BATCH_FETCH_SIZE: usize = 256;
 /// row identifier, so index scans must decode PK entries as `DataType::Uuid`.
 pub(super) const IMPLICIT_PK_TYPE: crate::model::DataType = crate::model::DataType::Uuid;
 
+/// Where a `TableScanOperator` reads its rows from after `open()`.
+#[derive(Debug)]
+enum TableScanSource {
+    /// Streaming storage scan: at most one page buffered at a time.
+    Storage(RowScanCursor),
+    /// CTE rows are owned by `ctx.cte_tables` for the statement lifetime;
+    /// serve them per-row instead of cloning the whole vector.
+    Cte { name: String, position: usize },
+    /// Caller-provided rows (the operator owns the only copy); must survive
+    /// `close()`/re-`open()`, so rows are cloned out per call.
+    Preloaded,
+    /// Not opened yet (or closed).
+    Idle,
+}
+
 #[derive(Debug)]
 pub struct TableScanOperator {
     schema: TableSchema,
     scan_limit: Option<usize>,
-    buffer: Vec<Row>,
-    position: usize,
+    source: TableScanSource,
+    /// Current storage page, or the preloaded rows.
+    page: ChargedRowBuffer,
+    preloaded_rows: Vec<Row>,
+    preloaded_position: usize,
     opened: bool,
     preloaded: bool,
 }
@@ -26,22 +48,17 @@ pub struct TableScanOperator {
 impl TableScanOperator {
     #[cfg(test)]
     pub fn new(schema: TableSchema) -> Self {
-        Self {
-            schema,
-            scan_limit: None,
-            buffer: Vec::new(),
-            position: 0,
-            opened: false,
-            preloaded: false,
-        }
+        Self::new_with_scan_limit(schema, None)
     }
 
     pub fn new_with_scan_limit(schema: TableSchema, scan_limit: Option<usize>) -> Self {
         Self {
             schema,
             scan_limit,
-            buffer: Vec::new(),
-            position: 0,
+            source: TableScanSource::Idle,
+            page: ChargedRowBuffer::new(),
+            preloaded_rows: Vec::new(),
+            preloaded_position: 0,
             opened: false,
             preloaded: false,
         }
@@ -51,10 +68,35 @@ impl TableScanOperator {
         Self {
             schema,
             scan_limit: None,
-            buffer: rows,
-            position: 0,
+            source: TableScanSource::Idle,
+            page: ChargedRowBuffer::new(),
+            preloaded_rows: rows,
+            preloaded_position: 0,
             opened: false,
             preloaded: true,
+        }
+    }
+
+    /// Pull the next row from the streaming storage scan, fetching and
+    /// charging a new page when the current one is drained.
+    async fn next_storage_row(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+        loop {
+            if let Some(row) = self.page.take_next() {
+                return Ok(Some(fill_row_defaults_scan(row, &self.schema)?));
+            }
+            let TableScanSource::Storage(cursor) = &mut self.source else {
+                return Ok(None);
+            };
+            if cursor.exhausted() {
+                self.page.reset();
+                return Ok(None);
+            }
+            let rows = ctx.store.scan_cursor_next_page(ctx.txn, cursor).await?;
+            if rows.is_empty() {
+                self.page.reset();
+                return Ok(None);
+            }
+            self.page.adopt("operators.table_scan.page", rows)?;
         }
     }
 }
@@ -74,48 +116,72 @@ impl PhysicalOperator for TableScanOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.position = 0;
         self.opened = true;
+        self.preloaded_position = 0;
+        self.page.reset();
 
-        if !self.preloaded {
-            self.buffer.clear();
-            let table_name_lower = self.schema.name.to_lowercase();
-            if let Some((cte_schema, cte_rows)) = ctx.cte_tables.get(&table_name_lower) {
-                self.schema = cte_schema.clone();
-                self.buffer = cte_rows.clone();
-            } else {
-                let rows = ctx
-                    .store
-                    .scan(ctx.txn, ctx.db_id, &self.schema.name, self.scan_limit)
-                    .await?;
-                self.buffer = rows
-                    .into_iter()
-                    .map(|r| fill_row_defaults_scan(r, &self.schema))
-                    .collect::<Result<Vec<_>>>()?;
-            }
+        if self.preloaded {
+            self.source = TableScanSource::Preloaded;
+            return Ok(());
+        }
+
+        let table_name_lower = self.schema.name.to_lowercase();
+        if let Some((cte_schema, _)) = ctx.cte_tables.get(&table_name_lower) {
+            self.schema = cte_schema.clone();
+            self.source = TableScanSource::Cte {
+                name: table_name_lower,
+                position: 0,
+            };
+        } else {
+            // Resolves the schema (and "table not found") here; row pages are
+            // fetched lazily in next() so memory stays O(one page).
+            let cursor = ctx
+                .store
+                .table_scan_cursor(ctx.txn, ctx.db_id, &self.schema.name, self.scan_limit)
+                .await?;
+            self.source = TableScanSource::Storage(cursor);
         }
 
         Ok(())
     }
 
-    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
 
-        if self.position < self.buffer.len() {
-            let row = self.buffer[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
+        if matches!(self.source, TableScanSource::Storage(_)) {
+            return self.next_storage_row(ctx).await;
+        }
+
+        match &mut self.source {
+            TableScanSource::Storage(_) => Ok(None),
+            TableScanSource::Cte { name, position } => {
+                let Some((_, cte_rows)) = ctx.cte_tables.get(name.as_str()) else {
+                    return Ok(None);
+                };
+                if let Some(row) = cte_rows.get(*position) {
+                    *position += 1;
+                    Ok(Some(row.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            TableScanSource::Preloaded => {
+                if let Some(row) = self.preloaded_rows.get(self.preloaded_position) {
+                    self.preloaded_position += 1;
+                    Ok(Some(row.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            TableScanSource::Idle => Ok(None),
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        if !self.preloaded {
-            self.buffer.clear();
-        }
+        self.page.reset();
+        self.source = TableScanSource::Idle;
         self.opened = false;
         Ok(())
     }
@@ -239,8 +305,8 @@ pub struct PrimaryKeyRangeScanOperator {
     schema: TableSchema,
     pk_prefix_values: Vec<Value>,
     scan_limit: Option<usize>,
-    buffer: Vec<Row>,
-    position: usize,
+    cursor: Option<RowScanCursor>,
+    page: ChargedRowBuffer,
     opened: bool,
 }
 
@@ -254,8 +320,8 @@ impl PrimaryKeyRangeScanOperator {
             schema,
             pk_prefix_values,
             scan_limit,
-            buffer: Vec::new(),
-            position: 0,
+            cursor: None,
+            page: ChargedRowBuffer::new(),
             opened: false,
         }
     }
@@ -268,49 +334,45 @@ impl PhysicalOperator for PrimaryKeyRangeScanOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.position = 0;
         self.opened = true;
-        self.buffer.clear();
-
-        if matches!(self.scan_limit, Some(0)) {
-            return Ok(());
-        }
-
-        let rows = ctx
-            .store
-            .scan_rows_by_pk_prefix(
-                ctx.txn,
-                ctx.db_id,
-                self.schema.table_id,
-                &self.pk_prefix_values,
-                self.scan_limit,
-            )
-            .await?;
-
-        self.buffer = rows
-            .into_iter()
-            .map(|r| fill_row_defaults_scan(r, &self.schema))
-            .collect::<Result<Vec<_>>>()?;
-
+        self.page.reset();
+        self.cursor = Some(ctx.store.pk_prefix_scan_cursor(
+            ctx.db_id,
+            self.schema.table_id,
+            &self.pk_prefix_values,
+            self.scan_limit,
+        ));
         Ok(())
     }
 
-    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
 
-        if self.position < self.buffer.len() {
-            let row = self.buffer[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
+        loop {
+            if let Some(row) = self.page.take_next() {
+                return Ok(Some(fill_row_defaults_scan(row, &self.schema)?));
+            }
+            let Some(cursor) = self.cursor.as_mut() else {
+                return Ok(None);
+            };
+            if cursor.exhausted() {
+                self.page.reset();
+                return Ok(None);
+            }
+            let rows = ctx.store.scan_cursor_next_page(ctx.txn, cursor).await?;
+            if rows.is_empty() {
+                self.page.reset();
+                return Ok(None);
+            }
+            self.page.adopt("operators.pk_range_scan.page", rows)?;
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.page.reset();
+        self.cursor = None;
         self.opened = false;
         Ok(())
     }
@@ -339,7 +401,7 @@ struct IndexScanBase {
     index_id: u64,
     index_name: String,
     scan_limit: Option<usize>,
-    pk_queue: Vec<Vec<Value>>,
+    pk_queue: ChargedPkBuffer,
     row_buffer: Vec<Row>,
     position: usize,
     opened: bool,
@@ -357,7 +419,7 @@ impl IndexScanBase {
             index_id,
             index_name,
             scan_limit,
-            pk_queue: Vec::new(),
+            pk_queue: ChargedPkBuffer::new(),
             row_buffer: Vec::new(),
             position: 0,
             opened: false,
@@ -366,7 +428,7 @@ impl IndexScanBase {
 
     /// Reset state and mark as opened. Called at the start of each open().
     fn reset_and_open(&mut self) {
-        self.pk_queue.clear();
+        self.pk_queue.reset();
         self.row_buffer.clear();
         self.position = 0;
         self.opened = true;
@@ -418,9 +480,20 @@ impl IndexScanBase {
         self.row_buffer.clear();
         self.position = 0;
 
-        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
-            let batch_size = OPERATOR_BATCH_FETCH_SIZE.min(self.pk_queue.len());
-            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
+        loop {
+            // Drain up to a batch from the charged pk_queue; take_next releases
+            // each PK's payload charge as it leaves the queue (the fetched
+            // row_buffer page is the next bounded structure).
+            let mut batch_pks: Vec<Vec<Value>> = Vec::new();
+            while batch_pks.len() < OPERATOR_BATCH_FETCH_SIZE {
+                match self.pk_queue.take_next() {
+                    Some(pk) => batch_pks.push(pk),
+                    None => break,
+                }
+            }
+            if batch_pks.is_empty() {
+                break;
+            }
             let rows = ctx
                 .store
                 .batch_get_rows(
@@ -436,6 +509,10 @@ impl IndexScanBase {
                 .into_iter()
                 .map(|r| fill_row_defaults_scan(r, &self.schema))
                 .collect::<Result<Vec<_>>>()?;
+
+            if !self.row_buffer.is_empty() {
+                break;
+            }
         }
 
         Ok(())
@@ -465,7 +542,7 @@ impl IndexScanBase {
 
     /// Release buffers and mark as closed.
     fn close(&mut self) {
-        self.pk_queue.clear();
+        self.pk_queue.reset();
         self.row_buffer.clear();
         self.opened = false;
     }
@@ -535,7 +612,11 @@ impl PhysicalOperator for IndexScanOperator {
                 .await?
         };
 
-        self.base.pk_queue = pks;
+        for pk in pks {
+            self.base
+                .pk_queue
+                .push("operators.index_scan.pk_queue", pk)?;
+        }
         self.base.load_next_batch(ctx).await?;
 
         Ok(())
@@ -629,7 +710,11 @@ impl PhysicalOperator for RangeIndexScanOperator {
             )
             .await?;
 
-        self.base.pk_queue = pks;
+        for pk in pks {
+            self.base
+                .pk_queue
+                .push("operators.range_index_scan.pk_queue", pk)?;
+        }
         self.base.load_next_batch(ctx).await?;
 
         Ok(())
@@ -707,7 +792,12 @@ impl PhysicalOperator for InListScanOperator {
             Vec::new()
         };
 
+        // The match set is O(matches); charge candidate PKs as they are
+        // scanned so a huge IN-list aborts with 53200 instead of OOMing. The
+        // transient charge is released once the deduped PKs move into the
+        // charged pk_queue below.
         let mut all_pks = Vec::new();
+        let mut transient_charged = 0usize;
         for values in &self.column_values {
             let pks = if needs_prefix_scan {
                 ctx.store
@@ -737,6 +827,12 @@ impl PhysicalOperator for InListScanOperator {
                     )
                     .await?
             };
+            for pk in &pks {
+                let bytes = estimate_values_payload_size(pk)
+                    .saturating_add(std::mem::size_of::<Vec<Value>>());
+                try_grow_statement_memory_scope("operators.in_list_scan.candidates", bytes)?;
+                transient_charged = transient_charged.saturating_add(bytes);
+            }
             all_pks.extend(pks);
         }
 
@@ -750,7 +846,12 @@ impl PhysicalOperator for InListScanOperator {
             deduped_pks.truncate(limit);
         }
 
-        self.base.pk_queue = deduped_pks;
+        for pk in deduped_pks {
+            self.base
+                .pk_queue
+                .push("operators.in_list_scan.pk_queue", pk)?;
+        }
+        try_shrink_statement_memory_scope(transient_charged);
         self.base.load_next_batch(ctx).await?;
 
         Ok(())
@@ -823,7 +924,8 @@ mod tests {
 
         assert_eq!(scan.name(), "TableScan");
         assert!(!scan.opened);
-        assert!(scan.buffer.is_empty());
+        assert!(matches!(scan.source, TableScanSource::Idle));
+        assert_eq!(scan.page.len(), 0);
     }
 
     #[test]
@@ -850,7 +952,9 @@ mod tests {
     fn test_index_scan_base_reset_and_close_state() {
         let schema = test_schema_with_index(vec!["name"]);
         let mut base = IndexScanBase::new(schema, 42, "idx_users_name".to_string(), Some(5));
-        base.pk_queue = vec![vec![Value::Int32(1)]];
+        base.pk_queue
+            .push("test.pk", vec![Value::Int32(1)])
+            .unwrap();
         base.row_buffer = vec![Row::new(vec![
             Value::Int32(1),
             Value::Text("Alice".to_string()),
@@ -861,17 +965,19 @@ mod tests {
         base.reset_and_open();
         assert!(base.opened);
         assert_eq!(base.position, 0);
-        assert!(base.pk_queue.is_empty());
+        assert_eq!(base.pk_queue.len(), 0);
         assert!(base.row_buffer.is_empty());
 
-        base.pk_queue = vec![vec![Value::Int32(2)]];
+        base.pk_queue
+            .push("test.pk", vec![Value::Int32(2)])
+            .unwrap();
         base.row_buffer = vec![Row::new(vec![
             Value::Int32(2),
             Value::Text("Bob".to_string()),
         ])];
         base.close();
         assert!(!base.opened);
-        assert!(base.pk_queue.is_empty());
+        assert_eq!(base.pk_queue.len(), 0);
         assert!(base.row_buffer.is_empty());
     }
 

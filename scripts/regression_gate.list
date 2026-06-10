@@ -116,6 +116,8 @@ tests/251_any_empty_array_type_check.sql
 tests/100_aggregate_alias_fixes.sql
 tests/118_intersect_except_all_multiset_issue50.sql
 tests/248_nullable_aggregation.sql
+tests/2555_hash_aggregate_streaming.sql
+tests/2555_scan_page_boundaries.sql
 # Expressions / functions
 tests/105_expr_functions.sql
 tests/110_enum_search_path.sql

@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use super::key_encoding::encode_values_key;
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema};
+use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
+use crate::sql::memory::estimate_key_size;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SetOperationType {
@@ -59,6 +61,12 @@ impl PhysicalOperator for SetOperationOperator {
 
         self.result_rows.clear();
 
+        // The row payloads are charged by collect_all; the dedup keysets below
+        // are an additional O(input) structure that must be charged too so a
+        // huge UNION/INTERSECT/EXCEPT aborts with 53200 instead of OOMing. The
+        // keysets are local to open() and dropped here, so a single grow/shrink
+        // pair (released after the match) is within contract.
+        let mut key_charge = 0usize;
         match self.op_type {
             SetOperationType::UnionAll => {
                 self.result_rows.extend(left_rows);
@@ -68,18 +76,31 @@ impl PhysicalOperator for SetOperationOperator {
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows.into_iter().chain(right_rows) {
                     let key = Self::row_to_key(&row);
+                    let kb = estimate_key_size(&key);
                     if seen.insert(key) {
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
                         self.result_rows.push(row);
                     }
                 }
             }
             SetOperationType::Intersect => {
-                let right_keys: HashSet<Vec<u8>> =
-                    right_rows.iter().map(Self::row_to_key).collect();
+                let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
+                for row in &right_rows {
+                    let key = Self::row_to_key(row);
+                    let kb = estimate_key_size(&key);
+                    if right_keys.insert(key) {
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
+                    }
+                }
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows {
                     let key = Self::row_to_key(&row);
+                    let kb = estimate_key_size(&key);
                     if right_keys.contains(&key) && seen.insert(key) {
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
                         self.result_rows.push(row);
                     }
                 }
@@ -89,6 +110,11 @@ impl PhysicalOperator for SetOperationOperator {
                     std::collections::HashMap::new();
                 for row in &right_rows {
                     let key = Self::row_to_key(row);
+                    if !right_counts.contains_key(&key) {
+                        let kb = estimate_key_size(&key);
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
+                    }
                     *right_counts.entry(key).or_insert(0) += 1;
                 }
                 for row in left_rows {
@@ -102,12 +128,22 @@ impl PhysicalOperator for SetOperationOperator {
                 }
             }
             SetOperationType::Except => {
-                let right_keys: HashSet<Vec<u8>> =
-                    right_rows.iter().map(Self::row_to_key).collect();
+                let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
+                for row in &right_rows {
+                    let key = Self::row_to_key(row);
+                    let kb = estimate_key_size(&key);
+                    if right_keys.insert(key) {
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
+                    }
+                }
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows {
                     let key = Self::row_to_key(&row);
+                    let kb = estimate_key_size(&key);
                     if !right_keys.contains(&key) && seen.insert(key) {
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
                         self.result_rows.push(row);
                     }
                 }
@@ -117,6 +153,11 @@ impl PhysicalOperator for SetOperationOperator {
                     std::collections::HashMap::new();
                 for row in &right_rows {
                     let key = Self::row_to_key(row);
+                    if !right_counts.contains_key(&key) {
+                        let kb = estimate_key_size(&key);
+                        try_grow_statement_memory_scope("operators.set_operation.keys", kb)?;
+                        key_charge += kb;
+                    }
                     *right_counts.entry(key).or_insert(0) += 1;
                 }
                 for row in left_rows {
@@ -131,6 +172,9 @@ impl PhysicalOperator for SetOperationOperator {
                 }
             }
         }
+
+        // Release the dedup keysets' charge (they are dropped at end of open()).
+        try_shrink_statement_memory_scope(key_charge);
 
         self.position = 0;
         self.opened = true;

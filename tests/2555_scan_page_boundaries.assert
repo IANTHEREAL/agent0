@@ -1,0 +1,10 @@
+full_scan=2500,2500,3126250,1,2500
+grouped=7,2500
+limit0=0
+limit1024=1024,524800
+limit1025=1025,525825
+limit2048=2048
+limit_all=2500
+prefix1=1500,1500,1125750
+prefix2=10,55
+prefix_exact_page=1024

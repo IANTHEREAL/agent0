@@ -26,6 +26,7 @@
 //! - `Limit` - LIMIT/OFFSET handling
 
 mod aggregate;
+mod charged_rows;
 mod context;
 mod cte;
 mod db9_cop;

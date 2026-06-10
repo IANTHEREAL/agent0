@@ -14,8 +14,11 @@ use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use tracing::debug;
 
+use super::charged_rows::ChargedPkBuffer;
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema, Value};
+use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
+use crate::sql::memory::estimate_key_size;
 use crate::sql::planner::GinQual;
 use crate::sql::projection::fill_row_defaults;
 use crate::storage::decode_pk_from_index_suffix;
@@ -53,8 +56,17 @@ pub struct GinScanOperator {
     index_name: String,
     qual: GinQual,
     scan_limit: Option<usize>,
-    /// Primary-key queue produced by posting-list set operations.
-    pk_queue: Vec<Vec<Value>>,
+    /// Primary-key queue produced by posting-list set operations. Charged
+    /// against the tenant quota so a huge candidate set aborts with 53200
+    /// instead of OOMing (#2612 gate-review follow-up).
+    pk_queue: ChargedPkBuffer,
+    /// Count of PKs produced into `pk_queue` (the charged buffer exposes no
+    /// live len); drives the AllDocs effective-limit logic and metrics.
+    pk_produced: usize,
+    /// Statement-scope charge accumulated for the in-construction candidate
+    /// byte-set (posting-list pages / driver matches), released at end of
+    /// open() once the set is decoded into the separately-charged pk_queue.
+    candidate_charge: usize,
     /// Row buffer for batch_get results.
     row_buffer: Vec<Row>,
     position: usize,
@@ -76,7 +88,9 @@ impl GinScanOperator {
             index_name,
             qual,
             scan_limit,
-            pk_queue: Vec::new(),
+            pk_queue: ChargedPkBuffer::new(),
+            pk_produced: 0,
+            candidate_charge: 0,
             row_buffer: Vec::new(),
             position: 0,
             opened: false,
@@ -217,6 +231,11 @@ impl GinScanOperator {
             if page.is_empty() {
                 break;
             }
+            // Charge the posting-list page as it is scanned so a high-frequency
+            // token aborts with 53200 instead of building an unbounded set.
+            let page_charge: usize = page.iter().map(|k| estimate_key_size(k)).sum();
+            try_grow_statement_memory_scope("operators.gin_scan.candidates", page_charge)?;
+            self.candidate_charge += page_charge;
             pk_set.extend(page);
             match next_cursor {
                 Some(next) => cursor = Some(next),
@@ -322,6 +341,9 @@ impl GinScanOperator {
             }
 
             for pk_bytes in candidates {
+                let kb = estimate_key_size(&pk_bytes);
+                try_grow_statement_memory_scope("operators.gin_scan.candidates", kb)?;
+                self.candidate_charge += kb;
                 matched.insert(pk_bytes);
                 if matched.len() >= effective_limit {
                     break;
@@ -444,9 +466,19 @@ impl GinScanOperator {
         self.row_buffer.clear();
         self.position = 0;
 
-        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
-            let batch_size = GIN_BATCH_FETCH_SIZE.min(self.pk_queue.len());
-            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
+        loop {
+            // Drain a batch from the charged pk_queue; take_next releases each
+            // PK's payload charge as it leaves the queue.
+            let mut batch_pks: Vec<Vec<Value>> = Vec::new();
+            while batch_pks.len() < GIN_BATCH_FETCH_SIZE {
+                match self.pk_queue.take_next() {
+                    Some(pk) => batch_pks.push(pk),
+                    None => break,
+                }
+            }
+            if batch_pks.is_empty() {
+                break;
+            }
             self.metrics.row_batch_get_rpcs += 1;
             self.metrics.rows_fetched += batch_pks.len() as u64;
             let rows = ctx
@@ -470,6 +502,10 @@ impl GinScanOperator {
                     Ok(r)
                 })
                 .collect::<Result<Vec<_>>>()?;
+
+            if !self.row_buffer.is_empty() {
+                break;
+            }
         }
 
         Ok(())
@@ -483,7 +519,9 @@ impl PhysicalOperator for GinScanOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.pk_queue.clear();
+        self.pk_queue.reset();
+        self.pk_produced = 0;
+        self.candidate_charge = 0;
         self.row_buffer.clear();
         self.position = 0;
         self.opened = true;
@@ -505,12 +543,14 @@ impl PhysicalOperator for GinScanOperator {
 
         match candidate_pk_set {
             GinCandidateSet::Keys(candidate_pk_bytes) => {
-                // Decode raw PK bytes into typed Values.
+                // The candidate byte-set was already charged as it was scanned
+                // (self.candidate_charge); decode it into the pk_queue (charged
+                // separately) and release the candidate charge after the match.
                 let pk_types = self.pk_types();
-                self.pk_queue.reserve(candidate_pk_bytes.len());
                 for pk_bytes in candidate_pk_bytes {
                     let pk = decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
-                    self.pk_queue.push(pk);
+                    self.pk_queue.push("operators.gin_scan.pk_queue", pk)?;
+                    self.pk_produced += 1;
                 }
             }
             GinCandidateSet::AllDocs => {
@@ -519,10 +559,10 @@ impl PhysicalOperator for GinScanOperator {
                 let pk_types = self.pk_types();
                 let effective_limit = self.scan_limit.unwrap_or(usize::MAX);
                 let mut cursor: Option<Vec<u8>> = None;
-                while self.pk_queue.len() < effective_limit {
+                while self.pk_produced < effective_limit {
                     self.metrics.table_pk_scan_rpcs += 1;
                     let page_size = effective_limit
-                        .saturating_sub(self.pk_queue.len())
+                        .saturating_sub(self.pk_produced)
                         .min(GIN_POSTING_PAGE_SIZE as usize)
                         .max(1) as u32;
                     let (page, next_cursor) = ctx
@@ -542,14 +582,15 @@ impl PhysicalOperator for GinScanOperator {
 
                     for pk_bytes in page {
                         let pk = decode_pk_from_index_suffix(&pk_bytes, &pk_types)?;
-                        self.pk_queue.push(pk);
-                        if self.pk_queue.len() >= effective_limit {
+                        self.pk_queue.push("operators.gin_scan.pk_queue", pk)?;
+                        self.pk_produced += 1;
+                        if self.pk_produced >= effective_limit {
                             break;
                         }
                     }
 
                     match next_cursor {
-                        Some(next) if self.pk_queue.len() < effective_limit => {
+                        Some(next) if self.pk_produced < effective_limit => {
                             cursor = Some(next);
                         }
                         _ => break,
@@ -557,7 +598,11 @@ impl PhysicalOperator for GinScanOperator {
                 }
             }
         }
-        self.metrics.candidate_pk_count = self.pk_queue.len() as u64;
+        // The candidate byte-set was charged as it was scanned; release it now
+        // that it has been decoded into the (separately charged) pk_queue.
+        try_shrink_statement_memory_scope(self.candidate_charge);
+        self.candidate_charge = 0;
+        self.metrics.candidate_pk_count = self.pk_produced as u64;
 
         debug!(
             table = %self.schema.name,
@@ -620,7 +665,7 @@ impl PhysicalOperator for GinScanOperator {
             scan_limit = self.scan_limit,
             "gin_scan_close"
         );
-        self.pk_queue.clear();
+        self.pk_queue.reset();
         self.row_buffer.clear();
         self.opened = false;
         Ok(())

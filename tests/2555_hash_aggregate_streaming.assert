@@ -1,0 +1,15 @@
+grp_key|cnt_all|cnt_v|sum_v|min_v|max_v
+<null>|1|1|99|99|99
+A|3|2|30|10|20
+B|3|3|45|5|25
+empty_global=0,0,NULL
+empty_group_rows=0
+grp_key|kept_rows|kept_sum|distinct_labels
+<null>|1|99|1
+A|2|10|2
+B|2|20|2
+grp_key|labels_desc
+<null>|zeta
+A|alpha;beta,alpha
+B|gamma~delta-gamma
+wide_count=64,max_payload=4096,string_agg_len=262144

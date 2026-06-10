@@ -77,7 +77,7 @@ Defined in `src/cli.rs`. Supports both `--flag value` and `--flag=value` syntax.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DB9_TENANT_QPS_LIMIT` | Per-tenant queries-per-second limit. `0` disables. | `0` |
-| `DB9_TENANT_MEMORY_QUOTA_BYTES` | Per-tenant aggregate memory quota in bytes. `0` means unlimited. | `0` |
+| `DB9_TENANT_MEMORY_QUOTA_BYTES` | Per-tenant aggregate memory quota in bytes. `0` disables the gate — **no pod-OOM protection** (see #2555). | `1073741824` (1 GiB) |
 
 #### fs9 WebSocket (`src/main.rs`)
 

@@ -39,6 +39,7 @@ mod views;
 pub mod worker;
 pub use cron::CronRunClaimStatus;
 pub use ddl_journal::{DdlJournalEntry, DdlOperation};
+pub use tables::RowScanCursor;
 pub use worker::WqIndexRow;
 
 // Import helper functions for tests

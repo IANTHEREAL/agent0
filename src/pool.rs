@@ -55,10 +55,24 @@ const DEFAULT_TENANT_MEMORY_QUOTA_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 fn tenant_memory_quota_bytes() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        std::env::var("DB9_TENANT_MEMORY_QUOTA_BYTES")
+        let quota = std::env::var("DB9_TENANT_MEMORY_QUOTA_BYTES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_TENANT_MEMORY_QUOTA_BYTES)
+            .unwrap_or(DEFAULT_TENANT_MEMORY_QUOTA_BYTES);
+        if quota == 0 {
+            // The statement-memory accounting (collect_all, hash aggregate,
+            // cop buffers, …) all charge against this quota; a zero quota makes
+            // every charge a silent no-op, so no precision prevents a pod OOM.
+            // This was the #2555 operational root cause — the gate the ledger
+            // feeds was disabled. Surface it loudly rather than fail closed
+            // (some single-tenant/benchmark deployments intend unlimited).
+            tracing::warn!(
+                "DB9_TENANT_MEMORY_QUOTA_BYTES=0: per-tenant memory quota DISABLED; \
+                 statement memory accounting will NOT prevent pod OOM (see #2555). \
+                 Set a non-zero quota (e.g. pod_budget / max_concurrent_tenants) in production."
+            );
+        }
+        quota
     })
 }
 
@@ -66,6 +80,81 @@ fn tenant_memory_quota_bytes() -> usize {
 ///
 /// All interactive/worker statements for the same keyspace share one
 /// `TenantMemoryAccountant` so quota is enforced across concurrent sessions.
+///
+/// # Memory-accounting contract (the closure condition)
+///
+/// `charged_bytes` is a **conservative lower bound** on the statement's true
+/// live heap, within a fixed factor `C >= 1`: at every instant
+/// `charged_bytes >= true_live_heap / C`. Enforcement runs on the exact
+/// `charged_bytes` total; the deployment carries `C` in the quota by setting
+/// `quota_bytes = pod_budget / (C * max_concurrent_tenants)`. Byte-exactness
+/// against the allocator is therefore a **non-goal** (see #2559).
+///
+/// **In-contract** (absorbed by `C`, NOT a finding): slot-pointer capacity
+/// (`size_of::<T>()` per element), `HashMap`/`HashSet` bucket-array index
+/// bytes, `Vec`/`String` len-vs-capacity slack, struct/control-byte overhead,
+/// one in-flight transient (or release-timing window) bounded by a single
+/// row / group / page, a **leaf-source materialization bounded by a fixed cap
+/// independent of input size** (one stored value ≤ the TiKV value limit for
+/// `UNNEST`/`JSON_*`; a configured row cap such as `generate_series`'s
+/// `DB9_MAX_GENERATE_SERIES_ROWS`, which errors when exceeded), and **an
+/// operator output/intermediate that is a bounded constant multiple of an
+/// already-charged base** — e.g. `WindowOperator.result_rows` is ≤ one composed
+/// row per `collect_all`-charged input row, so its peak is ≤ 2× the charged
+/// input and cannot independently exceed `2·quota`. None of these scale as an
+/// unbounded fraction of input, so none are findings.
+///
+/// **Blocker** (the only actionable under-count): a site that charges `O(1)`
+/// while retaining `O(N)` bytes *not* bounded by a per-element charge already
+/// taken — uncharged growth as an unbounded fraction of input. The coverage
+/// obligation is **per operator that materializes input-proportional memory**
+/// — a finite, `grep`-checkable list, NOT per allocation site. Three classes,
+/// each of which must stream or route through a charged buffer
+/// ([`crate::sql::operators::charged_rows::ChargedBuf`]):
+///   1. child-row materializers (Sort, HashJoin, NLJ inner, SetOperation,
+///      Window, CTE) — via `collect_all` (which charges `estimate_row_size`
+///      per row) or a `ChargedRowBuffer`; any *additional* dedup keyset built
+///      on top must itself be charged (`estimate_key_size` per inserted key —
+///      `collect_all` charging the row payloads does NOT cover a second keyset).
+///   2. scan PK/candidate materializers (Index/Range/InList scans via
+///      `IndexScanBase.pk_queue`, `GinScan` pk_queue + posting-list candidate
+///      set) — the O(matches) PK set is produced uncharged by storage and held
+///      across `next()`; it must be admitted into a `ChargedPkBuffer` (charged
+///      per PK on push, released on `take_next`/`reset`), including pre-stage
+///      transients (`InListScan` candidates, GIN byte-sets).
+///   3. leaf-source materializers (table functions: `UNNEST`/`JSON_*`) — route
+///      the produced rows through a `ChargedRowBuffer` when held resident.
+///
+/// The #2555 shape was class 1 (`collect_all` into one `Vec`); the #2612 gate
+/// review added class 2.
+///
+/// Scope boundary: charging is applied at the **operator boundary**, which
+/// converts over-quota SELECT scan→aggregate→result queries into `53200`. Two
+/// deeper/wider materializers are the NAMED SUCCESSOR EPIC, not this change
+/// (both pre-existing, neither a regression):
+///   - storage index-scan producers (`scan_index*` in
+///     `storage/tikv_store/indexes.rs`) return the whole match-set `Vec` before
+///     the operator's `ChargedPkBuffer` charges it, so a match set exceeding pod
+///     memory can still OOM during storage materialization — the complete fix is
+///     a streaming/charged storage cursor like `TableScanOperator`'s page cursor
+///     (or charge per PK inside the `scan_range_in_pages` visit closure);
+///   - the DML write path (`DELETE`/`UPDATE` full-table scan in `dml_analyzed`)
+///     is a separate write path, not the #2555 SELECT path.
+///
+/// Continuing to fold these into one PR is the unbounded-scope patch-loop that
+/// kept #2610/#2612 from converging; the closure condition is per the operator
+/// boundary above, verified by the reconciliation test, not an open-ended sweep.
+///
+/// **Review stop-rule:** a finding is actionable iff it shows an
+/// unbounded-fraction-of-input under-count, or a charge path with no scope
+/// established. Cite the whole-path reconciliation test, not a byte count.
+/// Bounded constant-factor slack is in-contract and is not a finding.
+///
+/// **Enforcement caveat (the #2555 operational root cause):** the quota must
+/// be explicitly configured and non-zero in production.
+/// `DB9_TENANT_MEMORY_QUOTA_BYTES=0` disables the gate entirely, so no
+/// accounting precision can prevent a pod OOM. `quota_bytes == 0` is logged
+/// once at startup (see [`tenant_memory_quota_bytes`]).
 #[derive(Clone, Debug)]
 pub struct TenantMemoryAccountant {
     #[allow(dead_code)] // observability/test helper
@@ -75,7 +164,7 @@ pub struct TenantMemoryAccountant {
 }
 
 impl TenantMemoryAccountant {
-    fn new_with_quota(keyspace: String, quota_bytes: usize) -> Self {
+    pub(crate) fn new_with_quota(keyspace: String, quota_bytes: usize) -> Self {
         Self {
             keyspace: Arc::from(keyspace),
             used_bytes: Arc::new(AtomicUsize::new(0)),

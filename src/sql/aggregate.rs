@@ -9,6 +9,7 @@ use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
 use crate::model::{DataType, Value};
 use crate::sql::expr::compare_values;
+use crate::sql::memory::estimate_value_size;
 #[cfg(test)]
 use crate::sql::names::function_name_upper;
 use crate::sql::pg_numeric::pg_numeric_div;
@@ -59,6 +60,91 @@ pub enum Aggregator {
     },
 }
 
+/// Conservative retained-memory delta for aggregate state updates.
+///
+/// This is intentionally not allocator-exact. It must stay O(1) in the current
+/// state size and avoid unbounded under-counting of retained aggregate state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AggregateStateDelta {
+    pub grow_bytes: usize,
+    pub shrink_bytes: usize,
+}
+
+impl AggregateStateDelta {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    fn grow(bytes: usize) -> Self {
+        Self {
+            grow_bytes: bytes,
+            shrink_bytes: 0,
+        }
+    }
+
+    fn from_sizes(before: usize, after: usize) -> Self {
+        if after >= before {
+            Self::grow(after - before)
+        } else {
+            Self {
+                grow_bytes: 0,
+                shrink_bytes: before - after,
+            }
+        }
+    }
+}
+
+fn vector_state_size(v: &[f64]) -> usize {
+    std::mem::size_of::<Vec<f64>>() + std::mem::size_of_val(v)
+}
+
+/// Determine a `string_agg` input's retained length without building the
+/// retained string when possible. Text values report their length from the
+/// borrowed value so admission can precede the clone. Other types must be
+/// formatted to learn their length — an **explicitly bounded exception**:
+/// one value-sized transient that is freed if the charge rejects it and is
+/// never retained without admission.
+fn string_agg_payload(val: &Value) -> (usize, Option<String>) {
+    match val {
+        Value::Text(s) => (s.len(), None),
+        v => {
+            let s = v.to_string();
+            (s.len(), Some(s))
+        }
+    }
+}
+
+/// Admit an accumulating push **before** anything is allocated: the payload
+/// is known from the existing input value, and when the Vec is full the next
+/// capacity is chosen explicitly (doubling) so the slot growth is a measured
+/// decision, not a prediction of std's private policy. Returns the admitted
+/// total and the reservation to make; on charge failure nothing was
+/// allocated. Without this, a full retained Vec's reallocation creates a
+/// state-sized backing buffer ahead of quota admission.
+fn admit_accumulating_push<T>(
+    vec: &Vec<T>,
+    payload_bytes: usize,
+    charge: &mut dyn FnMut(usize) -> Result<()>,
+) -> Result<(usize, usize)> {
+    let needs_growth = vec.len() == vec.capacity();
+    let target_capacity = if needs_growth {
+        std::cmp::max(4, vec.capacity().saturating_mul(2))
+    } else {
+        vec.capacity()
+    };
+    let grown_slots = target_capacity
+        .saturating_sub(vec.capacity())
+        .saturating_mul(std::mem::size_of::<T>());
+    let total = payload_bytes.saturating_add(grown_slots);
+    charge(total)?;
+    let additional = if needs_growth {
+        target_capacity - vec.len()
+    } else {
+        0
+    };
+    Ok((total, additional))
+}
+
 impl Aggregator {
     pub fn new(kind: &str, return_type: Option<DataType>) -> Result<Self> {
         match kind.to_uppercase().as_str() {
@@ -100,16 +186,48 @@ impl Aggregator {
 
     /// Append a `(value, delimiter)` pair for `string_agg`.
     /// The delimiter is evaluated per-row to match PostgreSQL semantics.
-    pub fn update_string_agg(&mut self, val: &Value, delimiter: &str) -> Result<()> {
+    #[allow(dead_code)] // quota-free convenience wrapper; production folds go through *_charged
+    pub fn update_string_agg(
+        &mut self,
+        val: &Value,
+        delimiter: &str,
+    ) -> Result<AggregateStateDelta> {
+        self.update_string_agg_charged(val, delimiter, &mut |_| Ok(()))
+    }
+
+    /// Like [`Self::update_string_agg`], admitting retained growth through
+    /// `charge` before it is allocated. The returned delta's `grow_bytes`
+    /// were already passed to `charge`; callers record them, they do not
+    /// re-charge them.
+    pub fn update_string_agg_charged(
+        &mut self,
+        val: &Value,
+        delimiter: &str,
+        charge: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<AggregateStateDelta> {
         if let Aggregator::StringAgg { entries } = self {
             if !matches!(val, Value::Null) {
-                let s = match val {
-                    Value::Text(s) => s.clone(),
-                    v => v.to_string(),
+                let (payload_len, prebuilt) = string_agg_payload(val);
+                let retained_bytes = payload_len.saturating_add(delimiter.len());
+                let (admitted, additional) =
+                    admit_accumulating_push(entries, retained_bytes, charge)?;
+                if additional > 0 {
+                    entries.reserve_exact(additional);
+                }
+                // The retained clone is built only after admission.
+                let s = match prebuilt {
+                    Some(s) => s,
+                    None => {
+                        let Value::Text(s) = val else {
+                            return Err(anyhow!("string_agg input changed type mid-update"));
+                        };
+                        s.clone()
+                    }
                 };
                 entries.push((s, delimiter.to_string()));
+                return Ok(AggregateStateDelta::grow(admitted));
             }
-            Ok(())
+            Ok(AggregateStateDelta::none())
         } else {
             Err(anyhow!(
                 "update_string_agg called on non-StringAgg aggregator"
@@ -117,39 +235,84 @@ impl Aggregator {
         }
     }
 
-    pub fn update(&mut self, val: &Value) -> Result<()> {
-        match self {
+    #[allow(dead_code)] // quota-free convenience wrapper; production folds go through *_charged
+    pub fn update(&mut self, val: &Value) -> Result<AggregateStateDelta> {
+        self.update_charged(val, &mut |_| Ok(()))
+    }
+
+    /// Like [`Self::update`], admitting retained growth through `charge`.
+    /// Accumulating aggregators (array/json/jsonb/string agg) admit payload
+    /// and explicit slot growth **before** anything is allocated; fixed-size
+    /// aggregators charge their measured value-sized delta after the fold
+    /// (a value-sized transient, within contract). The returned delta's
+    /// `grow_bytes` were already passed to `charge`; callers record them,
+    /// they do not re-charge them. Shrinks are returned for the caller to
+    /// release.
+    pub fn update_charged(
+        &mut self,
+        val: &Value,
+        charge: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<AggregateStateDelta> {
+        let delta = match self {
             Aggregator::Count(_) => {
                 if !matches!(val, Value::Null) {
                     if let Aggregator::Count(c) = self {
                         *c += 1;
                     }
                 }
+                AggregateStateDelta::none()
             }
             Aggregator::Sum {
                 value: current,
                 return_type,
             } => {
                 if !matches!(val, Value::Null) {
+                    let before = estimate_value_size(current);
                     if matches!(current, Value::Null) {
                         *current = widen_value(val, return_type);
                     } else {
                         *current = add_values(current, val)?;
                     }
+                    let delta =
+                        AggregateStateDelta::from_sizes(before, estimate_value_size(current));
+                    if delta.grow_bytes > 0 {
+                        charge(delta.grow_bytes)?;
+                    }
+                    delta
+                } else {
+                    AggregateStateDelta::none()
                 }
             }
             Aggregator::Max(current) => {
                 if !matches!(val, Value::Null)
                     && (matches!(current, Value::Null) || compare_values(val, current)? > 0)
                 {
+                    let before = estimate_value_size(current);
                     *current = val.clone();
+                    let delta =
+                        AggregateStateDelta::from_sizes(before, estimate_value_size(current));
+                    if delta.grow_bytes > 0 {
+                        charge(delta.grow_bytes)?;
+                    }
+                    delta
+                } else {
+                    AggregateStateDelta::none()
                 }
             }
             Aggregator::Min(current) => {
                 if !matches!(val, Value::Null)
                     && (matches!(current, Value::Null) || compare_values(val, current)? < 0)
                 {
+                    let before = estimate_value_size(current);
                     *current = val.clone();
+                    let delta =
+                        AggregateStateDelta::from_sizes(before, estimate_value_size(current));
+                    if delta.grow_bytes > 0 {
+                        charge(delta.grow_bytes)?;
+                    }
+                    delta
+                } else {
+                    AggregateStateDelta::none()
                 }
             }
             Aggregator::Avg {
@@ -159,6 +322,7 @@ impl Aggregator {
                 count,
             } => {
                 if !matches!(val, Value::Null) {
+                    let before = sum_vector.as_deref().map(vector_state_size).unwrap_or(0);
                     match val {
                         Value::Int32(i) => {
                             if let Some(sf) = sum_float.as_mut() {
@@ -218,45 +382,79 @@ impl Aggregator {
                         _ => return Err(anyhow!("AVG requires numeric type")),
                     }
                     *count += 1;
+                    let after = sum_vector.as_deref().map(vector_state_size).unwrap_or(0);
+                    let delta = AggregateStateDelta::from_sizes(before, after);
+                    if delta.grow_bytes > 0 {
+                        charge(delta.grow_bytes)?;
+                    }
+                    delta
+                } else {
+                    AggregateStateDelta::none()
                 }
             }
             Aggregator::StringAgg { entries } => {
                 if !matches!(val, Value::Null) {
-                    let s = match val {
-                        Value::Text(s) => s.clone(),
-                        v => v.to_string(),
+                    let (payload_len, prebuilt) = string_agg_payload(val);
+                    let retained_bytes = payload_len.saturating_add(1);
+                    let (admitted, additional) =
+                        admit_accumulating_push(entries, retained_bytes, charge)?;
+                    if additional > 0 {
+                        entries.reserve_exact(additional);
+                    }
+                    let s = match prebuilt {
+                        Some(s) => s,
+                        None => {
+                            let Value::Text(s) = val else {
+                                return Err(anyhow!("string_agg input changed type mid-update"));
+                            };
+                            s.clone()
+                        }
                     };
                     // When called via generic update() (no per-row delimiter),
                     // use "," as the fallback. The per-row path goes through
                     // update_string_agg() instead.
                     entries.push((s, ",".to_string()));
+                    AggregateStateDelta::grow(admitted)
+                } else {
+                    AggregateStateDelta::none()
                 }
             }
             Aggregator::ArrayAgg { values } => {
+                let (admitted, additional) =
+                    admit_accumulating_push(values, estimate_value_size(val), charge)?;
+                if additional > 0 {
+                    values.reserve_exact(additional);
+                }
                 values.push(val.clone());
+                AggregateStateDelta::grow(admitted)
             }
             Aggregator::BoolAnd(current) => match val {
-                Value::Null => {}
+                Value::Null => AggregateStateDelta::none(),
                 Value::Boolean(b) => {
                     *current = Some(current.unwrap_or(true) && *b);
+                    AggregateStateDelta::none()
                 }
                 _ => return Err(anyhow!("BOOL_AND requires boolean type")),
             },
             Aggregator::BoolOr(current) => match val {
-                Value::Null => {}
+                Value::Null => AggregateStateDelta::none(),
                 Value::Boolean(b) => {
                     *current = Some(current.unwrap_or(false) || *b);
+                    AggregateStateDelta::none()
                 }
                 _ => return Err(anyhow!("BOOL_OR requires boolean type")),
             },
-            Aggregator::JsonAgg { values } => {
+            Aggregator::JsonAgg { values } | Aggregator::JsonbAgg { values } => {
+                let (admitted, additional) =
+                    admit_accumulating_push(values, estimate_value_size(val), charge)?;
+                if additional > 0 {
+                    values.reserve_exact(additional);
+                }
                 values.push(val.clone());
+                AggregateStateDelta::grow(admitted)
             }
-            Aggregator::JsonbAgg { values } => {
-                values.push(val.clone());
-            }
-        }
-        Ok(())
+        };
+        Ok(delta)
     }
 
     pub fn result(&self) -> Result<Value> {
@@ -326,6 +524,109 @@ impl Aggregator {
                 }
             }
         })
+    }
+
+    /// Finalize by consuming retained state, admitting state-sized output
+    /// allocations through `charge` **before** they are materialized.
+    ///
+    /// `result()` duplicates the whole retained state for accumulating
+    /// aggregates (string join, values clone, JSON build), which reopens the
+    /// #2555 OOM shape after every input row was admitted. Here:
+    ///
+    /// - `array_agg` moves its values out — no copy, nothing new to charge.
+    /// - `string_agg` charges the exact output length before allocating it.
+    ///   The length is arithmetic over the retained strings' real `len()`s —
+    ///   a measurement of existing objects, never a prediction of formatter
+    ///   behavior.
+    /// - `json/jsonb_agg` charge each item string after it is built (one
+    ///   O(item) in-flight transient, within contract), then charge the exact
+    ///   output length before assembling it in a single allocation.
+    /// - Fixed-size aggregators delegate to `result()`.
+    ///
+    /// Retained state consumed here stays charged by the caller until its
+    /// group ledger is released, so accounting remains conservative while the
+    /// state and the output briefly coexist.
+    pub fn result_consuming(
+        &mut self,
+        charge: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Value> {
+        match self {
+            Aggregator::StringAgg { entries } => {
+                if entries.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let entries = std::mem::take(entries);
+                let total: usize = entries[0].0.len()
+                    + entries[1..]
+                        .iter()
+                        .map(|(val, delim)| delim.len() + val.len())
+                        .sum::<usize>();
+                charge(total)?;
+                let mut result = String::with_capacity(total);
+                // PostgreSQL semantics: for i > 0, delimiter[i] is placed
+                // before value[i] (between value[i-1] and value[i]).
+                for (i, (val, delim)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        result.push_str(delim);
+                    }
+                    result.push_str(val);
+                }
+                Ok(Value::Text(result))
+            }
+            Aggregator::ArrayAgg { values } => {
+                if values.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Array(std::mem::take(values)))
+                }
+            }
+            Aggregator::JsonAgg { values } => {
+                if values.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Self::json_agg_result_consuming(values, charge, true).map(Value::Json)
+                }
+            }
+            Aggregator::JsonbAgg { values } => {
+                if values.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Self::json_agg_result_consuming(values, charge, false).map(Value::Jsonb)
+                }
+            }
+            other => other.result(),
+        }
+    }
+
+    fn json_agg_result_consuming(
+        values: &mut Vec<Value>,
+        charge: &mut dyn FnMut(usize) -> Result<()>,
+        canonicalize_jsonb: bool,
+    ) -> Result<String> {
+        let values = std::mem::take(values);
+        // Item Vec slots are sized from the real element count.
+        charge(values.len().saturating_mul(std::mem::size_of::<String>()))?;
+        let mut items = Vec::with_capacity(values.len());
+        let mut items_bytes = 0usize;
+        for v in &values {
+            let item = value_to_json_str_inner(v, canonicalize_jsonb);
+            charge(item.len())?;
+            items_bytes = items_bytes.saturating_add(item.len());
+            items.push(item);
+        }
+        drop(values);
+        let total = 2 + items_bytes + items.len().saturating_sub(1);
+        charge(total)?;
+        let mut out = String::with_capacity(total);
+        out.push('[');
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(item);
+        }
+        out.push(']');
+        Ok(out)
     }
 }
 
@@ -1091,5 +1392,294 @@ mod tests {
         agg.update(&Value::Int64(100)).unwrap();
         agg.update(&Value::Int64(200)).unwrap();
         assert_eq!(agg.result().unwrap(), Value::Numeric(Decimal::from(300)));
+    }
+
+    // Retained-memory delta contract (#2555): for aggregators whose state
+    // grows with input, cumulative `grow_bytes` must cover the retained
+    // payload (conservative, never structurally under-counting); fixed-size
+    // aggregators must not report growth proportional to input count.
+
+    #[test]
+    fn test_state_delta_count_reports_no_growth() {
+        let mut agg = Aggregator::new("COUNT", None).unwrap();
+        for i in 0..100 {
+            let delta = agg.update(&Value::Int32(i)).unwrap();
+            assert_eq!(delta, AggregateStateDelta::default());
+        }
+    }
+
+    #[test]
+    fn test_state_delta_null_input_reports_no_growth() {
+        let mut sum = Aggregator::new("SUM", None).unwrap();
+        assert_eq!(
+            sum.update(&Value::Null).unwrap(),
+            AggregateStateDelta::default()
+        );
+        let mut string_agg = Aggregator::new_string_agg();
+        assert_eq!(
+            string_agg.update_string_agg(&Value::Null, ",").unwrap(),
+            AggregateStateDelta::default()
+        );
+    }
+
+    #[test]
+    fn test_state_delta_string_agg_covers_retained_payload() {
+        let mut agg = Aggregator::new_string_agg();
+        let mut charged = 0usize;
+        let mut payload = 0usize;
+        for i in 0..50 {
+            let s = format!("value-{i:04}-{}", "x".repeat(64));
+            let delim = "; ";
+            let delta = agg
+                .update_string_agg(&Value::Text(s.clone()), delim)
+                .unwrap();
+            assert_eq!(delta.shrink_bytes, 0);
+            charged += delta.grow_bytes;
+            payload += s.len() + delim.len();
+        }
+        assert!(
+            charged >= payload,
+            "string_agg charged {charged} bytes for {payload} retained payload bytes"
+        );
+    }
+
+    #[test]
+    fn test_state_delta_array_agg_covers_retained_values() {
+        let mut agg = Aggregator::new("ARRAY_AGG", None).unwrap();
+        let mut charged = 0usize;
+        let mut payload = 0usize;
+        for i in 0..50 {
+            let val = Value::Text(format!("row-{i}-{}", "y".repeat(128)));
+            payload += estimate_value_size(&val);
+            let delta = agg.update(&val).unwrap();
+            charged += delta.grow_bytes;
+        }
+        assert!(
+            charged >= payload,
+            "array_agg charged {charged} bytes for {payload} retained value bytes"
+        );
+    }
+
+    #[test]
+    fn test_state_delta_json_agg_covers_retained_values() {
+        let mut agg = Aggregator::new("JSON_AGG", None).unwrap();
+        let val = Value::Text("z".repeat(1024));
+        let delta = agg.update(&val).unwrap();
+        assert!(
+            delta.grow_bytes >= estimate_value_size(&val),
+            "json_agg delta {delta:?} must cover the cloned value"
+        );
+    }
+
+    #[test]
+    fn test_state_delta_min_replacement_reports_shrink() {
+        let mut agg = Aggregator::new("MIN", None).unwrap();
+        let wide = Value::Text("m".repeat(512));
+        let grow = agg.update(&wide).unwrap();
+        assert!(grow.grow_bytes >= 512);
+        // A lexically-smaller, shorter value replaces the wide one.
+        let shrink = agg.update(&Value::Text("a".to_string())).unwrap();
+        assert!(
+            shrink.shrink_bytes > 0,
+            "replacing retained MIN state with a smaller value should shrink, got {shrink:?}"
+        );
+    }
+
+    #[test]
+    fn test_state_delta_sum_not_proportional_to_input_count() {
+        let mut agg = Aggregator::new("SUM", None).unwrap();
+        let mut charged = 0usize;
+        for i in 0..1000 {
+            charged += agg.update(&Value::Int32(i)).unwrap().grow_bytes;
+        }
+        // SUM retains one numeric value; growth must stay bounded by the
+        // state size, not the number of input rows.
+        assert!(
+            charged < 1024,
+            "SUM charged {charged} bytes over 1000 updates; state is fixed-size"
+        );
+    }
+
+    fn accumulating_len(agg: &Aggregator) -> (usize, usize) {
+        match agg {
+            Aggregator::ArrayAgg { values }
+            | Aggregator::JsonAgg { values }
+            | Aggregator::JsonbAgg { values } => (values.len(), values.capacity()),
+            Aggregator::StringAgg { entries } => (entries.len(), entries.capacity()),
+            _ => unreachable!("not an accumulating aggregator"),
+        }
+    }
+
+    #[test]
+    fn test_update_charged_admits_growth_before_allocation() {
+        // Every accumulating arm must follow the same shape: a rejected
+        // charge aborts before any allocation or state change (a full Vec's
+        // doubling is state-sized and needs admission first). Testing one
+        // arm of an N-arm pattern lets the siblings drift.
+        for kind in ["ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "STRING_AGG"] {
+            let mut agg = Aggregator::new(kind, None).unwrap();
+            // Fill exactly to capacity so the next push needs slot growth.
+            for i in 0..4 {
+                agg.update(&Value::Int32(i)).unwrap();
+            }
+            let (len_before, cap_before) = accumulating_len(&agg);
+            assert_eq!((len_before, cap_before), (4, 4), "{kind} setup");
+
+            let err = agg.update_charged(&Value::Int32(99), &mut |_| Err(anyhow!("quota")));
+            assert!(err.is_err(), "{kind} must propagate the rejection");
+            let (len, cap) = accumulating_len(&agg);
+            assert_eq!(len, 4, "{kind}: rejected update must not retain");
+            assert_eq!(cap, 4, "{kind}: rejected growth must not allocate");
+
+            // A successful charge admits payload plus the explicit slot
+            // growth before the push.
+            let mut charged = 0usize;
+            agg.update_charged(&Value::Int32(99), &mut |b| {
+                charged += b;
+                Ok(())
+            })
+            .unwrap();
+            let (len, cap) = accumulating_len(&agg);
+            assert_eq!((len, cap), (5, 8), "{kind} growth shape");
+            assert!(charged > 0, "{kind} must admit through the callback");
+        }
+    }
+
+    #[test]
+    fn test_string_agg_charged_admits_text_before_clone() {
+        let mut agg = Aggregator::new_string_agg();
+        let wide = Value::Text("w".repeat(1 << 20));
+        // The admitted amount must be known from the borrowed value: exactly
+        // payload + delimiter + initial slots, charged before the retained
+        // clone is built.
+        let mut charged = 0usize;
+        agg.update_string_agg_charged(&wide, "; ", &mut |b| {
+            charged += b;
+            Ok(())
+        })
+        .unwrap();
+        let expected_payload = (1 << 20) + 2;
+        assert!(
+            charged >= expected_payload,
+            "charge {charged} must cover the {expected_payload}-byte retained payload"
+        );
+        // Rejection leaves no retained entry.
+        let err = agg.update_string_agg_charged(&wide, "; ", &mut |_| Err(anyhow!("quota")));
+        assert!(err.is_err());
+        let Aggregator::StringAgg { entries } = &agg else {
+            unreachable!()
+        };
+        assert_eq!(entries.len(), 1);
+    }
+
+    // Consuming finalization contract (#2555 / #2612 review): state-sized
+    // output allocations must be admitted via the charge callback before they
+    // are materialized, and the produced values must match `result()`.
+
+    fn twin_aggregators(kind: &str, inputs: &[Value]) -> (Aggregator, Aggregator) {
+        let mut a = Aggregator::new(kind, None).unwrap();
+        let mut b = Aggregator::new(kind, None).unwrap();
+        for v in inputs {
+            a.update(v).unwrap();
+            b.update(v).unwrap();
+        }
+        (a, b)
+    }
+
+    fn charged_result(agg: &mut Aggregator) -> (Value, usize) {
+        let mut charged = 0usize;
+        let value = agg
+            .result_consuming(&mut |bytes| {
+                charged += bytes;
+                Ok(())
+            })
+            .unwrap();
+        (value, charged)
+    }
+
+    #[test]
+    fn test_result_consuming_string_agg_precharges_exact_output() {
+        let mut reference = Aggregator::new_string_agg();
+        let mut consuming = Aggregator::new_string_agg();
+        for i in 0..20 {
+            let v = Value::Text(format!("item-{i}-{}", "x".repeat(32)));
+            reference.update_string_agg(&v, "; ").unwrap();
+            consuming.update_string_agg(&v, "; ").unwrap();
+        }
+        let expected = reference.result().unwrap();
+        let (value, charged) = charged_result(&mut consuming);
+        assert_eq!(value, expected);
+        let Value::Text(s) = &value else {
+            panic!("string_agg must produce text");
+        };
+        assert_eq!(charged, s.len(), "charge must equal the real output size");
+    }
+
+    #[test]
+    fn test_result_consuming_array_agg_moves_without_charge() {
+        let inputs: Vec<Value> = (0..10).map(|i| Value::Text(format!("v{i}"))).collect();
+        let (reference, mut consuming) = twin_aggregators("ARRAY_AGG", &inputs);
+        let expected = reference.result().unwrap();
+        let (value, charged) = charged_result(&mut consuming);
+        assert_eq!(value, expected);
+        assert_eq!(charged, 0, "moving retained values must not allocate");
+    }
+
+    #[test]
+    fn test_result_consuming_json_agg_matches_and_covers_output() {
+        for kind in ["JSON_AGG", "JSONB_AGG"] {
+            let inputs: Vec<Value> = (0..10)
+                .map(|i| Value::Text(format!("needs \"escaping\" {i}")))
+                .collect();
+            let (reference, mut consuming) = twin_aggregators(kind, &inputs);
+            let expected = reference.result().unwrap();
+            let (value, charged) = charged_result(&mut consuming);
+            assert_eq!(
+                value, expected,
+                "{kind} consuming output must match result()"
+            );
+            let out_len = match &value {
+                Value::Json(s) | Value::Jsonb(s) => s.len(),
+                other => panic!("{kind} produced {other:?}"),
+            };
+            assert!(
+                charged >= out_len,
+                "{kind} charged {charged} bytes for {out_len} output bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_result_consuming_empty_accumulators_return_null_without_charge() {
+        for kind in ["STRING_AGG", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG"] {
+            let mut agg = Aggregator::new(kind, None).unwrap();
+            let (value, charged) = charged_result(&mut agg);
+            assert_eq!(value, Value::Null, "{kind} over empty input");
+            assert_eq!(charged, 0, "{kind} over empty input must charge nothing");
+        }
+    }
+
+    #[test]
+    fn test_result_consuming_charge_failure_aborts_finalization() {
+        let mut agg = Aggregator::new_string_agg();
+        agg.update_string_agg(&Value::Text("payload".to_string()), ",")
+            .unwrap();
+        let err = agg.result_consuming(&mut |_| Err(anyhow!("quota exceeded")));
+        assert!(err.is_err(), "charge rejection must abort finalization");
+    }
+
+    #[test]
+    fn test_result_consuming_fixed_size_aggregators_delegate() {
+        let inputs: Vec<Value> = (1..=5).map(Value::Int32).collect();
+        for kind in ["COUNT", "SUM", "MAX", "MIN", "AVG"] {
+            let (reference, mut consuming) = twin_aggregators(kind, &inputs);
+            let expected = reference.result().unwrap();
+            let (value, charged) = charged_result(&mut consuming);
+            assert_eq!(
+                value, expected,
+                "{kind} consuming output must match result()"
+            );
+            assert_eq!(charged, 0, "{kind} state is fixed-size; nothing to charge");
+        }
     }
 }

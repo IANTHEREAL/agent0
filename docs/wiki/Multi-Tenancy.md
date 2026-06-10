@@ -114,7 +114,7 @@ These caches have the same lifetime as the `TenantEntry`. When the reaper evicts
 | Resource | Control Mechanism | Configuration |
 |----------|-------------------|---------------|
 | QPS | `TokenBucket` rate limiter per `TenantEntry` | `DB9_TENANT_QPS_LIMIT` env var (0 = disabled) |
-| Memory | `TenantMemoryAccountant` with CAS-based accounting | `DB9_TENANT_MEMORY_QUOTA_BYTES` env var (0 = unlimited) |
+| Memory | `TenantMemoryAccountant` with CAS-based accounting | `DB9_TENANT_MEMORY_QUOTA_BYTES` env var (default 1 GiB; `0` = disabled — **no pod-OOM protection**, see #2555) |
 | Per-user connections | `user_connections` map in `TenantEntry` | `User.connection_limit` (rolconnlimit, -1 = unlimited) |
 | Global connections | `Semaphore` in `main.rs` accept loop | `DB9_MAX_CONNECTIONS` env var (default 1000) |
 

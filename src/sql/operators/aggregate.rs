@@ -1,10 +1,47 @@
+//! Hash aggregation with streaming input (#2555).
+//!
+//! `open()` consumes child rows one at a time and folds them into per-group
+//! aggregator state, so live memory is O(groups × state), never O(input rows).
+//!
+//! # Memory accounting contract
+//!
+//! Retained state is charged to the statement memory scope as a **cheap,
+//! conservative estimate measured from the real object after it is built**
+//! (capacity deltas around `push`, `estimate_*` on existing values):
+//!
+//! - O(1) work per update; never rescan whole aggregate state to recompute.
+//! - Accounting may over-estimate (rejecting slightly early is safe) and may
+//!   under-count at most one in-flight transient **of single-row/value
+//!   size**. The bound is on the transient's *size*, not just its count: any
+//!   allocation that scales with retained state (joined strings, cloned
+//!   value vectors, assembled JSON) must be admitted before it is
+//!   materialized, with its size computed from the real retained parts
+//!   (`Aggregator::result_consuming`). A row-sized transient cannot OOM a
+//!   process that admitted all retained state; a state-sized one can.
+//! - Over-charge is bounded the same way: **charges follow ownership**. When
+//!   a charged row/page/state moves to its consumer (rows handed out of
+//!   `next()`, state consumed by finalization), the source releases that
+//!   share as part of the transfer. Transient double-charge during a handoff
+//!   is bounded by the object being handed off, never by the accumulated
+//!   result set — unbounded over-charge fails queries that fit the budget,
+//!   which defeats the quota just as surely as under-counting OOMs it.
+//! - **Mechanism, not discipline:** buffers that hold charged rows across
+//!   method boundaries must use [`ChargedRowBuffer`], which owns the rows
+//!   and their charge in one place so they cannot desynchronize. Raw
+//!   `try_grow`/`try_shrink` pairs are allowed only when the grow and its
+//!   matching shrink are both visible within a single function body (the
+//!   per-group state and finalize accumulators in `open()` below).
+//! - Byte-exactness against the allocator is explicitly a **non-goal**; do
+//!   not add size predictors that shadow formatter/display internals.
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
+use super::charged_rows::{ChargedBuf, ChargedEntry, ChargedRowBuffer};
 use super::key_encoding::{encode_value_key, encode_values_key};
-use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
 use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
@@ -12,10 +49,8 @@ use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::memory::{
-    estimate_key_size, estimate_row_size, estimate_value_size, estimate_values_payload_size,
-};
-use crate::sql::Aggregator;
+use crate::sql::memory::{estimate_key_size, estimate_value_size, estimate_values_payload_size};
+use crate::sql::{AggregateStateDelta, Aggregator};
 
 #[derive(Debug, Clone)]
 pub struct AggregateExpr {
@@ -34,9 +69,9 @@ pub struct HashAggregateOperator {
     group_by_exprs: Vec<TypedExpr>,
     aggregate_exprs: Vec<AggregateExpr>,
     output_schema: TableSchema,
-    result_rows: Vec<Row>,
-    position: usize,
+    result_rows: ChargedRowBuffer,
     opened: bool,
+    child_closed: bool,
 }
 
 impl HashAggregateOperator {
@@ -66,9 +101,9 @@ impl HashAggregateOperator {
             group_by_exprs,
             aggregate_exprs,
             output_schema,
-            result_rows: Vec::new(),
-            position: 0,
+            result_rows: ChargedRowBuffer::new(),
             opened: false,
+            child_closed: true,
         }
     }
 
@@ -77,6 +112,58 @@ impl HashAggregateOperator {
             return Ok(Aggregator::new_string_agg());
         }
         Aggregator::new(&agg_expr.func_name, Some(return_type.clone()))
+    }
+
+    /// Fold one value into an aggregator. Retained growth is admitted inside
+    /// `update_charged` (before allocation) against the statement scope;
+    /// shrinks are released here. The returned delta is recorded into the
+    /// group's charge accumulator by the caller — its grows are already in
+    /// the scope and must not be re-charged.
+    fn apply_aggregate_update(
+        agg: &mut Aggregator,
+        val: &Value,
+        delimiter: &str,
+        is_string_agg: bool,
+    ) -> Result<AggregateStateDelta> {
+        let charge = &mut |bytes: usize| {
+            try_grow_statement_memory_scope("operators.hash_aggregate.aggregate_state", bytes)
+                .map_err(anyhow::Error::from)
+        };
+        let delta = if is_string_agg {
+            agg.update_string_agg_charged(val, delimiter, charge)?
+        } else {
+            agg.update_charged(val, charge)?
+        };
+        if delta.shrink_bytes > 0 {
+            try_shrink_statement_memory_scope(delta.shrink_bytes);
+        }
+        Ok(delta)
+    }
+
+    fn record_charged_delta(charged_bytes: &mut usize, delta: AggregateStateDelta) {
+        if delta.grow_bytes > 0 {
+            *charged_bytes = charged_bytes.saturating_add(delta.grow_bytes);
+        }
+        if delta.shrink_bytes > 0 {
+            *charged_bytes = charged_bytes.saturating_sub(delta.shrink_bytes);
+        }
+    }
+
+    fn push_result_row(&mut self, row: Row) -> Result<()> {
+        self.result_rows
+            .push("operators.hash_aggregate.result_rows", row)
+    }
+}
+
+/// Ordered-aggregate buffer entry: `(ORDER BY keys, value, delimiter)`.
+/// Slot bytes are accounted by the owning [`ChargedBuf`]; this reports heap
+/// payload only.
+impl ChargedEntry for (Vec<Value>, Value, String) {
+    fn charged_size(&self) -> usize {
+        estimate_values_payload_size(&self.0) + estimate_value_size(&self.1) + self.2.len()
+    }
+    fn hollow() -> Self {
+        (Vec::new(), Value::Null, String::new())
     }
 }
 
@@ -87,25 +174,24 @@ impl PhysicalOperator for HashAggregateOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.result_rows.reset();
         self.child.open(ctx).await?;
-
-        let input_rows = collect_all(self.child.as_mut(), ctx).await?;
-        let input_rows_charged_bytes: usize = input_rows.iter().map(estimate_row_size).sum();
+        self.child_closed = false;
 
         struct GroupState {
             group_values: Vec<Value>,
             aggregators: Vec<Aggregator>,
             seen_distinct: Vec<HashSet<Vec<u8>>>,
-            ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value, String)>>>,
+            ordered_agg_buffers: Vec<Option<ChargedBuf<(Vec<Value>, Value, String)>>>,
             charged_bytes: usize,
         }
 
         let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
 
-        for row in &input_rows {
+        while let Some(row) = self.child.next(ctx).await? {
             let mut group_key_values = Vec::new();
             for expr in &self.group_by_exprs {
-                let val = eval_typed_expr(expr, row, ctx.query_ctx)?;
+                let val = eval_typed_expr(expr, &row, ctx.query_ctx)?;
                 group_key_values.push(val);
             }
 
@@ -125,18 +211,21 @@ impl PhysicalOperator for HashAggregateOperator {
                 let seen_distinct: Vec<HashSet<Vec<u8>>> = (0..self.aggregate_exprs.len())
                     .map(|_| HashSet::new())
                     .collect();
-                let ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value, String)>>> = self
-                    .aggregate_exprs
-                    .iter()
-                    .map(|agg_expr| {
-                        if !agg_expr.order_by.is_empty() {
-                            Some(Vec::new())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let group_overhead_bytes = std::mem::size_of::<(Vec<u8>, GroupState)>()
+                let ordered_agg_buffers: Vec<Option<ChargedBuf<(Vec<Value>, Value, String)>>> =
+                    self.aggregate_exprs
+                        .iter()
+                        .map(|agg_expr| {
+                            if !agg_expr.order_by.is_empty() {
+                                Some(ChargedBuf::new())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                // Two table slots per entry are prepaid so every future
+                // bucket-array doubling of `groups` is admitted before it
+                // allocates (same amortization as the distinct sets below).
+                let group_overhead_bytes = 2 * (std::mem::size_of::<(Vec<u8>, GroupState)>() + 1)
                     + key_bytes.len()
                     + estimate_values_payload_size(&group_key_values)
                     + std::mem::size_of_val(aggregators.as_slice())
@@ -169,7 +258,7 @@ impl PhysicalOperator for HashAggregateOperator {
                             .executor
                             .materialize_expr_for_row(
                                 filter_expr,
-                                row,
+                                &row,
                                 ctx.outer_row.as_ref(),
                                 Some(self.child.schema()),
                                 ctx.txn,
@@ -180,9 +269,9 @@ impl PhysicalOperator for HashAggregateOperator {
                                 ctx.query_ctx,
                             )
                             .await?;
-                        eval_typed_expr(&mat, row, ctx.query_ctx)?
+                        eval_typed_expr(&mat, &row, ctx.query_ctx)?
                     } else {
-                        eval_typed_expr(filter_expr, row, ctx.query_ctx)?
+                        eval_typed_expr(filter_expr, &row, ctx.query_ctx)?
                     };
                     if !matches!(filter_val, Value::Boolean(true)) {
                         continue;
@@ -195,7 +284,7 @@ impl PhysicalOperator for HashAggregateOperator {
                             .executor
                             .materialize_expr_for_row(
                                 arg,
-                                row,
+                                &row,
                                 ctx.outer_row.as_ref(),
                                 Some(self.child.schema()),
                                 ctx.txn,
@@ -206,9 +295,9 @@ impl PhysicalOperator for HashAggregateOperator {
                                 ctx.query_ctx,
                             )
                             .await?;
-                        eval_typed_expr(&mat, row, ctx.query_ctx)?
+                        eval_typed_expr(&mat, &row, ctx.query_ctx)?
                     } else {
-                        eval_typed_expr(arg, row, ctx.query_ctx)?
+                        eval_typed_expr(arg, &row, ctx.query_ctx)?
                     }
                 } else {
                     Value::Int32(1)
@@ -216,14 +305,24 @@ impl PhysicalOperator for HashAggregateOperator {
 
                 if agg_expr.distinct {
                     let val_bytes = encode_value_key(&val);
-                    let distinct_entry_bytes = estimate_key_size(val_bytes.as_slice());
-                    if !state.seen_distinct[i].insert(val_bytes) {
+                    if state.seen_distinct[i].contains(&val_bytes) {
                         continue;
                     }
+                    // Admit before the insert retains the key or doubles the
+                    // table. The per-entry charge prepays two slots, which
+                    // amortizes every future bucket-array doubling (a
+                    // doubling at len N allocates N slots; the N entries
+                    // already prepaid 2N), so growth never allocates ahead
+                    // of admission. The first allocation is under-prepaid by
+                    // a constant handful of slots — bounded, within
+                    // contract.
+                    let distinct_entry_bytes = estimate_key_size(val_bytes.as_slice())
+                        .saturating_add(2 * (std::mem::size_of::<Vec<u8>>() + 1));
                     try_grow_statement_memory_scope(
                         "operators.hash_aggregate.seen_distinct",
                         distinct_entry_bytes,
                     )?;
+                    state.seen_distinct[i].insert(val_bytes);
                     state.charged_bytes = state.charged_bytes.saturating_add(distinct_entry_bytes);
                 }
 
@@ -235,7 +334,7 @@ impl PhysicalOperator for HashAggregateOperator {
                                 .executor
                                 .materialize_expr_for_row(
                                     delim_expr,
-                                    row,
+                                    &row,
                                     ctx.outer_row.as_ref(),
                                     Some(self.child.schema()),
                                     ctx.txn,
@@ -246,9 +345,9 @@ impl PhysicalOperator for HashAggregateOperator {
                                     ctx.query_ctx,
                                 )
                                 .await?;
-                            eval_typed_expr(&mat, row, ctx.query_ctx)?
+                            eval_typed_expr(&mat, &row, ctx.query_ctx)?
                         } else {
-                            eval_typed_expr(delim_expr, row, ctx.query_ctx)?
+                            eval_typed_expr(delim_expr, &row, ctx.query_ctx)?
                         };
                         match dv {
                             Value::Text(s) => s,
@@ -271,7 +370,7 @@ impl PhysicalOperator for HashAggregateOperator {
                                 .executor
                                 .materialize_expr_for_row(
                                     &o.expr,
-                                    row,
+                                    &row,
                                     ctx.outer_row.as_ref(),
                                     Some(self.child.schema()),
                                     ctx.txn,
@@ -282,63 +381,81 @@ impl PhysicalOperator for HashAggregateOperator {
                                     ctx.query_ctx,
                                 )
                                 .await?;
-                            eval_typed_expr(&mat, row, ctx.query_ctx)?
+                            eval_typed_expr(&mat, &row, ctx.query_ctx)?
                         } else {
-                            eval_typed_expr(&o.expr, row, ctx.query_ctx)?
+                            eval_typed_expr(&o.expr, &row, ctx.query_ctx)?
                         };
                         keys.push(key);
                     }
-                    let ordered_entry_bytes = std::mem::size_of::<(Vec<Value>, Value, String)>()
-                        + estimate_values_payload_size(&keys)
-                        + estimate_value_size(&val)
-                        + row_delimiter.len();
-                    try_grow_statement_memory_scope(
+                    // The buffer owns its payload+slot charge (admitted
+                    // before allocation inside push) and releases it as
+                    // entries are drained or when it is dropped — it never
+                    // enters the group accumulator.
+                    buf.push(
                         "operators.hash_aggregate.ordered_buffer",
-                        ordered_entry_bytes,
+                        (keys, val, row_delimiter),
                     )?;
-                    state.charged_bytes = state.charged_bytes.saturating_add(ordered_entry_bytes);
-                    buf.push((keys, val, row_delimiter));
-                } else if agg_expr.func_name == "STRING_AGG" {
-                    state.aggregators[i].update_string_agg(&val, &row_delimiter)?;
                 } else {
-                    state.aggregators[i].update(&val)?;
+                    let delta = Self::apply_aggregate_update(
+                        &mut state.aggregators[i],
+                        &val,
+                        &row_delimiter,
+                        agg_expr.func_name == "STRING_AGG",
+                    )?;
+                    Self::record_charged_delta(&mut state.charged_bytes, delta);
                 }
             }
         }
-        // `collect_all` rows are no longer retained after grouping.
-        // Drop first so runtime accounting matches live allocations.
-        drop(input_rows);
-        try_shrink_statement_memory_scope(input_rows_charged_bytes);
 
-        self.result_rows.clear();
+        self.child.close(ctx).await?;
+        self.child_closed = true;
 
         if groups.is_empty() && self.group_by_exprs.is_empty() {
             let mut values = Vec::new();
+            let mut finalize_charged = 0usize;
             for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
                 let rt = &self.output_schema.columns[i].data_type;
-                let agg = Self::create_aggregator(agg_expr, rt)?;
-                values.push(agg.result()?);
+                let mut agg = Self::create_aggregator(agg_expr, rt)?;
+                values.push(agg.result_consuming(&mut |bytes| {
+                    try_grow_statement_memory_scope("operators.hash_aggregate.finalize", bytes)?;
+                    finalize_charged = finalize_charged.saturating_add(bytes);
+                    Ok(())
+                })?);
             }
             let out_row = Row::new(values);
-            try_grow_statement_memory_scope(
-                "operators.hash_aggregate.result_rows",
-                estimate_row_size(&out_row),
-            )?;
-            self.result_rows.push(out_row);
+            self.push_result_row(out_row)?;
+            try_shrink_statement_memory_scope(finalize_charged);
         } else {
+            // In-contract (see the memory-accounting contract on
+            // `TenantMemoryAccountant` in pool.rs): consuming `groups` by
+            // IntoIter keeps the whole hashbrown bucket array resident until
+            // this loop ends, while each group's `charged_bytes` (incl. the
+            // 2-slot bucket prepay) is released per-group below. The
+            // released-early window is the bucket array only — O(group count),
+            // ~256 B/group, already admitted at build time and bounded by a
+            // single map. That is a release-timing artifact within the
+            // constant-factor headroom, not an O(input) under-count, so it is
+            // deliberately not point-fixed here; routing the groups map (and
+            // `seen_distinct`) through a charged collection is the successor-
+            // epic class fix.
             for (_, state) in groups {
                 let GroupState {
                     group_values,
                     aggregators,
                     mut ordered_agg_buffers,
-                    charged_bytes,
+                    mut charged_bytes,
                     ..
                 } = state;
                 let mut values = group_values;
+                // Finalization charges (result strings/arrays/JSON assembled by
+                // `result_consuming`) are admitted here and released right after
+                // `push_result_row` re-charges the retained row, so the
+                // double-charge window is one group, not the whole result set.
+                let mut finalize_charged = 0usize;
                 for (i, mut agg) in aggregators.into_iter().enumerate() {
                     if let Some(mut buf) = ordered_agg_buffers.get_mut(i).and_then(Option::take) {
                         let order_by = &self.aggregate_exprs[i].order_by;
-                        sort_by_fallible(&mut buf, |(keys_a, _, _), (keys_b, _, _)| {
+                        sort_by_fallible(buf.as_mut_slice(), |(keys_a, _, _), (keys_b, _, _)| {
                             for (key_idx, order_expr) in order_by.iter().enumerate() {
                                 let asc = order_expr.asc;
                                 let nulls_first = order_expr.nulls_first;
@@ -355,28 +472,46 @@ impl PhysicalOperator for HashAggregateOperator {
                             Ok(std::cmp::Ordering::Equal)
                         })?;
                         let is_string_agg = self.aggregate_exprs[i].func_name == "STRING_AGG";
-                        for (_, sorted_value, delim) in buf {
-                            if is_string_agg {
-                                agg.update_string_agg(&sorted_value, &delim)?;
-                            } else {
-                                agg.update(&sorted_value)?;
-                            }
+                        // take_next releases each entry's payload share as it
+                        // is consumed (the update re-admits what the
+                        // aggregator retains); dropping the buffer right
+                        // after releases its slot charge with the freed
+                        // allocation, before finalization needs quota.
+                        while let Some((_, sorted_value, delim)) = buf.take_next() {
+                            let delta = Self::apply_aggregate_update(
+                                &mut agg,
+                                &sorted_value,
+                                &delim,
+                                is_string_agg,
+                            )?;
+                            Self::record_charged_delta(&mut charged_bytes, delta);
                         }
+                        drop(buf);
                     }
-                    values.push(agg.result()?);
+                    values.push(agg.result_consuming(&mut |bytes| {
+                        try_grow_statement_memory_scope(
+                            "operators.hash_aggregate.finalize",
+                            bytes,
+                        )?;
+                        finalize_charged = finalize_charged.saturating_add(bytes);
+                        Ok(())
+                    })?);
                 }
-                let out_row = Row::new(values);
-                try_grow_statement_memory_scope(
-                    "operators.hash_aggregate.result_rows",
-                    estimate_row_size(&out_row),
-                )?;
-                self.result_rows.push(out_row);
+                // The aggregators consumed their retained state in
+                // result_consuming (and the ordered buffers were drained by
+                // the replay), so release the state charge before charging
+                // the result row — otherwise state + finalize + row are all
+                // charged at once, demanding ~3x quota for a single huge
+                // group whose real peak is the result plus its in-flight
+                // copy.
                 drop(ordered_agg_buffers);
                 try_shrink_statement_memory_scope(charged_bytes);
+                let out_row = Row::new(values);
+                self.push_result_row(out_row)?;
+                try_shrink_statement_memory_scope(finalize_charged);
             }
         }
 
-        self.position = 0;
         self.opened = true;
         Ok(())
     }
@@ -385,23 +520,22 @@ impl PhysicalOperator for HashAggregateOperator {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
-
-        if self.position < self.result_rows.len() {
-            let row = self.result_rows[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
-        }
+        // ChargedRowBuffer hands the row out by move and releases its charge
+        // share with the transfer (the consumer charges its own retention).
+        Ok(self.result_rows.take_next())
     }
 
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.child.close(ctx).await?;
-        let retained_bytes: usize = self.result_rows.iter().map(estimate_row_size).sum();
-        try_shrink_statement_memory_scope(retained_bytes);
-        self.result_rows.clear();
+        let child_close_result = if self.child_closed {
+            Ok(())
+        } else {
+            let result = self.child.close(ctx).await;
+            self.child_closed = true;
+            result
+        };
+        self.result_rows.reset();
         self.opened = false;
-        Ok(())
+        child_close_result
     }
 
     #[cfg(test)]

@@ -56,6 +56,33 @@ async fn scan_one_page(
     Ok((pairs, next_start))
 }
 
+/// Resumable cursor over a table-data key range, yielding bounded pages of
+/// rows (#2555). Holding the cursor between pages keeps no row data alive:
+/// only the continuation key, so operator memory stays O(one page).
+#[derive(Debug)]
+pub struct RowScanCursor {
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl RowScanCursor {
+    fn new(start_key: Vec<u8>, end_key: Vec<u8>, limit: Option<usize>) -> Self {
+        let remaining = limit.unwrap_or(usize::MAX);
+        Self {
+            start_key,
+            end_key,
+            remaining,
+            exhausted: remaining == 0,
+        }
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
 impl TikvStore {
     /// Build pessimistic lock keys for the given rows.
     ///
@@ -728,6 +755,75 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Begin a paginated scan over a table's full data range.
+    ///
+    /// Resolves the schema once (erroring here if the table does not exist)
+    /// so subsequent [`Self::scan_cursor_next_page`] calls do no metadata IO.
+    pub async fn table_scan_cursor(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        limit: Option<usize>,
+    ) -> Result<RowScanCursor> {
+        let schema = self
+            .get_schema(txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+        Ok(RowScanCursor::new(
+            self.key(&raw_start),
+            self.key(&raw_end),
+            limit,
+        ))
+    }
+
+    /// Begin a paginated scan over rows whose physical PK encoding starts with
+    /// `pk_prefix_values`. Performs no IO; the range is computed locally.
+    pub fn pk_prefix_scan_cursor(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        pk_prefix_values: &[Value],
+        limit: Option<usize>,
+    ) -> RowScanCursor {
+        let row_prefix = encode_pk_values(pk_prefix_values);
+        let raw_start = encode_data_key_v2(db_id, table_id, &row_prefix);
+        let raw_end = encode_prefix_end(&raw_start);
+        RowScanCursor::new(self.key(&raw_start), self.key(&raw_end), limit)
+    }
+
+    /// Fetch the next page (at most `TABLE_SCAN_BATCH_SIZE` rows) for a
+    /// cursor. An empty result means the scan is exhausted.
+    pub async fn scan_cursor_next_page(
+        &self,
+        txn: &mut Transaction,
+        cursor: &mut RowScanCursor,
+    ) -> Result<Vec<Row>> {
+        if cursor.exhausted {
+            return Ok(Vec::new());
+        }
+        let batch_size = std::cmp::min(TABLE_SCAN_BATCH_SIZE as usize, cursor.remaining) as u32;
+        let (pairs, next_start) = scan_one_page(
+            txn,
+            cursor.start_key.clone(),
+            cursor.end_key.clone(),
+            batch_size,
+        )
+        .await?;
+        let mut rows = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            rows.push(deserialize_row(pair.value())?);
+        }
+        kv_stats::record_table_scan_pairs(rows.len());
+        cursor.remaining = cursor.remaining.saturating_sub(rows.len());
+        match next_start {
+            Some(k) if cursor.remaining > 0 => cursor.start_key = k,
+            _ => cursor.exhausted = true,
+        }
+        Ok(rows)
+    }
+
     /// Scan all rows from a table (paginated to avoid gRPC message size overflow).
     pub async fn scan(
         &self,
@@ -736,35 +832,17 @@ impl TikvStore {
         table_name: &str,
         limit: Option<usize>,
     ) -> Result<Vec<Row>> {
-        let schema = self
-            .get_schema(txn, db_id, table_name)
-            .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
-        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
-        let end_key = self.key(&raw_end);
-        let mut start_key = self.key(&raw_start);
-        let total_limit = limit.unwrap_or(usize::MAX);
+        let mut cursor = self
+            .table_scan_cursor(txn, db_id, table_name, limit)
+            .await?;
         let mut rows = Vec::new();
-
-        loop {
-            if rows.len() >= total_limit {
+        while !cursor.exhausted() {
+            let page = self.scan_cursor_next_page(txn, &mut cursor).await?;
+            if page.is_empty() {
                 break;
             }
-            let remaining = total_limit - rows.len();
-            let batch_size = std::cmp::min(TABLE_SCAN_BATCH_SIZE as usize, remaining) as u32;
-            let (pairs, next_start) =
-                scan_one_page(txn, start_key.clone(), end_key.clone(), batch_size).await?;
-            for pair in pairs {
-                let row = deserialize_row(pair.value())?;
-                rows.push(row);
-            }
-            match next_start {
-                Some(k) => start_key = k,
-                None => break,
-            }
+            rows.extend(page);
         }
-
-        kv_stats::record_table_scan_pairs(rows.len());
         debug!("Scanned {} rows from '{}'", rows.len(), table_name);
         Ok(rows)
     }
@@ -833,33 +911,15 @@ impl TikvStore {
         pk_prefix_values: &[Value],
         limit: Option<usize>,
     ) -> Result<Vec<Row>> {
-        let row_prefix = encode_pk_values(pk_prefix_values);
-        let raw_start = encode_data_key_v2(db_id, table_id, &row_prefix);
-        let raw_end = encode_prefix_end(&raw_start);
-        let end_key = self.key(&raw_end);
-        let mut start_key = self.key(&raw_start);
-        let total_limit = limit.unwrap_or(usize::MAX);
+        let mut cursor = self.pk_prefix_scan_cursor(db_id, table_id, pk_prefix_values, limit);
         let mut rows = Vec::new();
-
-        loop {
-            if rows.len() >= total_limit {
+        while !cursor.exhausted() {
+            let page = self.scan_cursor_next_page(txn, &mut cursor).await?;
+            if page.is_empty() {
                 break;
             }
-            let remaining = total_limit - rows.len();
-            let batch_size = std::cmp::min(TABLE_SCAN_BATCH_SIZE as usize, remaining) as u32;
-            let (pairs, next_start) =
-                scan_one_page(txn, start_key.clone(), end_key.clone(), batch_size).await?;
-            let batch_len = pairs.len();
-            for pair in pairs {
-                rows.push(deserialize_row(pair.value())?);
-            }
-            kv_stats::record_table_scan_pairs(batch_len);
-            match next_start {
-                Some(k) => start_key = k,
-                None => break,
-            }
+            rows.extend(page);
         }
-
         Ok(rows)
     }
 
