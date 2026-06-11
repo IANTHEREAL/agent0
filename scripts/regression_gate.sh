@@ -330,13 +330,21 @@ PY
 }
 
 worker_is_enabled() {
-  local raw="${DB9_WORKER_ENABLED:-1}"
+  local raw="1"
+  if [[ -n "${DB9_WORKER_ENABLED+x}" ]]; then
+    raw="$DB9_WORKER_ENABLED"
+  fi
   local raw_lc
   raw_lc="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  raw_lc="${raw_lc#"${raw_lc%%[![:space:]]*}"}"
+  raw_lc="${raw_lc%"${raw_lc##*[![:space:]]}"}"
   case "$raw_lc" in
     1|true|t|yes|y|on) return 0 ;;
     0|false|f|no|n|off) return 1 ;;
-    *) return 0 ;;
+    *)
+      echo "WARNING: DB9_WORKER_ENABLED='${raw}' is not a valid boolean; treating worker as disabled." >&2
+      return 1
+      ;;
   esac
 }
 
