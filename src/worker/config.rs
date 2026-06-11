@@ -95,8 +95,18 @@ impl WorkerConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = env::var("DB9_WORKER_ENABLED") {
-            cfg.enabled = parse_bool(&v).unwrap_or(cfg.enabled);
+        let worker_enabled_raw = env::var("DB9_WORKER_ENABLED").ok();
+        if let Some(v) = worker_enabled_raw.as_deref() {
+            match parse_bool(v) {
+                Some(enabled) => cfg.enabled = enabled,
+                None => {
+                    tracing::warn!(
+                        "DB9_WORKER_ENABLED='{}' is not a valid boolean; disabling worker",
+                        v
+                    );
+                    cfg.enabled = false;
+                }
+            }
         }
         if let Ok(v) = env::var("DB9_WORKER_POLL_MS") {
             match v.parse::<u64>() {
@@ -298,6 +308,12 @@ impl WorkerConfig {
             }
         }
 
+        tracing::info!(
+            "Worker config loaded: DB9_WORKER_ENABLED raw='{}', resolved={}",
+            worker_enabled_raw.as_deref().unwrap_or("<unset>"),
+            cfg.enabled
+        );
+
         cfg
     }
 
@@ -491,8 +507,51 @@ mod tests {
 
     #[test]
     fn test_parse_bool_invalid() {
-        for input in &["maybe", "", "2", "yep", "nope", "enabled"] {
+        for input in &["maybe", "", "2", "yep", "nope", "enabled", "live=false"] {
             assert_eq!(parse_bool(input), None, "input: {}", input);
+        }
+    }
+
+    #[test]
+    fn from_env_applies_worker_enabled_false() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_ENABLED";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "false");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert!(!cfg.enabled);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_invalid_worker_enabled_fails_closed() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_ENABLED";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "live=false");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert!(
+            !cfg.enabled,
+            "invalid DB9_WORKER_ENABLED must not leave the worker enabled"
+        );
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
         }
     }
 
