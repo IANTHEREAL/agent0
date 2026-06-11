@@ -111,7 +111,7 @@ pub use crate::model::IndexState;
 pub struct TaskRegistryEntry {
     pub keyspace: String,
     pub db_id: u64,
-    pub task_types: u8, // bitmask: 0x01=cron, 0x02=async_trigger, 0x04=auto_analyze, 0x08=bg_ddl, 0x10=bg_sql
+    pub task_types: u8, // bitmask: cron/async_trigger/auto_analyze/bg_ddl/bg_sql/hnsw/storage/ddl_journal
     pub job_count: u32, // hint for load balancing, not required to be exact
     pub registered_at: i64, // epoch ms
 }
@@ -246,6 +246,21 @@ impl TaskRegistryEntry {
     #[allow(dead_code)]
     pub fn clear_storage_size_scan(&mut self) {
         self.task_types &= !TASK_TYPE_STORAGE_SIZE_SCAN;
+    }
+
+    #[allow(dead_code)]
+    pub fn has_ddl_journal(&self) -> bool {
+        self.task_types & TASK_TYPE_DDL_JOURNAL != 0
+    }
+
+    #[allow(dead_code)]
+    pub fn set_ddl_journal(&mut self) {
+        self.task_types |= TASK_TYPE_DDL_JOURNAL;
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_ddl_journal(&mut self) {
+        self.task_types &= !TASK_TYPE_DDL_JOURNAL;
     }
 
     #[allow(dead_code)]
@@ -559,6 +574,12 @@ mod tests {
         assert_eq!(TaskType::AutoAnalyze.to_bitmask(), TASK_TYPE_AUTO_ANALYZE);
         assert_eq!(TaskType::BgDdl.to_bitmask(), TASK_TYPE_BG_DDL);
         assert_eq!(TaskType::BgSql.to_bitmask(), TASK_TYPE_BG_SQL);
+        assert_eq!(TaskType::HnswMerge.to_bitmask(), TASK_TYPE_HNSW_MERGE);
+        assert_eq!(
+            TaskType::StorageSizeScan.to_bitmask(),
+            TASK_TYPE_STORAGE_SIZE_SCAN
+        );
+        assert_eq!(TaskType::DdlJournal.to_bitmask(), TASK_TYPE_DDL_JOURNAL);
     }
 
     // ── V2 descriptor / payload split (issue #2576) ──────────────────────
@@ -690,6 +711,18 @@ mod tests {
             TaskType::from_bitmask(TASK_TYPE_BG_SQL),
             Some(TaskType::BgSql)
         );
+        assert_eq!(
+            TaskType::from_bitmask(TASK_TYPE_HNSW_MERGE),
+            Some(TaskType::HnswMerge)
+        );
+        assert_eq!(
+            TaskType::from_bitmask(TASK_TYPE_STORAGE_SIZE_SCAN),
+            Some(TaskType::StorageSizeScan)
+        );
+        assert_eq!(
+            TaskType::from_bitmask(TASK_TYPE_DDL_JOURNAL),
+            Some(TaskType::DdlJournal)
+        );
         assert_eq!(TaskType::from_bitmask(0), None);
     }
 
@@ -703,6 +736,7 @@ mod tests {
         let mut entry = TaskRegistryEntry::new("default".to_string(), 1);
         assert!(!entry.has_cron());
         assert!(!entry.has_async_trigger());
+        assert!(!entry.has_ddl_journal());
 
         entry.set_cron();
         assert!(entry.has_cron());
@@ -711,12 +745,19 @@ mod tests {
         entry.set_async_trigger();
         assert!(entry.has_cron());
         assert!(entry.has_async_trigger());
+        assert!(!entry.has_ddl_journal());
+
+        entry.set_ddl_journal();
+        assert!(entry.has_ddl_journal());
 
         entry.clear_cron();
         assert!(!entry.has_cron());
         assert!(entry.has_async_trigger());
+        assert!(entry.has_ddl_journal());
 
         entry.clear_async_trigger();
+        assert!(!entry.is_empty());
+        entry.clear_ddl_journal();
         assert!(entry.is_empty());
     }
 
@@ -836,8 +877,10 @@ mod tests {
         let mut entry = TaskRegistryEntry::new("ks".to_string(), 1);
         entry.set_cron();
         entry.set_bg_ddl();
+        entry.set_ddl_journal();
         assert!(entry.has_cron());
         assert!(entry.has_bg_ddl());
+        assert!(entry.has_ddl_journal());
         assert!(!entry.has_bg_sql());
         assert!(!entry.has_async_trigger());
         assert!(!entry.has_auto_analyze());

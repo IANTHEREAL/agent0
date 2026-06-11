@@ -460,6 +460,76 @@ fn storage_size_scan_tracks_its_long_lived_read_transaction() {
 }
 
 #[test]
+fn registry_batch_from_cursor_wraps_and_clamps() {
+    let entries = (0..5)
+        .map(|i| TaskRegistryEntry::new(format!("tenant_{i}"), i))
+        .collect::<Vec<_>>();
+
+    let batch = registry_batch_from_cursor(&entries, 3, 4);
+    let keys = batch
+        .iter()
+        .map(|entry| entry.keyspace.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["tenant_3", "tenant_4", "tenant_0", "tenant_1"]);
+
+    let oversized = registry_batch_from_cursor(&entries, 0, 99);
+    assert_eq!(oversized.len(), entries.len());
+
+    let empty: Vec<TaskRegistryEntry> = Vec::new();
+    assert!(registry_batch_from_cursor(&empty, 0, 1).is_empty());
+}
+
+#[test]
+fn worker_startup_does_not_run_unbounded_registry_fanout() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let startup_source = prod_source
+        .split("pub async fn run(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("let mut interval =").next())
+        .expect("WorkerEngine::run startup block must exist");
+
+    assert!(
+        startup_source.contains("self.reconcile_ddl_journal().await"),
+        "startup must keep DDL journal crash recovery"
+    );
+    assert!(
+        !startup_source.contains("reconcile_hnsw_merges"),
+        "startup must not synchronously scan every registry entry for HNSW deltas"
+    );
+    assert!(
+        !startup_source.contains("reconcile_storage_scans"),
+        "startup must not synchronously enqueue storage scans for every registry entry"
+    );
+    assert!(
+        !startup_source.contains("warm_load_storage_stats"),
+        "startup must not warm-load storage stats by acquiring every tenant store"
+    );
+}
+
+#[test]
+fn ddl_journal_reconciliation_filters_registry_bit_before_tenant_acquire() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let reconcile_fn = prod_source
+        .split("async fn reconcile_ddl_journal(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn reconcile_ddl_journal_for_db").next())
+        .expect("reconcile_ddl_journal must exist before per-db helper");
+
+    assert!(
+        reconcile_fn.contains("entry.has_ddl_journal()"),
+        "DDL journal startup recovery must only acquire tenants with TASK_TYPE_DDL_JOURNAL set"
+    );
+}
+
+#[test]
 fn hnsw_startup_sweep_tracks_its_read_transaction() {
     let source = include_str!("../engine.rs");
     let prod_source = source
@@ -1134,14 +1204,11 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "execute_task",
         // [lookup] Reads schema for one table; immediate commit.
         "execute_bg_ddl_backfill",
-        // [reconcile] Reads registry list (small metadata) + immediate commit.
+        // [reconcile] Reads registry list (small metadata) + immediate commit,
+        // then processes a bounded tenant batch.
         "reconcile_storage_scans",
-        // [reconcile] Reads registry list (small metadata) + immediate commit.
-        "reconcile_hnsw_merges",
         // [enqueue] Single put to system store queue + commit.
         "enqueue_storage_scan",
-        // [reconcile] Reads registry + iterates DBs to warm cache; read-only + rollback.
-        "warm_load_storage_stats",
         // [finalize] Single stats key write after scan completes; immediate commit.
         // (The long-lived scan txn in execute_storage_size_scan IS tracked; this is
         // just the final persist_txn that writes the result.)
@@ -1158,7 +1225,7 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "publish_gc_instance_state",
         // [lookup] Read all GC instance states (small registry) + rollback.
         "advance_gc_safepoint",
-        // [reconcile] Read registry list + immediate commit.
+        // [reconcile] Read registry list + immediate commit, then process a bounded tenant batch.
         "sweep_hnsw_delta_backlogs",
         // [reconcile] Read registry list + immediate commit.
         "cleanup_cron_runs",

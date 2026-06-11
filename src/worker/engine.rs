@@ -30,7 +30,7 @@ use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tikv_client::TimestampExt;
@@ -58,6 +58,7 @@ pub struct WorkerEngine {
     metrics: Arc<WorkerMetrics>,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
+    storage_reconcile_cursor: AtomicUsize,
 }
 
 struct ActiveJobGuard {
@@ -93,6 +94,22 @@ fn keep_queue_entry_for_claim_status(claim_status: CronRunClaimStatus) -> Option
     }
 }
 
+pub(crate) fn registry_batch_from_cursor(
+    entries: &[TaskRegistryEntry],
+    cursor: usize,
+    batch_size: usize,
+) -> Vec<&TaskRegistryEntry> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    let limit = batch_size.max(1).min(entries.len());
+    let start = cursor % entries.len();
+    (0..limit)
+        .map(|offset| &entries[(start + offset) % entries.len()])
+        .collect()
+}
+
 impl WorkerEngine {
     pub fn new(
         config: WorkerConfig,
@@ -112,6 +129,7 @@ impl WorkerEngine {
             metrics: Arc::new(WorkerMetrics::new()),
             notify,
             shutdown,
+            storage_reconcile_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -140,26 +158,6 @@ impl WorkerEngine {
         }
         if let Err(e) = self.reconcile_ddl_journal().await {
             warn!("DDL journal recovery failed (engine will continue): {}", e);
-        }
-        if let Err(e) = self.reconcile_hnsw_merges().await {
-            warn!(
-                "HNSW merge reconciliation failed (engine will continue): {}",
-                e
-            );
-        }
-
-        if let Err(e) = warm_load_storage_stats(&self.pool, &self.system_store).await {
-            warn!(
-                "Storage stats warm-load failed (engine will continue): {}",
-                e
-            );
-        }
-
-        if let Err(e) = self.reconcile_storage_scans().await {
-            warn!(
-                "Storage scan reconciliation failed (engine will continue): {}",
-                e
-            );
         }
 
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
@@ -542,6 +540,9 @@ impl WorkerEngine {
         sys_txn.commit().await?;
 
         for entry in registry_entries {
+            if !entry.has_ddl_journal() {
+                continue;
+            }
             if let Err(e) = self
                 .reconcile_ddl_journal_for_db(&entry.keyspace, entry.db_id)
                 .await
@@ -1595,8 +1596,22 @@ impl WorkerEngine {
         let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
         txn.commit().await?;
 
+        let cursor = self.storage_reconcile_cursor.load(Ordering::Relaxed);
+        let batch_entries = registry_batch_from_cursor(
+            &registry_entries,
+            cursor,
+            self.config.registry_reconcile_batch_size,
+        );
+        if !registry_entries.is_empty() {
+            self.storage_reconcile_cursor.store(
+                (cursor + batch_entries.len()) % registry_entries.len(),
+                Ordering::Relaxed,
+            );
+        }
+
         let mut total_enqueued = 0u32;
-        for entry in &registry_entries {
+        let mut total_databases = 0u32;
+        for entry in &batch_entries {
             let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
                 Ok(h) => h,
                 Err(_) => continue,
@@ -1607,6 +1622,7 @@ impl WorkerEngine {
             tenant_txn.rollback().await.ok();
 
             for db in databases {
+                total_databases += 1;
                 if let Err(e) =
                     enqueue_storage_scan(&self.system_store, &entry.keyspace, db.id).await
                 {
@@ -1620,46 +1636,13 @@ impl WorkerEngine {
             }
         }
 
-        if total_enqueued > 0 {
-            info!(total_enqueued, "Storage scan reconciliation complete");
-        }
-        Ok(())
-    }
-
-    async fn reconcile_hnsw_merges(&self) -> Result<()> {
-        let mut txn = self.system_store.begin().await?;
-        let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
-        txn.commit().await?;
-
-        let mut total_enqueued = 0u32;
-        let mut total_observed = 0u32;
-        // Iterate ALL entries — no has_hnsw_merge() filter.
-        // A crash between DML commit and flush_pending_hnsw_merges() leaves
-        // deltas without the registry bit being set. We must check every
-        // known (keyspace, db_id) to find orphaned deltas.
-        for entry in &all_entries {
-            match enqueue_pending_hnsw_merges(
-                &self.system_store,
-                &self.pool,
-                &entry.keyspace,
-                entry.db_id,
-            )
-            .await
-            {
-                Ok(r) => {
-                    total_observed += r.observed;
-                    total_enqueued += r.enqueued;
-                }
-                Err(e) => warn!(
-                    "HNSW reconcile error for keyspace={} db_id={}: {}",
-                    entry.keyspace, entry.db_id, e
-                ),
-            }
-        }
-        if total_observed > 0 {
+        if total_enqueued > 0 || registry_entries.len() > batch_entries.len() {
             info!(
-                total_observed,
-                total_enqueued, "HNSW startup reconciliation complete"
+                total_enqueued,
+                total_databases,
+                processed_registry_entries = batch_entries.len(),
+                total_registry_entries = registry_entries.len(),
+                "Storage scan reconciliation batch complete"
             );
         }
         Ok(())
@@ -2065,45 +2048,6 @@ pub(crate) async fn enqueue_storage_scan(
         .await?;
     txn.commit().await?;
     crate::worker::wake_worker();
-    Ok(())
-}
-
-/// Warm-load persisted storage stats into the in-memory cache on startup.
-pub(crate) async fn warm_load_storage_stats(
-    pool: &TikvClientPool,
-    system_store: &TikvStore,
-) -> Result<()> {
-    use crate::storage_stats::{deserialize_storage_stats, global_storage_stats_cache};
-
-    let mut sys_txn = system_store.begin().await?;
-    let registry_entries = system_store.list_worker_registry(&mut sys_txn).await?;
-    sys_txn.commit().await?;
-
-    let mut loaded = 0u32;
-    for entry in registry_entries {
-        let handle = match pool.acquire(Some(entry.keyspace.clone())).await {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        let store = handle.store().clone();
-        let mut txn = store.begin().await?;
-
-        let databases = store.list_databases(&mut txn).await?;
-        for db in databases {
-            let stats_key = crate::storage::encode_storage_stats_key_v2(db.id);
-            if let Some(data) = txn.get(stats_key).await? {
-                if let Some(stats) = deserialize_storage_stats(&data) {
-                    global_storage_stats_cache().put(&entry.keyspace, db.id, stats);
-                    loaded += 1;
-                }
-            }
-        }
-        txn.rollback().await.ok();
-    }
-
-    if loaded > 0 {
-        info!(loaded, "Warm-loaded persisted storage stats into cache");
-    }
     Ok(())
 }
 

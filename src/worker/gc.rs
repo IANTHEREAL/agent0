@@ -89,11 +89,15 @@ impl WorkerGc {
         tokio::time::sleep(Duration::from_secs(jitter)).await;
 
         let mut backoff_state: HashMap<(String, u64), SweepBackoff> = HashMap::new();
+        let mut hnsw_sweep_cursor: usize = 0;
         let mut interval =
             tokio::time::interval(Duration::from_secs(self.config.hnsw_sweep_interval_sec));
         loop {
             interval.tick().await;
-            if let Err(e) = self.sweep_hnsw_delta_backlogs(&mut backoff_state).await {
+            if let Err(e) = self
+                .sweep_hnsw_delta_backlogs(&mut backoff_state, &mut hnsw_sweep_cursor)
+                .await
+            {
                 warn!("HNSW sweep error: {}", e);
             }
             // S3 orphan sweep: only run if S3 offload is configured.
@@ -483,18 +487,28 @@ impl WorkerGc {
     async fn sweep_hnsw_delta_backlogs(
         &self,
         backoff_state: &mut HashMap<(String, u64), SweepBackoff>,
+        cursor: &mut usize,
     ) -> Result<()> {
         let mut txn = self.system_store.begin().await?;
         let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
         txn.commit().await?;
+        let batch_entries = crate::worker::engine::registry_batch_from_cursor(
+            &all_entries,
+            *cursor,
+            self.config.registry_reconcile_batch_size,
+        );
+        if !all_entries.is_empty() {
+            *cursor = (*cursor + batch_entries.len()) % all_entries.len();
+        }
 
         let mut total_observed = 0u32;
         let mut total_enqueued = 0u32;
         let mut total_enqueue_errors = 0u32;
         let mut total_skipped = 0u32;
-        // Iterate ALL registry entries — discovery does NOT depend on any
-        // task-type bit. The shared helper inspects schemas + probes deltas.
-        for entry in &all_entries {
+        // Discovery does NOT depend on any task-type bit. Sweep a bounded
+        // registry window per tick so one large registry cannot create an
+        // unbounded burst of tenant clients.
+        for entry in &batch_entries {
             let key = (entry.keyspace.clone(), entry.db_id);
 
             // Circuit breaker: skip entries that are in backoff.
@@ -624,10 +638,15 @@ impl WorkerGc {
             metrics::counter!("db9_server_hnsw_sweep_skipped_total")
                 .increment(total_skipped as u64);
         }
-        if total_observed > 0 || total_skipped > 0 {
+        if total_observed > 0 || total_skipped > 0 || all_entries.len() > batch_entries.len() {
             info!(
                 total_observed,
-                total_enqueued, total_enqueue_errors, total_skipped, "HNSW periodic sweep complete"
+                total_enqueued,
+                total_enqueue_errors,
+                total_skipped,
+                processed_registry_entries = batch_entries.len(),
+                total_registry_entries = all_entries.len(),
+                "HNSW periodic sweep batch complete"
             );
         }
         Ok(())

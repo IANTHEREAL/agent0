@@ -5,6 +5,32 @@ use crate::model::{DataType, Value};
 use chrono::{Offset, TimeZone, Timelike};
 use std::sync::Arc;
 
+#[test]
+fn storage_stats_virtual_tables_lazy_load_persisted_stats_per_tenant() {
+    let source = include_str!("mod.rs");
+
+    assert!(
+        source.contains("async fn load_persisted_storage_stats("),
+        "storage stats virtual tables should use a per-tenant lazy loader"
+    );
+    assert!(
+        source.contains("deserialize_storage_stats"),
+        "lazy loader must read the persisted storage stats format"
+    );
+    assert!(
+        source.contains("self.load_persisted_storage_stats(txn, None).await?"),
+        "_DB9_SYS_STORAGE_STATS should lazy-load current keyspace stats"
+    );
+    assert!(
+        source.contains("self.load_persisted_storage_stats(txn, Some(db_id)).await?"),
+        "_DB9_SYS_TABLE_STORAGE_STATS should lazy-load current database stats"
+    );
+    assert!(
+        !source.contains("list_worker_registry"),
+        "table_utils lazy loading must not enumerate the worker registry"
+    );
+}
+
 fn with_session_timezone<T>(timezone: &str, f: impl FnOnce() -> T) -> T {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

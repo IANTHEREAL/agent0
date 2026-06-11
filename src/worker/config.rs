@@ -14,6 +14,7 @@ const DEFAULT_HNSW_SWEEP_INTERVAL_SEC: u64 = 600;
 const MIN_HNSW_SWEEP_INTERVAL_SEC: u64 = 30;
 const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 1800;
 const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
+const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 
 // GC safepoint defaults — controls TiKV MVCC version cleanup.
@@ -44,6 +45,7 @@ pub struct WorkerConfig {
     pub gc_interval_sec: u64,
     pub hnsw_sweep_interval_sec: u64,
     pub storage_scan_interval_sec: u64,
+    pub registry_reconcile_batch_size: usize,
     pub system_keyspace: String,
 
     // TiKV MVCC GC safepoint advancement
@@ -74,6 +76,7 @@ impl Default for WorkerConfig {
             gc_interval_sec: DEFAULT_GC_INTERVAL_SEC,
             hnsw_sweep_interval_sec: DEFAULT_HNSW_SWEEP_INTERVAL_SEC,
             storage_scan_interval_sec: DEFAULT_STORAGE_SCAN_INTERVAL_SEC,
+            registry_reconcile_batch_size: DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
 
             gc_safepoint_enabled: DEFAULT_GC_SAFEPOINT_ENABLED,
@@ -255,6 +258,21 @@ impl WorkerConfig {
                 }
             }
         }
+        if let Ok(v) = env::var("DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE") {
+            cfg.registry_reconcile_batch_size = v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(|n| n.min(u32::MAX as u64) as usize)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE='{}' is not a valid positive integer; using default {}",
+                        v,
+                        cfg.registry_reconcile_batch_size
+                    );
+                    cfg.registry_reconcile_batch_size
+                });
+        }
         if let Ok(v) = env::var("DB9_WORKER_SYSTEM_KEYSPACE") {
             cfg.system_keyspace = v;
         }
@@ -373,6 +391,7 @@ mod tests {
             "DB9_WORKER_GC_INTERVAL_SEC",
             "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC",
             "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC",
+            "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE",
             "DB9_WORKER_SYSTEM_KEYSPACE",
         ];
 
@@ -403,6 +422,10 @@ mod tests {
         assert_eq!(
             cfg.storage_scan_interval_sec,
             DEFAULT_STORAGE_SCAN_INTERVAL_SEC
+        );
+        assert_eq!(
+            cfg.registry_reconcile_batch_size,
+            DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE
         );
         assert_eq!(cfg.system_keyspace, DEFAULT_SYSTEM_KEYSPACE);
 
@@ -571,7 +594,51 @@ mod tests {
         assert_eq!(cfg.gc_interval_sec, 600);
         assert_eq!(cfg.hnsw_sweep_interval_sec, 600);
         assert_eq!(cfg.storage_scan_interval_sec, 1800);
+        assert_eq!(cfg.registry_reconcile_batch_size, 32);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
+    }
+
+    #[test]
+    fn from_env_applies_registry_reconcile_batch_size() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "7");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.registry_reconcile_batch_size, 7);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_ignores_zero_registry_reconcile_batch_size() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "0");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(
+            cfg.registry_reconcile_batch_size,
+            DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE
+        );
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
     }
 
     #[test]

@@ -61,6 +61,47 @@ pub(crate) fn create_sequence_state_table_schema(
 }
 
 impl Executor {
+    async fn load_persisted_storage_stats(
+        &self,
+        txn: &mut Transaction,
+        db_id: Option<u64>,
+    ) -> Result<()> {
+        use crate::storage_stats::{deserialize_storage_stats, global_storage_stats_cache};
+
+        let keyspace = self.tenant_keyspace();
+        let cache = global_storage_stats_cache();
+
+        if let Some(db_id) = db_id {
+            if cache.get(keyspace, db_id).is_some() {
+                return Ok(());
+            }
+
+            let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
+            if let Some(data) = txn.get(stats_key).await? {
+                if let Some(stats) = deserialize_storage_stats(&data) {
+                    cache.put(keyspace, db_id, stats);
+                }
+            }
+            return Ok(());
+        }
+
+        let databases = self.store().list_databases(txn).await?;
+        for db in databases {
+            if cache.get(keyspace, db.id).is_some() {
+                continue;
+            }
+
+            let stats_key = crate::storage::encode_storage_stats_key_v2(db.id);
+            if let Some(data) = txn.get(stats_key).await? {
+                if let Some(stats) = deserialize_storage_stats(&data) {
+                    cache.put(keyspace, db.id, stats);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn get_table_data(
         &self,
         txn: &mut Transaction,
@@ -256,6 +297,7 @@ impl Executor {
             let mut schema = virtual_table_schema("_DB9_SYS_STORAGE_STATS").unwrap();
             schema.name = table_name.to_string();
 
+            self.load_persisted_storage_stats(txn, None).await?;
             let cache = crate::storage_stats::global_storage_stats_cache();
             let all_stats = cache.get_all_for_keyspace(self.tenant_keyspace());
             let mut rows = Vec::new();
@@ -298,6 +340,9 @@ impl Executor {
             schema.name = table_name.to_string();
 
             let cache = crate::storage_stats::global_storage_stats_cache();
+            if cache.get(self.tenant_keyspace(), db_id).is_none() {
+                self.load_persisted_storage_stats(txn, Some(db_id)).await?;
+            }
             let db_stats = cache.get(self.tenant_keyspace(), db_id);
 
             let mut rows = Vec::new();
