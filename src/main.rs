@@ -62,9 +62,9 @@ const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 struct WorkerRuntimeHandles {
     engine_handle: JoinHandle<()>,
+    maintenance_handle: JoinHandle<()>,
     engine_shutdown: CancellationToken,
     gc_loop_handle: JoinHandle<()>,
-    hnsw_sweep_handle: JoinHandle<()>,
 }
 
 struct ConnectionTaskRegistry {
@@ -460,7 +460,24 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
                 e
             )
         })?;
-    worker::set_gc_registry_store(gc_store.clone());
+    worker::set_system_store(gc_store.clone());
+    worker::set_worker_execution_enabled(worker_config.enabled);
+    let registered = worker::register_database_inventory(&gc_store, &store, &startup_keyspace)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to register startup database inventory for keyspace '{}': {}",
+                startup_keyspace,
+                e
+            )
+        })?;
+    if registered > 0 {
+        info!(
+            keyspace = %startup_keyspace,
+            registered,
+            "Registered startup databases in worker inventory"
+        );
+    }
 
     // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
     // the safepoint, another node in the cluster might. This only checks
@@ -531,47 +548,37 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // Worker engine: OPTIONAL — cron, triggers, HNSW, DDL, BgSql.
     // ================================================================
     let worker_runtime = if worker_config.enabled {
-        let system_store = match worker::init_system_store(pd_addrs.clone(), &worker_config).await {
-            Ok(Some(system_store)) => system_store,
-            Ok(None) => unreachable!("worker init returned None while worker is enabled"),
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Failed to initialize system store: {}. \
-                         Worker is enabled (DB9_WORKER_ENABLED=true) but cannot start. \
-                         Either fix the system store connection or set DB9_WORKER_ENABLED=false.",
-                    e
-                ));
-            }
-        };
+        let system_store = gc_store.clone();
 
-        worker::set_system_store(system_store.clone());
-
-        let engine = worker::engine::WorkerEngine::new(
+        let engine = Arc::new(worker::engine::WorkerEngine::new(
             worker_config.clone(),
             system_store.clone(),
             client_pool.clone(),
-        );
+        ));
         let metrics = engine.metrics().clone();
         let engine_shutdown = engine.shutdown_token();
         worker::set_worker_metrics(metrics.clone());
-        let engine_handle = tokio::spawn(async move { engine.run().await });
+        let engine_for_queue = engine.clone();
+        let engine_handle = tokio::spawn(async move { engine_for_queue.run().await });
+        let engine_for_maintenance = engine.clone();
+        let maintenance_handle =
+            tokio::spawn(async move { engine_for_maintenance.run_maintenance().await });
 
-        // WorkerGc: orphan claims + cron cleanup + HNSW sweep ONLY.
+        // WorkerGc: orphan-claim cleanup only. Registry maintenance runs in WorkerEngine.
         // Publisher and advancer are spawned above, not here.
         let gc = Arc::new(worker::gc::WorkerGc::new(
             system_store,
             client_pool.clone(),
             worker_config.clone(),
-            metrics,
         ));
         let gc_handles = gc.spawn_worker_gc_only();
 
         info!("WorkerEngine started (cron/triggers/HNSW/DDL)");
         Some(WorkerRuntimeHandles {
             engine_handle,
+            maintenance_handle,
             engine_shutdown,
             gc_loop_handle: gc_handles.gc_loop_handle,
-            hnsw_sweep_handle: gc_handles.hnsw_sweep_handle,
         })
     } else {
         None
@@ -972,9 +979,9 @@ async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
     };
     let WorkerRuntimeHandles {
         engine_handle,
+        maintenance_handle,
         engine_shutdown,
         gc_loop_handle,
-        hnsw_sweep_handle,
     } = worker_runtime;
 
     engine_shutdown.cancel();
@@ -991,8 +998,18 @@ async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
         }
     }
 
+    let mut maintenance_handle = maintenance_handle;
+    match tokio::time::timeout(WORKER_SHUTDOWN_GRACE, &mut maintenance_handle).await {
+        Ok(Ok(())) => info!("Worker maintenance loop stopped"),
+        Ok(Err(e)) if e.is_cancelled() => info!("Worker maintenance loop stopped"),
+        Ok(Err(e)) => warn!("Worker maintenance loop join failed during shutdown: {}", e),
+        Err(_) => {
+            warn!("Timed out waiting for Worker maintenance loop to stop; aborting");
+            abort_task("Worker maintenance loop", maintenance_handle).await;
+        }
+    }
+
     abort_task("Worker GC loop", gc_loop_handle).await;
-    abort_task("HNSW sweep loop", hnsw_sweep_handle).await;
 }
 
 async fn shutdown_gc_runtime(

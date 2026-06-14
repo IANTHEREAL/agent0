@@ -10,7 +10,8 @@ Unified async task engine. All db9-server instances share a global task queue in
 ```
 Startup (main.rs):
     → WorkerConfig::from_env()
-    → init_system_store(pd_addrs) → TikvStore for _sys_worker keyspace
+    → init_gc_registry_store(pd_addrs) → TikvStore for _sys_worker keyspace
+        (runs the one-shot V1→V2 worker-queue migration before any polling)
     → tokio::spawn(WorkerEngine::run())   # task processing loop
     → tokio::spawn(WorkerGc::run())       # orphan recovery + DLQ cleanup
 ```

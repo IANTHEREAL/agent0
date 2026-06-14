@@ -1,5 +1,4 @@
 use crate::cron::config::CronConfig;
-use crate::cron::worker::gc_database;
 use crate::pool::TikvClientPool;
 use crate::storage::worker::GcInstanceState;
 use crate::storage::TikvStore;
@@ -10,7 +9,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tikv_client::{Timestamp, TimestampExt};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -28,14 +27,13 @@ const SAFEPOINT_UPDATE_TIMEOUT_SEC: u64 = 30;
 
 pub struct WorkerGc {
     system_store: Arc<TikvStore>,
+    #[allow(dead_code)]
     pool: Arc<TikvClientPool>,
     config: WorkerConfig,
-    metrics: Arc<WorkerMetrics>,
 }
 
 pub struct WorkerGcHandles {
     pub gc_loop_handle: JoinHandle<()>,
-    pub hnsw_sweep_handle: JoinHandle<()>,
 }
 
 struct ClaimGcBatch {
@@ -49,26 +47,19 @@ impl WorkerGc {
         system_store: Arc<TikvStore>,
         pool: Arc<TikvClientPool>,
         config: WorkerConfig,
-        metrics: Arc<WorkerMetrics>,
     ) -> Self {
         Self {
             system_store,
             pool,
             config,
-            metrics,
         }
     }
 
-    /// Spawn worker-only GC loops (orphan claims + cron cleanup + HNSW sweep).
+    /// Spawn worker-only GC loops (orphan-claim cleanup).
     /// Publisher and advancer are spawned separately at the top level of main.rs.
     pub fn spawn_worker_gc_only(self: Arc<Self>) -> WorkerGcHandles {
-        let gc_self = self.clone();
-        let gc_loop_handle = tokio::spawn(async move { gc_self.run_gc_loop().await });
-        let hnsw_sweep_handle = tokio::spawn(async move { self.run_hnsw_sweep_loop().await });
-        WorkerGcHandles {
-            gc_loop_handle,
-            hnsw_sweep_handle,
-        }
+        let gc_loop_handle = tokio::spawn(async move { self.run_gc_loop().await });
+        WorkerGcHandles { gc_loop_handle }
     }
 
     async fn run_gc_loop(&self) {
@@ -82,76 +73,6 @@ impl WorkerGc {
                 warn!("Worker GC tick error: {}", e);
             }
         }
-    }
-
-    async fn run_hnsw_sweep_loop(&self) {
-        let jitter = rand_jitter_secs(60);
-        tokio::time::sleep(Duration::from_secs(jitter)).await;
-
-        let mut backoff_state: HashMap<(String, u64), SweepBackoff> = HashMap::new();
-        let mut hnsw_sweep_cursor: usize = 0;
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(self.config.hnsw_sweep_interval_sec));
-        loop {
-            interval.tick().await;
-            if let Err(e) = self
-                .sweep_hnsw_delta_backlogs(&mut backoff_state, &mut hnsw_sweep_cursor)
-                .await
-            {
-                warn!("HNSW sweep error: {}", e);
-            }
-            // S3 orphan sweep: only run if S3 offload is configured.
-            if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
-                if let Err(e) = self.sweep_hnsw_s3_orphans().await {
-                    warn!("HNSW S3 sweep error: {}", e);
-                }
-            }
-        }
-    }
-}
-
-// ── HNSW sweep circuit breaker ──────────────────────────────────────────────
-
-/// Per-(keyspace, db_id) backoff state for the HNSW sweep loop.
-/// Prevents permanent failures from generating unbounded WARN log spam.
-struct SweepBackoff {
-    /// Number of consecutive sweep failures.
-    consecutive_failures: u32,
-    /// Earliest time at which this entry should be retried.
-    retry_after: Instant,
-}
-
-/// Base delay for sweep backoff: 1 sweep interval (multiplied by 2^failures).
-/// After 1 failure: skip 1 interval (~10 min at default 600s).
-/// After 2: skip 2 intervals. After 3: skip 4. Capped at 32 intervals (~5.3h).
-const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
-/// Maximum consecutive failures before the backoff multiplier is capped.
-const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5; // 2^5 = 32 intervals
-/// After this many consecutive failures, check PD whether the keyspace is
-/// DISABLED and, if so, remove it from the worker registry.
-const DISABLED_CHECK_THRESHOLD: u32 = 5;
-
-impl SweepBackoff {
-    fn new_failed(interval_sec: u64) -> Self {
-        Self {
-            consecutive_failures: 1,
-            retry_after: Instant::now()
-                + Duration::from_secs(interval_sec * SWEEP_BACKOFF_BASE_INTERVALS as u64),
-        }
-    }
-
-    fn record_failure(&mut self, interval_sec: u64) {
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let shift = self
-            .consecutive_failures
-            .saturating_sub(1)
-            .min(SWEEP_BACKOFF_MAX_SHIFT);
-        let multiplier = SWEEP_BACKOFF_BASE_INTERVALS as u64 * (1u64 << shift);
-        self.retry_after = Instant::now() + Duration::from_secs(interval_sec * multiplier);
-    }
-
-    fn should_skip(&self) -> bool {
-        Instant::now() < self.retry_after
     }
 }
 
@@ -472,235 +393,32 @@ async fn advance_gc_safepoint(
 
 impl WorkerGc {
     async fn gc_tick(&self) -> Result<()> {
+        self.cleanup_hnsw_s3_external_object_intents().await?;
         self.cleanup_orphan_claims().await?;
-        self.cleanup_cron_runs().await?;
         Ok(())
     }
 
-    /// Periodic sweep: discover HNSW indexes with pending deltas and enqueue
-    /// merge tasks. Uses the same shared helper as startup reconciliation.
-    /// Configurable via `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` (default 600s).
-    ///
-    /// `backoff_state` tracks per-(keyspace, db_id) consecutive failures to
-    /// prevent unbounded retries against permanently broken entries. On success
-    /// the entry is removed; on failure the backoff escalates exponentially.
-    async fn sweep_hnsw_delta_backlogs(
-        &self,
-        backoff_state: &mut HashMap<(String, u64), SweepBackoff>,
-        cursor: &mut usize,
-    ) -> Result<()> {
-        let mut txn = self.system_store.begin().await?;
-        let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
-        txn.commit().await?;
-        let batch_entries = crate::worker::engine::registry_batch_from_cursor(
-            &all_entries,
-            *cursor,
-            self.config.registry_reconcile_batch_size,
-        );
-        if !all_entries.is_empty() {
-            *cursor = (*cursor + batch_entries.len()) % all_entries.len();
-        }
-
-        let mut total_observed = 0u32;
-        let mut total_enqueued = 0u32;
-        let mut total_enqueue_errors = 0u32;
-        let mut total_skipped = 0u32;
-        // Discovery does NOT depend on any task-type bit. Sweep a bounded
-        // registry window per tick so one large registry cannot create an
-        // unbounded burst of tenant clients.
-        for entry in &batch_entries {
-            let key = (entry.keyspace.clone(), entry.db_id);
-
-            // Circuit breaker: skip entries that are in backoff.
-            if let Some(backoff) = backoff_state.get(&key) {
-                if backoff.should_skip() {
-                    // If failures have accumulated past the threshold, probe PD
-                    // to see if this keyspace has been disabled.  If so, remove
-                    // the registry entry so we never retry it again.
-                    if backoff.consecutive_failures >= DISABLED_CHECK_THRESHOLD {
-                        let state = crate::worker::check_keyspace_state(
-                            self.pool.pd_endpoints(),
-                            &entry.keyspace,
-                        )
-                        .await;
-                        if state.as_deref() == Some("DISABLED") {
-                            info!(
-                                keyspace = %entry.keyspace,
-                                db_id = entry.db_id,
-                                "Keyspace is DISABLED in PD; removing from worker registry"
-                            );
-                            let del_result: Result<()> = async {
-                                let mut txn = self.system_store.begin().await?;
-                                self.system_store
-                                    .delete_worker_registry(&mut txn, &entry.keyspace, entry.db_id)
-                                    .await?;
-                                txn.commit().await?;
-                                Ok(())
-                            }
-                            .await;
-                            match del_result {
-                                Ok(()) => {
-                                    backoff_state.remove(&key);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        keyspace = %entry.keyspace,
-                                        db_id = entry.db_id,
-                                        "Failed to remove DISABLED keyspace from registry: {}",
-                                        e
-                                    );
-                                    // Leave backoff in place so the DISABLED check
-                                    // retries on the next eligible sweep tick.
-                                }
-                            }
-                            continue;
-                        }
-                    }
-
-                    total_skipped += 1;
-                    debug!(
-                        keyspace = %entry.keyspace,
-                        db_id = entry.db_id,
-                        consecutive_failures = backoff.consecutive_failures,
-                        "HNSW sweep: skipping (in backoff)"
-                    );
-                    continue;
-                }
-            }
-
-            match crate::worker::engine::enqueue_pending_hnsw_merges(
-                &self.system_store,
-                &self.pool,
-                &entry.keyspace,
-                entry.db_id,
-            )
-            .await
-            {
-                Ok(r) => {
-                    total_observed += r.observed;
-                    total_enqueued += r.enqueued;
-                    total_enqueue_errors += r.enqueue_errors;
-                    // Success: clear any backoff for this entry.
-                    backoff_state.remove(&key);
-                }
-                Err(e) => {
-                    let interval = self.config.hnsw_sweep_interval_sec;
-                    match backoff_state.entry(key) {
-                        std::collections::hash_map::Entry::Occupied(mut o) => {
-                            o.get_mut().record_failure(interval);
-                        }
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(SweepBackoff::new_failed(interval));
-                        }
-                    }
-                    let backoff = backoff_state
-                        .get(&(entry.keyspace.clone(), entry.db_id))
-                        .unwrap();
-                    warn!(
-                        keyspace = %entry.keyspace,
-                        db_id = entry.db_id,
-                        consecutive_failures = backoff.consecutive_failures,
-                        "HNSW sweep error (will backoff): {}",
-                        e
-                    );
-                }
-            }
-        }
-
-        // Prune backoff entries for (keyspace, db_id) pairs no longer in the registry.
-        let active_keys: std::collections::HashSet<(String, u64)> = all_entries
-            .iter()
-            .map(|e| (e.keyspace.clone(), e.db_id))
-            .collect();
-        backoff_state.retain(|k, _| active_keys.contains(k));
-
-        // Gauge: overwrite with total observed across all DBs this sweep.
-        self.metrics
-            .hnsw_pending_indexes_observed
-            .store(total_observed as u64, std::sync::atomic::Ordering::Relaxed);
-        // Counters: cumulative fetch_add.
-        if total_enqueued > 0 {
-            self.metrics
-                .hnsw_sweep_enqueued
-                .fetch_add(total_enqueued as u64, std::sync::atomic::Ordering::Relaxed);
-            metrics::counter!("db9_server_hnsw_sweep_enqueued_total")
-                .increment(total_enqueued as u64);
-        }
-        if total_enqueue_errors > 0 {
-            self.metrics.hnsw_sweep_enqueue_errors.fetch_add(
-                total_enqueue_errors as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            metrics::counter!("db9_server_hnsw_sweep_enqueue_errors_total")
-                .increment(total_enqueue_errors as u64);
-        }
-        if total_skipped > 0 {
-            metrics::counter!("db9_server_hnsw_sweep_skipped_total")
-                .increment(total_skipped as u64);
-        }
-        if total_observed > 0 || total_skipped > 0 || all_entries.len() > batch_entries.len() {
-            info!(
-                total_observed,
-                total_enqueued,
-                total_enqueue_errors,
-                total_skipped,
-                processed_registry_entries = batch_entries.len(),
-                total_registry_entries = all_entries.len(),
-                "HNSW periodic sweep batch complete"
-            );
-        }
-        Ok(())
-    }
-
-    /// Scan worker registry for keyspaces with cron jobs and GC their run history.
-    async fn cleanup_cron_runs(&self) -> Result<()> {
-        let mut cron_config = CronConfig::from_env();
-        cron_config.orphan_timeout_sec =
-            effective_cron_orphan_timeout_sec(&cron_config, &self.config);
-
-        let mut txn = self.system_store.begin().await?;
-        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
-        txn.commit().await?;
-
-        for entry in registry_entries {
-            if !entry.has_cron() {
-                continue;
-            }
-
-            let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(
-                        "cron GC: failed to acquire store for keyspace={}: {}",
-                        entry.keyspace, e
-                    );
-                    continue;
-                }
-            };
-            let store = handle.store().clone();
-
-            if let Err(e) = gc_database(&store, entry.db_id, &cron_config).await {
-                warn!(
-                    "cron GC error for keyspace={} db_id={}: {}",
-                    entry.keyspace, entry.db_id, e
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Scan all claims and delete those older than orphan_timeout_sec.
+    /// Scan all claims and delete those whose LEASE has expired. A live
+    /// (renewed) lease is never reaped, so a long-running BgSql/BgDdl task that
+    /// keeps renewing its claim cannot be reaped mid-flight and double-executed.
     /// Orphaned claims are NOT re-enqueued — the next cron fire or scheduler
     /// handles retries. One-shot tasks stay failed.
+    ///
+    /// Legacy `claimed_at`-only rows (from a pre-lease binary, mixed-version
+    /// window) synthesize their lease as `claimed_at + orphan_timeout`, so this
+    /// reaper and an old age-based reaper agree until the fleet upgrades.
     async fn cleanup_orphan_claims(&self) -> Result<()> {
         let batch_size = self.config.gc_batch_size.max(1);
         let now_ms = now_epoch_ms();
-        let timeout_ms = (self.config.orphan_timeout_sec as i64).saturating_mul(1000);
-        let cutoff = now_ms.saturating_sub(timeout_ms);
+        let legacy_orphan_timeout_ms = (self.config.orphan_timeout_sec as i64).saturating_mul(1000);
 
         let (cleaned, _) = run_claim_gc_batches(batch_size, |start_after, requested_batch_size| {
-            self.cleanup_orphan_claims_batch(start_after, requested_batch_size, cutoff)
+            self.cleanup_orphan_claims_batch(
+                start_after,
+                requested_batch_size,
+                now_ms,
+                legacy_orphan_timeout_ms,
+            )
         })
         .await?;
 
@@ -715,7 +433,8 @@ impl WorkerGc {
         &self,
         start_after: Option<Vec<u8>>,
         batch_size: usize,
-        cutoff: i64,
+        now_ms: i64,
+        legacy_orphan_timeout_ms: i64,
     ) -> Result<ClaimGcBatch> {
         let mut txn = self.system_store.begin().await?;
 
@@ -729,14 +448,17 @@ impl WorkerGc {
             let mut cleaned = 0u32;
 
             for (key, claim) in claims {
-                if claim.claimed_at < cutoff {
+                if claim.is_expired(now_ms, legacy_orphan_timeout_ms) {
                     self.system_store
                         .delete_worker_claim_by_raw_key(&mut txn, &key)
                         .await?;
                     cleaned += 1;
                     warn!(
-                        "GC: cleaned orphan claim worker={} type={:?} claimed_at={}",
-                        claim.worker_id, claim.task_type, claim.claimed_at
+                        "GC: cleaned expired-lease claim worker={} type={:?} claimed_at={} lease_until={}",
+                        claim.worker_id,
+                        claim.task_type,
+                        claim.claimed_at,
+                        claim.effective_lease_until(legacy_orphan_timeout_ms)
                     );
                 }
             }
@@ -961,7 +683,7 @@ fn rand_jitter_secs(max_secs: u64) -> u64 {
     (seed % max_secs as u128) as u64
 }
 
-fn effective_cron_orphan_timeout_sec(
+pub(crate) fn effective_cron_orphan_timeout_sec(
     cron_config: &CronConfig,
     worker_config: &WorkerConfig,
 ) -> u64 {

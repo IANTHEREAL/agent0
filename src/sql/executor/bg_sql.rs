@@ -73,8 +73,11 @@ async fn execute_bg_launch(
         _ => return Err(anyhow!("pg_background_launch: sql must be text")),
     };
 
+    if !crate::worker::execution_enabled() {
+        return Err(anyhow!("pg_background_launch: worker engine not available"));
+    }
     let system_store = get_system_store()
-        .ok_or_else(|| anyhow!("pg_background_launch: worker engine not available"))?;
+        .ok_or_else(|| anyhow!("pg_background_launch: worker system store not available"))?;
 
     // task_id: collision-free identity via TiKV CAS atomic counter (per tenant-db scope).
     // fire_time: scheduling order only — may repeat across launches.
@@ -115,8 +118,13 @@ async fn execute_refresh_storage_stats(
         ));
     }
 
+    if !crate::worker::execution_enabled() {
+        return Err(anyhow!(
+            "db9_refresh_storage_stats: worker engine not available"
+        ));
+    }
     let system_store = get_system_store()
-        .ok_or_else(|| anyhow!("db9_refresh_storage_stats: worker engine not available"))?;
+        .ok_or_else(|| anyhow!("db9_refresh_storage_stats: worker system store not available"))?;
 
     crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
 

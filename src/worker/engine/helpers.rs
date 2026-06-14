@@ -52,17 +52,6 @@ pub(super) fn should_start_cic_backfill(state: IndexState) -> bool {
     matches!(state, IndexState::Building)
 }
 
-pub(super) fn repair_incomplete_cic_states(schema: &mut crate::model::TableSchema) -> u32 {
-    let mut repaired = 0u32;
-    for idx in &mut schema.indexes {
-        if matches!(idx.state, IndexState::Building | IndexState::WriteOnly) {
-            idx.state = IndexState::Invalid;
-            repaired += 1;
-        }
-    }
-    repaired
-}
-
 pub(super) fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
     let args = command
         .strip_prefix("__backfill_index ")
@@ -157,6 +146,175 @@ pub(crate) fn check_graph_oversize_freeze(
     serde_json::to_vec(&frozen_meta).ok()
 }
 
+/// Allocate an HNSW S3 graph object version from the source transaction's PD
+/// TSO. The version is part of the external object key, so it must be unique
+/// per writer and monotonic relative to the currently published graph.
+pub(crate) fn hnsw_s3_graph_version_for_txn(
+    txn: &tikv_client::Transaction,
+    previous_graph_version: u64,
+) -> Result<u64> {
+    let version = txn.start_timestamp().version();
+    if version <= previous_graph_version {
+        return Err(anyhow!(
+            "HNSW S3 graph version invariant violated: transaction TSO {} is not newer than \
+             current graph_version {}",
+            version,
+            previous_graph_version
+        ));
+    }
+    Ok(version)
+}
+
+pub(crate) fn should_delete_legacy_tikv_graph_after_s3_migration(
+    previous_graph_version: u64,
+) -> bool {
+    previous_graph_version == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn put_hnsw_s3_graph_with_intent(
+    tenant_store: &TikvStore,
+    tenant_txn: &mut tikv_client::Transaction,
+    keyspace: &str,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    version: u64,
+    data: bytes::Bytes,
+    reason: &str,
+) -> Result<()> {
+    let s3 = crate::sql::hnsw::s3::hnsw_s3_client()
+        .ok_or_else(|| anyhow!("HNSW S3 client not available"))?;
+    let system_store = crate::worker::system_store()?;
+    let intent = crate::worker::types::HnswS3GraphUploadIntent::new(
+        keyspace.to_string(),
+        db_id,
+        table_id,
+        index_id,
+        version,
+        tenant_txn.start_timestamp().version(),
+        reason.to_string(),
+    );
+
+    let mut sys_txn = system_store.begin().await?;
+    system_store
+        .put_hnsw_s3_graph_upload_intent(&mut sys_txn, &intent)
+        .await?;
+    sys_txn.commit().await?;
+
+    tenant_store
+        .assert_database_alive_for_update(tenant_txn, db_id)
+        .await?;
+
+    if let Err(e) = s3
+        .put_graph(keyspace, db_id, table_id, index_id, version, data)
+        .await
+    {
+        delete_hnsw_s3_graph_upload_intent_best_effort(
+            keyspace, db_id, table_id, index_id, version,
+        )
+        .await;
+        return Err(anyhow!("HNSW S3 put_graph failed: {}", e));
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn cleanup_hnsw_s3_graph_upload_after_failed_txn(
+    keyspace: &str,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    version: u64,
+) {
+    let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() else {
+        return;
+    };
+
+    match s3
+        .delete_graph(keyspace, db_id, table_id, index_id, version)
+        .await
+    {
+        Ok(()) => {
+            delete_hnsw_s3_graph_upload_intent_best_effort(
+                keyspace, db_id, table_id, index_id, version,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(
+                keyspace,
+                db_id,
+                table_id,
+                index_id,
+                version,
+                error = %e,
+                "HNSW S3 speculative graph cleanup failed; durable intent retained for GC"
+            );
+        }
+    }
+}
+
+async fn delete_hnsw_s3_graph_upload_intent_best_effort(
+    keyspace: &str,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    version: u64,
+) {
+    let Ok(system_store) = crate::worker::system_store() else {
+        return;
+    };
+    let Ok(mut txn) = system_store.begin().await else {
+        return;
+    };
+    if system_store
+        .delete_hnsw_s3_graph_upload_intent(&mut txn, keyspace, db_id, table_id, index_id, version)
+        .await
+        .is_ok()
+    {
+        let _ = txn.commit().await;
+    } else {
+        let _ = txn.rollback().await;
+    }
+}
+
+async fn cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
+    keyspace: &str,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    uploaded_version: Option<u64>,
+) {
+    let Some(version) = uploaded_version else {
+        return;
+    };
+    cleanup_hnsw_s3_graph_upload_after_failed_txn(keyspace, db_id, table_id, index_id, version)
+        .await;
+}
+
+fn retain_uploaded_hnsw_s3_graph_after_uncertain_commit(
+    keyspace: &str,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    uploaded_version: Option<u64>,
+    error: &anyhow::Error,
+) {
+    let Some(version) = uploaded_version else {
+        return;
+    };
+    warn!(
+        keyspace,
+        db_id,
+        table_id,
+        index_id,
+        version,
+        error = %error,
+        "HNSW S3 graph upload retained after TiKV commit error; durable intent retained for safepoint GC reconciliation"
+    );
+}
+
 /// Execute HNSW merge in batches. Each batch is a separate TiKV transaction
 /// that processes up to MERGE_BATCH_SIZE deltas, writes the consolidated base
 /// graph, deletes consumed deltas, and updates meta — all atomically.
@@ -168,6 +326,7 @@ pub(super) async fn execute_hnsw_merge(
     db_id: u64,
     table_id: u64,
     index_id: u64,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     use crate::sql::hnsw::storage::{
         create_empty_hnsw_index, delete_delta_keys, hnsw_delta_prefix, hnsw_delta_prefix_end,
@@ -206,6 +365,21 @@ pub(super) async fn execute_hnsw_merge(
 
     let mut region_retries = 0u32;
     loop {
+        // Loop-top lease fence (defense-in-depth). Each iteration opens a fresh
+        // txn and commits one batch (graph blob + meta) at helpers.rs §7. A merge
+        // can run for many batches, long enough for the claim lease to lapse
+        // mid-run; if the renewer already cancelled `lease_cancel` we abandon this
+        // batch WITHOUT starting its txn and leave the remaining deltas for the new
+        // owner. This check alone is NOT load-bearing: the lease can also lapse
+        // AFTER this point, during the iteration's long work (delta scan, graph
+        // build/serialize, S3 upload, TiKV mutations). The load-bearing fences are
+        // the COMMIT-ADJACENT checks immediately before each tenant commit below
+        // (oversize-freeze early commit + normal batch commit), which run after all
+        // long work and clean up any speculative S3 upload on bail. Deltas already
+        // merged in prior committed batches stay merged (idempotent: their delta
+        // keys were deleted).
+        lease_cancel.bail_if_cancelled()?;
+
         // Each iteration processes one batch inside a fresh transaction.
         // Wrap in an async block so region errors can be caught and retried
         // with a new transaction (fresh region cache) instead of propagating
@@ -338,20 +512,25 @@ pub(super) async fn execute_hnsw_merge(
                 serialize_hnsw_snapshot(db_id, table_id, index_id, index.deref(), &updated_meta)?;
 
             // 5a. S3 vs TiKV write path for the graph blob.
-            if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+            let mut uploaded_s3_graph_version: Option<u64> = None;
+            if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
                 // S3 path: upload graph to S3, increment graph_version.
                 let previous_version = updated_meta.graph_version;
-                let new_version = updated_meta.graph_version + 1;
-                s3.put_graph(
+                let new_version = hnsw_s3_graph_version_for_txn(&txn, previous_version)?;
+                put_hnsw_s3_graph_with_intent(
+                    store,
+                    &mut txn,
                     keyspace,
                     db_id,
                     table_id,
                     index_id,
                     new_version,
                     bytes::Bytes::from(graph_bytes),
+                    "hnsw_merge",
                 )
                 .await
-                .map_err(|e| anyhow!("HNSW S3 put_graph failed: {}", e))?;
+                .map_err(|e| anyhow!("HNSW S3 merge upload failed: {}", e))?;
+                uploaded_s3_graph_version = Some(new_version);
                 updated_meta.graph_version = new_version;
                 // First S3 write: upgrade storage_version to 2.
                 if updated_meta.storage_version == 1 {
@@ -361,26 +540,46 @@ pub(super) async fn execute_hnsw_merge(
                 updated_meta.frozen = false;
                 // Re-serialize meta with updated graph_version/storage_version.
                 let meta_bytes_s3 = serde_json::to_vec(&updated_meta)?;
-                txn_put(&mut txn, meta_key, meta_bytes_s3).await?;
-                if previous_version > 0 {
-                    let marker = HnswS3RetiredVersionGc {
-                        delete_after_safepoint: None,
-                    };
-                    txn_put(
-                        &mut txn,
-                        hnsw_s3_retired_version_key(db_id, table_id, index_id, previous_version),
-                        serde_json::to_vec(&marker)?,
-                    )
-                    .await?;
+                let s3_tikv_mutation_result: Result<()> = async {
+                    txn_put(&mut txn, meta_key, meta_bytes_s3).await?;
+                    if previous_version > 0 {
+                        let marker = HnswS3RetiredVersionGc {
+                            delete_after_safepoint: None,
+                        };
+                        txn_put(
+                            &mut txn,
+                            hnsw_s3_retired_version_key(
+                                db_id,
+                                table_id,
+                                index_id,
+                                previous_version,
+                            ),
+                            serde_json::to_vec(&marker)?,
+                        )
+                        .await?;
+                    }
+                    // On first migration (old graph was in TiKV), delete the stale
+                    // TiKV graph blob. Safe: concurrent queries at older snapshots
+                    // still see it via MVCC; no future query will read it since
+                    // graph_version > 0 routes to S3.
+                    if should_delete_legacy_tikv_graph_after_s3_migration(previous_version) {
+                        let graph_key =
+                            crate::sql::hnsw::storage::hnsw_graph_key(db_id, table_id, index_id);
+                        crate::txn::txn_delete(&mut txn, graph_key).await?;
+                    }
+                    Ok(())
                 }
-                // On first migration (old graph was in TiKV), delete the stale
-                // TiKV graph blob. Safe: concurrent queries at older snapshots
-                // still see it via MVCC; no future query will read it since
-                // graph_version > 0 routes to S3.
-                if new_version == 1 {
-                    let graph_key =
-                        crate::sql::hnsw::storage::hnsw_graph_key(db_id, table_id, index_id);
-                    crate::txn::txn_delete(&mut txn, graph_key).await?;
+                .await;
+                if let Err(e) = s3_tikv_mutation_result {
+                    cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
+                        keyspace,
+                        db_id,
+                        table_id,
+                        index_id,
+                        uploaded_s3_graph_version.take(),
+                    )
+                    .await;
+                    return Err(e);
                 }
                 // Skip TiKV graph write and oversize check — graph is in S3.
             } else {
@@ -396,6 +595,29 @@ pub(super) async fn execute_hnsw_merge(
                         "HNSW graph exceeds size limit — freezing index"
                     );
                     txn_put(&mut txn, meta_key, frozen_meta_bytes).await?;
+                    // Commit-adjacent lease fence: the work above (delta scan, graph
+                    // build/serialize) can outlive the claim lease. Check the cancel
+                    // token IMMEDIATELY before this tenant commit — the loop-top check
+                    // is not load-bearing here because the lease can lapse during that
+                    // long work. On cancellation we abandon WITHOUT committing and
+                    // leave the task for the new owner (at-most-once). This branch is
+                    // the TiKV write path, so no S3 graph was speculatively uploaded
+                    // (`uploaded_s3_graph_version` is always None here); abandoning the
+                    // txn is sufficient — there is no external object to clean up.
+                    if let Err(e) = lease_cancel.bail_if_cancelled() {
+                        cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
+                            keyspace,
+                            db_id,
+                            table_id,
+                            index_id,
+                            uploaded_s3_graph_version.take(),
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                    store
+                        .assert_database_alive_for_update(&mut txn, db_id)
+                        .await?;
                     txn.commit().await?;
                     return Ok(None);
                 }
@@ -410,14 +632,94 @@ pub(super) async fn execute_hnsw_merge(
                 let meta_bytes_new = serde_json::to_vec(&updated_meta)?;
                 txn_put(&mut txn, meta_key, meta_bytes_new).await?;
             }
-            delete_delta_keys(&mut txn, &batch_keys).await?;
+            if let Err(e) = delete_delta_keys(&mut txn, &batch_keys).await {
+                cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
+                    keyspace,
+                    db_id,
+                    table_id,
+                    index_id,
+                    uploaded_s3_graph_version.take(),
+                )
+                .await;
+                return Err(e.into());
+            }
 
             // 7. Commit.
+            // Commit-adjacent lease fence: all long-running work for this batch
+            // (delta scan, graph build/serialize, S3 upload, TiKV mutations) is
+            // done. The claim lease can lapse DURING that work — most likely in the
+            // S3-upload window — so the loop-top check is not load-bearing here.
+            // Check the cancel token IMMEDIATELY before the tenant commit. A bail is
+            // a DEFINITE non-commit (txn.commit has not run), which is categorically
+            // different from the commit-ERROR path below: there we retain the upload
+            // (the commit is AMBIGUOUS and may have landed); here we MUST clean up
+            // the speculative S3 graph (it will never be referenced by committed
+            // meta) so the new owner can re-run the merge and re-upload without
+            // leaving a no-meta S3 orphan. Mirrors the delete_delta_keys failure
+            // path. The canonical claim-cancelled error makes is_claim_cancelled_error
+            // classify it so the caller does not mark anything invalid.
+            if let Err(e) = lease_cancel.bail_if_cancelled() {
+                cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
+                    keyspace,
+                    db_id,
+                    table_id,
+                    index_id,
+                    uploaded_s3_graph_version.take(),
+                )
+                .await;
+                return Err(e);
+            }
+
+            // Pre-commit liveness fence. DROP DATABASE removes the database
+            // metadata row before destroying its key range; this get_for_update
+            // read conflicts with that drop and aborts the merge if the database
+            // is gone. This MUST run as a separate fallible step BEFORE
+            // txn.commit(): an error here is a DEFINITE non-commit (the database
+            // is dropped, or get_for_update itself failed — either way commit has
+            // not run), categorically the same as the bail / delete-delta-keys
+            // failure paths above. So we clean up the speculative S3 graph (it
+            // will never be referenced by committed meta) rather than retaining
+            // it, which would leave a no-meta S3 orphan after a DROP DATABASE
+            // race until safepoint GC. Only txn.commit() itself is ambiguous, so
+            // only its error reaches the retain path below.
+            if let Err(e) = store
+                .assert_database_alive_for_update(&mut txn, db_id)
+                .await
+            {
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
+                }
+                cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
+                    keyspace,
+                    db_id,
+                    table_id,
+                    index_id,
+                    uploaded_s3_graph_version.take(),
+                )
+                .await;
+                return Err(e);
+            }
+
             if let Err(e) = txn.commit().await {
+                let e = anyhow::Error::from(e);
                 if let Some(g) = txn_guard.as_mut() {
                     g.quarantine();
                 }
-                return Err(e.into());
+                // Commit errors can be ambiguous: TiKV may have committed even
+                // when the client sees an error. Do not delete the external
+                // object or its durable intent here; GC resolves it after the
+                // source txn crosses the safepoint by reading committed meta.
+                retain_uploaded_hnsw_s3_graph_after_uncertain_commit(
+                    keyspace,
+                    db_id,
+                    table_id,
+                    index_id,
+                    uploaded_s3_graph_version.take(),
+                    &e,
+                );
+                return Err(e);
             }
 
             info!(

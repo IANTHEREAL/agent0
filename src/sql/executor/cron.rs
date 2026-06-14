@@ -95,7 +95,7 @@ async fn execute_schedule(
     if !installed.enabled {
         return Err(crate::extensions::ext_disabled("pg_cron"));
     }
-    if get_system_store().is_none() {
+    if !crate::worker::execution_enabled() {
         return Err(anyhow!(
             "cron.schedule requires the worker subsystem (DB9_WORKER_ENABLED=false). \
              Cron jobs cannot execute without the worker engine."
@@ -232,7 +232,7 @@ async fn execute_alter_job(
     if !installed.enabled {
         return Err(crate::extensions::ext_disabled("pg_cron"));
     }
-    if get_system_store().is_none() {
+    if !crate::worker::execution_enabled() {
         return Err(anyhow!(
             "cron.alter_job requires the worker subsystem (DB9_WORKER_ENABLED=false). \
              Cron jobs cannot execute without the worker engine."

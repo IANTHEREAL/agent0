@@ -6,12 +6,22 @@ const DEFAULT_MAX_CONCURRENT_JOBS: usize = 32;
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_CRON_JOB_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_ORPHAN_TIMEOUT_SEC: u64 = 300;
+// Claim lease span. The owning worker renews at ~lease/3 while it executes, so
+// a long-running BgSql/BgDdl task keeps its claim alive instead of being reaped
+// mid-flight and double-executed by a second worker. Must be large relative to
+// plausible clock skew; sub-second leases are forbidden (design §K4).
+const DEFAULT_CLAIM_LEASE_MS: u64 = 60_000;
+const MIN_CLAIM_LEASE_MS: u64 = 5_000;
 const DEFAULT_GC_BATCH_SIZE: usize = 100;
 const DEFAULT_AUTO_ANALYZE_THRESHOLD: u64 = 50;
 const DEFAULT_GC_INTERVAL_SEC: u64 = 600;
 const MIN_GC_INTERVAL_SEC: u64 = 30;
 const DEFAULT_HNSW_SWEEP_INTERVAL_SEC: u64 = 600;
 const MIN_HNSW_SWEEP_INTERVAL_SEC: u64 = 30;
+const DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC: u64 = 60;
+const MIN_REGISTRY_SWEEP_INTERVAL_SEC: u64 = 1;
+const DEFAULT_SWEEP_PAGE_INTERVAL_SEC: u64 = 30;
+const MIN_SWEEP_PAGE_INTERVAL_SEC: u64 = 1;
 const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 1800;
 const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
 const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
@@ -39,11 +49,16 @@ pub struct WorkerConfig {
     pub statement_timeout_ms: u64,
     pub cron_job_timeout_ms: u64,
     pub orphan_timeout_sec: u64,
+    /// Worker-claim lease span in ms. The executing worker renews its claim at
+    /// ~lease/3; GC reaps only leases that have actually expired.
+    pub claim_lease_ms: u64,
     pub gc_batch_size: usize,
     pub auto_analyze_enabled: bool,
     pub auto_analyze_threshold: u64,
     pub gc_interval_sec: u64,
     pub hnsw_sweep_interval_sec: u64,
+    pub registry_sweep_interval_sec: u64,
+    pub sweep_page_interval_sec: u64,
     pub storage_scan_interval_sec: u64,
     pub registry_reconcile_batch_size: usize,
     pub system_keyspace: String,
@@ -70,11 +85,14 @@ impl Default for WorkerConfig {
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
             cron_job_timeout_ms: DEFAULT_CRON_JOB_TIMEOUT_MS,
             orphan_timeout_sec: DEFAULT_ORPHAN_TIMEOUT_SEC,
+            claim_lease_ms: DEFAULT_CLAIM_LEASE_MS,
             gc_batch_size: DEFAULT_GC_BATCH_SIZE,
             auto_analyze_enabled: true,
             auto_analyze_threshold: DEFAULT_AUTO_ANALYZE_THRESHOLD,
             gc_interval_sec: DEFAULT_GC_INTERVAL_SEC,
             hnsw_sweep_interval_sec: DEFAULT_HNSW_SWEEP_INTERVAL_SEC,
+            registry_sweep_interval_sec: DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC,
+            sweep_page_interval_sec: DEFAULT_SWEEP_PAGE_INTERVAL_SEC,
             storage_scan_interval_sec: DEFAULT_STORAGE_SCAN_INTERVAL_SEC,
             registry_reconcile_batch_size: DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
@@ -174,6 +192,28 @@ impl WorkerConfig {
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.orphan_timeout_sec);
         }
+        if let Ok(v) = env::var("DB9_WORKER_CLAIM_LEASE_MS") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_CLAIM_LEASE_MS => {
+                    cfg.claim_lease_ms = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_CLAIM_LEASE_MS={} is below minimum {}ms; using default {}ms",
+                        parsed,
+                        MIN_CLAIM_LEASE_MS,
+                        cfg.claim_lease_ms
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_CLAIM_LEASE_MS='{}' is not a valid integer; using default {}ms",
+                        v,
+                        cfg.claim_lease_ms
+                    );
+                }
+            }
+        }
         if let Ok(v) = env::var("DB9_WORKER_GC_BATCH_SIZE") {
             cfg.gc_batch_size = v
                 .parse::<u64>()
@@ -232,6 +272,50 @@ impl WorkerConfig {
                         "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
                         v,
                         cfg.hnsw_sweep_interval_sec
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_REGISTRY_SWEEP_INTERVAL_SEC => {
+                    cfg.registry_sweep_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_REGISTRY_SWEEP_INTERVAL_SEC,
+                        cfg.registry_sweep_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.registry_sweep_interval_sec
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_SWEEP_PAGE_INTERVAL_SEC => {
+                    cfg.sweep_page_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_SWEEP_PAGE_INTERVAL_SEC,
+                        cfg.sweep_page_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.sweep_page_interval_sec
                     );
                 }
             }
@@ -390,6 +474,8 @@ mod tests {
             "DB9_AUTO_ANALYZE_THRESHOLD",
             "DB9_WORKER_GC_INTERVAL_SEC",
             "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC",
+            "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC",
+            "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC",
             "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC",
             "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE",
             "DB9_WORKER_SYSTEM_KEYSPACE",
@@ -419,6 +505,11 @@ mod tests {
         assert_eq!(cfg.auto_analyze_threshold, DEFAULT_AUTO_ANALYZE_THRESHOLD);
         assert_eq!(cfg.gc_interval_sec, DEFAULT_GC_INTERVAL_SEC);
         assert_eq!(cfg.hnsw_sweep_interval_sec, DEFAULT_HNSW_SWEEP_INTERVAL_SEC);
+        assert_eq!(
+            cfg.registry_sweep_interval_sec,
+            DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC
+        );
+        assert_eq!(cfg.sweep_page_interval_sec, DEFAULT_SWEEP_PAGE_INTERVAL_SEC);
         assert_eq!(
             cfg.storage_scan_interval_sec,
             DEFAULT_STORAGE_SCAN_INTERVAL_SEC
@@ -588,14 +679,44 @@ mod tests {
         assert_eq!(cfg.statement_timeout_ms, 300_000);
         assert_eq!(cfg.cron_job_timeout_ms, 1_800_000);
         assert_eq!(cfg.orphan_timeout_sec, 300);
+        assert_eq!(cfg.claim_lease_ms, 60_000);
         assert_eq!(cfg.gc_batch_size, 100);
         assert!(cfg.auto_analyze_enabled);
         assert_eq!(cfg.auto_analyze_threshold, 50);
         assert_eq!(cfg.gc_interval_sec, 600);
         assert_eq!(cfg.hnsw_sweep_interval_sec, 600);
+        assert_eq!(cfg.registry_sweep_interval_sec, 60);
+        assert_eq!(cfg.sweep_page_interval_sec, 30);
         assert_eq!(cfg.storage_scan_interval_sec, 1800);
         assert_eq!(cfg.registry_reconcile_batch_size, 32);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
+    }
+
+    #[test]
+    fn from_env_applies_claim_lease_ms_and_clamps_below_minimum() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_CLAIM_LEASE_MS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "120000");
+        }
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.claim_lease_ms, 120_000);
+
+        // Below the minimum: keep the default (sub-second/too-small leases are
+        // forbidden by design §K4).
+        unsafe {
+            env::set_var(key, "1000");
+        }
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.claim_lease_ms, DEFAULT_CLAIM_LEASE_MS);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
     }
 
     #[test]
@@ -705,6 +826,49 @@ mod tests {
     }
 
     #[test]
+    fn from_env_applies_registry_sweep_interval_when_at_least_minimum() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "7");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.registry_sweep_interval_sec, 7);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_keeps_default_registry_sweep_interval_when_below_minimum() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "0");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(
+            cfg.registry_sweep_interval_sec,
+            DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC
+        );
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
     fn from_env_applies_gc_interval_when_at_least_minimum() {
         let _guard = test_lock().lock();
 
@@ -745,22 +909,26 @@ mod tests {
     }
 
     #[test]
-    fn gc_and_hnsw_sweep_intervals_are_independent() {
+    fn gc_hnsw_and_registry_sweep_intervals_are_independent() {
         let _guard = test_lock().lock();
 
         let gc_key = "DB9_WORKER_GC_INTERVAL_SEC";
         let hnsw_key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
+        let registry_key = "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC";
         let gc_saved = env::var(gc_key).ok();
         let hnsw_saved = env::var(hnsw_key).ok();
+        let registry_saved = env::var(registry_key).ok();
 
         unsafe {
             env::set_var(gc_key, "60");
             env::set_var(hnsw_key, "300");
+            env::set_var(registry_key, "9");
         }
 
         let cfg = WorkerConfig::from_env();
         assert_eq!(cfg.gc_interval_sec, 60);
         assert_eq!(cfg.hnsw_sweep_interval_sec, 300);
+        assert_eq!(cfg.registry_sweep_interval_sec, 9);
 
         match gc_saved {
             Some(v) => unsafe { env::set_var(gc_key, v) },
@@ -769,6 +937,10 @@ mod tests {
         match hnsw_saved {
             Some(v) => unsafe { env::set_var(hnsw_key, v) },
             None => unsafe { env::remove_var(hnsw_key) },
+        }
+        match registry_saved {
+            Some(v) => unsafe { env::set_var(registry_key, v) },
+            None => unsafe { env::remove_var(registry_key) },
         }
     }
 

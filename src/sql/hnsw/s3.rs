@@ -78,10 +78,17 @@ impl HnswS3Config {
 // S3ObjectInfo (for GC listing)
 // ---------------------------------------------------------------------------
 
-/// Metadata about an S3 object, returned by [`HnswS3Client::list_objects`].
+/// Metadata about an S3 object, returned by HNSW S3 listing helpers.
 #[allow(dead_code)] // Used by GC sweep (Phase 4), not yet wired
 pub(crate) struct S3ObjectInfo {
     pub key: String,
+}
+
+/// One bounded page of S3 objects under a database prefix.
+#[allow(dead_code)] // Used by GC sweep
+pub(crate) struct S3ObjectPage {
+    pub objects: Vec<S3ObjectInfo>,
+    pub next_continuation_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +863,62 @@ impl HnswS3Client {
         self.delete_objects_by_prefix(&prefix).await
     }
 
-    /// List all objects under a database prefix (for batched GC).
+    /// List one bounded page of objects under a database prefix.
+    #[allow(dead_code)] // Used by GC sweep
+    pub async fn list_objects_page(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        continuation_token: Option<String>,
+    ) -> anyhow::Result<S3ObjectPage> {
+        let prefix = self.db_prefix(keyspace, db_id);
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix);
+
+        if let Some(token) = continuation_token {
+            req = req.continuation_token(token);
+        }
+
+        let output = req.send().await.with_context(|| {
+            format!(
+                "hnsw-s3: ListObjectsV2 failed for s3://{}/{}",
+                self.bucket, prefix
+            )
+        })?;
+
+        let mut objects = Vec::new();
+        for obj in output.contents() {
+            let key = match obj.key() {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
+            objects.push(S3ObjectInfo { key });
+        }
+
+        let next_continuation_token = match output.next_continuation_token() {
+            Some(token) if output.is_truncated() == Some(true) => Some(token.to_string()),
+            _ => None,
+        };
+
+        debug!(
+            prefix = %prefix,
+            count = objects.len(),
+            has_more = next_continuation_token.is_some(),
+            "hnsw-s3: listed object page"
+        );
+        Ok(S3ObjectPage {
+            objects,
+            next_continuation_token,
+        })
+    }
+
+    /// List all objects under a database prefix.
+    ///
+    /// Production GC should prefer [`Self::list_objects_page`] so a single
+    /// database cannot force the worker to materialize its whole S3 prefix.
     #[allow(dead_code)] // Used by GC sweep
     pub async fn list_objects(
         &self,
@@ -868,35 +930,14 @@ impl HnswS3Client {
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix);
+            let page = self
+                .list_objects_page(keyspace, db_id, continuation_token.take())
+                .await?;
+            let next = page.next_continuation_token;
+            results.extend(page.objects);
 
-            if let Some(token) = continuation_token.take() {
-                req = req.continuation_token(token);
-            }
-
-            let output = req.send().await.with_context(|| {
-                format!(
-                    "hnsw-s3: ListObjectsV2 failed for s3://{}/{}",
-                    self.bucket, prefix
-                )
-            })?;
-
-            for obj in output.contents() {
-                let key = match obj.key() {
-                    Some(k) => k.to_string(),
-                    None => continue,
-                };
-                results.push(S3ObjectInfo { key });
-            }
-
-            match output.next_continuation_token() {
-                Some(token) if output.is_truncated() == Some(true) => {
-                    continuation_token = Some(token.to_string());
-                }
+            match next {
+                Some(token) => continuation_token = Some(token),
                 _ => break,
             }
         }

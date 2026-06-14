@@ -303,6 +303,16 @@ fn maybe_rotate_backfill_txn_clears_then_refreshes_session_registration() {
     let commit_pos = rotate_fn
         .find("txn.commit().await?")
         .expect("rotation helper must commit the old transaction");
+    let lease_fence_pos = rotate_fn
+        .find("lease_cancel.bail_if_cancelled()?;")
+        .expect("rotation helper must fence the claim lease before committing a batch");
+    assert!(
+        lease_fence_pos < commit_pos,
+        "lease fence must precede the per-batch commit so a lost claim abandons the batch uncommitted"
+    );
+    let fence_pos = rotate_fn
+        .find("assert_database_alive_for_update(txn, db_id)")
+        .expect("rotation helper must lock/read DB liveness before commit");
     let clear_pos = rotate_fn
         .find("crate::session_context::clear_current_session_txn_registration();")
         .expect("rotation helper must clear the old session registration");
@@ -314,8 +324,11 @@ fn maybe_rotate_backfill_txn_clears_then_refreshes_session_registration() {
         .expect("rotation helper must refresh the worker txn guard for the new transaction");
 
     assert!(
-        commit_pos < clear_pos && clear_pos < begin_pos && begin_pos < worker_guard_pos,
-        "rotation helper must clear the old session registration after commit, reopen the session-owned txn via the shared helper, then track the new worker txn"
+        fence_pos < commit_pos
+            && commit_pos < clear_pos
+            && clear_pos < begin_pos
+            && begin_pos < worker_guard_pos,
+        "rotation helper must fence before commit, clear the old session registration after commit, reopen the session-owned txn via the shared helper, then track the new worker txn"
     );
     assert!(
         !rotate_fn.contains("refresh_active_session_txn_registration(txn);")
@@ -638,4 +651,125 @@ fn alter_table_byte_limit_respects_env_var() {
 
     // Cleanup
     std::env::remove_var("DB9_ALTER_TABLE_BYTE_LIMIT");
+}
+
+// ── Claim-lease cancellation contract ───────────────────────────────────────
+
+/// Behavioral contract test for the shared cancellation primitive that the three
+/// specialized long-running task paths (HNSW merge, CIC backfill, storage scan)
+/// use before every tenant commit. Pure (no TiKV): proves the gate itself.
+#[test]
+fn lease_cancel_bails_only_when_token_is_cancelled() {
+    use crate::worker::LeaseCancel;
+    use pgwire::tokio::CancellationToken;
+
+    // No token (foreground DDL): never bails.
+    assert!(LeaseCancel::none().bail_if_cancelled().is_ok());
+    assert!(LeaseCancel::new(None).bail_if_cancelled().is_ok());
+
+    // Live, uncancelled token: does not bail.
+    let token = CancellationToken::new();
+    let lease = LeaseCancel::new(Some(token.clone()));
+    assert!(lease.bail_if_cancelled().is_ok());
+
+    // After the lease-renewer cancels (lost/stolen claim): bails with the
+    // canonical claim-cancelled error — the SAME string run_with_guards emits.
+    token.cancel();
+    let err = lease
+        .bail_if_cancelled()
+        .expect_err("a cancelled lease must bail before any commit");
+    assert!(
+        err.to_string().contains("cancelled by administrator"),
+        "must surface the shared cancellation error, got: {err}"
+    );
+}
+
+/// Behavioral, TiKV-backed regression for the P1 this fix closes: the shared
+/// per-batch commit choke point (`maybe_rotate_backfill_txn`, used by both CIC
+/// backfill phases and reconcile) must, when the claim lease is cancelled
+/// MID-RUN, abort BEFORE committing the in-flight batch — leaving the tenant
+/// write uncommitted for the new owner. Drives the real production helper with a
+/// real TiKV transaction and a real (cancelled) lease token, then proves the
+/// staged write never landed.
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn rotate_backfill_txn_abandons_batch_when_lease_cancelled_midrun() {
+    use crate::worker::LeaseCancel;
+    use pgwire::tokio::CancellationToken;
+
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let keyspace = format!(
+        "leasecancel_rotate_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let pool = crate::pool::TikvClientPool::new(pd_endpoints);
+    let store = pool
+        .acquire(Some(keyspace))
+        .await
+        .expect("acquire tenant handle")
+        .store()
+        .clone();
+
+    // A unique probe key that the (to-be-abandoned) batch would otherwise commit.
+    let probe_key: Vec<u8> = format!(
+        "_lease_cancel_probe_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
+    .into_bytes();
+    let db_id = 1_u64;
+
+    // Stage a tenant write inside an open backfill-style txn.
+    let mut txn = store.begin().await.expect("begin backfill txn");
+    let mut txn_guard = super::track_active_worker_txn(&txn);
+    crate::txn::txn_put(&mut txn, probe_key.clone(), b"staged".to_vec())
+        .await
+        .expect("stage tenant write");
+
+    // Simulate the renewer cancelling our claim mid-run (lost/stolen lease).
+    let token = CancellationToken::new();
+    token.cancel();
+    let lease = LeaseCancel::new(Some(token));
+
+    // Force the rotation path (>= commit threshold) so the lease fence is reached.
+    let mut current_batch_writes = super::DDL_BACKFILL_COMMIT_SIZE;
+    let mut has_committed_batches = false;
+    let result = super::maybe_rotate_backfill_txn(
+        &store,
+        &mut txn,
+        db_id,
+        &mut txn_guard,
+        &mut current_batch_writes,
+        &mut has_committed_batches,
+        &lease,
+    )
+    .await;
+
+    let err = result.expect_err("a cancelled lease must abort the rotation before commit");
+    assert!(
+        err.to_string().contains("cancelled by administrator"),
+        "rotation must fail with the claim-cancelled error, got: {err}"
+    );
+    assert!(
+        !has_committed_batches,
+        "no batch may be marked committed after a cancelled rotation"
+    );
+
+    // Roll back the abandoned txn (as the production error path would) and prove
+    // the staged tenant write was NEVER committed — the new owner sees nothing.
+    txn.rollback().await.ok();
+    let mut verify = store.begin().await.expect("begin verify txn");
+    let seen = verify.get(probe_key).await.expect("get probe key");
+    verify.rollback().await.ok();
+    assert!(
+        seen.is_none(),
+        "cancelled rotation must NOT commit the staged tenant write"
+    );
 }

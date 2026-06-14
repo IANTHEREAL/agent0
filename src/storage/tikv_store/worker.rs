@@ -1,8 +1,10 @@
 use super::*;
 use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{
-    TaskDescriptorV2, TaskPayloadV2, TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim,
+    HnswS3DbPrefixCleanupIntent, HnswS3GraphUploadIntent, TaskDescriptorV2, TaskPayloadV2,
+    TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim,
 };
+use std::time::Duration;
 
 /// A V2 index row decoded into its identity plus the reconstructed V2 due-queue
 /// key it points at. Carries no command payload.
@@ -18,6 +20,9 @@ pub struct WqIndexRow {
 
 const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
 const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
+const WORKER_QUEUE_SCHEMA_V2: u8 = 2;
+const WORKER_QUEUE_MIGRATION_BATCH: u32 = 256;
+const WORKER_QUEUE_MIGRATION_LOCK_STALE_MS: i64 = 30 * 60 * 1000;
 
 /// Published GC instance state read back from `_sys_worker`.
 #[derive(Clone)]
@@ -28,6 +33,12 @@ pub struct GcInstanceState {
     /// Legacy 25-byte row compatibility during mixed-version rollout.
     /// New-format rows do not publish this timeout tail.
     pub legacy_max_untracked_timeout_sec: Option<u64>,
+}
+
+enum WorkerQueueMigrationLock {
+    AlreadyV2,
+    Acquired,
+    Busy,
 }
 
 fn encode_gc_instance_state_value(min_start_ts: Option<u64>, updated_at_version: u64) -> Vec<u8> {
@@ -71,6 +82,39 @@ fn gc_instance_state_scan_end(prefix: &[u8]) -> Vec<u8> {
     end
 }
 
+fn worker_queue_schema_is_v2(value: Option<&[u8]>) -> bool {
+    value.is_some_and(|bytes| bytes.first().copied() == Some(WORKER_QUEUE_SCHEMA_V2))
+}
+
+fn decode_worker_queue_migration_lock(value: &[u8]) -> i64 {
+    if value.len() >= 8 {
+        i64::from_be_bytes(value[..8].try_into().unwrap_or([0; 8]))
+    } else {
+        0
+    }
+}
+
+fn migrated_legacy_worker_nonce(entry: &TaskQueueEntry, fire_time_ms: i64) -> u64 {
+    fn mix(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    mix(&mut hash, entry.keyspace.as_bytes());
+    mix(&mut hash, &entry.db_id.to_be_bytes());
+    mix(&mut hash, &entry.task_id.to_be_bytes());
+    mix(&mut hash, &[entry.task_type.to_bitmask()]);
+    mix(&mut hash, &fire_time_ms.to_be_bytes());
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
 impl TikvStore {
     // ========================================================================
     // Registry methods
@@ -104,6 +148,8 @@ impl TikvStore {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn list_worker_registry(
         &self,
         txn: &mut Transaction,
@@ -127,7 +173,52 @@ impl TikvStore {
         Ok(entries)
     }
 
-    pub async fn delete_worker_registry(
+    pub async fn scan_worker_registry_page(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<TaskRegistryEntry>, Option<Vec<u8>>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let prefix = encode_worker_registry_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0x00);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(Some(limit))).await)?;
+
+        let mut entries = Vec::new();
+        let mut last_key = None;
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let entry: TaskRegistryEntry = bincode::deserialize(pair.value())
+                .context("Failed to deserialize worker registry entry")?;
+            entries.push(entry);
+            last_key = Some(key.to_vec());
+        }
+
+        let next_cursor = if entries.len() == limit {
+            last_key
+        } else {
+            None
+        };
+        Ok((entries, next_cursor))
+    }
+
+    async fn delete_worker_registry(
         &self,
         txn: &mut Transaction,
         keyspace: &str,
@@ -136,6 +227,24 @@ impl TikvStore {
         let key = self.key(&encode_worker_registry_key(keyspace, db_id));
         txn_delete(txn, key).await?;
         Ok(())
+    }
+
+    /// Reap all worker queue entries for a database, then delete its registry
+    /// inventory row. The registry row is intentionally retained if queue
+    /// cleanup fails so bounded maintenance can retry from durable inventory.
+    pub async fn reap_db_queue_entries_then_delete_worker_registry(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<usize> {
+        let deleted = self.reap_db_queue_entries(keyspace, db_id).await?;
+
+        let mut txn = self.begin().await?;
+        self.delete_worker_registry(&mut txn, keyspace, db_id)
+            .await?;
+        txn.commit().await?;
+
+        Ok(deleted)
     }
 
     pub async fn update_registry_task_types(
@@ -154,22 +263,340 @@ impl TikvStore {
         entry.task_types |= set_bits;
         entry.task_types &= !clear_bits;
 
-        if entry.task_types == 0 && entry.job_count == 0 {
-            self.delete_worker_registry(txn, keyspace, db_id).await?;
-        } else {
-            self.put_worker_registry(txn, &entry).await?;
-        }
+        self.put_worker_registry(txn, &entry).await?;
         Ok(())
+    }
+
+    // ========================================================================
+    // External object lifecycle intents
+    // ========================================================================
+
+    pub async fn put_hnsw_s3_graph_upload_intent(
+        &self,
+        txn: &mut Transaction,
+        intent: &HnswS3GraphUploadIntent,
+    ) -> Result<()> {
+        let key = self.key(&encode_hnsw_s3_graph_upload_intent_key(
+            &intent.keyspace,
+            intent.db_id,
+            intent.table_id,
+            intent.index_id,
+            intent.version,
+        ));
+        let data =
+            bincode::serialize(intent).context("Failed to serialize HNSW S3 upload intent")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn delete_hnsw_s3_graph_upload_intent(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        version: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_hnsw_s3_graph_upload_intent_key(
+            keyspace, db_id, table_id, index_id, version,
+        ));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
+    pub async fn scan_hnsw_s3_graph_upload_intents_page(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<HnswS3GraphUploadIntent>, Option<Vec<u8>>)> {
+        self.scan_external_intent_page(
+            txn,
+            encode_hnsw_s3_graph_upload_intent_prefix(),
+            start_after,
+            limit,
+            "HNSW S3 graph upload intent",
+        )
+        .await
+    }
+
+    pub async fn put_hnsw_s3_db_prefix_cleanup_intent(
+        &self,
+        txn: &mut Transaction,
+        intent: &HnswS3DbPrefixCleanupIntent,
+    ) -> Result<()> {
+        let key = self.key(&encode_hnsw_s3_db_prefix_cleanup_intent_key(
+            &intent.keyspace,
+            intent.db_id,
+        ));
+        let data =
+            bincode::serialize(intent).context("Failed to serialize HNSW S3 DB cleanup intent")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn delete_hnsw_s3_db_prefix_cleanup_intent(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_hnsw_s3_db_prefix_cleanup_intent_key(
+            keyspace, db_id,
+        ));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
+    pub async fn scan_hnsw_s3_db_prefix_cleanup_intents_page(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<HnswS3DbPrefixCleanupIntent>, Option<Vec<u8>>)> {
+        self.scan_external_intent_page(
+            txn,
+            encode_hnsw_s3_db_prefix_cleanup_intent_prefix(),
+            start_after,
+            limit,
+            "HNSW S3 DB prefix cleanup intent",
+        )
+        .await
+    }
+
+    async fn scan_external_intent_page<T>(
+        &self,
+        txn: &mut Transaction,
+        prefix: Vec<u8>,
+        start_after: Option<&[u8]>,
+        limit: usize,
+        label: &'static str,
+    ) -> Result<(Vec<T>, Option<Vec<u8>>)>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0x00);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(Some(limit))).await)?;
+
+        let mut intents = Vec::new();
+        let mut last_key = None;
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let intent = bincode::deserialize(pair.value())
+                .with_context(|| format!("Failed to deserialize {label}"))?;
+            intents.push(intent);
+            last_key = Some(key.to_vec());
+        }
+
+        let next_cursor = if intents.len() == limit {
+            last_key
+        } else {
+            None
+        };
+        Ok((intents, next_cursor))
     }
 
     // ========================================================================
     // Queue methods
     // ========================================================================
 
+    pub async fn ensure_worker_queue_schema_v2(&self) -> Result<usize> {
+        loop {
+            match self.try_acquire_worker_queue_migration_lock().await? {
+                WorkerQueueMigrationLock::AlreadyV2 => return Ok(0),
+                WorkerQueueMigrationLock::Acquired => break,
+                WorkerQueueMigrationLock::Busy => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+
+        let migrated = match self.migrate_legacy_worker_queue_to_v2().await {
+            Ok(migrated) => migrated,
+            Err(e) => {
+                self.clear_worker_queue_migration_lock().await.ok();
+                return Err(e);
+            }
+        };
+
+        let mut txn = self.begin().await?;
+        let version_key = self.key(&encode_worker_queue_schema_version_key());
+        let lock_key = self.key(&encode_worker_queue_migration_lock_key());
+        txn_put(&mut txn, version_key, vec![WORKER_QUEUE_SCHEMA_V2]).await?;
+        txn_delete(&mut txn, lock_key).await?;
+        txn.commit().await?;
+        Ok(migrated)
+    }
+
+    async fn try_acquire_worker_queue_migration_lock(&self) -> Result<WorkerQueueMigrationLock> {
+        let mut txn = self.begin().await?;
+        let version_key = self.key(&encode_worker_queue_schema_version_key());
+        if worker_queue_schema_is_v2(tikv_op!(txn.get(version_key).await)?.as_deref()) {
+            txn.rollback().await.ok();
+            return Ok(WorkerQueueMigrationLock::AlreadyV2);
+        }
+
+        let lock_key = self.key(&encode_worker_queue_migration_lock_key());
+        let now_ms = crate::worker::now_epoch_ms();
+        if let Some(value) = tikv_op!(txn.get_for_update(lock_key.clone()).await)? {
+            let locked_at = decode_worker_queue_migration_lock(&value);
+            if now_ms.saturating_sub(locked_at) < WORKER_QUEUE_MIGRATION_LOCK_STALE_MS {
+                txn.rollback().await.ok();
+                return Ok(WorkerQueueMigrationLock::Busy);
+            }
+        }
+
+        txn_put(&mut txn, lock_key, now_ms.to_be_bytes().to_vec()).await?;
+        txn.commit().await?;
+        Ok(WorkerQueueMigrationLock::Acquired)
+    }
+
+    async fn clear_worker_queue_migration_lock(&self) -> Result<()> {
+        let mut txn = self.begin().await?;
+        let lock_key = self.key(&encode_worker_queue_migration_lock_key());
+        txn_delete(&mut txn, lock_key).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// One-shot bulk drain of every legacy (`_worker_queue_`) row into V2,
+    /// looping the bounded batch primitive until the legacy queue is empty.
+    /// Runs once at startup (under the migration lock) to convert all V1 rows a
+    /// pre-upgrade binary left behind before the V2-only tick begins polling.
+    ///
+    /// This handles only the rows that exist at startup. Rows written by an OLD
+    /// binary AFTER this node latches the V2 marker are caught by the convergent
+    /// background drain (`drain_legacy_worker_queue_batch`) on the maintenance
+    /// loop — see the design doc §II.8 M5.
+    async fn migrate_legacy_worker_queue_to_v2(&self) -> Result<usize> {
+        let mut migrated = 0usize;
+        loop {
+            let batch = self.drain_legacy_worker_queue_batch().await?;
+            migrated += batch;
+            if batch < WORKER_QUEUE_MIGRATION_BATCH as usize {
+                break;
+            }
+        }
+        Ok(migrated)
+    }
+
+    /// Cheap empty-range probe for the legacy (`_worker_queue_`) layer: a single
+    /// 1-key scan. The converged steady state of the background drain costs only
+    /// this probe, so the drain never imposes a global scan once stragglers stop
+    /// appearing.
+    pub async fn legacy_worker_queue_is_empty(&self) -> Result<bool> {
+        let mut txn = self.begin().await?;
+        let empty = !self.legacy_queue_has_entries(&mut txn).await?;
+        txn.rollback().await.ok();
+        Ok(empty)
+    }
+
+    /// Migrate ONE bounded batch (≤ `WORKER_QUEUE_MIGRATION_BATCH`) of due legacy
+    /// (`_worker_queue_`) rows into V2 — writing each row's V2 due/index/payload
+    /// and deleting its V1 key in the SAME batch transaction — and return how
+    /// many were migrated. Returns 0 when the legacy queue is empty.
+    ///
+    /// This is the single convergent primitive shared by the one-shot startup
+    /// migration AND the periodic background drain (maintenance loop). It is
+    /// BOUNDED (one page-sized batch per call), never a per-operation or
+    /// per-tick global scan: the V2-only enqueue/dequeue hot paths never touch
+    /// the legacy layer (issue #2576 invariant). Because new producers only ever
+    /// write V2, repeated calls strictly drain the legacy layer toward empty.
+    pub async fn drain_legacy_worker_queue_batch(&self) -> Result<usize> {
+        let mut txn = self.begin().await?;
+        let rows = self
+            .scan_due_legacy_bytesafe(&mut txn, i64::MAX, WORKER_QUEUE_MIGRATION_BATCH)
+            .await?;
+        if rows.is_empty() {
+            txn.rollback().await.ok();
+            return Ok(0);
+        }
+
+        let mut migrated = 0usize;
+        for (legacy_key, mut entry) in rows {
+            let fire_time_ms = decode_worker_queue_fire_time(&legacy_key).ok_or_else(|| {
+                anyhow!("corrupted legacy worker queue key: missing fire_time_ms")
+            })?;
+            if entry.task_type.uses_deterministic_queue_key() {
+                // Deterministic task types REQUIRE singleton semantics: a rolling
+                // deploy can let an OLD binary write a V1 deterministic row AFTER
+                // a NEW node already enqueued/claimed the V2 singleton. Migrating
+                // such a row with raw `put_task_v2` would either overwrite the
+                // live descriptor under a new nonce (cleanup's nonce check then
+                // skips deletion → re-run) or create a second descriptor at a
+                // different `fire_time_ms` (two workers run the same logical
+                // singleton). Route through the IDENTICAL singleton guard that
+                // every producer uses (`put_singleton_task_v2`): if a pending or
+                // claimed V2 row already represents this logical task, drop the
+                // V1 key WITHOUT writing another descriptor; otherwise write the
+                // one V2 singleton and drop the V1 key — same batch txn.
+                if entry.nonce == 0 {
+                    entry.nonce = migrated_legacy_worker_nonce(&entry, fire_time_ms);
+                }
+                self.put_singleton_task_v2(&mut txn, &entry, fire_time_ms)
+                    .await?;
+            } else {
+                self.put_task_v2(&mut txn, &entry, fire_time_ms).await?;
+            }
+            self.delete_worker_queue_entry(&mut txn, &legacy_key)
+                .await?;
+            migrated += 1;
+        }
+        txn.commit().await?;
+        Ok(migrated)
+    }
+
+    /// Seed a single legacy (`_worker_queue_`) entry, simulating durable state
+    /// written by a pre-V2 binary before an upgrade. Test-only: production
+    /// paths never write the legacy layout. Used by the production-startup
+    /// migration behavioral test (`worker::mod::tests`).
+    #[cfg(test)]
+    pub async fn seed_legacy_worker_queue_entry_for_test(
+        &self,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+    ) -> Result<()> {
+        let legacy_key = encode_worker_queue_key(
+            entry.priority,
+            fire_time_ms,
+            entry.task_type.to_bitmask(),
+            &entry.keyspace,
+            entry.db_id,
+            entry.task_id,
+        )?;
+        let mut txn = self.begin().await?;
+        txn_put(
+            &mut txn,
+            self.key(&legacy_key),
+            bincode::serialize(entry).context("serialize legacy worker queue entry")?,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     /// Delete a single due-queue key (legacy `_worker_queue_`). Used by the
-    /// migration-window legacy paths and the worker-tick cleanup of a legacy
-    /// entry. V2 deletes go through [`Self::delete_task_v2`].
-    pub async fn delete_worker_queue_entry(&self, txn: &mut Transaction, key: &[u8]) -> Result<()> {
+    /// one-shot V1-to-V2 migration and test-only compatibility checks. Normal
+    /// production queue paths are V2-only.
+    async fn delete_worker_queue_entry(&self, txn: &mut Transaction, key: &[u8]) -> Result<()> {
         txn_delete(txn, key.to_vec()).await?;
         Ok(())
     }
@@ -200,6 +627,7 @@ impl TikvStore {
         entry: &TaskQueueEntry,
         fire_time_ms: i64,
     ) -> Result<()> {
+        validate_task_v2_enqueue(entry)?;
         let task_type = entry.task_type.to_bitmask();
         let (descriptor, payload) = TaskDescriptorV2::split_from_entry(entry);
 
@@ -240,6 +668,53 @@ impl TikvStore {
         // Value = priority byte, enough to reconstruct the exact due key.
         txn_put(txn, index_key, vec![entry.priority]).await?;
         Ok(())
+    }
+
+    /// Enqueue a deterministic-key task only if no pending/claimed row already
+    /// represents the same logical task.
+    ///
+    /// Deterministic tasks use a stable due key, so blindly calling
+    /// `put_task_v2` can replace the descriptor while a worker is processing an
+    /// older nonce. That leaves the newer row behind after successful cleanup and
+    /// causes immediate redundant execution. Callers that deliberately want
+    /// replacement semantics must use a non-deterministic key or delete first.
+    pub async fn put_singleton_task_v2(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+    ) -> Result<bool> {
+        validate_task_v2_enqueue(entry)?;
+        if !entry.task_type.uses_deterministic_queue_key() {
+            return Err(anyhow!(
+                "singleton enqueue requires a deterministic worker task type, got {:?}",
+                entry.task_type
+            ));
+        }
+        if self
+            .task_has_pending(
+                txn,
+                &entry.keyspace,
+                entry.db_id,
+                entry.task_id,
+                entry.task_type,
+            )
+            .await?
+            || self
+                .task_has_claim(
+                    txn,
+                    &entry.keyspace,
+                    entry.db_id,
+                    entry.task_id,
+                    fire_time_ms,
+                    entry.task_type,
+                )
+                .await?
+        {
+            return Ok(false);
+        }
+        self.put_task_v2(txn, entry, fire_time_ms).await?;
+        Ok(true)
     }
 
     /// Delete a task's V2 due descriptor, index row, and (for split types)
@@ -457,7 +932,7 @@ impl TikvStore {
     }
 
     // ========================================================================
-    // V2 due-queue dequeue + byte-safe legacy drain (issue #2576)
+    // V2 due-queue dequeue + byte-safe legacy migration scan (issue #2576)
     // ========================================================================
 
     /// Scan due V2 descriptors across all priorities up to `now_ms`, ordered by
@@ -513,10 +988,8 @@ impl TikvStore {
     }
 
     /// Byte-safe scan of due LEGACY (`_worker_queue_`) entries: fetch exactly
-    /// one key/value pair per RPC. Used by the worker tick during the migration
-    /// window to execute V1 entries an old binary may still enqueue; after V1
-    /// drains this returns empty (the caller gates on `legacy_queue_has_entries`).
-    pub async fn scan_due_legacy_bytesafe(
+    /// one key/value pair per RPC. Used only by startup V1-to-V2 migration.
+    async fn scan_due_legacy_bytesafe(
         &self,
         txn: &mut Transaction,
         now_ms: i64,
@@ -556,10 +1029,13 @@ impl TikvStore {
         Ok(results)
     }
 
-    /// Cheap existence check for any legacy (`_worker_queue_`) entry. Used to
-    /// gate the byte-safe legacy paths so they cost a single key-only RPC once
-    /// V1 has been drained.
-    pub async fn legacy_queue_has_entries(&self, txn: &mut Transaction) -> Result<bool> {
+    /// Cheap existence check for any legacy (`_worker_queue_`) entry: a single
+    /// 1-key scan. Used by the convergent background drain's empty-range probe
+    /// (`legacy_worker_queue_is_empty`) and by migration tests. It is NOT a
+    /// per-operation gate on any enqueue/dequeue hot path — those are V2-only
+    /// (issue #2576 invariant); only the bounded maintenance-loop drain consults
+    /// it.
+    async fn legacy_queue_has_entries(&self, txn: &mut Transaction) -> Result<bool> {
         let prefix = encode_worker_queue_prefix();
         let end = encode_prefix_end(&prefix);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -569,10 +1045,10 @@ impl TikvStore {
         Ok(keys.iter().any(|k| k.starts_with(&prefix)))
     }
 
-    /// Byte-safe scan of legacy (`_worker_queue_`) entries matching `pred`:
-    /// fetch one key/value pair per RPC, then filter. Used by targeted ops during
-    /// the migration window; callers gate on `legacy_queue_has_entries` so this
-    /// is never invoked once V1 is drained.
+    /// Byte-safe scan of legacy (`_worker_queue_`) entries matching `pred`.
+    /// Test-only: production V1 compatibility is handled by the startup schema
+    /// migration and normal task/db-targeted paths are V2-only.
+    #[cfg(test)]
     async fn scan_legacy_filtered<F>(
         &self,
         txn: &mut Transaction,
@@ -608,10 +1084,9 @@ impl TikvStore {
         Ok(out)
     }
 
-    /// Delete every queue entry for one task across BOTH layers: V2 (via index)
-    /// and, during the migration window, legacy. Returns the number deleted.
-    /// Test-only guard for migration-window behavior; production SQL hot paths
-    /// use `delete_task_v2_by_identity` instead.
+    /// Delete every queue entry for one task across V2 and test-seeded legacy.
+    /// Test-only guard; production SQL hot paths use `delete_task_v2_by_identity`
+    /// after startup migration has made the queue schema V2-only.
     #[cfg(test)]
     pub async fn delete_task_all_layers(
         &self,
@@ -656,9 +1131,8 @@ impl TikvStore {
     }
 
     /// Legacy (`_worker_queue_`) entries for one (keyspace, db_id, task_type),
-    /// as `(legacy_due_key, task_id)`. Test-only guard for migration-window
-    /// behavior; production startup paths must not call this helper because it
-    /// scans the whole legacy queue.
+    /// as `(legacy_due_key, task_id)`. Test-only guard; production paths must
+    /// not call this helper because it scans the whole legacy queue.
     #[cfg(test)]
     pub async fn legacy_entries_for_db_type(
         &self,
@@ -678,9 +1152,8 @@ impl TikvStore {
         Ok(rows.into_iter().map(|(key, e)| (key, e.task_id)).collect())
     }
 
-    /// Whether any pending queue entry exists for one task, across V2 and (gated)
-    /// legacy. Used by bg_sql result polling and AutoAnalyze enqueue dedup. No
-    /// global due-queue scan.
+    /// Whether any pending queue entry exists for one task. V2-only by contract:
+    /// startup schema migration converts legacy rows before production paths run.
     pub async fn task_has_pending(
         &self,
         txn: &mut Transaction,
@@ -696,45 +1169,42 @@ impl TikvStore {
         {
             return Ok(true);
         }
-        if self.legacy_queue_has_entries(txn).await? {
-            let rows = self
-                .scan_legacy_filtered(txn, |e| {
-                    e.task_id == task_id
-                        && e.db_id == db_id
-                        && e.keyspace == keyspace
-                        && e.task_type == task_type
-                })
-                .await?;
-            return Ok(!rows.is_empty());
-        }
         Ok(false)
     }
 
-    /// Delete every queue entry for an entire (keyspace, db_id) across both
-    /// layers — used by DROP DATABASE so worker queue entries do not leak.
-    /// Self-contained: collects the work-list with byte-safe reads, then deletes
-    /// in BOUNDED batched transactions so a db with a large backlog cannot build
-    /// one oversized 2PC write/lock set. Returns the number deleted. No global
-    /// due-queue value scan.
+    pub async fn task_has_claim(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        task_type: TaskType,
+    ) -> Result<bool> {
+        let key = self.key(&encode_worker_claim_key(
+            task_type.to_bitmask(),
+            keyspace,
+            db_id,
+            task_id,
+            fire_time_ms,
+        ));
+        Ok(tikv_op!(txn.get(key).await)?.is_some())
+    }
+
+    /// Delete every V2 queue entry for an entire (keyspace, db_id), used by
+    /// DROP DATABASE so worker queue entries do not leak. Self-contained:
+    /// collects the work-list from the V2 identity index, then deletes in bounded
+    /// batched transactions so a db with a large backlog cannot build one
+    /// oversized 2PC write/lock set.
     pub async fn reap_db_queue_entries(&self, keyspace: &str, db_id: u64) -> Result<usize> {
         const DELETE_BATCH: usize = 256;
 
-        // Phase 1: collect the work-list (byte-safe: 1-byte index values + gated
-        // one-value legacy scan).
-        let (index_rows, legacy_keys) = {
+        // Phase 1: collect the work-list from 1-byte V2 index values.
+        let index_rows = {
             let mut txn = self.begin().await?;
             let idx = self.index_rows_for_db(&mut txn, keyspace, db_id).await?;
-            let legacy = if self.legacy_queue_has_entries(&mut txn).await? {
-                self.scan_legacy_filtered(&mut txn, |e| e.db_id == db_id && e.keyspace == keyspace)
-                    .await?
-                    .into_iter()
-                    .map(|(k, _)| k)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
             txn.rollback().await.ok();
-            (idx, legacy)
+            idx
         };
 
         // Phase 2: delete in bounded batches (idempotent — a re-deleted key is a
@@ -757,41 +1227,25 @@ impl TikvStore {
             }
             txn.commit().await?;
         }
-        for chunk in legacy_keys.chunks(DELETE_BATCH) {
-            let mut txn = self.begin().await?;
-            for key in chunk {
-                self.delete_worker_queue_entry(&mut txn, key).await?;
-                deleted += 1;
-            }
-            txn.commit().await?;
-        }
         Ok(deleted)
     }
 
     /// Task IDs of all pending AsyncTrigger entries for a keyspace (every db),
-    /// across V2 and (gated) legacy. Used by the trigger queue-stats metric;
-    /// reads only identities, never command payloads.
+    /// using the V2 identity index. Used by the trigger queue-stats metric; reads
+    /// only identities, never command payloads.
     pub async fn pending_async_trigger_task_ids(
         &self,
         txn: &mut Transaction,
         keyspace: &str,
     ) -> Result<Vec<i64>> {
         let async_mask = TaskType::AsyncTrigger.to_bitmask();
-        let mut ids: Vec<i64> = self
+        let ids: Vec<i64> = self
             .index_rows_for_keyspace(txn, keyspace)
             .await?
             .into_iter()
             .filter(|r| r.task_type == async_mask)
             .map(|r| r.task_id)
             .collect();
-        if self.legacy_queue_has_entries(txn).await? {
-            let rows = self
-                .scan_legacy_filtered(txn, |e| {
-                    e.task_type == TaskType::AsyncTrigger && e.keyspace == keyspace
-                })
-                .await?;
-            ids.extend(rows.into_iter().map(|(_, e)| e.task_id));
-        }
         Ok(ids)
     }
 
@@ -799,6 +1253,15 @@ impl TikvStore {
     // Claim methods
     // ========================================================================
 
+    /// Acquire a worker claim. CAS-style: takes a write lock on the claim key
+    /// with `get_for_update` so concurrent claimers under pessimistic
+    /// transactions resolve to a single winner by construction (a plain `get`
+    /// takes no lock — design §K4).
+    ///
+    /// A claim whose lease has EXPIRED is treated as absent and overwritten:
+    /// this is how a second worker takes over after the original holder's lease
+    /// lapsed (e.g. it crashed or was partitioned). A live (unexpired) lease
+    /// held by anyone blocks the claim.
     pub async fn try_claim_worker_task(
         &self,
         txn: &mut Transaction,
@@ -807,6 +1270,7 @@ impl TikvStore {
         task_id: i64,
         fire_time_ms: i64,
         claim: &WorkerClaim,
+        legacy_orphan_timeout_ms: i64,
     ) -> Result<bool> {
         let key = self.key(&encode_worker_claim_key(
             claim.task_type.to_bitmask(),
@@ -815,13 +1279,60 @@ impl TikvStore {
             task_id,
             fire_time_ms,
         ));
-        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
-            return Ok(false);
+        if let Some(existing) = tikv_op!(txn.get_for_update(key.clone()).await)? {
+            let existing = WorkerClaim::decode_compat(&existing)
+                .context("Failed to deserialize existing worker claim")?;
+            // A live lease blocks the claim; an expired lease may be taken over.
+            if !existing.is_expired(crate::worker::now_epoch_ms(), legacy_orphan_timeout_ms) {
+                return Ok(false);
+            }
         }
         txn_put(
             txn,
             key,
             bincode::serialize(claim).context("Failed to serialize worker claim")?,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Renew (extend the lease of) a claim the calling worker already owns.
+    /// Identity-checked: only refreshes the lease if the stored claim still has
+    /// the same `worker_id`. Returns `false` when the claim is gone or owned by
+    /// someone else, which the caller treats as a lost lease and aborts the run
+    /// before its next tenant commit.
+    pub async fn renew_worker_claim(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        worker_id: &str,
+        task_type: TaskType,
+        new_lease_until_ms: i64,
+    ) -> Result<bool> {
+        let key = self.key(&encode_worker_claim_key(
+            task_type.to_bitmask(),
+            keyspace,
+            db_id,
+            task_id,
+            fire_time_ms,
+        ));
+        let Some(existing) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
+            return Ok(false);
+        };
+        let mut claim = WorkerClaim::decode_compat(&existing)
+            .context("Failed to deserialize worker claim for renewal")?;
+        if claim.worker_id != worker_id {
+            return Ok(false);
+        }
+        claim.claimed_at = crate::worker::now_epoch_ms();
+        claim.lease_until_ms = new_lease_until_ms;
+        txn_put(
+            txn,
+            key,
+            bincode::serialize(&claim).context("Failed to serialize renewed worker claim")?,
         )
         .await?;
         Ok(true)
@@ -845,6 +1356,76 @@ impl TikvStore {
         ));
         txn_delete(txn, key).await?;
         Ok(())
+    }
+
+    /// Read-only ownership re-check: is the claim still held by `worker_id`?
+    ///
+    /// Returns `true` only when the claim exists AND its `worker_id` matches.
+    /// `false` means the claim is gone or was taken over by another worker after
+    /// a lost lease. Takes a write lock (`get_for_update`, same identity check as
+    /// `delete_worker_claim_if_owned`) so the verdict serializes against a
+    /// concurrent takeover/renew/delete, but writes nothing — used as a
+    /// commit-adjacent ownership fence on long-task paths (e.g. cron finalize)
+    /// where the caller wants to gate a *tenant-store* terminal commit on still
+    /// owning the *system-store* claim, BEFORE doing the ownership-checked delete.
+    pub async fn is_worker_claim_owned_by(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        task_type: TaskType,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_worker_claim_key(
+            task_type.to_bitmask(),
+            keyspace,
+            db_id,
+            task_id,
+            fire_time_ms,
+        ));
+        let Some(existing) = tikv_op!(txn.get_for_update(key).await)? else {
+            return Ok(false);
+        };
+        let claim = WorkerClaim::decode_compat(&existing)
+            .context("Failed to deserialize worker claim for ownership check")?;
+        Ok(claim.worker_id == worker_id)
+    }
+
+    /// Delete a worker claim ONLY if `worker_id` still owns it. Returns whether
+    /// the caller still held the claim (`true`) or it was gone / taken over by
+    /// another worker after a lost lease (`false`). Used by the executor's
+    /// cleanup so a worker that lost its lease (and whose task was taken over by
+    /// a second worker) does NOT delete the new owner's claim. Takes a write
+    /// lock (`get_for_update`) so the ownership check and delete are atomic.
+    pub async fn delete_worker_claim_if_owned(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        task_type: TaskType,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_worker_claim_key(
+            task_type.to_bitmask(),
+            keyspace,
+            db_id,
+            task_id,
+            fire_time_ms,
+        ));
+        let Some(existing) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
+            return Ok(false);
+        };
+        let claim = WorkerClaim::decode_compat(&existing)
+            .context("Failed to deserialize worker claim for owned-delete")?;
+        if claim.worker_id != worker_id {
+            return Ok(false);
+        }
+        txn_delete(txn, key).await?;
+        Ok(true)
     }
 
     /// Delete a worker claim by its raw TiKV key.
@@ -902,8 +1483,8 @@ impl TikvStore {
             if !key.starts_with(&prefix) {
                 continue;
             }
-            let claim: WorkerClaim =
-                bincode::deserialize(pair.value()).context("Failed to deserialize worker claim")?;
+            let claim = WorkerClaim::decode_compat(pair.value())
+                .context("Failed to deserialize worker claim")?;
             results.push((key.to_vec(), claim));
         }
         Ok(results)
@@ -1056,6 +1637,16 @@ impl TikvStore {
     }
 }
 
+fn validate_task_v2_enqueue(entry: &TaskQueueEntry) -> Result<()> {
+    if entry.task_type.uses_deterministic_queue_key() && entry.nonce == 0 {
+        return Err(anyhow!(
+            "deterministic worker task {:?} requires a non-zero nonce before enqueue",
+            entry.task_type
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,6 +1680,165 @@ mod tests {
         let prefix = b"_sys_worker_gc_instance_abc".to_vec();
         let end = gc_instance_state_scan_end(&prefix);
         assert_eq!(end, [prefix, vec![0xFF]].concat());
+    }
+
+    #[test]
+    fn ordered_worker_inventory_cleanup_reaps_queue_before_registry_delete() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn reap_db_queue_entries_then_delete_worker_registry")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn update_registry_task_types").next())
+            .expect("ordered worker inventory cleanup helper must exist");
+
+        let reap_pos = helper
+            .find("reap_db_queue_entries(keyspace, db_id).await?")
+            .expect("helper must reap DB queue entries");
+        let delete_pos = helper
+            .find("delete_worker_registry(&mut txn, keyspace, db_id)")
+            .expect("helper must delete registry after queue reap");
+        assert!(
+            reap_pos < delete_pos,
+            "registry row must be deleted only after queue reap succeeds"
+        );
+    }
+
+    #[test]
+    fn raw_worker_registry_delete_is_not_public_api() {
+        let source = include_str!("worker.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("worker.rs must contain #[cfg(test)]");
+        assert!(
+            !prod_source.contains("pub async fn delete_worker_registry"),
+            "direct registry delete must stay private; production cleanup must go through the ordered helper"
+        );
+    }
+
+    #[test]
+    fn deterministic_queue_tasks_require_nonzero_nonce_on_enqueue() {
+        let mut hnsw = TaskQueueEntry::new(
+            "ks".to_string(),
+            7,
+            42,
+            TaskType::HnswMerge,
+            "__hnsw_merge 1 2".to_string(),
+            "system".to_string(),
+            192,
+        );
+        assert!(
+            validate_task_v2_enqueue(&hnsw).is_err(),
+            "HnswMerge uses a deterministic key and must carry a nonce"
+        );
+        hnsw.nonce = 1;
+        validate_task_v2_enqueue(&hnsw).expect("non-zero nonce is valid");
+
+        let mut storage_scan = TaskQueueEntry::new(
+            "ks".to_string(),
+            7,
+            7,
+            TaskType::StorageSizeScan,
+            String::new(),
+            "system".to_string(),
+            200,
+        );
+        assert!(
+            validate_task_v2_enqueue(&storage_scan).is_err(),
+            "StorageSizeScan also uses a deterministic key and must carry a nonce"
+        );
+        storage_scan.nonce = 1;
+        validate_task_v2_enqueue(&storage_scan).expect("non-zero nonce is valid");
+
+        let cron = cron_entry("ks", 7, 1, "SELECT 1");
+        validate_task_v2_enqueue(&cron).expect("non-deterministic queue tasks do not need a nonce");
+    }
+
+    #[test]
+    fn singleton_enqueue_checks_pending_and_claim_before_put() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn put_singleton_task_v2")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn delete_task_v2").next())
+            .expect("singleton enqueue helper must exist before delete_task_v2");
+
+        assert!(
+            helper.contains("uses_deterministic_queue_key"),
+            "singleton enqueue must be restricted to deterministic task identities"
+        );
+        assert!(
+            helper.contains(".task_has_pending(") && helper.contains(".task_has_claim("),
+            "singleton enqueue must skip existing pending or claimed work"
+        );
+        assert!(
+            helper.contains("self.put_task_v2(txn, entry, fire_time_ms).await?"),
+            "singleton enqueue must delegate the actual row writes to put_task_v2"
+        );
+    }
+
+    #[test]
+    fn worker_queue_migration_uses_schema_version_and_lock() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn ensure_worker_queue_schema_v2")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Delete a single due-queue key").next())
+            .expect("worker queue schema migration helper must exist");
+
+        assert!(
+            helper.contains("encode_worker_queue_schema_version_key"),
+            "worker queue migration must write an explicit schema version"
+        );
+        assert!(
+            helper.contains("encode_worker_queue_migration_lock_key"),
+            "worker queue migration must use an explicit migration lock"
+        );
+        assert!(
+            helper.contains("scan_due_legacy_bytesafe"),
+            "legacy queue reads must be isolated to the startup migration helper"
+        );
+    }
+
+    #[test]
+    fn production_targeted_queue_paths_are_v2_only() {
+        let source = include_str!("worker.rs");
+        let task_has_pending = source
+            .split("pub async fn task_has_pending")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn task_has_claim").next())
+            .expect("task_has_pending must exist before task_has_claim");
+        let reap_db = source
+            .split("pub async fn reap_db_queue_entries(&self")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// Task IDs of all pending AsyncTrigger")
+                    .next()
+            })
+            .expect("reap_db_queue_entries must exist before async trigger stats");
+        let async_stats = source
+            .split("pub async fn pending_async_trigger_task_ids")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split(
+                    "// ========================================================================",
+                )
+                .next()
+            })
+            .expect("pending_async_trigger_task_ids must exist before claim methods");
+
+        for (name, body) in [
+            ("task_has_pending", task_has_pending),
+            ("reap_db_queue_entries", reap_db),
+            ("pending_async_trigger_task_ids", async_stats),
+        ] {
+            assert!(
+                !body.contains("legacy_queue_has_entries")
+                    && !body.contains("scan_legacy_filtered")
+                    && !body.contains("delete_worker_queue_entry"),
+                "{name} must not scan or delete legacy _worker_queue_ rows"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1138,10 +1888,9 @@ mod tests {
             system_keyspace: system_keyspace.clone(),
             ..Default::default()
         };
-        let store = crate::worker::init_system_store(pd_endpoints, &cfg)
+        let store = crate::worker::init_gc_registry_store(pd_endpoints, &cfg)
             .await
-            .expect("failed to initialize system store for bg task ID concurrency test")
-            .expect("worker system store should be present when enabled");
+            .expect("failed to initialize system store for bg task ID concurrency test");
 
         let scope_keyspace = format!(
             "test_bg_task_seq_{}_{}",
@@ -1211,10 +1960,29 @@ mod tests {
             system_keyspace,
             ..Default::default()
         };
-        crate::worker::init_system_store(pd_endpoints, &cfg)
+        crate::worker::init_gc_registry_store(pd_endpoints, &cfg)
             .await
             .expect("init system store")
-            .expect("store present when enabled")
+    }
+
+    async fn raw_worker_test_store(tag: &str) -> Arc<TikvStore> {
+        let pd_endpoints = std::env::var("PD_ENDPOINTS")
+            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let system_keyspace = format!(
+            "_sys_wq_{tag}_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        Arc::new(
+            TikvStore::new_system(pd_endpoints, &system_keyspace)
+                .await
+                .expect("init raw system store"),
+        )
     }
 
     fn unique_ks(tag: &str) -> String {
@@ -1236,6 +2004,307 @@ mod tests {
             128,
         )
         .with_schedule("*/5 * * * *".to_string())
+    }
+
+    /// Convergent drain (design §II.8 M5): a legacy V1 row written by an OLD
+    /// binary AFTER this node already latched `_wq_schema_version = 2` (the
+    /// rolling-deploy straggler) must still be migrated to V2 by the periodic
+    /// background drain, not stranded by the one-shot startup migration.
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn convergent_drain_migrates_straggler_v1_rows_written_after_v2_marker() {
+        // init_gc_registry_store runs the one-shot migration and latches the V2
+        // marker — exactly the production startup state.
+        let store = v2_test_store().await;
+        let ks = unique_ks("drain");
+        let db_id = 9u64;
+
+        // Empty legacy queue right after startup: drain is a no-op empty probe.
+        assert!(
+            store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("empty probe"),
+            "legacy queue must be empty immediately after startup migration"
+        );
+        assert_eq!(
+            store
+                .drain_legacy_worker_queue_batch()
+                .await
+                .expect("drain empty"),
+            0,
+            "draining an empty legacy queue migrates nothing"
+        );
+
+        // Simulate an OLD binary writing a V1 row AFTER the V2 marker is set.
+        let entry = cron_entry(&ks, db_id, 314, "SELECT 1");
+        let fire = crate::worker::now_epoch_ms() - 60_000;
+        store
+            .seed_legacy_worker_queue_entry_for_test(&entry, fire)
+            .await
+            .expect("seed straggler V1 row");
+        assert!(
+            !store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("non-empty probe"),
+            "straggler V1 row must be observed by the empty probe"
+        );
+
+        // The V2-only tick scan must NOT yet see it (it is still a V1 row).
+        let mut txn = store.begin().await.unwrap();
+        let due_before = store.scan_due_v2(&mut txn, i64::MAX, 1000).await.unwrap();
+        txn.rollback().await.ok();
+        assert!(
+            !due_before
+                .iter()
+                .any(|(_, d)| d.keyspace == ks && d.task_id == 314),
+            "straggler is invisible to the V2-only tick before the drain"
+        );
+
+        // One convergent drain batch migrates the straggler.
+        let migrated = store
+            .drain_legacy_worker_queue_batch()
+            .await
+            .expect("drain straggler");
+        assert_eq!(migrated, 1, "drain must migrate exactly the one straggler");
+
+        // Legacy queue is now empty (converged) and the row is visible to V2.
+        assert!(
+            store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("converged probe"),
+            "legacy queue must be empty after the straggler is drained"
+        );
+        let mut txn = store.begin().await.unwrap();
+        let due_after = store.scan_due_v2(&mut txn, i64::MAX, 1000).await.unwrap();
+        txn.rollback().await.ok();
+        assert!(
+            due_after.iter().any(|(_, d)| d.keyspace == ks
+                && d.task_id == 314
+                && d.task_type == TaskType::Cron),
+            "drained straggler must be visible to the V2-only tick"
+        );
+
+        // Cleanup.
+        let mut txn = store.begin().await.unwrap();
+        store
+            .delete_task_all_layers(&mut txn, &ks, db_id, 314, TaskType::Cron)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    fn hnsw_merge_entry(ks: &str, db_id: u64, task_id: i64) -> TaskQueueEntry {
+        TaskQueueEntry::new(
+            ks.to_string(),
+            db_id,
+            task_id,
+            TaskType::HnswMerge,
+            String::new(),
+            "system".to_string(),
+            128,
+        )
+    }
+
+    /// Convergent drain + singleton contract (design §II.8 M5): a rolling deploy
+    /// can let an OLD binary write a V1 deterministic (`HnswMerge`) row AFTER a
+    /// NEW node already enqueued the V2 singleton. Draining that straggler must
+    /// NOT create a second V2 descriptor (raw `put_task_v2` would) — it must
+    /// route through the SAME singleton guard producers use and simply drop the
+    /// V1 key, leaving exactly one V2 representation.
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn drain_preserves_singleton_for_deterministic_straggler_when_v2_exists() {
+        let store = v2_test_store().await;
+        let ks = unique_ks("det_dup");
+        let db_id = 21u64;
+        let task_id = 7i64;
+
+        // A NEW node already enqueued the V2 singleton via the producer path.
+        let v2_entry = {
+            let mut e = hnsw_merge_entry(&ks, db_id, task_id);
+            e.nonce = 0xA1B2C3D4;
+            e
+        };
+        let v2_fire = crate::worker::now_epoch_ms() - 30_000;
+        let mut txn = store.begin().await.unwrap();
+        assert!(
+            store
+                .put_singleton_task_v2(&mut txn, &v2_entry, v2_fire)
+                .await
+                .unwrap(),
+            "first singleton enqueue must write the descriptor"
+        );
+        txn.commit().await.unwrap();
+
+        // Snapshot the live V2 descriptor (identity + nonce) before the drain.
+        let before = {
+            let mut txn = store.begin().await.unwrap();
+            let rows = store
+                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
+                .await
+                .unwrap();
+            txn.rollback().await.ok();
+            rows
+        };
+        assert_eq!(before.len(), 1, "exactly one V2 descriptor before drain");
+        let before_fire = before[0].fire_time_ms;
+        assert_eq!(
+            before_fire, v2_fire,
+            "V2 descriptor at the producer fire_time"
+        );
+
+        // An OLD binary writes a V1 deterministic straggler for the SAME logical
+        // task at a DIFFERENT fire_time (nonce 0 — the pre-V2 layout).
+        let straggler = hnsw_merge_entry(&ks, db_id, task_id);
+        let straggler_fire = before_fire + 5_000;
+        store
+            .seed_legacy_worker_queue_entry_for_test(&straggler, straggler_fire)
+            .await
+            .expect("seed deterministic straggler V1 row");
+        assert!(
+            !store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("non-empty probe"),
+            "straggler V1 row must be observed before the drain"
+        );
+
+        // Drain the straggler.
+        let migrated = store
+            .drain_legacy_worker_queue_batch()
+            .await
+            .expect("drain straggler");
+        assert_eq!(migrated, 1, "drain removes exactly the one V1 straggler");
+
+        // The V1 key is gone (converged).
+        assert!(
+            store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("converged probe"),
+            "legacy queue must be empty after draining the straggler"
+        );
+
+        // Singleton preserved: STILL exactly one V2 descriptor, unchanged — no
+        // second row at `straggler_fire`, no nonce overwrite.
+        let after = {
+            let mut txn = store.begin().await.unwrap();
+            let rows = store
+                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
+                .await
+                .unwrap();
+            txn.rollback().await.ok();
+            rows
+        };
+        assert_eq!(
+            after.len(),
+            1,
+            "draining a deterministic straggler must NOT create a second V2 descriptor"
+        );
+        assert_eq!(
+            after[0].fire_time_ms, before_fire,
+            "the surviving descriptor must be the original V2 singleton, not the straggler's fire_time"
+        );
+
+        // Cleanup.
+        let mut txn = store.begin().await.unwrap();
+        store
+            .delete_task_all_layers(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    /// The complementary case: when NO V2 row exists for the logical
+    /// deterministic task, draining the legacy V1 straggler must materialize
+    /// EXACTLY ONE V2 singleton (and drop the V1 key).
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn drain_creates_single_singleton_for_deterministic_straggler_when_no_v2() {
+        let store = v2_test_store().await;
+        let ks = unique_ks("det_new");
+        let db_id = 22u64;
+        let task_id = 9i64;
+
+        // No V2 row exists yet.
+        let mut txn = store.begin().await.unwrap();
+        assert!(
+            store
+                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no V2 descriptor must exist before the drain"
+        );
+        txn.rollback().await.ok();
+
+        // OLD binary wrote a V1 deterministic straggler (nonce 0).
+        let straggler = hnsw_merge_entry(&ks, db_id, task_id);
+        let straggler_fire = crate::worker::now_epoch_ms() - 10_000;
+        store
+            .seed_legacy_worker_queue_entry_for_test(&straggler, straggler_fire)
+            .await
+            .expect("seed deterministic straggler V1 row");
+
+        // Drain materializes the singleton.
+        let migrated = store
+            .drain_legacy_worker_queue_batch()
+            .await
+            .expect("drain straggler");
+        assert_eq!(migrated, 1, "drain removes exactly the one V1 straggler");
+        assert!(
+            store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("converged probe"),
+            "legacy queue must be empty after the drain"
+        );
+
+        // Exactly one V2 singleton now exists, at the straggler's fire_time, with
+        // a non-zero migrated nonce (V2 deterministic rows require a nonce).
+        let after = {
+            let mut txn = store.begin().await.unwrap();
+            let rows = store
+                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
+                .await
+                .unwrap();
+            txn.rollback().await.ok();
+            rows
+        };
+        assert_eq!(
+            after.len(),
+            1,
+            "draining a deterministic straggler with no V2 must create exactly one V2 singleton"
+        );
+        assert_eq!(
+            after[0].fire_time_ms, straggler_fire,
+            "the materialized singleton keeps the straggler's fire_time"
+        );
+
+        let mut txn = store.begin().await.unwrap();
+        let due = store.scan_due_v2(&mut txn, i64::MAX, 1000).await.unwrap();
+        txn.rollback().await.ok();
+        let descriptor = due
+            .iter()
+            .find(|(_, d)| d.keyspace == ks && d.task_id == task_id)
+            .map(|(_, d)| d)
+            .expect("migrated descriptor present in the V2 due scan");
+        assert_eq!(descriptor.task_type, TaskType::HnswMerge);
+        assert_ne!(
+            descriptor.nonce, 0,
+            "migrated deterministic singleton must carry a non-zero nonce"
+        );
+
+        // Cleanup.
+        let mut txn = store.begin().await.unwrap();
+        store
+            .delete_task_all_layers(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -1436,12 +2505,8 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires TiKV / PD cluster"]
-    async fn legacy_entry_is_handled_in_place_across_layers() {
-        // V2 never MOVES legacy entries (that would let an old + new binary
-        // execute the same task twice during a rolling deploy). Instead legacy
-        // entries are visible to the byte-safe dual-read dequeue and to targeted
-        // ops via the gated legacy scan, and are deleted in place.
-        let store = v2_test_store().await;
+    async fn legacy_entry_is_migrated_to_v2_before_production_paths() {
+        let store = raw_worker_test_store("legacy_migrate").await;
         let ks = unique_ks("legacy");
         let db_id = 1u64;
         let fire = 5_000i64;
@@ -1467,9 +2532,6 @@ mod tests {
         .unwrap();
         txn.commit().await.unwrap();
 
-        // Discoverable via the byte-safe legacy dequeue (no global value scan)
-        // and via the gated targeted-pending check — but NOT via the V2 index
-        // (it is never moved to V2).
         let mut txn = store.begin().await.unwrap();
         assert!(store.legacy_queue_has_entries(&mut txn).await.unwrap());
         let due = store
@@ -1479,13 +2541,6 @@ mod tests {
         assert!(due.iter().any(|(_, e)| e.keyspace == ks
             && e.task_id == 21
             && e.command == "SELECT pg_sleep(1)"));
-        assert!(store
-            .task_has_pending(&mut txn, &ks, db_id, 21, TaskType::Cron)
-            .await
-            .unwrap());
-        // The migration helper can still find legacy cron entries for explicit
-        // maintenance/testing paths, but startup cron reconciliation must not
-        // call it because it scans the whole legacy queue.
         let legacy_cron = store
             .legacy_entries_for_db_type(&mut txn, &ks, db_id, TaskType::Cron)
             .await
@@ -1504,7 +2559,28 @@ mod tests {
         );
         txn.rollback().await.ok();
 
-        // Targeted delete removes it across layers (here: the legacy layer).
+        let migrated = store.ensure_worker_queue_schema_v2().await.unwrap();
+        assert_eq!(migrated, 1);
+
+        let mut txn = store.begin().await.unwrap();
+        assert!(!store.legacy_queue_has_entries(&mut txn).await.unwrap());
+        assert!(store
+            .task_has_pending(&mut txn, &ks, db_id, 21, TaskType::Cron)
+            .await
+            .unwrap());
+        let rows = store
+            .index_rows_for_task(&mut txn, &ks, db_id, 21, TaskType::Cron)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "migration must write the V2 identity index");
+        let payload = store
+            .get_task_payload_v2(&mut txn, TaskType::Cron.to_bitmask(), &ks, db_id, 21, fire)
+            .await
+            .unwrap()
+            .expect("cron payload must be split out during migration");
+        assert_eq!(payload.command, "SELECT pg_sleep(1)");
+        txn.rollback().await.ok();
+
         let mut txn = store.begin().await.unwrap();
         let deleted = store
             .delete_task_all_layers(&mut txn, &ks, db_id, 21, TaskType::Cron)
@@ -1552,5 +2628,185 @@ mod tests {
         txn.rollback().await.ok();
 
         store.reap_db_queue_entries(&ks, db_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn claim_blocks_while_lease_live_and_allows_takeover_when_expired() {
+        // Design §K4 / T4: a live lease blocks a second claimer; an EXPIRED
+        // lease lets a second worker take over the same task identity.
+        let store = v2_test_store().await;
+        let ks = unique_ks("lease_takeover");
+        let db_id = 1u64;
+        let task_id = 77i64;
+        let fire = 1_000i64;
+        let legacy_orphan_ms = 300_000;
+
+        // Worker A claims with a live lease.
+        let claim_a = WorkerClaim::with_lease("A".to_string(), TaskType::BgSql, 60_000);
+        let mut txn = store.begin().await.unwrap();
+        assert!(store
+            .try_claim_worker_task(
+                &mut txn,
+                &ks,
+                db_id,
+                task_id,
+                fire,
+                &claim_a,
+                legacy_orphan_ms
+            )
+            .await
+            .unwrap());
+        txn.commit().await.unwrap();
+
+        // Worker B cannot take over while A's lease is live.
+        let claim_b = WorkerClaim::with_lease("B".to_string(), TaskType::BgSql, 60_000);
+        let mut txn = store.begin().await.unwrap();
+        assert!(
+            !store
+                .try_claim_worker_task(
+                    &mut txn,
+                    &ks,
+                    db_id,
+                    task_id,
+                    fire,
+                    &claim_b,
+                    legacy_orphan_ms
+                )
+                .await
+                .unwrap(),
+            "a live lease must block a second claimer"
+        );
+        txn.rollback().await.ok();
+
+        // Force A's lease to be already expired, then B takes over.
+        let expired = WorkerClaim {
+            worker_id: "A".to_string(),
+            claimed_at: crate::worker::now_epoch_ms() - 120_000,
+            task_type: TaskType::BgSql,
+            lease_until_ms: crate::worker::now_epoch_ms() - 1,
+        };
+        let key = store.key(&encode_worker_claim_key(
+            TaskType::BgSql.to_bitmask(),
+            &ks,
+            db_id,
+            task_id,
+            fire,
+        ));
+        let mut txn = store.begin().await.unwrap();
+        txn_put(&mut txn, key, bincode::serialize(&expired).unwrap())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().await.unwrap();
+        assert!(
+            store
+                .try_claim_worker_task(
+                    &mut txn,
+                    &ks,
+                    db_id,
+                    task_id,
+                    fire,
+                    &claim_b,
+                    legacy_orphan_ms
+                )
+                .await
+                .unwrap(),
+            "an expired lease must allow takeover by a second worker"
+        );
+        txn.commit().await.unwrap();
+
+        // After takeover, A's cleanup must NOT delete B's claim.
+        let mut txn = store.begin().await.unwrap();
+        let a_still_owns = store
+            .delete_worker_claim_if_owned(&mut txn, &ks, db_id, task_id, fire, TaskType::BgSql, "A")
+            .await
+            .unwrap();
+        assert!(
+            !a_still_owns,
+            "former owner A must not delete the takeover worker B's claim"
+        );
+        txn.rollback().await.ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn renew_extends_lease_only_for_owner() {
+        // Design §K4 / T2: the owner renews its lease; a non-owner renewal fails.
+        let store = v2_test_store().await;
+        let ks = unique_ks("lease_renew");
+        let db_id = 1u64;
+        let task_id = 88i64;
+        let fire = 2_000i64;
+        let legacy_orphan_ms = 300_000;
+
+        let claim = WorkerClaim::with_lease("owner".to_string(), TaskType::BgDdl, 10_000);
+        let original_lease = claim.lease_until_ms;
+        let mut txn = store.begin().await.unwrap();
+        assert!(store
+            .try_claim_worker_task(
+                &mut txn,
+                &ks,
+                db_id,
+                task_id,
+                fire,
+                &claim,
+                legacy_orphan_ms
+            )
+            .await
+            .unwrap());
+        txn.commit().await.unwrap();
+
+        // A foreign worker cannot renew.
+        let mut txn = store.begin().await.unwrap();
+        assert!(
+            !store
+                .renew_worker_claim(
+                    &mut txn,
+                    &ks,
+                    db_id,
+                    task_id,
+                    fire,
+                    "intruder",
+                    TaskType::BgDdl,
+                    crate::worker::now_epoch_ms() + 999_999,
+                )
+                .await
+                .unwrap(),
+            "a non-owner must not be able to renew the claim"
+        );
+        txn.rollback().await.ok();
+
+        // The owner renews, extending the lease.
+        let new_lease = crate::worker::now_epoch_ms() + 60_000;
+        let mut txn = store.begin().await.unwrap();
+        assert!(store
+            .renew_worker_claim(
+                &mut txn,
+                &ks,
+                db_id,
+                task_id,
+                fire,
+                "owner",
+                TaskType::BgDdl,
+                new_lease,
+            )
+            .await
+            .unwrap());
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().await.unwrap();
+        let claims = store.list_worker_claims(&mut txn).await.unwrap();
+        txn.rollback().await.ok();
+        let stored = claims
+            .iter()
+            .find(|(_, c)| c.worker_id == "owner")
+            .map(|(_, c)| c.clone())
+            .expect("owner claim must persist");
+        assert!(
+            stored.lease_until_ms >= new_lease && stored.lease_until_ms > original_lease,
+            "renewal must extend the stored lease"
+        );
     }
 }

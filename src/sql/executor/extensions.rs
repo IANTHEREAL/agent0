@@ -901,10 +901,7 @@ impl Executor {
                 return Err(anyhow!("extension \"{}\" already exists", ext_name));
             }
 
-            validate_extension_runtime_requirements(
-                &ext_name,
-                crate::worker::get_system_store().is_some(),
-            )?;
+            validate_extension_runtime_requirements(&ext_name, crate::worker::execution_enabled())?;
 
             let ext = InstalledExtension::new(desc);
             self.store().put_extension(txn, db_id, &ext).await?;

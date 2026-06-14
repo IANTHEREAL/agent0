@@ -69,8 +69,16 @@ pub(crate) async fn enqueue_after_triggers(
 
         // Check async-ness on the original body BEFORE substitution, so that
         // table names like "http_get_jobs" don't accidentally match async keywords.
-        let is_async =
-            trigger_body_needs_async(&func.body) && crate::worker::get_system_store().is_some();
+        //
+        // This `execution_enabled()` gate is INTENTIONALLY an execution-strategy
+        // choice, NOT a producer-write gate: when this node runs worker
+        // execution the async-needing body is deferred to the worker, otherwise
+        // it runs SYNCHRONOUSLY inline in the firing transaction. Either way the
+        // trigger always executes — there is no silent drop — so this differs
+        // from the producer-write sites (HNSW merge, auto-analyze, async-trigger
+        // flush) which must record work durably via the always-on system store.
+        // The durable enqueue itself (`flush_trigger_activations`) is NOT gated.
+        let is_async = trigger_body_needs_async(&func.body) && crate::worker::execution_enabled();
 
         // Substitute trigger context variables (TG_OP, TG_TABLE_NAME) before
         // either execution path so both sync and async triggers resolve them.

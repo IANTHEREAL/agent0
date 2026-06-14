@@ -34,10 +34,11 @@ pub use metadata_keys::decode_worker_queue_fire_time;
 #[cfg(test)]
 pub use metadata_keys::{decode_worker_queue_task_type, encode_worker_queue_key};
 pub use metadata_keys::{
-    decode_wq_due_v2_fire_time, decode_wq_index_key, encode_wq_due_v2_key, encode_wq_due_v2_prefix,
+    decode_wq_due_v2_fire_time, decode_wq_index_key, encode_worker_queue_migration_lock_key,
+    encode_worker_queue_schema_version_key, encode_wq_due_v2_key, encode_wq_due_v2_prefix,
     encode_wq_due_v2_scan_end, encode_wq_index_key, encode_wq_index_prefix_db,
     encode_wq_index_prefix_db_type, encode_wq_index_prefix_keyspace, encode_wq_index_prefix_task,
-    encode_wq_payload_v2_key, is_wq_due_v2_key,
+    encode_wq_payload_v2_key,
 };
 pub use metadata_keys::{
     encode_collation_key_v2, encode_collation_prefix_v2, encode_cron_claim_key_v2,
@@ -47,6 +48,8 @@ pub use metadata_keys::{
     encode_ddl_journal_prefix, encode_embedding_usage_key_v2, encode_extension_config_key_v2,
     encode_extension_key_v2, encode_extension_prefix_v2, encode_function_key_v2,
     encode_function_prefix_v2, encode_gc_instance_state_key, encode_gc_instance_state_prefix,
+    encode_hnsw_s3_db_prefix_cleanup_intent_key, encode_hnsw_s3_db_prefix_cleanup_intent_prefix,
+    encode_hnsw_s3_graph_upload_intent_key, encode_hnsw_s3_graph_upload_intent_prefix,
     encode_matview_bindings_key_v2, encode_matview_bindings_prefix_v2, encode_matview_key_v2,
     encode_matview_prefix_v2, encode_migration_key, encode_migration_prefix,
     encode_next_cron_job_id_key_v2, encode_next_cron_run_id_key_v2,

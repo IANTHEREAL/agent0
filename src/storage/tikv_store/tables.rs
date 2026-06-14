@@ -984,6 +984,53 @@ impl TikvStore {
         Ok(tables)
     }
 
+    /// List one raw-key cursor page of table names for a database.
+    pub async fn scan_tables_page(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<String>, Option<Vec<u8>>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let prefix = encode_schema_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0x00);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(Some(limit))).await)?;
+
+        let mut tables = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut scanned = 0usize;
+        let mut last_key = None;
+        for pair in pairs {
+            scanned += 1;
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            if seen.insert(name.clone()) {
+                tables.push(name);
+            }
+            last_key = Some(key.to_vec());
+        }
+
+        let next_cursor = if scanned == limit { last_key } else { None };
+        Ok((tables, next_cursor))
+    }
+
     /// Batch-load table schemas by explicit table names.
     ///
     /// The result preserves `table_names` order and skips names that do not
@@ -1103,8 +1150,7 @@ impl TikvStore {
                                     let prefix_gc_exists =
                                         txn.get(prefix_gc_key.clone()).await?.is_some();
                                     if old_meta.graph_version > 0 {
-                                        let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client()
-                                        else {
+                                        if crate::sql::hnsw::s3::hnsw_s3_client().is_none() {
                                             return Err(anyhow!(
                                                 "HNSW index d_{}_hnsw_{}_{} requires S3 storage \
                                                  during TRUNCATE (graph_version={}) but S3 is \
@@ -1115,7 +1161,7 @@ impl TikvStore {
                                                 index.id,
                                                 old_meta.graph_version
                                             ));
-                                        };
+                                        }
                                         let keyspace = self.keyspace().unwrap_or("default");
                                         let (empty_index, _) = create_empty_hnsw_index(
                                             old_meta.dimensions,
@@ -1123,7 +1169,11 @@ impl TikvStore {
                                             old_meta.m,
                                             old_meta.ef_construction,
                                         )?;
-                                        let new_version = old_meta.graph_version + 1;
+                                        let new_version =
+                                            crate::worker::hnsw_s3_graph_version_for_txn(
+                                                txn,
+                                                old_meta.graph_version,
+                                            )?;
                                         let fresh_meta = crate::sql::hnsw::HnswMeta {
                                             count: 0,
                                             capacity: empty_index.capacity() as u64,
@@ -1145,22 +1195,34 @@ impl TikvStore {
                                             &empty_index,
                                             &fresh_meta,
                                         )?;
-                                        s3.put_graph(
+                                        crate::worker::put_hnsw_s3_graph_with_intent(
+                                            self,
+                                            txn,
                                             keyspace,
                                             db_id,
                                             schema.table_id,
                                             index.id,
                                             new_version,
                                             bytes::Bytes::from(graph_bytes),
+                                            "truncate",
                                         )
                                         .await
                                         .map_err(|e| {
-                                            anyhow!(
-                                                "HNSW S3 put_graph failed during TRUNCATE: {}",
-                                                e
-                                            )
+                                            anyhow!("HNSW S3 upload failed during TRUNCATE: {}", e)
                                         })?;
-                                        txn_put(txn, meta_key_bytes, fresh_bytes).await?;
+                                        if let Err(e) =
+                                            txn_put(txn, meta_key_bytes, fresh_bytes).await
+                                        {
+                                            crate::worker::cleanup_hnsw_s3_graph_upload_after_failed_txn(
+                                                keyspace,
+                                                db_id,
+                                                schema.table_id,
+                                                index.id,
+                                                new_version,
+                                            )
+                                            .await;
+                                            return Err(e);
+                                        }
                                         let marker = HnswS3RetiredVersionGc {
                                             delete_after_safepoint: None,
                                         };
@@ -1381,12 +1443,25 @@ mod tests {
             .expect("tables.rs must contain truncate_table followed by rename_table_schema");
 
         assert!(
-            truncate_section.contains("let new_version = old_meta.graph_version + 1;"),
-            "truncate_table must preserve monotonic HNSW S3 graph versions across TRUNCATE"
+            truncate_section.contains("hnsw_s3_graph_version_for_txn")
+                && !truncate_section.contains("graph_version + 1"),
+            "truncate_table must allocate collision-free HNSW S3 graph versions across TRUNCATE"
         );
         assert!(
             !truncate_section.contains("delete_prefix("),
             "truncate_table must not inline-delete HNSW S3 prefixes; GC owns MVCC-safe cleanup"
+        );
+        assert!(
+            truncate_section.contains("put_hnsw_s3_graph_with_intent"),
+            "truncate_table must upload replacement HNSW S3 graphs through the external-object intent helper"
+        );
+        assert!(
+            truncate_section.contains("cleanup_hnsw_s3_graph_upload_after_failed_txn"),
+            "truncate_table must clean up speculative HNSW S3 uploads if the staged meta write fails"
+        );
+        assert!(
+            !truncate_section.contains(".put_graph("),
+            "truncate_table must not call S3 put_graph directly"
         );
     }
 }

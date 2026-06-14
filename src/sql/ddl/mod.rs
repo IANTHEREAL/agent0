@@ -970,14 +970,26 @@ pub(super) async fn delete_range(
 pub(super) async fn maybe_rotate_backfill_txn(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     txn_guard: &mut Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
     current_batch_writes: &mut usize,
     has_committed_batches: &mut bool,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     if *current_batch_writes < DDL_BACKFILL_COMMIT_SIZE {
         return Ok(());
     }
 
+    // Shared per-batch commit choke point for BOTH worker (CIC backfill /
+    // reconcile) and foreground (`CREATE INDEX`, `CREATE TABLE`) paths. The
+    // worker path passes a live `LeaseCancel`; foreground passes
+    // `LeaseCancel::none` (no-op). Fence the lease here so a CIC backfill whose
+    // claim lapsed mid-scan aborts BEFORE committing the next batch and leaves
+    // the remaining work for the new owner — one cancellation contract for every
+    // long backfill loop, regardless of caller.
+    lease_cancel.bail_if_cancelled()?;
+
+    store.assert_database_alive_for_update(txn, db_id).await?;
     txn.commit().await?;
     crate::session_context::clear_current_session_txn_registration();
     *txn_guard = None;

@@ -565,10 +565,20 @@ impl Executor {
         let keyspace = self.tenant_keyspace().to_string();
         let table_name = table_name.to_string();
         tokio::spawn(async move {
-            let Some(system_store) = crate::worker::get_system_store() else {
-                return;
+            // Producer write via the ALWAYS-ON system store, NOT gated on
+            // `execution_enabled()`. Auto-ANALYZE is an implicit side effect of
+            // ordinary DML that commits regardless of local worker execution; a
+            // SQL node with execution disabled must still durably record the
+            // analyze work so an execution-enabled node performs it. Gating the
+            // write here would silently drop it (the same class of bug fixed for
+            // the HNSW merge producer).
+            let store = match crate::worker::system_store() {
+                Ok(store) => store.clone(),
+                Err(e) => {
+                    tracing::warn!("auto-ANALYZE enqueue skipped: {}", e);
+                    return;
+                }
             };
-            let store = system_store.clone();
             let entry = crate::worker::types::TaskQueueEntry::new(
                 keyspace.clone(),
                 db_id,

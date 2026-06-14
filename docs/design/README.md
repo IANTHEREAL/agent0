@@ -64,3 +64,10 @@ Each document may include:
 - `docs/design/27_hnsw_vector_index.md`: HNSW vector index (approximate nearest neighbor search)
   - historical original implementation design; current architecture no longer uses the process-level cache described there
   - PR: [#1241](https://github.com/c4pt0r/db9-server/pull/1241), Issue: [#1220](https://github.com/c4pt0r/db9-server/issues/1220)
+
+## Worker Architecture
+
+- `docs/design/34_worker_kernel_and_protocols.md`: target worker kernel and
+  outer protocol design (v2) — single load-bearing inventory row, leased
+  CAS claims, shared observation walk, database liveness fence, trigger
+  outbox, and recovery contracts.

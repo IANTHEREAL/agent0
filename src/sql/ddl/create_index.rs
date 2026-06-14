@@ -301,8 +301,7 @@ async fn build_hnsw_index(
             // 2. GC's version-ordering classification (current / historical
             //    / future) remains correct — no clock-skew inversion.
             graph_version: if s3_enabled {
-                use tikv_client::TimestampExt;
-                txn.start_timestamp().version()
+                crate::worker::hnsw_s3_graph_version_for_txn(txn, 0)?
             } else {
                 0
             },
@@ -315,16 +314,11 @@ async fn build_hnsw_index(
         (gb, mb, gv)
     };
 
-    // Register this (keyspace, db_id) in the worker registry so the periodic
-    // HNSW sweeper can discover it. This is FATAL: if registration fails,
-    // CREATE INDEX fails. This guarantees no HNSW index can exist without
-    // a registry entry — closing the crash-orphan discovery gap completely.
-    //
-    // Safety: get_system_store() is guaranteed Some — we checked at the top
-    // of the HNSW branch and returned an error if None.
+    // Register this (keyspace, db_id) in the worker registry so the bounded
+    // sweep can discover it. This is FATAL: if registration fails, CREATE INDEX
+    // fails before committing an index that depends on background maintenance.
     {
-        let system_store = crate::worker::get_system_store()
-            .expect("worker check at HNSW branch entry guarantees Some");
+        let system_store = crate::worker::system_store()?;
         let mut sys_txn = system_store.begin().await?;
         system_store
             .update_registry_task_types(
@@ -338,25 +332,39 @@ async fn build_hnsw_index(
         sys_txn.commit().await?;
     }
 
-    if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
+    if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
         // S3 path: upload graph to S3, skip TiKV graph write and size guard.
-        s3.put_graph(
+        crate::worker::put_hnsw_s3_graph_with_intent(
+            store,
+            txn,
             keyspace,
             db_id,
             schema.table_id,
             index_id,
             initial_graph_version, // timestamp-based, set above
             bytes::Bytes::from(graph_bytes),
+            "create_index",
         )
         .await
-        .map_err(|e| anyhow!("HNSW S3 put_graph failed during CREATE INDEX: {}", e))?;
+        .map_err(|e| anyhow!("HNSW S3 upload failed during CREATE INDEX: {}", e))?;
         // Only write meta to TiKV (graph is in S3).
-        txn_put(
+        if let Err(e) = txn_put(
             txn,
             hnsw_meta_key(db_id, schema.table_id, index_id),
             meta_bytes,
         )
-        .await?;
+        .await
+        {
+            crate::worker::cleanup_hnsw_s3_graph_upload_after_failed_txn(
+                keyspace,
+                db_id,
+                schema.table_id,
+                index_id,
+                initial_graph_version,
+            )
+            .await;
+            return Err(e);
+        }
     } else {
         // TiKV path: guard against oversized graph, then write both.
         if graph_bytes.len() > crate::worker::engine::HNSW_GRAPH_MAX_BYTES {
@@ -401,6 +409,7 @@ async fn backfill_btree_index(
     txn_guard: &mut Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
     current_batch_writes: &mut usize,
     has_committed_batches: &mut bool,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     let index_id = new_index.id;
     if !rows.is_empty() {
@@ -446,9 +455,11 @@ async fn backfill_btree_index(
                     maybe_rotate_backfill_txn(
                         store,
                         txn,
+                        db_id,
                         txn_guard,
                         current_batch_writes,
                         has_committed_batches,
+                        lease_cancel,
                     )
                     .await?;
                 }
@@ -476,9 +487,11 @@ async fn backfill_btree_index(
                 maybe_rotate_backfill_txn(
                     store,
                     txn,
+                    db_id,
                     txn_guard,
                     current_batch_writes,
                     has_committed_batches,
+                    lease_cancel,
                 )
                 .await?;
             }
@@ -504,6 +517,7 @@ async fn backfill_gin_index(
     txn_guard: &mut Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
     current_batch_writes: &mut usize,
     has_committed_batches: &mut bool,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     let index_id = new_index.id;
     if schema.pk_indices.is_empty() {
@@ -545,9 +559,11 @@ async fn backfill_gin_index(
                 maybe_rotate_backfill_txn(
                     store,
                     txn,
+                    db_id,
                     txn_guard,
                     current_batch_writes,
                     has_committed_batches,
+                    lease_cancel,
                 )
                 .await?;
             }
@@ -573,9 +589,11 @@ async fn backfill_gin_index(
             maybe_rotate_backfill_txn(
                 store,
                 txn,
+                db_id,
                 txn_guard,
                 current_batch_writes,
                 has_committed_batches,
+                lease_cancel,
             )
             .await?;
         }
@@ -831,8 +849,7 @@ pub async fn execute_create_index(
         store.update_schema(txn, db_id, schema.clone()).await?;
 
         {
-            let system_store = crate::worker::get_system_store()
-                .expect("require_worker_for_index guarantees Some");
+            let system_store = crate::worker::system_store()?;
             let entry = TaskQueueEntry::new(
                 keyspace.to_string(),
                 db_id,
@@ -884,20 +901,19 @@ pub async fn execute_create_index(
                 .as_secs(),
         };
         store.write_ddl_journal(txn, db_id, &entry).await?;
-        // Ensure the (keyspace, db_id) pair is discoverable by startup recovery
-        // even if no other worker task type is registered for this database.
-        if let Some(ss) = crate::worker::get_system_store() {
-            let mut sys_txn = ss.begin().await?;
-            ss.update_registry_task_types(
-                &mut sys_txn,
-                keyspace,
-                db_id,
-                crate::worker::types::TASK_TYPE_DDL_JOURNAL,
-                0,
-            )
-            .await?;
-            sys_txn.commit().await?;
-        }
+        // Ensure the (keyspace, db_id) pair is discoverable by the bounded
+        // worker sweep even if no other task type is registered for this database.
+        let ss = crate::worker::system_store()?;
+        let mut sys_txn = ss.begin().await?;
+        ss.update_registry_task_types(
+            &mut sys_txn,
+            keyspace,
+            db_id,
+            crate::worker::types::TASK_TYPE_DDL_JOURNAL,
+            0,
+        )
+        .await?;
+        sys_txn.commit().await?;
         Some(id)
     } else {
         None
@@ -927,6 +943,8 @@ pub async fn execute_create_index(
                 &mut txn_guard,
                 &mut current_batch_writes,
                 &mut has_committed_batches,
+                // Foreground (synchronous) CREATE INDEX has no claim lease.
+                &crate::worker::LeaseCancel::none(),
             )
             .await?;
         } else if supported_gin_index_column(&schema, &new_index).is_some() && !rows.is_empty() {
@@ -941,6 +959,8 @@ pub async fn execute_create_index(
                 &mut txn_guard,
                 &mut current_batch_writes,
                 &mut has_committed_batches,
+                // Foreground (synchronous) CREATE INDEX has no claim lease.
+                &crate::worker::LeaseCancel::none(),
             )
             .await?;
         }
@@ -957,9 +977,8 @@ pub async fn execute_create_index(
             // which commits later (by the executor).  Clearing the discovery bit
             // in a separate transaction would race: a crash between the two
             // leaves an orphaned journal entry with no way to discover it.
-            // The startup reconciliation path clears the bit after confirming
-            // no journal entries remain, so the only cost is one cheap empty
-            // scan on the next startup.
+            // The bounded worker sweep keeps probing the authoritative journal
+            // state, so the only cost is one cheap empty scan per cycle.
         }
         Ok(())
     }
@@ -995,6 +1014,9 @@ pub async fn execute_create_index(
                         .delete_ddl_journal(&mut cleanup_txn, db_id, jid)
                         .await?;
                 }
+                store
+                    .assert_database_alive_for_update(&mut cleanup_txn, db_id)
+                    .await?;
                 cleanup_txn.commit().await?;
                 Ok(())
             }
@@ -1018,7 +1040,7 @@ pub async fn execute_create_index(
 /// Gate: reject index creation when worker subsystem is unavailable.
 /// Used by both HNSW (needs background merge) and CONCURRENTLY (needs BgDdl).
 fn require_worker_for_index(feature: &str, index_name: &str, reason: &str) -> Result<()> {
-    if crate::worker::get_system_store().is_none() {
+    if !crate::worker::execution_enabled() {
         return Err(anyhow!(
             "Cannot create {} index '{}': worker subsystem is disabled \
              (DB9_WORKER_ENABLED=false). {}",
@@ -1160,6 +1182,9 @@ pub async fn update_index_state(
             .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
         idx.state = state;
         store.update_schema(&mut txn, db_id, schema).await?;
+        store
+            .assert_database_alive_for_update(&mut txn, db_id)
+            .await?;
         txn.commit().await?;
         Ok(())
     }
@@ -1179,6 +1204,7 @@ pub async fn backfill_index_by_name(
     table_name: &str,
     index_name: &str,
     set_state_on_commit: Option<IndexState>,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
     let mut txn_guard = track_active_worker_txn(&txn);
@@ -1265,9 +1291,11 @@ pub async fn backfill_index_by_name(
                     maybe_rotate_backfill_txn(
                         store,
                         &mut txn,
+                        db_id,
                         &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
+                        lease_cancel,
                     )
                     .await?;
                 }
@@ -1313,9 +1341,11 @@ pub async fn backfill_index_by_name(
                     maybe_rotate_backfill_txn(
                         store,
                         &mut txn,
+                        db_id,
                         &mut txn_guard,
                         &mut current_batch_writes,
                         &mut has_committed_batches,
+                        lease_cancel,
                     )
                     .await?;
                 }
@@ -1338,6 +1368,13 @@ pub async fn backfill_index_by_name(
             store.update_schema(&mut txn, db_id, schema).await?;
         }
 
+        // Lease fence before the final commit, which flips the index state (a
+        // tenant write). A lapsed claim must not let us commit the transition;
+        // abandon and leave the task for the new owner.
+        lease_cancel.bail_if_cancelled()?;
+        store
+            .assert_database_alive_for_update(&mut txn, db_id)
+            .await?;
         txn.commit().await?;
         Ok(())
     }
@@ -1422,6 +1459,7 @@ async fn reconcile_index_pass(
     index_name: &str,
     allow_rotate: bool,
     set_state_on_commit: Option<IndexState>,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
     let mut txn_guard = track_active_worker_txn(&txn);
@@ -1456,6 +1494,16 @@ async fn reconcile_index_pass(
                 idx.state = state;
                 store.update_schema(&mut txn, db_id, schema).await?;
             }
+            // Lease fence before the final commit, which flips the index state (a
+            // tenant write). A lapsed claim must not let us commit the
+            // transition; abandon and leave the task for the new owner. The
+            // non-materializable (e.g. GIN) CIC reconcile branch reaches the
+            // state-flip here, so it needs the same fence as the materializable
+            // path below.
+            lease_cancel.bail_if_cancelled()?;
+            store
+                .assert_database_alive_for_update(&mut txn, db_id)
+                .await?;
             txn.commit().await?;
             return Ok(());
         }
@@ -1539,9 +1587,11 @@ async fn reconcile_index_pass(
                         maybe_rotate_backfill_txn(
                             store,
                             &mut txn,
+                            db_id,
                             &mut txn_guard,
                             &mut current_batch_writes,
                             &mut has_committed_batches,
+                            lease_cancel,
                         )
                         .await?;
                     }
@@ -1565,6 +1615,13 @@ async fn reconcile_index_pass(
             store.update_schema(&mut txn, db_id, schema).await?;
         }
 
+        // Lease fence before the final commit, which flips the index state (a
+        // tenant write). A lapsed claim must not let us commit the transition;
+        // abandon and leave the task for the new owner.
+        lease_cancel.bail_if_cancelled()?;
+        store
+            .assert_database_alive_for_update(&mut txn, db_id)
+            .await?;
         txn.commit().await?;
         Ok(())
     }
@@ -1590,11 +1647,21 @@ pub async fn reconcile_index(
     table_name: &str,
     index_name: &str,
     set_state_on_commit: Option<IndexState>,
+    lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     // Pass 1 may commit partial cleanup batches via transaction rotation. This is safe:
     // Pass 2 always re-scans the full index range and is the authoritative verification
     // pass before any Ready state transition is committed.
-    reconcile_index_pass(store, db_id, table_name, index_name, true, None).await?;
+    reconcile_index_pass(
+        store,
+        db_id,
+        table_name,
+        index_name,
+        true,
+        None,
+        lease_cancel,
+    )
+    .await?;
     // Pass 2: short final verification + optional atomic state flip.
     reconcile_index_pass(
         store,
@@ -1603,6 +1670,7 @@ pub async fn reconcile_index(
         index_name,
         false,
         set_state_on_commit,
+        lease_cancel,
     )
     .await
 }
@@ -1772,15 +1840,12 @@ mod tests {
     }
 
     /// Regression test: require_worker_for_index (used by both HNSW and
-    /// CONCURRENTLY paths) must reject when worker system store is absent.
-    /// In the test environment the global SYSTEM_STORE OnceLock is never set,
-    /// so this exercises the actual production guard function.
+    /// CONCURRENTLY paths) must reject when worker execution is disabled.
     #[test]
     fn require_worker_for_index_rejects_when_worker_absent() {
-        // Precondition: system store not initialized in test harness
         assert!(
-            crate::worker::get_system_store().is_none(),
-            "test expects worker system store to be unset"
+            !crate::worker::execution_enabled(),
+            "test expects worker execution to be disabled"
         );
 
         let err = require_worker_for_index("HNSW", "idx_test", "reason")
@@ -1803,7 +1868,7 @@ mod tests {
     /// Regression test: CONCURRENTLY path also requires worker.
     #[test]
     fn require_worker_for_index_rejects_concurrently_when_worker_absent() {
-        assert!(crate::worker::get_system_store().is_none());
+        assert!(!crate::worker::execution_enabled());
 
         let err = require_worker_for_index("CONCURRENTLY", "idx_cic", "needs BgDdl")
             .expect_err("CONCURRENTLY should reject without worker");
@@ -1877,6 +1942,37 @@ mod tests {
         assert!(
             !cleanup_path.contains("*txn = store.begin().await?;"),
             "cleanup path must not bypass the shared session-owned txn replacement helper"
+        );
+    }
+
+    #[test]
+    fn initial_hnsw_s3_upload_uses_external_object_intent() {
+        let source = include_str!("create_index.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("create_index.rs must contain test module marker");
+        let build_fn = prod_source
+            .split("async fn build_hnsw_index(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn backfill_btree_index").next())
+            .expect("build_hnsw_index must exist before btree backfill");
+
+        assert!(
+            build_fn.contains("put_hnsw_s3_graph_with_intent"),
+            "initial CREATE INDEX HNSW S3 upload must go through the external-object intent helper"
+        );
+        assert!(
+            build_fn.contains("hnsw_s3_graph_version_for_txn(txn, 0)"),
+            "initial CREATE INDEX HNSW S3 upload must allocate graph version from the source transaction TSO"
+        );
+        assert!(
+            build_fn.contains("cleanup_hnsw_s3_graph_upload_after_failed_txn"),
+            "initial CREATE INDEX HNSW S3 upload must clean up the intent/object on staged meta write failure"
+        );
+        assert!(
+            !build_fn.contains(".put_graph("),
+            "initial CREATE INDEX must not call S3 put_graph directly"
         );
     }
 

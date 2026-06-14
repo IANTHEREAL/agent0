@@ -68,6 +68,19 @@ pub(super) const WORKER_PAYLOAD_V2_PREFIX: &[u8] = b"_wq_payload_v2_";
 /// task-targeted or tenant-targeted operation is a bounded prefix scan that
 /// never reads the (potentially large) due-queue value. See issue #2576.
 pub(super) const WORKER_QUEUE_INDEX_V2_PREFIX: &[u8] = b"_wq_idx_v2_";
+/// Worker queue storage schema version. Version 2 means normal production
+/// paths are V2-only; legacy `_worker_queue_` rows must have been migrated.
+pub(super) const WORKER_QUEUE_SCHEMA_VERSION_KEY: &[u8] = b"_wq_schema_version";
+/// Explicit migration lock for V1 `_worker_queue_` to V2 due/index/payload
+/// conversion. The value stores the lock acquisition time in epoch millis.
+pub(super) const WORKER_QUEUE_MIGRATION_LOCK_KEY: &[u8] = b"_wq_migration_lock";
+/// HNSW S3 graph uploads that crossed the transactional boundary but have not
+/// yet been proven committed or aborted by GC.
+pub(super) const HNSW_S3_GRAPH_UPLOAD_INTENT_PREFIX: &[u8] = b"_hnsw_s3_graph_upload_intent_";
+/// DROP DATABASE S3 prefix cleanup requests. Stored outside tenant data so a
+/// failed inline cleanup keeps a retry target after tenant metadata is gone.
+pub(super) const HNSW_S3_DB_PREFIX_CLEANUP_INTENT_PREFIX: &[u8] =
+    b"_hnsw_s3_db_prefix_cleanup_intent_";
 
 // ============================================================================
 // Migration keys
@@ -438,6 +451,47 @@ pub fn encode_worker_registry_prefix() -> Vec<u8> {
     WORKER_REGISTRY_PREFIX.to_vec()
 }
 
+pub fn encode_hnsw_s3_graph_upload_intent_key(
+    keyspace: &str,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    version: u64,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        HNSW_S3_GRAPH_UPLOAD_INTENT_PREFIX.len() + 2 + keyspace.len() + 1 + 8 * 4,
+    );
+    key.extend_from_slice(HNSW_S3_GRAPH_UPLOAD_INTENT_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key.extend_from_slice(&version.to_be_bytes());
+    key
+}
+
+pub fn encode_hnsw_s3_graph_upload_intent_prefix() -> Vec<u8> {
+    HNSW_S3_GRAPH_UPLOAD_INTENT_PREFIX.to_vec()
+}
+
+pub fn encode_hnsw_s3_db_prefix_cleanup_intent_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        HNSW_S3_DB_PREFIX_CLEANUP_INTENT_PREFIX.len() + 2 + keyspace.len() + 1 + 8,
+    );
+    key.extend_from_slice(HNSW_S3_DB_PREFIX_CLEANUP_INTENT_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+pub fn encode_hnsw_s3_db_prefix_cleanup_intent_prefix() -> Vec<u8> {
+    HNSW_S3_DB_PREFIX_CLEANUP_INTENT_PREFIX.to_vec()
+}
+
 /// Encode a worker queue key (global). LEGACY V1 layout.
 ///
 /// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}_{task_type:u8}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
@@ -546,10 +600,12 @@ pub fn encode_wq_due_v2_prefix() -> Vec<u8> {
     WORKER_QUEUE_V2_PREFIX.to_vec()
 }
 
-/// True if `key` is a V2 due-queue key (vs a legacy `_worker_queue_` key). Used
-/// by the worker dequeue to decode fire_time and clean up with the right layout.
-pub fn is_wq_due_v2_key(key: &[u8]) -> bool {
-    key.starts_with(WORKER_QUEUE_V2_PREFIX)
+pub fn encode_worker_queue_schema_version_key() -> Vec<u8> {
+    WORKER_QUEUE_SCHEMA_VERSION_KEY.to_vec()
+}
+
+pub fn encode_worker_queue_migration_lock_key() -> Vec<u8> {
+    WORKER_QUEUE_MIGRATION_LOCK_KEY.to_vec()
 }
 
 /// Exclusive upper bound for a V2 due-queue range scan at a given priority/time.

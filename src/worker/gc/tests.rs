@@ -1013,6 +1013,155 @@ fn gc_publisher_loop_retries_on_failure_with_backoff() {
     );
 }
 
+#[test]
+fn hnsw_s3_entry_sweep_uses_paged_object_listing() {
+    let source = include_str!("hnsw_impl.rs");
+    let entry_fn = source
+        .split("pub(crate) async fn sweep_hnsw_s3_orphans_for_entry")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn read_all_hnsw_metas").next())
+        .expect("sweep_hnsw_s3_orphans_for_entry must exist before read_all_hnsw_metas");
+
+    assert!(
+        entry_fn.contains("list_objects_page"),
+        "production HNSW S3 entry sweep must list one bounded object page at a time"
+    );
+    assert!(
+        !entry_fn.contains("list_objects(&entry.keyspace"),
+        "production HNSW S3 entry sweep must not materialize the whole database prefix"
+    );
+    assert!(
+        entry_fn.contains("continuation_token"),
+        "paged HNSW S3 sweep must advance through S3 continuation tokens"
+    );
+    assert!(
+        entry_fn.contains("read_hnsw_metas_for_indexes")
+            && !entry_fn.contains("read_all_hnsw_metas"),
+        "production HNSW S3 sweep must point-read metas for indexes seen in the current S3 page"
+    );
+}
+
+#[test]
+fn hnsw_s3_external_object_gc_uses_durable_intents() {
+    let source = include_str!("hnsw_impl.rs");
+    let intent_fn = source
+        .split("pub(super) async fn cleanup_hnsw_s3_external_object_intents")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("/// Sweep orphaned HNSW S3 graph objects.")
+                .next()
+        })
+        .expect("external object intent GC must exist before legacy S3 sweep");
+
+    assert!(
+        intent_fn.contains("scan_hnsw_s3_graph_upload_intents_page"),
+        "GC must scan durable graph-upload intents"
+    );
+    assert!(
+        intent_fn.contains("scan_hnsw_s3_db_prefix_cleanup_intents_page"),
+        "GC must scan durable DB-prefix cleanup intents"
+    );
+    assert!(
+        intent_fn.contains("gc_safepoint < intent.txn_start_ts"),
+        "GC must not delete speculative graph uploads until the source txn is below safepoint"
+    );
+    assert!(
+        intent_fn.contains("meta.graph_version > intent.version")
+            && intent_fn.contains("retired-version"),
+        "upload-intent GC must not delete historical committed graph versions"
+    );
+    assert!(
+        intent_fn.contains("get_database_by_id") && intent_fn.contains("if db_exists"),
+        "DB-prefix cleanup intent GC must verify the database metadata is gone before deleting S3"
+    );
+    let live_db_branch = intent_fn
+        .split("if db_exists")
+        .nth(1)
+        .and_then(|rest| rest.split("match s3.delete_db_prefix").next())
+        .expect("DB-prefix cleanup intent GC must branch before S3 prefix deletion");
+    let safepoint_pos = live_db_branch
+        .find("gc_safepoint < intent.drop_txn_start_ts")
+        .expect("live-DB cleanup intent handling must be guarded by the DROP txn safepoint");
+    let delete_pos = live_db_branch
+        .find("delete_hnsw_s3_db_prefix_cleanup_intent")
+        .expect(
+            "live-DB stale cleanup intent must be removable after the DROP txn crosses safepoint",
+        );
+    assert!(
+        live_db_branch.contains("intent retained") && safepoint_pos < delete_pos,
+        "DB-prefix cleanup intent GC must retain live-DB intents until the source DROP txn crosses safepoint"
+    );
+}
+
+#[test]
+fn hnsw_s3_retired_marker_cleanup_is_batched_and_liveness_fenced() {
+    let source = include_str!("hnsw_impl.rs");
+    let cleanup_fn = source
+        .split("async fn delete_hnsw_s3_retired_version_markers_for_index")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn delete_hnsw_meta").next())
+        .expect("retired marker cleanup helper must exist before meta cleanup");
+
+    assert!(
+        cleanup_fn.contains("HNSW_S3_MARKER_DELETE_BATCH_SIZE"),
+        "retired marker cleanup must use a bounded scan/delete batch size"
+    );
+    assert!(
+        !cleanup_fn.contains("u32::MAX"),
+        "retired marker cleanup must not scan the whole marker prefix in one RPC"
+    );
+    assert!(
+        cleanup_fn.contains("assert_database_alive_for_update"),
+        "retired marker cleanup must fence the DB before deleting marker batches"
+    );
+}
+
+#[test]
+fn hnsw_s3_page_grouping_groups_versions_and_ignores_invalid_keys() {
+    let grouped = super::hnsw_impl::group_hnsw_s3_objects_by_index(
+        vec![
+            crate::sql::hnsw::s3::S3ObjectInfo {
+                key: "hnsw/6b73/10/20/30/graph_v1.usearch".to_string(),
+            },
+            crate::sql::hnsw::s3::S3ObjectInfo {
+                key: "hnsw/6b73/10/20/30/graph_v2.usearch".to_string(),
+            },
+            crate::sql::hnsw::s3::S3ObjectInfo {
+                key: "hnsw/6b73/10/20/31/graph_v1.usearch".to_string(),
+            },
+            crate::sql::hnsw::s3::S3ObjectInfo {
+                key: "hnsw/6b73/10/20/30/not_graph.bin".to_string(),
+            },
+        ],
+        &std::collections::HashSet::new(),
+    );
+
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped.get(&(20, 30)).map(Vec::len), Some(2));
+    assert_eq!(grouped.get(&(20, 31)).map(Vec::len), Some(1));
+}
+
+#[test]
+fn hnsw_s3_page_grouping_skips_prefixes_deleted_earlier_in_pass() {
+    let mut deleted = std::collections::HashSet::new();
+    deleted.insert((20, 30));
+
+    let grouped = super::hnsw_impl::group_hnsw_s3_objects_by_index(
+        vec![
+            crate::sql::hnsw::s3::S3ObjectInfo {
+                key: "hnsw/6b73/10/20/30/graph_v3.usearch".to_string(),
+            },
+            crate::sql::hnsw::s3::S3ObjectInfo {
+                key: "hnsw/6b73/10/20/31/graph_v3.usearch".to_string(),
+            },
+        ],
+        &deleted,
+    );
+
+    assert!(!grouped.contains_key(&(20, 30)));
+    assert_eq!(grouped.get(&(20, 31)).map(Vec::len), Some(1));
+}
+
 // ── heartbeat_timeout_sec adapts to config ──────────────────
 
 #[test]
@@ -1050,59 +1199,5 @@ fn heartbeat_timeout_exceeds_publish_interval() {
         "heartbeat_timeout {} must exceed publish interval {}",
         heartbeat_timeout_sec(&config),
         config.gc_safepoint_interval_sec,
-    );
-}
-
-// --- SweepBackoff tests ---
-
-#[test]
-fn sweep_backoff_new_failed_sets_retry_in_future() {
-    let b = SweepBackoff::new_failed(600);
-    assert_eq!(b.consecutive_failures, 1);
-    assert!(
-        b.should_skip(),
-        "should skip immediately after first failure"
-    );
-}
-
-#[test]
-fn sweep_backoff_escalates_exponentially() {
-    let mut b = SweepBackoff::new_failed(10); // 10s interval for fast test
-                                              // After 1st failure: skip 1 interval (10s)
-    assert_eq!(b.consecutive_failures, 1);
-
-    b.record_failure(10);
-    assert_eq!(b.consecutive_failures, 2);
-    // After 2nd: skip 2 intervals (20s)
-
-    b.record_failure(10);
-    assert_eq!(b.consecutive_failures, 3);
-    // After 3rd: skip 4 intervals (40s)
-
-    b.record_failure(10);
-    assert_eq!(b.consecutive_failures, 4);
-    // After 4th: skip 8 intervals (80s)
-}
-
-#[test]
-fn sweep_backoff_caps_at_max_shift() {
-    let mut b = SweepBackoff::new_failed(10);
-    for _ in 0..20 {
-        b.record_failure(10);
-    }
-    assert_eq!(b.consecutive_failures, 21);
-    // Even after 21 failures, backoff is capped at 2^5 = 32 intervals
-    assert!(b.should_skip());
-}
-
-#[test]
-fn sweep_backoff_should_skip_returns_false_after_delay() {
-    let b = SweepBackoff {
-        consecutive_failures: 1,
-        retry_after: Instant::now() - Duration::from_secs(1), // already past
-    };
-    assert!(
-        !b.should_skip(),
-        "should not skip when retry_after is in the past"
     );
 }

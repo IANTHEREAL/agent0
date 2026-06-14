@@ -105,7 +105,7 @@ Running cron jobs are tracked in a global `CronProcessList` singleton (`src/cron
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Module root; system store initialization (`init_system_store`), keyspace provisioning (`ensure_system_keyspace`), global `SYSTEM_STORE` and `WORKER_NOTIFY` statics |
+| `mod.rs` | Module root; system store initialization (`init_gc_registry_store`, the single canonical init used by both production and tests; runs the V1→V2 queue migration), keyspace provisioning (`ensure_system_keyspace`), global `SYSTEM_STORE` and `WORKER_NOTIFY` statics |
 | `engine.rs` | `WorkerEngine` struct: main poll loop (`run`/`tick`), task claiming (`claim_and_execute`), SQL execution (`execute_task`), CIC backfill (`execute_bg_ddl_backfill`), cron reconciliation |
 | `types.rs` | Core type definitions: `TaskType` enum, `IndexState` enum, `TaskRegistryEntry`, `TaskQueueEntry`, `WorkerClaim` |
 | `config.rs` | `WorkerConfig` with environment variable parsing (`DB9_WORKER_*`) and defaults |

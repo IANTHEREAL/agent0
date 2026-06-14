@@ -743,20 +743,19 @@ pub async fn create_table_from_stream(
     store
         .write_ddl_journal(txn, db_id, &ddl_journal_entry)
         .await?;
-    // Ensure the (keyspace, db_id) pair is discoverable by startup recovery.
-    if let Some(ss) = crate::worker::get_system_store() {
-        let ks = store.keyspace().unwrap_or("default");
-        let mut sys_txn = ss.begin().await?;
-        ss.update_registry_task_types(
-            &mut sys_txn,
-            ks,
-            db_id,
-            crate::worker::types::TASK_TYPE_DDL_JOURNAL,
-            0,
-        )
-        .await?;
-        sys_txn.commit().await?;
-    }
+    // Ensure the (keyspace, db_id) pair is discoverable by the bounded worker sweep.
+    let ss = crate::worker::system_store()?;
+    let ks = crate::worker::canonical_registry_keyspace(store.keyspace().unwrap_or("default"));
+    let mut sys_txn = ss.begin().await?;
+    ss.update_registry_task_types(
+        &mut sys_txn,
+        &ks,
+        db_id,
+        crate::worker::types::TASK_TYPE_DDL_JOURNAL,
+        0,
+    )
+    .await?;
+    sys_txn.commit().await?;
 
     use futures::StreamExt;
     let mut row_stream = stream.0;
@@ -777,9 +776,12 @@ pub async fn create_table_from_stream(
         super::maybe_rotate_backfill_txn(
             store,
             txn,
+            db_id,
             &mut txn_guard,
             &mut batch_writes,
             &mut has_committed_batches,
+            // Foreground CREATE TABLE ... seeding has no claim lease.
+            &crate::worker::LeaseCancel::none(),
         )
         .await?;
     }

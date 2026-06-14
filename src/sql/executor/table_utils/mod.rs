@@ -243,8 +243,10 @@ impl Executor {
             if let Some(system_store) = crate::worker::get_system_store() {
                 let mut sys_txn = system_store.begin().await?;
                 // Bounded: read pending AsyncTrigger identities from the V2 index
-                // (+ gated legacy) — never a global due-queue scan of command
-                // payloads. The async-trigger `task_id` doubles as its enqueue
+                // only — never a global due-queue scan of command payloads.
+                // Legacy `_worker_queue_` rows are converted to V2 by the
+                // startup migration, so the V2 index is the single source of
+                // truth here. The async-trigger `task_id` doubles as its enqueue
                 // timestamp, which is all this metric needs.
                 let task_ids = system_store
                     .pending_async_trigger_task_ids(&mut sys_txn, self.tenant_keyspace())

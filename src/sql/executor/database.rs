@@ -3,6 +3,7 @@ use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
+use tikv_client::TimestampExt;
 use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,8 +420,11 @@ impl Executor {
             ));
         }
 
+        let system_store = crate::worker::system_store()?.clone();
+        let keyspace = self.tenant_keyspace().to_string();
+
         session.begin().await?;
-        let result: Result<Vec<ExecuteResult>> = async {
+        let result: Result<(Vec<ExecuteResult>, Option<u64>)> = async {
             let owner = cmd
                 .owner
                 .clone()
@@ -435,6 +439,10 @@ impl Executor {
                 .store()
                 .create_database(txn, &cmd.name, &owner, cmd.if_not_exists)
                 .await?;
+            let registry_db_id = match created.as_ref() {
+                Some(def) => Some(def.id),
+                None => self.store().get_database_id(txn, &cmd.name).await?,
+            };
 
             let mut results = Vec::new();
             if created.is_none() {
@@ -447,17 +455,41 @@ impl Executor {
             results.push(ExecuteResult::CommandComplete {
                 tag: "CREATE DATABASE",
             });
-            Ok(results)
+            Ok((results, registry_db_id))
         }
         .await;
 
-        if result.is_ok() {
-            session.commit().await?;
-        } else {
-            session.rollback().await?;
+        let (results, registry_db_id) = match result {
+            Ok(value) => value,
+            Err(e) => {
+                session.rollback().await?;
+                return Err(e);
+            }
+        };
+
+        if let Some(db_id) = registry_db_id {
+            if let Err(e) = crate::worker::ensure_database_inventory_row_with_retry(
+                system_store.as_ref(),
+                &keyspace,
+                db_id,
+                3,
+            )
+            .await
+            {
+                session.rollback().await?;
+                return Err(anyhow!(
+                    "CREATE DATABASE worker inventory registration failed for database '{}' \
+                     (keyspace='{}', db_id={}): {}",
+                    cmd.name,
+                    keyspace,
+                    db_id,
+                    e
+                ));
+            }
         }
 
-        Ok(ExecuteResults(result?))
+        session.commit().await?;
+        Ok(ExecuteResults(results))
     }
 
     pub(crate) async fn execute_drop_database_cmd(
@@ -482,20 +514,7 @@ impl Executor {
 
         session.begin().await?;
 
-        // Collect HNSW S3 cleanup info BEFORE commit (schemas are still readable).
-        // After commit + unsafe_destroy_range, all TiKV keys (including HNSW meta/
-        // markers) are gone, so GC can never discover these S3 objects.
-        let mut hnsw_s3_db_id: Option<u64> = None;
-        if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
-            // Peek at the db_id for this database name. If it exists and has
-            // HNSW indexes, we'll clean up S3 after commit.
-            let (txn, _, _) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
-            if let Some(db_id) = self.store().get_database_id(txn, &cmd.name).await? {
-                hnsw_s3_db_id = Some(db_id);
-            }
-        }
+        let keyspace = self.tenant_keyspace().to_string();
 
         let result: Result<_> = async {
             let current_db_id = session.current_database_id();
@@ -520,13 +539,51 @@ impl Executor {
         }
         .await;
 
-        if result.is_ok() {
-            session.commit().await?;
-        } else {
-            session.rollback().await?;
+        let (dropped_result, mut results) = match result {
+            Ok(result) => result,
+            Err(e) => {
+                session.rollback().await?;
+                return Err(e);
+            }
+        };
+
+        // Record HNSW S3 cleanup only after DROP preflight succeeds, but
+        // before committing tenant metadata deletion. Writing the durable
+        // system-store intent does not require this SQL node to have S3
+        // credentials; only executing the cleanup does. That keeps rejected
+        // drops from leaving stale external intents while preserving the
+        // crash-safe handoff for successful drops on any SQL node.
+        let mut hnsw_s3_db_id: Option<u64> = None;
+        if let Some((db_id, _)) = dropped_result.as_ref() {
+            let drop_txn_start_ts = {
+                let (txn, _, _) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+                txn.start_timestamp().version()
+            };
+            if let Err(e) = crate::worker::request_hnsw_s3_db_prefix_cleanup(
+                &keyspace,
+                *db_id,
+                drop_txn_start_ts,
+                "drop_database",
+            )
+            .await
+            {
+                session.rollback().await?;
+                return Err(anyhow!(
+                    "DROP DATABASE '{}' could not record HNSW S3 cleanup intent \
+                     (keyspace='{}', db_id={}): {}",
+                    cmd.name,
+                    keyspace,
+                    db_id,
+                    e
+                ));
+            }
+            hnsw_s3_db_id = Some(*db_id);
         }
 
-        let (dropped_result, mut results) = result?;
+        session.commit().await?;
+
         if let Some((db_id, mut dropping_guard)) = dropped_result {
             // Step 1: Delete all HNSW text-format keys for this database.
             // HNSW keys use text format (d_{db_id}_hnsw_...) which falls
@@ -568,13 +625,25 @@ impl Executor {
             // start for this database. Await (not spawn) because
             // unsafe_destroy_range would remove any remaining markers.
             if let Some(s3_db_id) = hnsw_s3_db_id {
-                if let Some(s3) = crate::sql::hnsw::s3::hnsw_s3_client() {
-                    let keyspace = self.store().keyspace().unwrap_or("default").to_string();
-                    if let Err(e) = s3.delete_db_prefix(&keyspace, s3_db_id).await {
+                match crate::worker::complete_hnsw_s3_db_prefix_cleanup_for_dropped_db(
+                    &keyspace, s3_db_id,
+                )
+                .await
+                {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(
+                            "DROP DATABASE '{}': deleted {} HNSW S3 objects for db_id={}",
+                            cmd.name,
+                            deleted,
+                            s3_db_id
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
                         warn!(
                             db_id = s3_db_id,
                             error = %e,
-                            "DROP DATABASE: S3 HNSW cleanup failed; objects may be leaked"
+                            "DROP DATABASE: S3 HNSW cleanup failed; durable cleanup intent retained"
                         );
                     }
                 }
@@ -592,30 +661,45 @@ impl Executor {
             // global system keyspace. The binary-format range destroyed in
             // Step 3 only covers `d_{db_id}_*`; cron/bg/trigger queue entries
             // live under the global worker prefixes and would otherwise leak.
-            // Bounded prefix scan of the V2 index (+ gated legacy), no global
-            // due-queue scan. See issue #2576.
-            if let Some(system_store) = crate::worker::get_system_store() {
-                // MUST use tenant_keyspace() (the logical tenant string every
-                // enqueue site embeds as entry.keyspace), NOT store().keyspace()
-                // — the latter is the API-v2 connection keyspace, which for the
-                // default tenant is "DEFAULT" while queue rows are keyed under
-                // "default", so the reap prefix would never match and leak them.
-                let keyspace = self.tenant_keyspace().to_string();
-                // Self-contained + batched: manages its own bounded transactions.
-                let reap = system_store.reap_db_queue_entries(&keyspace, db_id).await;
-                match reap {
-                    Ok(n) if n > 0 => tracing::info!(
-                        "DROP DATABASE '{}': reaped {} worker queue entries for db_id={}",
-                        cmd.name,
-                        n,
-                        db_id
-                    ),
-                    Ok(_) => {}
-                    Err(e) => warn!(
-                        "DROP DATABASE '{}': worker queue reap failed for db_id={}: {}",
-                        cmd.name, db_id, e
-                    ),
+            // Bounded prefix scan of the V2 identity index, no global
+            // due-queue scan. Legacy `_worker_queue_` rows do not exist here:
+            // the one-shot V1->V2 migration runs in init_gc_registry_store at
+            // startup (before any DROP can run), so every queue row is already
+            // V2 by the time this reap executes. See issue #2576.
+            // MUST use tenant_keyspace() (the logical tenant string every
+            // enqueue site embeds as entry.keyspace), NOT store().keyspace()
+            // — the latter is the API-v2 connection keyspace, which for the
+            // default tenant is "DEFAULT" while queue rows are keyed under
+            // "default", so the reap prefix would never match and leak them.
+            match crate::worker::system_store() {
+                Ok(system_store) => {
+                    // Self-contained + batched: manages its own bounded transactions.
+                    // Keep the registry row if queue cleanup fails; the registry sweep
+                    // uses it as the durable retry target for orphaned worker rows.
+                    match system_store
+                        .reap_db_queue_entries_then_delete_worker_registry(&keyspace, db_id)
+                        .await
+                    {
+                        Ok(n) => {
+                            if n > 0 {
+                                tracing::info!(
+                                    "DROP DATABASE '{}': reaped {} worker queue entries for db_id={}",
+                                    cmd.name,
+                                    n,
+                                    db_id
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            "DROP DATABASE '{}': worker cleanup failed for db_id={}; retaining registry row for retry: {}",
+                            cmd.name, db_id, e
+                        ),
+                    }
                 }
+                Err(e) => warn!(
+                    "DROP DATABASE '{}': worker system store unavailable for db_id={} cleanup: {}",
+                    cmd.name, db_id, e
+                ),
             }
 
             // Step 4: Finalize the dropping guard — remove the registry entry.
@@ -745,6 +829,133 @@ mod tests {
                 name: "testdb".to_string(),
                 if_exists: true
             }
+        );
+    }
+
+    #[test]
+    fn drop_database_uses_ordered_worker_inventory_cleanup() {
+        let source = include_str!("database.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("database.rs must contain #[cfg(test)]");
+        let cleanup_source = prod_source
+            .split("match crate::worker::system_store()")
+            .nth(1)
+            .and_then(|rest| rest.split("// Step 4:").next())
+            .expect("DROP DATABASE worker cleanup block must exist");
+
+        assert!(
+            cleanup_source.contains("reap_db_queue_entries_then_delete_worker_registry"),
+            "DROP DATABASE must use the ordered worker cleanup helper"
+        );
+
+        let reap_error_branch = cleanup_source
+            .split("Err(e) => warn!(")
+            .nth(1)
+            .expect("DROP DATABASE worker cleanup error branch must exist");
+        assert!(
+            reap_error_branch.contains("retaining registry row for retry"),
+            "worker cleanup failures must leave the registry row as retry inventory"
+        );
+        assert!(
+            !reap_error_branch.contains("delete_worker_registry"),
+            "worker cleanup failure branch must not delete the registry row"
+        );
+    }
+
+    #[test]
+    fn drop_database_records_hnsw_s3_cleanup_intent_before_metadata_commit() {
+        let source = include_str!("database.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("database.rs must contain #[cfg(test)]");
+        let drop_fn = prod_source
+            .split("pub(crate) async fn execute_drop_database_cmd(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) async fn execute_alter_database_cmd(")
+                    .next()
+            })
+            .expect("DROP DATABASE executor must exist before ALTER DATABASE executor");
+
+        let intent_pos = drop_fn
+            .find("request_hnsw_s3_db_prefix_cleanup")
+            .expect("DROP DATABASE must record durable S3 cleanup intent");
+        let metadata_drop_pos = drop_fn
+            .find("drop_database_metadata")
+            .expect("DROP DATABASE must perform metadata preflight/drop");
+        let commit_pos = drop_fn
+            .find("session.commit().await?")
+            .expect("DROP DATABASE must commit tenant metadata deletion");
+        assert!(
+            metadata_drop_pos < intent_pos,
+            "DROP DATABASE must not record S3 cleanup intent before metadata preflight succeeds"
+        );
+        assert!(
+            intent_pos < commit_pos,
+            "DROP DATABASE must record the S3 cleanup intent before committing metadata deletion"
+        );
+        assert!(
+            !drop_fn[..intent_pos].contains("hnsw_s3_client().is_some()"),
+            "DROP DATABASE must record the durable S3 cleanup intent even when this SQL node has no S3 client"
+        );
+        let preflight_section = &drop_fn[..metadata_drop_pos];
+        assert!(
+            !preflight_section.contains("request_hnsw_s3_db_prefix_cleanup"),
+            "rejected DROP DATABASE preflight paths must not leave durable S3 cleanup intents"
+        );
+
+        assert!(
+            drop_fn.contains("complete_hnsw_s3_db_prefix_cleanup_for_dropped_db"),
+            "DROP DATABASE must complete S3 prefix cleanup through the external-object protocol"
+        );
+        let cleanup_failure = drop_fn
+            .split("durable cleanup intent retained")
+            .nth(1)
+            .expect("DROP DATABASE must retain cleanup intent on inline S3 failure");
+        assert!(
+            !cleanup_failure.contains("delete_hnsw_s3_db_prefix_cleanup_intent"),
+            "inline S3 cleanup failure must not delete the durable retry intent"
+        );
+    }
+
+    #[test]
+    fn create_database_registers_worker_inventory_before_commit() {
+        let source = include_str!("database.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("database.rs must contain #[cfg(test)]");
+        let create_fn = prod_source
+            .split("pub(crate) async fn execute_create_database_cmd(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) async fn execute_drop_database_cmd(")
+                    .next()
+            })
+            .expect("CREATE DATABASE executor must exist before DROP DATABASE executor");
+
+        let register_pos = create_fn
+            .find("ensure_database_inventory_row_with_retry")
+            .expect("CREATE DATABASE must register a worker inventory row");
+        let commit_pos = create_fn
+            .find("session.commit().await?")
+            .expect("CREATE DATABASE must commit the tenant transaction");
+        assert!(
+            register_pos < commit_pos,
+            "worker inventory row must be written before the CREATE DATABASE tenant commit"
+        );
+
+        let register_error_branch = create_fn
+            .split("if let Err(e) = crate::worker::ensure_database_inventory_row_with_retry")
+            .nth(1)
+            .and_then(|rest| rest.split("session.commit().await?").next())
+            .expect("CREATE DATABASE inventory registration error branch must precede commit");
+        assert!(
+            register_error_branch.contains("session.rollback().await?"),
+            "inventory registration failure must roll back the still-open tenant transaction"
         );
     }
 

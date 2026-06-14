@@ -1466,6 +1466,25 @@ impl TikvClientPool {
                 return Err(e);
             }
         };
+        if let Some(system_store) = crate::worker::get_system_store() {
+            match crate::worker::register_database_inventory(system_store, &store, key).await {
+                Ok(registered) if registered > 0 => {
+                    tracing::info!(
+                        keyspace = key,
+                        registered,
+                        "Registered tenant databases in worker inventory"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Failed to register tenant database inventory for keyspace '{}': {}",
+                        key,
+                        e
+                    ));
+                }
+            }
+        }
 
         Ok(Arc::new(store))
     }
@@ -1570,6 +1589,46 @@ impl TikvClientPool {
         evicted
     }
 
+    /// Evict one tenant immediately if it is currently idle.
+    ///
+    /// Worker registry sweeps intentionally acquire many tenants in a bounded
+    /// page. Waiting for the normal idle timeout would let those clients
+    /// accumulate for up to 300 seconds, so the sweep calls this after dropping
+    /// each page's handles.
+    pub(crate) async fn evict_if_idle(&self, keyspace: &str) -> bool {
+        let removed = {
+            let mut tenants = self.tenants.write().await;
+            let should_evict = tenants
+                .get(keyspace)
+                .is_some_and(|entry| entry.active_connections.load(Ordering::Relaxed) == 0);
+            if should_evict {
+                tenants.remove(keyspace).is_some()
+            } else {
+                false
+            }
+        };
+
+        if removed {
+            {
+                let mut idx = self.idle_index.lock();
+                idx.retain(|(_, ks)| ks != keyspace);
+            }
+
+            let mut locks = self.creation_locks.write().await;
+            locks.remove(keyspace);
+            drop(locks);
+
+            crate::auth::invalidate_initialized(keyspace);
+            crate::sql::fts_tokenizers::evict_user_tsc_keyspace(keyspace);
+            crate::extensions::embedding::evict_embedding_semaphore(keyspace);
+            crate::extensions::http::evict_http_limiter(keyspace);
+            crate::extensions::parquet::limits::evict_parquet_limiter(keyspace);
+            admission_budget_registry().evict(keyspace);
+        }
+
+        removed
+    }
+
     /// Spawn a background reaper task that periodically evicts idle tenants.
     pub fn spawn_reaper(self: &Arc<Self>) {
         let pool = Arc::clone(self);
@@ -1652,6 +1711,28 @@ mod tests {
         assert!(
             !locks.contains_key(keyspace),
             "creation lock must be removed after failed create_store"
+        );
+    }
+
+    #[test]
+    fn tenant_inventory_registration_failure_is_fail_closed() {
+        let source = include_str!("pool.rs");
+        let create_store = source
+            .split("async fn create_store(")
+            .nth(1)
+            .expect("create_store must exist");
+        let registration_branch = create_store
+            .split("register_database_inventory")
+            .nth(1)
+            .expect("create_store must register tenant database inventory");
+
+        assert!(
+            registration_branch.contains("return Err(anyhow!"),
+            "tenant inventory registration failure must fail tenant creation, not log-and-cache"
+        );
+        assert!(
+            !registration_branch.contains("tracing::warn!"),
+            "tenant inventory registration failure must not be fail-open"
         );
     }
 

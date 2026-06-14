@@ -241,6 +241,9 @@ async fn gc_database_batch_inner(
     match batch_result {
         Ok(batch) => {
             if batch.recovered > 0 || batch.deleted > 0 {
+                store
+                    .assert_database_alive_for_update(&mut txn, db_id)
+                    .await?;
                 txn.commit().await?;
             } else {
                 txn.rollback().await.ok();

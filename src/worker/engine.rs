@@ -1,5 +1,7 @@
+use crate::cron::config::CronConfig;
 use crate::cron::process_list::{get_process_list, RunningCronJob};
 use crate::cron::types::{CronJob, CronRun, CronRunStatus};
+use crate::cron::worker::gc_database;
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
 use crate::pool::TikvClientPool;
@@ -20,8 +22,11 @@ use anyhow::{anyhow, Result};
 pub(crate) use helpers::HNSW_GRAPH_MAX_BYTES;
 use helpers::{
     background_statement_extension_context, execute_hnsw_merge, parse_backfill_index_command,
-    parse_hnsw_merge_command, repair_incomplete_cic_states, should_skip_frozen_merge,
-    should_start_cic_backfill,
+    parse_hnsw_merge_command, should_skip_frozen_merge, should_start_cic_backfill,
+};
+pub(crate) use helpers::{
+    cleanup_hnsw_s3_graph_upload_after_failed_txn, hnsw_s3_graph_version_for_txn,
+    put_hnsw_s3_graph_with_intent,
 };
 pub(crate) use helpers::{
     is_retryable_region_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
@@ -30,18 +35,57 @@ use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tikv_client::TimestampExt;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const STATEMENT_TIMEOUT_ERROR: &str = "canceling statement due to statement timeout";
-const CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by administrator";
+/// Single source of truth for the claim-cancelled / shutdown error message,
+/// shared with the specialized long-running paths via `LeaseCancel`.
+use crate::worker::CLAIM_CANCELLED_ERROR as CANCELLED_BY_ADMIN_ERROR;
 const WORKER_BGSQL_MAX_RETRY_ATTEMPTS: usize = 64;
+const REGISTRY_SWEEP_POLL_INTERVAL_SEC: u64 = 1;
+const REGISTRY_SWEEP_CATCHUP_PAGE_INTERVAL_SEC: u64 = 2;
+/// Convergent legacy `_worker_queue_` drain (design §II.8 M5). While stragglers
+/// are still being migrated, drain a bounded batch every this many seconds.
+const LEGACY_DRAIN_ACTIVE_INTERVAL_SEC: u64 = 5;
+/// Once the legacy queue has been observed EMPTY for `LEGACY_DRAIN_GRACE_EMPTY_SWEEPS`
+/// consecutive probes, fall back to this slower cadence. The drain NEVER stops —
+/// an OLD binary may still write V1 rows during a rolling deploy — but the
+/// steady-state cost is only a single 1-key empty-range probe at this interval.
+const LEGACY_DRAIN_IDLE_INTERVAL_SEC: u64 = 300;
+/// Grace window: number of consecutive empty probes before downshifting to the
+/// idle cadence. A straggler V1 row resets the streak and re-arms active drain.
+const LEGACY_DRAIN_GRACE_EMPTY_SWEEPS: u32 = 3;
+/// Per-tick batch budget so one drain tick never holds the maintenance loop on
+/// an unbounded backlog: at most this many bounded batches are migrated per tick;
+/// the remainder is picked up on the next tick (still convergent).
+const LEGACY_DRAIN_MAX_BATCHES_PER_TICK: u32 = 8;
+const REGISTRY_SWEEP_RECOVERY_BACKOFF_SEC: u64 = 30;
+const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
+const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5;
+const DISABLED_CHECK_THRESHOLD: u32 = 5;
+const CIC_REPAIR_TABLE_PAGE_SIZE: usize = 256;
+const HNSW_DELTA_TABLE_PAGE_SIZE: usize = 256;
+
+/// Pacing for the convergent legacy `_worker_queue_` drain (design §II.8 M5).
+/// Active while stragglers are still being seen; downshifts to a cheap periodic
+/// empty-range probe once the queue has been empty for the grace window. The
+/// drain NEVER stops — a downshift only widens the interval — so an old binary
+/// that resumes writing V1 rows during a rolling deploy is always caught.
+fn legacy_drain_interval(empty_streak: u32) -> Duration {
+    if empty_streak >= LEGACY_DRAIN_GRACE_EMPTY_SWEEPS {
+        Duration::from_secs(LEGACY_DRAIN_IDLE_INTERVAL_SEC)
+    } else {
+        Duration::from_secs(LEGACY_DRAIN_ACTIVE_INTERVAL_SEC)
+    }
+}
 
 async fn worker_bgsql_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -58,7 +102,113 @@ pub struct WorkerEngine {
     metrics: Arc<WorkerMetrics>,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
-    storage_reconcile_cursor: AtomicUsize,
+    registry_sweep_state: Mutex<RegistrySweepState>,
+}
+
+struct RegistrySweepState {
+    cursor: Option<Vec<u8>>,
+    catch_up: bool,
+    last_page_at: Option<Instant>,
+    last_cycle_completed: Option<Instant>,
+    hnsw_observed_this_cycle: u64,
+    entry_backoff: HashMap<(String, u64), RegistrySweepBackoff>,
+    kind_backoff: HashMap<RegistrySweepKindKey, RegistrySweepBackoff>,
+    missing_database_seen: HashSet<(String, u64)>,
+    cic_table_cursors: HashMap<(String, u64), Vec<u8>>,
+    hnsw_delta_table_cursors: HashMap<(String, u64), Vec<u8>>,
+    /// Convergent legacy `_worker_queue_` drain state (design §II.8 M5).
+    /// `legacy_drain_last_at` paces the drain; `legacy_drain_empty_streak`
+    /// counts consecutive empty probes for the grace-window downshift.
+    legacy_drain_last_at: Option<Instant>,
+    legacy_drain_empty_streak: u32,
+}
+
+impl Default for RegistrySweepState {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            catch_up: true,
+            last_page_at: None,
+            last_cycle_completed: None,
+            hnsw_observed_this_cycle: 0,
+            entry_backoff: HashMap::new(),
+            kind_backoff: HashMap::new(),
+            missing_database_seen: HashSet::new(),
+            cic_table_cursors: HashMap::new(),
+            hnsw_delta_table_cursors: HashMap::new(),
+            legacy_drain_last_at: None,
+            legacy_drain_empty_streak: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RegistrySweepKind {
+    Cron,
+    Cic,
+    DdlJournal,
+    HnswDelta,
+    HnswS3,
+    StorageScan,
+}
+
+impl RegistrySweepKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cron => "cron",
+            Self::Cic => "cic",
+            Self::DdlJournal => "ddl_journal",
+            Self::HnswDelta => "hnsw_delta",
+            Self::HnswS3 => "hnsw_s3",
+            Self::StorageScan => "storage_scan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RegistrySweepKindKey {
+    keyspace: String,
+    db_id: u64,
+    kind: RegistrySweepKind,
+}
+
+impl RegistrySweepKindKey {
+    fn new(keyspace: &str, db_id: u64, kind: RegistrySweepKind) -> Self {
+        Self {
+            keyspace: keyspace.to_string(),
+            db_id,
+            kind,
+        }
+    }
+}
+
+struct RegistrySweepBackoff {
+    consecutive_failures: u32,
+    retry_after: Instant,
+}
+
+impl RegistrySweepBackoff {
+    fn new_failed(interval_sec: u64) -> Self {
+        Self {
+            consecutive_failures: 1,
+            retry_after: Instant::now()
+                + Duration::from_secs(interval_sec * SWEEP_BACKOFF_BASE_INTERVALS as u64),
+        }
+    }
+
+    fn record_failure(&mut self, interval_sec: u64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let shift = self
+            .consecutive_failures
+            .saturating_sub(1)
+            .min(SWEEP_BACKOFF_MAX_SHIFT);
+        let multiplier = SWEEP_BACKOFF_BASE_INTERVALS as u64 * (1u64 << shift);
+        self.retry_after = Instant::now() + Duration::from_secs(interval_sec * multiplier);
+    }
+
+    fn should_skip(&self) -> bool {
+        Instant::now() < self.retry_after
+    }
 }
 
 struct ActiveJobGuard {
@@ -78,6 +228,41 @@ impl Drop for ActiveJobGuard {
     }
 }
 
+/// Lifetime guard for a claim's lease-renewal loop. Dropping it aborts the loop
+/// (execution has finished, so the lease no longer needs renewing).
+struct LeaseRenewerGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// Result of a single lease-renewal attempt. The loop maps this onto its
+/// `last_committed_lease_until` state and the cancel/continue decision.
+///
+/// Extracted as an explicit value (rather than inlined in the spawned closure)
+/// so the loop wiring — seed at spawn, advance ONLY on a committed renewal, and
+/// compare a renewal error against the COMMITTED deadline — is driven through
+/// one real code path that tests can exercise against TiKV. A pure-inequality
+/// unit test cannot guard that wiring (post-mortem class F: the original bug was
+/// the wiring, not the math).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseRenewOutcome {
+    /// Renewal committed; the stored lease now extends to this deadline. The
+    /// loop advances `last_committed_lease_until` to it and continues.
+    Renewed { committed_lease_until_ms: i64 },
+    /// The claim is gone or owned by another worker (renew returned `false`).
+    /// The lease is lost: cancel and stop renewing.
+    ClaimLost,
+    /// Transient renewal error. `cancel` was decided by comparing `now` against
+    /// the COMMITTED deadline (never the prospective one): cancel if the stored
+    /// lease has already lapsed, otherwise retry next tick.
+    Errored { cancel: bool },
+}
+
+impl Drop for LeaseRenewerGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 fn cron_queue_entry_matches_job(entry: &TaskQueueEntry, job: &CronJob) -> bool {
     entry.task_type == TaskType::Cron
         && entry.task_id == job.job_id
@@ -92,22 +277,6 @@ fn keep_queue_entry_for_claim_status(claim_status: CronRunClaimStatus) -> Option
         CronRunClaimStatus::AlreadyClaimedForMinute => Some(false),
         CronRunClaimStatus::BlockedByRunningGuard => Some(true),
     }
-}
-
-pub(crate) fn registry_batch_from_cursor(
-    entries: &[TaskRegistryEntry],
-    cursor: usize,
-    batch_size: usize,
-) -> Vec<&TaskRegistryEntry> {
-    if entries.is_empty() {
-        return Vec::new();
-    }
-
-    let limit = batch_size.max(1).min(entries.len());
-    let start = cursor % entries.len();
-    (0..limit)
-        .map(|offset| &entries[(start + offset) % entries.len()])
-        .collect()
 }
 
 impl WorkerEngine {
@@ -129,7 +298,7 @@ impl WorkerEngine {
             metrics: Arc::new(WorkerMetrics::new()),
             notify,
             shutdown,
-            storage_reconcile_cursor: AtomicUsize::new(0),
+            registry_sweep_state: Mutex::new(RegistrySweepState::default()),
         }
     }
 
@@ -147,22 +316,7 @@ impl WorkerEngine {
             self.config.poll_ms, self.config.max_concurrent_jobs
         );
 
-        if let Err(e) = self.reconcile_cron_jobs().await {
-            warn!("Cron reconciliation failed (engine will continue): {}", e);
-        }
-        if let Err(e) = self.reconcile_incomplete_cic_indexes().await {
-            warn!(
-                "CIC index-state recovery failed (engine will continue): {}",
-                e
-            );
-        }
-        if let Err(e) = self.reconcile_ddl_journal().await {
-            warn!("DDL journal recovery failed (engine will continue): {}", e);
-        }
-
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
-        let mut last_storage_reconcile = tokio::time::Instant::now();
-        let storage_scan_interval = Duration::from_secs(self.config.storage_scan_interval_sec);
 
         loop {
             tokio::select! {
@@ -170,19 +324,43 @@ impl WorkerEngine {
                     info!("WorkerEngine shutdown requested");
                     break;
                 }
-                _ = interval.tick() => {}
-                _ = self.notify.notified() => {}
-            }
-
-            if last_storage_reconcile.elapsed() >= storage_scan_interval {
-                if let Err(e) = self.reconcile_storage_scans().await {
-                    warn!("Periodic storage scan reconciliation failed: {}", e);
+                _ = interval.tick() => {
+                    if let Err(e) = self.tick().await {
+                        warn!("Worker tick error: {}", e);
+                    }
                 }
-                last_storage_reconcile = tokio::time::Instant::now();
+                _ = self.notify.notified() => {
+                    if let Err(e) = self.tick().await {
+                        warn!("Worker tick error: {}", e);
+                    }
+                }
             }
+        }
+    }
 
-            if let Err(e) = self.tick().await {
-                warn!("Worker tick error: {}", e);
+    pub async fn run_maintenance(&self) {
+        info!(
+            "WorkerEngine maintenance loop starting (poll_sec={})",
+            REGISTRY_SWEEP_POLL_INTERVAL_SEC
+        );
+
+        let mut sweep_interval =
+            tokio::time::interval(Duration::from_secs(REGISTRY_SWEEP_POLL_INTERVAL_SEC));
+
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    info!("WorkerEngine maintenance shutdown requested");
+                    break;
+                }
+                _ = sweep_interval.tick() => {
+                    if let Err(e) = self.registry_sweep_tick().await {
+                        warn!("Worker registry sweep error: {}", e);
+                    }
+                    if let Err(e) = self.legacy_queue_drain_tick().await {
+                        warn!("Worker legacy queue drain error: {}", e);
+                    }
+                }
             }
         }
     }
@@ -192,37 +370,13 @@ impl WorkerEngine {
 
         let mut txn = self.system_store.begin().await?;
         // V2 descriptors (small values) up to `now`.
-        let mut due_entries: Vec<(Vec<u8>, DueItem)> = self
+        let due_entries: Vec<(Vec<u8>, DueItem)> = self
             .system_store
             .scan_due_v2(&mut txn, now_ms, 1000)
             .await?
             .into_iter()
             .map(|(key, descriptor)| (key, DueItem::V2(descriptor)))
             .collect();
-        // Migration window only: an OLD binary may still enqueue legacy
-        // `_worker_queue_` entries during a rolling deploy. The new binary
-        // executes them IN PLACE (never moves them to V2), sharing the same
-        // worker-claim identity as the old binary so an entry is processed once
-        // and deleted from its single namespace. V1 drains naturally: cron
-        // requeues its next fire as V2, one-shots are executed and deleted.
-        // Byte-safe (one legacy value per RPC); gated so it is one empty RPC once
-        // V1 is drained. NOTE: V2 is scanned first up to the limit and
-        // legacy only fills the remainder, so legacy drains opportunistically
-        // (not on a fixed schedule); a sustained backlog of >=limit due V2
-        // entries deprioritizes it — acceptable since old-binary writes cease
-        // once the deploy completes.
-        if due_entries.len() < 1000 && self.system_store.legacy_queue_has_entries(&mut txn).await? {
-            let remaining = (1000 - due_entries.len()) as u32;
-            let legacy = self
-                .system_store
-                .scan_due_legacy_bytesafe(&mut txn, now_ms, remaining)
-                .await?;
-            due_entries.extend(
-                legacy
-                    .into_iter()
-                    .map(|(key, entry)| (key, DueItem::Legacy(entry))),
-            );
-        }
         txn.commit().await?;
 
         self.metrics.sample_tick(
@@ -279,56 +433,797 @@ impl WorkerEngine {
         Ok(())
     }
 
-    /// Reconcile cron jobs at startup: ensure all active cron jobs have queue entries,
-    /// and remove queue entries for jobs that no longer exist or are inactive.
-    async fn reconcile_cron_jobs(&self) -> Result<()> {
-        info!("Starting cron job reconciliation...");
+    async fn registry_sweep_tick(&self) -> Result<()> {
+        let now = Instant::now();
+        let (start_after, batch_size) = {
+            let state = self.registry_sweep_state.lock().await;
+            let page_interval = if state.catch_up {
+                Duration::from_secs(REGISTRY_SWEEP_CATCHUP_PAGE_INTERVAL_SEC)
+            } else {
+                Duration::from_secs(self.config.sweep_page_interval_sec.max(1))
+            };
+            if state
+                .last_page_at
+                .is_some_and(|last| now.duration_since(last) < page_interval)
+            {
+                return Ok(());
+            }
+            if state.cursor.is_none() && !state.catch_up {
+                let cycle_interval =
+                    Duration::from_secs(self.config.registry_sweep_interval_sec.max(1));
+                if state
+                    .last_cycle_completed
+                    .is_some_and(|last| now.duration_since(last) < cycle_interval)
+                {
+                    return Ok(());
+                }
+            }
+            (
+                state.cursor.clone(),
+                self.config.registry_reconcile_batch_size.max(1),
+            )
+        };
 
-        let mut txn = self.system_store.begin().await?;
-        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
-        txn.commit().await?;
+        let (entries, next_cursor) = {
+            let mut txn = self.system_store.begin().await?;
+            let page = self
+                .system_store
+                .scan_worker_registry_page(&mut txn, start_after.as_deref(), batch_size)
+                .await?;
+            txn.rollback().await.ok();
+            page
+        };
 
-        let mut total_enqueued = 0u32;
-        let mut total_cleaned = 0u32;
+        if entries.is_empty() {
+            self.finish_registry_sweep_cycle(now, 0).await;
+            return Ok(());
+        }
 
-        for entry in registry_entries {
-            if !entry.has_cron() {
+        let mut cron_config = CronConfig::from_env();
+        cron_config.orphan_timeout_sec =
+            crate::worker::gc::effective_cron_orphan_timeout_sec(&cron_config, &self.config);
+
+        let mut page_hnsw_observed = 0u64;
+        let mut page_hnsw_enqueued = 0u64;
+        let mut page_hnsw_enqueue_errors = 0u64;
+        let mut processed = 0usize;
+        let mut skipped = 0usize;
+        let mut touched_keyspaces = HashSet::new();
+
+        for entry in &entries {
+            let backoff_key = (entry.keyspace.clone(), entry.db_id);
+            if self.registry_sweep_should_skip(entry, &backoff_key).await? {
+                skipped += 1;
                 continue;
             }
 
-            match self
-                .reconcile_cron_for_db(&entry.keyspace, entry.db_id)
-                .await
-            {
-                Ok((enqueued, cleaned)) => {
-                    total_enqueued += enqueued;
-                    total_cleaned += cleaned;
+            let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
+                Ok(handle) => {
+                    touched_keyspaces.insert(entry.keyspace.clone());
+                    handle
                 }
                 Err(e) => {
+                    self.registry_sweep_record_failure(&backoff_key).await;
                     warn!(
-                        "Cron reconciliation error for keyspace={} db_id={}: {}",
-                        entry.keyspace, entry.db_id, e
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        "Worker registry sweep tenant acquire failed: {}",
+                        e
+                    );
+                    continue;
+                }
+            };
+            let store = handle.store().clone();
+
+            match self
+                .process_registry_sweep_entry(entry, &store, &cron_config)
+                .await
+            {
+                Ok(outcome) => {
+                    processed += 1;
+                    page_hnsw_observed += outcome.hnsw_observed as u64;
+                    page_hnsw_enqueued += outcome.hnsw_enqueued as u64;
+                    page_hnsw_enqueue_errors += outcome.hnsw_enqueue_errors as u64;
+                    self.registry_sweep_record_success(&backoff_key).await;
+                }
+                Err(e) => {
+                    self.registry_sweep_record_failure(&backoff_key).await;
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        "Worker registry sweep entry failed: {}",
+                        e
+                    );
+                }
+            }
+            drop(handle);
+        }
+
+        for keyspace in touched_keyspaces {
+            if self.pool.evict_if_idle(&keyspace).await {
+                tracing::debug!(keyspace, "Worker registry sweep evicted idle tenant client");
+            }
+        }
+
+        if page_hnsw_enqueued > 0 {
+            self.metrics
+                .hnsw_sweep_enqueued
+                .fetch_add(page_hnsw_enqueued, Ordering::Relaxed);
+            metrics::counter!("db9_server_hnsw_sweep_enqueued_total").increment(page_hnsw_enqueued);
+        }
+        if page_hnsw_enqueue_errors > 0 {
+            self.metrics
+                .hnsw_sweep_enqueue_errors
+                .fetch_add(page_hnsw_enqueue_errors, Ordering::Relaxed);
+            metrics::counter!("db9_server_hnsw_sweep_enqueue_errors_total")
+                .increment(page_hnsw_enqueue_errors);
+        }
+
+        let cycle_completed = next_cursor.is_none();
+        {
+            let mut state = self.registry_sweep_state.lock().await;
+            state.cursor = next_cursor;
+            state.last_page_at = Some(now);
+            state.hnsw_observed_this_cycle = state
+                .hnsw_observed_this_cycle
+                .saturating_add(page_hnsw_observed);
+            if cycle_completed {
+                let observed = state.hnsw_observed_this_cycle;
+                state.hnsw_observed_this_cycle = 0;
+                state.catch_up = false;
+                state.last_cycle_completed = Some(now);
+                self.metrics
+                    .hnsw_pending_indexes_observed
+                    .store(observed, Ordering::Relaxed);
+                metrics::gauge!("db9_server_hnsw_pending_indexes_observed").set(observed as f64);
+                metrics::counter!("db9_server_worker_sweep_cycles_completed_total").increment(1);
+            }
+        }
+
+        metrics::counter!("db9_server_worker_sweep_entries_total").increment(processed as u64);
+        if skipped > 0 {
+            metrics::counter!("db9_server_worker_sweep_entries_skipped_total")
+                .increment(skipped as u64);
+        }
+        info!(
+            processed,
+            skipped,
+            page_entries = entries.len(),
+            cycle_completed,
+            hnsw_observed = page_hnsw_observed,
+            hnsw_enqueued = page_hnsw_enqueued,
+            hnsw_enqueue_errors = page_hnsw_enqueue_errors,
+            "Worker registry sweep page complete"
+        );
+
+        Ok(())
+    }
+
+    async fn finish_registry_sweep_cycle(&self, now: Instant, observed_delta: u64) {
+        let mut state = self.registry_sweep_state.lock().await;
+        state.cursor = None;
+        state.last_page_at = Some(now);
+        state.catch_up = false;
+        state.last_cycle_completed = Some(now);
+        state.hnsw_observed_this_cycle = state
+            .hnsw_observed_this_cycle
+            .saturating_add(observed_delta);
+        let observed = state.hnsw_observed_this_cycle;
+        state.hnsw_observed_this_cycle = 0;
+        self.metrics
+            .hnsw_pending_indexes_observed
+            .store(observed, Ordering::Relaxed);
+        metrics::gauge!("db9_server_hnsw_pending_indexes_observed").set(observed as f64);
+        metrics::counter!("db9_server_worker_sweep_cycles_completed_total").increment(1);
+    }
+
+    /// Convergent background drain of legacy `_worker_queue_` rows (design
+    /// §II.8 M5).
+    ///
+    /// The startup migration only converts V1 rows that exist when this node
+    /// latches `_wq_schema_version = 2`. During a rolling deploy an OLD
+    /// (pre-V2) binary keeps writing V1 rows AFTER that point; the V2-only tick
+    /// would never dequeue or reap them, stranding cron fires / bg DDL / bg SQL
+    /// / auto-analyze forever. This tick keeps draining stragglers in BOUNDED
+    /// batches until the legacy queue is observed empty across a grace window,
+    /// after which it costs only a cheap empty-range probe — and it NEVER stops,
+    /// because an old binary may write a fresh V1 row at any time in the window.
+    ///
+    /// Bounded by construction (issue #2576 invariant): each active sweep does
+    /// at most `LEGACY_DRAIN_MAX_BATCHES_PER_TICK` page-sized batch migrations;
+    /// the converged path is a single 1-key probe. This is NOT a per-operation
+    /// or per-tick global scan — only this maintenance-loop step touches the
+    /// legacy layer, and the V2-only enqueue/dequeue hot paths never do.
+    async fn legacy_queue_drain_tick(&self) -> Result<()> {
+        let now = Instant::now();
+        {
+            let state = self.registry_sweep_state.lock().await;
+            let interval = legacy_drain_interval(state.legacy_drain_empty_streak);
+            if state
+                .legacy_drain_last_at
+                .is_some_and(|last| now.duration_since(last) < interval)
+            {
+                return Ok(());
+            }
+        }
+
+        // Drain bounded batches until the legacy queue is empty or the per-tick
+        // budget is spent. Each batch migrates V1 -> V2 (due/index/payload) and
+        // deletes the V1 keys in the SAME transaction.
+        let mut migrated_total = 0usize;
+        let mut batches = 0u32;
+        let mut drained_to_empty = false;
+        while batches < LEGACY_DRAIN_MAX_BATCHES_PER_TICK {
+            let migrated = self.system_store.drain_legacy_worker_queue_batch().await?;
+            batches += 1;
+            migrated_total += migrated;
+            if migrated == 0 {
+                drained_to_empty = true;
+                break;
+            }
+        }
+
+        // If the budget was spent without emptying, confirm whether more remains
+        // so the grace streak is not advanced prematurely.
+        if !drained_to_empty {
+            drained_to_empty = self.system_store.legacy_worker_queue_is_empty().await?;
+        }
+
+        {
+            let mut state = self.registry_sweep_state.lock().await;
+            state.legacy_drain_last_at = Some(now);
+            if drained_to_empty {
+                state.legacy_drain_empty_streak = state.legacy_drain_empty_streak.saturating_add(1);
+            } else {
+                // A straggler appeared: re-arm aggressive draining.
+                state.legacy_drain_empty_streak = 0;
+            }
+        }
+
+        if migrated_total > 0 {
+            self.metrics
+                .legacy_queue_drained
+                .fetch_add(migrated_total as u64, Ordering::Relaxed);
+            metrics::counter!("db9_server_worker_legacy_queue_drained_total")
+                .increment(migrated_total as u64);
+            info!(
+                migrated = migrated_total,
+                batches, "Worker drained legacy V1 worker-queue stragglers into V2"
+            );
+            // New V2 due rows are now visible to the tick; nudge it.
+            crate::worker::wake_worker();
+        }
+
+        Ok(())
+    }
+
+    async fn registry_sweep_should_skip(
+        &self,
+        entry: &TaskRegistryEntry,
+        key: &(String, u64),
+    ) -> Result<bool> {
+        let should_check_disabled = {
+            let state = self.registry_sweep_state.lock().await;
+            let Some(backoff) = state.entry_backoff.get(key) else {
+                return Ok(false);
+            };
+            if !backoff.should_skip() {
+                return Ok(false);
+            }
+            backoff.consecutive_failures >= DISABLED_CHECK_THRESHOLD
+        };
+
+        if should_check_disabled {
+            let state =
+                crate::worker::check_keyspace_state(self.pool.pd_endpoints(), &entry.keyspace)
+                    .await;
+            if state.as_deref() == Some("DISABLED") {
+                warn!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    "Worker registry sweep retained DISABLED keyspace entry"
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn registry_sweep_record_success(&self, key: &(String, u64)) {
+        let mut state = self.registry_sweep_state.lock().await;
+        state.entry_backoff.remove(key);
+    }
+
+    async fn registry_sweep_record_failure(&self, key: &(String, u64)) {
+        let mut state = self.registry_sweep_state.lock().await;
+        let interval = self.config.registry_sweep_interval_sec.max(1);
+        match state.entry_backoff.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().record_failure(interval);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RegistrySweepBackoff::new_failed(interval));
+            }
+        }
+    }
+
+    async fn registry_sweep_kind_should_skip(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        kind: RegistrySweepKind,
+    ) -> bool {
+        let key = RegistrySweepKindKey::new(keyspace, db_id, kind);
+        let state = self.registry_sweep_state.lock().await;
+        state
+            .kind_backoff
+            .get(&key)
+            .is_some_and(RegistrySweepBackoff::should_skip)
+    }
+
+    async fn registry_sweep_record_kind_success(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        kind: RegistrySweepKind,
+    ) {
+        let key = RegistrySweepKindKey::new(keyspace, db_id, kind);
+        let mut state = self.registry_sweep_state.lock().await;
+        state.kind_backoff.remove(&key);
+    }
+
+    async fn registry_sweep_record_kind_failure(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        kind: RegistrySweepKind,
+    ) {
+        let key = RegistrySweepKindKey::new(keyspace, db_id, kind);
+        let interval = self.registry_sweep_kind_backoff_interval(kind);
+        let mut state = self.registry_sweep_state.lock().await;
+        match state.kind_backoff.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().record_failure(interval);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RegistrySweepBackoff::new_failed(interval));
+            }
+        }
+    }
+
+    fn registry_sweep_kind_backoff_interval(&self, kind: RegistrySweepKind) -> u64 {
+        match kind {
+            RegistrySweepKind::Cron | RegistrySweepKind::Cic | RegistrySweepKind::DdlJournal => {
+                REGISTRY_SWEEP_RECOVERY_BACKOFF_SEC
+            }
+            RegistrySweepKind::HnswDelta | RegistrySweepKind::HnswS3 => {
+                self.config.hnsw_sweep_interval_sec.max(1)
+            }
+            RegistrySweepKind::StorageScan => self.config.storage_scan_interval_sec.max(1),
+        }
+    }
+
+    async fn registry_sweep_db_missing_should_delete(&self, key: &(String, u64)) -> bool {
+        let mut state = self.registry_sweep_state.lock().await;
+        !state.missing_database_seen.insert(key.clone())
+    }
+
+    async fn registry_sweep_record_db_exists(&self, key: &(String, u64)) {
+        let mut state = self.registry_sweep_state.lock().await;
+        state.missing_database_seen.remove(key);
+    }
+
+    async fn registry_sweep_record_registry_deleted(&self, key: &(String, u64)) {
+        let mut state = self.registry_sweep_state.lock().await;
+        state.entry_backoff.remove(key);
+        state.missing_database_seen.remove(key);
+        state.cic_table_cursors.remove(key);
+        state.hnsw_delta_table_cursors.remove(key);
+        state.kind_backoff.retain(|kind_key, _| {
+            kind_key.keyspace.as_str() != key.0.as_str() || kind_key.db_id != key.1
+        });
+    }
+
+    async fn cic_table_cursor(&self, keyspace: &str, db_id: u64) -> Option<Vec<u8>> {
+        let state = self.registry_sweep_state.lock().await;
+        state
+            .cic_table_cursors
+            .get(&(keyspace.to_string(), db_id))
+            .cloned()
+    }
+
+    async fn record_cic_table_cursor(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        next_cursor: Option<Vec<u8>>,
+    ) {
+        let mut state = self.registry_sweep_state.lock().await;
+        let key = (keyspace.to_string(), db_id);
+        if let Some(cursor) = next_cursor {
+            state.cic_table_cursors.insert(key, cursor);
+        } else {
+            state.cic_table_cursors.remove(&key);
+        }
+    }
+
+    async fn hnsw_delta_table_cursor(&self, keyspace: &str, db_id: u64) -> Option<Vec<u8>> {
+        let state = self.registry_sweep_state.lock().await;
+        state
+            .hnsw_delta_table_cursors
+            .get(&(keyspace.to_string(), db_id))
+            .cloned()
+    }
+
+    async fn record_hnsw_delta_table_cursor(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        next_cursor: Option<Vec<u8>>,
+    ) {
+        let mut state = self.registry_sweep_state.lock().await;
+        let key = (keyspace.to_string(), db_id);
+        if let Some(cursor) = next_cursor {
+            state.hnsw_delta_table_cursors.insert(key, cursor);
+        } else {
+            state.hnsw_delta_table_cursors.remove(&key);
+        }
+    }
+
+    async fn process_registry_sweep_entry(
+        &self,
+        entry: &TaskRegistryEntry,
+        store: &Arc<TikvStore>,
+        cron_config: &CronConfig,
+    ) -> Result<RegistrySweepEntryOutcome> {
+        let registry_key = (entry.keyspace.clone(), entry.db_id);
+        let db_exists = {
+            let mut txn = store.begin().await?;
+            let exists = store
+                .get_database_by_id(&mut txn, entry.db_id)
+                .await?
+                .is_some();
+            txn.rollback().await.ok();
+            exists
+        };
+        if !db_exists {
+            if !self
+                .registry_sweep_db_missing_should_delete(&registry_key)
+                .await
+            {
+                warn!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    "Worker registry sweep saw database missing; retaining registry row until next cycle"
+                );
+                return Ok(RegistrySweepEntryOutcome::default());
+            }
+            let reaped = self
+                .system_store
+                .reap_db_queue_entries_then_delete_worker_registry(&entry.keyspace, entry.db_id)
+                .await?;
+            if reaped > 0 {
+                info!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    reaped,
+                    "Worker registry sweep reaped queue entries for missing database"
+                );
+            }
+            self.registry_sweep_record_registry_deleted(&registry_key)
+                .await;
+            return Ok(RegistrySweepEntryOutcome::default());
+        }
+        self.registry_sweep_record_db_exists(&registry_key).await;
+
+        let mut outcome = RegistrySweepEntryOutcome::default();
+
+        // Registry task bits are inventory hints, not recovery truth. Producers
+        // can race on the bitmask row, so recovery probes run for every live
+        // registry entry and rely on each subsystem's durable tenant state.
+        let kind = RegistrySweepKind::Cron;
+        if !self
+            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+            .await
+        {
+            let result = async {
+                self.reconcile_cron_for_db(store, &entry.keyspace, entry.db_id)
+                    .await?;
+                gc_database(store, entry.db_id, cron_config).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            self.record_registry_sweep_kind_result(entry, kind, result)
+                .await;
+        }
+
+        let kind = RegistrySweepKind::Cic;
+        if !self
+            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+            .await
+        {
+            let table_cursor = self.cic_table_cursor(&entry.keyspace, entry.db_id).await;
+            match self
+                .reconcile_incomplete_cic_indexes_for_db_safe(
+                    store,
+                    &entry.keyspace,
+                    entry.db_id,
+                    table_cursor.as_deref(),
+                    CIC_REPAIR_TABLE_PAGE_SIZE,
+                )
+                .await
+            {
+                Ok(next_cursor) => {
+                    self.record_cic_table_cursor(&entry.keyspace, entry.db_id, next_cursor)
+                        .await;
+                    self.registry_sweep_record_kind_success(&entry.keyspace, entry.db_id, kind)
+                        .await;
+                }
+                Err(e) => {
+                    self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
+                        .await;
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        kind = kind.label(),
+                        "Worker registry sweep task failed: {}",
+                        e
                     );
                 }
             }
         }
 
-        info!(
-            "Cron reconciliation complete: enqueued={} cleaned={}",
-            total_enqueued, total_cleaned
-        );
-        Ok(())
+        let kind = RegistrySweepKind::DdlJournal;
+        if !self
+            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+            .await
+        {
+            let result = self
+                .reconcile_ddl_journal_for_db(store, &entry.keyspace, entry.db_id)
+                .await;
+            self.record_registry_sweep_kind_result(entry, kind, result)
+                .await;
+        }
+
+        let kind = RegistrySweepKind::HnswDelta;
+        if !self
+            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+            .await
+        {
+            let table_cursor = self
+                .hnsw_delta_table_cursor(&entry.keyspace, entry.db_id)
+                .await;
+            match enqueue_pending_hnsw_merges(
+                &self.system_store,
+                store,
+                &entry.keyspace,
+                entry.db_id,
+                table_cursor.as_deref(),
+                HNSW_DELTA_TABLE_PAGE_SIZE,
+            )
+            .await
+            {
+                Ok(hnsw) => {
+                    outcome.hnsw_observed = hnsw.observed;
+                    outcome.hnsw_enqueued = hnsw.enqueued;
+                    outcome.hnsw_enqueue_errors = hnsw.enqueue_errors;
+                    self.record_hnsw_delta_table_cursor(
+                        &entry.keyspace,
+                        entry.db_id,
+                        hnsw.next_table_cursor,
+                    )
+                    .await;
+                    self.registry_sweep_record_kind_success(&entry.keyspace, entry.db_id, kind)
+                        .await;
+                }
+                Err(e) => {
+                    self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
+                        .await;
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        kind = kind.label(),
+                        "Worker registry sweep task failed: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
+            let kind = RegistrySweepKind::HnswS3;
+            if !self
+                .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+                .await
+            {
+                let gc = crate::worker::gc::WorkerGc::new(
+                    self.system_store.clone(),
+                    self.pool.clone(),
+                    self.config.clone(),
+                );
+                let result = gc.sweep_hnsw_s3_orphans_for_entry(entry, store).await;
+                self.record_registry_sweep_kind_result(entry, kind, result)
+                    .await;
+            }
+        }
+
+        let kind = RegistrySweepKind::StorageScan;
+        if !self
+            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+            .await
+        {
+            let result = async {
+                if self.storage_scan_due(store, entry.db_id).await? {
+                    enqueue_storage_scan(&self.system_store, &entry.keyspace, entry.db_id).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            self.record_registry_sweep_kind_result(entry, kind, result)
+                .await;
+        }
+
+        Ok(outcome)
+    }
+
+    async fn record_registry_sweep_kind_result(
+        &self,
+        entry: &TaskRegistryEntry,
+        kind: RegistrySweepKind,
+        result: Result<()>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.registry_sweep_record_kind_success(&entry.keyspace, entry.db_id, kind)
+                    .await;
+            }
+            Err(e) => {
+                self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
+                    .await;
+                warn!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    kind = kind.label(),
+                    "Worker registry sweep task failed: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    async fn reconcile_incomplete_cic_indexes_for_db_safe(
+        &self,
+        store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+        table_start_after: Option<&[u8]>,
+        table_page_size: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut txn = store.begin().await?;
+        let result: Result<(u32, Option<Vec<u8>>)> = async {
+            let mut repaired = 0u32;
+            let (table_names, next_cursor) = store
+                .scan_tables_page(&mut txn, db_id, table_start_after, table_page_size)
+                .await?;
+            for table_name in table_names {
+                let Some(mut schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
+                    continue;
+                };
+                let mut schema_repaired = 0u32;
+                for idx in &mut schema.indexes {
+                    if !matches!(idx.state, IndexState::Building | IndexState::WriteOnly) {
+                        continue;
+                    }
+                    let Ok(task_id) = i64::try_from(idx.id) else {
+                        warn!(
+                            table = %table_name,
+                            index = %idx.name,
+                            index_id = idx.id,
+                            "Skipping CIC repair pending check because index_id does not fit i64"
+                        );
+                        continue;
+                    };
+                    let pending = {
+                        let mut sys_txn = self.system_store.begin().await?;
+                        let pending = self
+                            .system_store
+                            .task_has_pending(
+                                &mut sys_txn,
+                                keyspace,
+                                db_id,
+                                task_id,
+                                TaskType::BgDdl,
+                            )
+                            .await?;
+                        sys_txn.rollback().await.ok();
+                        pending
+                    };
+                    if pending {
+                        continue;
+                    }
+                    idx.state = IndexState::Invalid;
+                    schema_repaired += 1;
+                }
+                if schema_repaired > 0 {
+                    repaired += schema_repaired;
+                    store.update_schema(&mut txn, db_id, schema).await?;
+                }
+            }
+            Ok((repaired, next_cursor))
+        }
+        .await;
+
+        match result {
+            Ok((repaired, next_cursor)) => {
+                if repaired > 0 {
+                    store
+                        .assert_database_alive_for_update(&mut txn, db_id)
+                        .await?;
+                    txn.commit().await?;
+                } else {
+                    txn.rollback().await.ok();
+                }
+                if repaired > 0 {
+                    warn!(
+                        "Recovered {} incomplete CIC indexes as Invalid in keyspace={} db_id={}",
+                        repaired, keyspace, db_id
+                    );
+                }
+                Ok(next_cursor)
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
+    async fn storage_scan_due(&self, store: &Arc<TikvStore>, db_id: u64) -> Result<bool> {
+        use crate::storage_stats::deserialize_storage_stats;
+
+        let mut txn = store.begin().await?;
+        // Cross-store liveness fence (same class as reconcile_cron_for_db): the
+        // due-decision reads tenant stats but enqueue_storage_scan writes into
+        // the global system_store queue. Take get_for_update on the tenant DB
+        // row so a DROP DATABASE that already removed the metadata makes us
+        // report "not due", suppressing the enqueue. Any orphan from the
+        // irreducible cross-store window is self-healing via the worker tick.
+        let alive = store.database_alive_for_update(&mut txn, db_id).await?;
+        if !alive {
+            txn.rollback().await.ok();
+            return Ok(false);
+        }
+        let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
+        let data = txn.get(stats_key).await?;
+        txn.rollback().await.ok();
+
+        let Some(data) = data else {
+            return Ok(true);
+        };
+        let Some(stats) = deserialize_storage_stats(&data) else {
+            return Ok(true);
+        };
+        let interval_ms = i64::try_from(self.config.storage_scan_interval_sec)
+            .unwrap_or(i64::MAX / 1000)
+            .saturating_mul(1000);
+        Ok(now_epoch_ms().saturating_sub(stats.scanned_at_ms) >= interval_ms)
     }
 
     /// Reconcile cron jobs for a single (keyspace, db_id).
     /// Returns (enqueued_count, cleaned_count).
-    async fn reconcile_cron_for_db(&self, keyspace: &str, db_id: u64) -> Result<(u32, u32)> {
-        // 1. Existing cron entries. Startup reconciliation must stay bounded:
-        //    it runs before the worker tick loop, so scanning legacy
-        //    `_worker_queue_` here can block all cron execution when a migrated
-        //    fleet still has a large V1 backlog. Legacy entries are drained by
-        //    tick() opportunistically; duplicate V1/V2 entries for the same
-        //    scheduled minute are suppressed by the tenant cron run claim.
+    async fn reconcile_cron_for_db(
+        &self,
+        store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<(u32, u32)> {
+        // 1. Existing cron entries (V2 identity index only). Reconciliation is
+        //    bounded: it reads the per-(db, type) V2 index, never the global
+        //    due queue. Legacy `_worker_queue_` rows do not need draining here
+        //    because the one-shot V1->V2 migration runs in
+        //    `init_gc_registry_store` at startup, before the worker tick loop
+        //    or this sweep ever run. After migration the queue is V2-only.
         let mut txn = self.system_store.begin().await?;
         let existing_rows = self
             .system_store
@@ -338,19 +1233,36 @@ impl WorkerEngine {
 
         let existing_job_ids: HashSet<i64> = existing_rows.iter().map(|r| r.task_id).collect();
 
-        // 2. Acquire tenant store and check cron state
-        let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
-        let store = handle.store().clone();
-
+        // 2. Check tenant cron state using the sweep-owned tenant handle.
+        //
+        // Cross-store liveness fence: the cron jobs read here live in the TENANT
+        // keyspace, but the next-fire rows are enqueued into the global
+        // `_sys_worker` queue (system_store) in step 4 — two stores, so a
+        // single-txn fence (as load_next/finalize use) is impossible. We take
+        // get_for_update on the tenant DB metadata row in the same tenant
+        // snapshot that decides the missing jobs, so a DROP DATABASE that has
+        // already removed the metadata row makes us bail before enqueuing. The
+        // irreducible residual is a DROP that commits its metadata-delete
+        // between this tenant commit and the system enqueue commit; that orphan
+        // is self-healing — the worker tick that later claims it sees the DB
+        // gone in execute_task's preamble (get_database_by_id → None), skips,
+        // and cleanup deletes the queue row. DROP's own queue reap covers the
+        // common case.
         let mut tenant_txn = store.begin().await?;
+        if !store
+            .database_alive_for_update(&mut tenant_txn, db_id)
+            .await?
+        {
+            tenant_txn.rollback().await.ok();
+            return Ok((0, 0));
+        }
         let cron_enabled = store.is_cron_enabled(&mut tenant_txn, db_id).await?;
 
         if !cron_enabled {
             tenant_txn.commit().await?;
             // Cron disabled but registry has cron bit — clean up bounded V2
-            // entries. Legacy V1 entries, if any, are intentionally left to the
-            // tick path/catalog checks so startup cannot be blocked by a global
-            // legacy scan.
+            // entries via the per-(db, type) index. No legacy V1 rows remain:
+            // the startup V1->V2 migration already converted them.
             let total = existing_rows.len();
             if total > 0 {
                 let mut sys_txn = self.system_store.begin().await?;
@@ -425,8 +1337,9 @@ impl WorkerEngine {
         }
 
         // 5. Cleanup bounded V2 orphans: queue entries whose job_id is not in
-        //    active jobs. Legacy V1 orphan cleanup would require a global
-        //    `_worker_queue_` scan and is left to execution-time catalog checks.
+        //    active jobs. The queue is V2-only after the startup migration, so
+        //    the V2 identity index is the complete orphan set — no global
+        //    `_worker_queue_` scan is needed.
         let orphan_rows: Vec<&WqIndexRow> = existing_rows
             .iter()
             .filter(|r| !active_job_ids.contains(&r.task_id))
@@ -454,77 +1367,6 @@ impl WorkerEngine {
         Ok((enqueued, cleaned))
     }
 
-    /// Recover CIC indexes left in transitional states after process restart.
-    ///
-    /// Transitional states (`Building`/`WriteOnly`) are not durable across worker restarts:
-    /// they indicate an interrupted asynchronous build pipeline. We conservatively mark such
-    /// indexes `Invalid` so they are never used/read as complete.
-    async fn reconcile_incomplete_cic_indexes(&self) -> Result<()> {
-        let mut txn = self.system_store.begin().await?;
-        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
-        txn.commit().await?;
-
-        for entry in registry_entries {
-            if !entry.has_bg_ddl() {
-                continue;
-            }
-            if let Err(e) = self
-                .reconcile_incomplete_cic_indexes_for_db(&entry.keyspace, entry.db_id)
-                .await
-            {
-                warn!(
-                    "CIC recovery error for keyspace={} db_id={}: {}",
-                    entry.keyspace, entry.db_id, e
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn reconcile_incomplete_cic_indexes_for_db(
-        &self,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<()> {
-        let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
-        let store = handle.store().clone();
-        let mut txn = store.begin().await?;
-
-        let result: Result<u32> = async {
-            let mut repaired = 0u32;
-            let table_names = store.list_tables(&mut txn, db_id).await?;
-            for table_name in table_names {
-                let Some(mut schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
-                    continue;
-                };
-                let repaired_in_schema = repair_incomplete_cic_states(&mut schema);
-                if repaired_in_schema > 0 {
-                    repaired += repaired_in_schema;
-                    store.update_schema(&mut txn, db_id, schema).await?;
-                }
-            }
-            Ok(repaired)
-        }
-        .await;
-
-        match result {
-            Ok(repaired) => {
-                txn.commit().await?;
-                if repaired > 0 {
-                    warn!(
-                        "Recovered {} incomplete CIC indexes as Invalid in keyspace={} db_id={}",
-                        repaired, keyspace, db_id
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => {
-                txn.rollback().await.ok();
-                Err(e)
-            }
-        }
-    }
-
     /// Recover from incomplete DDL operations by scanning the DDL journal.
     ///
     /// For each journal entry left behind by a crash:
@@ -534,33 +1376,13 @@ impl WorkerEngine {
     /// DDL journal writes register `TASK_TYPE_DDL_JOURNAL` in the worker
     /// registry, so the standard registry enumeration discovers all databases
     /// that may have journal entries.
-    async fn reconcile_ddl_journal(&self) -> Result<()> {
-        let mut sys_txn = self.system_store.begin().await?;
-        let registry_entries = self.system_store.list_worker_registry(&mut sys_txn).await?;
-        sys_txn.commit().await?;
-
-        for entry in registry_entries {
-            if !entry.has_ddl_journal() {
-                continue;
-            }
-            if let Err(e) = self
-                .reconcile_ddl_journal_for_db(&entry.keyspace, entry.db_id)
-                .await
-            {
-                warn!(
-                    "DDL journal recovery error for keyspace={} db_id={}: {}",
-                    entry.keyspace, entry.db_id, e
-                );
-            }
-        }
-        Ok(())
-    }
-
-    async fn reconcile_ddl_journal_for_db(&self, keyspace: &str, db_id: u64) -> Result<()> {
+    async fn reconcile_ddl_journal_for_db(
+        &self,
+        store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
         use crate::storage::DdlOperation;
-
-        let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
-        let store = handle.store().clone();
 
         // Scan journal entries in a read transaction.
         let mut scan_txn = store.begin().await?;
@@ -601,6 +1423,9 @@ impl WorkerEngine {
                             .await?;
                         match next {
                             Some(next_cursor) => {
+                                store
+                                    .assert_database_alive_for_update(&mut txn, db_id)
+                                    .await?;
                                 txn.commit().await?;
                                 txn = store.begin().await?;
                                 cursor = next_cursor;
@@ -617,6 +1442,9 @@ impl WorkerEngine {
                         .release_relation_name(&mut txn, db_id, index_name)
                         .await?;
                     store.delete_ddl_journal(&mut txn, db_id, jentry.id).await?;
+                    store
+                        .assert_database_alive_for_update(&mut txn, db_id)
+                        .await?;
                     txn.commit().await?;
                     info!(
                         "DDL journal: cleaned up orphaned index data (table_id={}, index_id={}, name={}) in db_id={}",
@@ -639,6 +1467,9 @@ impl WorkerEngine {
                             .await?;
                         match next {
                             Some(next_cursor) => {
+                                store
+                                    .assert_database_alive_for_update(&mut txn, db_id)
+                                    .await?;
                                 txn.commit().await?;
                                 txn = store.begin().await?;
                                 cursor = next_cursor;
@@ -669,13 +1500,16 @@ impl WorkerEngine {
                     if let Err(e) = store.drop_table(&mut txn, db_id, table_name).await {
                         warn!(
                             "DDL journal: failed to drop CTAS table metadata '{}' in db_id={}: {}. \
-                             Journal entry preserved for retry on next startup.",
+                             Journal entry preserved for retry on the next sweep cycle.",
                             table_name, db_id, e
                         );
                         txn.rollback().await.ok();
                         continue;
                     }
                     store.delete_ddl_journal(&mut txn, db_id, jentry.id).await?;
+                    store
+                        .assert_database_alive_for_update(&mut txn, db_id)
+                        .await?;
                     txn.commit().await?;
                     info!(
                         "DDL journal: cleaned up orphaned CTAS table '{}' in db_id={}",
@@ -693,9 +1527,9 @@ impl WorkerEngine {
         // entry between our last journal delete and our registry update,
         // leaving the new entry undiscoverable after a crash.
         //
-        // The stale bit causes only a cheap empty journal scan per startup.
+        // The stale bit causes only a cheap empty journal scan per sweep cycle.
         // If any entries failed cleanup (!all_cleaned), the bit must stay
-        // set regardless so the next startup retries those entries.
+        // set regardless so a later sweep cycle retries those entries.
 
         info!(
             "DDL journal: recovered {} incomplete operations in keyspace={} db_id={}",
@@ -727,32 +1561,25 @@ impl WorkerEngine {
         .await
     }
 
-    /// Delete a due entry using the correct layout: V2 removes the descriptor,
-    /// index, and (split-type) payload together; legacy removes just the
-    /// `_worker_queue_` key.
+    /// Delete a V2 due entry plus its identity index and split payload row.
     async fn delete_due_entry(
         system_store: &Arc<TikvStore>,
         txn: &mut tikv_client::Transaction,
-        is_v2: bool,
         due_key: &[u8],
         entry: &TaskQueueEntry,
         fire_time_ms: i64,
     ) -> Result<()> {
-        if is_v2 {
-            system_store
-                .delete_task_v2(
-                    txn,
-                    due_key,
-                    &entry.keyspace,
-                    entry.db_id,
-                    entry.task_type.to_bitmask(),
-                    entry.task_id,
-                    fire_time_ms,
-                )
-                .await
-        } else {
-            system_store.delete_worker_queue_entry(txn, due_key).await
-        }
+        system_store
+            .delete_task_v2(
+                txn,
+                due_key,
+                &entry.keyspace,
+                entry.db_id,
+                entry.task_type.to_bitmask(),
+                entry.task_id,
+                fire_time_ms,
+            )
+            .await
     }
 
     /// Release a just-won worker claim (used when we decline to execute after
@@ -773,14 +1600,199 @@ impl WorkerEngine {
         Ok(())
     }
 
+    /// Pure classifier mapping a renewal-txn result onto a `LeaseRenewOutcome`.
+    ///
+    /// This holds the three pieces of wiring the original bug got wrong, in ONE
+    /// testable place (post-mortem class F: the bug was the wiring, not the math):
+    ///
+    /// 1. `Ok(true)` advances the committed deadline to the PROSPECTIVE value that
+    ///    just committed (`new_lease_until_ms`) — and ONLY this arm advances.
+    /// 2. `Ok(false)` is `ClaimLost` (claim gone / foreign owner) → loop cancels.
+    /// 3. `Err` compares `now` against the COMMITTED deadline
+    ///    (`last_committed_lease_until_ms`), NOT the prospective one. This is the
+    ///    exact regression surface: passing `new_lease_until_ms` here (always in
+    ///    the future) would make `cancel` always false and re-open
+    ///    double-execution. Unit tests drive `Err` directly to guard this.
+    fn classify_renew_result(
+        renewed: Result<bool>,
+        new_lease_until_ms: i64,
+        now_ms: i64,
+        last_committed_lease_until_ms: i64,
+    ) -> LeaseRenewOutcome {
+        match renewed {
+            // Commit landed — the stored lease now extends to `new_lease_until_ms`.
+            // ONLY this arm advances the loop's committed deadline.
+            Ok(true) => LeaseRenewOutcome::Renewed {
+                committed_lease_until_ms: new_lease_until_ms,
+            },
+            // Claim is gone or owned by another worker — our lease is lost.
+            Ok(false) => LeaseRenewOutcome::ClaimLost,
+            // Transient error. Decide against the COMMITTED deadline, never the
+            // prospective `new_lease_until_ms`: once the stored lease has lapsed
+            // another worker can win the expired-lease CAS and double-execute.
+            Err(_) => LeaseRenewOutcome::Errored {
+                cancel: now_ms >= last_committed_lease_until_ms,
+            },
+        }
+    }
+
+    /// Perform ONE lease-renewal attempt and classify the outcome.
+    ///
+    /// `last_committed_lease_until_ms` is the deadline the loop has actually
+    /// committed so far (seeded from the claim's initial lease). The txn I/O and
+    /// the outcome classification are split: this method does the I/O, then
+    /// delegates the decision to the pure `classify_renew_result`, so the
+    /// "committed, not prospective" comparison is unit-testable without TiKV
+    /// while still being the exact decision a TiKV-backed loop test drives.
+    ///
+    /// Returns `Renewed` carrying the NEW committed deadline only when the renew
+    /// txn committed (`Ok(true)`); the caller advances its state from that value.
+    #[allow(clippy::too_many_arguments)]
+    async fn renew_lease_once(
+        system_store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        worker_id: &str,
+        task_type: TaskType,
+        lease_ms: i64,
+        last_committed_lease_until_ms: i64,
+    ) -> LeaseRenewOutcome {
+        let new_lease_until = crate::worker::now_epoch_ms().saturating_add(lease_ms);
+        let renewed = async {
+            let mut txn = system_store.begin().await?;
+            let ok = system_store
+                .renew_worker_claim(
+                    &mut txn,
+                    keyspace,
+                    db_id,
+                    task_id,
+                    fire_time_ms,
+                    worker_id,
+                    task_type,
+                    new_lease_until,
+                )
+                .await?;
+            if ok {
+                txn.commit().await?;
+            } else {
+                txn.rollback().await.ok();
+            }
+            Ok::<bool, anyhow::Error>(ok)
+        }
+        .await;
+
+        // Log the abnormal outcomes here (where keyspace/task context is in
+        // scope), then delegate the decision to the pure classifier.
+        match &renewed {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "Worker claim lost (renewal found no/foreign claim); cancelling task: \
+                 keyspace={} db_id={} task_id={} type={:?}",
+                keyspace, db_id, task_id, task_type
+            ),
+            Err(e) => warn!(
+                "Worker claim renewal error (will retry within lease): \
+                 keyspace={} db_id={} task_id={} type={:?}: {e}",
+                keyspace, db_id, task_id, task_type
+            ),
+        }
+
+        Self::classify_renew_result(
+            renewed,
+            new_lease_until,
+            crate::worker::now_epoch_ms(),
+            last_committed_lease_until_ms,
+        )
+    }
+
+    /// Spawn the lease-renewal loop for a claimed task. While the task runs, the
+    /// loop renews the claim's lease at ~lease/3. If a renewal is LOST (claim
+    /// deleted or stolen) or repeatedly errors past the lease, it cancels
+    /// `exec_shutdown` so the executor aborts before its next tenant commit.
+    /// The returned guard aborts the loop when dropped (execution finished).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_claim_lease_renewer(
+        system_store: Arc<TikvStore>,
+        config: WorkerConfig,
+        keyspace: String,
+        db_id: u64,
+        task_id: i64,
+        fire_time_ms: i64,
+        task_type: TaskType,
+        // The lease deadline committed at claim time (claimed_at + claim_lease_ms).
+        // Seeds the "last successfully committed lease" the error path compares
+        // against, so a renewal-error storm cancels once the STORED lease lapses.
+        initial_lease_until_ms: i64,
+        exec_shutdown: CancellationToken,
+    ) -> LeaseRenewerGuard {
+        let lease_ms = (config.claim_lease_ms as i64).max(1);
+        // Renew at ~lease/3, floored so we never busy-spin.
+        let renew_interval_ms = (lease_ms / 3).max(1_000) as u64;
+        let worker_id = config.worker_id.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(renew_interval_ms));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; skip it so the first renewal lands
+            // ~renew_interval after the claim was taken.
+            ticker.tick().await;
+            // The last lease deadline we actually COMMITTED. Seeded from the
+            // claim's initial lease, advanced ONLY by a Renewed outcome (an
+            // Ok(true) commit); the error path compares against THIS, never the
+            // prospective `new_lease_until` (which is always in the future).
+            let mut last_committed_lease_until = initial_lease_until_ms;
+            loop {
+                tokio::select! {
+                    _ = exec_shutdown.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+
+                match Self::renew_lease_once(
+                    &system_store,
+                    &keyspace,
+                    db_id,
+                    task_id,
+                    fire_time_ms,
+                    &worker_id,
+                    task_type,
+                    lease_ms,
+                    last_committed_lease_until,
+                )
+                .await
+                {
+                    LeaseRenewOutcome::Renewed {
+                        committed_lease_until_ms,
+                    } => {
+                        // Advance ONLY on a committed renewal.
+                        last_committed_lease_until = committed_lease_until_ms;
+                    }
+                    LeaseRenewOutcome::ClaimLost => {
+                        // Lease lost — abort before the run commits more tenant work.
+                        exec_shutdown.cancel();
+                        return;
+                    }
+                    LeaseRenewOutcome::Errored { cancel } => {
+                        // `cancel` was decided against the COMMITTED deadline.
+                        if cancel {
+                            exec_shutdown.cancel();
+                            return;
+                        }
+                        // Otherwise retry next tick within the remaining window.
+                    }
+                }
+            }
+        });
+
+        LeaseRenewerGuard { handle }
+    }
+
     /// Core implementation of claim_and_execute, parameterized over the finalize
     /// function so tests can inject failures in the real code path.
     ///
-    /// Handles both V2 descriptors and (during the migration window) legacy
-    /// `_worker_queue_` entries. A legacy entry is executed IN PLACE and deleted
-    /// from V1 — never moved to V2 — so an entry exists in a single namespace and
-    /// the shared worker claim makes it execute-once even across an old+new
-    /// binary deploy. A post-claim existence re-check closes the
+    /// Handles V2 descriptors after startup migration has converted legacy
+    /// `_worker_queue_` rows. A post-claim existence re-check closes the
     /// read-before/claim-after-release window: if the entry was deleted by
     /// another replica (or unschedule / DROP DATABASE reap) since the tick
     /// scanned it, we release the claim and skip rather than re-execute.
@@ -795,23 +1807,27 @@ impl WorkerEngine {
         finalize_fn: F,
     ) -> Result<()>
     where
-        F: FnOnce(Arc<TikvStore>, u64, CronRun, CronRunStatus, Option<String>, i64, i64) -> Fut,
+        F: FnOnce(
+            Arc<TikvStore>,
+            u64,
+            CronRun,
+            CronRunStatus,
+            Option<String>,
+            i64,
+            i64,
+            i64,
+        ) -> Fut,
         Fut: Future<Output = Result<()>> + Send,
     {
-        // The due key carries the prefix (V2 `_wq_due_v2_` vs legacy
-        // `_worker_queue_`); decode fire_time and clean up accordingly.
-        let is_v2 = crate::storage::is_wq_due_v2_key(&queue_key);
-        let queue_fire_time_ms = if is_v2 {
-            crate::storage::decode_wq_due_v2_fire_time(&queue_key)
-        } else {
-            crate::storage::decode_worker_queue_fire_time(&queue_key)
-        }
-        .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
+        let queue_fire_time_ms = crate::storage::decode_wq_due_v2_fire_time(&queue_key)
+            .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
         let scheduled_minute = queue_fire_time_ms.div_euclid(60_000);
         let task_type = due.task_type();
         let (claim_keyspace, claim_db_id, claim_task_id) =
             (due.keyspace().to_string(), due.db_id(), due.task_id());
-        let claim = WorkerClaim::new(config.worker_id.clone(), task_type);
+        let legacy_orphan_timeout_ms = (config.orphan_timeout_sec as i64).saturating_mul(1000);
+        let claim_lease_ms = config.claim_lease_ms as i64;
+        let claim = WorkerClaim::with_lease(config.worker_id.clone(), task_type, claim_lease_ms);
 
         let mut txn = system_store.begin().await?;
         let claimed = system_store
@@ -822,6 +1838,7 @@ impl WorkerEngine {
                 claim_task_id,
                 queue_fire_time_ms,
                 &claim,
+                legacy_orphan_timeout_ms,
             )
             .await?;
 
@@ -859,10 +1876,9 @@ impl WorkerEngine {
         }
 
         // Hydrate the full entry now that we own the claim and confirmed it
-        // exists. Legacy entries carry the command inline; split V2 types fetch
-        // the command/username/schedule out-of-line by exact identity.
+        // exists. Split V2 types fetch the command/username/schedule out-of-line
+        // by exact identity.
         let entry: TaskQueueEntry = match due {
-            DueItem::Legacy(e) => e,
             DueItem::V2(descriptor) => {
                 let payload = if descriptor.needs_payload() {
                     let mut ptxn = system_store.begin().await?;
@@ -933,6 +1949,27 @@ impl WorkerEngine {
         };
         let should_requeue_cron = cron_run.is_some();
 
+        // Lease keeper: while this task executes, periodically renew our claim
+        // (at ~lease/3) so GC's expired-lease reaper never reaps a still-running
+        // task and lets a second worker double-execute it. A lost renewal
+        // (claim deleted or stolen) cancels `exec_shutdown`, aborting the run
+        // before its next tenant commit — at-most-once while the lease is live
+        // (design §K4). `exec_shutdown` is a child of the engine shutdown token,
+        // so an engine shutdown still propagates.
+        let exec_shutdown = shutdown_signal.child_token();
+        let _lease_guard = Self::spawn_claim_lease_renewer(
+            system_store.clone(),
+            config.clone(),
+            claim_keyspace.clone(),
+            claim_db_id,
+            claim_task_id,
+            queue_fire_time_ms,
+            task_type,
+            // Seed with the lease deadline committed by the winning claim above.
+            claim.lease_until_ms,
+            exec_shutdown.clone(),
+        );
+
         let exec_result = if entry.task_type == TaskType::Cron && cron_run.is_none() {
             Ok(0usize)
         } else if let Some((_, cron_db_id, ref run, _started_at, max_runtime_ms)) = cron_run {
@@ -958,7 +1995,7 @@ impl WorkerEngine {
                 config,
                 &entry,
                 Some(cancel_signal),
-                Some(shutdown_signal.clone()),
+                Some(exec_shutdown.clone()),
                 deadline,
             )
             .await;
@@ -966,11 +2003,69 @@ impl WorkerEngine {
             get_process_list().deregister(run.run_id);
             result
         } else {
-            Self::execute_task(pool, config, &entry, None, Some(shutdown_signal), None).await
+            Self::execute_task(
+                pool,
+                config,
+                &entry,
+                None,
+                Some(exec_shutdown.clone()),
+                None,
+            )
+            .await
         };
 
+        // Execution finished — stop renewing the lease. The cleanup below holds
+        // the claim until it deletes it explicitly, and runs on the same node,
+        // so it does not depend on the lease.
+        drop(_lease_guard);
+
+        // Commit-adjacent ownership fence (claim-lease lifecycle, design §K4).
+        // finalize_cron_run commits TERMINAL tenant cron state (terminal CronRun
+        // + cleared running guard + released per-minute claim). Once the renewer
+        // is stopped, our lease may already have been stolen — a takeover only
+        // happens on an EXPIRED lease, by which point the renewer has cancelled
+        // exec_shutdown and aborted us. A worker that no longer owns the claim
+        // must NOT commit terminal cron state or run any cleanup/requeue: the
+        // takeover worker is the sole authority for this run's outcome. DB
+        // liveness alone (finalize's existing fence) does not detect takeover —
+        // the DB is still alive, only ownership changed. So re-verify ownership
+        // against the SAME system_store claim (the identity check
+        // delete_worker_claim_if_owned does, hoisted ahead of finalize) and, if
+        // lost, skip finalize AND the whole cleanup/requeue/bg-result block,
+        // leaving the row for the new owner. This is a same-store fence and is
+        // feasible (unlike the documented cross-store cron next-fire residual).
+        let still_owned = {
+            let mut own_txn = system_store.begin().await?;
+            let owned = system_store
+                .is_worker_claim_owned_by(
+                    &mut own_txn,
+                    &entry.keyspace,
+                    entry.db_id,
+                    entry.task_id,
+                    queue_fire_time_ms,
+                    entry.task_type,
+                    &config.worker_id,
+                )
+                .await?;
+            own_txn.rollback().await.ok();
+            owned
+        };
+
+        if !still_owned {
+            warn!(
+                "Worker no longer owns claim before finalize (lease lost / taken over); \
+                 skipping finalize + cleanup and leaving queue row for the new owner: \
+                 keyspace={} db_id={} task_id={} type={:?}",
+                entry.keyspace, entry.db_id, entry.task_id, entry.task_type
+            );
+            // The takeover worker owns the run's terminal state and cleanup; the
+            // running guard stays Running so the new owner is not blocked.
+            return Ok(());
+        }
+
         // Capture finalize result instead of propagating with `?` — cleanup
-        // must run unconditionally even when finalize fails (#1259).
+        // must run unconditionally even when finalize fails (#1259). Finalize is
+        // now gated on the ownership fence above, so a non-owner never reaches it.
         let finalize_result =
             if let Some((store, db_id, run, started_at, _max_runtime_ms)) = cron_run {
                 let (status, message) = match &exec_result {
@@ -989,6 +2084,7 @@ impl WorkerEngine {
                     message,
                     started_at,
                     now_epoch_ms(),
+                    scheduled_minute,
                 )
                 .await
             } else {
@@ -999,50 +2095,61 @@ impl WorkerEngine {
             warn!("finalize_cron_run failed: {e}; proceeding with cleanup");
         }
 
-        // Cleanup: delete worker claim, manage queue entry, requeue next cron
-        // fire. This block ALWAYS runs regardless of finalize_result.
+        // Cleanup: delete OUR worker claim, manage queue entry, requeue next
+        // cron fire. This block ALWAYS runs regardless of finalize_result.
+        //
+        // Ownership-checked claim delete: the fence above already established we
+        // still own the claim, but re-check atomically here under the SAME txn
+        // that performs the delete (and the queue-row / requeue / bg-result
+        // writes), so a takeover landing between the fence and this commit still
+        // cannot make us delete the new owner's claim or its work.
+        // `still_owned == false` means "we lost the lease in that window"; we
+        // then leave the entire row untouched.
         let mut txn = system_store.begin().await?;
-        system_store
-            .delete_worker_claim(
+        let still_owned = system_store
+            .delete_worker_claim_if_owned(
                 &mut txn,
                 &entry.keyspace,
                 entry.db_id,
                 entry.task_id,
                 queue_fire_time_ms,
                 entry.task_type,
+                &config.worker_id,
             )
             .await?;
+
+        if !still_owned {
+            txn.rollback().await.ok();
+            warn!(
+                "Worker no longer owns claim at cleanup (lease lost / taken over); \
+                 leaving queue row for the new owner: keyspace={} db_id={} task_id={} type={:?}",
+                entry.keyspace, entry.db_id, entry.task_id, entry.task_type
+            );
+            // Do not propagate a finalize error here: the takeover worker is the
+            // authority for this run's outcome.
+            return Ok(());
+        }
+
         if !keep_queue_entry {
-            if entry.task_type == TaskType::HnswMerge {
-                // HnswMerge uses deterministic fire_time=0 → concurrent DML can
-                // overwrite the same descriptor with a new nonce. Read-compare-delete
-                // ensures we only remove the entry we actually processed.
+            if entry.task_type.uses_deterministic_queue_key() {
+                // Deterministic-key tasks can be overwritten by a later enqueue
+                // while a worker still holds the old claim. Read-compare-delete
+                // ensures cleanup only removes the descriptor it processed.
                 //
-                // Only delete the queue entry on SUCCESS. On failure (e.g., S3 not
-                // configured on this node), keep the entry so a capable worker can
-                // pick it up on the next poll cycle. This prevents a non-S3 worker
-                // from repeatedly claiming and failing merges, blocking progress
-                // until the 600s periodic sweep re-enqueues.
-                if exec_result.is_ok() {
+                // HNSW merge additionally keeps the row on failure so a worker
+                // with the right capability can retry. Other deterministic tasks
+                // delete the exact processed descriptor even after failure.
+                if exec_result.is_ok()
+                    || !entry.task_type.keeps_deterministic_queue_entry_on_failure()
+                {
                     if let Some(current_bytes) = txn.get(queue_key.clone()).await? {
-                        // V2 value is a descriptor carrying the nonce inline; a
-                        // legacy value is a full entry. Compare from whichever.
-                        let current_nonce = if is_v2 {
-                            TaskDescriptorV2::decode(&current_bytes)
-                                .map(|d| d.nonce)
-                                .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?
-                        } else {
-                            TaskQueueEntry::deserialize_compat(&current_bytes)
-                                .map(|e| e.nonce)
-                                .map_err(|e| {
-                                    anyhow!("Failed to deserialize worker queue entry: {e}")
-                                })?
-                        };
+                        let current_nonce = TaskDescriptorV2::decode(&current_bytes)
+                            .map(|d| d.nonce)
+                            .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?;
                         if current_nonce == entry.nonce {
                             Self::delete_due_entry(
                                 system_store,
                                 &mut txn,
-                                is_v2,
                                 &queue_key,
                                 &entry,
                                 queue_fire_time_ms,
@@ -1053,12 +2160,11 @@ impl WorkerEngine {
                     }
                 }
             } else {
-                // Non-HnswMerge: these tasks never share deterministic keys with DML,
-                // so unconditional delete is safe.
+                // Non-deterministic queue keys are unique per logical due row, so
+                // cleanup can delete the exact scanned key unconditionally.
                 Self::delete_due_entry(
                     system_store,
                     &mut txn,
-                    is_v2,
                     &queue_key,
                     &entry,
                     queue_fire_time_ms,
@@ -1067,7 +2173,17 @@ impl WorkerEngine {
             }
         }
 
-        if entry.task_type == TaskType::Cron && should_requeue_cron {
+        // Only requeue the next cron fire when finalization SUCCEEDED. A failed
+        // finalize means the run's terminal state / DB liveness is in doubt
+        // (e.g. DROP DATABASE removed metadata mid-run), so scheduling the next
+        // fire could write a fresh entry into the global queue for a dropped DB.
+        if entry.task_type == TaskType::Cron && should_requeue_cron && finalize_result.is_ok() {
+            // The next-fire decision must cross the SAME DB-liveness fence that
+            // finalize uses. The database metadata row lives in the TENANT
+            // keyspace (not this system_store txn), so the fence is taken inside
+            // load_next_cron_queue_entry's own tenant txn via
+            // assert_database_alive_for_update: a dropped/!alive DB makes it
+            // return None, so no next entry is written into the global queue.
             if let Some(next_entry) = Self::load_next_cron_queue_entry(pool, &entry).await? {
                 if let Some(schedule) = next_entry.schedule.as_deref() {
                     if let Ok(next_fire) = compute_next_fire_time(schedule) {
@@ -1195,7 +2311,7 @@ impl WorkerEngine {
                 .set_cron_running_guard(&mut txn, entry.db_id, entry.task_id, run_id)
                 .await?;
             Ok((
-                Some((store, entry.db_id, run, started_at, max_runtime_ms)),
+                Some((store.clone(), entry.db_id, run, started_at, max_runtime_ms)),
                 false,
             ))
         }
@@ -1203,6 +2319,9 @@ impl WorkerEngine {
 
         match claim_result {
             Ok((Some(run), keep_queue_entry)) => {
+                store
+                    .assert_database_alive_for_update(&mut txn, entry.db_id)
+                    .await?;
                 txn.commit().await?;
                 Ok((Some(run), keep_queue_entry))
             }
@@ -1226,6 +2345,19 @@ impl WorkerEngine {
         let mut txn = store.begin().await?;
 
         let result: Result<Option<TaskQueueEntry>> = async {
+            // Liveness fence: take get_for_update on the tenant DB metadata row
+            // BEFORE deciding the next fire, so a concurrent DROP DATABASE makes
+            // this read see the DB gone (None) rather than scheduling a next
+            // cron fire into the global queue for a dropped DB. This is the same
+            // fence finalize_cron_run uses; here a dropped DB simply means "no
+            // next entry" so cleanup can still delete the claim/queue row.
+            if !store
+                .database_alive_for_update(&mut txn, entry.db_id)
+                .await?
+            {
+                return Ok(None);
+            }
+
             if !store.is_cron_enabled(&mut txn, entry.db_id).await? {
                 return Ok(None);
             }
@@ -1274,6 +2406,7 @@ impl WorkerEngine {
         return_message: Option<String>,
         start_time: i64,
         end_time: i64,
+        scheduled_min: i64,
     ) -> Result<()> {
         let mut txn = store.begin().await?;
         let finalize_result = async {
@@ -1282,9 +2415,19 @@ impl WorkerEngine {
             run.start_time = Some(start_time);
             run.end_time = Some(end_time);
             store.put_cron_run(&mut txn, db_id, &run).await?;
-            // Clear the running guard now that the run is in a terminal state
+            // Clear the running guard now that the run is in a terminal state.
             store
                 .clear_cron_running_guard(&mut txn, db_id, run.job_id, run.run_id)
+                .await?;
+            // Also release the per-minute run claim. It was written by
+            // try_claim_cron_run to dedup same-minute fires and is scoped to a
+            // LIVE run; leaving it after the run is terminal makes a takeover
+            // worker (re-claiming the same scheduled_min after an expired lease)
+            // hit AlreadyClaimedForMinute and drop the due row without requeue —
+            // one scheduled fire silently lost. Cleared in the SAME tenant txn so
+            // the per-minute guard never outlives its run's terminal state.
+            store
+                .clear_cron_claim(&mut txn, db_id, run.job_id, scheduled_min)
                 .await?;
             Ok(())
         }
@@ -1292,6 +2435,9 @@ impl WorkerEngine {
 
         match finalize_result {
             Ok(()) => {
+                store
+                    .assert_database_alive_for_update(&mut txn, db_id)
+                    .await?;
                 txn.commit().await?;
                 Ok(())
             }
@@ -1333,14 +2479,22 @@ impl WorkerEngine {
         let tx_start_ms = now_epoch_ms();
         let statement_memory_accountant = handle.memory_accountant();
 
+        // The specialized long-running paths below return BEFORE `run_with_guards`
+        // (the only place that otherwise threads `shutdown_signal`), yet each one
+        // commits TENANT writes after extended work. They must observe the same
+        // lease-cancellation token so a lost/stolen claim aborts the run before its
+        // next commit — at-most-once while the lease is live. `LeaseCancel` carries
+        // that token to every per-batch / per-phase commit choke point.
+        let lease_cancel = crate::worker::LeaseCancel::new(shutdown_signal.clone());
+
         if entry.task_type == TaskType::StorageSizeScan {
-            execute_storage_size_scan(&store, entry.db_id).await?;
+            execute_storage_size_scan(&store, entry.db_id, &lease_cancel).await?;
             return Ok(1);
         }
 
         if entry.task_type == TaskType::HnswMerge && entry.command.starts_with("__hnsw_merge ") {
             let (table_id, index_id) = parse_hnsw_merge_command(&entry.command)?;
-            execute_hnsw_merge(&store, entry.db_id, table_id, index_id).await?;
+            execute_hnsw_merge(&store, entry.db_id, table_id, index_id, &lease_cancel).await?;
             return Ok(1);
         }
 
@@ -1358,7 +2512,7 @@ impl WorkerEngine {
             );
             query_context::with_scoped_query_context(
                 &qctx,
-                Self::execute_bg_ddl_backfill(&store, entry),
+                Self::execute_bg_ddl_backfill(&store, entry, &lease_cancel),
             )
             .await?;
             return Ok(1);
@@ -1464,6 +2618,9 @@ impl WorkerEngine {
                     );
                     let _ = fut.await?;
                 }
+                store
+                    .assert_database_alive_for_update(&mut txn, entry.db_id)
+                    .await?;
                 txn.commit().await?;
                 Ok(statements.len())
             };
@@ -1510,7 +2667,11 @@ impl WorkerEngine {
         unreachable!("worker retry loop must return")
     }
 
-    async fn execute_bg_ddl_backfill(store: &Arc<TikvStore>, entry: &TaskQueueEntry) -> Result<()> {
+    async fn execute_bg_ddl_backfill(
+        store: &Arc<TikvStore>,
+        entry: &TaskQueueEntry,
+        lease_cancel: &crate::worker::LeaseCancel,
+    ) -> Result<()> {
         let (table_name, index_name) = parse_backfill_index_command(&entry.command)?;
         let db_id = entry.db_id;
 
@@ -1554,97 +2715,69 @@ impl WorkerEngine {
             return Ok(());
         }
 
+        // Lease fence at the start of every phase AND inside each phase's
+        // per-batch txn rotation (`maybe_rotate_backfill_txn`, threaded via
+        // `lease_cancel`). A multi-phase CIC backfill is a long loop where the
+        // claim lease can lapse mid-run; on cancellation we abort WITHOUT
+        // committing the next batch / phase and leave the task for the new owner.
+        //
+        // A pre-phase cancellation surfaces as a plain error (not mark_invalid):
+        // the index is still in a valid intermediate state for the new owner to
+        // resume, so it must NOT be flipped to Invalid.
+        lease_cancel.bail_if_cancelled()?;
+
         // Phase 1 (Building): backfill and atomically flip to WriteOnly.
-        if let Err(e) = ddl::backfill_index_by_name(
+        match ddl::backfill_index_by_name(
             store,
             db_id,
             &table_name,
             &index_name,
             Some(IndexState::WriteOnly),
+            lease_cancel,
         )
         .await
         {
-            return Err(mark_invalid(e).await);
+            Ok(()) => {}
+            Err(e) if is_claim_cancelled_error(&e) => return Err(e),
+            Err(e) => return Err(mark_invalid(e).await),
         }
+
+        lease_cancel.bail_if_cancelled()?;
 
         // Phase 2 (WriteOnly): catch-up scan on a fresh snapshot.
-        if let Err(e) =
-            ddl::backfill_index_by_name(store, db_id, &table_name, &index_name, None).await
+        match ddl::backfill_index_by_name(
+            store,
+            db_id,
+            &table_name,
+            &index_name,
+            None,
+            lease_cancel,
+        )
+        .await
         {
-            return Err(mark_invalid(e).await);
+            Ok(()) => {}
+            Err(e) if is_claim_cancelled_error(&e) => return Err(e),
+            Err(e) => return Err(mark_invalid(e).await),
         }
 
+        lease_cancel.bail_if_cancelled()?;
+
         // Phase 3: reconcile stale entries and atomically expose index to planner.
-        if let Err(e) = ddl::reconcile_index(
+        match ddl::reconcile_index(
             store,
             db_id,
             &table_name,
             &index_name,
             Some(IndexState::Ready),
+            lease_cancel,
         )
         .await
         {
-            return Err(mark_invalid(e).await);
+            Ok(()) => {}
+            Err(e) if is_claim_cancelled_error(&e) => return Err(e),
+            Err(e) => return Err(mark_invalid(e).await),
         }
 
-        Ok(())
-    }
-
-    /// Enqueue storage size scan tasks for all known databases.
-    async fn reconcile_storage_scans(&self) -> Result<()> {
-        let mut txn = self.system_store.begin().await?;
-        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
-        txn.commit().await?;
-
-        let cursor = self.storage_reconcile_cursor.load(Ordering::Relaxed);
-        let batch_entries = registry_batch_from_cursor(
-            &registry_entries,
-            cursor,
-            self.config.registry_reconcile_batch_size,
-        );
-        if !registry_entries.is_empty() {
-            self.storage_reconcile_cursor.store(
-                (cursor + batch_entries.len()) % registry_entries.len(),
-                Ordering::Relaxed,
-            );
-        }
-
-        let mut total_enqueued = 0u32;
-        let mut total_databases = 0u32;
-        for entry in &batch_entries {
-            let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            let store = handle.store().clone();
-            let mut tenant_txn = store.begin().await?;
-            let databases = store.list_databases(&mut tenant_txn).await?;
-            tenant_txn.rollback().await.ok();
-
-            for db in databases {
-                total_databases += 1;
-                if let Err(e) =
-                    enqueue_storage_scan(&self.system_store, &entry.keyspace, db.id).await
-                {
-                    warn!(
-                        "Failed to enqueue storage scan for keyspace={} db_id={}: {}",
-                        entry.keyspace, db.id, e
-                    );
-                } else {
-                    total_enqueued += 1;
-                }
-            }
-        }
-
-        if total_enqueued > 0 || registry_entries.len() > batch_entries.len() {
-            info!(
-                total_enqueued,
-                total_databases,
-                processed_registry_entries = batch_entries.len(),
-                total_registry_entries = registry_entries.len(),
-                "Storage scan reconciliation batch complete"
-            );
-        }
         Ok(())
     }
 }
@@ -1657,6 +2790,15 @@ pub(crate) struct HnswSweepResult {
     pub enqueued: u32,
     /// Number of enqueue attempts that failed (system store errors).
     pub enqueue_errors: u32,
+    /// Raw schema key cursor for the next bounded table page.
+    pub next_table_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct RegistrySweepEntryOutcome {
+    hnsw_observed: u32,
+    hnsw_enqueued: u32,
+    hnsw_enqueue_errors: u32,
 }
 
 /// Scan all tables in (keyspace, db_id) for HNSW indexes with pending deltas.
@@ -1666,18 +2808,17 @@ pub(crate) struct HnswSweepResult {
 /// table schemas and probes for delta keys in the tenant store.
 pub(crate) async fn enqueue_pending_hnsw_merges(
     system_store: &TikvStore,
-    pool: &TikvClientPool,
+    store: &Arc<TikvStore>,
     keyspace: &str,
     db_id: u64,
+    table_start_after: Option<&[u8]>,
+    table_page_size: usize,
 ) -> Result<HnswSweepResult> {
     use crate::sql::hnsw::storage::{
         hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_merge_task_id, hnsw_meta_key, HnswMeta,
     };
     use rand::Rng;
     use tikv_client::BoundRange;
-
-    let handle = pool.acquire(Some(keyspace.to_string())).await?;
-    let store = handle.store().clone();
 
     // Retry the entire scan+enqueue with a fresh transaction on region errors
     // (RegionNotFound, EpochNotMatch, etc.) that occur after TiKV region
@@ -1692,7 +2833,31 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
             let mut txn_guard = crate::worker::active_txn_registry::global_registry()
                 .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
-            let table_names = store.list_tables(&mut txn, db_id).await?;
+            // Cross-store liveness fence (same rationale as reconcile_cron_for_db):
+            // merge tasks read here from the TENANT store but are enqueued into
+            // the global system_store queue, so we cannot fence the enqueue in a
+            // single txn. Take get_for_update on the tenant DB row in this scan
+            // snapshot so a DROP DATABASE that already removed the metadata makes
+            // the sweep bail with no merges enqueued. Any orphan from the
+            // irreducible cross-store window is self-healing: execute_task skips
+            // a merge for a dropped DB and cleanup deletes the queue row.
+            if !store.database_alive_for_update(&mut txn, db_id).await? {
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
+                }
+                return Ok(HnswSweepResult {
+                    observed: 0,
+                    enqueued: 0,
+                    enqueue_errors: 0,
+                    next_table_cursor: None,
+                });
+            }
+
+            let (table_names, next_table_cursor) = store
+                .scan_tables_page(&mut txn, db_id, table_start_after, table_page_size)
+                .await?;
             let mut observed = 0u32;
             let mut enqueued = 0u32;
             let mut enqueue_errors = 0u32;
@@ -1750,18 +2915,24 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
                     );
                     entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
 
-                    let enqueue_result: Result<()> = async {
+                    let enqueue_result: Result<bool> = async {
                         let mut sys_txn = system_store.begin().await?;
-                        system_store
-                            .put_task_v2(&mut sys_txn, &entry, 0)
+                        let enqueued = system_store
+                            .put_singleton_task_v2(&mut sys_txn, &entry, 0)
                             .await?;
                         sys_txn.commit().await?;
-                        Ok(())
+                        Ok(enqueued)
                     }
                     .await;
 
                     match enqueue_result {
-                        Ok(()) => enqueued += 1,
+                        Ok(true) => enqueued += 1,
+                        Ok(false) => {
+                            debug!(
+                                "HNSW sweep: merge already pending for table_id={} index_id={}",
+                                schema.table_id, index.id
+                            );
+                        }
                         Err(e) => {
                             enqueue_errors += 1;
                             warn!(
@@ -1782,6 +2953,7 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
                 observed,
                 enqueued,
                 enqueue_errors,
+                next_table_cursor,
             })
         }
         .await;
@@ -1804,6 +2976,15 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
 
     // Unreachable: the loop either returns Ok or Err on the last attempt.
     unreachable!()
+}
+
+/// True if `e` is the claim-lease cancellation / shutdown error (raised by
+/// `LeaseCancel::bail_if_cancelled` and `run_with_guards`). A CIC backfill that
+/// aborts because it LOST its claim must NOT be marked Invalid — the index stays
+/// in a valid intermediate state for the new owner to resume.
+fn is_claim_cancelled_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.to_string().contains(CANCELLED_BY_ADMIN_ERROR))
 }
 
 async fn run_with_guards<F, T>(
@@ -1853,7 +3034,11 @@ const STORAGE_SCAN_RATE_LIMIT_MS: u64 = 5;
 /// Performs a full paginated range scan over `[d_{db_id}_, d_{db_id+1}_)`,
 /// classifies each key by prefix, and accumulates logical sizes (key.len + value.len).
 /// Results are persisted to TiKV and cached in memory.
-async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result<()> {
+async fn execute_storage_size_scan(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    lease_cancel: &crate::worker::LeaseCancel,
+) -> Result<()> {
     use crate::storage::encode_database_data_range;
     use crate::storage_stats::{
         classify_key, global_storage_stats_cache, parse_legacy_hnsw_table_id,
@@ -2007,10 +3192,19 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
         scan_duration_ms,
     };
 
+    // Lease fence before the only tenant write in this path: if the claim lease
+    // was lost/stolen during the (potentially long, rate-limited) scan, abandon
+    // the stats persist so the new owner can re-run it. Returning here leaves the
+    // task for the new owner exactly as the generic run_with_guards path bails.
+    lease_cancel.bail_if_cancelled()?;
+
     let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
     let stats_value = serialize_storage_stats(&stats);
     let mut persist_txn = store.begin().await?;
     crate::txn::txn_put(&mut persist_txn, stats_key, stats_value).await?;
+    store
+        .assert_database_alive_for_update(&mut persist_txn, db_id)
+        .await?;
     persist_txn.commit().await?;
 
     let keyspace = store.keyspace().unwrap_or("default");
@@ -2026,13 +3220,15 @@ async fn execute_storage_size_scan(store: &Arc<TikvStore>, db_id: u64) -> Result
 
 /// Enqueue a storage size scan task for a specific database.
 ///
-/// Called by `db9_refresh_storage_stats()` and by the periodic reconciler.
+/// Called by `db9_refresh_storage_stats()` and by the bounded registry sweep.
 pub(crate) async fn enqueue_storage_scan(
     system_store: &TikvStore,
     keyspace: &str,
     db_id: u64,
 ) -> Result<()> {
-    let entry = TaskQueueEntry::new(
+    use rand::Rng;
+
+    let mut entry = TaskQueueEntry::new(
         keyspace.to_string(),
         db_id,
         db_id as i64,
@@ -2041,11 +3237,20 @@ pub(crate) async fn enqueue_storage_scan(
         "system".to_string(),
         200, // low priority — background housekeeping
     );
-    let fire_time = now_epoch_ms();
+    entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
+    let fire_time = 0;
     let mut txn = system_store.begin().await?;
-    system_store
-        .put_task_v2(&mut txn, &entry, fire_time)
-        .await?;
+    if !system_store
+        .put_singleton_task_v2(&mut txn, &entry, fire_time)
+        .await?
+    {
+        txn.rollback().await.ok();
+        debug!(
+            keyspace,
+            db_id, "Storage size scan already pending; skipping duplicate enqueue"
+        );
+        return Ok(());
+    }
     txn.commit().await?;
     crate::worker::wake_worker();
     Ok(())

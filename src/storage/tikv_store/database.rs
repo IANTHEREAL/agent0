@@ -352,6 +352,49 @@ impl TikvStore {
         }
     }
 
+    /// Lock the database metadata row before committing background writes.
+    ///
+    /// DROP DATABASE removes this row before destroying the database key range.
+    /// A worker that writes tenant data after resolving the DB earlier in its
+    /// execution must take this lock in the same transaction it is about to
+    /// commit; otherwise it can recreate orphan keys after range destruction.
+    pub async fn assert_database_alive_for_update(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<()> {
+        if self.database_alive_for_update(txn, db_id).await? {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "database with id {} no longer exists; aborting background tenant write",
+                db_id
+            ))
+        }
+    }
+
+    /// Same liveness fence as `assert_database_alive_for_update`, but reports a
+    /// dropped database as `Ok(false)` instead of an error.
+    ///
+    /// Use this when a background re-enqueue must distinguish "the DB was
+    /// dropped, so produce no further work" (return `false` → caller suppresses
+    /// the enqueue) from a genuine TiKV failure (return `Err` → caller retries).
+    /// It still takes `get_for_update` so the read conflicts with DROP DATABASE,
+    /// fencing the enqueue against a concurrent drop just like the assert form.
+    pub async fn database_alive_for_update(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<bool> {
+        let key = self.key(&encode_database_id_key(db_id));
+        let Some(data) = tikv_op!(txn.get_for_update(key).await)? else {
+            return Ok(false);
+        };
+        let _: DatabaseDef =
+            bincode::deserialize(&data).context("Failed to deserialize database definition")?;
+        Ok(true)
+    }
+
     /// List all databases in the current keyspace (storage format v2).
     pub async fn list_databases(&self, txn: &mut Transaction) -> Result<Vec<DatabaseDef>> {
         let prefix = encode_database_id_prefix();
@@ -371,6 +414,48 @@ impl TikvStore {
             dbs.push(def);
         }
         Ok(dbs)
+    }
+
+    /// List one raw-key cursor page of databases in the current keyspace.
+    pub async fn scan_databases_page(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<DatabaseDef>, Option<Vec<u8>>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let prefix = encode_database_id_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0x00);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(Some(limit))).await)?;
+
+        let mut dbs = Vec::new();
+        let mut last_key = None;
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let def: DatabaseDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize database")?;
+            dbs.push(def);
+            last_key = Some(key.to_vec());
+        }
+
+        let next_cursor = if dbs.len() == limit { last_key } else { None };
+        Ok((dbs, next_cursor))
     }
 
     /// Create a new database (storage format v2).
@@ -715,5 +800,98 @@ mod tests {
     fn default_database_commit_conflict_detector_ignores_non_conflict_errors() {
         let err = tikv_client::Error::StringError("boom".to_string());
         assert!(!tikv_error_contains_write_conflict(&err));
+    }
+
+    // ── Liveness fence behavior (#2: dropped-DB enqueue suppression) ─────────
+    //
+    // TiKV-backed; run with a reachable PD cluster (CI integration-tests job).
+    // Drives BOTH branches of `database_alive_for_update`: a live DB row yields
+    // Ok(true); after the metadata row is deleted (exactly what DROP DATABASE
+    // does before destroying the data range) it yields Ok(false) — NOT an Err —
+    // so background re-enqueue call sites can suppress work for a dropped DB.
+
+    async fn liveness_test_store(tag: &str) -> TikvStore {
+        let pd_endpoints = std::env::var("PD_ENDPOINTS")
+            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let keyspace = format!(
+            "_db_alive_{tag}_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        // Raw system store: no bootstrap, so the only DB row present is the one
+        // this test writes — keeping the assertions deterministic.
+        TikvStore::new_system(pd_endpoints, &keyspace)
+            .await
+            .expect("init raw system store")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn database_alive_for_update_reports_live_then_dropped() {
+        let store = liveness_test_store("alive").await;
+        let db_id = 7_u64;
+        let id_key = store.key(&encode_database_id_key(db_id));
+
+        // Write a live DB metadata row directly (mirrors create_database's id_key
+        // write) so this test exercises the storage primitive in isolation.
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let def = DatabaseDef::new(db_id, "appdb".to_string(), "admin".to_string());
+            let data = bincode::serialize(&def).expect("serialize def");
+            txn_put(&mut txn, id_key.clone(), data).await.expect("put");
+            txn.commit().await.expect("commit");
+        }
+
+        // Live DB → Ok(true).
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let alive = store
+                .database_alive_for_update(&mut txn, db_id)
+                .await
+                .expect("alive check must not error for a live DB");
+            assert!(alive, "live DB metadata row must report alive == true");
+            txn.rollback().await.ok();
+        }
+
+        // Delete the metadata row exactly as DROP DATABASE does before destroying
+        // the data range.
+        {
+            let mut txn = store.begin().await.expect("begin");
+            txn_delete(&mut txn, id_key.clone()).await.expect("delete");
+            txn.commit().await.expect("commit");
+        }
+
+        // Dropped DB → Ok(false), NOT Err. This is the branch the enqueue-
+        // suppression fix depends on: a missing row is a definitive "dropped"
+        // answer, not a transient failure to retry.
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let alive = store
+                .database_alive_for_update(&mut txn, db_id)
+                .await
+                .expect("dropped DB must return Ok(false), not Err");
+            assert!(!alive, "dropped DB metadata row must report alive == false");
+            txn.rollback().await.ok();
+        }
+
+        // And the assert form must turn the same dropped state into an error so
+        // single-store fences (finalize/load_next) abort their commit.
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let err = store
+                .assert_database_alive_for_update(&mut txn, db_id)
+                .await
+                .expect_err("assert form must error for a dropped DB");
+            assert!(
+                err.to_string().contains("no longer exists"),
+                "unexpected error: {err}"
+            );
+            txn.rollback().await.ok();
+        }
     }
 }

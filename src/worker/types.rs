@@ -14,6 +14,62 @@ pub const TASK_TYPE_HNSW_MERGE: u8 = 0x20;
 pub const TASK_TYPE_STORAGE_SIZE_SCAN: u8 = 0x40;
 pub const TASK_TYPE_DDL_JOURNAL: u8 = 0x80;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HnswS3GraphUploadIntent {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub table_id: u64,
+    pub index_id: u64,
+    pub version: u64,
+    pub txn_start_ts: u64,
+    pub created_at: i64,
+    pub reason: String,
+}
+
+impl HnswS3GraphUploadIntent {
+    pub fn new(
+        keyspace: String,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        version: u64,
+        txn_start_ts: u64,
+        reason: String,
+    ) -> Self {
+        Self {
+            keyspace,
+            db_id,
+            table_id,
+            index_id,
+            version,
+            txn_start_ts,
+            created_at: now_epoch_ms(),
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HnswS3DbPrefixCleanupIntent {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub drop_txn_start_ts: u64,
+    pub created_at: i64,
+    pub reason: String,
+}
+
+impl HnswS3DbPrefixCleanupIntent {
+    pub fn new(keyspace: String, db_id: u64, drop_txn_start_ts: u64, reason: String) -> Self {
+        Self {
+            keyspace,
+            db_id,
+            drop_txn_start_ts,
+            created_at: now_epoch_ms(),
+            reason,
+        }
+    }
+}
+
 // ============================================================================
 // TaskType Enum
 // ============================================================================
@@ -72,6 +128,18 @@ impl TaskType {
         )
     }
 
+    /// Whether this task type uses a deterministic due-queue key that later
+    /// enqueues may overwrite while an earlier worker still holds a claim.
+    pub fn uses_deterministic_queue_key(self) -> bool {
+        matches!(self, TaskType::HnswMerge | TaskType::StorageSizeScan)
+    }
+
+    /// Whether a failed deterministic task should leave its due row in place
+    /// for another worker/capability profile to retry.
+    pub fn keeps_deterministic_queue_entry_on_failure(self) -> bool {
+        matches!(self, TaskType::HnswMerge)
+    }
+
     /// Convert bitmask value to TaskType (returns first matching type)
     #[allow(dead_code)] // forward-compat: bitmask API for task type serialization
     pub fn from_bitmask(mask: u8) -> Option<Self> {
@@ -128,6 +196,7 @@ impl TaskRegistryEntry {
     }
 
     /// Check if cron bit is set
+    #[allow(dead_code)] // forward-compat: registry bits are hints, not recovery gates
     pub fn has_cron(&self) -> bool {
         self.task_types & TASK_TYPE_CRON != 0
     }
@@ -181,6 +250,7 @@ impl TaskRegistryEntry {
     }
 
     /// Check if bg_ddl bit is set
+    #[allow(dead_code)] // forward-compat: registry bits are hints, not recovery gates
     pub fn has_bg_ddl(&self) -> bool {
         self.task_types & TASK_TYPE_BG_DDL != 0
     }
@@ -498,41 +568,32 @@ impl TaskDescriptorV2 {
     }
 }
 
-/// A due item read by the worker tick: a V2 descriptor (command fetched from
-/// `_wq_payload_v2_` after claim, for split types) or a legacy `_worker_queue_`
-/// entry (command inline). The legacy variant only appears during the migration
-/// window while an old binary is still enqueuing V1 entries; the new binary
-/// executes them IN PLACE (it never moves them to V2), so an entry lives in a
-/// single namespace and is processed once via the shared worker claim.
+/// A due item read by the worker tick. Legacy `_worker_queue_` rows are migrated
+/// before polling starts, so execution only hydrates V2 descriptors.
 #[derive(Debug, Clone)]
 pub enum DueItem {
     V2(TaskDescriptorV2),
-    Legacy(TaskQueueEntry),
 }
 
 impl DueItem {
     pub fn keyspace(&self) -> &str {
         match self {
             DueItem::V2(d) => &d.keyspace,
-            DueItem::Legacy(e) => &e.keyspace,
         }
     }
     pub fn db_id(&self) -> u64 {
         match self {
             DueItem::V2(d) => d.db_id,
-            DueItem::Legacy(e) => e.db_id,
         }
     }
     pub fn task_id(&self) -> i64 {
         match self {
             DueItem::V2(d) => d.task_id,
-            DueItem::Legacy(e) => e.task_id,
         }
     }
     pub fn task_type(&self) -> TaskType {
         match self {
             DueItem::V2(d) => d.task_type,
-            DueItem::Legacy(e) => e.task_type,
         }
     }
 }
@@ -546,15 +607,73 @@ pub struct WorkerClaim {
     pub worker_id: String, // instance identifier (hostname:pid or UUID)
     pub claimed_at: i64,   // epoch ms
     pub task_type: TaskType,
+    /// Lease expiry (epoch ms). The owning worker renews this at ~lease/3 while
+    /// it executes; GC reaps a claim ONLY after its lease has expired. This is
+    /// the kernel's at-most-once mechanism (design §K4): a flat orphan timeout
+    /// shorter than a legitimate task runtime would otherwise reap a still-
+    /// running claim and allow a second worker to double-execute the task.
+    ///
+    /// `#[serde(default)]` keeps decode backward-compatible during a rolling
+    /// upgrade: a legacy `claimed_at`-only row (written by an older binary)
+    /// deserializes with `lease_until_ms == 0`, which `effective_lease_until`
+    /// then synthesizes from `claimed_at + orphan_timeout`.
+    #[serde(default)]
+    pub lease_until_ms: i64,
+}
+
+/// Legacy on-disk layout (no lease field) for backward-compatible decode of
+/// claims written by binaries from before the lease landed.
+#[derive(Deserialize)]
+struct LegacyWorkerClaim {
+    worker_id: String,
+    claimed_at: i64,
+    task_type: TaskType,
 }
 
 impl WorkerClaim {
-    pub fn new(worker_id: String, task_type: TaskType) -> Self {
+    pub fn with_lease(worker_id: String, task_type: TaskType, lease_ms: i64) -> Self {
+        let now = now_epoch_ms();
         Self {
             worker_id,
-            claimed_at: now_epoch_ms(),
+            claimed_at: now,
             task_type,
+            lease_until_ms: now.saturating_add(lease_ms.max(0)),
         }
+    }
+
+    /// Decode a claim value tolerating both the current layout (with
+    /// `lease_until_ms`) and the legacy `claimed_at`-only layout. Used by every
+    /// production read of a claim so a mixed-version fleet never mis-decodes.
+    pub fn decode_compat(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        match bincode::deserialize::<WorkerClaim>(bytes) {
+            Ok(claim) => Ok(claim),
+            Err(_) => {
+                let legacy: LegacyWorkerClaim = bincode::deserialize(bytes)?;
+                Ok(Self {
+                    worker_id: legacy.worker_id,
+                    claimed_at: legacy.claimed_at,
+                    task_type: legacy.task_type,
+                    lease_until_ms: 0, // synthesized by effective_lease_until
+                })
+            }
+        }
+    }
+
+    /// Effective lease expiry. A migrated legacy row (`lease_until_ms == 0`)
+    /// synthesizes `claimed_at + orphan_timeout` so an old age-based reaper and
+    /// the new lease-based reaper agree during the rolling-deploy window.
+    pub fn effective_lease_until(&self, legacy_orphan_timeout_ms: i64) -> i64 {
+        if self.lease_until_ms > 0 {
+            self.lease_until_ms
+        } else {
+            self.claimed_at
+                .saturating_add(legacy_orphan_timeout_ms.max(0))
+        }
+    }
+
+    /// True iff this claim's lease has expired as of `now_ms`.
+    pub fn is_expired(&self, now_ms: i64, legacy_orphan_timeout_ms: i64) -> bool {
+        self.effective_lease_until(legacy_orphan_timeout_ms) < now_ms
     }
 }
 
@@ -807,12 +926,74 @@ mod tests {
 
     #[test]
     fn test_worker_claim_bincode_roundtrip() {
-        let claim = WorkerClaim::new("worker-1".to_string(), TaskType::AsyncTrigger);
+        let claim = WorkerClaim::with_lease("worker-1".to_string(), TaskType::AsyncTrigger, 60_000);
         let data = bincode::serialize(&claim).expect("serialize");
         let decoded: WorkerClaim = bincode::deserialize(&data).expect("deserialize");
 
         assert_eq!(decoded.worker_id, "worker-1");
         assert_eq!(decoded.task_type, TaskType::AsyncTrigger);
+        assert_eq!(decoded.lease_until_ms, claim.lease_until_ms);
+    }
+
+    #[test]
+    fn worker_claim_carries_a_future_lease() {
+        let before = now_epoch_ms();
+        let claim = WorkerClaim::with_lease("w".to_string(), TaskType::BgSql, 60_000);
+        assert!(
+            claim.lease_until_ms >= before + 60_000,
+            "new claim must carry a lease ~now+lease_ms"
+        );
+        // A fresh claim is NOT expired even with a tiny legacy timeout.
+        assert!(!claim.is_expired(now_epoch_ms(), 1));
+    }
+
+    #[test]
+    fn worker_claim_decode_compat_synthesizes_lease_for_legacy_rows() {
+        // A legacy row was written WITHOUT the lease field. Reproduce its bytes
+        // with the legacy struct shape, then assert decode_compat reads it and
+        // synthesizes the lease from claimed_at + orphan_timeout.
+        #[derive(serde::Serialize)]
+        struct LegacyOnDisk {
+            worker_id: String,
+            claimed_at: i64,
+            task_type: TaskType,
+        }
+        let legacy = LegacyOnDisk {
+            worker_id: "old-binary".to_string(),
+            claimed_at: 1_000_000,
+            task_type: TaskType::BgDdl,
+        };
+        let bytes = bincode::serialize(&legacy).expect("serialize legacy");
+
+        let decoded = WorkerClaim::decode_compat(&bytes).expect("decode legacy claim");
+        assert_eq!(decoded.worker_id, "old-binary");
+        assert_eq!(decoded.task_type, TaskType::BgDdl);
+        assert_eq!(decoded.lease_until_ms, 0, "legacy rows decode with lease 0");
+
+        let orphan_ms = 300_000;
+        assert_eq!(
+            decoded.effective_lease_until(orphan_ms),
+            1_000_000 + orphan_ms,
+            "legacy lease must synthesize claimed_at + orphan_timeout"
+        );
+        // Expired well after claimed_at + orphan_timeout.
+        assert!(decoded.is_expired(1_000_000 + orphan_ms + 1, orphan_ms));
+        // Not expired before that synthesized deadline.
+        assert!(!decoded.is_expired(1_000_000 + orphan_ms - 1, orphan_ms));
+    }
+
+    #[test]
+    fn worker_claim_live_lease_is_not_expired_regardless_of_legacy_timeout() {
+        let now = now_epoch_ms();
+        let claim = WorkerClaim {
+            worker_id: "w".to_string(),
+            claimed_at: now - 10 * 60 * 1000, // claimed 10 min ago
+            task_type: TaskType::BgSql,
+            lease_until_ms: now + 30_000, // but lease still live 30s out
+        };
+        // Even with a 5-min legacy orphan timeout (which the OLD age-based reaper
+        // would have tripped on), the LIVE lease must protect a long task.
+        assert!(!claim.is_expired(now, 300_000));
     }
 
     #[test]
@@ -889,13 +1070,15 @@ mod tests {
 
     #[test]
     fn test_worker_claim_bincode_all_fields() {
-        let claim = WorkerClaim::new("host1:9999".to_string(), TaskType::AutoAnalyze);
+        let claim =
+            WorkerClaim::with_lease("host1:9999".to_string(), TaskType::AutoAnalyze, 60_000);
         let data = bincode::serialize(&claim).expect("serialize");
         let decoded: WorkerClaim = bincode::deserialize(&data).expect("deserialize");
 
         assert_eq!(decoded.worker_id, "host1:9999");
         assert_eq!(decoded.claimed_at, claim.claimed_at);
         assert_eq!(decoded.task_type, TaskType::AutoAnalyze);
+        assert_eq!(decoded.lease_until_ms, claim.lease_until_ms);
     }
 
     #[test]
@@ -1036,30 +1219,35 @@ mod tests {
         }
     }
 
-    /// Task type branching: only HnswMerge should use CAS delete.
-    /// All other task types use unconditional delete.
+    /// Task type branching: every deterministic-key task must use nonce
+    /// compare-delete. Non-deterministic tasks use unconditional delete.
     #[test]
-    fn test_hnsw_merge_is_only_cas_eligible_task_type() {
-        let cas_types = [TaskType::HnswMerge];
+    fn test_deterministic_key_task_types_use_cas_delete() {
+        let cas_types = [TaskType::HnswMerge, TaskType::StorageSizeScan];
         let unconditional_types = [
             TaskType::Cron,
             TaskType::AsyncTrigger,
             TaskType::AutoAnalyze,
             TaskType::BgDdl,
             TaskType::BgSql,
+            TaskType::DdlJournal,
         ];
 
         for tt in &cas_types {
-            assert_eq!(*tt, TaskType::HnswMerge, "only HnswMerge uses CAS delete");
-        }
-        for tt in &unconditional_types {
-            assert_ne!(
-                *tt,
-                TaskType::HnswMerge,
-                "{:?} must use unconditional delete, not CAS",
-                tt
+            assert!(
+                tt.uses_deterministic_queue_key(),
+                "{tt:?} must use nonce compare-delete"
             );
         }
+        for tt in &unconditional_types {
+            assert!(
+                !tt.uses_deterministic_queue_key(),
+                "{tt:?} must use unconditional delete, not nonce compare-delete"
+            );
+        }
+
+        assert!(TaskType::HnswMerge.keeps_deterministic_queue_entry_on_failure());
+        assert!(!TaskType::StorageSizeScan.keeps_deterministic_queue_entry_on_failure());
     }
 
     /// New-format entries (with nonce) must also round-trip correctly through

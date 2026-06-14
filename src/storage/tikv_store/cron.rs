@@ -422,6 +422,31 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Release the per-minute run claim once a run reaches a terminal state.
+    ///
+    /// `try_claim_cron_run` writes a `(db_id, job_id, scheduled_min)` claim key
+    /// to deduplicate same-minute fires, but that key was historically never
+    /// deleted. A worker that takes over an expired lease re-claims the SAME due
+    /// row (same `scheduled_min`); once the original owner finalized (clearing
+    /// the running guard but not this claim) the takeover hit
+    /// `AlreadyClaimedForMinute` and the due row was dropped WITHOUT requeue —
+    /// one scheduled fire silently lost. Finalization (the terminal-state owner)
+    /// clears it in the same tenant transaction that clears the running guard, so
+    /// the per-minute guard is scoped to a live run, not to the run's history.
+    pub async fn clear_cron_claim(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+        scheduled_min: i64,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_claim_key_v2(db_id, job_id, scheduled_min));
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
+            txn_delete(txn, key).await?;
+        }
+        Ok(())
+    }
+
     pub async fn delete_all_cron_data(&self, txn: &mut Transaction, db_id: u64) -> Result<()> {
         let prefixes = [
             encode_cron_job_prefix_v2(db_id),
@@ -573,10 +598,9 @@ mod tests {
             system_keyspace,
             ..Default::default()
         };
-        let store = crate::worker::init_system_store(pd_endpoints, &cfg)
+        let store = crate::worker::init_gc_registry_store(pd_endpoints, &cfg)
             .await
-            .expect("init system store")
-            .expect("system store present when enabled");
+            .expect("init system store");
 
         let db_id = 987_654_u64;
         // 14 jobs x ~5 MiB command = ~70 MiB total, comfortably over the 64 MiB

@@ -252,52 +252,63 @@ impl Executor {
             .drain(..)
             .collect();
         if !triggers.is_empty() {
-            if let Some(system_store) = crate::worker::get_system_store() {
-                let system_store = system_store.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        let mut txn = system_store.begin().await?;
-                        for (idx, trigger) in triggers.iter().enumerate() {
-                            let now_ms = chrono::Utc::now().timestamp_millis();
-                            let task_id = now_ms.saturating_add(idx as i64);
-                            let entry = crate::worker::types::TaskQueueEntry::new(
-                                trigger.keyspace.clone(),
-                                trigger.db_id,
-                                task_id,
-                                crate::worker::types::TaskType::AsyncTrigger,
-                                trigger.command.clone(),
-                                "admin".to_string(),
-                                200,
-                            );
-                            let fire_time = chrono::Utc::now().timestamp_millis();
-                            system_store
-                                .put_task_v2(&mut txn, &entry, fire_time)
-                                .await?;
-                            system_store
-                                .update_registry_task_types(
-                                    &mut txn,
-                                    &trigger.keyspace,
+            // Producer write via the ALWAYS-ON system store, NOT gated on
+            // `execution_enabled()`. A trigger that was decided async at firing
+            // time must be enqueued durably regardless of whether THIS node runs
+            // worker execution; an execution-enabled node in the fleet performs
+            // it. Gating the write would silently drop the activation on a
+            // producer-only node (or on an enabled→disabled flip between push and
+            // flush) — the same class of bug fixed for the HNSW merge and
+            // auto-analyze producers.
+            match crate::worker::system_store() {
+                Ok(system_store) => {
+                    let system_store = system_store.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            let mut txn = system_store.begin().await?;
+                            for (idx, trigger) in triggers.iter().enumerate() {
+                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                let task_id = now_ms.saturating_add(idx as i64);
+                                let entry = crate::worker::types::TaskQueueEntry::new(
+                                    trigger.keyspace.clone(),
                                     trigger.db_id,
-                                    crate::worker::types::TASK_TYPE_ASYNC_TRIGGER,
-                                    0,
-                                )
-                                .await?;
+                                    task_id,
+                                    crate::worker::types::TaskType::AsyncTrigger,
+                                    trigger.command.clone(),
+                                    "admin".to_string(),
+                                    200,
+                                );
+                                let fire_time = chrono::Utc::now().timestamp_millis();
+                                system_store
+                                    .put_task_v2(&mut txn, &entry, fire_time)
+                                    .await?;
+                                system_store
+                                    .update_registry_task_types(
+                                        &mut txn,
+                                        &trigger.keyspace,
+                                        trigger.db_id,
+                                        crate::worker::types::TASK_TYPE_ASYNC_TRIGGER,
+                                        0,
+                                    )
+                                    .await?;
+                            }
+                            txn.commit().await?;
+                            Ok::<(), anyhow::Error>(())
                         }
-                        txn.commit().await?;
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        tracing::warn!("Failed to enqueue async triggers to worker: {}", e);
-                    }
-                    crate::worker::wake_worker();
-                });
-            } else {
-                tracing::warn!(
-                    "Dropping {} async trigger activation(s): worker subsystem is disabled. \
-                     These triggers will not fire.",
-                    triggers.len()
-                );
+                        .await;
+                        if let Err(e) = result {
+                            tracing::warn!("Failed to enqueue async triggers to worker: {}", e);
+                        }
+                        crate::worker::wake_worker();
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Dropping {} async trigger activation(s): {}",
+                        triggers.len(),
+                        e
+                    );
+                }
             }
         }
         self.pending_trigger_activations
@@ -307,10 +318,17 @@ impl Executor {
     }
 
     /// Flush accumulated HNSW merge requests after successful commit.
-    /// Deduplicates by (table_id, index_id), enqueues a worker task via
-    /// `put_worker_queue_entry` with a constant `fire_time_ms=0` so that
-    /// repeated enqueues for the same index produce the same queue key
-    /// (true idempotent overwrite). Best-effort: errors are logged and ignored.
+    /// Deduplicates by (table_id, index_id) and uses singleton queue enqueue so
+    /// a foreground DML commit never overwrites a pending or claimed merge row.
+    /// Best-effort: errors are logged and ignored.
+    ///
+    /// The singleton queue row is written via the ALWAYS-ON system store, NOT
+    /// gated on `execution_enabled()`. A SQL node with local worker execution
+    /// disabled must still durably record this producer work so an
+    /// execution-enabled node in the fleet performs the merge; gating the
+    /// producer write would silently drop pending merges (matching how cron,
+    /// bg_sql, auto-analyze, create_index, and materialized_views producers all
+    /// write durably regardless of local execution).
     pub(crate) fn flush_pending_hnsw_merges(&self) {
         let merges: Vec<PendingHnswMerge> = self
             .pending_hnsw_merges
@@ -329,62 +347,67 @@ impl Executor {
             .filter(|m| seen.insert((m.keyspace.clone(), m.db_id, m.table_id, m.index_id)))
             .collect();
 
-        if let Some(system_store) = crate::worker::get_system_store() {
-            let system_store = system_store.clone();
-            tokio::spawn(async move {
-                for merge in unique_merges {
-                    let task_id = match crate::sql::hnsw::storage::hnsw_merge_task_id(
-                        merge.table_id,
-                        merge.index_id,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            tracing::debug!("HNSW merge task_id overflow: {}", e);
-                            continue;
-                        }
-                    };
-                    let result: Result<(), anyhow::Error> = async {
-                        // Use fire_time_ms=0 so the queue key is deterministic for the
-                        // same (priority, task_type, keyspace, db_id, task_id).  Repeated
-                        // puts overwrite the same key — true idempotent dedup.
-                        // fire_time=0 is always <= now, so the task is immediately "due".
-                        let fire_time_ms = 0i64;
-                        let mut entry = crate::worker::types::TaskQueueEntry::new(
-                            merge.keyspace.clone(),
+        let system_store = match crate::worker::system_store() {
+            Ok(store) => store.clone(),
+            Err(e) => {
+                tracing::warn!("HNSW merge enqueue skipped: {}", e);
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            for merge in unique_merges {
+                let task_id = match crate::sql::hnsw::storage::hnsw_merge_task_id(
+                    merge.table_id,
+                    merge.index_id,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::debug!("HNSW merge task_id overflow: {}", e);
+                        continue;
+                    }
+                };
+                let result: Result<(), anyhow::Error> = async {
+                    // Use fire_time_ms=0 so the queue key is deterministic for the
+                    // same (priority, task_type, keyspace, db_id, task_id).
+                    // Singleton enqueue skips an existing row instead of replacing
+                    // a descriptor/nonce that a worker may already be processing.
+                    // fire_time=0 is always <= now, so the task is immediately "due".
+                    let fire_time_ms = 0i64;
+                    let mut entry = crate::worker::types::TaskQueueEntry::new(
+                        merge.keyspace.clone(),
+                        merge.db_id,
+                        task_id,
+                        crate::worker::types::TaskType::HnswMerge,
+                        format!("__hnsw_merge {} {}", merge.table_id, merge.index_id),
+                        "system".to_string(),
+                        192, // Lower priority than BgDdl/AutoAnalyze=128
+                    );
+                    // Guarantee non-zero nonce so CAS delete can distinguish
+                    // fresh entries from legacy entries with default nonce=0.
+                    entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
+                    let mut txn = system_store.begin().await?;
+                    system_store
+                        .put_singleton_task_v2(&mut txn, &entry, fire_time_ms)
+                        .await?;
+                    system_store
+                        .update_registry_task_types(
+                            &mut txn,
+                            &merge.keyspace,
                             merge.db_id,
-                            task_id,
-                            crate::worker::types::TaskType::HnswMerge,
-                            format!("__hnsw_merge {} {}", merge.table_id, merge.index_id),
-                            "system".to_string(),
-                            192, // Lower priority than BgDdl/AutoAnalyze=128
-                        );
-                        // Guarantee non-zero nonce so CAS delete can distinguish
-                        // fresh entries from legacy entries with default nonce=0.
-                        entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
-                        let mut txn = system_store.begin().await?;
-                        system_store
-                            .put_task_v2(&mut txn, &entry, fire_time_ms)
-                            .await?;
-                        system_store
-                            .update_registry_task_types(
-                                &mut txn,
-                                &merge.keyspace,
-                                merge.db_id,
-                                crate::worker::types::TASK_TYPE_HNSW_MERGE,
-                                0,
-                            )
-                            .await?;
-                        txn.commit().await?;
-                        crate::worker::wake_worker();
-                        Ok(())
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        tracing::debug!("HNSW merge enqueue failed (best-effort): {}", e);
-                    }
+                            crate::worker::types::TASK_TYPE_HNSW_MERGE,
+                            0,
+                        )
+                        .await?;
+                    txn.commit().await?;
+                    crate::worker::wake_worker();
+                    Ok(())
                 }
-            });
-        }
+                .await;
+                if let Err(e) = result {
+                    tracing::debug!("HNSW merge enqueue failed (best-effort): {}", e);
+                }
+            }
+        });
     }
 
     /// Mark that the `is_initialized` cache should be invalidated after the
