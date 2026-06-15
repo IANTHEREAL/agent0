@@ -211,6 +211,25 @@ fn test_rand_jitter_secs_max_one() {
 }
 
 #[test]
+fn test_effective_cron_orphan_floor_ms_covers_execution_window() {
+    // A default job (no max_runtime): orphan_timeout 5 min, cron_job_timeout 30 min.
+    // The floor must be the LONGER execution window, not the bare orphan timeout.
+    assert_eq!(
+        effective_cron_orphan_floor_ms(300, 1_800_000),
+        1_800_000,
+        "floor must cover cron_job_timeout when it exceeds orphan_timeout"
+    );
+    // When the control orphan timeout is the larger of the two, it wins.
+    assert_eq!(
+        effective_cron_orphan_floor_ms(7_200, 1_800_000),
+        7_200_000,
+        "floor must keep the larger orphan_timeout (sec→ms)"
+    );
+    // Equal inputs are stable.
+    assert_eq!(effective_cron_orphan_floor_ms(60, 60_000), 60_000);
+}
+
+#[test]
 fn test_effective_cron_orphan_timeout_respects_worker_timeout() {
     let cron_cfg = CronConfig {
         orphan_timeout_sec: 300,

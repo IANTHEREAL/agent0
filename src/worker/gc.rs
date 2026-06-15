@@ -683,12 +683,49 @@ fn rand_jitter_secs(max_secs: u64) -> u64 {
     (seed % max_secs as u128) as u64
 }
 
+/// SINGLE SOURCE OF TRUTH for the cron control-plane "effective orphan floor".
+///
+/// A cron run's frozen CONTROL/ACTIVE deadline must cover the LONGEST a
+/// legitimate run can take. With no per-job `max_runtime_ms`, that legitimate
+/// window is the EXECUTION timeout `cron_job_timeout_ms` (claim_and_execute_core
+/// uses `max_runtime_ms.unwrap_or(cron_job_timeout_ms)`), NOT the bare control
+/// `orphan_timeout_sec`. If the frozen deadline were only `now + orphan_timeout`
+/// (default 5 min) while the run may legitimately execute up to `cron_job_timeout`
+/// (default 30 min), a later fire would see the still-running ACTIVE as expired,
+/// mint a fresh fence, and take over — violating per-job no-overlap. So the floor
+/// is `max(orphan_timeout, cron_job_timeout)`; the per-claim path then takes a
+/// further `max` with `job.max_runtime_ms` via `cron_effective_orphan_deadline_ms`.
+///
+/// EVERY site that derives a cron control/orphan floor — the per-claim path
+/// (`claim_and_record_cron_run`), the bulk migration (`ensure_cron_control_migrated`),
+/// the straggler fold, and the GC reaper view (`effective_cron_orphan_timeout_sec`)
+/// — MUST route through this one function so the formula cannot drift (a second
+/// inline copy is exactly the class that cost prior rounds).
+pub(crate) fn effective_cron_orphan_floor_ms(
+    orphan_timeout_sec: u64,
+    cron_job_timeout_ms: u64,
+) -> i64 {
+    let orphan_timeout_ms = orphan_timeout_sec.saturating_mul(1000);
+    // The default-job (no per-job `max_runtime_ms`) execution window, taken through
+    // the ONE source the executor and the per-claim deadline also use, so the floor
+    // cannot drift from the window a default run actually executes for.
+    let default_window_ms =
+        crate::storage::cron::cron_execution_window_ms(None, cron_job_timeout_ms);
+    let floor = orphan_timeout_ms.max(default_window_ms);
+    i64::try_from(floor).unwrap_or(i64::MAX)
+}
+
 pub(crate) fn effective_cron_orphan_timeout_sec(
     cron_config: &CronConfig,
     worker_config: &WorkerConfig,
 ) -> u64 {
-    let worker_timeout_sec = worker_config.cron_job_timeout_ms.saturating_add(999) / 1000;
-    cron_config.orphan_timeout_sec.max(worker_timeout_sec)
+    let floor_ms = effective_cron_orphan_floor_ms(
+        cron_config.orphan_timeout_sec,
+        worker_config.cron_job_timeout_ms,
+    );
+    // Ceil-div back to whole seconds so the seconds view is never SHORTER than
+    // the canonical ms floor.
+    (floor_ms.max(0) as u64).saturating_add(999) / 1000
 }
 
 mod hnsw_helpers;

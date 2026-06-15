@@ -37,7 +37,7 @@ mod triggers;
 mod types;
 mod views;
 pub mod worker;
-pub use cron::CronRunClaimStatus;
+pub use cron::CronClaimOutcome;
 pub use ddl_journal::{DdlJournalEntry, DdlOperation};
 pub use tables::RowScanCursor;
 pub use worker::WqIndexRow;

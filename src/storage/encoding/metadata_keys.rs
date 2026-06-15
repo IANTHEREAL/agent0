@@ -45,6 +45,14 @@ const DB_SYS_CRON_RUN_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_run_id";
 const DB_SYS_CRON_ENABLED_PREFIX_V2: &[u8] = b"sys_cron_enabled";
 const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
 const DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2: &[u8] = b"sys_cron_running_guard_";
+// Single-lifecycle control plane (design 35). CONTROL = per-(db,job,minute) per-fire
+// state/dedup record; ACTIVE = per-(db,job) job-level no-overlap pointer. These
+// supersede the dumb per-minute claim flag + running guard; both are written only
+// inside the cron CAS helpers so neither can be orphaned. MIGRATED marks a db whose
+// legacy guard/claim keys have been translated (fail-closed claim gate).
+const DB_SYS_CRON_CONTROL_PREFIX_V2: &[u8] = b"sys_cron_control_";
+const DB_SYS_CRON_ACTIVE_PREFIX_V2: &[u8] = b"sys_cron_active_";
+const DB_SYS_CRON_MIGRATED_V3: &[u8] = b"sys_cron_migrated_v3";
 const DB_SYS_DDL_JOURNAL_PREFIX: &[u8] = b"sys_ddl_journal_";
 
 // Worker system prefixes (global, not per-database)
@@ -388,15 +396,6 @@ pub fn encode_cron_run_prefix_v2(db_id: u64) -> Vec<u8> {
     key
 }
 
-pub fn encode_cron_claim_key_v2(db_id: u64, job_id: i64, scheduled_min: i64) -> Vec<u8> {
-    let mut key = encode_database_data_prefix(db_id);
-    key.extend_from_slice(DB_SYS_CRON_CLAIM_PREFIX_V2);
-    key.extend_from_slice(&job_id.to_be_bytes());
-    key.push(b'_');
-    key.extend_from_slice(&scheduled_min.to_be_bytes());
-    key
-}
-
 pub fn encode_cron_claim_prefix_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_CRON_CLAIM_PREFIX_V2);
@@ -421,20 +420,68 @@ pub fn encode_cron_enabled_key_v2(db_id: u64) -> Vec<u8> {
     key
 }
 
-/// Encode a cron running-guard key to prevent overlapping runs of the same job.
-///
-/// Format: `d_{db_id:8bytes}_sys_cron_running_guard_{job_id:be8}`
-/// Value: big-endian i64 of the current run_id
-pub fn encode_cron_running_guard_key_v2(db_id: u64, job_id: i64) -> Vec<u8> {
+/// Legacy running-guard prefix (pre design-35). Retained only for the legacy-shim
+/// window so the migration sweep, the per-claim straggler check (design 35
+/// §Migration), and DROP DATABASE cleanup can read/purge any rolling-window
+/// leftovers an old binary may still be writing.
+pub fn encode_cron_running_guard_prefix_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2);
+    key
+}
+
+/// Legacy running-guard key for a single `(db, job)` (pre design-35).
+/// Format: `d_{db_id:8bytes}_sys_cron_running_guard_{job_id:be8}` — byte-identical
+/// to what the removed #2629 writer used and what `decode_legacy_guard` parses.
+/// Re-added for the legacy-shim window so the new claim path can point-get one
+/// job's guard (a post-marker straggler an old binary wrote) without a prefix
+/// scan; removed in the follow-up release once the fleet is fully upgraded.
+pub fn encode_cron_running_guard_key_v2(db_id: u64, job_id: i64) -> Vec<u8> {
+    let mut key = encode_cron_running_guard_prefix_v2(db_id);
     key.extend_from_slice(&job_id.to_be_bytes());
     key
 }
 
-pub fn encode_cron_running_guard_prefix_v2(db_id: u64) -> Vec<u8> {
+/// Per-(db,job,minute) cron CONTROL record key (design 35). Both `job_id` and
+/// `scheduled_min` are fixed 8-byte big-endian with NO separator, so the prefix
+/// range-scans cleanly.
+///
+/// Value: bincode `CronRunControl` (per-fire state + monotonic fence token).
+pub fn encode_cron_control_key_v2(db_id: u64, job_id: i64, scheduled_min: i64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
-    key.extend_from_slice(DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2);
+    key.extend_from_slice(DB_SYS_CRON_CONTROL_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key.extend_from_slice(&scheduled_min.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_control_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_CONTROL_PREFIX_V2);
+    key
+}
+
+/// Per-(db,job) cron ACTIVE-RUN pointer key (design 35) — job-level no-overlap.
+///
+/// Value: bincode `CronActiveRun`.
+pub fn encode_cron_active_key_v2(db_id: u64, job_id: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_ACTIVE_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_active_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_ACTIVE_PREFIX_V2);
+    key
+}
+
+/// Per-db marker that the legacy guard/claim keys have been migrated to the
+/// control/active model. The new claim path is fail-closed until this exists.
+pub fn encode_cron_migrated_key_v3(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_MIGRATED_V3);
     key
 }
 

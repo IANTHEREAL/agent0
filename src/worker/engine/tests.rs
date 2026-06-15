@@ -67,19 +67,88 @@ fn cron_queue_entry_must_match_current_catalog_job() {
 
 #[test]
 fn already_claimed_cron_minute_deletes_duplicate_due_row() {
+    use crate::cron::types::{CronRun, CronRunStatus};
+    use crate::storage::CronClaimOutcome;
+    let dummy_run = || CronRun {
+        run_id: 1,
+        job_id: 1,
+        job_pid: None,
+        database: "db".to_string(),
+        username: "u".to_string(),
+        command: "SELECT 1".to_string(),
+        status: CronRunStatus::Running,
+        return_message: None,
+        start_time: Some(0),
+        end_time: None,
+    };
     assert_eq!(
-        super::keep_queue_entry_for_claim_status(CronRunClaimStatus::Claimed),
+        super::keep_queue_entry_for_claim_status(&CronClaimOutcome::Claimed { run: dummy_run() }),
         None
     );
     assert_eq!(
-        super::keep_queue_entry_for_claim_status(CronRunClaimStatus::AlreadyClaimedForMinute),
-        Some(false),
-        "same-minute duplicate due rows must be deleted, not retried forever"
+        super::keep_queue_entry_for_claim_status(&CronClaimOutcome::TookOver { run: dummy_run() }),
+        None,
+        "a takeover owns the run and must proceed, not drop/keep the row"
     );
     assert_eq!(
-        super::keep_queue_entry_for_claim_status(CronRunClaimStatus::BlockedByRunningGuard),
+        super::keep_queue_entry_for_claim_status(&CronClaimOutcome::AlreadyTerminalForMinute),
+        Some(false),
+        "a fire that already reached terminal state must drop the due row, not retry forever"
+    );
+    assert_eq!(
+        super::keep_queue_entry_for_claim_status(&CronClaimOutcome::BlockedByLiveActive),
         Some(true),
-        "running-guard blocks should keep the due row so it can retry after the active run"
+        "a live run (no-overlap) should keep the due row so it can retry after the active run"
+    );
+    // A blocked-but-folded claim has the SAME queue disposition (keep + retry) as a
+    // plain block — only the txn commit decision differs (it carries durable fold
+    // writes the reaper must reap, signalled separately via `must_commit_blocked`).
+    assert_eq!(
+        super::keep_queue_entry_for_claim_status(&CronClaimOutcome::BlockedByLiveActiveFolded),
+        Some(true),
+        "a blocked-but-folded straggler keeps the due row to retry, same as a plain block"
+    );
+}
+
+/// The fold-commit signal (P1 fold-commit fix): only the `BlockedByLiveActiveFolded`
+/// outcome — the straggler-fold block path that wrote durable ACTIVE/CONTROL — asks
+/// the caller to COMMIT its txn. Every other outcome (plain block, terminal dedup,
+/// or a yielded run handled on the run-commit path) must NOT request a blocked
+/// commit, so a plain block with no writes still rolls back.
+#[test]
+fn only_folded_block_requests_commit() {
+    use crate::cron::types::{CronRun, CronRunStatus};
+    let dummy_run = || CronRun {
+        run_id: 1,
+        job_id: 1,
+        job_pid: None,
+        database: "db".to_string(),
+        username: "u".to_string(),
+        command: "SELECT 1".to_string(),
+        status: CronRunStatus::Running,
+        return_message: None,
+        start_time: Some(0),
+        end_time: None,
+    };
+    assert!(
+        CronClaimOutcome::BlockedByLiveActiveFolded.must_commit_blocked(),
+        "a folded straggler block must commit so the orphan becomes reapable"
+    );
+    assert!(
+        !CronClaimOutcome::BlockedByLiveActive.must_commit_blocked(),
+        "a plain block wrote nothing and must roll back"
+    );
+    assert!(
+        !CronClaimOutcome::AlreadyTerminalForMinute.must_commit_blocked(),
+        "a terminal dedup outcome wrote nothing and must roll back"
+    );
+    assert!(
+        !CronClaimOutcome::Claimed { run: dummy_run() }.must_commit_blocked(),
+        "a claimed run is committed on the run path, not the blocked-commit path"
+    );
+    assert!(
+        !CronClaimOutcome::TookOver { run: dummy_run() }.must_commit_blocked(),
+        "a takeover run is committed on the run path, not the blocked-commit path"
     );
 }
 
@@ -99,12 +168,12 @@ fn cron_claim_stale_check_precedes_same_minute_claim() {
         .find("cron_queue_entry_matches_job")
         .expect("cron claim path must reject stale queue payloads");
     let claim = fn_body
-        .find(".try_claim_cron_run(")
-        .expect("cron claim path must claim the scheduled minute");
+        .find(".claim_or_takeover_cron_run(")
+        .expect("cron claim path must claim the scheduled minute via the fence CAS");
 
     assert!(
         job_lookup < claim && stale_check < claim,
-        "stale legacy cron entries must be rejected before AlreadyClaimedForMinute can keep them"
+        "stale cron entries must be rejected before the claim CAS runs"
     );
 }
 
@@ -1032,13 +1101,14 @@ fn background_tenant_write_commits_take_database_liveness_fence() {
         cron_finalize.contains("assert_database_alive_for_update(&mut txn, db_id)"),
         "cron run finalize must fence before committing tenant cron state"
     );
-    // Finalize releases the per-minute run claim in the SAME tenant txn that
-    // clears the running guard, so a takeover worker re-claiming the same
-    // scheduled_min after an expired lease does not hit AlreadyClaimedForMinute
-    // and drop the due row without requeue (one fire silently lost).
+    // Finalize is a fence-gated terminal CAS (design 35): it rejects a worker
+    // that lost its lease (old fence) and, on accept, clears the no-overlap
+    // pointer + projects the terminal run in one txn — so a terminal transition
+    // can never strand a dedup flag (DEFECT 2) nor be committed by a non-owner
+    // (DEFECT 1).
     assert!(
-        cron_finalize.contains("clear_cron_claim(&mut txn, db_id, run.job_id, scheduled_min)"),
-        "cron run finalize must release the per-minute run claim so a takeover can requeue"
+        cron_finalize.contains("finalize_cron_run_cas("),
+        "cron run finalize must go through the fence CAS, not ad-hoc guard/claim clears"
     );
 }
 
@@ -1337,24 +1407,13 @@ async fn finalize_success_in_claim_and_execute_releases_claim_and_requeues_cron(
         queue_key,
         DueItem::V2(descriptor),
         CancellationToken::new(),
-        |store, fin_db_id, mut run, status, msg, start, end, sched_min| async move {
-            let mut txn = store.begin().await?;
-            run.status = status;
-            run.return_message = msg;
-            run.start_time = Some(start);
-            run.end_time = Some(end);
-            store.put_cron_run(&mut txn, fin_db_id, &run).await?;
-            store
-                .clear_cron_running_guard(&mut txn, fin_db_id, run.job_id, run.run_id)
-                .await?;
-            store
-                .clear_cron_claim(&mut txn, fin_db_id, run.job_id, sched_min)
-                .await?;
-            store
-                .assert_database_alive_for_update(&mut txn, fin_db_id)
-                .await?;
-            txn.commit().await?;
-            Ok(())
+        |store, fin_db_id, run, status, msg, start, end, sched_min| async move {
+            // Exercise the REAL finalize (fence-gated terminal CAS), not a
+            // hand-rolled stand-in.
+            WorkerEngine::finalize_cron_run(
+                store, fin_db_id, run, status, msg, start, end, sched_min,
+            )
+            .await
         },
     )
     .await;
@@ -1386,6 +1445,266 @@ async fn finalize_success_in_claim_and_execute_releases_claim_and_requeues_cron(
     );
 
     txn.rollback().await.ok();
+}
+
+/// Guaranteed-schedule-progress on the REAPER-RECOVERED-CRASH path (design 35
+/// §Contract / DEFECT 2 residual). A worker claims cron minute M (CONTROL Running
+/// + ACTIVE) and crashes before requeue; the cron GC reaper recovers it by
+/// terminalizing CONTROL(M) and clearing ACTIVE — but the system due row for M
+/// still exists (the crashed worker never deleted it). A later worker reclaims
+/// that due row: the claim observes terminal CONTROL and returns
+/// `AlreadyTerminalForMinute`, so this worker did NOT run the fire (no `cron_run`,
+/// `finalize_fn` must NEVER fire). The minute is nonetheless DONE, so cleanup MUST
+/// still enqueue the next fire M+1 — otherwise the schedule silently stalls until
+/// a much-later registry sweep.
+///
+/// This drives the REAL `claim_and_execute_core` path and asserts:
+///   (i)   the reclaim deduplicates (finalize_fn is never invoked — the only way
+///         claim_and_execute_core reaches finalize is with a claimed run, which
+///         `AlreadyTerminalForMinute` is not);
+///   (ii)  the due row for M is dropped AND the next fire M+1 IS enqueued;
+///   (iii) the next-fire enqueue is the SAME fenced idempotent singleton put the
+///         ran-it path uses — two reclaims of the same terminal minute enqueue
+///         M+1 exactly once (the cron due key is deterministic on
+///         (priority, fire_time, type, keyspace, db_id, task_id), so a duplicate
+///         next-fire write overwrites rather than duplicating).
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn cluster_already_terminal_minute_still_requeues_next_fire() {
+    let (system_store, pool, cfg, metrics, keyspace, task_id, queue_key, descriptor) =
+        setup_cron_finalize_fixture("term").await;
+
+    let db_id = 1_u64;
+    let fire_time_ms = crate::storage::decode_wq_due_v2_fire_time(&queue_key)
+        .expect("fire_time_ms must decode from the queue key");
+    // The engine derives the scheduled minute the same way (engine.rs).
+    let scheduled_min = fire_time_ms.div_euclid(60_000);
+
+    // Resolve the exact catalog job the fixture installed (so the planted run
+    // matches command/username and the claim's no-overlap/dedup keys line up).
+    let job = {
+        let handle = pool.acquire(Some(keyspace.clone())).await.unwrap();
+        let store = handle.store().clone();
+        let mut txn = store.begin().await.unwrap();
+        let job = store
+            .get_cron_job(&mut txn, db_id, task_id)
+            .await
+            .unwrap()
+            .expect("fixture cron job must exist");
+        txn.rollback().await.ok();
+        job
+    };
+
+    // Simulate "worker claims M, crashes, reaper terminalizes": drive the REAL
+    // CAS helpers on the TENANT store to leave CONTROL(M) terminal + ACTIVE
+    // cleared, exactly the state reap_stale_active_runs commits. The system due
+    // row for M is left in place (the crashed worker never deleted it).
+    {
+        let handle = pool.acquire(Some(keyspace.clone())).await.unwrap();
+        let store = handle.store().clone();
+
+        // Claim M -> mints the fence and writes CONTROL(Running) + ACTIVE.
+        let fence = {
+            let mut txn = store.begin().await.unwrap();
+            let outcome = store
+                .claim_or_takeover_cron_run(
+                    &mut txn,
+                    db_id,
+                    task_id,
+                    scheduled_min,
+                    crate::worker::now_epoch_ms(),
+                    crate::worker::now_epoch_ms() + 10_000_000,
+                    &job,
+                    "postgres".to_string(),
+                )
+                .await
+                .expect("claim M");
+            txn.commit().await.expect("commit claim M");
+            match outcome {
+                CronClaimOutcome::Claimed { run } => run.run_id,
+                other => panic!("first claim of M must be Claimed, got {other:?}"),
+            }
+        };
+
+        // Reaper terminalization: terminal CONTROL(M) + ACTIVE deleted.
+        {
+            let mut txn = store.begin().await.unwrap();
+            let run = CronRun {
+                run_id: fence,
+                job_id: task_id,
+                job_pid: None,
+                database: "postgres".to_string(),
+                username: job.username.clone(),
+                command: job.command.clone(),
+                status: CronRunStatus::Failed,
+                return_message: Some("recovered by reaper".to_string()),
+                start_time: Some(0),
+                end_time: Some(1),
+            };
+            let accepted = store
+                .finalize_cron_run_cas(
+                    &mut txn,
+                    db_id,
+                    task_id,
+                    scheduled_min,
+                    fence,
+                    CronRunState::Failed,
+                    &run,
+                )
+                .await
+                .expect("reaper finalize M");
+            assert!(accepted, "reaper terminalization of M must be accepted");
+            txn.commit().await.expect("commit reaper finalize M");
+        }
+    }
+
+    // finalize_fn must NEVER run for an AlreadyTerminalForMinute reclaim: the
+    // minute is already done, so this worker owns no run to finalize.
+    let no_finalize = |_store, _db_id, _run, _status, _msg, _start, _end, _sched_min| async {
+        panic!(
+            "INVARIANT VIOLATED: finalize ran for an AlreadyTerminalForMinute reclaim — \
+                 this worker did not run the fire and owns no run to finalize"
+        );
+        #[allow(unreachable_code)]
+        Ok(())
+    };
+
+    // First reclaim of the still-present due row for M.
+    let result = WorkerEngine::claim_and_execute_core(
+        &system_store,
+        &pool,
+        &cfg,
+        &metrics,
+        queue_key.clone(),
+        DueItem::V2(descriptor.clone()),
+        CancellationToken::new(),
+        no_finalize,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "claim_and_execute_core must succeed on an already-terminal reclaim: {:?}",
+        result.err()
+    );
+
+    // The next fire M+1 must be enqueued; assert it sits at a strictly later fire
+    // time than M (so we are observing the requeue, not a leftover M row).
+    let next_fire_count = |rows: &[(Vec<u8>, TaskDescriptorV2)]| -> usize {
+        rows.iter()
+            .filter(|(k, d)| {
+                d.task_id == task_id
+                    && d.keyspace == keyspace
+                    && d.task_type == TaskType::Cron
+                    && crate::storage::decode_wq_due_v2_fire_time(k)
+                        .map(|ft| ft > fire_time_ms)
+                        .unwrap_or(false)
+            })
+            .count()
+    };
+
+    {
+        let mut txn = system_store.begin().await.unwrap();
+
+        // (i) the original M due row is gone (cleanup dropped it).
+        let m_present = {
+            let rows = system_store
+                .scan_due_v2(&mut txn, i64::MAX, 1000)
+                .await
+                .unwrap();
+            rows.iter().any(|(k, d)| {
+                d.task_id == task_id
+                    && d.keyspace == keyspace
+                    && d.task_type == TaskType::Cron
+                    && crate::storage::decode_wq_due_v2_fire_time(k) == Some(fire_time_ms)
+            })
+        };
+        assert!(!m_present, "the processed minute-M due row must be dropped");
+
+        // (ii) the next fire M+1 IS enqueued.
+        let rows = system_store
+            .scan_due_v2(&mut txn, i64::MAX, 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_fire_count(&rows),
+            1,
+            "AlreadyTerminalForMinute must requeue exactly one next cron fire (M+1)"
+        );
+        txn.rollback().await.ok();
+    }
+
+    // (iii) Idempotency: re-plant the M due row and reclaim a SECOND time. The
+    // minute is still terminal, so the reclaim again dedups and re-enqueues M+1
+    // through the SAME deterministic-key singleton put — there must still be
+    // exactly one M+1 row (the duplicate next-fire write overwrites in place).
+    {
+        let entry = TaskQueueEntry::new(
+            keyspace.clone(),
+            db_id,
+            task_id,
+            TaskType::Cron,
+            job.command.clone(),
+            job.username.clone(),
+            descriptor.priority,
+        )
+        .with_schedule(job.schedule.clone());
+        let mut txn = system_store.begin().await.unwrap();
+        system_store
+            .put_task_v2(&mut txn, &entry, fire_time_ms)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let (key2, descriptor2) = {
+            let mut txn = system_store.begin().await.unwrap();
+            let rows = system_store
+                .scan_due_v2(&mut txn, i64::MAX, 1000)
+                .await
+                .unwrap();
+            let found = rows
+                .into_iter()
+                .find(|(k, d)| {
+                    d.task_id == task_id
+                        && d.keyspace == keyspace
+                        && d.task_type == TaskType::Cron
+                        && crate::storage::decode_wq_due_v2_fire_time(k) == Some(fire_time_ms)
+                })
+                .expect("re-planted minute-M due row must exist");
+            txn.rollback().await.ok();
+            found
+        };
+
+        let result2 = WorkerEngine::claim_and_execute_core(
+            &system_store,
+            &pool,
+            &cfg,
+            &metrics,
+            key2,
+            DueItem::V2(descriptor2),
+            CancellationToken::new(),
+            no_finalize,
+        )
+        .await;
+        assert!(
+            result2.is_ok(),
+            "second already-terminal reclaim must succeed: {:?}",
+            result2.err()
+        );
+    }
+
+    {
+        let mut txn = system_store.begin().await.unwrap();
+        let rows = system_store
+            .scan_due_v2(&mut txn, i64::MAX, 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_fire_count(&rows),
+            1,
+            "two terminal-minute reclaims must enqueue M+1 EXACTLY once (idempotent singleton)"
+        );
+        txn.rollback().await.ok();
+    }
 }
 
 /// Behavioral coverage for the commit-adjacent OWNERSHIP fence on the cron

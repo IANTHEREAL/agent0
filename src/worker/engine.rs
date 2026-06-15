@@ -1,6 +1,6 @@
 use crate::cron::config::CronConfig;
 use crate::cron::process_list::{get_process_list, RunningCronJob};
-use crate::cron::types::{CronJob, CronRun, CronRunStatus};
+use crate::cron::types::{CronJob, CronRun, CronRunState, CronRunStatus};
 use crate::cron::worker::gc_database;
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
@@ -10,7 +10,7 @@ use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
-use crate::storage::{CronRunClaimStatus, TikvStore, WqIndexRow};
+use crate::storage::{CronClaimOutcome, TikvStore, WqIndexRow};
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 
@@ -271,11 +271,57 @@ fn cron_queue_entry_matches_job(entry: &TaskQueueEntry, job: &CronJob) -> bool {
         && entry.schedule.as_deref() == Some(job.schedule.as_str())
 }
 
-fn keep_queue_entry_for_claim_status(claim_status: CronRunClaimStatus) -> Option<bool> {
-    match claim_status {
-        CronRunClaimStatus::Claimed => None,
-        CronRunClaimStatus::AlreadyClaimedForMinute => Some(false),
-        CronRunClaimStatus::BlockedByRunningGuard => Some(true),
+/// Map a cron claim outcome to the queue-row disposition: `None` = we own a run,
+/// proceed; `Some(false)` = drop the due row (this exact fire already completed —
+/// requeue is the *next* fire's job); `Some(true)` = keep the row and retry next
+/// tick (a live run holds the job, no-overlap).
+fn keep_queue_entry_for_claim_status(outcome: &CronClaimOutcome) -> Option<bool> {
+    match outcome {
+        CronClaimOutcome::Claimed { .. } | CronClaimOutcome::TookOver { .. } => None,
+        CronClaimOutcome::AlreadyTerminalForMinute => Some(false),
+        // Both block outcomes keep the queue row and retry next tick. The `Folded`
+        // variant additionally carries durable fold writes the caller must COMMIT
+        // (see `must_commit_blocked`); the queue disposition is identical.
+        CronClaimOutcome::BlockedByLiveActive | CronClaimOutcome::BlockedByLiveActiveFolded => {
+            Some(true)
+        }
+    }
+}
+
+/// Whether the cleanup must enqueue the job's NEXT fire, given the claim outcome.
+///
+/// The guaranteed-schedule-progress contract (design 35 §Contract) requires the
+/// next fire be enqueued whenever the claimed minute is DONE — not only when THIS
+/// worker ran it. A minute is DONE in two cases:
+///   - we claimed/took over and executed it (`Claimed`/`TookOver`), or
+///   - it is ALREADY TERMINAL (`AlreadyTerminalForMinute`): some other path
+///     completed it — including the crash-recovery case where this worker claimed
+///     M, crashed before requeue, and the reaper terminalized CONTROL(M) while the
+///     due row for M still existed. A later worker reclaiming that due row sees
+///     terminal CONTROL and returns `AlreadyTerminalForMinute`; if cleanup then
+///     dropped the row WITHOUT requeue, the schedule would silently stall until a
+///     much-later registry sweep (the residual silent-dropped-fire of DEFECT 2).
+///
+/// A still-running block (`BlockedByLiveActive`/`Folded`) is NOT done: the live
+/// run owns the fire and will itself requeue the next fire when it finalizes —
+/// the due row is KEPT for a later retry and no new fire is enqueued here (a
+/// double-enqueue would be folded by the singleton next-fire put, but keeping the
+/// row is the correct disposition).
+///
+/// The next-fire enqueue this gates is a fenced, idempotent SINGLETON put
+/// (`enqueue_task_v2_unless_db_dropped` over the deterministic next-due key), so
+/// multiple workers reclaiming the same terminal minute enqueue M+1 at most once,
+/// and a dropped DB suppresses it — the same guarantees the ran-it path relies on.
+fn cron_outcome_requeues_next_fire(outcome: &CronClaimOutcome) -> bool {
+    match outcome {
+        // Ran it, or it was already done — the minute is terminal: requeue M+1.
+        CronClaimOutcome::Claimed { .. }
+        | CronClaimOutcome::TookOver { .. }
+        | CronClaimOutcome::AlreadyTerminalForMinute => true,
+        // A live run still holds the job — keep the row, do NOT enqueue a new fire.
+        CronClaimOutcome::BlockedByLiveActive | CronClaimOutcome::BlockedByLiveActiveFolded => {
+            false
+        }
     }
 }
 
@@ -1838,7 +1884,22 @@ impl WorkerEngine {
         let task_type = due.task_type();
         let (claim_keyspace, claim_db_id, claim_task_id) =
             (due.keyspace().to_string(), due.db_id(), due.task_id());
+        // Worker-queue SYSTEM-claim orphan timeout: a fallback for legacy claims
+        // without an explicit lease. The live run renews its claim via the lease
+        // keeper, so this stays the raw control timeout (it gates the queue claim,
+        // not the cron control deadline).
         let legacy_orphan_timeout_ms = (config.orphan_timeout_sec as i64).saturating_mul(1000);
+        // Cron CONTROL/ACTIVE floor: the FROZEN orphan deadline must cover the
+        // full legitimate EXECUTION window. With no per-job `max_runtime_ms` that
+        // window is `cron_job_timeout_ms`, not the bare `orphan_timeout_sec`, so
+        // the floor is the effective `max(orphan_timeout, cron_job_timeout)` — the
+        // SAME single-source helper the GC reaper view uses (no second copy that
+        // can drift). The per-claim path then takes a further `max` with
+        // `job.max_runtime_ms` inside `cron_effective_orphan_deadline_ms`.
+        let cron_control_floor_ms = crate::worker::gc::effective_cron_orphan_floor_ms(
+            config.orphan_timeout_sec,
+            config.cron_job_timeout_ms,
+        );
         let claim_lease_ms = config.claim_lease_ms as i64;
         let claim = WorkerClaim::with_lease(config.worker_id.clone(), task_type, claim_lease_ms);
 
@@ -1955,12 +2016,26 @@ impl WorkerEngine {
             }
         };
 
-        let (cron_run, keep_queue_entry) = if entry.task_type == TaskType::Cron {
-            Self::claim_and_record_cron_run(pool, &entry, scheduled_minute).await?
+        let (cron_run, keep_queue_entry, should_requeue_cron) = if entry.task_type == TaskType::Cron
+        {
+            Self::claim_and_record_cron_run(
+                pool,
+                &entry,
+                scheduled_minute,
+                cron_control_floor_ms,
+                config.cron_job_timeout_ms,
+            )
+            .await?
         } else {
-            (None, false)
+            (None, false, false)
         };
-        let should_requeue_cron = cron_run.is_some();
+        // `should_requeue_cron` is decoupled from `cron_run.is_some()`: it is true
+        // whenever the claimed minute is DONE (ran-it OR `AlreadyTerminalForMinute`),
+        // so a reaper-recovered crash whose minute the next worker observes already
+        // terminal still enqueues the next fire and preserves guaranteed schedule
+        // progress (design 35 §Contract / DEFECT 2 residual). It is false for a
+        // still-live block and for not-actionable outcomes (cron disabled, job
+        // gone/inactive, stale payload, DB dropped).
 
         // Lease keeper: while this task executes, periodically renew our claim
         // (at ~lease/3) so GC's expired-lease reaper never reaps a still-running
@@ -1996,7 +2071,14 @@ impl WorkerEngine {
                 started_at: now_epoch_ms(),
             });
 
-            let timeout_ms = max_runtime_ms.unwrap_or(config.cron_job_timeout_ms);
+            // The executor timeout and the frozen orphan deadline are the SAME
+            // "legitimate execution window" — derive both from the one source so a
+            // still-executing run can never be classed expired and taken over
+            // (`cron_execution_window_ms`; design 35 §Effective floor).
+            let timeout_ms = crate::storage::cron::cron_execution_window_ms(
+                max_runtime_ms,
+                config.cron_job_timeout_ms,
+            );
             let deadline = if timeout_ms > 0 {
                 Some(tokio::time::Instant::now() + Duration::from_millis(timeout_ms))
             } else {
@@ -2186,10 +2268,25 @@ impl WorkerEngine {
             }
         }
 
-        // Only requeue the next cron fire when finalization SUCCEEDED. A failed
-        // finalize means the run's terminal state / DB liveness is in doubt
-        // (e.g. DROP DATABASE removed metadata mid-run), so scheduling the next
-        // fire could write a fresh entry into the global queue for a dropped DB.
+        // Requeue the next cron fire whenever the claimed minute is DONE
+        // (`should_requeue_cron`): we ran/took-over the fire, OR the claim observed
+        // it ALREADY TERMINAL (`AlreadyTerminalForMinute` — e.g. this worker claimed
+        // M, crashed before requeue, and the reaper terminalized CONTROL(M) while
+        // the due row for M still existed; a later worker reclaims it, sees terminal
+        // CONTROL, and must NOT drop the row without scheduling M+1). Both cases use
+        // the SAME fenced idempotent singleton enqueue below — a reaper-recovered
+        // crash thus preserves guaranteed schedule progress instead of stalling
+        // until a much-later registry sweep (design 35 §Contract / DEFECT 2
+        // residual). A still-live block keeps the row and does NOT requeue here.
+        //
+        // Gated on `finalize_result.is_ok()`: a failed finalize means the run's
+        // terminal state / DB liveness is in doubt (e.g. DROP DATABASE removed
+        // metadata mid-run), so scheduling the next fire could write a fresh entry
+        // into the global queue for a dropped DB. The `AlreadyTerminalForMinute`
+        // path carries no `cron_run`, so `finalize_result` is `Ok(())` (the run was
+        // finalized by whoever completed M) — its DB-liveness is instead enforced by
+        // `load_next_cron_queue_entry`'s own tenant fence + the dropped-DB tombstone
+        // fence on the enqueue below.
         if entry.task_type == TaskType::Cron && should_requeue_cron && finalize_result.is_ok() {
             // The next-fire decision must cross the SAME DB-liveness fence that
             // finalize uses. The database metadata row lives in the TENANT
@@ -2264,31 +2361,86 @@ impl WorkerEngine {
         Ok(())
     }
 
+    /// Returns `(cron_run, keep_queue_entry, requeue_next_fire)`:
+    /// - `cron_run`: `Some` iff this worker owns a run to execute + finalize.
+    /// - `keep_queue_entry`: keep the due row (a live run holds the job) vs drop it.
+    /// - `requeue_next_fire`: enqueue the job's NEXT fire because the claimed minute
+    ///   is DONE (ran it, or already terminal). FALSE for blocked/not-actionable
+    ///   outcomes (cron disabled, job gone/inactive, stale payload, DB dropped, or a
+    ///   still-live block) — see `cron_outcome_requeues_next_fire`. Decoupled from
+    ///   `cron_run.is_some()` so the `AlreadyTerminalForMinute` crash-recovery case
+    ///   (reaper terminalized the minute; this worker did not run it) still preserves
+    ///   guaranteed schedule progress (design 35 §Contract / DEFECT 2 residual).
     async fn claim_and_record_cron_run(
         pool: &Arc<TikvClientPool>,
         entry: &TaskQueueEntry,
         scheduled_minute: i64,
+        global_orphan_timeout_ms: i64,
+        cron_job_timeout_ms: u64,
     ) -> Result<(
         Option<(Arc<TikvStore>, u64, CronRun, i64, Option<u64>)>,
+        bool,
         bool,
     )> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
+
+        // Fail-closed migration gate (design 35): before claiming on the new
+        // control/active path, ensure any legacy guard/claim keys for this db are
+        // migrated, so a rolling deploy never runs the old and new claim schemes
+        // against the same fire. Idempotent — a no-op marker read once migrated.
+        //
+        // The migrated guard inherits a LIVE orphan deadline so it keeps the
+        // legacy guard's no-overlap authority for the rolling window (a born-stale
+        // `deadline_ms = 0` would be classed as expired by both the no-overlap gate
+        // and the reaper, reopening the double-exec window). The migration resolves
+        // EACH guard's own job `max_runtime_ms` from the catalog inside its txn and
+        // stamps the deadline via the SAME shared helper a fresh claim uses
+        // (`now + max(global, job.max_runtime)`), so a long-running job's migrated
+        // authority does not expire at `now + global` while the per-claim straggler
+        // fold (which already uses the longer effective deadline) would not —
+        // closing the mixed-version job-level overlap that divergence opened. We
+        // pass the global timeout as the floor; the per-job runtime is read inside
+        // the migration, not here.
+        store
+            .ensure_cron_control_migrated(
+                entry.db_id,
+                now_epoch_ms(),
+                global_orphan_timeout_ms,
+                cron_job_timeout_ms,
+            )
+            .await?;
+
         let mut txn = store.begin().await?;
 
+        // The inner block yields `(run, keep_queue_entry, must_commit, requeue)`:
+        // `must_commit` is `true` ONLY when the claim performed a durable straggler
+        // fold but is blocked (it wrote ACTIVE/CONTROL the reaper must later be able
+        // to reap). Every plain "no run" path leaves it `false` so the txn rolls
+        // back — no needless commit (design 35 §Post-marker straggler fold).
+        // `requeue` is `true` iff the claimed minute is DONE and the caller must
+        // enqueue the job's next fire (ran-it OR `AlreadyTerminalForMinute`); the
+        // not-actionable early returns below leave it `false` (no job to schedule
+        // from, or the DB/cron is gone) — see `cron_outcome_requeues_next_fire`.
         let claim_result = async {
+            // Cheap fast-path snapshot read: skip the claim work if cron is already
+            // visibly disabled. This is NOT the authoritative gate — a concurrent
+            // `DROP EXTENSION pg_cron` can still commit `remove_cron_enabled` AFTER
+            // this snapshot. The control-plane writes below are fenced by the
+            // `is_cron_enabled_for_update` pessimistic read taken in the SAME txn
+            // before commit (see the commit arms), which conflicts with that drop.
             if !store.is_cron_enabled(&mut txn, entry.db_id).await? {
-                return Ok((None, false));
+                return Ok((None, false, false, false));
             }
 
             let Some(job) = store
                 .get_cron_job(&mut txn, entry.db_id, entry.task_id)
                 .await?
             else {
-                return Ok((None, false));
+                return Ok((None, false, false, false));
             };
             if !job.active {
-                return Ok((None, false));
+                return Ok((None, false, false, false));
             }
             if !cron_queue_entry_matches_job(entry, &job) {
                 warn!(
@@ -2297,65 +2449,146 @@ impl WorkerEngine {
                     job_id = entry.task_id,
                     "skipping stale cron queue entry whose payload no longer matches catalog job"
                 );
-                return Ok((None, false));
+                return Ok((None, false, false, false));
             }
 
-            let claim_status = store
-                .try_claim_cron_run(&mut txn, entry.db_id, entry.task_id, scheduled_minute)
-                .await?;
-            if let Some(keep_queue_entry) = keep_queue_entry_for_claim_status(claim_status) {
-                return Ok((None, keep_queue_entry));
-            }
-
+            // The database name is needed to build the run record, so resolve it
+            // (and the DROP-DATABASE liveness signal) BEFORE the claim CAS.
             let Some(db_def) = store.get_database_by_id(&mut txn, entry.db_id).await? else {
                 tracing::warn!(
                     db_id = entry.db_id,
                     job_id = entry.task_id,
                     "skipping cron job: database no longer exists (possibly dropped)"
                 );
-                return Ok((None, false));
+                return Ok((None, false, false, false));
             };
             let database = db_def.name;
-
             let max_runtime_ms = job.max_runtime_ms;
 
-            let run_id = store.next_cron_run_id(entry.db_id).await?;
-            let started_at = now_epoch_ms();
-            let run = CronRun {
-                run_id,
-                job_id: entry.task_id,
-                job_pid: None,
-                database,
-                username: job.username.clone(),
-                command: job.command.clone(),
-                status: CronRunStatus::Running,
-                return_message: None,
-                start_time: Some(started_at),
-                end_time: None,
-            };
-            store.put_cron_run(&mut txn, entry.db_id, &run).await?;
-            // Set the running guard to prevent overlapping runs
-            store
-                .set_cron_running_guard(&mut txn, entry.db_id, entry.task_id, run_id)
+            // Orphan deadline: now + max(global orphan timeout, this job's
+            // max_runtime), FROZEN onto the CONTROL/ACTIVE records at claim time.
+            // The fence-CAS reaper (`reap_stale_active_runs`, cron/worker.rs) is
+            // the single orphan-recovery path and drives off this frozen deadline,
+            // so a later `cron.alter_job` that lowers max_runtime cannot retroact
+            // a still-live run to Failed. It is >> the system claim lease, so a
+            // normally lease-renewing run is never superseded mid-flight.
+            let now = now_epoch_ms();
+            // Single source of truth for the frozen orphan deadline — the SAME
+            // helper the bulk migration and the per-claim straggler fold use, so
+            // `now + max(global, job.max_runtime)` is computed in exactly one place
+            // (a second copy once let the bulk migration stamp `now + global` and
+            // expire a long job's migrated authority early — design 35 §Migration).
+            let deadline_ms = crate::storage::cron::cron_effective_orphan_deadline_ms(
+                now,
+                global_orphan_timeout_ms,
+                max_runtime_ms,
+                cron_job_timeout_ms,
+            );
+
+            // Single-lifecycle, fence-token claim (design 35). One pessimistic CAS
+            // over the CONTROL + ACTIVE keys: dedup, no-overlap, fence mint, and
+            // the Running history projection all happen here.
+            let outcome = store
+                .claim_or_takeover_cron_run(
+                    &mut txn,
+                    entry.db_id,
+                    entry.task_id,
+                    scheduled_minute,
+                    now,
+                    deadline_ms,
+                    &job,
+                    database,
+                )
                 .await?;
+            if let Some(keep_queue_entry) = keep_queue_entry_for_claim_status(&outcome) {
+                // A blocked claim yields no run. If it folded a straggler guard it
+                // wrote durable ACTIVE/CONTROL the reaper must later reap, so the txn
+                // MUST commit; a plain block wrote nothing and rolls back.
+                //
+                // `AlreadyTerminalForMinute` lands here too (no run, drop the row),
+                // but its minute is DONE — the caller MUST still enqueue the next
+                // fire (`cron_outcome_requeues_next_fire`), or a reaper-recovered
+                // crash silently loses one fire (DEFECT 2 residual). A still-live
+                // block is NOT done → no requeue.
+                let requeue = cron_outcome_requeues_next_fire(&outcome);
+                return Ok((
+                    None,
+                    keep_queue_entry,
+                    outcome.must_commit_blocked(),
+                    requeue,
+                ));
+            }
+            let requeue = cron_outcome_requeues_next_fire(&outcome);
+            let (CronClaimOutcome::Claimed { run } | CronClaimOutcome::TookOver { run }) = outcome
+            else {
+                unreachable!(
+                    "keep_queue_entry_for_claim_status returns None only for Claimed/TookOver"
+                );
+            };
+            let started_at = run.start_time.unwrap_or(now);
             Ok((
                 Some((store.clone(), entry.db_id, run, started_at, max_runtime_ms)),
                 false,
+                true,
+                requeue,
             ))
         }
         .await;
 
         match claim_result {
-            Ok((Some(run), keep_queue_entry)) => {
+            Ok((Some(run), keep_queue_entry, _must_commit, requeue)) => {
+                // Authoritative cron-disabled fence (P1). This is the SAME txn that
+                // wrote CONTROL/ACTIVE/CronRun via `claim_or_takeover_cron_run`.
+                // Take `get_for_update` on the cron-enabled marker so a concurrent
+                // `DROP EXTENSION pg_cron` (`remove_cron_enabled` + `delete_all_cron_data`)
+                // either makes this read see cron disabled (→ abort, no orphaned
+                // control-plane state) or write-write-conflicts the marker and aborts
+                // one side. The plain fast-path read above does not serialize with
+                // the drop; this fence does. Mirrors the DB-liveness fence beside it
+                // — the disabled-DB GC skip never reaps such orphaned state, so the
+                // write must be prevented, not self-healed.
+                if !store
+                    .is_cron_enabled_for_update(&mut txn, entry.db_id)
+                    .await?
+                {
+                    // Aborted: nothing committed and cron is disabled — no next fire.
+                    txn.rollback().await.ok();
+                    return Ok((None, keep_queue_entry, false));
+                }
                 store
                     .assert_database_alive_for_update(&mut txn, entry.db_id)
                     .await?;
                 txn.commit().await?;
-                Ok((Some(run), keep_queue_entry))
+                Ok((Some(run), keep_queue_entry, requeue))
             }
-            Ok((None, keep_queue_entry)) => {
+            // Blocked-but-folded: commit the durable fold (ACTIVE/CONTROL the reaper
+            // can later supersede) under the same DB-liveness fence, even though no
+            // run was claimed this tick. Without this the fold is rolled back every
+            // tick and the orphaned straggler never becomes reapable.
+            Ok((None, keep_queue_entry, true, requeue)) => {
+                // Same authoritative cron-disabled fence: a straggler fold TRANSLATES
+                // legacy guard state into new ACTIVE/CONTROL authority, so a fold
+                // committed after a concurrent `DROP EXTENSION pg_cron` would leave
+                // orphaned (un-reaped) control-plane state. Fence it identically to
+                // the claimed-run arm.
+                if !store
+                    .is_cron_enabled_for_update(&mut txn, entry.db_id)
+                    .await?
+                {
+                    txn.rollback().await.ok();
+                    return Ok((None, keep_queue_entry, false));
+                }
+                store
+                    .assert_database_alive_for_update(&mut txn, entry.db_id)
+                    .await?;
+                txn.commit().await?;
+                // A fold is a still-live block (`BlockedByLiveActiveFolded`) → not
+                // done → `requeue` is false; propagate it for a single clean path.
+                Ok((None, keep_queue_entry, requeue))
+            }
+            Ok((None, keep_queue_entry, false, requeue)) => {
                 txn.rollback().await.ok();
-                Ok((None, keep_queue_entry))
+                Ok((None, keep_queue_entry, requeue))
             }
             Err(e) => {
                 txn.rollback().await.ok();
@@ -2436,37 +2669,59 @@ impl WorkerEngine {
         end_time: i64,
         scheduled_min: i64,
     ) -> Result<()> {
+        let terminal_state = match &status {
+            CronRunStatus::Succeeded => CronRunState::Succeeded,
+            CronRunStatus::Cancelled => CronRunState::Cancelled,
+            _ => CronRunState::Failed,
+        };
+        run.status = status;
+        run.return_message = return_message;
+        run.start_time = Some(start_time);
+        run.end_time = Some(end_time);
+
         let mut txn = store.begin().await?;
-        let finalize_result = async {
-            run.status = status;
-            run.return_message = return_message;
-            run.start_time = Some(start_time);
-            run.end_time = Some(end_time);
-            store.put_cron_run(&mut txn, db_id, &run).await?;
-            // Clear the running guard now that the run is in a terminal state.
-            store
-                .clear_cron_running_guard(&mut txn, db_id, run.job_id, run.run_id)
+        // Fence-gated terminal CAS (design 35). The store rejects the write if a
+        // takeover has minted a higher fence — so a worker that lost its lease
+        // cannot commit terminal cron state (DEFECT 1). On accept the SAME txn
+        // clears the no-overlap pointer and projects the terminal CronRun, so a
+        // terminal transition can never strand the per-minute dedup record
+        // (DEFECT 2). `run.run_id` IS the fence (minted == run_id at claim).
+        let finalize_result: Result<bool> = async {
+            let accepted = store
+                .finalize_cron_run_cas(
+                    &mut txn,
+                    db_id,
+                    run.job_id,
+                    scheduled_min,
+                    run.run_id,
+                    terminal_state,
+                    &run,
+                )
                 .await?;
-            // Also release the per-minute run claim. It was written by
-            // try_claim_cron_run to dedup same-minute fires and is scoped to a
-            // LIVE run; leaving it after the run is terminal makes a takeover
-            // worker (re-claiming the same scheduled_min after an expired lease)
-            // hit AlreadyClaimedForMinute and drop the due row without requeue —
-            // one scheduled fire silently lost. Cleared in the SAME tenant txn so
-            // the per-minute guard never outlives its run's terminal state.
+            if !accepted {
+                return Ok(false);
+            }
             store
-                .clear_cron_claim(&mut txn, db_id, run.job_id, scheduled_min)
+                .assert_database_alive_for_update(&mut txn, db_id)
                 .await?;
-            Ok(())
+            Ok(true)
         }
         .await;
 
         match finalize_result {
-            Ok(()) => {
-                store
-                    .assert_database_alive_for_update(&mut txn, db_id)
-                    .await?;
+            Ok(true) => {
                 txn.commit().await?;
+                Ok(())
+            }
+            Ok(false) => {
+                txn.rollback().await.ok();
+                warn!(
+                    db_id,
+                    job_id = run.job_id,
+                    scheduled_min,
+                    "cron finalize rejected by fence (lease lost / taken over); \
+                     leaving terminal state to the new owner"
+                );
                 Ok(())
             }
             Err(e) => {
