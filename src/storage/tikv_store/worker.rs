@@ -21,7 +21,11 @@ pub struct WqIndexRow {
 const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
 const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
 const WORKER_QUEUE_SCHEMA_V2: u8 = 2;
-const WORKER_QUEUE_MIGRATION_BATCH: u32 = 256;
+/// Max rows migrated by ONE `drain_legacy_worker_queue_batch` call. Exposed at
+/// crate scope so the worker engine's drain-tick budget-cap orchestration test
+/// can compute the exact per-tick migration ceiling
+/// (`LEGACY_DRAIN_MAX_BATCHES_PER_TICK * WORKER_QUEUE_MIGRATION_BATCH`).
+pub(crate) const WORKER_QUEUE_MIGRATION_BATCH: u32 = 256;
 const WORKER_QUEUE_MIGRATION_LOCK_STALE_MS: i64 = 30 * 60 * 1000;
 
 /// Published GC instance state read back from `_sys_worker`.
@@ -593,6 +597,41 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Seed many legacy (`_worker_queue_`) entries in batched transactions,
+    /// simulating a large backlog left by a pre-V2 binary. Test-only; used by the
+    /// drain-tick budget-cap orchestration test where seeding one txn per row
+    /// would be prohibitively slow. Each `(entry, fire_time_ms)` becomes one V1
+    /// key; rows are committed in chunks of `chunk_size`.
+    #[cfg(test)]
+    pub async fn seed_legacy_worker_queue_entries_for_test(
+        &self,
+        entries: &[(TaskQueueEntry, i64)],
+        chunk_size: usize,
+    ) -> Result<()> {
+        let chunk_size = chunk_size.max(1);
+        for chunk in entries.chunks(chunk_size) {
+            let mut txn = self.begin().await?;
+            for (entry, fire_time_ms) in chunk {
+                let legacy_key = encode_worker_queue_key(
+                    entry.priority,
+                    *fire_time_ms,
+                    entry.task_type.to_bitmask(),
+                    &entry.keyspace,
+                    entry.db_id,
+                    entry.task_id,
+                )?;
+                txn_put(
+                    &mut txn,
+                    self.key(&legacy_key),
+                    bincode::serialize(entry).context("serialize legacy worker queue entry")?,
+                )
+                .await?;
+            }
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+
     /// Delete a single due-queue key (legacy `_worker_queue_`). Used by the
     /// one-shot V1-to-V2 migration and test-only compatibility checks. Normal
     /// production queue paths are V2-only.
@@ -615,6 +654,11 @@ impl TikvStore {
     /// purely a cursor batch size; even very large tenants stay far under the
     /// gRPC frame limit (~50-byte keys × this batch ≈ a few hundred KiB).
     const WQ_INDEX_SCAN_PAGE: u32 = 4096;
+
+    /// Page size for the streamed DROP DATABASE reap. One page is BOTH the read
+    /// unit and the 2PC delete unit, so the read phase never holds more than this
+    /// many index rows and the delete txn's write/lock set stays bounded.
+    const REAP_INDEX_PAGE: u32 = 256;
 
     /// Enqueue (or idempotently overwrite) a task in V2 layout: write the
     /// due-queue descriptor, the index row, and — for split task types — the
@@ -807,8 +851,92 @@ impl TikvStore {
         }
     }
 
+    /// Scan ONE bounded page of the V2 index under `logical_prefix`, starting
+    /// after `start_after` (exclusive; `None` = from the prefix start). Returns
+    /// the decoded rows plus a `next_cursor` (the raw last key) when the page was
+    /// full and more rows MAY remain, or `None` when this page reached the end of
+    /// the prefix range. Index values are a single byte, so the response is
+    /// byte-safe regardless of command payload size; due-queue values are never
+    /// read.
+    ///
+    /// This is the single page primitive. `scan_index_rows` loops it to collect a
+    /// full result; `reap_db_queue_entries` drives it page-by-page so the read
+    /// phase never materializes the whole per-db backlog at once.
+    async fn scan_index_rows_page(
+        &self,
+        txn: &mut Transaction,
+        logical_prefix: &[u8],
+        start_after: Option<&[u8]>,
+        page_size: u32,
+    ) -> Result<(Vec<WqIndexRow>, Option<Vec<u8>>)> {
+        let prefix = self.key(logical_prefix);
+        let upper = encode_prefix_end(&prefix);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+
+        let range: BoundRange = (start..upper).into();
+        let pairs: Vec<_> = tikv_op!(txn.scan(range, page_size).await)?.collect();
+        let page_len = pairs.len();
+
+        let mut rows = Vec::with_capacity(page_len);
+        let mut last_key: Vec<u8> = Vec::new();
+        for pair in &pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            last_key = key.to_vec();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let Some(entry) = decode_wq_index_key(key) else {
+                continue;
+            };
+            // The index value is always a 1-byte priority (written by
+            // put_task_v2). A missing/empty value is corruption: skip it
+            // rather than defaulting priority to 0, which would reconstruct a
+            // due_key at the wrong priority and delete a nonexistent row.
+            let Some(priority) = pair.value().first().copied() else {
+                tracing::warn!(
+                    "Skipping V2 index row with empty value: keyspace={} db_id={} task_type={} task_id={}",
+                    entry.keyspace, entry.db_id, entry.task_type, entry.task_id
+                );
+                continue;
+            };
+            let due_key = self.key(&encode_wq_due_v2_key(
+                priority,
+                entry.fire_time_ms,
+                entry.task_type,
+                &entry.keyspace,
+                entry.db_id,
+                entry.task_id,
+            )?);
+            rows.push(WqIndexRow {
+                due_key,
+                keyspace: entry.keyspace,
+                db_id: entry.db_id,
+                task_type: entry.task_type,
+                task_id: entry.task_id,
+                fire_time_ms: entry.fire_time_ms,
+            });
+        }
+
+        // A short page (or an empty last_key) means we reached the end of the
+        // prefix range; otherwise hand back the raw last key as the next cursor.
+        let next_cursor = if (page_len as u32) < page_size || last_key.is_empty() {
+            None
+        } else {
+            Some(last_key)
+        };
+        Ok((rows, next_cursor))
+    }
+
     /// Scan the V2 index under `logical_prefix`, returning each matching row with
-    /// its reconstructed V2 due-queue key. Paged by count (values are 1 byte, so
+    /// its reconstructed V2 due-queue key. Loops [`scan_index_rows_page`] until
+    /// the prefix range is exhausted. Paged by count (values are 1 byte, so
     /// byte-safe regardless of command payload size). Never reads due-queue
     /// values.
     async fn scan_index_rows(
@@ -816,62 +944,22 @@ impl TikvStore {
         txn: &mut Transaction,
         logical_prefix: Vec<u8>,
     ) -> Result<Vec<WqIndexRow>> {
-        let prefix = self.key(&logical_prefix);
-        let upper = encode_prefix_end(&prefix);
-
         let mut rows = Vec::new();
-        let mut cursor = prefix.clone();
+        let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let range: BoundRange = (cursor.clone()..upper.clone()).into();
-            let pairs: Vec<_> =
-                tikv_op!(txn.scan(range, Self::WQ_INDEX_SCAN_PAGE).await)?.collect();
-            let page_len = pairs.len();
-            if page_len == 0 {
-                break;
+            let (page, next) = self
+                .scan_index_rows_page(
+                    txn,
+                    &logical_prefix,
+                    cursor.as_deref(),
+                    Self::WQ_INDEX_SCAN_PAGE,
+                )
+                .await?;
+            rows.extend(page);
+            match next {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
             }
-            let mut last_key: Vec<u8> = Vec::new();
-            for pair in &pairs {
-                let key: &[u8] = pair.key().as_ref().into();
-                last_key = key.to_vec();
-                if !key.starts_with(&prefix) {
-                    continue;
-                }
-                let Some(entry) = decode_wq_index_key(key) else {
-                    continue;
-                };
-                // The index value is always a 1-byte priority (written by
-                // put_task_v2). A missing/empty value is corruption: skip it
-                // rather than defaulting priority to 0, which would reconstruct a
-                // due_key at the wrong priority and delete a nonexistent row.
-                let Some(priority) = pair.value().first().copied() else {
-                    tracing::warn!(
-                        "Skipping V2 index row with empty value: keyspace={} db_id={} task_type={} task_id={}",
-                        entry.keyspace, entry.db_id, entry.task_type, entry.task_id
-                    );
-                    continue;
-                };
-                let due_key = self.key(&encode_wq_due_v2_key(
-                    priority,
-                    entry.fire_time_ms,
-                    entry.task_type,
-                    &entry.keyspace,
-                    entry.db_id,
-                    entry.task_id,
-                )?);
-                rows.push(WqIndexRow {
-                    due_key,
-                    keyspace: entry.keyspace,
-                    db_id: entry.db_id,
-                    task_type: entry.task_type,
-                    task_id: entry.task_id,
-                    fire_time_ms: entry.fire_time_ms,
-                });
-            }
-            if (page_len as u32) < Self::WQ_INDEX_SCAN_PAGE || last_key.is_empty() {
-                break;
-            }
-            cursor = last_key;
-            cursor.push(0);
         }
         Ok(rows)
     }
@@ -908,8 +996,13 @@ impl TikvStore {
         .await
     }
 
-    /// All index rows for one (keyspace, db_id), every task type — used by
-    /// DROP DATABASE queue reap.
+    /// All index rows for one (keyspace, db_id), every task type. The DROP
+    /// DATABASE reap (`reap_db_queue_entries`) now streams the index page-by-page
+    /// instead of materializing the whole backlog, so this collect-all variant is
+    /// retained only as a test/diagnostic helper that asserts the full per-db
+    /// index set (e.g. "the index is empty after reap").
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn index_rows_for_db(
         &self,
         txn: &mut Transaction,
@@ -1192,40 +1285,59 @@ impl TikvStore {
     }
 
     /// Delete every V2 queue entry for an entire (keyspace, db_id), used by
-    /// DROP DATABASE so worker queue entries do not leak. Self-contained:
-    /// collects the work-list from the V2 identity index, then deletes in bounded
-    /// batched transactions so a db with a large backlog cannot build one
-    /// oversized 2PC write/lock set.
+    /// DROP DATABASE so worker queue entries do not leak. Self-contained and
+    /// STREAMED: the read phase fetches ONE bounded index page at a time (via the
+    /// dedicated per-db prefix index, 1-byte values — never a global scan), deletes
+    /// that page in its own bounded 2PC transaction, advances the cursor, and
+    /// repeats. The whole per-db backlog is therefore never materialized into one
+    /// Vec, and no single transaction builds an oversized write/lock set. Deletes
+    /// stay idempotent (a re-deleted key is a no-op), so a retry after a partial
+    /// failure is safe.
     pub async fn reap_db_queue_entries(&self, keyspace: &str, db_id: u64) -> Result<usize> {
-        const DELETE_BATCH: usize = 256;
+        let logical_prefix = encode_wq_index_prefix_db(keyspace, db_id);
 
-        // Phase 1: collect the work-list from 1-byte V2 index values.
-        let index_rows = {
-            let mut txn = self.begin().await?;
-            let idx = self.index_rows_for_db(&mut txn, keyspace, db_id).await?;
-            txn.rollback().await.ok();
-            idx
-        };
-
-        // Phase 2: delete in bounded batches (idempotent — a re-deleted key is a
-        // no-op, so a retry after a partial failure is safe).
         let mut deleted = 0usize;
-        for chunk in index_rows.chunks(DELETE_BATCH) {
-            let mut txn = self.begin().await?;
-            for r in chunk {
-                self.delete_task_v2(
-                    &mut txn,
-                    &r.due_key,
-                    &r.keyspace,
-                    r.db_id,
-                    r.task_type,
-                    r.task_id,
-                    r.fire_time_ms,
-                )
-                .await?;
-                deleted += 1;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            // Read ONE bounded page of index rows from a snapshot read txn.
+            let (page, next_cursor) = {
+                let mut read_txn = self.begin().await?;
+                let result = self
+                    .scan_index_rows_page(
+                        &mut read_txn,
+                        &logical_prefix,
+                        cursor.as_deref(),
+                        Self::REAP_INDEX_PAGE,
+                    )
+                    .await?;
+                read_txn.rollback().await.ok();
+                result
+            };
+
+            // Delete exactly this page in its own bounded transaction.
+            if !page.is_empty() {
+                let mut txn = self.begin().await?;
+                for r in &page {
+                    self.delete_task_v2(
+                        &mut txn,
+                        &r.due_key,
+                        &r.keyspace,
+                        r.db_id,
+                        r.task_type,
+                        r.task_id,
+                        r.fire_time_ms,
+                    )
+                    .await?;
+                    deleted += 1;
+                }
+                txn.commit().await?;
             }
-            txn.commit().await?;
+
+            // Advance the cursor; stop when this page reached the prefix end.
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
         }
         Ok(deleted)
     }
@@ -1978,6 +2090,14 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
+        // `new_system` connects with `with_keyspace`, which requires the keyspace
+        // to already exist in PD (the vendored client does NOT auto-create it).
+        // Pre-create it with the canonical PD-API helper, mirroring what
+        // `init_gc_registry_store` (used by `v2_test_store`) does — otherwise the
+        // connect fails with "keyspace does not exist".
+        crate::worker::ensure_system_keyspace(&pd_endpoints, &system_keyspace)
+            .await
+            .expect("pre-create raw worker test keyspace in PD");
         Arc::new(
             TikvStore::new_system(pd_endpoints, &system_keyspace)
                 .await
@@ -2503,6 +2623,142 @@ mod tests {
         txn.commit().await.unwrap();
     }
 
+    /// #2628 item 1: the DROP DATABASE reap STREAMS its read phase. Seed more than
+    /// one index page of entries for one db and assert (a) the page primitive
+    /// `scan_index_rows_page` returns at most `REAP_INDEX_PAGE` rows per call and
+    /// hands back a non-None cursor while more remain — i.e. the read phase never
+    /// materializes more than one page at once — and (b) `reap_db_queue_entries`
+    /// still reaps ALL rows for the db (the same return count and empty index the
+    /// collect-all implementation produced), with another db untouched.
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn reap_db_queue_entries_streams_read_phase_one_page_at_a_time() {
+        let store = v2_test_store().await;
+        let ks = unique_ks("reap_stream");
+        let db_id = 91u64;
+
+        // Seed more than one page so the streamed read must paginate. Spread
+        // across multiple task types so the per-db prefix (all task types) is
+        // exercised end to end.
+        let page = TikvStore::REAP_INDEX_PAGE as i64;
+        let total = page + 37; // > 1 page, < 2 pages
+        for job in 0..total {
+            let mut txn = store.begin().await.unwrap();
+            let entry = if job % 2 == 0 {
+                cron_entry(&ks, db_id, job, "SELECT 1")
+            } else {
+                TaskQueueEntry::new(
+                    ks.clone(),
+                    db_id,
+                    job,
+                    TaskType::BgSql,
+                    "SELECT 2".to_string(),
+                    "admin".to_string(),
+                    128,
+                )
+            };
+            store
+                .put_task_v2(&mut txn, &entry, 1_000 + job)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // A different db must survive the reap untouched.
+        let mut txn = store.begin().await.unwrap();
+        store
+            .put_task_v2(&mut txn, &cron_entry(&ks, db_id + 1, 5, "SELECT 3"), 9_000)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        // (a) Boundedness: the page primitive yields at most one page and a
+        // non-None cursor while more rows remain. Walk it manually and assert the
+        // invariant on every page.
+        let logical_prefix = encode_wq_index_prefix_db(&ks, db_id);
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut pages = 0usize;
+        let mut walked = 0usize;
+        loop {
+            let mut read_txn = store.begin().await.unwrap();
+            let (rows, next) = store
+                .scan_index_rows_page(
+                    &mut read_txn,
+                    &logical_prefix,
+                    cursor.as_deref(),
+                    TikvStore::REAP_INDEX_PAGE,
+                )
+                .await
+                .unwrap();
+            read_txn.rollback().await.ok();
+            assert!(
+                rows.len() <= TikvStore::REAP_INDEX_PAGE as usize,
+                "a single index page must never materialize more than REAP_INDEX_PAGE rows"
+            );
+            walked += rows.len();
+            pages += 1;
+            match next {
+                Some(next_cursor) => {
+                    assert_eq!(
+                        rows.len(),
+                        TikvStore::REAP_INDEX_PAGE as usize,
+                        "a non-None cursor must only follow a FULL page"
+                    );
+                    cursor = Some(next_cursor);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked as i64, total,
+            "the streamed walk must cover every row"
+        );
+        assert!(
+            pages >= 2,
+            "the seeded backlog must span more than one page (streamed, not one Vec)"
+        );
+
+        // (b) The streamed reap deletes every row for the db and reports the count.
+        let reaped = store.reap_db_queue_entries(&ks, db_id).await.unwrap();
+        assert_eq!(
+            reaped as i64, total,
+            "streamed reap must delete exactly all rows for the db"
+        );
+
+        let mut txn = store.begin().await.unwrap();
+        assert!(
+            store
+                .index_rows_for_db(&mut txn, &ks, db_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no index row may survive the streamed reap"
+        );
+        // Other db untouched.
+        assert_eq!(
+            store
+                .index_rows_for_db(&mut txn, &ks, db_id + 1)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a different db must be untouched by the reap"
+        );
+        txn.rollback().await.ok();
+
+        // Re-reaping is idempotent: a second pass deletes nothing.
+        let reaped_again = store.reap_db_queue_entries(&ks, db_id).await.unwrap();
+        assert_eq!(reaped_again, 0, "re-reaping an emptied db is a no-op");
+
+        // Cleanup the surviving db.
+        let mut txn = store.begin().await.unwrap();
+        store
+            .delete_task_all_layers(&mut txn, &ks, db_id + 1, 5, TaskType::Cron)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires TiKV / PD cluster"]
     async fn legacy_entry_is_migrated_to_v2_before_production_paths() {
@@ -2809,4 +3065,15 @@ mod tests {
             "renewal must extend the stored lease"
         );
     }
+
+    // #2627 producer durability (decouple from execution): the test that
+    // proves the HNSW-merge, auto-ANALYZE, and async-trigger producers still
+    // ENQUEUE a durable V2 row while `execution_enabled() == false` now drives
+    // the REAL producers (flush_pending_hnsw_merges / maybe_enqueue_auto_analyze
+    // / flush_trigger_activations) through a constructed Executor, so a
+    // regression that gates a producer on execution is caught. It lives next to
+    // those producers at
+    // src/sql/executor/core/tests.rs::producers_enqueue_v2_row_even_when_worker_execution_disabled
+    // (the auto-ANALYZE producer is pub(super) to crate::sql::executor and is
+    // not reachable from this storage-layer test module).
 }

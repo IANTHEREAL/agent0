@@ -823,6 +823,13 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
+        // `new_system` connects with `with_keyspace`, which requires the keyspace
+        // to already exist in PD (the vendored client does NOT auto-create it).
+        // Pre-create it with the canonical PD-API helper so this promoted CI test
+        // does not fail at connect with "keyspace does not exist".
+        crate::worker::ensure_system_keyspace(&pd_endpoints, &keyspace)
+            .await
+            .expect("pre-create liveness test keyspace in PD");
         // Raw system store: no bootstrap, so the only DB row present is the one
         // this test writes — keeping the assertions deterministic.
         TikvStore::new_system(pd_endpoints, &keyspace)

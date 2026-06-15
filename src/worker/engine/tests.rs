@@ -1,5 +1,17 @@
 use super::*;
 
+/// Pre-create a TENANT keyspace in PD before the pool's `with_keyspace` connect.
+/// The vendored tikv-client does NOT auto-create keyspaces, so `pool.acquire`
+/// for a fresh keyspace fails with "keyspace does not exist" unless it is
+/// provisioned first. Mirrors what `init_gc_registry_store` does for the system
+/// keyspace. Used by every TiKV-backed engine test that acquires a tenant store.
+#[cfg(test)]
+async fn ensure_tenant_keyspace_for_test(pd_endpoints: &[String], keyspace: &str) {
+    crate::worker::ensure_system_keyspace(pd_endpoints, keyspace)
+        .await
+        .expect("pre-create tenant keyspace in PD");
+}
+
 fn test_cron_job() -> crate::cron::types::CronJob {
     crate::cron::types::CronJob {
         job_id: 42,
@@ -1156,7 +1168,7 @@ async fn setup_cron_finalize_fixture_cmd(
     let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
         .await
         .expect("init system store");
-    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints));
+    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints.clone()));
     let metrics = Arc::new(crate::worker::metrics::WorkerMetrics::new());
 
     let keyspace = format!(
@@ -1164,6 +1176,7 @@ async fn setup_cron_finalize_fixture_cmd(
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
+    ensure_tenant_keyspace_for_test(&pd_endpoints, &keyspace).await;
     let db_id = 1_u64;
     let task_id = 42_i64;
 
@@ -1599,13 +1612,14 @@ async fn dropped_db_suppresses_enqueue_across_all_cross_store_sites() {
     let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
         .await
         .expect("init system store");
-    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints));
+    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints.clone()));
 
     let keyspace = format!(
         "test_droppedfence_{}_{}",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
+    ensure_tenant_keyspace_for_test(&pd_endpoints, &keyspace).await;
     // bootstrap creates only db_id=1 (postgres). Use a db_id that has NO metadata
     // row: identical state to a DROP DATABASE that already removed the row.
     let missing_db_id = 9_999_u64;
@@ -1780,7 +1794,7 @@ async fn orphan_cron_nextfire_for_dropped_db_is_skipped_and_reaped() {
     let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
         .await
         .expect("init system store");
-    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints));
+    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints.clone()));
     let metrics = Arc::new(crate::worker::metrics::WorkerMetrics::new());
 
     let keyspace = format!(
@@ -1788,6 +1802,7 @@ async fn orphan_cron_nextfire_for_dropped_db_is_skipped_and_reaped() {
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
+    ensure_tenant_keyspace_for_test(&pd_endpoints, &keyspace).await;
     // A db_id with NO `database_id` metadata row — identical durable state to a
     // DROP DATABASE that already removed the row. We DO seed the tenant cron
     // bits (enabled flag + active job) to model a cron next-fire that was
@@ -2189,106 +2204,170 @@ fn hnsw_s3_merge_upload_is_liveness_locked_and_commit_uncertain_retained() {
     );
 }
 
-/// REGRESSION GUARD (P1 commit-adjacency): the HNSW merge claim-lease fence must
-/// be COMMIT-ADJACENT, not merely at loop-top. Each tenant commit in the batch
-/// loop body — the oversize-freeze early commit AND the normal batch commit — can
-/// be reached after long work (delta scan, graph build/serialize, S3 upload, TiKV
+/// REGRESSION GUARD (P1 commit-adjacency), BEHAVIORAL: the HNSW merge claim-lease
+/// fence must be COMMIT-ADJACENT, not merely at loop-top. The normal batch commit
+/// is reached only after long work (delta scan, graph build/serialize, TiKV
 /// mutations) during which the claim lease can lapse. If the only fence were at
-/// loop-top, a second worker could take over an expired claim while the original
-/// commits the batch -> duplicate tenant write (the at-most-once hole this PR
-/// closes). The prior specialized-cancellation tests are source-string and would
-/// NOT catch a commit-adjacency regression (they only assert the token is
-/// threaded / loop-top check exists), so this test specifically pins the
-/// IMMEDIATELY-BEFORE-COMMIT placement of both fences and the cleanup-on-bail
-/// (not retain) S3 contract.
-#[test]
-fn hnsw_merge_lease_fence_is_commit_adjacent_at_each_tenant_commit() {
-    let helper_source = include_str!("helpers.rs");
-    let merge_fn = helper_source
-        .split("pub(super) async fn execute_hnsw_merge(")
-        .nth(1)
-        .expect("execute_hnsw_merge helper must exist");
+/// loop-top, a second worker could take over the expired claim while the original
+/// commits the batch -> duplicate tenant write (the at-most-once hole).
+///
+/// This drives the REAL `execute_hnsw_merge` against TiKV with a lease-cancel
+/// fuse armed to fire on the SECOND `bail_if_cancelled` call: check 1 (loop-top)
+/// PASSES, so the merge does all of its work (scans the delta, builds the graph,
+/// writes graph+meta into the batch txn); check 2 (the commit-adjacent fence
+/// immediately before `txn.commit`) FIRES. We then assert the observable
+/// commit-adjacency contract:
+///   - the merge returns the canonical claim-cancelled error
+///     (`is_claim_cancelled_error` true);
+///   - the tenant batch did NOT commit — the delta is still present (not
+///     consumed) and the graph blob / meta graph_version are unchanged;
+///   - no speculative S3 upload is retained (this is the no-S3 TiKV path, so
+///     `uploaded_s3_graph_version` is always None and the bail's cleanup branch
+///     is a no-op — there is no no-meta S3 orphan to leave behind).
+/// A loop-top-only fence would have ALREADY committed by check 2, consuming the
+/// delta and bumping the graph blob — so this fails if the fence regresses to
+/// loop-top only.
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn hnsw_merge_commit_adjacent_lease_cancel_aborts_tenant_commit_behaviorally() {
+    use crate::sql::hnsw::storage::{
+        hnsw_delta_key, hnsw_graph_key, hnsw_meta_key, HnswDelta, HnswLabelMode, HnswMeta,
+    };
+    use crate::txn::txn_put;
 
-    // ── Normal batch commit (helpers.rs §7) ─────────────────────────────────
-    // The final commit goes through `if let Err(e) = txn.commit().await`. The
-    // region between the last batch mutation (delete_delta_keys) and the commit
-    // must contain the commit-adjacent lease bail AND the pre-commit liveness
-    // fence — both DEFINITE non-commits that clean up the speculative S3 upload —
-    // with NO long-running work (scan/upload/serialize) and NO retain
-    // reintroduced between those fences and the commit.
-    let commit_adjacent_tail = merge_fn
-        .split("delete_delta_keys(&mut txn, &batch_keys)")
-        .last()
-        .and_then(|rest| rest.split("if let Err(e) = txn.commit().await").next())
-        .expect("execute_hnsw_merge must commit the batch via if let Err(e) = txn.commit()");
-    assert!(
-        commit_adjacent_tail.contains("lease_cancel.bail_if_cancelled()"),
-        "HNSW normal batch commit must have a COMMIT-ADJACENT lease fence \
-         immediately before txn.commit, not only at loop-top"
+    // This test exercises the TiKV (no-S3) path. If a stray HNSW_S3_BUCKET is set
+    // in the environment, the S3 branch would run instead — skip rather than
+    // assert against the wrong path.
+    if crate::sql::hnsw::s3::hnsw_s3_client().is_some() {
+        eprintln!("skipping: HNSW S3 is configured; this test targets the TiKV path");
+        return;
+    }
+
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints.clone()));
+
+    let keyspace = format!(
+        "test_merge_fence_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
+    // The pool's tenant connect (`with_keyspace`) requires the keyspace to exist
+    // in PD; pre-create it with the canonical PD-API helper (no-op under TLS).
+    crate::worker::ensure_system_keyspace(&pd_endpoints, &keyspace)
+        .await
+        .expect("pre-create tenant keyspace in PD");
+    // Acquiring a tenant handle bootstraps db_id=1 (postgres), so the pre-commit
+    // liveness fence in the merge passes — only the lease fence can abort here.
+    let store = {
+        let handle = pool
+            .acquire(Some(keyspace.clone()))
+            .await
+            .expect("acquire tenant handle");
+        handle.store().clone()
+    };
+    let db_id = 1_u64;
+    let table_id = 4242_u64;
+    let index_id = 7_u64;
+
+    // Seed a real, mergeable (storage_version=1, not frozen) HNSW index: meta +
+    // one delta. The merge will scan the delta, build the graph, write graph+meta
+    // into the batch txn, then hit the commit-adjacent fence.
+    let meta = HnswMeta {
+        count: 0,
+        capacity: 0,
+        dimensions: 4,
+        distance_metric: "l2".to_string(),
+        m: 16,
+        ef_construction: 200,
+        storage_version: 1,
+        label_mode: HnswLabelMode::Direct,
+        frozen: false,
+        graph_version: 0,
+        dropped_at: None,
+        cache_nonce: 0,
+    };
+    let delta = HnswDelta {
+        label: 1,
+        vector: vec![0.1_f32, 0.2, 0.3, 0.4],
+    };
+    let delta_key = hnsw_delta_key(db_id, table_id, index_id, 1);
+    {
+        let mut txn = store.begin().await.unwrap();
+        txn_put(
+            &mut txn,
+            hnsw_meta_key(db_id, table_id, index_id),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .await
+        .unwrap();
+        txn_put(
+            &mut txn,
+            delta_key.clone(),
+            bincode::serialize(&delta).unwrap(),
+        )
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    // Arm the fuse to fire on check 2: loop-top passes, commit-adjacent fires.
+    let lease_cancel = crate::worker::LeaseCancel::new_tripping_at_check(2);
+    let result = execute_hnsw_merge(&store, db_id, table_id, index_id, &lease_cancel).await;
+
+    // 1. The merge bails with the canonical claim-cancelled error.
+    let err = result.expect_err("commit-adjacent lease cancel must abort the merge");
     assert!(
-        commit_adjacent_tail.contains("assert_database_alive_for_update(&mut txn, db_id)"),
-        "HNSW normal batch commit must run the DB liveness fence as a separate \
-         pre-commit step immediately before txn.commit"
-    );
-    assert!(
-        commit_adjacent_tail.contains("cleanup_uploaded_hnsw_s3_graph_after_failed_batch"),
-        "a lease bail / liveness-fence failure before the normal batch commit is a \
-         DEFINITE non-commit and MUST clean up the speculative S3 upload (cleanup, \
-         not retain) to avoid a no-meta S3 orphan"
-    );
-    assert!(
-        !commit_adjacent_tail.contains("retain_uploaded_hnsw_s3_graph_after_uncertain_commit"),
-        "retain is only correct for AMBIGUOUS commit ERRORS, never for a definite \
-         pre-commit lease bail or liveness-fence abort"
-    );
-    assert!(
-        !commit_adjacent_tail.contains(".scan(")
-            && !commit_adjacent_tail.contains("put_hnsw_s3_graph_with_intent")
-            && !commit_adjacent_tail.contains("serialize_hnsw_snapshot"),
-        "no long-running work may run between the normal-batch fences and the commit"
+        is_claim_cancelled_error(&err),
+        "fence must propagate the canonical claim-cancelled error, got: {err}"
     );
 
-    // ── Oversize-freeze early commit (TiKV path) ────────────────────────────
-    // The freeze branch ends with `return Ok(None);` after `txn.commit()`. The
-    // lease fence must sit between writing the frozen meta and committing it.
-    let freeze_branch = merge_fn
-        .split("HNSW graph exceeds size limit — freezing index")
-        .nth(1)
-        .and_then(|rest| rest.split("return Ok(None);").next())
-        .expect("execute_hnsw_merge must have the oversize-freeze early-commit branch");
-    let freeze_meta_pos = freeze_branch
-        .find("txn_put(&mut txn, meta_key, frozen_meta_bytes)")
-        .expect("freeze branch must persist frozen meta");
-    let freeze_fence_pos = freeze_branch
-        .find("lease_cancel.bail_if_cancelled()")
-        .expect("oversize-freeze early commit must have a COMMIT-ADJACENT lease fence");
-    let freeze_commit_pos = freeze_branch
-        .find("txn.commit()")
-        .expect("freeze branch must commit the frozen meta");
-    assert!(
-        freeze_meta_pos < freeze_fence_pos && freeze_fence_pos < freeze_commit_pos,
-        "oversize-freeze lease fence must sit AFTER writing frozen meta and \
-         IMMEDIATELY BEFORE the tenant commit"
-    );
-    // No long-running work (scan/upload) may be reintroduced between the fence
-    // and the commit in the freeze branch.
-    let freeze_tail = &freeze_branch[freeze_fence_pos..freeze_commit_pos];
-    assert!(
-        !freeze_tail.contains(".scan(")
-            && !freeze_tail.contains("put_hnsw_s3_graph_with_intent")
-            && !freeze_tail.contains("serialize_hnsw_snapshot"),
-        "no long-running work may run between the oversize-freeze lease fence and its commit"
-    );
+    // 2. The tenant batch did NOT commit: the delta is still present (not
+    //    consumed) and the meta graph_version is unchanged.
+    {
+        let mut txn = store.begin().await.unwrap();
+        // The single seeded delta must still be present at its exact key: a
+        // commit-adjacent bail must NOT consume it (the batch did not commit).
+        assert!(
+            txn.get(delta_key.clone()).await.unwrap().is_some(),
+            "a commit-adjacent bail must NOT consume the delta (the batch did not commit)"
+        );
+        let meta_after: HnswMeta = serde_json::from_slice(
+            &txn.get(hnsw_meta_key(db_id, table_id, index_id))
+                .await
+                .unwrap()
+                .expect("meta must still exist"),
+        )
+        .unwrap();
+        assert_eq!(
+            meta_after.graph_version, 0,
+            "graph_version must be unchanged: the batch never committed"
+        );
+        // No new graph blob was committed on the TiKV path either.
+        assert!(
+            txn.get(hnsw_graph_key(db_id, table_id, index_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "no graph blob may be committed when the commit-adjacent fence aborts"
+        );
+        txn.rollback().await.ok();
+    }
 
-    // The canonical claim-cancelled error must flow so is_claim_cancelled_error
-    // classifies the bail (caller must not mark anything invalid). The fence
-    // returns the error produced by bail_if_cancelled, whose message is the
-    // shared CLAIM_CANCELLED_ERROR constant.
-    assert!(
-        merge_fn.contains("if let Err(e) = lease_cancel.bail_if_cancelled()"),
-        "commit-adjacent fences must propagate the canonical claim-cancelled error"
-    );
+    // Cleanup the seeded keys.
+    {
+        let mut txn = store.begin().await.unwrap();
+        crate::txn::txn_delete(&mut txn, hnsw_meta_key(db_id, table_id, index_id))
+            .await
+            .ok();
+        crate::txn::txn_delete(&mut txn, delta_key).await.ok();
+        txn.commit().await.ok();
+    }
 }
 
 #[test]
@@ -3838,4 +3917,286 @@ fn legacy_drain_interval_downshifts_only_after_grace_window_and_never_zero() {
         // Drain must never stop probing — interval must be non-zero.
         assert!(LEGACY_DRAIN_IDLE_INTERVAL_SEC > 0);
     }
+}
+
+/// Clear the drain pacing gate so the NEXT `legacy_queue_drain_tick` runs
+/// immediately, bypassing the multi-second wall-clock interval that paces the
+/// real maintenance loop. The test module is a child of `engine` so it may touch
+/// the private sweep state directly.
+async fn arm_drain_tick_now(engine: &WorkerEngine) {
+    engine
+        .registry_sweep_state
+        .lock()
+        .await
+        .legacy_drain_last_at = None;
+}
+
+async fn drain_empty_streak(engine: &WorkerEngine) -> u32 {
+    engine
+        .registry_sweep_state
+        .lock()
+        .await
+        .legacy_drain_empty_streak
+}
+
+/// #2627 (i) legacy_queue_drain_tick ORCHESTRATION end-to-end. Stand up an engine
+/// against TiKV (its system store already latched the V2 marker, mirroring
+/// production startup), then drive the private drain tick through three contracts:
+///  1. a V1 straggler seeded AFTER the V2 marker is migrated by one tick, becomes
+///     visible to `scan_due_v2`, and its V1 key is gone;
+///  2. the `LEGACY_DRAIN_MAX_BATCHES_PER_TICK` budget cap bounds work per tick:
+///     a backlog larger than one tick's ceiling is NOT emptied in a single tick;
+///  3. the empty-streak re-arms to 0 when a straggler reappears after the queue
+///     had drained empty.
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn legacy_queue_drain_tick_orchestrates_straggler_migration_budget_and_rearm() {
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let system_keyspace = format!(
+        "_sys_drain_tick_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let cfg = crate::worker::config::WorkerConfig {
+        enabled: true,
+        system_keyspace,
+        ..Default::default()
+    };
+    // init_gc_registry_store runs the one-shot startup migration AND latches the
+    // `_wq_schema_version = 2` marker — exactly the production post-startup state.
+    let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
+        .await
+        .expect("init system store");
+    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints));
+    let engine = WorkerEngine::new(cfg.clone(), system_store.clone(), pool);
+
+    let keyspace = format!(
+        "drain_tick_tenant_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let db_id = 17_u64;
+
+    let cron_straggler = |task_id: i64| {
+        TaskQueueEntry::new(
+            keyspace.clone(),
+            db_id,
+            task_id,
+            TaskType::Cron,
+            "SELECT 1".to_string(),
+            "admin".to_string(),
+            128,
+        )
+        .with_schedule("*/5 * * * *".to_string())
+    };
+
+    // ── 1. Single straggler migrated by one tick ────────────────────────────
+    let straggler_id = 101_i64;
+    let fire = crate::worker::now_epoch_ms() - 60_000;
+    system_store
+        .seed_legacy_worker_queue_entry_for_test(&cron_straggler(straggler_id), fire)
+        .await
+        .expect("seed straggler V1 row after the V2 marker");
+
+    // Invisible to the V2-only consumer before the drain.
+    {
+        let mut txn = system_store.begin().await.unwrap();
+        let due = system_store
+            .scan_due_v2(&mut txn, i64::MAX, 1000)
+            .await
+            .unwrap();
+        txn.rollback().await.ok();
+        assert!(
+            !due.iter()
+                .any(|(_, d)| d.keyspace == keyspace && d.task_id == straggler_id),
+            "straggler must be invisible to scan_due_v2 before the drain tick"
+        );
+    }
+
+    arm_drain_tick_now(&engine).await;
+    engine
+        .legacy_queue_drain_tick()
+        .await
+        .expect("drain tick must succeed");
+
+    // The V1 key is gone, the queue is empty, and the row is now V2-visible.
+    assert!(
+        system_store
+            .legacy_worker_queue_is_empty()
+            .await
+            .expect("empty probe"),
+        "one drain tick must clear the single straggler's V1 key"
+    );
+    {
+        let mut txn = system_store.begin().await.unwrap();
+        let due = system_store
+            .scan_due_v2(&mut txn, i64::MAX, 1000)
+            .await
+            .unwrap();
+        txn.rollback().await.ok();
+        assert!(
+            due.iter().any(|(_, d)| d.keyspace == keyspace
+                && d.task_id == straggler_id
+                && d.task_type == TaskType::Cron),
+            "migrated straggler must be visible to scan_due_v2 after the tick"
+        );
+    }
+    // Draining to empty advances the streak to 1.
+    assert_eq!(
+        drain_empty_streak(&engine).await,
+        1,
+        "draining to empty must advance the empty streak"
+    );
+
+    // Clean up the migrated V2 row so it does not pollute later phases.
+    {
+        let mut txn = system_store.begin().await.unwrap();
+        system_store
+            .delete_task_all_layers(&mut txn, &keyspace, db_id, straggler_id, TaskType::Cron)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    // ── 2. Budget cap bounds work per tick ──────────────────────────────────
+    // Seed MORE than one tick's migration ceiling so a single tick cannot empty
+    // the queue. The ceiling is cap * migration_batch; seed ceiling + 1.
+    let migration_batch = crate::storage::worker::WORKER_QUEUE_MIGRATION_BATCH as usize;
+    let per_tick_ceiling = LEGACY_DRAIN_MAX_BATCHES_PER_TICK as usize * migration_batch;
+    let backlog = per_tick_ceiling + 1;
+    let base_id = 1_000_i64;
+    let entries: Vec<(TaskQueueEntry, i64)> = (0..backlog)
+        .map(|i| (cron_straggler(base_id + i as i64), fire + i as i64))
+        .collect();
+    system_store
+        .seed_legacy_worker_queue_entries_for_test(&entries, migration_batch)
+        .await
+        .expect("seed oversized legacy backlog");
+
+    arm_drain_tick_now(&engine).await;
+    engine
+        .legacy_queue_drain_tick()
+        .await
+        .expect("first budgeted drain tick must succeed");
+
+    // One tick migrated at most the per-tick ceiling, so the queue is NOT empty
+    // and the streak re-armed to 0 (a straggler still remained at tick end).
+    let remaining_after_one_tick = {
+        let mut txn = system_store.begin().await.unwrap();
+        let due = system_store
+            .scan_due_v2(&mut txn, i64::MAX, backlog as u32 + 10)
+            .await
+            .unwrap();
+        txn.rollback().await.ok();
+        due.iter()
+            .filter(|(_, d)| d.keyspace == keyspace && d.task_id >= base_id)
+            .count()
+    };
+    assert!(
+        remaining_after_one_tick <= per_tick_ceiling,
+        "a single tick must migrate at most LEGACY_DRAIN_MAX_BATCHES_PER_TICK batches \
+         ({per_tick_ceiling} rows), got {remaining_after_one_tick} migrated"
+    );
+    assert!(
+        !system_store
+            .legacy_worker_queue_is_empty()
+            .await
+            .expect("non-empty probe"),
+        "a backlog larger than one tick's budget must NOT be emptied by a single tick"
+    );
+    assert_eq!(
+        drain_empty_streak(&engine).await,
+        0,
+        "a straggler remaining at tick end must re-arm the empty streak to 0"
+    );
+
+    // Subsequent ticks converge: drain until the queue is empty.
+    for _ in 0..(LEGACY_DRAIN_MAX_BATCHES_PER_TICK + 4) {
+        if system_store.legacy_worker_queue_is_empty().await.unwrap() {
+            break;
+        }
+        arm_drain_tick_now(&engine).await;
+        engine
+            .legacy_queue_drain_tick()
+            .await
+            .expect("convergent drain tick must succeed");
+    }
+    assert!(
+        system_store
+            .legacy_worker_queue_is_empty()
+            .await
+            .expect("converged probe"),
+        "repeated budgeted ticks must converge the backlog to empty"
+    );
+
+    // Reap the migrated backlog so the keyspace is clean.
+    let reaped = system_store
+        .reap_db_queue_entries(&keyspace, db_id)
+        .await
+        .unwrap();
+    assert!(
+        reaped >= backlog,
+        "all migrated backlog rows must be reapable"
+    );
+
+    // ── 3. Empty-streak re-arm to 0 when a backlog of stragglers reappears ───
+    // Advance the streak by draining the (now empty) queue a couple of times so
+    // we can observe it being knocked back to 0.
+    for _ in 0..2 {
+        arm_drain_tick_now(&engine).await;
+        engine
+            .legacy_queue_drain_tick()
+            .await
+            .expect("empty drain tick must succeed");
+    }
+    let streak_before_reappear = drain_empty_streak(&engine).await;
+    assert!(
+        streak_before_reappear >= 2,
+        "consecutive empty ticks must accumulate the streak, got {streak_before_reappear}"
+    );
+
+    // A late batch of V1 rows from an old binary reappears, larger than one tick's
+    // budget. The next tick spends its budget WITHOUT emptying the queue, which is
+    // exactly the condition that re-arms the streak to 0 (aggressive cadence).
+    let late_base = 20_000_i64;
+    let late_entries: Vec<(TaskQueueEntry, i64)> = (0..backlog)
+        .map(|i| (cron_straggler(late_base + i as i64), fire + i as i64))
+        .collect();
+    system_store
+        .seed_legacy_worker_queue_entries_for_test(&late_entries, migration_batch)
+        .await
+        .expect("seed reappearing oversized backlog");
+
+    arm_drain_tick_now(&engine).await;
+    engine
+        .legacy_queue_drain_tick()
+        .await
+        .expect("re-arm drain tick must succeed");
+    assert_eq!(
+        drain_empty_streak(&engine).await,
+        0,
+        "a reappearing backlog that is not emptied in one tick must re-arm the streak to 0"
+    );
+
+    // Converge and clean up.
+    for _ in 0..(LEGACY_DRAIN_MAX_BATCHES_PER_TICK + 4) {
+        if system_store.legacy_worker_queue_is_empty().await.unwrap() {
+            break;
+        }
+        arm_drain_tick_now(&engine).await;
+        engine
+            .legacy_queue_drain_tick()
+            .await
+            .expect("convergent cleanup drain tick must succeed");
+    }
+    system_store
+        .reap_db_queue_entries(&keyspace, db_id)
+        .await
+        .unwrap();
 }

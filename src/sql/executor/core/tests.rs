@@ -634,3 +634,276 @@ fn lock_backoff_count_based_unchanged() {
     assert!(b.next_delay_duration().is_some());
     assert!(b.next_delay_duration().is_none());
 }
+
+// ── #2627 producer durability: decouple producers from local execution ──────
+//
+// TiKV-backed (CI `integration-tests` job, run with `-- --ignored`).
+//
+// Acceptance A3(ii): with local worker execution DISABLED
+// (`execution_enabled() == false`, i.e. a SQL node whose `WorkerConfig.enabled =
+// false`), the HNSW-merge, auto-ANALYZE, and async-trigger producers must STILL
+// enqueue a durable V2 queue row via the always-on system store, so an
+// execution-enabled node in the fleet performs the work.
+//
+// This drives the REAL producers — `flush_pending_hnsw_merges`,
+// `maybe_enqueue_auto_analyze`, `flush_trigger_activations` — through a
+// constructed `Executor`, NOT the storage primitives they call. A regression
+// that adds `if !execution_enabled() { return; }` to any of the three producers
+// would make this test fail, which the previous primitive-level test could not
+// catch.
+
+#[cfg(test)]
+async fn producer_durability_live_system_store() -> std::sync::Arc<crate::storage::TikvStore> {
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let system_keyspace = format!(
+        "_sys_producer_durable_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let cfg = crate::worker::config::WorkerConfig {
+        enabled: true,
+        system_keyspace,
+        ..Default::default()
+    };
+    let store = crate::worker::init_gc_registry_store(pd_endpoints, &cfg)
+        .await
+        .expect("init live system store");
+    // Register as the process-global system store the producers read via
+    // `crate::worker::system_store()`. The OnceLock is set-once; if a prior test
+    // in this binary already set one, that pre-existing live store is used
+    // instead — which is fine, because read-back below also goes through
+    // `crate::worker::system_store()`, and each producer writes under a UNIQUE
+    // entry keyspace so rows never collide with another test's store contents.
+    crate::worker::set_system_store(store.clone());
+    crate::worker::system_store()
+        .expect("a live system store must be registered for the producers")
+        .clone()
+}
+
+/// Poll the system store until exactly one identity-index row exists for the
+/// task, returning it. Producers spawn their durable write on a detached task,
+/// so the row appears asynchronously.
+#[cfg(test)]
+async fn await_one_index_row(
+    store: &crate::storage::TikvStore,
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+    task_type: crate::worker::types::TaskType,
+    what: &str,
+) {
+    for _ in 0..200 {
+        let mut txn = store.begin().await.expect("begin");
+        let rows = store
+            .index_rows_for_task(&mut txn, keyspace, db_id, task_id, task_type)
+            .await
+            .expect("scan identity index");
+        txn.rollback().await.ok();
+        if rows.len() == 1 {
+            return;
+        }
+        assert!(
+            rows.len() <= 1,
+            "{what}: producer must enqueue exactly one V2 row, found {}",
+            rows.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{what}: producer did not enqueue a durable V2 row within the deadline");
+}
+
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn producers_enqueue_v2_row_even_when_worker_execution_disabled() {
+    use crate::worker::types::TaskType;
+
+    let store = producer_durability_live_system_store().await;
+    let db_id = 1u64;
+
+    // The execution flag is process-global; save/restore so this test does not
+    // leak state into others sharing the binary.
+    let prev_enabled = crate::worker::execution_enabled();
+    crate::worker::set_worker_execution_enabled(false);
+    assert!(
+        !crate::worker::execution_enabled(),
+        "execution must be disabled to exercise the decouple-from-execution contract"
+    );
+
+    // Unique per-producer entry keyspaces so the durable rows are isolated from
+    // every other test's contents in the shared system store.
+    let merge_ks = format!(
+        "ks_prod_merge_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let analyze_ks = format!(
+        "ks_prod_analyze_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let trigger_ks = format!(
+        "ks_prod_trigger_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+
+    let merge_table_id = 4242u64;
+    let merge_index_id = 7u64;
+    let merge_task_id =
+        crate::sql::hnsw::storage::hnsw_merge_task_id(merge_table_id, merge_index_id)
+            .expect("deterministic hnsw merge task_id");
+    let analyze_table_id = 909u64;
+    let analyze_task_id = analyze_table_id as i64;
+
+    let outcome: anyhow::Result<()> = async {
+        // ── Producer 1: HNSW merge (deterministic singleton via the REAL flush) ──
+        {
+            let observability = crate::observability::registry().tenant(&merge_ks);
+            let executor = super::Executor::new(
+                store.clone(),
+                merge_ks.clone(),
+                observability,
+                crate::pool::TenantMemoryAccountant::unlimited("producer_durable".to_string()),
+                std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new()),
+                std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new()),
+                std::sync::Arc::new(crate::sql::stats::TableStatsCache::new()),
+            );
+            executor.push_pending_hnsw_merge(super::PendingHnswMerge {
+                keyspace: merge_ks.clone(),
+                db_id,
+                table_id: merge_table_id,
+                index_id: merge_index_id,
+            });
+            // The production producer; gated on execution would silently drop it.
+            executor.flush_pending_hnsw_merges();
+            await_one_index_row(
+                &store,
+                &merge_ks,
+                db_id,
+                merge_task_id,
+                TaskType::HnswMerge,
+                "HNSW-merge",
+            )
+            .await;
+        }
+
+        // ── Producer 2: auto-ANALYZE (task_has_pending-guarded, REAL enqueue) ──
+        {
+            let observability = crate::observability::registry().tenant(&analyze_ks);
+            let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+            let executor = super::Executor::new(
+                store.clone(),
+                analyze_ks.clone(),
+                observability,
+                crate::pool::TenantMemoryAccountant::unlimited("producer_durable".to_string()),
+                std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new()),
+                std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new()),
+                stats_cache.clone(),
+            );
+            // Push the modification count above the auto-ANALYZE threshold so the
+            // producer actually decides to enqueue (threshold base = 50).
+            stats_cache.bump_mod_count(db_id, analyze_table_id, 10_000);
+            assert!(
+                stats_cache.needs_auto_analyze(db_id, analyze_table_id, 50),
+                "stats priming must put the table over the auto-ANALYZE threshold"
+            );
+            // The production producer chooses keyspace = tenant_keyspace() and
+            // task_id = table_id; both match what await_one_index_row reads back.
+            executor.maybe_enqueue_auto_analyze(db_id, analyze_table_id, "t");
+            await_one_index_row(
+                &store,
+                &analyze_ks,
+                db_id,
+                analyze_task_id,
+                TaskType::AutoAnalyze,
+                "auto-ANALYZE",
+            )
+            .await;
+        }
+
+        // ── Producer 3: async-trigger flush (plain put, REAL flush) ──
+        let trigger_task_id;
+        {
+            let observability = crate::observability::registry().tenant(&trigger_ks);
+            let executor = super::Executor::new(
+                store.clone(),
+                trigger_ks.clone(),
+                observability,
+                crate::pool::TenantMemoryAccountant::unlimited("producer_durable".to_string()),
+                std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new()),
+                std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new()),
+                std::sync::Arc::new(crate::sql::stats::TableStatsCache::new()),
+            );
+            executor.push_pending_async_trigger(super::PendingAsyncTrigger {
+                keyspace: trigger_ks.clone(),
+                db_id,
+                command: "SELECT extensions.http_get('http://x')".to_string(),
+            });
+            executor.flush_trigger_activations();
+            // The trigger producer derives task_id from wall-clock ms, so discover
+            // it by scanning the (keyspace, db_id, task_type) index instead.
+            let mut found = None;
+            for _ in 0..200 {
+                let mut txn = store.begin().await?;
+                let rows = store
+                    .index_rows_for_db_type(&mut txn, &trigger_ks, db_id, TaskType::AsyncTrigger)
+                    .await?;
+                txn.rollback().await.ok();
+                if rows.len() == 1 {
+                    found = Some(rows[0].task_id);
+                    break;
+                }
+                assert!(
+                    rows.len() <= 1,
+                    "async-trigger producer must enqueue exactly one V2 row, found {}",
+                    rows.len()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            trigger_task_id =
+                found.expect("async-trigger producer did not enqueue a durable V2 row");
+        }
+
+        // Producer/consumer are decoupled: every durable producer row is visible
+        // to the V2-only consumer scan, so an execution-enabled node dequeues it.
+        let mut txn = store.begin().await?;
+        let due = store.scan_due_v2(&mut txn, i64::MAX, 10_000).await?;
+        txn.rollback().await.ok();
+        for (ks, tid, tt) in [
+            (&merge_ks, merge_task_id, TaskType::HnswMerge),
+            (&analyze_ks, analyze_task_id, TaskType::AutoAnalyze),
+            (&trigger_ks, trigger_task_id, TaskType::AsyncTrigger),
+        ] {
+            assert!(
+                due.iter()
+                    .any(|(_, d)| &d.keyspace == ks && d.task_id == tid && d.task_type == tt),
+                "durable producer row ({ks}, {tid}, {tt:?}) must be visible to the V2 consumer scan"
+            );
+        }
+
+        // Cleanup.
+        for (ks, tid, tt) in [
+            (&merge_ks, merge_task_id, TaskType::HnswMerge),
+            (&analyze_ks, analyze_task_id, TaskType::AutoAnalyze),
+            (&trigger_ks, trigger_task_id, TaskType::AsyncTrigger),
+        ] {
+            let mut txn = store.begin().await?;
+            store
+                .delete_task_all_layers(&mut txn, ks, db_id, tid, tt)
+                .await?;
+            txn.commit().await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // Restore the global flag regardless of assertion outcome.
+    crate::worker::set_worker_execution_enabled(prev_enabled);
+    outcome.expect("producer-durability assertions must pass");
+}

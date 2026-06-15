@@ -1277,6 +1277,14 @@ Crash between 2 and 3 leaves an orphan row → removed by grace (A2.4).
 4. `unsafe_destroy_range` on the binary data range.
 5. `inventory::reap_queue_then_delete(sys, ck, db_id)` — on failure, the
    row is retained and the sweep retries via the missing-database protocol.
+   The queue reap (`reap_db_queue_entries`) STREAMS its read phase: it fetches
+   ONE bounded page of the per-db V2 identity index (1-byte values), deletes that
+   page in its own bounded 2PC transaction, advances the cursor, and repeats —
+   it never materializes the whole per-db backlog into one Vec, and no single
+   transaction builds an oversized write/lock set. Deletes stay idempotent (a
+   re-deleted key is a no-op), so a retry after a partial failure is safe; the
+   reap still uses ONLY the dedicated per-db prefix index (no global scan) and
+   reaps every task type for the db (issue #2628 item 1).
 6. Finalize the dropping guard.
 
 ### A7. Claim hygiene
@@ -1369,6 +1377,11 @@ are the production alarms that a protocol is being violated upstream.
     V2-only enqueue/dequeue hot paths never touch the legacy layer. The
     `_wq_schema_version = 2` marker records only that the startup bulk migration
     ran; it does NOT gate or stop the straggler drain.
+  - *Behavioral coverage (T20).* The full `legacy_queue_drain_tick` orchestration
+    — straggler migration → `scan_due_v2` visibility + V1 key removal, the
+    `legacy_drain_max_batches_per_tick` per-tick budget cap, and the empty-streak
+    re-arm to 0 when a backlog reappears — is asserted end to end against TiKV
+    (not just the pure `legacy_drain_interval` cadence function).
 - **M6 outbox.** New key family; old binaries during the deploy still use
   spawn-enqueue (old loss window persists until the fleet upgrades —
   accepted).
@@ -1379,6 +1392,26 @@ are the production alarms that a protocol is being violated upstream.
 
 Integration tests run against TiKV (existing `#[ignore]`-gated harness, CI
 integration job). No `include_str!` source assertions.
+
+The TiKV-backed worker-V2 `#[ignore]` tests are PROMOTED into the CI
+`integration-tests` job (after `start-tikv`), run with
+`PD_ENDPOINTS=127.0.0.1:2379 cargo test <filter> -- --ignored --nocapture`
+following the fs9 precedent. The module filters
+(`storage::tikv_store::worker::tests::`, `worker::engine::tests::`, the
+database-liveness test, and the production-init migration test) select exactly
+the worker/storage-worker surface; the default `cargo test` job is unchanged
+(these stay `#[ignore]`-gated there). One engine test
+(`takeover_before_finalize_skips_stale_finalize_and_preserves_due_row`) is
+excluded from the CI step via `--skip`: it races a live `claim_and_execute`
+against a manual takeover on a single-node playground and is inherently
+timing-sensitive, so promoting it would flake the job. Its lease/takeover
+contract is still covered green by `spawned_renewer_*`, `renew_lease_once_*`, and
+the storage-layer `claim_blocks_*` / `renew_extends_*` tests. Source-string
+`include_str!` guards for the
+commit-adjacent lease fence and the `is_claim_cancelled_error` path are replaced
+by behavioral tests T19/T20; the remaining S3-path source guards (retain on
+uncertain commit; route uploads through the intent helper) are kept because CI
+has no S3 client to drive them behaviorally.
 
 | ID | Contract | Given / When / Then |
 | --- | --- | --- |
@@ -1400,6 +1433,10 @@ integration job). No `include_str!` source assertions.
 | T16 | walk GC guard | observation walk snapshot is registered with the safepoint for its duration (runtime assertion, not source grep) |
 | T17 | CREATE fail-closed | system store down → CREATE DATABASE fails; tenant has no database |
 | T18 | CIC live work | Building index with claimed BgDdl task → repair skips; after lease expiry + takeover completes → state Ready |
+| T19 | merge commit-adjacency (behavioral) | seed real meta+delta; run `execute_hnsw_merge` with a lease-cancel fuse that trips on the 2nd `bail_if_cancelled` (loop-top passes, commit-adjacent fires) → returns the canonical claim-cancelled error (`is_claim_cancelled_error` true); the batch did NOT commit (delta still present, graph_version unchanged, no graph blob); a loop-top-only fence would have already committed by then. (TiKV path; no S3 needed) |
+| T20 | drain-tick orchestration | seed a V1 straggler AFTER the V2 marker; one `legacy_queue_drain_tick` migrates it (visible to `scan_due_v2`, V1 key gone, empty-streak advances); a backlog > one tick's `legacy_drain_max_batches_per_tick * migration_batch` ceiling is NOT emptied in one tick and re-arms the empty-streak to 0; repeated ticks converge |
+| T21 | producer durability | with `WORKER_EXECUTION_ENABLED = false`, the HNSW-merge / auto-ANALYZE / async-trigger producer storage writes still enqueue a V2 row (visible via the identity index AND to `scan_due_v2`) — producer is decoupled from local consumer execution |
+| T22 | streamed DROP reap | seed > one index page for a db; `scan_index_rows_page` returns ≤ one page per call (non-None cursor only after a FULL page); `reap_db_queue_entries` deletes ALL rows for the db (same count as collect-all) with another db untouched; re-reap is a no-op |
 
 ## II.10 PR plan
 

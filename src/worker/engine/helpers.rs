@@ -602,9 +602,17 @@ pub(super) async fn execute_hnsw_merge(
                     // long work. On cancellation we abandon WITHOUT committing and
                     // leave the task for the new owner (at-most-once). This branch is
                     // the TiKV write path, so no S3 graph was speculatively uploaded
-                    // (`uploaded_s3_graph_version` is always None here); abandoning the
-                    // txn is sufficient — there is no external object to clean up.
+                    // (`uploaded_s3_graph_version` is always None here). Roll the
+                    // pessimistic txn back so its meta `get_for_update` lock is
+                    // released IMMEDIATELY (not left to lock-TTL), letting the new
+                    // owner re-run the merge without waiting; on rollback failure
+                    // quarantine the tracked txn so GC does not advance past it.
                     if let Err(e) = lease_cancel.bail_if_cancelled() {
+                        if txn.rollback().await.is_err() {
+                            if let Some(g) = txn_guard.as_mut() {
+                                g.quarantine();
+                            }
+                        }
                         cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
                             keyspace,
                             db_id,
@@ -657,8 +665,16 @@ pub(super) async fn execute_hnsw_merge(
             // meta) so the new owner can re-run the merge and re-upload without
             // leaving a no-meta S3 orphan. Mirrors the delete_delta_keys failure
             // path. The canonical claim-cancelled error makes is_claim_cancelled_error
-            // classify it so the caller does not mark anything invalid.
+            // classify it so the caller does not mark anything invalid. Roll the
+            // pessimistic txn back so its meta `get_for_update` lock is released
+            // IMMEDIATELY (not left to lock-TTL) for the new owner; quarantine on
+            // rollback failure so GC does not advance past the tracked txn.
             if let Err(e) = lease_cancel.bail_if_cancelled() {
+                if txn.rollback().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
+                }
                 cleanup_uploaded_hnsw_s3_graph_after_failed_batch(
                     keyspace,
                     db_id,

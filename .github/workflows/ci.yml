@@ -243,6 +243,39 @@ jobs:
           PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_without_size_keeps_small_files_mutable -- --ignored --nocapture
           PD_ENDPOINTS=127.0.0.1:2379 cargo test test_begin_write_stream_without_size_routes_large_files_after_spool -- --ignored --nocapture
 
+      # Worker-queue V2 (#2576/#2627/#2628) TiKV-backed behavioral tests. These
+      # are #[ignore]-gated (require a live PD/TiKV cluster) and otherwise never
+      # run in the default `cargo test` job; promote them here so the V2 queue,
+      # claim/lease lifecycle, legacy-drain orchestration, streamed DROP reap, and
+      # producer-durability contracts are exercised against real TiKV. The module
+      # filters select exactly the worker/storage-worker/database-liveness ignored
+      # tests (no fs9/embedding overlap).
+      - name: Run worker-queue V2 storage behavioral tests
+        shell: bash
+        run: |
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test 'storage::tikv_store::worker::tests::' -- --ignored --nocapture
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test database_alive_for_update_reports_live_then_dropped -- --ignored --nocapture
+          # Producer-durability (A3(ii)): drives the REAL HNSW-merge/auto-ANALYZE/
+          # async-trigger producers through a constructed Executor with worker
+          # execution disabled. It lives next to those producers in
+          # sql::executor::core::tests (the auto-ANALYZE producer is pub(super) to
+          # crate::sql::executor and not reachable from the storage worker module).
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test producers_enqueue_v2_row_even_when_worker_execution_disabled -- --ignored --nocapture
+
+      - name: Run worker-queue V2 engine behavioral tests
+        shell: bash
+        run: |
+          # takeover_before_finalize is excluded: it races a live claim_and_execute
+          # against a manual takeover on a single-node playground and is inherently
+          # timing-sensitive (it was never run in CI before — #[ignore]-gated and
+          # gated further by a keyspace-precreation bug fixed in this PR). Promoting
+          # it would make this job flaky; it stays runnable locally. The lease/
+          # takeover CONTRACT it targets is still covered green here by
+          # spawned_renewer_* and renew_lease_once_* and by the storage-layer
+          # claim_blocks_*/renew_extends_* tests.
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test 'worker::engine::tests::' -- --ignored --nocapture --skip takeover_before_finalize
+          PD_ENDPOINTS=127.0.0.1:2379 cargo test production_init_migrates_legacy_worker_queue_rows -- --ignored --nocapture
+
       - name: Start db9-server
         run: |
           PD_ENDPOINTS=127.0.0.1:2379 \

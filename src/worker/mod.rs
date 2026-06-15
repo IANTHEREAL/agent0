@@ -44,25 +44,62 @@ pub(crate) const CLAIM_CANCELLED_ERROR: &str = "cancelled by administrator";
 #[derive(Clone, Default)]
 pub struct LeaseCancel {
     token: Option<pgwire::tokio::CancellationToken>,
+    /// Test-only fuse: cancel the token on the Nth `bail_if_cancelled` call.
+    /// Lets behavioral tests fire cancellation at a SPECIFIC fence (e.g. the
+    /// commit-adjacent one, AFTER the loop-top check has passed) without racing.
+    /// `None` in all production constructions, so the production check below is a
+    /// plain `is_cancelled` read.
+    #[cfg(test)]
+    trip_at_check: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl LeaseCancel {
     /// No lease attached (foreground DDL). `bail_if_cancelled` is a no-op.
     pub fn none() -> Self {
-        Self { token: None }
+        Self {
+            token: None,
+            #[cfg(test)]
+            trip_at_check: None,
+        }
     }
 
     /// Attach a lease-cancellation token (worker task path). A `None` argument
     /// degrades to [`LeaseCancel::none`] so callers can forward an optional
     /// signal without branching.
     pub fn new(token: Option<pgwire::tokio::CancellationToken>) -> Self {
-        Self { token }
+        Self {
+            token,
+            #[cfg(test)]
+            trip_at_check: None,
+        }
+    }
+
+    /// Test-only constructor that arms a fuse: the token is cancelled exactly on
+    /// the `nth` (1-based) `bail_if_cancelled` call. Checks 1..nth-1 pass; the nth
+    /// check (and every check after) bails with the canonical claim-cancelled
+    /// error. Use `nth = 2` to fire at the FIRST commit-adjacent fence in
+    /// `execute_hnsw_merge` (TiKV path): check 1 = loop-top (passes), check 2 =
+    /// the commit-adjacent fence immediately before `txn.commit()`.
+    #[cfg(test)]
+    pub fn new_tripping_at_check(nth: i64) -> Self {
+        let token = pgwire::tokio::CancellationToken::new();
+        Self {
+            token: Some(token),
+            trip_at_check: Some(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(nth))),
+        }
     }
 
     /// Return the canonical claim-cancelled error if the lease has been lost,
     /// stolen, or the engine is shutting down. Call this immediately before any
     /// tenant commit / txn rotation / phase write in a long-running task body.
     pub fn bail_if_cancelled(&self) -> Result<()> {
+        #[cfg(test)]
+        if let (Some(token), Some(counter)) = (&self.token, &self.trip_at_check) {
+            // Fire the fuse on the configured check, then stay cancelled.
+            if counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) <= 1 {
+                token.cancel();
+            }
+        }
         if let Some(token) = &self.token {
             if token.is_cancelled() {
                 return Err(anyhow::anyhow!(CLAIM_CANCELLED_ERROR));
@@ -371,7 +408,12 @@ pub async fn check_keyspace_state(pd_endpoints: &[String], keyspace: &str) -> Op
 /// This keeps worker metadata isolated (`_sys_worker`) while removing the need
 /// for manual keyspace pre-provisioning in local/dev and CI-like environments.
 /// In TLS mode, skip HTTP provisioning and rely on existing pre-created keyspace.
-async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<()> {
+///
+/// Visible at crate scope so TiKV-backed behavioral tests that acquire a TENANT
+/// store via the pool (whose `with_keyspace` connect requires the keyspace to
+/// already exist in PD) can pre-create the tenant keyspace with the SAME
+/// canonical PD-API path production uses for the system keyspace.
+pub(crate) async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<()> {
     if std::env::var("TIKV_CA_PATH").is_ok() {
         info!(
             "Skipping system keyspace ensure in TLS mode; expecting '{}' to be pre-created",
@@ -601,6 +643,13 @@ mod tests {
             ..Default::default()
         };
 
+        // `new_system` connects with `with_keyspace`, which requires the keyspace
+        // to already exist in PD (the vendored client does NOT auto-create it).
+        // Pre-create it with the canonical PD-API helper that `init_gc_registry_store`
+        // uses, so this promoted CI test does not fail at connect.
+        ensure_system_keyspace(&pd_endpoints, &cfg.system_keyspace)
+            .await
+            .expect("pre-create production-init test keyspace in PD");
         // Seed a legacy V1 row directly (pre-upgrade durable state) on a raw
         // store handle that has NOT run the migration yet.
         let raw = std::sync::Arc::new(
