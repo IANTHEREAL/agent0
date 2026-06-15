@@ -1964,6 +1964,369 @@ async fn orphan_cron_nextfire_for_dropped_db_is_skipped_and_reaped() {
     txn.rollback().await.ok();
 }
 
+/// PROACTIVE cross-store fence (#2628 item 2): a DROP-reap that writes the
+/// durable dropped-DB TOMBSTONE and a concurrent cron next-fire enqueue that
+/// reads that tombstone via `get_for_update` in the SAME system txn as
+/// `put_task_v2` (`enqueue_task_v2_unless_db_dropped`) CANNOT both commit — they
+/// serialize on the tombstone key under pessimistic txns. Exactly one wins, and
+/// when DROP wins the enqueue is aborted/retried-to-suppressed so NO stale
+/// `_sys_worker` next-fire row remains for the dropped db_id.
+///
+/// This makes the former "self-healing residual" orphan IMPOSSIBLE, not merely
+/// recoverable. It drives the real conflict against a live store, not a source
+/// grep: two concurrent pessimistic txns touching the same tombstone key, then
+/// the post-conflict store state.
+///
+/// Scenarios exercised against the same db_id family:
+///   (A) RACE: reap-txn (tombstone put) and enqueue-txn (tombstone
+///       get_for_update + put_task_v2) run concurrently, then both attempt to
+///       commit. At most one commits. When the reap wins, the global queue holds
+///       ZERO next-fire rows for the dropped db_id.
+///   (B) SEQUENCED: once a tombstone is durably committed, a later enqueue's
+///       `enqueue_task_v2_unless_db_dropped` returns false and writes nothing —
+///       the clean suppress path the production reap-then-enqueue ordering hits.
+///   (C) REGISTRY FENCE: the SQL cron-enqueue path
+///       (`enqueue_cron_registry_and_task_unless_db_dropped`) writes BOTH the
+///       `_sys_worker` registry inventory bit AND the next-fire queue row under
+///       ONE tombstone fence, so a strictly-sequential DROP-then-`cron.schedule`
+///       re-creates NEITHER a stale registry row NOR a stale queue row; a live
+///       (un-tombstoned) db_id still gets both.
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn dropped_db_tombstone_makes_cross_store_nextfire_orphan_impossible() {
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let system_keyspace = format!(
+        "_sys_tombstone_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let cfg = crate::worker::config::WorkerConfig {
+        enabled: true,
+        system_keyspace: system_keyspace.clone(),
+        ..Default::default()
+    };
+    let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
+        .await
+        .expect("init system store");
+
+    let keyspace = format!(
+        "test_tombstone_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+
+    let make_entry = |db_id: u64, task_id: i64| {
+        TaskQueueEntry::new(
+            keyspace.clone(),
+            db_id,
+            task_id,
+            TaskType::Cron,
+            "SELECT 1".to_string(),
+            "admin".to_string(),
+            100,
+        )
+        .with_schedule("*/5 * * * *".to_string())
+    };
+
+    // ── Scenario A: RACE — reap (tombstone put) vs enqueue (fenced put). ──
+    //
+    // Both txns are pessimistic. The enqueue takes `get_for_update` on the
+    // tombstone key, which is exactly the key the reap writes — so the two
+    // serialize on that key and cannot both commit. We drive the race a few
+    // times to cover both commit interleavings, asserting the invariant on each.
+    //
+    // Each round must model a DISTINCT dropped database: a tombstone is durable
+    // and never cleared (db_id is monotonic / non-recycled), and this scenario
+    // guarantees a tombstone for the round's db_id is committed before the round
+    // ends (the reap wins, or the enqueue-won leg commits one explicitly). So a
+    // FRESH db_id per round is required for the round's "no prior tombstone"
+    // precondition to hold — reusing one db_id would make every round after the
+    // first observe the committed tombstone and (correctly) suppress.
+    for round in 0..4i64 {
+        // Disjoint from every other db_id used below (7_002..=7_005) so a
+        // tombstone committed for a race round never fences a later scenario.
+        let race_db_id = 7_100_u64 + round as u64;
+        let task_id = 500 + round;
+        let fire_time_ms = crate::worker::now_epoch_ms();
+        let entry = make_entry(race_db_id, task_id);
+
+        // Open both txns BEFORE either commits, so they genuinely contend.
+        let mut reap_txn = system_store.begin().await.unwrap();
+        let mut enq_txn = system_store.begin().await.unwrap();
+
+        // Enqueue stages its fenced put (tombstone get_for_update sees no
+        // tombstone yet → stages put_task_v2). It now holds a pessimistic lock
+        // on the tombstone key from get_for_update.
+        let staged = system_store
+            .enqueue_task_v2_unless_db_dropped(&mut enq_txn, &entry, fire_time_ms)
+            .await
+            .expect("fenced enqueue stage must not error");
+        assert!(
+            staged,
+            "with no prior tombstone the fenced enqueue must stage the put"
+        );
+
+        // Reap stages the tombstone put on the SAME key the enqueue locked.
+        let reap_stage = system_store
+            .put_dropped_db_tombstone(&mut reap_txn, &keyspace, race_db_id)
+            .await;
+
+        // Commit both; at most one may succeed — they conflict on the tombstone.
+        let enq_ok = enq_txn.commit().await.is_ok();
+        let reap_ok = match reap_stage {
+            Ok(()) => reap_txn.commit().await.is_ok(),
+            Err(_) => {
+                // Reap staging was blocked by the enqueue's pessimistic lock —
+                // i.e. the enqueue won contention; the reap made no progress.
+                reap_txn.rollback().await.ok();
+                false
+            }
+        };
+        assert!(
+            !(enq_ok && reap_ok),
+            "INVARIANT VIOLATED: reap (tombstone) and fenced enqueue BOTH committed \
+             for the same db_id — the cross-store orphan window is open (round {round})"
+        );
+        assert!(
+            enq_ok || reap_ok,
+            "at least one of {{reap, enqueue}} should make progress (round {round})"
+        );
+
+        // When DROP (the reap) won, the global queue must hold NO next-fire row
+        // for this dropped db_id: the enqueue lost and wrote nothing.
+        if reap_ok && !enq_ok {
+            let mut check = system_store.begin().await.unwrap();
+            let due = system_store
+                .scan_due_v2(&mut check, i64::MAX, 100_000)
+                .await
+                .unwrap();
+            assert!(
+                !due.iter()
+                    .any(|(_, d)| d.db_id == race_db_id && d.task_id == task_id),
+                "INVARIANT VIOLATED: a stale next-fire row survived after DROP won \
+                 the race (round {round})"
+            );
+            check.rollback().await.ok();
+        }
+
+        // If the enqueue happened to win this interleaving, retry the enqueue
+        // against the now-known-dropped DB AFTER committing the tombstone: it
+        // must now suppress (this is the retry-to-suppressed leg the production
+        // path takes when its first commit conflicts).
+        if enq_ok && !reap_ok {
+            let mut t = system_store.begin().await.unwrap();
+            system_store
+                .put_dropped_db_tombstone(&mut t, &keyspace, race_db_id)
+                .await
+                .unwrap();
+            t.commit().await.unwrap();
+
+            let mut retry = system_store.begin().await.unwrap();
+            let staged_again = system_store
+                .enqueue_task_v2_unless_db_dropped(&mut retry, &entry, fire_time_ms)
+                .await
+                .unwrap();
+            retry.rollback().await.ok();
+            assert!(
+                !staged_again,
+                "after the tombstone is committed, a retried enqueue MUST suppress \
+                 (round {round})"
+            );
+        }
+    }
+
+    // ── Scenario B: SEQUENCED — tombstone committed first, enqueue suppressed. ──
+    //
+    // This is the production DROP ordering: the reap commits the tombstone, then
+    // any later cross-store enqueue cleanly returns false and writes nothing.
+    let seq_db_id = 7_002_u64;
+    let seq_task_id = 900_i64;
+    {
+        let mut t = system_store.begin().await.unwrap();
+        system_store
+            .put_dropped_db_tombstone(&mut t, &keyspace, seq_db_id)
+            .await
+            .unwrap();
+        t.commit().await.unwrap();
+    }
+    {
+        let mut t = system_store.begin().await.unwrap();
+        let exists = system_store
+            .dropped_db_tombstone_exists_for_update(&mut t, &keyspace, seq_db_id)
+            .await
+            .unwrap();
+        assert!(exists, "committed tombstone must be readable for_update");
+        t.rollback().await.ok();
+    }
+    {
+        let entry = make_entry(seq_db_id, seq_task_id);
+        let mut t = system_store.begin().await.unwrap();
+        let staged = system_store
+            .enqueue_task_v2_unless_db_dropped(&mut t, &entry, crate::worker::now_epoch_ms())
+            .await
+            .unwrap();
+        assert!(
+            !staged,
+            "fenced enqueue must suppress for a tombstoned (dropped) DB"
+        );
+        t.commit().await.unwrap();
+    }
+    // Decisive end-state: zero next-fire rows for the sequenced dropped db_id.
+    {
+        let mut check = system_store.begin().await.unwrap();
+        let due = system_store
+            .scan_due_v2(&mut check, i64::MAX, 100_000)
+            .await
+            .unwrap();
+        assert!(
+            !due.iter().any(|(_, d)| d.db_id == seq_db_id),
+            "INVARIANT VIOLATED: a next-fire row exists for a tombstoned DB"
+        );
+        check.rollback().await.ok();
+    }
+
+    // A tombstone for one db_id must NEVER fence a DIFFERENT db_id (db_id is
+    // monotonic / non-recycled, so tombstones are 1:1 with a dropped database).
+    {
+        let live_db_id = 7_003_u64;
+        let entry = make_entry(live_db_id, 1_001);
+        let mut t = system_store.begin().await.unwrap();
+        let staged = system_store
+            .enqueue_task_v2_unless_db_dropped(&mut t, &entry, crate::worker::now_epoch_ms())
+            .await
+            .unwrap();
+        assert!(
+            staged,
+            "a tombstone for another db_id must not fence a live db_id's enqueue"
+        );
+        t.rollback().await.ok();
+    }
+
+    // ── Scenario C: REGISTRY FENCE — the SQL cron-enqueue path writes BOTH the
+    // `_sys_worker` registry inventory bit AND the next-fire queue row, and BOTH
+    // must be fenced by the SAME tombstone. This is the strictly-sequential gap:
+    // DROP DATABASE has fully committed (tombstone + registry delete + queue reap)
+    // and THEN a `cron.schedule` for that db_id arrives. The registry write must
+    // be suppressed too — otherwise it re-creates a stale inventory row that only
+    // the self-healing registry sweep would later clean up, violating the "no
+    // stale `_sys_worker` row" invariant. ──
+    let reg_db_id = 7_004_u64;
+    let reg_task_id = 1_200_i64;
+    {
+        // DROP's reap committed the tombstone for this db_id.
+        let mut t = system_store.begin().await.unwrap();
+        system_store
+            .put_dropped_db_tombstone(&mut t, &keyspace, reg_db_id)
+            .await
+            .unwrap();
+        t.commit().await.unwrap();
+    }
+    // Pre-state: no registry row exists for the dropped db_id (reap deleted it).
+    {
+        let mut t = system_store.begin().await.unwrap();
+        let pre = system_store
+            .get_worker_registry(&mut t, &keyspace, reg_db_id)
+            .await
+            .unwrap();
+        assert!(
+            pre.is_none(),
+            "precondition: dropped db_id must have no registry row before the late enqueue"
+        );
+        t.rollback().await.ok();
+    }
+    // A late SQL cron-enqueue for the dropped db_id: BOTH registry and queue
+    // writes must be suppressed by the single tombstone fence.
+    {
+        let entry = make_entry(reg_db_id, reg_task_id);
+        let mut t = system_store.begin().await.unwrap();
+        let staged = system_store
+            .enqueue_cron_registry_and_task_unless_db_dropped(
+                &mut t,
+                &entry,
+                crate::worker::now_epoch_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !staged,
+            "the SQL cron-enqueue path must suppress for a tombstoned (dropped) DB"
+        );
+        t.commit().await.unwrap();
+    }
+    // Decisive end-state: NEITHER a registry inventory row NOR a next-fire queue
+    // row may exist for the dropped db_id.
+    {
+        let mut t = system_store.begin().await.unwrap();
+        let reg = system_store
+            .get_worker_registry(&mut t, &keyspace, reg_db_id)
+            .await
+            .unwrap();
+        assert!(
+            reg.is_none(),
+            "INVARIANT VIOLATED: a stale `_sys_worker` registry row was re-created \
+             for a dropped db_id by the late SQL cron-enqueue path"
+        );
+        let due = system_store
+            .scan_due_v2(&mut t, i64::MAX, 100_000)
+            .await
+            .unwrap();
+        assert!(
+            !due.iter().any(|(_, d)| d.db_id == reg_db_id),
+            "INVARIANT VIOLATED: a next-fire row exists for a tombstoned DB after the \
+             SQL cron-enqueue path"
+        );
+        t.rollback().await.ok();
+    }
+
+    // The registry fence must NOT block a live db_id: the SQL cron-enqueue path
+    // for an un-tombstoned db_id writes BOTH the registry bit and the queue row.
+    {
+        let live_reg_db_id = 7_005_u64;
+        let live_reg_task_id = 1_300_i64;
+        let entry = make_entry(live_reg_db_id, live_reg_task_id);
+        let mut t = system_store.begin().await.unwrap();
+        let staged = system_store
+            .enqueue_cron_registry_and_task_unless_db_dropped(
+                &mut t,
+                &entry,
+                crate::worker::now_epoch_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            staged,
+            "the SQL cron-enqueue path must enqueue for a live (un-tombstoned) db_id"
+        );
+        t.commit().await.unwrap();
+
+        let mut t = system_store.begin().await.unwrap();
+        let reg = system_store
+            .get_worker_registry(&mut t, &keyspace, live_reg_db_id)
+            .await
+            .unwrap();
+        assert!(
+            reg.is_some_and(|r| r.task_types & TASK_TYPE_CRON != 0),
+            "live db_id must get a registry row with the cron bit set"
+        );
+        let due = system_store
+            .scan_due_v2(&mut t, i64::MAX, 100_000)
+            .await
+            .unwrap();
+        assert!(
+            due.iter()
+                .any(|(_, d)| d.db_id == live_reg_db_id && d.task_id == live_reg_task_id),
+            "live db_id must get a next-fire queue row"
+        );
+        t.rollback().await.ok();
+    }
+}
+
 // ── frozen hotfix: engine entry-point helper tests ────────────
 
 #[test]

@@ -1241,13 +1241,20 @@ impl WorkerEngine {
         // single-txn fence (as load_next/finalize use) is impossible. We take
         // get_for_update on the tenant DB metadata row in the same tenant
         // snapshot that decides the missing jobs, so a DROP DATABASE that has
-        // already removed the metadata row makes us bail before enqueuing. The
-        // irreducible residual is a DROP that commits its metadata-delete
-        // between this tenant commit and the system enqueue commit; that orphan
-        // is self-healing — the worker tick that later claims it sees the DB
-        // gone in execute_task's preamble (get_database_by_id → None), skips,
-        // and cleanup deletes the queue row. DROP's own queue reap covers the
-        // common case.
+        // already removed the metadata row makes us bail before enqueuing.
+        //
+        // The former cross-store residual — a DROP that commits its
+        // metadata-delete between this tenant commit and the system enqueue
+        // commit — is now PREVENTED, not merely self-healing (issue #2628 item
+        // 2). DROP's reap writes a durable dropped-DB TOMBSTONE in the SYSTEM
+        // store, and step 4's enqueue takes get_for_update on that tombstone in
+        // the SAME system txn as put_task_v2
+        // (`enqueue_task_v2_unless_db_dropped`). The reap's tombstone put and the
+        // enqueue's tombstone read then conflict under pessimistic txns: at most
+        // one commits, and on enqueue retry the tombstone is present → suppress.
+        // No stale `_sys_worker` next-fire row can remain for the dropped db_id.
+        // The self-healing nets (execute_task's get_database_by_id → None skip,
+        // and the queue reap) are retained as defense-in-depth.
         let mut tenant_txn = store.begin().await?;
         if !store
             .database_alive_for_update(&mut tenant_txn, db_id)
@@ -1328,10 +1335,16 @@ impl WorkerEngine {
                     128,
                 )
                 .with_schedule(job.schedule.clone());
-                self.system_store
-                    .put_task_v2(&mut sys_txn, &queue_entry, next_fire)
-                    .await?;
-                enqueued += 1;
+                // Cross-store fence: tombstone get_for_update + put_task_v2 in
+                // ONE system txn (issue #2628 item 2). A concurrent DROP-reap
+                // conflicts on the tombstone key.
+                if self
+                    .system_store
+                    .enqueue_task_v2_unless_db_dropped(&mut sys_txn, &queue_entry, next_fire)
+                    .await?
+                {
+                    enqueued += 1;
+                }
             }
             sys_txn.commit().await?;
         }
@@ -2184,11 +2197,26 @@ impl WorkerEngine {
             // load_next_cron_queue_entry's own tenant txn via
             // assert_database_alive_for_update: a dropped/!alive DB makes it
             // return None, so no next entry is written into the global queue.
+            //
+            // The cross-store residual (a DROP committing between that tenant
+            // fence and this system commit) is now PREVENTED, not merely
+            // self-healing (issue #2628 item 2): the enqueue routes through
+            // enqueue_task_v2_unless_db_dropped, which takes get_for_update on
+            // the durable dropped-DB tombstone (written by DROP's reap in the
+            // SYSTEM store) in THIS SAME system txn as put_task_v2. The reap's
+            // tombstone put and this enqueue then conflict under pessimistic
+            // txns — at most one commits, and a retry sees the tombstone and
+            // suppresses — so no stale next-fire row survives for a dropped db.
             if let Some(next_entry) = Self::load_next_cron_queue_entry(pool, &entry).await? {
                 if let Some(schedule) = next_entry.schedule.as_deref() {
                     if let Ok(next_fire) = compute_next_fire_time(schedule) {
+                        // Cross-store fence: tombstone get_for_update +
+                        // put_task_v2 in this SAME system txn (issue #2628 item
+                        // 2). A DROP-reap that committed the tombstone (or races
+                        // this commit) conflicts on the tombstone key, so no
+                        // stale next-fire row survives for a dropped db_id.
                         system_store
-                            .put_task_v2(&mut txn, &next_entry, next_fire)
+                            .enqueue_task_v2_unless_db_dropped(&mut txn, &next_entry, next_fire)
                             .await?;
                     }
                 }

@@ -2,7 +2,7 @@ use super::*;
 use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{
     HnswS3DbPrefixCleanupIntent, HnswS3GraphUploadIntent, TaskDescriptorV2, TaskPayloadV2,
-    TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim,
+    TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim, TASK_TYPE_CRON,
 };
 use std::time::Duration;
 
@@ -236,11 +236,27 @@ impl TikvStore {
     /// Reap all worker queue entries for a database, then delete its registry
     /// inventory row. The registry row is intentionally retained if queue
     /// cleanup fails so bounded maintenance can retry from durable inventory.
+    ///
+    /// FIRST writes the durable dropped-DB tombstone (committed in its own system
+    /// txn) so the cross-store DROP-vs-enqueue race is closed proactively: a cron
+    /// next-fire enqueue that takes `get_for_update` on the tombstone in the same
+    /// system txn as its `put_task_v2` either (a) started after this commit and
+    /// observes the tombstone → suppresses, or (b) raced this commit and
+    /// conflicts on the tombstone key → at most one of {reap, enqueue} commits,
+    /// and on enqueue retry the tombstone is present → suppresses. Either way no
+    /// stale `_sys_worker` next-fire row can survive for the dropped db_id. The
+    /// tombstone is written BEFORE the queue scan so it fences enqueues that race
+    /// the reap's own delete window.
     pub async fn reap_db_queue_entries_then_delete_worker_registry(
         &self,
         keyspace: &str,
         db_id: u64,
     ) -> Result<usize> {
+        let mut tombstone_txn = self.begin().await?;
+        self.put_dropped_db_tombstone(&mut tombstone_txn, keyspace, db_id)
+            .await?;
+        tombstone_txn.commit().await?;
+
         let deleted = self.reap_db_queue_entries(keyspace, db_id).await?;
 
         let mut txn = self.begin().await?;
@@ -249,6 +265,120 @@ impl TikvStore {
         txn.commit().await?;
 
         Ok(deleted)
+    }
+
+    // ========================================================================
+    // Dropped-DB tombstone (cross-store DROP-vs-enqueue fence, issue #2628)
+    //
+    // The DB liveness fence (`database_alive_for_update`) lives in the TENANT
+    // store, but every cron next-fire enqueue commits in the SYSTEM store, so a
+    // single-txn fence across the two is impossible. These helpers add a durable
+    // tombstone IN THE SYSTEM STORE so the DROP-reap and the enqueue can conflict
+    // within one store: the reap PUTs the tombstone and the enqueue takes
+    // `get_for_update` on it in the SAME system txn as `put_task_v2`. Under
+    // pessimistic txns the two writers serialize — the orphan next-fire row is
+    // made impossible, not merely self-healing. `db_id` is monotonic /
+    // non-recycled, so the tombstone is safe to keep forever.
+    // ========================================================================
+
+    /// Write the durable dropped-DB tombstone in the SYSTEM store. Idempotent:
+    /// re-running DROP's reap (or a sweep retry) just rewrites the same marker.
+    pub async fn put_dropped_db_tombstone(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_dropped_db_tombstone_key(keyspace, db_id));
+        // Value carries no information; presence is the whole signal.
+        txn_put(txn, key, vec![1u8]).await?;
+        Ok(())
+    }
+
+    /// Read the dropped-DB tombstone under a WRITE LOCK (`get_for_update`). This
+    /// is the fence read every cross-store enqueue takes in the SAME system txn
+    /// as `put_task_v2`, so a concurrent DROP-reap that PUTs the tombstone and
+    /// this enqueue cannot both commit (pessimistic conflict on the tombstone
+    /// key). Returns `true` when the DB has been dropped → caller must suppress
+    /// the enqueue.
+    pub async fn dropped_db_tombstone_exists_for_update(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<bool> {
+        let key = self.key(&encode_worker_dropped_db_tombstone_key(keyspace, db_id));
+        Ok(tikv_op!(txn.get_for_update(key).await)?.is_some())
+    }
+
+    /// THE single cross-store enqueue path: fence on the dropped-DB tombstone
+    /// (`get_for_update`) and, only if the DB is NOT tombstoned, enqueue the task
+    /// — both in the caller's SAME system transaction. Returns whether the task
+    /// was enqueued (`false` = the DB was dropped, enqueue suppressed).
+    ///
+    /// All cross-store next-fire producers (cron reconcile, post-exec next-fire,
+    /// the SQL cron-enqueue path) MUST route through this so the proactive fence
+    /// stays consistent across every site. Because the tombstone read and the
+    /// `put_task_v2` write share one pessimistic txn, a concurrent DROP-reap
+    /// (which PUTs the tombstone) and this enqueue serialize: exactly one commits.
+    /// When DROP wins, this enqueue's commit conflicts and is retried; the retry
+    /// observes the tombstone and suppresses — so NO stale `_sys_worker` next-fire
+    /// row can remain for the dropped db_id.
+    pub async fn enqueue_task_v2_unless_db_dropped(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+    ) -> Result<bool> {
+        if self
+            .dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.put_task_v2(txn, entry, fire_time_ms).await?;
+        Ok(true)
+    }
+
+    /// SQL cron-enqueue path (`cron.schedule` / `cron.alter_job`): fence the
+    /// dropped-DB tombstone ONCE (`get_for_update`) and, only if the DB is NOT
+    /// tombstoned, write BOTH the `_sys_worker` registry inventory bit AND the
+    /// next-fire queue row — all in the caller's SAME system transaction. Returns
+    /// whether the cron job was enqueued (`false` = the DB was dropped, the whole
+    /// enqueue suppressed).
+    ///
+    /// Why a dedicated helper: the cron SQL path writes the registry inventory row
+    /// in addition to the queue row, and BOTH are `_sys_worker` rows that must not
+    /// survive for a dropped db_id. If the registry write were done before the
+    /// fence (or outside it), a strictly-sequential `DROP DATABASE` (which commits
+    /// the tombstone PUT, the registry delete, and the queue reap) followed by a
+    /// `cron.schedule` for that db_id would re-create a stale registry inventory row
+    /// even though the queue row is suppressed — degrading back to self-healing
+    /// registry-sweep cleanup and violating the "no stale `_sys_worker` row"
+    /// invariant (issue #2628 item 2). Folding the registry write under the SAME
+    /// tombstone `get_for_update` closes that gap: a concurrent DROP-reap (tombstone
+    /// PUT) and this enqueue serialize on the tombstone key, so exactly one commits,
+    /// and on retry the tombstone forces suppression of registry AND queue together.
+    ///
+    /// The two engine-side cross-store sites (cron reconcile, post-exec next-fire)
+    /// do NOT touch the registry — they enqueue into an already-registered
+    /// inventory — so they keep using `enqueue_task_v2_unless_db_dropped`.
+    pub async fn enqueue_cron_registry_and_task_unless_db_dropped(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+    ) -> Result<bool> {
+        if self
+            .dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.update_registry_task_types(txn, &entry.keyspace, entry.db_id, TASK_TYPE_CRON, 0)
+            .await?;
+        self.put_task_v2(txn, entry, fire_time_ms).await?;
+        Ok(true)
     }
 
     pub async fn update_registry_task_types(

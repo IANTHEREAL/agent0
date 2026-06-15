@@ -721,6 +721,7 @@ slow create, anti-entropy layer 2 (K2) repairs on the next acquisition.
 delete tenant metadata INCLUDING the liveness key   (arms the K8 fence)
 clean feature-external state (HNSW text keys, S3)
 destroy data ranges
+write dropped-DB TOMBSTONE in the SYSTEM store      (arms the cross-store fence)
 reap worker queue entries for (keyspace, db_id)
 delete canonical inventory row                      (ordered cleanup, K5)
 ```
@@ -729,6 +730,28 @@ If queue reap fails, retain the inventory row; the sweep retries cleanup via
 the missing-database protocol. Tasks claimed after the metadata delete abort
 at liveness resolution or at the fence; tasks already past their last commit
 were serialized before the drop and their writes die with the range.
+
+**Cross-store next-fire fence (issue #2628 item 2).** The K8 liveness key lives
+in the TENANT store, but every cron next-fire enqueue commits in the SYSTEM
+store, so a single-txn fence across the two stores is impossible. Closing that
+window requires a fence object IN the system store: DROP's reap writes a durable
+dropped-DB **tombstone** (`_wq_dropped_db_{keyspace}_{db_id}`, committed before
+the queue scan), and every cross-store enqueue routes through ONE helper
+(`enqueue_task_v2_unless_db_dropped`) that takes `get_for_update` on that
+tombstone in the SAME system transaction as `put_task_v2`. The three producers
+that must use it: cron reconcile enqueue, post-exec cron next-fire, and the SQL
+cron-enqueue path. A concurrent DROP-reap (tombstone put) and an enqueue
+(tombstone `get_for_update`) then conflict under pessimistic txns — at most one
+commits, and on enqueue retry the committed tombstone forces suppression. The
+former self-healing residual (a DROP committing between the tenant fence and the
+system enqueue) is therefore PREVENTED, not merely recoverable. `db_id` is
+monotonic / non-recycled, so the tombstone is safe to keep forever and can never
+falsely fence a future database.
+
+A tombstone write failure (e.g. system store unavailable) must NOT fail DROP: it
+returns an error from the reap, which the DROP path logs and ignores, degrading
+to the prior self-healing behavior (the consumer-side `get_database_by_id → None`
+skip in `execute_task`, plus the queue reap, remain as defense-in-depth).
 
 ### Missing database during sweep
 
@@ -812,6 +835,12 @@ Kernel — claims and fence:
 - A background transaction committing after DROP's metadata delete aborts at
   the fence; after drop completes, no keys exist in the destroyed range
   (resurrection test).
+- Cross-store next-fire fence (#2628 item 2): a DROP-reap that writes the
+  dropped-DB tombstone and a concurrent cron next-fire enqueue that reads it via
+  `get_for_update` in the same system txn as `put_task_v2` cannot both commit —
+  exactly one wins; when DROP wins, no stale `_sys_worker` next-fire row remains
+  for the dropped db_id, and a tombstone for one db_id never fences another.
+  (`dropped_db_tombstone_makes_cross_store_nextfire_orphan_impossible`).
 
 Kernel — inventory:
 

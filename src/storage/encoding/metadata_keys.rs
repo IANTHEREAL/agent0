@@ -74,6 +74,15 @@ pub(super) const WORKER_QUEUE_SCHEMA_VERSION_KEY: &[u8] = b"_wq_schema_version";
 /// Explicit migration lock for V1 `_worker_queue_` to V2 due/index/payload
 /// conversion. The value stores the lock acquisition time in epoch millis.
 pub(super) const WORKER_QUEUE_MIGRATION_LOCK_KEY: &[u8] = b"_wq_migration_lock";
+/// Durable dropped-DB tombstone (global, system store). Written by DROP
+/// DATABASE's worker reap and read with `get_for_update` in the SAME system
+/// transaction as every cross-store next-fire `put_task_v2`. Because `db_id` is
+/// monotonic / non-recycled, the tombstone is safe to keep forever: it can
+/// never falsely fence a future database. It exists to make the cross-store
+/// DROP-vs-enqueue race impossible — the reap's tombstone put and the enqueue's
+/// tombstone `get_for_update` conflict under pessimistic txns, so they cannot
+/// both commit. See issue #2628 (item 2) and design doc §K8.
+pub(super) const WORKER_DROPPED_DB_TOMBSTONE_PREFIX: &[u8] = b"_wq_dropped_db_";
 /// HNSW S3 graph uploads that crossed the transactional boundary but have not
 /// yet been proven committed or aborted by GC.
 pub(super) const HNSW_S3_GRAPH_UPLOAD_INTENT_PREFIX: &[u8] = b"_hnsw_s3_graph_upload_intent_";
@@ -449,6 +458,24 @@ pub fn encode_worker_registry_key(keyspace: &str, db_id: u64) -> Vec<u8> {
 /// Encode the prefix for all worker registry keys (global).
 pub fn encode_worker_registry_prefix() -> Vec<u8> {
     WORKER_REGISTRY_PREFIX.to_vec()
+}
+
+/// Encode a dropped-DB tombstone key (global, system store).
+///
+/// Format: `_wq_dropped_db_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}`
+///
+/// Keyed by the logical tenant keyspace string (the same value every enqueue
+/// site embeds as `entry.keyspace`) plus the monotonic `db_id`, so the tombstone
+/// is 1:1 with a dropped database and can never collide with a future one.
+pub fn encode_worker_dropped_db_tombstone_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_DROPPED_DB_TOMBSTONE_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_DROPPED_DB_TOMBSTONE_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
 }
 
 pub fn encode_hnsw_s3_graph_upload_intent_key(

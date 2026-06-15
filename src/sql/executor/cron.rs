@@ -2,7 +2,7 @@ use crate::cron::{parser, types::CronJob};
 use crate::model::Value;
 use crate::storage::TikvStore;
 use crate::worker::get_system_store;
-use crate::worker::types::{TaskQueueEntry, TaskType, TASK_TYPE_CRON};
+use crate::worker::types::{TaskQueueEntry, TaskType};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -379,11 +379,20 @@ async fn enqueue_cron_to_worker(
                 )
                 .await?;
         }
+        // Cross-store fence: a SINGLE tombstone get_for_update guards BOTH the
+        // `_sys_worker` registry inventory bit AND the next-fire queue row, all in
+        // ONE system txn (issue #2628 item 2). Both are `_sys_worker` rows that
+        // must not survive for a dropped db_id, so the registry write MUST be
+        // fenced too — otherwise a strictly-sequential DROP DATABASE (tombstone +
+        // registry delete + queue reap, all committed) followed by a cron.schedule
+        // for that db_id would re-create a stale registry inventory row even though
+        // the queue row is suppressed. Routing both through one fenced helper means
+        // a concurrent DROP-reap (tombstone PUT) and this enqueue serialize on the
+        // tombstone key: exactly one commits, and on retry the tombstone forces
+        // suppression of registry AND queue together. No stale `_sys_worker` row
+        // can remain for a dropping/dropped DB.
         system_store
-            .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_CRON, 0)
-            .await?;
-        system_store
-            .put_task_v2(&mut sys_txn, &entry, next_fire)
+            .enqueue_cron_registry_and_task_unless_db_dropped(&mut sys_txn, &entry, next_fire)
             .await?;
         sys_txn.commit().await?;
         Ok::<(), anyhow::Error>(())
@@ -674,6 +683,31 @@ mod tests {
         assert!(
             source.contains("enqueue_cron_to_worker(keyspace, db_id, &existing_job, true).await?"),
             "schedule replacement must still clean existing V2 worker entries"
+        );
+    }
+
+    #[test]
+    fn cron_sql_enqueue_fences_registry_and_queue_through_one_helper() {
+        // The SQL cron-enqueue path must NOT write the `_sys_worker` registry
+        // inventory bit outside the tombstone fence: both the registry write and
+        // the next-fire queue write must go through the single fenced helper, so a
+        // strictly-sequential DROP-then-cron.schedule cannot re-create a stale
+        // registry row (issue #2628 item 2). Behavioral proof lives in
+        // worker/engine/tests.rs::dropped_db_tombstone_makes_cross_store_nextfire_orphan_impossible
+        // (scenario C); this guard prevents a regression back to an unfenced
+        // registry write.
+        let source = include_str!("cron.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("cron.rs must contain #[cfg(test)] tests");
+        assert!(
+            prod_source.contains(".enqueue_cron_registry_and_task_unless_db_dropped("),
+            "cron SQL enqueue must fence the registry AND queue writes through the single helper"
+        );
+        assert!(
+            !prod_source.contains(".update_registry_task_types("),
+            "cron SQL enqueue must not write the registry bit outside the tombstone fence"
         );
     }
 
