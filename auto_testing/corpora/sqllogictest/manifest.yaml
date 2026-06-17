@@ -1,0 +1,12 @@
+# Corpus manifest — sqllogictest (output-equivalence vs PG 17.10 oracle)
+name: sqllogictest
+type: sqllogictest
+corpus_tag: gregrahn-c67f97bf      # gregrahn/sqllogictest @ commit c67f97bf
+oracle: postgres:17.10
+source_sql: source/tests           # .test files (self-contained; no fixtures)
+schedule_full: schedule/full.list
+schedule_smoke: schedule/smoke.list
+baseline: baseline.json
+issue_links: issue_links.json
+parent_issue: 2642
+label: pg-compat

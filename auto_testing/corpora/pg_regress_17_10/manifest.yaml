@@ -1,0 +1,15 @@
+# Corpus manifest — read by auto_testing/corpora/_engine/run_corpus.py
+name: pg_regress_17_10
+type: regress_diff          # which engine runner handles it
+corpus_tag: REL_17_10       # pinned PostgreSQL source tag
+oracle: postgres:17.10      # standard-answer source (only used to (re)build baseline)
+source_sql: source/sql
+source_data: source/data
+setup: fixtures/adapted_setup.sql
+schedule_full: schedule/full_schedule.list
+schedule_smoke: schedule/smoke_subset.list
+baseline: baseline.json
+issue_links: issue_links.json
+parent_issue: 2642
+umbrella_issue: 2644
+label: pg-compat

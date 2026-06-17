@@ -1,0 +1,18 @@
+# Upstream corpus is fetched on demand (source/fetch.sh) + checksum-verified,
+# not vendored — keeps the repo small and license-clean.
+*/source/sql/
+*/source/data/
+*/source/parallel_schedule
+*/source/tests/
+
+# Baseline is environment-specific (tied to a db9 build): generate per-env with
+#   run_corpus.py --regen-baseline   (see README). Not vendored.
+*/baseline.json
+*/created_issues.json
+
+# Python / run artifacts
+__pycache__/
+*.pyc
+*.log
+results_*/
+*.final.md

@@ -1,0 +1,20 @@
+# Fast representative subset for per-change checks (~1-2 min). Full set = schedule_full.
+boolean
+int4
+int8
+float8
+numeric
+text
+varchar
+date
+timestamp
+interval
+case
+select
+join
+aggregates
+subselect
+union
+insert
+update
+delete

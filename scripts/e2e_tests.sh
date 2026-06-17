@@ -13,6 +13,10 @@ Suites:
   gorm_smoke       Run Go/GORM smoke test (e2e/gorm_smoke)
   sqlalchemy_smoke Run Python SQLAlchemy smoke suite (e2e/sqlalchemy_smoke)
   dify_sqlalchemy_compat Run Dify SQLAlchemy compat suite (e2e/dify_sqlalchemy_compat)
+  pg_regress       PG 17.10 regress differential gate, SMOKE subset (auto_testing/corpora/pg_regress_17_10)
+  pg_regress_full  PG 17.10 regress differential gate, FULL corpus (slow; nightly/on-demand)
+  sqllogictest     sqllogictest output-equivalence gate vs PG 17.10, SMOKE (auto_testing/corpora/sqllogictest)
+  sqllogictest_full sqllogictest output-equivalence gate, FULL corpus (slow; nightly/on-demand)
 
 Aliases:
   gorm             Alias for gorm_smoke
@@ -89,6 +93,30 @@ run_dify_sqlalchemy_compat() {
   bash "$entrypoint"
 }
 
+run_pg_regress() {
+  require_python
+  local scope="${1:-smoke}"
+  local dsn="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
+  local py; py="$(command -v python3 || command -v python)"
+  echo "=== e2e: pg_regress ($scope) ==="
+  # dedicated, freshly-reset gate db (clean state each run -> deterministic ratchet)
+  "$py" "$ROOT_DIR/auto_testing/corpora/_engine/run_corpus.py" \
+    --corpus pg_regress_17_10 --dsn "$dsn" --db-name pgcompat_regress --reset-db \
+    --check-baseline --"$scope"
+}
+
+run_slt() {
+  require_python
+  local scope="${1:-smoke}"
+  local dsn="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
+  local py; py="$(command -v python3 || command -v python)"
+  echo "=== e2e: sqllogictest ($scope) ==="
+  # dedicated, freshly-reset gate db (separate from the pg_regress one)
+  "$py" "$ROOT_DIR/auto_testing/corpora/_engine/run_corpus.py" \
+    --corpus sqllogictest --dsn "$dsn" --db-name pgcompat_slt --reset-db \
+    --check-baseline --"$scope"
+}
+
 suite="${1:-all}"
 
 case "$suite" in
@@ -107,6 +135,18 @@ case "$suite" in
     ;;
   dify_sqlalchemy_compat|dify)
     run_dify_sqlalchemy_compat
+    ;;
+  pg_regress)
+    run_pg_regress smoke
+    ;;
+  pg_regress_full)
+    run_pg_regress full
+    ;;
+  sqllogictest)
+    run_slt smoke
+    ;;
+  sqllogictest_full)
+    run_slt full
     ;;
   -h|--help|help)
     usage
