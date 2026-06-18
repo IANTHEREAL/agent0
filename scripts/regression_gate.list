@@ -305,6 +305,8 @@ tests/2348_ddl_journal_smoke.sql
 tests/2497_limit_text_param.sql
 # #2684 – accept operator-class qualifiers in CREATE INDEX (varchar/text/bpchar_pattern_ops)
 tests/2684_index_opclass.sql
+# #2694 – pg_get_indexdef() keeps the opclass on the PL/pgSQL / sequence-expr path
+tests/2694_indexdef_opclass_plpgsql.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

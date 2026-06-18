@@ -1,6 +1,13 @@
-//! Index definition formatting and OID-based lookup for `pg_get_indexdef()`.
+//! OID-based lookup for `pg_get_indexdef()` on the PL/pgSQL / sequence-expr
+//! evaluation path.
+//!
+//! Index-def *formatting* has a single source of truth in
+//! [`crate::sql::catalog::helpers::format_indexdef`] (the same formatter the
+//! analyzed-SELECT / `pg_indexes` path uses). This module only does the OID →
+//! `IndexDef` lookup and then delegates formatting, so the two paths can never
+//! diverge again (e.g. dropping an operator class — #2694).
 
-use crate::model::IndexDef;
+use crate::sql::catalog::helpers::format_indexdef;
 use crate::sql::catalog_oids;
 use crate::storage::TikvStore;
 use anyhow::Result;
@@ -8,35 +15,6 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::split_schema_and_name;
-
-fn access_method_name(method: Option<&str>) -> &str {
-    method.unwrap_or("btree")
-}
-
-pub(crate) fn format_index_columns(idx: &IndexDef) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.extend(idx.columns.iter().cloned());
-    parts.extend(idx.expressions.iter().map(|e| format!("({})", e)));
-    parts.join(", ")
-}
-
-pub(crate) fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> String {
-    let cols = format_index_columns(idx);
-    let mut indexdef = format!(
-        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
-        if idx.unique { "UNIQUE " } else { "" },
-        idx.name,
-        table_schema,
-        table_name,
-        access_method_name(idx.method.as_deref()),
-        cols
-    );
-    if let Some(pred) = idx.predicate.as_ref() {
-        indexdef.push_str(" WHERE ");
-        indexdef.push_str(pred);
-    }
-    indexdef
-}
 
 pub(crate) async fn lookup_indexdef_by_oid(
     store: &Arc<TikvStore>,
@@ -80,58 +58,4 @@ pub(crate) async fn lookup_indexdef_by_oid(
     }
 
     Ok(None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::worker::types::IndexState;
-
-    fn sample_index() -> IndexDef {
-        IndexDef {
-            name: "idx_t_a".to_string(),
-            id: 1,
-            columns: vec!["a".to_string(), "b".to_string()],
-            unique: true,
-            is_constraint: false,
-            method: Some("hash".to_string()),
-            predicate: Some("a > 0".to_string()),
-            expressions: vec!["lower(c)".to_string()],
-            state: IndexState::Ready,
-            cached_predicate_conjuncts: None,
-            deferrable: false,
-            initially_deferred: false,
-            hnsw_m: None,
-            hnsw_ef_construction: None,
-            hnsw_distance_metric: None,
-            opclasses: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn format_columns_includes_expressions() {
-        let idx = sample_index();
-        assert_eq!(format_index_columns(&idx), "a, b, (lower(c))");
-    }
-
-    #[test]
-    fn format_indexdef_includes_unique_method_and_predicate() {
-        let idx = sample_index();
-        let ddl = format_indexdef("public", "t", &idx);
-        assert_eq!(
-            ddl,
-            "CREATE UNIQUE INDEX idx_t_a ON public.t USING hash (a, b, (lower(c))) WHERE a > 0"
-        );
-    }
-
-    #[test]
-    fn format_indexdef_defaults_to_btree() {
-        let mut idx = sample_index();
-        idx.unique = false;
-        idx.method = None;
-        idx.predicate = None;
-        idx.expressions.clear();
-        let ddl = format_indexdef("s", "t", &idx);
-        assert_eq!(ddl, "CREATE INDEX idx_t_a ON s.t USING btree (a, b)");
-    }
 }

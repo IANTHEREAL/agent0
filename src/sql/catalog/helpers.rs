@@ -266,7 +266,9 @@ pub fn format_epoch_ms(epoch_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{data_type_to_pg_type, data_type_to_udt_name, is_unique_constraint_index};
+    use super::{
+        data_type_to_pg_type, data_type_to_udt_name, format_indexdef, is_unique_constraint_index,
+    };
     use crate::model::{DataType, IndexDef};
     use crate::worker::types::IndexState;
 
@@ -423,5 +425,37 @@ mod tests {
             ..plain_unique_index
         };
         assert!(is_unique_constraint_index(&unique_constraint_backing_index));
+    }
+
+    // Single source of truth for index-def formatting (#2684/#2694): an explicit
+    // operator class must round-trip; a default (`None`) opclass must be omitted,
+    // exactly as PostgreSQL's pg_get_indexdef does. The PL/pgSQL / sequence-expr
+    // path (`sequences::index_helpers`) delegates here, so this test guards both.
+    #[test]
+    fn format_indexdef_round_trips_explicit_opclass_and_omits_default() {
+        let idx = IndexDef {
+            name: "oc_like".to_string(),
+            id: 1,
+            columns: vec!["session_key".to_string(), "other".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: Some("btree".to_string()),
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+            // First column has an explicit opclass; second uses its default.
+            opclasses: vec![Some("varchar_pattern_ops".to_string()), None],
+        };
+        let ddl = format_indexdef("public", "oc", &idx);
+        assert_eq!(
+            ddl,
+            "create index oc_like on public.oc using btree (session_key varchar_pattern_ops, other)"
+        );
     }
 }

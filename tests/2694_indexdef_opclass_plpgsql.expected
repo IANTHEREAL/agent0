@@ -1,0 +1,6 @@
+                                                   ?column?
+--------------------------------------------------------------------------------------------------------------
+ PLPGSQL_IDXDEF=create index t2694_name_like on public.t2694 using btree (name text_pattern_ops)
+ PLPGSQL_IDXDEF=create index t2694_session_like on public.t2694 using btree (session_key varchar_pattern_ops)
+(2 rows)
+
