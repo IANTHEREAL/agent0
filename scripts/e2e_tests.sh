@@ -21,6 +21,7 @@ Suites:
   django_full      Django full suite (all 213 modules; very slow; on-demand)
   psycopg          psycopg3's own test suite vs db9, SMOKE tier (auto_testing/corpora/drivers/psycopg); clones psycopg + venv on first run
   psycopg_full     psycopg full suite (all tests/test_*.py; on-demand)
+  pgx              pgx (Go PG driver) own test suite vs db9 (auto_testing/corpora/drivers/pgx); clones pgx on first run
 
 Aliases:
   gorm             Alias for gorm_smoke
@@ -150,6 +151,18 @@ run_psycopg() {
     bash "$ROOT_DIR/auto_testing/corpora/drivers/psycopg/run.sh" "$scope"
 }
 
+run_pgx() {
+  # pgx driver lane (lane A-DRIVERS) — Go's PG driver. Runs pgx's OWN test suite
+  # against db9 (connect-path: protocol, binary codecs, COPY). NOT part of `all`.
+  local dsn="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
+  local hp; hp="$(echo "$dsn" | sed -E 's#.*@([^/]+)/.*#\1#')"
+  local up; up="$(echo "$dsn" | sed -E 's#.*://([^@/]+)@.*#\1#')"
+  echo "=== e2e: pgx ==="
+  DB9_HOST="${hp%:*}" DB9_PORT="${hp##*:}" \
+  DB9_USER="${up%%:*}" DB9_PASSWORD="${up#*:}" \
+    bash "$ROOT_DIR/auto_testing/corpora/drivers/pgx/run.sh" "$@"
+}
+
 suite="${1:-all}"
 
 case "$suite" in
@@ -192,6 +205,9 @@ case "$suite" in
     ;;
   psycopg_full)
     run_psycopg full
+    ;;
+  pgx)
+    run_pgx
     ;;
   -h|--help|help)
     usage
