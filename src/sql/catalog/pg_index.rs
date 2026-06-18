@@ -127,6 +127,18 @@ impl VirtualTable for PgIndex {
 
                     let method = idx.method.as_deref();
                     let mut indclass_vals: Vec<Value> = Vec::new();
+                    // `idx.opclasses` is aligned with `columns` then
+                    // `expressions`; an explicit non-default opclass resolves to
+                    // its own OID so introspection reports the requested opclass
+                    // (e.g. varchar_pattern_ops), not the column's default.
+                    let mut pos = 0usize;
+                    let opclass_oid_at = |pos: usize, type_oid: i64| -> i64 {
+                        idx.opclasses
+                            .get(pos)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|name| super::pg_opclass::opclass_oid_by_name(method, name))
+                            .unwrap_or_else(|| default_opclass_oid(method, type_oid))
+                    };
                     for col_name in &idx.columns {
                         let type_oid = schema
                             .columns
@@ -134,11 +146,13 @@ impl VirtualTable for PgIndex {
                             .find(|c| &c.name == col_name)
                             .map(|c| opclass_input_type_oid(&c.data_type))
                             .unwrap_or(25); // fallback to text
-                        indclass_vals.push(Value::Int64(default_opclass_oid(method, type_oid)));
+                        indclass_vals.push(Value::Int64(opclass_oid_at(pos, type_oid)));
+                        pos += 1;
                     }
                     // Expression index columns get the AM's fallback opclass
                     for _ in &idx.expressions {
-                        indclass_vals.push(Value::Int64(default_opclass_oid(method, 25)));
+                        indclass_vals.push(Value::Int64(opclass_oid_at(pos, 25)));
+                        pos += 1;
                     }
                     let indclass = Value::Array(indclass_vals);
                     let indoption =

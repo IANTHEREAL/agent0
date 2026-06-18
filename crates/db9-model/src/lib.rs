@@ -630,6 +630,14 @@ pub struct IndexDef {
     /// HNSW: distance metric ("l2", "cosine", "ip")
     #[serde(default)]
     pub hnsw_distance_metric: Option<String>,
+    /// Per-index-element operator class as requested in `CREATE INDEX`,
+    /// aligned with the key list (`columns` followed by `expressions`).
+    /// `None` at a position means the default opclass for the column type;
+    /// `Some(name)` records an explicit non-default opclass (e.g.
+    /// `varchar_pattern_ops`) so catalog introspection round-trips. An empty
+    /// vector (legacy schemas) is treated as "all default".
+    #[serde(default)]
+    pub opclasses: Vec<Option<String>>,
     /// Whether the backing UNIQUE constraint was declared `DEFERRABLE`
     /// (PG `pg_constraint.condeferrable`). Always `false` for plain
     /// (non-constraint) indexes.
@@ -668,6 +676,8 @@ struct IndexDefSerde {
     #[serde(default)]
     hnsw_distance_metric: Option<String>,
     #[serde(default)]
+    opclasses: Vec<Option<String>>,
+    #[serde(default)]
     deferrable: bool,
     #[serde(default)]
     initially_deferred: bool,
@@ -696,6 +706,7 @@ impl<'de> Deserialize<'de> for IndexDef {
             hnsw_m: raw.hnsw_m,
             hnsw_ef_construction: raw.hnsw_ef_construction,
             hnsw_distance_metric: raw.hnsw_distance_metric,
+            opclasses: raw.opclasses,
             deferrable: raw.deferrable,
             initially_deferred: raw.initially_deferred,
         })

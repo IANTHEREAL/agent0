@@ -1018,6 +1018,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }
     }
 
@@ -1083,6 +1084,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }]);
         let fk_columns = vec!["parent_id".to_string()];
         assert!(find_fk_covering_index(&schema, &fk_columns).is_none());
@@ -1106,6 +1108,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }]);
         let fk_columns = vec!["parent_id".to_string()];
         assert!(find_fk_covering_index(&schema, &fk_columns).is_none());
@@ -1129,6 +1132,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }]);
         let fk_columns = vec!["parent_id".to_string()];
         assert!(find_fk_covering_index(&schema, &fk_columns).is_none());

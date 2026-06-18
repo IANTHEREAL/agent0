@@ -1,0 +1,42 @@
+      indexname
+----------------------
+ t2684_name_like
+ t2684_name_like_desc
+ t2684_name_pgcat
+ t2684_name_quoted
+ t2684_pkey
+ t2684_session_like
+(6 rows)
+
+                                                        ?column?
+-------------------------------------------------------------------------------------------------------------------------
+ IDXDEF=t2684_name_pgcat:create index t2684_name_pgcat on public.t2684 using btree (name text_pattern_ops)
+ IDXDEF=t2684_session_like:create index t2684_session_like on public.t2684 using btree (session_key varchar_pattern_ops)
+(2 rows)
+
+                                             ?column?
+--------------------------------------------------------------------------------------------------
+ PG_GET_INDEXDEF=create index t2684_name_like on public.t2684 using btree (name text_pattern_ops)
+(1 row)
+
+ id | session_key
+----+-------------
+  1 | abc123
+  2 | abd456
+(2 rows)
+
+ id | name
+----+------
+  2 | beta
+(1 row)
+
+psql:tests/2684_index_opclass.sql:67: ERROR:  operator class "made_up_ops" does not exist for access method "btree"
+psql:tests/2684_index_opclass.sql:71: ERROR:  operator class "text_pattern_ops" does not accept data type integer
+psql:tests/2684_index_opclass.sql:75: ERROR:  operator class "int8_ops" does not accept data type integer
+psql:tests/2684_index_opclass.sql:80: ERROR:  operator class "bpchar_pattern_ops" does not accept data type text
+psql:tests/2684_index_opclass.sql:84: ERROR:  operator class "public.text_pattern_ops" does not exist for access method "btree"
+psql:tests/2684_index_opclass.sql:88: ERROR:  operator class "Text_Pattern_Ops" does not exist for access method "btree"
+psql:tests/2684_index_opclass.sql:91: ERROR:  operator class text_pattern_ops has no options
+psql:tests/2684_index_opclass.sql:95: ERROR:  operator class "text_pattern_ops" does not accept data type integer
+psql:tests/2684_index_opclass.sql:111: ERROR:  operator class vector_cosine_ops has no options
+psql:tests/2684_index_opclass.sql:115: ERROR:  operator class "made_up_ops" does not exist for access method "hnsw"

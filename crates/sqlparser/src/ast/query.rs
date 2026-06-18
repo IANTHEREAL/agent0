@@ -1070,11 +1070,40 @@ pub struct OrderByExpr {
     pub asc: Option<bool>,
     /// Optional `NULLS FIRST` or `NULLS LAST`
     pub nulls_first: Option<bool>,
+    /// Optional PostgreSQL operator class, e.g. `varchar_pattern_ops`.
+    /// Only ever set for `CREATE INDEX` index elements; always `None` for
+    /// `ORDER BY` expressions.
+    pub operator_class: Option<OperatorClass>,
+}
+
+/// A PostgreSQL operator class on a `CREATE INDEX` index element, e.g.
+/// `varchar_pattern_ops` or `gist_trgm_ops (siglen = 100)`.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct OperatorClass {
+    /// Operator class name (optionally schema-qualified).
+    pub name: ObjectName,
+    /// Optional operator-class parameters, e.g. `siglen = 100`.
+    pub params: Vec<Expr>,
+}
+
+impl fmt::Display for OperatorClass {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.name)?;
+        if !self.params.is_empty() {
+            write!(f, " ({})", display_comma_separated(&self.params))?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for OrderByExpr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.expr)?;
+        if let Some(operator_class) = &self.operator_class {
+            write!(f, " {operator_class}")?;
+        }
         match self.asc {
             Some(true) => write!(f, " ASC")?,
             Some(false) => write!(f, " DESC")?,

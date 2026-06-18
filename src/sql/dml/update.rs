@@ -1303,6 +1303,7 @@ mod tests {
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_distance_metric: None,
+                opclasses: Vec::new(),
             },
             IndexDef {
                 name: "idx_hnsw_v2".to_string(),
@@ -1320,6 +1321,7 @@ mod tests {
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_distance_metric: None,
+                opclasses: Vec::new(),
             },
         ];
         s

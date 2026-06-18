@@ -1397,6 +1397,7 @@ fn make_schema_with_index() -> TableSchema {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     });
     schema
 }
@@ -1464,6 +1465,7 @@ fn make_schema_with_composite_index() -> TableSchema {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     });
     schema
 }

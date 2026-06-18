@@ -3937,7 +3937,7 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_token(&Token::LParen)?;
-        let columns = self.parse_comma_separated(Parser::parse_order_by_expr)?;
+        let columns = self.parse_comma_separated(Parser::parse_create_index_column)?;
         self.expect_token(&Token::RParen)?;
 
         let include = if self.parse_keyword(Keyword::INCLUDE) {
@@ -7800,7 +7800,31 @@ impl<'a> Parser<'a> {
 
     /// Parse an expression, optionally followed by ASC or DESC (used in ORDER BY)
     pub fn parse_order_by_expr(&mut self) -> Result<OrderByExpr, ParserError> {
+        self.parse_order_by_expr_inner(false)
+    }
+
+    /// Parse a single `CREATE INDEX` index element:
+    /// `expr [COLLATE c] [opclass [(params)]] [ASC|DESC] [NULLS {FIRST|LAST}]`.
+    /// Same as [`parse_order_by_expr`] but additionally accepts a PostgreSQL
+    /// operator class (e.g. `varchar_pattern_ops`) after the expression.
+    pub fn parse_create_index_column(&mut self) -> Result<OrderByExpr, ParserError> {
+        self.parse_order_by_expr_inner(true)
+    }
+
+    fn parse_order_by_expr_inner(
+        &mut self,
+        allow_operator_class: bool,
+    ) -> Result<OrderByExpr, ParserError> {
         let expr = self.parse_expr()?;
+
+        // PostgreSQL allows an operator class between the (COLLATE-decorated)
+        // expression and the ASC/DESC/NULLS ordering options, but only on
+        // index elements — never in a plain ORDER BY clause.
+        let operator_class = if allow_operator_class {
+            self.parse_optional_operator_class()?
+        } else {
+            None
+        };
 
         let asc = if self.parse_keyword(Keyword::ASC) {
             Some(true)
@@ -7822,7 +7846,34 @@ impl<'a> Parser<'a> {
             expr,
             asc,
             nulls_first,
+            operator_class,
         })
+    }
+
+    /// Parse an optional PostgreSQL operator class on an index element:
+    /// a non-reserved identifier (optionally schema-qualified) followed by an
+    /// optional `( params )` list. Returns `None` when the next token starts a
+    /// trailing ordering option (`ASC`/`DESC`/`NULLS`) or ends the element
+    /// (`,`/`)`), so legitimate ordering keywords are never swallowed.
+    fn parse_optional_operator_class(&mut self) -> Result<Option<OperatorClass>, ParserError> {
+        let is_opclass_ident = matches!(
+            self.peek_token().token,
+            Token::Word(w) if w.keyword == Keyword::NoKeyword
+        );
+        if !is_opclass_ident {
+            return Ok(None);
+        }
+
+        let name = self.parse_object_name()?;
+        let params = if self.consume_token(&Token::LParen) {
+            let params = self.parse_comma_separated(Parser::parse_expr)?;
+            self.expect_token(&Token::RParen)?;
+            params
+        } else {
+            Vec::new()
+        };
+
+        Ok(Some(OperatorClass { name, params }))
     }
 
     /// Parse a TOP clause, MSSQL equivalent of LIMIT,
@@ -8435,6 +8486,38 @@ mod tests {
             assert_eq!(parser.next_token(), Token::EOF);
             parser.prev_token();
         });
+    }
+
+    #[test]
+    fn test_create_index_operator_class() {
+        // PostgreSQL operator classes on index elements (issue #2684).
+        for sql in [
+            "CREATE INDEX i ON t (col varchar_pattern_ops)",
+            "CREATE INDEX i ON t (col text_pattern_ops)",
+            "CREATE INDEX i ON t (col bpchar_pattern_ops)",
+            "CREATE INDEX i ON t (col text_pattern_ops DESC NULLS LAST)",
+            "CREATE INDEX i ON t (a text_pattern_ops, b varchar_pattern_ops ASC)",
+        ] {
+            // Round-trips back to the original text.
+            let stmt = all_dialects().one_statement_parses_to(sql, sql);
+            match stmt {
+                Statement::CreateIndex { columns, .. } => {
+                    assert!(
+                        columns.iter().all(|c| c.operator_class.is_some()),
+                        "operator class not captured for: {sql}"
+                    );
+                }
+                other => panic!("expected CreateIndex, got {other:?}"),
+            }
+        }
+
+        // A plain ORDER BY must NOT swallow a trailing identifier as an opclass.
+        match all_dialects().verified_stmt("SELECT a FROM t ORDER BY a DESC") {
+            Statement::Query(q) => {
+                assert!(q.order_by[0].operator_class.is_none());
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
     }
 
     #[cfg(test)]

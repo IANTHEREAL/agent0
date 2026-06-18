@@ -492,6 +492,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         schema.owner = "admin".into();
         schema
@@ -722,6 +723,7 @@ mod tests {
                     hnsw_m: None,
                     hnsw_ef_construction: None,
                     hnsw_distance_metric: None,
+                    opclasses: Vec::new(),
                 },
                 IndexDef {
                     name: "legacy_email_key".into(),
@@ -739,6 +741,7 @@ mod tests {
                     hnsw_m: None,
                     hnsw_ef_construction: None,
                     hnsw_distance_metric: None,
+                    opclasses: Vec::new(),
                 },
                 IndexDef {
                     name: "legacy_lower_email_uix".into(),
@@ -756,6 +759,7 @@ mod tests {
                     hnsw_m: None,
                     hnsw_ef_construction: None,
                     hnsw_distance_metric: None,
+                    opclasses: Vec::new(),
                 },
             ];
             s

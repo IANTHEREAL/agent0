@@ -87,6 +87,7 @@ fn gin_schema() -> TableSchema {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         },
         IndexDef {
             id: 2,
@@ -104,6 +105,7 @@ fn gin_schema() -> TableSchema {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         },
     ];
     s
@@ -243,6 +245,7 @@ fn test_expression_index_typed_lower() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s
     };
@@ -311,6 +314,7 @@ fn test_partial_index_typed_exact_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s
     };
@@ -376,6 +380,7 @@ fn test_partial_index_typed_missing_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s
     };
@@ -427,6 +432,7 @@ fn test_partial_index_typed_valid_cached_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s
     };
@@ -483,6 +489,7 @@ fn test_partial_index_typed_malformed_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s
     };
@@ -540,6 +547,7 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s
     };
@@ -647,6 +655,7 @@ fn build_single_column_schema(unique: bool) -> (TableSchema, IndexDef) {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
         cached_predicate_conjuncts: None,
         deferrable: false,
         initially_deferred: false,
@@ -779,6 +788,7 @@ fn test_inlist_mixed_null_and_duplicates_matches_normalized_scan_keys_and_cost()
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
         cached_predicate_conjuncts: None,
         deferrable: false,
         initially_deferred: false,
@@ -874,6 +884,7 @@ fn test_inlist_mixed_sign_nan_deduplicates_to_one_effective_nan() {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
         cached_predicate_conjuncts: None,
         deferrable: false,
         initially_deferred: false,
@@ -1124,6 +1135,7 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
         cached_predicate_conjuncts: None,
         deferrable: false,
         initially_deferred: false,
@@ -1249,6 +1261,7 @@ fn test_primary_key_exact_match_preferred_over_secondary_prefix_scan() {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
         cached_predicate_conjuncts: None,
         deferrable: false,
         initially_deferred: false,
@@ -1436,6 +1449,7 @@ fn test_btree_index_match_uses_column_index_for_quoted_identifier_collision() {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     }];
 
     let quoted_a_filter = typed_binop(
@@ -1505,6 +1519,7 @@ fn range_schema() -> TableSchema {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     }];
     s
 }
@@ -1538,6 +1553,7 @@ fn composite_range_schema() -> TableSchema {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     }];
     s
 }

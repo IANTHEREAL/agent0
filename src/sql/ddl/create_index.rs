@@ -676,7 +676,27 @@ pub async fn execute_create_index(
 
     let mut idx_cols = Vec::new();
     let mut idx_exprs = Vec::new();
+    // Opclass aligned with the key list. Tracked separately for columns and
+    // expressions, then concatenated (`columns` ++ `expressions`) to match the
+    // ordering used by the catalog (`pg_index.indclass`, `pg_get_indexdef`).
+    let mut col_opclasses: Vec<Option<String>> = Vec::new();
+    let mut expr_opclasses: Vec<Option<String>> = Vec::new();
+    // Search path + collations needed to resolve the result type of expression
+    // index elements (so an opclass on `((id+1) text_pattern_ops)` gets the same
+    // input-type check as a column). Collations are fetched lazily on first need
+    // so the common opclass-free CREATE INDEX adds no extra catalog read.
+    let opclass_search_path = reconcile_index_search_path(tbl_name);
+    let mut opclass_collations: Option<Vec<crate::sql::collation::CollationDef>> = None;
     for col_expr in columns {
+        // #2684: a PostgreSQL operator class on an index element (e.g.
+        // `varchar_pattern_ops`). Every element kind — column, expression, and
+        // HNSW — flows through the single `validate_and_resolve_opclass` entry
+        // point (name resolution + input-type compatibility + no options), and
+        // non-default opclasses are persisted so catalog introspection
+        // round-trips. The opclass is validated *after* resolving the index
+        // element so the input-type check sees the element's resolved data type.
+        // (For HNSW, the parser preprocessor strips well-formed vector opclasses
+        // into the method suffix; only error-case opclasses survive to here.)
         let mut expr = &col_expr.expr;
         while let Expr::Nested(inner) = expr {
             expr = inner.as_ref();
@@ -685,25 +705,73 @@ pub async fn execute_create_index(
         match expr {
             Expr::Identifier(ident) => {
                 let col_name = normalize_ident(ident);
-                if schema.column_index(&col_name).is_none() {
+                let Some(col_idx) = schema.column_index(&col_name) else {
                     return Err(anyhow!("Column not found"));
-                }
+                };
+                let stored_opclass = validate_and_resolve_opclass(
+                    col_expr.operator_class.as_ref(),
+                    method.as_deref(),
+                    Some(&schema.columns[col_idx].data_type),
+                )?;
                 idx_cols.push(col_name);
+                col_opclasses.push(stored_opclass);
             }
             Expr::CompoundIdentifier(parts) => {
                 let Some(last) = parts.last() else {
                     return Err(anyhow!("Index column must be identifier"));
                 };
                 let col_name = normalize_ident(last);
-                if schema.column_index(&col_name).is_none() {
+                let Some(col_idx) = schema.column_index(&col_name) else {
                     return Err(anyhow!("Column not found"));
-                }
+                };
+                let stored_opclass = validate_and_resolve_opclass(
+                    col_expr.operator_class.as_ref(),
+                    method.as_deref(),
+                    Some(&schema.columns[col_idx].data_type),
+                )?;
                 idx_cols.push(col_name);
+                col_opclasses.push(stored_opclass);
             }
             _ => {
+                // Expression element: resolve the expression's result type so
+                // the opclass input-type check (42804) matches PostgreSQL — e.g.
+                // `((id+1) text_pattern_ops)` must reject `integer`. Inference
+                // only runs when an opclass is present; without one the element
+                // type is irrelevant (validate returns the default-opclass
+                // `None`) and the common case stays inference-free.
+                let elem_type = if col_expr.operator_class.is_some() {
+                    if opclass_collations.is_none() {
+                        opclass_collations = Some(store.list_collations(txn, db_id).await?);
+                    }
+                    let collations = opclass_collations.as_deref().unwrap_or(&[]);
+                    let typed = analyze_row_level_expr(
+                        expr,
+                        &schema,
+                        db_id,
+                        &opclass_search_path,
+                        collations,
+                    )?;
+                    Some(typed.data_type)
+                } else {
+                    None
+                };
+                let stored_opclass = validate_and_resolve_opclass(
+                    col_expr.operator_class.as_ref(),
+                    method.as_deref(),
+                    elem_type.as_ref(),
+                )?;
                 idx_exprs.push(expr.to_string());
+                expr_opclasses.push(stored_opclass);
             }
         }
+    }
+    // Concatenate in key-list order (columns first, then expressions).
+    let mut idx_opclasses = col_opclasses;
+    idx_opclasses.extend(expr_opclasses);
+    // Drop the vector entirely when no element carries an explicit opclass, so
+    // schemas stay byte-identical to the pre-#2684 format in the common case.
+    if idx_opclasses.iter().all(Option::is_none) {
+        idx_opclasses.clear();
     }
 
     let mut hnsw_m: Option<u16> = None;
@@ -758,7 +826,7 @@ pub async fn execute_create_index(
             Some(HnswMethodVariant::Cosine) => "cosine".to_string(),
             Some(HnswMethodVariant::Ip) => "ip".to_string(),
             Some(HnswMethodVariant::L2Default) => {
-                let opclass = parse_hnsw_operator_class(columns, &indexed_col)?;
+                let opclass = hnsw_operator_class_from_ast(columns);
                 parse_hnsw_distance_metric(opclass.as_deref())?
             }
             None => return Err(anyhow!("internal error: HNSW index without HNSW method")),
@@ -831,6 +899,7 @@ pub async fn execute_create_index(
         hnsw_m,
         hnsw_ef_construction,
         hnsw_distance_metric,
+        opclasses: idx_opclasses,
     };
     new_index.cached_predicate_conjuncts =
         build_predicate_conjunct_cache(new_index.predicate.as_deref());
@@ -1054,32 +1123,168 @@ fn require_worker_for_index(feature: &str, index_name: &str, reason: &str) -> Re
     Ok(())
 }
 
-fn parse_hnsw_operator_class(columns: &[OrderByExpr], column_name: &str) -> Result<Option<String>> {
-    if columns.is_empty() {
-        return Ok(None);
+/// Resolve the operator class on an HNSW index's single vector column from the
+/// parsed AST (`OrderByExpr.operator_class`), returning its name as the last,
+/// possibly schema-qualified, segment lowercased. Reading the structured AST
+/// field (rather than re-parsing `expr.to_string()`) keeps schema-qualified or
+/// quoted opclasses (e.g. `pg_catalog.vector_cosine_ops`) routing to the right
+/// distance metric instead of silently defaulting to L2 (#2684).
+fn hnsw_operator_class_from_ast(columns: &[OrderByExpr]) -> Option<String> {
+    columns
+        .first()
+        .and_then(|c| c.operator_class.as_ref())
+        .and_then(|oc| oc.name.0.last().map(|id| id.value.to_ascii_lowercase()))
+}
+
+/// Resolved metadata for a known operator class, abstracted over its source so
+/// one validation routine serves every access method. btree/gin opclasses come
+/// from the `pg_opclass` catalog; HNSW's vector opclasses are resolved from the
+/// built-in set below (pgvector assigns them dynamic OIDs, so they are not
+/// catalogued).
+struct OpclassMeta {
+    /// pg_type OID the opclass accepts (`opcintype`).
+    opcintype: i64,
+    /// Whether this is the access method's default opclass (omitted from
+    /// `pg_get_indexdef`).
+    opcdefault: bool,
+}
+
+/// Resolve a folded (PostgreSQL identifier-folding already applied) opclass name
+/// for an access method to its metadata, or `None` if unknown for that AM.
+///
+/// HNSW's vector opclasses (`vector_l2_ops` / `vector_cosine_ops` /
+/// `vector_ip_ops`) are not present in `pg_opclass`, so they are resolved here
+/// against `vector`'s OID. `vector_l2_ops` is treated as the default (plain
+/// `USING hnsw` builds an L2 index without an explicit opclass), so it is
+/// omitted from introspection. Every other access method consults the catalog.
+fn lookup_opclass_meta(method: Option<&str>, folded: &str) -> Option<OpclassMeta> {
+    if method == Some("hnsw") {
+        return match folded {
+            "vector_l2_ops" | "vector_cosine_ops" | "vector_ip_ops" => Some(OpclassMeta {
+                opcintype: crate::sql::pg_types::OID_VECTOR,
+                opcdefault: folded == "vector_l2_ops",
+            }),
+            _ => None,
+        };
     }
+    crate::sql::catalog::pg_opclass::opclass_entry_exact(method, folded).map(|e| OpclassMeta {
+        opcintype: e.opcintype,
+        opcdefault: e.opcdefault,
+    })
+}
 
-    let raw_expr = columns[0].expr.to_string();
-    let compact = raw_expr.trim();
-    let normalized_col = column_name.to_ascii_lowercase();
-
-    if compact.eq_ignore_ascii_case(column_name) {
+/// Validate a parsed operator class on a CREATE INDEX element and return the
+/// name to persist (`None` for the access method's default opclass, which
+/// PostgreSQL omits from `pg_get_indexdef`). This is the single validation entry
+/// point for **every** index-element kind — column, expression, and HNSW — so
+/// opclass handling is uniform by construction rather than special-cased per
+/// path. Performs the three checks PostgreSQL applies, in PG's order:
+///
+/// 1. **Name resolution** — PostgreSQL folds an unquoted identifier to
+///    lowercase and keeps a quoted one verbatim. A bare name, or a name
+///    schema-qualified with `pg_catalog` (where every builtin opclass lives,
+///    e.g. `pg_catalog.text_pattern_ops`), resolves against the opclasses known
+///    for `method`; the schema is stripped so storage and `pg_get_indexdef`
+///    round-trip the bare name, matching PostgreSQL. Any other schema
+///    (e.g. `public.text_pattern_ops`), a name with more than two segments, or
+///    a name that does not case-fold to a known opclass is rejected with
+///    `42704` (`UndefinedObject`).
+/// 2. **Input-type compatibility** — the index element's resolved type must be
+///    accepted by the opclass's declared input type (`opcintype`); otherwise
+///    `42804` (`DataTypeMismatch`). Skipped when `elem_type` is `None` (only
+///    when the caller could not resolve the element type).
+/// 3. **Options** — db9 supports no opclass options, so any parameters are
+///    rejected with `22023` (`InvalidParameterValue`).
+fn validate_and_resolve_opclass(
+    operator_class: Option<&sqlparser::ast::OperatorClass>,
+    method: Option<&str>,
+    elem_type: Option<&DataType>,
+) -> Result<Option<String>> {
+    let Some(oc) = operator_class else {
         return Ok(None);
-    }
+    };
 
-    let mut tokens = compact.split_whitespace();
-    let first = tokens.next().unwrap_or_default().trim_matches('"');
-    let first = first.to_ascii_lowercase();
-    let second = tokens.next();
-    let third = tokens.next();
+    let am_display = crate::sql::catalog::helpers::access_method_name(method);
+    let segments = &oc.name.0;
+    // PostgreSQL's diagnostic prints the name as written (segments joined by
+    // dots, no re-quoting), e.g. `public.text_pattern_ops` or `Text_Pattern_Ops`.
+    let display_name = segments
+        .iter()
+        .map(|id| id.value.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
 
-    if first == normalized_col {
-        if let (Some(opclass), None) = (second, third) {
-            return Ok(Some(opclass.to_ascii_lowercase()));
+    // ── 1. Name resolution (PG identifier folding) ──────────────────────
+    // Fold a single identifier per PostgreSQL rules: an unquoted ident lowercases;
+    // a quoted one stays verbatim (so `"Text_Pattern_Ops"` misses the lowercase
+    // entry). A bare name resolves directly; a two-segment name resolves only when
+    // schema-qualified with `pg_catalog` (where the builtin opclasses live), with
+    // the schema stripped so storage/introspection round-trip the bare name. Any
+    // other schema, or more than two segments, is a miss → 42704 below.
+    let fold = |id: &sqlparser::ast::Ident| {
+        if id.quote_style.is_some() {
+            id.value.clone()
+        } else {
+            id.value.to_ascii_lowercase()
+        }
+    };
+    let resolved = match segments.as_slice() {
+        [id] => {
+            let folded = fold(id);
+            lookup_opclass_meta(method, &folded).map(|meta| (folded, meta))
+        }
+        // Schema-qualified resolution applies only to the catalogued builtin
+        // opclasses, which all live in `pg_catalog`. HNSW's vector opclasses are
+        // not catalogued there (they belong to the pgvector extension's schema),
+        // so a qualified HNSW opclass stays a miss — that path is out of scope
+        // here and tracked separately.
+        [schema, id] if method != Some("hnsw") && fold(schema) == "pg_catalog" => {
+            let folded = fold(id);
+            lookup_opclass_meta(method, &folded).map(|meta| (folded, meta))
+        }
+        _ => None,
+    };
+    let Some((folded, meta)) = resolved else {
+        return Err(SqlError::UndefinedObject(format!(
+            "operator class \"{}\" does not exist for access method \"{}\"",
+            display_name, am_display
+        ))
+        .into());
+    };
+
+    // ── 2. Input-type compatibility ─────────────────────────────────────
+    if let Some(dt) = elem_type {
+        let col_oid = match dt {
+            DataType::Array(_) => crate::sql::pg_types::OID_ANYARRAY,
+            _ => crate::sql::pg_types::oid_and_typlen_for_datatype(dt).0,
+        };
+        if !crate::sql::catalog::pg_opclass::type_oid_matches_opcintype(meta.opcintype, col_oid) {
+            return Err(SqlError::DataTypeMismatch {
+                message: format!(
+                    "operator class \"{}\" does not accept data type {}",
+                    folded,
+                    dt.pg_display_name()
+                ),
+            }
+            .into());
         }
     }
 
-    Ok(None)
+    // ── 3. Options ──────────────────────────────────────────────────────
+    if !oc.params.is_empty() {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!("operator class {} has no options", folded),
+        }
+        .into());
+    }
+
+    // PostgreSQL omits the default opclass from pg_get_indexdef; only record an
+    // explicit non-default opclass so introspection round-trips.
+    if meta.opcdefault {
+        Ok(None)
+    } else {
+        Ok(Some(folded))
+    }
 }
 
 fn parse_hnsw_distance_metric(opclass: Option<&str>) -> Result<String> {
@@ -1088,7 +1293,15 @@ fn parse_hnsw_distance_metric(opclass: Option<&str>) -> Result<String> {
         Some("vector_l2_ops") => Ok("l2".to_string()),
         Some("vector_cosine_ops") => Ok("cosine".to_string()),
         Some("vector_ip_ops") => Ok("ip".to_string()),
-        Some(other) => Err(anyhow!("Unknown operator class: {}", other)),
+        // Typed so the wire SQLSTATE is 42704 (matching the unified opclass
+        // validation path), not the untyped-anyhow default XX000. The SQL path
+        // rejects unknown opclasses earlier in `validate_and_resolve_opclass`;
+        // this guards the direct-API fallback for plain `USING hnsw`.
+        Some(other) => Err(SqlError::UndefinedObject(format!(
+            "operator class \"{}\" does not exist for access method \"hnsw\"",
+            other
+        ))
+        .into()),
     }
 }
 
@@ -1713,6 +1926,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }
     }
 

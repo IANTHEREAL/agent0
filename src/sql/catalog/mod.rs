@@ -22,7 +22,7 @@ mod pg_index;
 mod pg_indexes;
 mod pg_inherits;
 mod pg_namespace;
-mod pg_opclass;
+pub(crate) mod pg_opclass;
 mod pg_policies;
 mod pg_policy;
 mod pg_proc;

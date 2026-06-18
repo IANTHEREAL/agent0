@@ -118,6 +118,17 @@ pub fn format_index_columns(idx: &IndexDef) -> String {
     parts.extend(idx.columns.iter().cloned());
     // PostgreSQL does not wrap expression-index entries in extra parens.
     parts.extend(idx.expressions.iter().cloned());
+    // Append explicit (non-default) operator classes so introspection
+    // round-trips, e.g. `session_key varchar_pattern_ops`. `idx.opclasses` is
+    // aligned with `columns` followed by `expressions`; an empty vector (or a
+    // `None` entry) means the column uses its default opclass, which PostgreSQL
+    // omits from `pg_get_indexdef`.
+    for (i, part) in parts.iter_mut().enumerate() {
+        if let Some(Some(opclass)) = idx.opclasses.get(i) {
+            part.push(' ');
+            part.push_str(opclass);
+        }
+    }
     parts.join(", ")
 }
 
@@ -400,6 +411,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         assert!(!is_unique_constraint_index(&plain_unique_index));
 

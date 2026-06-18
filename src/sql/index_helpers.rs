@@ -171,6 +171,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         assert!(is_index_materializable(&btree_col_index));
 
@@ -190,6 +191,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         assert!(!is_index_materializable(&gin_index));
 
@@ -209,6 +211,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         assert!(is_index_materializable(&partial_index));
 
@@ -228,6 +231,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         assert!(is_index_materializable(&expr_index));
     }
@@ -250,6 +254,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -276,6 +281,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -302,6 +308,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -328,6 +335,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let schema = test_schema(vec![test_col("id"), test_col("name"), test_col("bio")]);
         let old_row = Row::new(vec![
@@ -362,6 +370,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let schema = test_schema(vec![test_col("email")]);
         let old_row = Row::new(vec![Value::Text("a@b.com".to_string())]);

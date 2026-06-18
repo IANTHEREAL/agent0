@@ -562,6 +562,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let row = Row::new(vec![Value::Jsonb(r#"{"a":1,"b":2}"#.to_string())]);
 

@@ -393,6 +393,7 @@ pub async fn execute_create_table(
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_distance_metric: None,
+                opclasses: Vec::new(),
             });
             next_index_id += 1;
         }
@@ -429,6 +430,7 @@ pub async fn execute_create_table(
                     hnsw_m: None,
                     hnsw_ef_construction: None,
                     hnsw_distance_metric: None,
+                    opclasses: Vec::new(),
                 });
                 next_index_id += 1;
             }

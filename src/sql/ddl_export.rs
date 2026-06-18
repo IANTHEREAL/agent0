@@ -153,6 +153,14 @@ fn index_to_ddl(table_name: &str, idx: &IndexDef) -> String {
     let method = idx.method.as_deref().unwrap_or("btree");
     let mut parts = idx.columns.clone();
     parts.extend(idx.expressions.iter().map(|e| format!("({})", e)));
+    // Append explicit (non-default) operator classes, aligned with the key list
+    // (`columns` then `expressions`), so a dumped DDL round-trips (#2684).
+    for (i, part) in parts.iter_mut().enumerate() {
+        if let Some(Some(opclass)) = idx.opclasses.get(i) {
+            part.push(' ');
+            part.push_str(opclass);
+        }
+    }
     let mut ddl = format!(
         "CREATE {}INDEX {} ON {} USING {} ({})",
         if idx.unique { "UNIQUE " } else { "" },
@@ -633,6 +641,7 @@ mod tests {
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_distance_metric: None,
+                opclasses: Vec::new(),
             }];
             s.foreign_keys = vec![ForeignKeyConstraint {
                 name: "t_parent_fk".to_string(),
@@ -704,6 +713,7 @@ mod tests {
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_distance_metric: None,
+                opclasses: Vec::new(),
             }];
             s
         };
@@ -865,6 +875,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         };
         let ddl = index_to_ddl("public.users", &idx);
         assert_eq!(

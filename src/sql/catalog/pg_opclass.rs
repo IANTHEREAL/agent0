@@ -141,6 +141,29 @@ pub(crate) static OPCLASS_ENTRIES: &[OpclassEntry] = &[
         opcmethod: 403,
         opcintype: 3802,
     },
+    // btree pattern-ops opclasses — non-default; used by Django's companion
+    // `*_like` indexes (#2684) for LIKE/prefix scans under non-C collations.
+    OpclassEntry {
+        oid: 10059,
+        opcname: "text_pattern_ops",
+        opcdefault: false,
+        opcmethod: 403,
+        opcintype: 25,
+    },
+    OpclassEntry {
+        oid: 10060,
+        opcname: "varchar_pattern_ops",
+        opcdefault: false,
+        opcmethod: 403,
+        opcintype: 1043,
+    },
+    OpclassEntry {
+        oid: 10061,
+        opcname: "bpchar_pattern_ops",
+        opcdefault: false,
+        opcmethod: 403,
+        opcintype: 1042,
+    },
     // hash opclasses
     OpclassEntry {
         oid: 10080,
@@ -201,6 +224,59 @@ pub(crate) static OPCLASS_ENTRIES: &[OpclassEntry] = &[
         opcintype: 2277,
     },
 ];
+
+/// Look up an operator-class OID by (access method, opclass name).
+/// `method == None` is treated as the default `btree` access method.
+pub(crate) fn opclass_oid_by_name(method: Option<&str>, opclass: &str) -> Option<i64> {
+    let am_oid = super::helpers::access_method_oid(method);
+    let opclass = opclass.to_ascii_lowercase();
+    OPCLASS_ENTRIES
+        .iter()
+        .find(|e| e.opcmethod == am_oid && e.opcname.eq_ignore_ascii_case(&opclass))
+        .map(|e| e.oid)
+}
+
+/// Look up an operator-class entry by (access method, exact opclass name).
+/// The name must already be folded per PostgreSQL identifier rules (unquoted →
+/// lowercased, quoted → verbatim); matching is **case-sensitive** so that a
+/// quoted mixed-case name like `"Text_Pattern_Ops"` does NOT match the
+/// lowercase catalog entry, mirroring PostgreSQL's 42704 rejection. Returns the
+/// entry so callers can read `opcintype`/`opcdefault` without a second lookup.
+pub(crate) fn opclass_entry_exact(
+    method: Option<&str>,
+    opclass_folded: &str,
+) -> Option<&'static OpclassEntry> {
+    let am_oid = super::helpers::access_method_oid(method);
+    OPCLASS_ENTRIES
+        .iter()
+        .find(|e| e.opcmethod == am_oid && e.opcname == opclass_folded)
+}
+
+/// True if a column of pg_type `col_type_oid` may use an operator class whose
+/// declared input type is `opcintype`. PostgreSQL accepts an opclass when the
+/// indexed type is binary-coercible to the opclass input type (`IsBinaryCoercible`).
+///
+/// Within the string family, `text` and `varchar` are mutually binary-coercible
+/// (their `pg_cast` entries use castmethod `'b'`), so an opclass declared over
+/// one accepts a column of the other — e.g. `text_pattern_ops` on a `varchar`
+/// column, or `varchar_pattern_ops` on a `text` column. `bpchar` (`char(n)`) is
+/// **not** binary-coercible to `text`/`varchar`: its cast runs a function
+/// (rtrim), so PostgreSQL 17 rejects `bpchar` columns under `text_pattern_ops`/
+/// `varchar_pattern_ops` (and `text`/`varchar` columns under `bpchar_pattern_ops`)
+/// with 42804. A `bpchar` column therefore only matches a `bpchar`-typed opclass,
+/// handled by the exact-OID check above. A mismatch is PostgreSQL error 42804
+/// ("operator class ... does not accept data type ...").
+pub(crate) fn type_oid_matches_opcintype(opcintype: i64, col_type_oid: i64) -> bool {
+    if opcintype == col_type_oid {
+        return true;
+    }
+    // Only text <-> varchar are binary-coercible; bpchar is deliberately excluded.
+    const TEXT_VARCHAR: &[i64] = &[
+        crate::sql::pg_types::OID_TEXT,
+        crate::sql::pg_types::OID_VARCHAR,
+    ];
+    TEXT_VARCHAR.contains(&opcintype) && TEXT_VARCHAR.contains(&col_type_oid)
+}
 
 #[async_trait]
 impl VirtualTable for PgOpclass {

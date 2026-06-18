@@ -163,6 +163,7 @@ fn test_index(name: &str) -> IndexDef {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     }
 }
 
@@ -452,6 +453,7 @@ fn assign_generated_check_names_avoids_existing_constraint_names() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }],
         &[ForeignKeyConstraint {
             name: "users_age_check1".to_string(),
@@ -542,6 +544,7 @@ fn constraint_name_exists_checks_pk_fk_index_and_checks() {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }];
         s.check_constraints = vec![CheckConstraint {
             name: None,

@@ -83,6 +83,7 @@ fn enum_literal_rewrite_preserves_unrelated_text_literals() {
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     }];
 
     let changed =

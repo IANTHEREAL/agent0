@@ -146,6 +146,7 @@ pub(super) async fn alter_table_add_unique_constraint(
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        opclasses: Vec::new(),
     };
 
     let mut budget = AlterTableBudget::new(&schema.name, "ADD CONSTRAINT UNIQUE (index backfill)");
@@ -798,6 +799,7 @@ mod tests {
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
+            opclasses: Vec::new(),
         }
     }
 
