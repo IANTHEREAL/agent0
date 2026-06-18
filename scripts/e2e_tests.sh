@@ -17,6 +17,8 @@ Suites:
   pg_regress_full  PG 17.10 regress differential gate, FULL corpus (slow; nightly/on-demand)
   sqllogictest     sqllogictest output-equivalence gate vs PG 17.10, SMOKE (auto_testing/corpora/sqllogictest)
   sqllogictest_full sqllogictest output-equivalence gate, FULL corpus (slow; nightly/on-demand)
+  django           Django's own test suite vs db9, SMOKE tier (auto_testing/corpora/django); clones Django + builds a venv on first run
+  django_full      Django full suite (all 213 modules; very slow; on-demand)
 
 Aliases:
   gorm             Alias for gorm_smoke
@@ -117,6 +119,21 @@ run_slt() {
     --check-baseline --"$scope"
 }
 
+run_django() {
+  # Django upstream-suite lane (lane A-ORM). Runs Django's OWN test suite against
+  # db9 via the stock postgresql wire protocol + the db9_backend override package.
+  # Heavier than the other suites (clones Django + builds a venv on first run), so
+  # it is NOT part of `all`; invoke explicitly. db9 location comes from PG_DSN.
+  local scope="${1:-smoke}"
+  local dsn="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
+  local hp; hp="$(echo "$dsn" | sed -E 's#.*@([^/]+)/.*#\1#')"
+  local up; up="$(echo "$dsn" | sed -E 's#.*://([^@/]+)@.*#\1#')"
+  echo "=== e2e: django ($scope) ==="
+  DB9_HOST="${hp%:*}" DB9_PORT="${hp##*:}" \
+  DB9_USER="${up%%:*}" DB9_PASSWORD="${up#*:}" \
+    bash "$ROOT_DIR/auto_testing/corpora/django/run.sh" "$scope"
+}
+
 suite="${1:-all}"
 
 case "$suite" in
@@ -147,6 +164,12 @@ case "$suite" in
     ;;
   sqllogictest_full)
     run_slt full
+    ;;
+  django)
+    run_django smoke
+    ;;
+  django_full)
+    run_django full
     ;;
   -h|--help|help)
     usage
