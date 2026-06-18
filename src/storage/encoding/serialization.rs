@@ -561,6 +561,26 @@ mod tests {
     }
 
     #[test]
+    fn opclasses_survive_v2_roundtrip() {
+        // #2695: a non-default operator class on an index element must survive the
+        // schema serialize -> deserialize round trip — catalog introspection
+        // (pg_get_indexdef / pg_indexes.indexdef / pg_index.indclass) reads it
+        // back from here. Prior tests only exercised an empty `opclasses` vector.
+        // The vector is aligned with `columns` then `expressions`; `None` means
+        // the element uses its type's default opclass.
+        let mut schema = sample_schema();
+        schema.indexes[0].columns = vec!["name".into(), "id".into()];
+        schema.indexes[0].opclasses = vec![Some("varchar_pattern_ops".into()), None];
+
+        let data = serialize_schema(&schema).unwrap();
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(
+            decoded.indexes[0].opclasses,
+            vec![Some("varchar_pattern_ops".to_string()), None]
+        );
+    }
+
+    #[test]
     fn function_deserializer_accepts_pre_security_definer_bytes() {
         let mut data = Vec::from(b"DB9_FUNCTION_V1\0".as_slice());
         data.extend(
@@ -788,6 +808,12 @@ mod tests {
         assert!(plain.is_constraint);
         assert!(constraint.is_constraint);
         assert!(!expression.is_constraint);
+        // #2695: a legacy index blob written before the `opclasses` field existed
+        // (the legacy serializer above omits it) must decode to "all default"
+        // (an empty vector), not error.
+        assert!(plain.opclasses.is_empty());
+        assert!(constraint.opclasses.is_empty());
+        assert!(expression.opclasses.is_empty());
     }
 
     #[test]

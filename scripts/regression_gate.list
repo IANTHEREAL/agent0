@@ -309,6 +309,8 @@ tests/2684_index_opclass.sql
 tests/2694_indexdef_opclass_plpgsql.sql
 # #2690 – HNSW opclass validation returns PG SQLSTATEs (42804/42704), not XX000
 tests/2690_hnsw_opclass_sqlstate.sql
+# #2695 – pg_index.indclass reflects the requested opclass (SQLAlchemy reflection)
+tests/2695_opclass_indclass_reflection.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

@@ -1,0 +1,6 @@
+                    reflected
+-------------------------------------------------
+ INDCLASS=t2695_name_like:text_pattern_ops
+ INDCLASS=t2695_session_like:varchar_pattern_ops
+(2 rows)
+
