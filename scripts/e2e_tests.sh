@@ -19,6 +19,8 @@ Suites:
   sqllogictest_full sqllogictest output-equivalence gate, FULL corpus (slow; nightly/on-demand)
   django           Django's own test suite vs db9, SMOKE tier (auto_testing/corpora/django); clones Django + builds a venv on first run
   django_full      Django full suite (all 213 modules; very slow; on-demand)
+  psycopg          psycopg3's own test suite vs db9, SMOKE tier (auto_testing/corpora/drivers/psycopg); clones psycopg + venv on first run
+  psycopg_full     psycopg full suite (all tests/test_*.py; on-demand)
 
 Aliases:
   gorm             Alias for gorm_smoke
@@ -134,6 +136,20 @@ run_django() {
     bash "$ROOT_DIR/auto_testing/corpora/django/run.sh" "$scope"
 }
 
+run_psycopg() {
+  # psycopg driver lane (lane A-DRIVERS). Runs psycopg3's OWN test suite against db9
+  # — the connect-path surface (extended protocol, type/OID codecs, SQLSTATE, COPY).
+  # Heavier (clones psycopg + builds a venv on first run); NOT part of `all`.
+  local scope="${1:-smoke}"
+  local dsn="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
+  local hp; hp="$(echo "$dsn" | sed -E 's#.*@([^/]+)/.*#\1#')"
+  local up; up="$(echo "$dsn" | sed -E 's#.*://([^@/]+)@.*#\1#')"
+  echo "=== e2e: psycopg ($scope) ==="
+  DB9_HOST="${hp%:*}" DB9_PORT="${hp##*:}" \
+  DB9_USER="${up%%:*}" DB9_PASSWORD="${up#*:}" \
+    bash "$ROOT_DIR/auto_testing/corpora/drivers/psycopg/run.sh" "$scope"
+}
+
 suite="${1:-all}"
 
 case "$suite" in
@@ -170,6 +186,12 @@ case "$suite" in
     ;;
   django_full)
     run_django full
+    ;;
+  psycopg)
+    run_psycopg smoke
+    ;;
+  psycopg_full)
+    run_psycopg full
     ;;
   -h|--help|help)
     usage
