@@ -307,6 +307,8 @@ tests/2497_limit_text_param.sql
 tests/2684_index_opclass.sql
 # #2694 – pg_get_indexdef() keeps the opclass on the PL/pgSQL / sequence-expr path
 tests/2694_indexdef_opclass_plpgsql.sql
+# #2690 – HNSW opclass validation returns PG SQLSTATEs (42804/42704), not XX000
+tests/2690_hnsw_opclass_sqlstate.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

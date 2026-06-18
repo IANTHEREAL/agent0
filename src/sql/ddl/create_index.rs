@@ -790,31 +790,52 @@ pub async fn execute_create_index(
             ));
         }
 
+        // Validate opclass/type compatibility BEFORE the db9-specific PK requirement
+        // so that a non-vector column on a table without a single-column PK returns
+        // the correct PostgreSQL SQLSTATE (42804/42704) rather than the XX000
+        // PK-requirement error. PostgreSQL+pgvector has no single-column-PK
+        // restriction, so the opclass/type error must be signalled first (#2690).
+        {
+            let indexed_col = idx_cols[0].clone();
+            let col_idx = schema
+                .column_index(&indexed_col)
+                .ok_or_else(|| anyhow!("Column not found"))?;
+            let col_data_type = &schema.columns[col_idx].data_type;
+            if !matches!(col_data_type, DataType::Vector(_)) {
+                // A non-vector column under the HNSW access method. Mirror PostgreSQL's
+                // SQLSTATEs (the btree opclass path in `validate_and_resolve_opclass`
+                // does the same): an explicit vector operator class on an incompatible
+                // column is 42804 (DataTypeMismatch); a bare `USING hnsw` with no
+                // default opclass for the type is 42704 (UndefinedObject). Both
+                // previously returned an untyped `anyhow` error, surfacing as XX000 on
+                // the wire instead of the proper SQLSTATE (#2690). Render the type with
+                // `pg_display_name()` so the message matches PG (e.g. "character
+                // varying", not "varchar(40)").
+                if let Some(variant) = resolved_method.hnsw_variant {
+                    if let Some(opclass) = hnsw_opclass_name(variant) {
+                        return Err(SqlError::DataTypeMismatch {
+                            message: format!(
+                                "operator class \"{}\" does not accept data type {}",
+                                opclass,
+                                col_data_type.pg_display_name()
+                            ),
+                        }
+                        .into());
+                    }
+                }
+                return Err(SqlError::UndefinedObject(format!(
+                    "data type {} has no default operator class for access method \"hnsw\"\nHINT:  You must specify an operator class for the index or define a default operator class for the data type.",
+                    col_data_type.pg_display_name()
+                ))
+                .into());
+            }
+        }
+
         // HNSW requires a single-column primary key.
         // Integer PKs use Direct mode (label = PK), others use Mapped mode
         // (label = internal rowid with persistent bidirectional mapping).
         if schema.pk_indices.len() != 1 {
             return Err(anyhow!("HNSW indexes require a single-column primary key"));
-        }
-        let indexed_col = idx_cols[0].clone();
-        let col_idx = schema
-            .column_index(&indexed_col)
-            .ok_or_else(|| anyhow!("Column not found"))?;
-        let col_data_type = &schema.columns[col_idx].data_type;
-        if !matches!(col_data_type, DataType::Vector(_)) {
-            if let Some(variant) = resolved_method.hnsw_variant {
-                if let Some(opclass) = hnsw_opclass_name(variant) {
-                    return Err(anyhow!(
-                        "operator class \"{}\" does not accept data type {}",
-                        opclass,
-                        col_data_type.to_string().to_lowercase()
-                    ));
-                }
-            }
-            return Err(anyhow!(
-                "data type {} has no default operator class for access method \"hnsw\"\nHINT:  You must specify an operator class for the index or define a default operator class for the data type.",
-                col_data_type.to_string().to_lowercase()
-            ));
         }
 
         // Distance metric is sourced from the preprocessor suffix when present

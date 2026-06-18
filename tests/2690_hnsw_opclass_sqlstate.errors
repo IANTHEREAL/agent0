@@ -1,0 +1,7 @@
+42804: operator class "vector_cosine_ops" does not accept data type text
+42804: operator class "vector_l2_ops" does not accept data type character varying
+42704: data type text has no default operator class for access method "hnsw"
+42804: operator class "vector_cosine_ops" does not accept data type text
+42704: data type text has no default operator class for access method "hnsw"
+42804: operator class "vector_cosine_ops" does not accept data type text
+42704: data type text has no default operator class for access method "hnsw"
