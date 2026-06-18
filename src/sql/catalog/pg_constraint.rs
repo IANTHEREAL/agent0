@@ -35,6 +35,23 @@ fn fk_action_sql(action: &ForeignKeyAction) -> Option<&'static str> {
     }
 }
 
+/// Append PostgreSQL's `pg_get_constraintdef` deferrability trailer
+/// (` DEFERRABLE [ INITIALLY DEFERRED ]`) to a constraint definition string.
+/// Shared by FOREIGN KEY / UNIQUE / PRIMARY KEY so all classes render
+/// identically (issue #2683).
+pub(crate) fn append_deferrable_trailer(
+    def: &mut String,
+    deferrable: bool,
+    initially_deferred: bool,
+) {
+    if deferrable {
+        def.push_str(" DEFERRABLE");
+        if initially_deferred {
+            def.push_str(" INITIALLY DEFERRED");
+        }
+    }
+}
+
 fn build_not_null_constraint_rows(
     schema: &TableSchema,
     table_short_name: &str,
@@ -153,7 +170,12 @@ impl VirtualTable for PgConstraint {
                     .iter()
                     .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                     .collect();
-                let constraintdef = format!("PRIMARY KEY ({})", pk_cols.join(", "));
+                let mut constraintdef = format!("PRIMARY KEY ({})", pk_cols.join(", "));
+                append_deferrable_trailer(
+                    &mut constraintdef,
+                    schema.pk_deferrable,
+                    schema.pk_initially_deferred,
+                );
                 let conindid = catalog_oids::pg_class_pk_index_oid(schema.table_id).unwrap_or(0);
 
                 rows.push(Row::new(vec![
@@ -168,8 +190,8 @@ impl VirtualTable for PgConstraint {
                     Value::Array(vec![]),
                     null_val(),
                     null_val(),
-                    Value::Boolean(false),
-                    Value::Boolean(false),
+                    Value::Boolean(schema.pk_deferrable),
+                    Value::Boolean(schema.pk_initially_deferred),
                     text_val(&constraintdef),
                     int_val(conindid),
                     int_val(0),
@@ -191,7 +213,12 @@ impl VirtualTable for PgConstraint {
                         conkey.push(Value::Int64((pos + 1) as i64));
                     }
                 }
-                let constraintdef = format!("UNIQUE ({})", idx.columns.join(", "));
+                let mut constraintdef = format!("UNIQUE ({})", idx.columns.join(", "));
+                append_deferrable_trailer(
+                    &mut constraintdef,
+                    idx.deferrable,
+                    idx.initially_deferred,
+                );
                 let conindid =
                     catalog_oids::pg_class_index_oid(schema.table_id, idx.id).unwrap_or(0);
 
@@ -207,8 +234,8 @@ impl VirtualTable for PgConstraint {
                     Value::Array(vec![]),
                     null_val(),
                     null_val(),
-                    Value::Boolean(false),
-                    Value::Boolean(false),
+                    Value::Boolean(idx.deferrable),
+                    Value::Boolean(idx.initially_deferred),
                     text_val(&constraintdef),
                     int_val(conindid),
                     int_val(0),
@@ -311,6 +338,8 @@ impl VirtualTable for PgConstraint {
                 if let Some(action) = fk_action_sql(&fk.on_update) {
                     constraintdef.push_str(&format!(" ON UPDATE {}", action));
                 }
+                // Mirror PostgreSQL's pg_get_constraintdef trailer for deferrable FKs.
+                append_deferrable_trailer(&mut constraintdef, fk.deferrable, fk.initially_deferred);
 
                 rows.push(Row::new(vec![
                     int_val(constraint_oid),
@@ -324,8 +353,8 @@ impl VirtualTable for PgConstraint {
                     Value::Array(confkey),
                     text_val(fk_action_code(&fk.on_delete)),
                     text_val(fk_action_code(&fk.on_update)),
-                    Value::Boolean(false),
-                    Value::Boolean(false),
+                    Value::Boolean(fk.deferrable),
+                    Value::Boolean(fk.initially_deferred),
                     text_val(&constraintdef),
                     int_val(0),
                     int_val(0),
@@ -367,6 +396,8 @@ mod tests {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,

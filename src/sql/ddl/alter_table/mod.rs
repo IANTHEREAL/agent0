@@ -94,7 +94,7 @@ pub async fn execute_alter_table(
                 name,
                 columns,
                 is_primary,
-                ..
+                characteristics,
             } if *is_primary => {
                 alter_table_add_primary_key(
                     store,
@@ -105,10 +105,16 @@ pub async fn execute_alter_table(
                     &t,
                     name,
                     columns,
+                    characteristics,
                 )
                 .await?;
             }
-            TableConstraint::Unique { columns, name, .. } => {
+            TableConstraint::Unique {
+                columns,
+                name,
+                characteristics,
+                ..
+            } => {
                 alter_table_add_unique_constraint(
                     store,
                     txn,
@@ -118,6 +124,7 @@ pub async fn execute_alter_table(
                     &t,
                     name,
                     columns,
+                    characteristics,
                 )
                 .await?;
             }
@@ -128,7 +135,7 @@ pub async fn execute_alter_table(
                 referred_columns,
                 on_delete,
                 on_update,
-                ..
+                characteristics,
             } => {
                 alter_table_add_foreign_key(
                     store,
@@ -143,6 +150,7 @@ pub async fn execute_alter_table(
                     referred_columns,
                     on_delete,
                     on_update,
+                    characteristics,
                 )
                 .await?;
             }

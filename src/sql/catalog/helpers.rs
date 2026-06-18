@@ -395,6 +395,8 @@ mod tests {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -404,6 +406,8 @@ mod tests {
         let unique_constraint_backing_index = IndexDef {
             is_constraint: true,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             ..plain_unique_index
         };
         assert!(is_unique_constraint_index(&unique_constraint_backing_index));

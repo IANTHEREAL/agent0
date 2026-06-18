@@ -1326,6 +1326,8 @@ mod tests {
             expressions: Vec::new(),
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,

@@ -1117,6 +1117,8 @@ mod tests {
             ref_columns: vec!["id".to_string()],
             on_delete,
             on_update,
+            deferrable: false,
+            initially_deferred: false,
         }
     }
 

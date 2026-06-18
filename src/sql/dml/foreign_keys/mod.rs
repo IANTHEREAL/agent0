@@ -1,4 +1,15 @@
 //! Foreign key constraint validation and cascade operations (DELETE/UPDATE).
+//!
+//! # PG-DIVERGENCE (#2683)
+//! db9 parses and records `DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` on
+//! constraints (see [`ForeignKeyConstraint::deferrable`] /
+//! [`ForeignKeyConstraint::initially_deferred`] and `pg_constraint`), but FK
+//! checks here always run **immediately** at statement time. True
+//! check-at-COMMIT semantics for `INITIALLY DEFERRED` constraints are not yet
+//! implemented; the recorded flags exist for catalog fidelity only.
+//!
+//! Deferred (check-at-COMMIT) enforcement is tracked separately in
+//! <https://github.com/db9-ai/db9-server/issues/2689>.
 
 mod cascade_delete;
 mod cascade_update;
@@ -848,6 +859,8 @@ mod tests {
             ref_columns: vec!["id".to_string()],
             on_delete: ForeignKeyAction::NoAction,
             on_update: ForeignKeyAction::NoAction,
+            deferrable: false,
+            initially_deferred: false,
         }];
         s
     }
@@ -1000,6 +1013,8 @@ mod tests {
             expressions: Vec::new(),
             state,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -1063,6 +1078,8 @@ mod tests {
             expressions: Vec::new(),
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -1084,6 +1101,8 @@ mod tests {
             expressions: Vec::new(),
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -1105,6 +1124,8 @@ mod tests {
             expressions: vec!["lower(name)".to_string()],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,

@@ -78,6 +78,8 @@ fn enum_literal_rewrite_preserves_unrelated_text_literals() {
         expressions: vec!["CASE WHEN state = 'active' THEN 1 ELSE 0 END".to_string()],
         state: IndexState::Ready,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,

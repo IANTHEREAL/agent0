@@ -7,6 +7,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
+use super::catalog::pg_constraint::append_deferrable_trailer;
 use super::sequences;
 use super::sequences::SerialDefaultBehavior;
 
@@ -39,6 +40,12 @@ fn column_type_sql(schema_col: &crate::model::ColumnDef) -> String {
 pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, String>) -> String {
     let mut definitions: Vec<String> = Vec::new();
 
+    // Names of unique-constraint indexes already rendered inline as a column
+    // `... UNIQUE` clause — these must not be re-emitted as a table-level
+    // CONSTRAINT or as a bare CREATE UNIQUE INDEX. (#2683)
+    let mut inline_unique_indexes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     // Skip logically dropped columns — they must not appear in DDL export.
     for col in schema.columns.iter().filter(|c| !c.is_dropped) {
         let mut col_sql = format!("{} {}", col.name, column_type_sql(col));
@@ -65,6 +72,14 @@ pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, Str
         }
         if col.unique {
             col_sql.push_str(" UNIQUE");
+            // Inline UNIQUE deferrability is persisted on the backing constraint
+            // index, not on the column itself — round-trip it from there. (#2683)
+            if let Some(idx) = schema.indexes.iter().find(|i| {
+                i.unique && i.is_constraint && i.columns.len() == 1 && i.columns[0] == col.name
+            }) {
+                append_deferrable_trailer(&mut col_sql, idx.deferrable, idx.initially_deferred);
+                inline_unique_indexes.insert(idx.name.clone());
+            }
         }
         definitions.push(col_sql);
     }
@@ -75,12 +90,34 @@ pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, Str
             .iter()
             .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
             .collect();
-        let pk_body = format!("PRIMARY KEY ({})", pk_columns.join(", "));
+        let mut pk_body = format!("PRIMARY KEY ({})", pk_columns.join(", "));
+        append_deferrable_trailer(
+            &mut pk_body,
+            schema.pk_deferrable,
+            schema.pk_initially_deferred,
+        );
         if let Some(name) = &schema.pk_constraint_name {
             definitions.push(format!("CONSTRAINT {} {}", name, pk_body));
         } else {
             definitions.push(pk_body);
         }
+    }
+
+    // Table-level / multi-column UNIQUE constraints that were not rendered
+    // inline above. Emit them as named table constraints (not bare unique
+    // indexes) so dump/restore round-trips both the constraint identity and
+    // its DEFERRABLE characteristic, matching PG's pg_get_constraintdef. (#2683)
+    for idx in &schema.indexes {
+        if !(idx.unique && idx.is_constraint) || inline_unique_indexes.contains(&idx.name) {
+            continue;
+        }
+        let mut unique_body = format!(
+            "CONSTRAINT {} UNIQUE ({})",
+            idx.name,
+            idx.columns.join(", ")
+        );
+        append_deferrable_trailer(&mut unique_body, idx.deferrable, idx.initially_deferred);
+        definitions.push(unique_body);
     }
 
     for check in &schema.check_constraints {
@@ -92,7 +129,7 @@ pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, Str
     }
 
     for fk in &schema.foreign_keys {
-        definitions.push(format!(
+        let mut fk_body = format!(
             "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}) ON DELETE {} ON UPDATE {}",
             fk.name,
             fk.columns.join(", "),
@@ -100,7 +137,9 @@ pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, Str
             fk.ref_columns.join(", "),
             foreign_key_action_sql(&fk.on_delete),
             foreign_key_action_sql(&fk.on_update)
-        ));
+        );
+        append_deferrable_trailer(&mut fk_body, fk.deferrable, fk.initially_deferred);
+        definitions.push(fk_body);
     }
 
     format!(
@@ -419,6 +458,13 @@ pub async fn export_all_ddl(
         }
 
         for idx in &schema.indexes {
+            // Unique-constraint-backing indexes are emitted as table constraints
+            // (inline column UNIQUE or `CONSTRAINT ... UNIQUE`) by `table_to_ddl`,
+            // never as standalone CREATE UNIQUE INDEX — emitting both would lose
+            // constraint identity/deferrability and duplicate the object. (#2683)
+            if idx.unique && idx.is_constraint {
+                continue;
+            }
             rows.push(DdlExportRow {
                 ddl_order: 0,
                 object_type: "index".to_string(),
@@ -532,6 +578,8 @@ mod tests {
                 ref_columns: vec!["id".to_string()],
                 on_delete: ForeignKeyAction::Cascade,
                 on_update: ForeignKeyAction::NoAction,
+                deferrable: false,
+                initially_deferred: false,
             }];
             s
         };
@@ -548,6 +596,127 @@ mod tests {
         assert!(ddl.contains("CONSTRAINT users_email_chk CHECK (email <> '')"));
         assert!(
             ddl.contains("CONSTRAINT users_org_fk FOREIGN KEY (id) REFERENCES public.orgs (id)")
+        );
+    }
+
+    #[test]
+    fn table_to_ddl_round_trips_deferrable_constraints() {
+        // #2683: PK / FK / inline-UNIQUE export must carry the
+        // DEFERRABLE [INITIALLY DEFERRED] trailer from the persisted flags.
+        let schema = {
+            let mut s = TableSchema::new(
+                "public.t".to_string(),
+                1,
+                vec![
+                    ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                    ColumnDef::new("code", DataType::Int32, true).unique(),
+                    ColumnDef::new("parent_id", DataType::Int32, true),
+                ],
+                vec![0],
+            );
+            s.pk_constraint_name = Some("t_pkey".to_string());
+            s.pk_deferrable = true;
+            s.pk_initially_deferred = true;
+            s.indexes = vec![IndexDef {
+                name: "t_code_key".to_string(),
+                id: 1,
+                columns: vec!["code".to_string()],
+                unique: true,
+                is_constraint: true,
+                method: Some("btree".to_string()),
+                predicate: None,
+                expressions: vec![],
+                state: crate::worker::types::IndexState::Ready,
+                cached_predicate_conjuncts: None,
+                deferrable: true,
+                initially_deferred: false,
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_distance_metric: None,
+            }];
+            s.foreign_keys = vec![ForeignKeyConstraint {
+                name: "t_parent_fk".to_string(),
+                columns: vec!["parent_id".to_string()],
+                ref_table: "public.parent".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+                deferrable: true,
+                initially_deferred: true,
+            }];
+            s
+        };
+
+        let ddl = table_to_ddl(&schema, &HashMap::new());
+        // PK: DEFERRABLE INITIALLY DEFERRED
+        assert!(
+            ddl.contains("CONSTRAINT t_pkey PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED"),
+            "PK trailer missing: {ddl}"
+        );
+        // Inline UNIQUE: DEFERRABLE (INITIALLY IMMEDIATE => no "INITIALLY DEFERRED")
+        assert!(
+            ddl.contains("code INTEGER UNIQUE DEFERRABLE"),
+            "UNIQUE trailer missing: {ddl}"
+        );
+        assert!(
+            !ddl.contains("code INTEGER UNIQUE DEFERRABLE INITIALLY DEFERRED"),
+            "UNIQUE must not be INITIALLY DEFERRED: {ddl}"
+        );
+        // FK: DEFERRABLE INITIALLY DEFERRED
+        assert!(
+            ddl.contains(
+                "CONSTRAINT t_parent_fk FOREIGN KEY (parent_id) REFERENCES public.parent (id) \
+                 ON DELETE NO ACTION ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED"
+            ),
+            "FK trailer missing: {ddl}"
+        );
+    }
+
+    #[test]
+    fn table_to_ddl_emits_multi_column_deferrable_unique_as_table_constraint() {
+        // #2683: a multi-column / named UNIQUE constraint must round-trip as a
+        // table-level `CONSTRAINT name UNIQUE (cols) [DEFERRABLE ...]`, carrying
+        // both its identity and deferrability — not as a bare CREATE UNIQUE INDEX.
+        let schema = {
+            let mut s = TableSchema::new(
+                "public.muc".to_string(),
+                1,
+                vec![
+                    ColumnDef::new("a", DataType::Int32, true),
+                    ColumnDef::new("b", DataType::Int32, true),
+                ],
+                vec![],
+            );
+            s.pk_constraint_name = None;
+            s.indexes = vec![IndexDef {
+                name: "muc_u".to_string(),
+                id: 1,
+                columns: vec!["a".to_string(), "b".to_string()],
+                unique: true,
+                is_constraint: true,
+                method: Some("btree".to_string()),
+                predicate: None,
+                expressions: vec![],
+                state: crate::worker::types::IndexState::Ready,
+                cached_predicate_conjuncts: None,
+                deferrable: true,
+                initially_deferred: true,
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_distance_metric: None,
+            }];
+            s
+        };
+
+        let ddl = table_to_ddl(&schema, &HashMap::new());
+        assert!(
+            ddl.contains("CONSTRAINT muc_u UNIQUE (a, b) DEFERRABLE INITIALLY DEFERRED"),
+            "multi-column UNIQUE table constraint missing: {ddl}"
+        );
+        // It must NOT degrade into a bare unique index in the table body.
+        assert!(
+            !ddl.contains("CREATE UNIQUE INDEX"),
+            "multi-column UNIQUE must not be emitted as CREATE UNIQUE INDEX: {ddl}"
         );
     }
 
@@ -691,6 +860,8 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -728,6 +899,8 @@ mod tests {
                 ref_columns: vec!["id".to_string()],
                 on_delete: ForeignKeyAction::NoAction,
                 on_update: ForeignKeyAction::NoAction,
+                deferrable: false,
+                initially_deferred: false,
             })
             .collect();
         s

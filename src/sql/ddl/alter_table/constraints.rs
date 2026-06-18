@@ -22,7 +22,8 @@ use super::super::create_table::{check_relation_name_available, RelationKind};
 use super::super::{
     analyze_row_level_expr, constraint_name_exists, delete_range, eval_row_level_expr,
     extract_first_column_from_check_expr, find_check_constraint_index, index_prefix_range,
-    parse_referential_action, AlterTableBudget, KvScanBatches, DDL_SCAN_BATCH_SIZE,
+    parse_constraint_characteristics, parse_referential_action, AlterTableBudget, KvScanBatches,
+    DDL_SCAN_BATCH_SIZE,
 };
 
 /// ADD CONSTRAINT ... PRIMARY KEY: validate columns, set pk_indices, reserve
@@ -36,7 +37,9 @@ pub(super) async fn alter_table_add_primary_key(
     full_table_name: &str,
     name: &Option<sqlparser::ast::Ident>,
     columns: &[sqlparser::ast::Ident],
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
 ) -> Result<()> {
+    let (deferrable, initially_deferred) = parse_constraint_characteristics(characteristics)?;
     let pk_names: Vec<String> = columns.iter().map(normalize_ident).collect();
     let mut pk_indices = Vec::new();
     for pk_name in &pk_names {
@@ -67,6 +70,8 @@ pub(super) async fn alter_table_add_primary_key(
     )
     .await?;
     schema.pk_constraint_name = Some(pk_constraint);
+    schema.pk_deferrable = deferrable;
+    schema.pk_initially_deferred = initially_deferred;
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
     Ok(())
@@ -83,7 +88,9 @@ pub(super) async fn alter_table_add_unique_constraint(
     full_table_name: &str,
     name: &Option<sqlparser::ast::Ident>,
     columns: &[sqlparser::ast::Ident],
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
 ) -> Result<()> {
+    let (deferrable, initially_deferred) = parse_constraint_characteristics(characteristics)?;
     let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
 
     for col_name in &col_names {
@@ -134,6 +141,8 @@ pub(super) async fn alter_table_add_unique_constraint(
         expressions: Vec::new(),
         state: IndexState::Ready,
         cached_predicate_conjuncts: None,
+        deferrable,
+        initially_deferred,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
@@ -208,6 +217,7 @@ pub(super) async fn alter_table_add_foreign_key(
     referred_columns: &[sqlparser::ast::Ident],
     on_delete: &Option<sqlparser::ast::ReferentialAction>,
     on_update: &Option<sqlparser::ast::ReferentialAction>,
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
 ) -> Result<()> {
     let fk_cols: Vec<String> = columns.iter().map(normalize_ident).collect();
     for col_name in &fk_cols {
@@ -345,6 +355,7 @@ pub(super) async fn alter_table_add_foreign_key(
         }
     }
 
+    let (deferrable, initially_deferred) = parse_constraint_characteristics(characteristics)?;
     schema.foreign_keys.push(ForeignKeyConstraint {
         name: fk_name,
         columns: fk_cols,
@@ -352,6 +363,8 @@ pub(super) async fn alter_table_add_foreign_key(
         ref_columns: ref_cols,
         on_delete: del_action,
         on_update: upd_action,
+        deferrable,
+        initially_deferred,
     });
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
@@ -780,6 +793,8 @@ mod tests {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,

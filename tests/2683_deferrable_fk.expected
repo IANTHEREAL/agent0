@@ -1,0 +1,38 @@
+conname|condeferrable|condeferred
+defer_child_alter_fk|t|t
+defer_child_fk|t|t
+defer_child_nd_parent_id_fkey|f|f
+defer_child_tbl_fk|t|f
+(4 rows)
+id|parent_id
+1|1
+(1 row)
+ERROR:  constraint declared INITIALLY DEFERRED must be DEFERRABLE
+ERROR:  constraint declared INITIALLY DEFERRED must be DEFERRABLE
+ERROR:  constraint declared INITIALLY DEFERRED must be DEFERRABLE
+conname|contype|condeferrable|condeferred|def
+defer_pk_pkey|p|t|t|PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED
+defer_uniq_def_u|u|t|t|UNIQUE (code) DEFERRABLE INITIALLY DEFERRED
+(2 rows)
+constraint_name|constraint_type|is_deferrable|initially_deferred
+defer_child_fk|FOREIGN KEY|YES|YES
+defer_child_nd_parent_id_fkey|FOREIGN KEY|NO|NO
+defer_child_tbl_fk|FOREIGN KEY|YES|NO
+defer_pk_pkey|PRIMARY KEY|YES|YES
+defer_uniq_def_u|UNIQUE|YES|YES
+defer_uniq_u|UNIQUE|YES|NO
+(6 rows)
+relname|indimmediate
+defer_pk_pkey|f
+defer_uniq_def_u|f
+defer_uniq_u|f
+(3 rows)
+constraint_name|constraint_type|is_deferrable|initially_deferred
+defer_named_uniq_named|UNIQUE|NO|NO
+(1 row)
+unique_constraint_emitted|leaks_unique_index
+t|f
+(1 row)
+standalone_index_rows
+0
+(1 row)

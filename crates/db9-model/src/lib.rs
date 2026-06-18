@@ -630,6 +630,19 @@ pub struct IndexDef {
     /// HNSW: distance metric ("l2", "cosine", "ip")
     #[serde(default)]
     pub hnsw_distance_metric: Option<String>,
+    /// Whether the backing UNIQUE constraint was declared `DEFERRABLE`
+    /// (PG `pg_constraint.condeferrable`). Always `false` for plain
+    /// (non-constraint) indexes.
+    #[serde(default)]
+    pub deferrable: bool,
+    /// Whether the UNIQUE constraint was declared `DEFERRABLE INITIALLY
+    /// DEFERRED` (PG `pg_constraint.condeferred`).
+    ///
+    /// # PG-DIVERGENCE
+    /// Recorded for catalog fidelity only — uniqueness is still enforced
+    /// immediately, not at COMMIT (issue #2683).
+    #[serde(default)]
+    pub initially_deferred: bool,
 }
 
 #[derive(Deserialize)]
@@ -654,6 +667,10 @@ struct IndexDefSerde {
     hnsw_ef_construction: Option<u16>,
     #[serde(default)]
     hnsw_distance_metric: Option<String>,
+    #[serde(default)]
+    deferrable: bool,
+    #[serde(default)]
+    initially_deferred: bool,
 }
 
 impl<'de> Deserialize<'de> for IndexDef {
@@ -679,6 +696,8 @@ impl<'de> Deserialize<'de> for IndexDef {
             hnsw_m: raw.hnsw_m,
             hnsw_ef_construction: raw.hnsw_ef_construction,
             hnsw_distance_metric: raw.hnsw_distance_metric,
+            deferrable: raw.deferrable,
+            initially_deferred: raw.initially_deferred,
         })
     }
 }
@@ -761,6 +780,18 @@ pub struct ForeignKeyConstraint {
     pub ref_columns: Vec<String>,
     pub on_delete: ForeignKeyAction,
     pub on_update: ForeignKeyAction,
+    /// Whether the constraint was declared `DEFERRABLE` (PG `pg_constraint.condeferrable`).
+    #[serde(default)]
+    pub deferrable: bool,
+    /// Whether the constraint defaults to deferred checking, i.e. declared
+    /// `DEFERRABLE INITIALLY DEFERRED` (PG `pg_constraint.condeferred`).
+    ///
+    /// # PG-DIVERGENCE
+    /// db9 records this flag for catalog fidelity but still validates foreign
+    /// keys *immediately* at statement time; true check-at-COMMIT semantics for
+    /// `INITIALLY DEFERRED` are not yet implemented (see issue #2683).
+    #[serde(default)]
+    pub initially_deferred: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -800,6 +831,18 @@ pub struct TableSchema {
     /// Primary key constraint name (e.g. `table_pkey` or a user-specified `CONSTRAINT` name).
     #[serde(default)]
     pub pk_constraint_name: Option<String>,
+    /// Whether the PRIMARY KEY constraint was declared `DEFERRABLE`
+    /// (PG `pg_constraint.condeferrable`).
+    #[serde(default)]
+    pub pk_deferrable: bool,
+    /// Whether the PRIMARY KEY was declared `DEFERRABLE INITIALLY DEFERRED`
+    /// (PG `pg_constraint.condeferred`).
+    ///
+    /// # PG-DIVERGENCE
+    /// Recorded for catalog fidelity only — the PK is still enforced
+    /// immediately, not at COMMIT (issue #2683).
+    #[serde(default)]
+    pub pk_initially_deferred: bool,
     pub pk_indices: Vec<usize>,
     pub indexes: Vec<IndexDef>,
     #[serde(default)]
@@ -841,6 +884,8 @@ impl TableSchema {
             columns,
             version: 1,
             pk_constraint_name,
+            pk_deferrable: false,
+            pk_initially_deferred: false,
             pk_indices,
             indexes: Vec::new(),
             check_constraints: Vec::new(),
@@ -869,6 +914,8 @@ impl TableSchema {
             columns,
             version: 1,
             pk_constraint_name: None,
+            pk_deferrable: false,
+            pk_initially_deferred: false,
             pk_indices: Vec::new(),
             indexes: Vec::new(),
             check_constraints: Vec::new(),
@@ -1453,6 +1500,8 @@ mod tests {
             columns: cols,
             version: 1,
             pk_constraint_name: None,
+            pk_deferrable: false,
+            pk_initially_deferred: false,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],

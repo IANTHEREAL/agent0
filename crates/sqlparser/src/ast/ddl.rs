@@ -281,6 +281,8 @@ pub enum TableConstraint {
         columns: Vec<Ident>,
         /// Whether this is a `PRIMARY KEY` or just a `UNIQUE` constraint
         is_primary: bool,
+        /// `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`
+        characteristics: Option<ConstraintCharacteristics>,
     },
     /// A referential integrity constraint (`[ CONSTRAINT <name> ] FOREIGN KEY (<columns>)
     /// REFERENCES <foreign_table> (<referred_columns>)
@@ -294,6 +296,8 @@ pub enum TableConstraint {
         referred_columns: Vec<Ident>,
         on_delete: Option<ReferentialAction>,
         on_update: Option<ReferentialAction>,
+        /// `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`
+        characteristics: Option<ConstraintCharacteristics>,
     },
     /// `[ CONSTRAINT <name> ] CHECK (<expr>)`
     Check {
@@ -350,13 +354,20 @@ impl fmt::Display for TableConstraint {
                 name,
                 columns,
                 is_primary,
-            } => write!(
-                f,
-                "{}{} ({})",
-                display_constraint_name(name),
-                if *is_primary { "PRIMARY KEY" } else { "UNIQUE" },
-                display_comma_separated(columns)
-            ),
+                characteristics,
+            } => {
+                write!(
+                    f,
+                    "{}{} ({})",
+                    display_constraint_name(name),
+                    if *is_primary { "PRIMARY KEY" } else { "UNIQUE" },
+                    display_comma_separated(columns)
+                )?;
+                if let Some(characteristics) = characteristics {
+                    write!(f, " {characteristics}")?;
+                }
+                Ok(())
+            }
             TableConstraint::ForeignKey {
                 name,
                 columns,
@@ -364,6 +375,7 @@ impl fmt::Display for TableConstraint {
                 referred_columns,
                 on_delete,
                 on_update,
+                characteristics,
             } => {
                 write!(
                     f,
@@ -378,6 +390,9 @@ impl fmt::Display for TableConstraint {
                 }
                 if let Some(action) = on_update {
                     write!(f, " ON UPDATE {action}")?;
+                }
+                if let Some(characteristics) = characteristics {
+                    write!(f, " {characteristics}")?;
                 }
                 Ok(())
             }
@@ -572,6 +587,8 @@ pub enum ColumnOption {
     /// `{ PRIMARY KEY | UNIQUE }`
     Unique {
         is_primary: bool,
+        /// `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`
+        characteristics: Option<ConstraintCharacteristics>,
     },
     /// A referential integrity constraint (`[FOREIGN KEY REFERENCES
     /// <foreign_table> (<referred_columns>)
@@ -583,6 +600,8 @@ pub enum ColumnOption {
         referred_columns: Vec<Ident>,
         on_delete: Option<ReferentialAction>,
         on_update: Option<ReferentialAction>,
+        /// `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`
+        characteristics: Option<ConstraintCharacteristics>,
     },
     /// `CHECK (<expr>)`
     Check(Expr),
@@ -610,14 +629,22 @@ impl fmt::Display for ColumnOption {
             Null => write!(f, "NULL"),
             NotNull => write!(f, "NOT NULL"),
             Default(expr) => write!(f, "DEFAULT {expr}"),
-            Unique { is_primary } => {
-                write!(f, "{}", if *is_primary { "PRIMARY KEY" } else { "UNIQUE" })
+            Unique {
+                is_primary,
+                characteristics,
+            } => {
+                write!(f, "{}", if *is_primary { "PRIMARY KEY" } else { "UNIQUE" })?;
+                if let Some(characteristics) = characteristics {
+                    write!(f, " {characteristics}")?;
+                }
+                Ok(())
             }
             ForeignKey {
                 foreign_table,
                 referred_columns,
                 on_delete,
                 on_update,
+                characteristics,
             } => {
                 write!(f, "REFERENCES {foreign_table}")?;
                 if !referred_columns.is_empty() {
@@ -628,6 +655,9 @@ impl fmt::Display for ColumnOption {
                 }
                 if let Some(action) = on_update {
                     write!(f, " ON UPDATE {action}")?;
+                }
+                if let Some(characteristics) = characteristics {
+                    write!(f, " {characteristics}")?;
                 }
                 Ok(())
             }
@@ -736,6 +766,57 @@ impl fmt::Display for ReferentialAction {
             ReferentialAction::NoAction => "NO ACTION",
             ReferentialAction::SetDefault => "SET DEFAULT",
         })
+    }
+}
+
+/// The `INITIALLY` deferral mode of a deferrable constraint:
+/// `INITIALLY { DEFERRED | IMMEDIATE }`.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum DeferrableInitial {
+    Immediate,
+    Deferred,
+}
+
+impl fmt::Display for DeferrableInitial {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            DeferrableInitial::Immediate => "INITIALLY IMMEDIATE",
+            DeferrableInitial::Deferred => "INITIALLY DEFERRED",
+        })
+    }
+}
+
+/// Constraint characteristics that may trail a `UNIQUE`/`PRIMARY KEY`/`FOREIGN KEY`
+/// constraint in PostgreSQL: `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`.
+///
+/// `deferrable: None` means the clause was not specified at all (PG default is
+/// `NOT DEFERRABLE`); `Some(true)`/`Some(false)` correspond to `DEFERRABLE`/`NOT
+/// DEFERRABLE`. `initially` records an explicit `INITIALLY` mode when present.
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct ConstraintCharacteristics {
+    /// `Some(true)` for `DEFERRABLE`, `Some(false)` for `NOT DEFERRABLE`,
+    /// `None` if neither was specified.
+    pub deferrable: Option<bool>,
+    /// The `INITIALLY { DEFERRED | IMMEDIATE }` mode, if specified.
+    pub initially: Option<DeferrableInitial>,
+}
+
+impl fmt::Display for ConstraintCharacteristics {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut parts: Vec<String> = Vec::new();
+        match self.deferrable {
+            Some(true) => parts.push("DEFERRABLE".to_string()),
+            Some(false) => parts.push("NOT DEFERRABLE".to_string()),
+            None => {}
+        }
+        if let Some(initially) = self.initially {
+            parts.push(initially.to_string());
+        }
+        f.write_str(&parts.join(" "))
     }
 }
 

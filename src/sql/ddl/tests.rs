@@ -158,6 +158,8 @@ fn test_index(name: &str) -> IndexDef {
         expressions: vec![],
         state: IndexState::Ready,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
@@ -445,6 +447,8 @@ fn assign_generated_check_names_avoids_existing_constraint_names() {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -456,6 +460,8 @@ fn assign_generated_check_names_avoids_existing_constraint_names() {
             ref_columns: vec![],
             on_delete: ForeignKeyAction::NoAction,
             on_update: ForeignKeyAction::NoAction,
+            deferrable: false,
+            initially_deferred: false,
         }],
         &mut checks,
     );
@@ -531,6 +537,8 @@ fn constraint_name_exists_checks_pk_fk_index_and_checks() {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -546,6 +554,8 @@ fn constraint_name_exists_checks_pk_fk_index_and_checks() {
             ref_columns: vec![],
             on_delete: ForeignKeyAction::NoAction,
             on_update: ForeignKeyAction::NoAction,
+            deferrable: false,
+            initially_deferred: false,
         }];
         s
     };

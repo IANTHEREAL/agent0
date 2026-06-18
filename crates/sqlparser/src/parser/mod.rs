@@ -4308,9 +4308,17 @@ impl<'a> Parser<'a> {
         } else if self.parse_keyword(Keyword::DEFAULT) {
             Ok(Some(ColumnOption::Default(self.parse_expr()?)))
         } else if self.parse_keywords(&[Keyword::PRIMARY, Keyword::KEY]) {
-            Ok(Some(ColumnOption::Unique { is_primary: true }))
+            let characteristics = self.parse_optional_constraint_characteristics()?;
+            Ok(Some(ColumnOption::Unique {
+                is_primary: true,
+                characteristics,
+            }))
         } else if self.parse_keyword(Keyword::UNIQUE) {
-            Ok(Some(ColumnOption::Unique { is_primary: false }))
+            let characteristics = self.parse_optional_constraint_characteristics()?;
+            Ok(Some(ColumnOption::Unique {
+                is_primary: false,
+                characteristics,
+            }))
         } else if self.parse_keyword(Keyword::REFERENCES) {
             let foreign_table = self.parse_object_name()?;
             // PostgreSQL allows omitting the column list and
@@ -4329,11 +4337,13 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
+            let characteristics = self.parse_optional_constraint_characteristics()?;
             Ok(Some(ColumnOption::ForeignKey {
                 foreign_table,
                 referred_columns,
                 on_delete,
                 on_update,
+                characteristics,
             }))
         } else if self.parse_keyword(Keyword::CHECK) {
             self.expect_token(&Token::LParen)?;
@@ -4448,6 +4458,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the optional constraint characteristics that may trail a
+    /// `UNIQUE` / `PRIMARY KEY` / `FOREIGN KEY` constraint in PostgreSQL:
+    /// `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`.
+    ///
+    /// The two clauses may appear in either order and either may be omitted.
+    /// Returns `None` if neither clause is present.
+    pub fn parse_optional_constraint_characteristics(
+        &mut self,
+    ) -> Result<Option<ConstraintCharacteristics>, ParserError> {
+        let mut deferrable = None;
+        let mut initially = None;
+        loop {
+            if deferrable.is_none() && self.parse_keywords(&[Keyword::NOT, Keyword::DEFERRABLE]) {
+                deferrable = Some(false);
+            } else if deferrable.is_none() && self.parse_keyword(Keyword::DEFERRABLE) {
+                deferrable = Some(true);
+            } else if initially.is_none() && self.parse_keyword(Keyword::INITIALLY) {
+                if self.parse_keyword(Keyword::DEFERRED) {
+                    initially = Some(DeferrableInitial::Deferred);
+                } else if self.parse_keyword(Keyword::IMMEDIATE) {
+                    initially = Some(DeferrableInitial::Immediate);
+                } else {
+                    return self.expected("one of DEFERRED or IMMEDIATE", self.peek_token());
+                }
+            } else {
+                break;
+            }
+        }
+        if deferrable.is_none() && initially.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(ConstraintCharacteristics {
+                deferrable,
+                initially,
+            }))
+        }
+    }
+
     pub fn parse_optional_table_constraint(
         &mut self,
     ) -> Result<Option<TableConstraint>, ParserError> {
@@ -4471,10 +4519,12 @@ impl<'a> Parser<'a> {
                     .or(name);
 
                 let columns = self.parse_parenthesized_column_list(Mandatory, false)?;
+                let characteristics = self.parse_optional_constraint_characteristics()?;
                 Ok(Some(TableConstraint::Unique {
                     name,
                     columns,
                     is_primary,
+                    characteristics,
                 }))
             }
             Token::Word(w) if w.keyword == Keyword::FOREIGN => {
@@ -4496,6 +4546,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
+                let characteristics = self.parse_optional_constraint_characteristics()?;
                 Ok(Some(TableConstraint::ForeignKey {
                     name,
                     columns,
@@ -4503,6 +4554,7 @@ impl<'a> Parser<'a> {
                     referred_columns,
                     on_delete,
                     on_update,
+                    characteristics,
                 }))
             }
             Token::Word(w) if w.keyword == Keyword::CHECK => {

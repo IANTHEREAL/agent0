@@ -82,6 +82,8 @@ fn gin_schema() -> TableSchema {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -97,6 +99,8 @@ fn gin_schema() -> TableSchema {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -234,6 +238,8 @@ fn test_expression_index_typed_lower() {
             expressions: vec!["lower(name)".to_string()],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -300,6 +306,8 @@ fn test_partial_index_typed_exact_predicate() {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -363,6 +371,8 @@ fn test_partial_index_typed_missing_predicate() {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -412,6 +422,8 @@ fn test_partial_index_typed_valid_cached_predicate() {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: Some(vec!["status = 'active'".to_string()]),
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -466,6 +478,8 @@ fn test_partial_index_typed_malformed_predicate() {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -521,6 +535,8 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
             expressions: Vec::new(),
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,
@@ -632,6 +648,8 @@ fn build_single_column_schema(unique: bool) -> (TableSchema, IndexDef) {
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
     };
 
     let mut col = ColumnDef::new("status", DataType::Text, true);
@@ -762,6 +780,8 @@ fn test_inlist_mixed_null_and_duplicates_matches_normalized_scan_keys_and_cost()
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
     };
     let schema = {
         let mut s = TableSchema::new(
@@ -855,6 +875,8 @@ fn test_inlist_mixed_sign_nan_deduplicates_to_one_effective_nan() {
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
     };
     let schema = {
         let mut s = TableSchema::new(
@@ -1103,6 +1125,8 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
     };
     let schema = {
         let mut s = TableSchema::new(
@@ -1226,6 +1250,8 @@ fn test_primary_key_exact_match_preferred_over_secondary_prefix_scan() {
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
     }];
 
     let filter = typed_binop(
@@ -1405,6 +1431,8 @@ fn test_btree_index_match_uses_column_index_for_quoted_identifier_collision() {
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
@@ -1472,6 +1500,8 @@ fn range_schema() -> TableSchema {
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
@@ -1503,6 +1533,8 @@ fn composite_range_schema() -> TableSchema {
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,

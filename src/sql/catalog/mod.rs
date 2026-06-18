@@ -11,7 +11,7 @@ mod pg_attrdef;
 mod pg_attribute;
 mod pg_class;
 mod pg_collation;
-mod pg_constraint;
+pub(crate) mod pg_constraint;
 mod pg_database;
 mod pg_db_role_setting;
 mod pg_depend;

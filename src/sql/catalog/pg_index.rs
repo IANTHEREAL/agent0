@@ -151,7 +151,10 @@ impl VirtualTable for PgIndex {
                         Value::Boolean(idx.unique),
                         Value::Boolean(false),
                         Value::Boolean(false),
-                        Value::Boolean(true),
+                        // indimmediate: false for any DEFERRABLE constraint index
+                        // (PG checks uniqueness at statement/commit time, not per-row),
+                        // regardless of INITIALLY IMMEDIATE/DEFERRED. (#2683)
+                        Value::Boolean(!idx.deferrable),
                         Value::Boolean(false),
                         Value::Boolean(true),
                         Value::Boolean(false),
@@ -197,7 +200,8 @@ impl VirtualTable for PgIndex {
                         Value::Boolean(true),
                         Value::Boolean(true),
                         Value::Boolean(false),
-                        Value::Boolean(true),
+                        // indimmediate: false for a DEFERRABLE primary key. (#2683)
+                        Value::Boolean(!schema.pk_deferrable),
                         Value::Boolean(false),
                         Value::Boolean(true),
                         Value::Boolean(false),

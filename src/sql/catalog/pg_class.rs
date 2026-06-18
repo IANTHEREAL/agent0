@@ -380,6 +380,8 @@ mod tests {
                 ref_columns: vec!["id".to_string()],
                 on_delete: ForeignKeyAction::NoAction,
                 on_update: ForeignKeyAction::NoAction,
+                deferrable: false,
+                initially_deferred: false,
             }];
             s
         });
@@ -393,6 +395,8 @@ mod tests {
                 ref_columns: vec!["id".to_string()],
                 on_delete: ForeignKeyAction::NoAction,
                 on_update: ForeignKeyAction::NoAction,
+                deferrable: false,
+                initially_deferred: false,
             }];
             s
         });

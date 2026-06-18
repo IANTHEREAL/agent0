@@ -96,6 +96,7 @@ tests/222_correlated_subquery_bare_column.sql
 tests/228_outer_join_async_on_subquery.sql
 # FK / constraints
 tests/100_fk_null_and_unique_ref.sql
+tests/2683_deferrable_fk.sql
 tests/107_pkless_index.sql
 tests/118_partial_index_predicate_implies_issue42.sql
 tests/145_alter_primary_key.sql

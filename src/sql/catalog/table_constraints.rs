@@ -4,6 +4,16 @@ use crate::model::{Row, TableSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 
+/// Render a deferrability flag as the SQL standard `'YES'` / `'NO'` literal
+/// used by `information_schema.table_constraints`.
+fn yes_no(flag: bool) -> &'static str {
+    if flag {
+        "YES"
+    } else {
+        "NO"
+    }
+}
+
 pub struct TableConstraints;
 
 #[async_trait]
@@ -61,18 +71,14 @@ impl VirtualTable for TableConstraints {
                         text_val(&table_schema),
                         text_val(&table_name),
                         text_val("PRIMARY KEY"),
-                        text_val("NO"),
-                        text_val("NO"),
+                        text_val(yes_no(table_def.pk_deferrable)),
+                        text_val(yes_no(table_def.pk_initially_deferred)),
                         text_val("YES"),
                     ]));
                 }
 
-                let mut seen_unique_constraints: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-
                 for idx in &table_def.indexes {
                     if is_unique_constraint_index(idx) {
-                        seen_unique_constraints.insert(idx.name.clone());
                         rows.push(Row::new(vec![
                             text_val(ctx.database_name),
                             text_val(&table_schema),
@@ -81,8 +87,8 @@ impl VirtualTable for TableConstraints {
                             text_val(&table_schema),
                             text_val(&table_name),
                             text_val("UNIQUE"),
-                            text_val("NO"),
-                            text_val("NO"),
+                            text_val(yes_no(idx.deferrable)),
+                            text_val(yes_no(idx.initially_deferred)),
                             text_val("YES"),
                         ]));
                     }
@@ -90,10 +96,20 @@ impl VirtualTable for TableConstraints {
 
                 for col in &table_def.columns {
                     if col.unique && !col.primary_key {
-                        let constraint_name = format!("{}_{}_key", table_name, col.name);
-                        if seen_unique_constraints.contains(&constraint_name) {
+                        // A column-level UNIQUE backed by an explicit (possibly
+                        // named) unique-constraint index is already emitted by the
+                        // loop above. Synthesizing a default `{table}_{col}_key`
+                        // row here would duplicate it under the wrong name — PG
+                        // surfaces only the real constraint. (#2683)
+                        let backed_by_index = table_def.indexes.iter().any(|idx| {
+                            is_unique_constraint_index(idx)
+                                && idx.columns.len() == 1
+                                && idx.columns[0] == col.name
+                        });
+                        if backed_by_index {
                             continue;
                         }
+                        let constraint_name = format!("{}_{}_key", table_name, col.name);
                         rows.push(Row::new(vec![
                             text_val(ctx.database_name),
                             text_val(&table_schema),
@@ -118,8 +134,8 @@ impl VirtualTable for TableConstraints {
                         text_val(&table_schema),
                         text_val(&table_name),
                         text_val("FOREIGN KEY"),
-                        text_val("NO"),
-                        text_val("NO"),
+                        text_val(yes_no(fk.deferrable)),
+                        text_val(yes_no(fk.initially_deferred)),
                         text_val("YES"),
                     ]));
                 }

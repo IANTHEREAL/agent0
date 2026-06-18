@@ -1056,6 +1056,45 @@ pub(super) fn parse_referential_action(
     }
 }
 
+// ── Parse constraint characteristics (shared by create_table and alter_table) ─
+
+/// Lower the parsed `[ NOT ] DEFERRABLE [ INITIALLY { DEFERRED | IMMEDIATE } ]`
+/// clause into the two boolean flags persisted on a constraint
+/// (`condeferrable` / `condeferred`).
+///
+/// A constraint is only `deferred` when it is both `DEFERRABLE` and declared
+/// `INITIALLY DEFERRED`. A bare `INITIALLY DEFERRED` (no `DEFERRABLE` / `NOT
+/// DEFERRABLE` keyword) implies deferrability, matching PostgreSQL. However an
+/// explicit `NOT DEFERRABLE INITIALLY DEFERRED` is contradictory and PostgreSQL
+/// rejects it with `constraint declared INITIALLY DEFERRED must be DEFERRABLE`
+/// — db9 mirrors that error rather than silently coercing to `DEFERRABLE`.
+///
+/// Applies uniformly to every constraint class (FOREIGN KEY / UNIQUE / PRIMARY
+/// KEY).
+///
+/// # PG-DIVERGENCE
+/// These flags are recorded for catalog fidelity only — FK checks still run
+/// immediately, not at COMMIT (issue #2683).
+pub(super) fn parse_constraint_characteristics(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+) -> Result<(bool, bool)> {
+    let Some(c) = characteristics else {
+        return Ok((false, false));
+    };
+    let initially_deferred = matches!(
+        c.initially,
+        Some(sqlparser::ast::DeferrableInitial::Deferred)
+    );
+    if c.deferrable == Some(false) && initially_deferred {
+        return Err(SqlError::SqlStructure(
+            "constraint declared INITIALLY DEFERRED must be DEFERRABLE".to_string(),
+        )
+        .into());
+    }
+    let deferrable = c.deferrable == Some(true) || initially_deferred;
+    Ok((deferrable, deferrable && initially_deferred))
+}
+
 // ── CASCADE helpers (shared by view/drop) ───────────────────────────────────
 
 /// Check whether `name` (possibly unqualified) resolves to any entry in

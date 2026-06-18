@@ -826,6 +826,8 @@ pub async fn execute_create_index(
             IndexState::Ready
         },
         cached_predicate_conjuncts: None,
+        deferrable: false,
+        initially_deferred: false,
         hnsw_m,
         hnsw_ef_construction,
         hnsw_distance_metric,
@@ -1706,6 +1708,8 @@ mod tests {
             expressions: expressions.into_iter().map(ToString::to_string).collect(),
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
             hnsw_m: None,
             hnsw_ef_construction: None,
             hnsw_distance_metric: None,

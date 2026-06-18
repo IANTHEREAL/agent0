@@ -27,9 +27,9 @@ use crate::worker::types::IndexState;
 
 use super::{
     advance_implicit_sequences_for_seeded_rows, assign_generated_check_constraint_names,
-    create_implicit_sequences_for_schema, parse_referential_action, resolve_column_data_type,
-    validate_column_default_expr, validate_generated_column_expr,
-    warn_legacy_relname_conflict_scan_once,
+    create_implicit_sequences_for_schema, parse_constraint_characteristics,
+    parse_referential_action, resolve_column_data_type, validate_column_default_expr,
+    validate_generated_column_expr, warn_legacy_relname_conflict_scan_once,
 };
 
 /// The kind of relation object being created/reserved. Controls `IF NOT EXISTS`
@@ -108,6 +108,13 @@ pub async fn execute_create_table(
     let mut col_defs = Vec::new();
     let mut unique_constraint_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // Per-column UNIQUE constraint deferrability (keyed by column name), and the
+    // PRIMARY KEY's deferrability — threaded into IndexDef / TableSchema so
+    // pg_constraint reflects condeferrable/condeferred (issue #2683).
+    let mut unique_constraint_chars: std::collections::HashMap<String, (bool, bool)> =
+        std::collections::HashMap::new();
+    let mut pk_deferrable = false;
+    let mut pk_initially_deferred = false;
     for col in columns {
         let col_name = normalize_ident(&col.name);
         let (data_type, mut is_serial) =
@@ -125,17 +132,26 @@ pub async fn execute_create_table(
 
         for opt in &col.options {
             match &opt.option {
-                ColumnOption::Unique { is_primary, .. } => {
+                ColumnOption::Unique {
+                    is_primary,
+                    characteristics,
+                } => {
+                    let (deferrable, initially_deferred) =
+                        parse_constraint_characteristics(characteristics)?;
                     if *is_primary {
                         is_pk = true;
                         if pk_constraint_name.is_none() {
                             pk_constraint_name = opt.name.as_ref().map(normalize_ident);
                         }
+                        pk_deferrable = deferrable;
+                        pk_initially_deferred = initially_deferred;
                     } else {
                         unique = true;
                         if unique_constraint_name.is_none() {
                             unique_constraint_name = opt.name.as_ref().map(normalize_ident);
                         }
+                        unique_constraint_chars
+                            .insert(col_name.clone(), (deferrable, initially_deferred));
                     }
                 }
                 ColumnOption::NotNull => nullable = false,
@@ -203,7 +219,7 @@ pub async fn execute_create_table(
                     referred_columns,
                     on_delete,
                     on_update,
-                    ..
+                    characteristics,
                 } => {
                     // Handle inline REFERENCES clause
                     let (ref_schema_opt, ref_table_name) = names::split_object_name(foreign_table)?;
@@ -258,6 +274,8 @@ pub async fn execute_create_table(
                         resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
                     }
 
+                    let (deferrable, initially_deferred) =
+                        parse_constraint_characteristics(characteristics)?;
                     foreign_keys.push(ForeignKeyConstraint {
                         name: fk_name,
                         columns: vec![col_name.clone()],
@@ -265,6 +283,8 @@ pub async fn execute_create_table(
                         ref_columns: ref_cols,
                         on_delete: parse_referential_action(on_delete),
                         on_update: parse_referential_action(on_update),
+                        deferrable,
+                        initially_deferred,
                     });
                     fk_name_is_user_specified.push(explicit_fk_name.is_some());
                 }
@@ -353,6 +373,10 @@ pub async fn execute_create_table(
                 .get(&col.name)
                 .cloned()
                 .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col.name));
+            let (deferrable, initially_deferred) = unique_constraint_chars
+                .get(&col.name)
+                .copied()
+                .unwrap_or((false, false));
             indexes.push(IndexDef {
                 name: idx_name,
                 id: next_index_id,
@@ -364,6 +388,8 @@ pub async fn execute_create_table(
                 expressions: Vec::new(),
                 state: IndexState::Ready,
                 cached_predicate_conjuncts: None,
+                deferrable,
+                initially_deferred,
                 hnsw_m: None,
                 hnsw_ef_construction: None,
                 hnsw_distance_metric: None,
@@ -379,8 +405,10 @@ pub async fn execute_create_table(
                 name,
                 columns,
                 is_primary,
-                ..
+                characteristics,
             } if !*is_primary => {
+                let (deferrable, initially_deferred) =
+                    parse_constraint_characteristics(characteristics)?;
                 let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
                 let idx_name = name.as_ref().map(|n| n.value.clone()).unwrap_or_else(|| {
                     format!("{}_{}_key", table_object_name, col_names.join("_"))
@@ -396,11 +424,23 @@ pub async fn execute_create_table(
                     expressions: Vec::new(),
                     state: IndexState::Ready,
                     cached_predicate_conjuncts: None,
+                    deferrable,
+                    initially_deferred,
                     hnsw_m: None,
                     hnsw_ef_construction: None,
                     hnsw_distance_metric: None,
                 });
                 next_index_id += 1;
+            }
+            TableConstraint::Unique {
+                characteristics, ..
+            } => {
+                // Table-level PRIMARY KEY: capture its deferrability for the
+                // schema-level PK flags (issue #2683).
+                let (deferrable, initially_deferred) =
+                    parse_constraint_characteristics(characteristics)?;
+                pk_deferrable = deferrable;
+                pk_initially_deferred = initially_deferred;
             }
             TableConstraint::ForeignKey {
                 name,
@@ -409,7 +449,7 @@ pub async fn execute_create_table(
                 referred_columns,
                 on_delete,
                 on_update,
-                ..
+                characteristics,
             } => {
                 let fk_cols: Vec<String> = columns.iter().map(normalize_ident).collect();
                 let (ref_schema_opt, ref_table_name) = names::split_object_name(foreign_table)?;
@@ -463,6 +503,8 @@ pub async fn execute_create_table(
                     resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
                 }
 
+                let (deferrable, initially_deferred) =
+                    parse_constraint_characteristics(characteristics)?;
                 foreign_keys.push(ForeignKeyConstraint {
                     name: fk_name,
                     columns: fk_cols,
@@ -470,6 +512,8 @@ pub async fn execute_create_table(
                     ref_columns: ref_cols,
                     on_delete: parse_referential_action(on_delete),
                     on_update: parse_referential_action(on_update),
+                    deferrable,
+                    initially_deferred,
                 });
                 fk_name_is_user_specified.push(explicit_fk_name.is_some());
             }
@@ -528,6 +572,8 @@ pub async fn execute_create_table(
 
     let mut schema = TableSchema::new(table_full_name.clone(), table_id, col_defs, pk_indices);
     schema.pk_constraint_name = pk_constraint_name;
+    schema.pk_deferrable = pk_deferrable;
+    schema.pk_initially_deferred = pk_initially_deferred;
     schema.indexes = indexes;
     schema.check_constraints = check_constraints;
     schema.foreign_keys = foreign_keys;
