@@ -22,6 +22,8 @@ Suites:
   psycopg          psycopg3's own test suite vs db9, SMOKE tier (auto_testing/corpora/drivers/psycopg); clones psycopg + venv on first run
   psycopg_full     psycopg full suite (all tests/test_*.py; on-demand)
   pgx              pgx (Go PG driver) own test suite vs db9 (auto_testing/corpora/drivers/pgx); clones pgx on first run
+  asyncpg          asyncpg's own test suite vs db9, SMOKE tier (auto_testing/corpora/drivers/asyncpg); clones asyncpg + builds C ext + venv on first run
+  asyncpg_full     asyncpg full suite (all tests/test_*.py; on-demand)
 
 Aliases:
   gorm             Alias for gorm_smoke
@@ -163,6 +165,23 @@ run_pgx() {
     bash "$ROOT_DIR/auto_testing/corpora/drivers/pgx/run.sh" "$@"
 }
 
+run_asyncpg() {
+  # asyncpg driver lane (lane A-DRIVERS). Runs asyncpg's OWN test suite against db9
+  # — connect-path surface from a third independent impl (Python async) after
+  # psycopg + pgx; binary-codec + type-introspection heavy. Heavier (clones asyncpg,
+  # builds its C extensions + a venv on first run); NOT part of `all`.
+  # NOTE: asyncpg's graceful close() hangs on db9 (#2721); run.sh installs a conftest
+  # that makes close() abrupt so the suite can complete.
+  local scope="${1:-smoke}"
+  local dsn="${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
+  local hp; hp="$(echo "$dsn" | sed -E 's#.*@([^/]+)/.*#\1#')"
+  local up; up="$(echo "$dsn" | sed -E 's#.*://([^@/]+)@.*#\1#')"
+  echo "=== e2e: asyncpg ($scope) ==="
+  DB9_HOST="${hp%:*}" DB9_PORT="${hp##*:}" \
+  DB9_USER="${up%%:*}" DB9_PASSWORD="${up#*:}" \
+    bash "$ROOT_DIR/auto_testing/corpora/drivers/asyncpg/run.sh" "$scope"
+}
+
 suite="${1:-all}"
 
 case "$suite" in
@@ -208,6 +227,12 @@ case "$suite" in
     ;;
   pgx)
     run_pgx
+    ;;
+  asyncpg)
+    run_asyncpg smoke
+    ;;
+  asyncpg_full)
+    run_asyncpg full
     ;;
   -h|--help|help)
     usage
