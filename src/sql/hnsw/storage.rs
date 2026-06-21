@@ -316,6 +316,47 @@ pub fn hnsw_delta_prefix(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_{table_id}_{index_id}_delta_").into_bytes()
 }
 
+/// Dirty marker for an HNSW index with pending delta work.
+///
+/// The marker lives in the same tenant keyspace as the deltas and is written in
+/// the same transaction as delta keys. Background workers scan this compact
+/// prefix instead of walking every table schema and probing every HNSW index.
+pub fn hnsw_dirty_key(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_dirty_{table_id}_{index_id}").into_bytes()
+}
+
+pub fn hnsw_dirty_prefix(db_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_dirty_").into_bytes()
+}
+
+pub fn hnsw_dirty_prefix_end(db_id: u64) -> Vec<u8> {
+    let mut end = hnsw_dirty_prefix(db_id);
+    end.push(0xFF);
+    end
+}
+
+pub fn parse_hnsw_dirty_key(db_id: u64, key: &[u8]) -> Option<(u64, u64)> {
+    let prefix = hnsw_dirty_prefix(db_id);
+    let rest = key.strip_prefix(prefix.as_slice())?;
+    let rest = std::str::from_utf8(rest).ok()?;
+    let (table_id, index_id) = rest.split_once('_')?;
+    Some((table_id.parse().ok()?, index_id.parse().ok()?))
+}
+
+/// Tenant-local cursor for the compatibility backfill that discovers pre-marker
+/// HNSW deltas after rolling out dirty-marker sweeps.
+///
+/// Keep this outside `hnsw_dirty_prefix(db_id)`: workers page that prefix as the
+/// authoritative set of merge candidates.
+pub fn hnsw_dirty_backfill_cursor_key(db_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_backfill_dirty_cursor").into_bytes()
+}
+
+/// Tenant-local cooldown marker for the dirty-marker compatibility backfill.
+pub fn hnsw_dirty_backfill_done_key(db_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_backfill_dirty_done").into_bytes()
+}
+
 /// Encode (table_id, index_id) into a single i64 for worker task dedup.
 /// table_id occupies upper 32 bits, index_id occupies lower 32 bits.
 ///
@@ -465,6 +506,7 @@ pub async fn write_hnsw_deltas(
     adds: &[(u64, Vec<f32>)], // (label, vector_f32)
 ) -> Result<u64, SqlError> {
     let mut total_bytes = 0u64;
+    let mut last_delta_key = None;
     for (label, vector) in adds {
         let seq = next_delta_seq();
         let key = hnsw_delta_key(db_id, table_id, index_id, seq);
@@ -476,6 +518,12 @@ pub async fn write_hnsw_deltas(
             bincode::serialize(&delta).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
         total_bytes += value.len() as u64;
         txn_put(txn, key, value)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        last_delta_key = Some(hnsw_delta_key(db_id, table_id, index_id, seq));
+    }
+    if let Some(marker_value) = last_delta_key {
+        txn_put(txn, hnsw_dirty_key(db_id, table_id, index_id), marker_value)
             .await
             .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
     }
@@ -534,6 +582,9 @@ pub async fn delete_all_deltas(
             None => break,
         }
     }
+    txn_delete(txn, hnsw_dirty_key(db_id, table_id, index_id))
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
     Ok(())
 }
 

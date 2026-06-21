@@ -567,6 +567,7 @@ impl Executor {
                     Ok(_) => {
                         self.flush_trigger_activations();
                         self.flush_pending_hnsw_merges();
+                        self.flush_pending_storage_dirty();
                         return Ok(candidates);
                     }
                     Err(err) => {
@@ -639,6 +640,7 @@ impl Executor {
                         Ok(_) => {
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
+                            self.flush_pending_storage_dirty();
                             self.stats_cache()
                                 .update_full_stats(db_id, table_id, Arc::new(stats));
                             self.stats_cache().reset_mod_count(db_id, table_id);
@@ -720,6 +722,7 @@ impl Executor {
                 session.commit().await?;
                 self.flush_trigger_activations();
                 self.flush_pending_hnsw_merges();
+                self.flush_pending_storage_dirty();
             } else {
                 session.rollback().await?;
                 self.clear_trigger_activations();

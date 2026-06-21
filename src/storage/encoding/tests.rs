@@ -393,6 +393,17 @@ fn test_encode_worker_registry_prefix() {
 }
 
 #[test]
+fn test_encode_worker_storage_scan_dirty_key() {
+    let key = encode_worker_storage_scan_dirty_key("myapp", 42);
+    let prefix = b"_worker_storage_dirty_";
+    assert!(key.starts_with(prefix));
+    let keyspace_len_bytes = &key[prefix.len()..prefix.len() + 2];
+    let keyspace_len = u16::from_be_bytes([keyspace_len_bytes[0], keyspace_len_bytes[1]]);
+    assert_eq!(keyspace_len, 5);
+    assert_ne!(key, encode_worker_registry_key("myapp", 42));
+}
+
+#[test]
 fn test_encode_worker_queue_key() {
     let key = encode_worker_queue_key(10, 1000, 1, "myapp", 42, 100).unwrap();
     assert!(key.starts_with(WORKER_QUEUE_PREFIX));

@@ -23,15 +23,11 @@ const MIN_REGISTRY_SWEEP_INTERVAL_SEC: u64 = 1;
 const DEFAULT_SWEEP_PAGE_INTERVAL_SEC: u64 = 30;
 const MIN_SWEEP_PAGE_INTERVAL_SEC: u64 = 1;
 // Storage-size accounting (StorageSizeScan) re-reads the FULL key+value of every
-// database's entire data range just to sum logical sizes — for ~all DBs every
-// interval. On a multi-tenant cell with TiKV leaders concentrated in one AZ, that
-// is a continuous multi-Gbit/s cross-AZ read (the dominant DataTransfer-Regional
-// cost; see db9-server#2731). The metric is a billing *foundation* (issue #1915),
-// not consumed for live billing, and is already point-in-time/approximate — so a
-// 30-min refresh was needlessly aggressive. Default to daily; operators who need
-// fresher stats can lower it via DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC, and
-// db9_refresh_storage_stats() forces an immediate on-demand refresh.
-const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 86_400;
+// database's entire data range just to sum logical sizes. Dirty markers enqueue
+// changed DBs quickly; this interval is now only the recovery fallback for missed
+// markers or disabled producer paths. Keep it much slower than the old 30-min
+// all-tenant scan while still self-healing within the same day.
+const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 21_600;
 const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
 const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
@@ -696,7 +692,7 @@ mod tests {
         assert_eq!(cfg.hnsw_sweep_interval_sec, 600);
         assert_eq!(cfg.registry_sweep_interval_sec, 60);
         assert_eq!(cfg.sweep_page_interval_sec, 30);
-        assert_eq!(cfg.storage_scan_interval_sec, 86_400);
+        assert_eq!(cfg.storage_scan_interval_sec, 21_600);
         assert_eq!(cfg.registry_reconcile_batch_size, 32);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
     }

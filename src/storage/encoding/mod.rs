@@ -70,6 +70,7 @@ pub use metadata_keys::{
     encode_worker_bg_result_key, encode_worker_bg_task_seq_key, encode_worker_claim_key,
     encode_worker_claim_prefix, encode_worker_dropped_db_tombstone_key, encode_worker_queue_prefix,
     encode_worker_queue_scan_end, encode_worker_registry_key, encode_worker_registry_prefix,
+    encode_worker_storage_scan_dirty_key,
 };
 pub(crate) use metadata_keys::{
     encode_comment_column_key_v2, encode_comment_extension_key_v2, encode_comment_function_key_v2,

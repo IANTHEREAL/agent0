@@ -1,12 +1,12 @@
-schedule
-1
+scheduled
+t
 (1 row)
-schedule
-2
+scheduled
+t
 (1 row)
-jobid|schedule|command|active|jobname
-1|* * * * *|SELECT 1|t|NULL
-2|*/5 * * * *|SELECT 1|t|test_job
+is_anon|schedule|command|active|jobname
+t|* * * * *|SELECT 1|t|NULL
+f|*/5 * * * *|SELECT 1|t|test_job
 (2 rows)
 alter_job
 NULL

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tikv_client::Transaction;
 
 use crate::model::{DataType, Row, TableSchema, Value};
@@ -676,9 +676,7 @@ pub async fn batch_maintain_hnsw_indexes(
         // Write delta entries (unique keys, ~100B each, zero shared-key contention).
         let delta_bytes = write_hnsw_deltas(txn, db_id, schema.table_id, index.id, &pending)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to write HNSW deltas for '{}': {}", index.name, e)
-            })?;
+            .with_context(|| format!("failed to write HNSW deltas for '{}'", index.name))?;
         stats.graph_bytes += delta_bytes;
         stats.delta_count += pending.len();
         stats.dirty_index_ids.push(index.id);
@@ -797,9 +795,7 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
         // Write delta entries.
         let delta_bytes = write_hnsw_deltas(txn, db_id, schema.table_id, index.id, &pending)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to write HNSW deltas for '{}': {}", index.name, e)
-            })?;
+            .with_context(|| format!("failed to write HNSW deltas for '{}'", index.name))?;
         stats.graph_bytes += delta_bytes;
         stats.delta_count += pending.len();
         stats.dirty_index_ids.push(index.id);
@@ -1147,9 +1143,7 @@ async fn maintain_hnsw_indexes_inner_for_index_ids(
         let adds = vec![(pk_label, vector_f32)];
         write_hnsw_deltas(txn, db_id, schema.table_id, index.id, &adds)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to write HNSW delta for '{}': {}", index.name, e)
-            })?;
+            .with_context(|| format!("failed to write HNSW delta for '{}'", index.name))?;
     }
 
     Ok(())

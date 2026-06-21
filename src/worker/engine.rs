@@ -10,7 +10,7 @@ use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
-use crate::storage::{CronClaimOutcome, TikvStore, WqIndexRow};
+use crate::storage::{CronClaimOutcome, StorageScanDirtyMarker, TikvStore, WqIndexRow};
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 
@@ -72,7 +72,7 @@ const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
 const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5;
 const DISABLED_CHECK_THRESHOLD: u32 = 5;
 const CIC_REPAIR_TABLE_PAGE_SIZE: usize = 256;
-const HNSW_DELTA_TABLE_PAGE_SIZE: usize = 256;
+const HNSW_DIRTY_MARKER_PAGE_SIZE: usize = 256;
 
 /// Pacing for the convergent legacy `_worker_queue_` drain (design §II.8 M5).
 /// Active while stragglers are still being seen; downshifts to a cheap periodic
@@ -115,7 +115,7 @@ struct RegistrySweepState {
     kind_backoff: HashMap<RegistrySweepKindKey, RegistrySweepBackoff>,
     missing_database_seen: HashSet<(String, u64)>,
     cic_table_cursors: HashMap<(String, u64), Vec<u8>>,
-    hnsw_delta_table_cursors: HashMap<(String, u64), Vec<u8>>,
+    hnsw_dirty_cursors: HashMap<(String, u64), Vec<u8>>,
     /// Convergent legacy `_worker_queue_` drain state (design §II.8 M5).
     /// `legacy_drain_last_at` paces the drain; `legacy_drain_empty_streak`
     /// counts consecutive empty probes for the grace-window downshift.
@@ -135,7 +135,7 @@ impl Default for RegistrySweepState {
             kind_backoff: HashMap::new(),
             missing_database_seen: HashSet::new(),
             cic_table_cursors: HashMap::new(),
-            hnsw_delta_table_cursors: HashMap::new(),
+            hnsw_dirty_cursors: HashMap::new(),
             legacy_drain_last_at: None,
             legacy_drain_empty_streak: 0,
         }
@@ -865,7 +865,7 @@ impl WorkerEngine {
         state.entry_backoff.remove(key);
         state.missing_database_seen.remove(key);
         state.cic_table_cursors.remove(key);
-        state.hnsw_delta_table_cursors.remove(key);
+        state.hnsw_dirty_cursors.remove(key);
         state.kind_backoff.retain(|kind_key, _| {
             kind_key.keyspace.as_str() != key.0.as_str() || kind_key.db_id != key.1
         });
@@ -894,15 +894,15 @@ impl WorkerEngine {
         }
     }
 
-    async fn hnsw_delta_table_cursor(&self, keyspace: &str, db_id: u64) -> Option<Vec<u8>> {
+    async fn hnsw_dirty_cursor(&self, keyspace: &str, db_id: u64) -> Option<Vec<u8>> {
         let state = self.registry_sweep_state.lock().await;
         state
-            .hnsw_delta_table_cursors
+            .hnsw_dirty_cursors
             .get(&(keyspace.to_string(), db_id))
             .cloned()
     }
 
-    async fn record_hnsw_delta_table_cursor(
+    async fn record_hnsw_dirty_cursor(
         &self,
         keyspace: &str,
         db_id: u64,
@@ -911,9 +911,9 @@ impl WorkerEngine {
         let mut state = self.registry_sweep_state.lock().await;
         let key = (keyspace.to_string(), db_id);
         if let Some(cursor) = next_cursor {
-            state.hnsw_delta_table_cursors.insert(key, cursor);
+            state.hnsw_dirty_cursors.insert(key, cursor);
         } else {
-            state.hnsw_delta_table_cursors.remove(&key);
+            state.hnsw_dirty_cursors.remove(&key);
         }
     }
 
@@ -1037,16 +1037,15 @@ impl WorkerEngine {
             .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
             .await
         {
-            let table_cursor = self
-                .hnsw_delta_table_cursor(&entry.keyspace, entry.db_id)
-                .await;
+            let dirty_cursor = self.hnsw_dirty_cursor(&entry.keyspace, entry.db_id).await;
             match enqueue_pending_hnsw_merges(
                 &self.system_store,
                 store,
                 &entry.keyspace,
                 entry.db_id,
-                table_cursor.as_deref(),
-                HNSW_DELTA_TABLE_PAGE_SIZE,
+                dirty_cursor.as_deref(),
+                HNSW_DIRTY_MARKER_PAGE_SIZE,
+                self.config.hnsw_sweep_interval_sec,
             )
             .await
             {
@@ -1054,10 +1053,10 @@ impl WorkerEngine {
                     outcome.hnsw_observed = hnsw.observed;
                     outcome.hnsw_enqueued = hnsw.enqueued;
                     outcome.hnsw_enqueue_errors = hnsw.enqueue_errors;
-                    self.record_hnsw_delta_table_cursor(
+                    self.record_hnsw_dirty_cursor(
                         &entry.keyspace,
                         entry.db_id,
-                        hnsw.next_table_cursor,
+                        hnsw.next_dirty_cursor,
                     )
                     .await;
                     self.registry_sweep_record_kind_success(&entry.keyspace, entry.db_id, kind)
@@ -1095,19 +1094,45 @@ impl WorkerEngine {
         }
 
         let kind = RegistrySweepKind::StorageScan;
-        if !self
-            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
-            .await
-        {
-            let result = async {
-                if self.storage_scan_due(store, entry.db_id).await? {
-                    enqueue_storage_scan(&self.system_store, &entry.keyspace, entry.db_id).await?;
-                }
-                Ok::<(), anyhow::Error>(())
-            }
+        let storage_dirty = self
+            .system_store
+            .get_storage_size_dirty_marker(&entry.keyspace, entry.db_id)
             .await;
-            self.record_registry_sweep_kind_result(entry, kind, result)
-                .await;
+        match storage_dirty {
+            Ok(Some(_)) => {
+                let result =
+                    enqueue_storage_scan(&self.system_store, &entry.keyspace, entry.db_id).await;
+                self.record_registry_sweep_kind_result(entry, kind, result)
+                    .await;
+            }
+            Ok(None) => {
+                if !self
+                    .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+                    .await
+                {
+                    let result = async {
+                        if self.storage_scan_due(store, entry.db_id).await? {
+                            enqueue_storage_scan(&self.system_store, &entry.keyspace, entry.db_id)
+                                .await?;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    self.record_registry_sweep_kind_result(entry, kind, result)
+                        .await;
+                }
+            }
+            Err(e) => {
+                self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
+                    .await;
+                warn!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    kind = kind.label(),
+                    "Worker registry sweep task failed: {}",
+                    e
+                );
+            }
         }
 
         Ok(outcome)
@@ -2771,7 +2796,19 @@ impl WorkerEngine {
         let lease_cancel = crate::worker::LeaseCancel::new(shutdown_signal.clone());
 
         if entry.task_type == TaskType::StorageSizeScan {
-            execute_storage_size_scan(&store, entry.db_id, &lease_cancel).await?;
+            let system_store = crate::worker::system_store()?.clone();
+            let dirty_marker = system_store
+                .get_storage_size_dirty_marker(&entry.keyspace, entry.db_id)
+                .await?;
+            execute_storage_size_scan(
+                &system_store,
+                &store,
+                &entry.keyspace,
+                entry.db_id,
+                dirty_marker,
+                &lease_cancel,
+            )
+            .await?;
             return Ok(1);
         }
 
@@ -3073,8 +3110,8 @@ pub(crate) struct HnswSweepResult {
     pub enqueued: u32,
     /// Number of enqueue attempts that failed (system store errors).
     pub enqueue_errors: u32,
-    /// Raw schema key cursor for the next bounded table page.
-    pub next_table_cursor: Option<Vec<u8>>,
+    /// Raw dirty-marker key cursor for the next bounded page.
+    pub next_dirty_cursor: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -3084,22 +3121,131 @@ struct RegistrySweepEntryOutcome {
     hnsw_enqueue_errors: u32,
 }
 
-/// Scan all tables in (keyspace, db_id) for HNSW indexes with pending deltas.
-/// For each found, enqueue a merge task (idempotent via deterministic queue key).
+fn encode_hnsw_dirty_backfill_due_ms(next_due_ms: i64) -> Vec<u8> {
+    next_due_ms.to_be_bytes().to_vec()
+}
+
+fn decode_hnsw_dirty_backfill_due_ms(value: &[u8]) -> Option<i64> {
+    let bytes: [u8; 8] = value.try_into().ok()?;
+    Some(i64::from_be_bytes(bytes))
+}
+
+fn hnsw_dirty_backfill_due(done_value: Option<&[u8]>, now_ms: i64) -> bool {
+    match done_value.and_then(decode_hnsw_dirty_backfill_due_ms) {
+        Some(next_due_ms) => next_due_ms <= now_ms,
+        // Missing or legacy/invalid completion values are treated as due so an
+        // earlier PR build that wrote `b"1"` cannot permanently suppress repair.
+        None => true,
+    }
+}
+
+fn next_hnsw_dirty_backfill_due_ms(fallback_interval_sec: u64) -> i64 {
+    let interval_sec = fallback_interval_sec.max(1).min((i64::MAX / 1000) as u64);
+    now_epoch_ms().saturating_add((interval_sec as i64).saturating_mul(1000))
+}
+
+/// One bounded page of deploy-time compatibility backfill for HNSW dirty
+/// markers.
 ///
-/// This function does NOT filter by any registry bit — it directly inspects
-/// table schemas and probes for delta keys in the tenant store.
+/// Dirty-marker sweeps are authoritative for new writes, but old binaries wrote
+/// delta keys before dirty markers existed. This tenant-local cursor lets any
+/// stateless replica converge those pre-marker deltas without returning the hot
+/// merge sweep to a permanent full-schema walk. Completion is a low-frequency
+/// cooldown, not a permanent latch, so markerless deltas written by old binaries
+/// during a rolling deploy are still discovered by a later fallback pass.
+async fn backfill_hnsw_dirty_markers_page(
+    store: &Arc<TikvStore>,
+    txn: &mut tikv_client::Transaction,
+    db_id: u64,
+    table_page_size: usize,
+    fallback_interval_sec: u64,
+) -> Result<bool> {
+    use crate::sql::hnsw::storage::{
+        hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_dirty_backfill_cursor_key,
+        hnsw_dirty_backfill_done_key, hnsw_dirty_key,
+    };
+    use crate::txn::{txn_delete, txn_put};
+    use tikv_client::BoundRange;
+
+    let done_key = hnsw_dirty_backfill_done_key(db_id);
+    let cursor_key = hnsw_dirty_backfill_cursor_key(db_id);
+    let cursor = txn.get_for_update(cursor_key.clone()).await?;
+    let done_value = txn.get(done_key.clone()).await?;
+    let now_ms = now_epoch_ms();
+    // Re-check after locking the shared cursor so concurrent stateless workers
+    // do not re-scan from the beginning after another worker commits a fresh
+    // cooldown marker. A cursor means a compatibility pass is already in
+    // progress and must continue even while the last completion marker exists.
+    if cursor.is_none() && !hnsw_dirty_backfill_due(done_value.as_deref(), now_ms) {
+        return Ok(false);
+    }
+    let (table_names, next_cursor) = store
+        .scan_tables_page(txn, db_id, cursor.as_deref(), table_page_size.max(1))
+        .await?;
+
+    for table_name in table_names {
+        let Some(schema) = store.get_schema(txn, db_id, &table_name).await? else {
+            continue;
+        };
+        for index in &schema.indexes {
+            if !index.is_hnsw() {
+                continue;
+            }
+
+            let prefix = hnsw_delta_prefix(db_id, schema.table_id, index.id);
+            let end = hnsw_delta_prefix_end(db_id, schema.table_id, index.id);
+            let range: BoundRange = (prefix.clone()..end).into();
+            let pairs: Vec<_> = txn.scan(range, 1).await?.collect();
+            let Some(delta_key) = pairs.iter().find_map(|pair| {
+                let key: &[u8] = pair.key().as_ref().into();
+                key.starts_with(&prefix).then(|| key.to_vec())
+            }) else {
+                continue;
+            };
+
+            let dirty_key = hnsw_dirty_key(db_id, schema.table_id, index.id);
+            if txn.get_for_update(dirty_key.clone()).await?.is_none() {
+                txn_put(txn, dirty_key, delta_key).await?;
+            }
+        }
+    }
+
+    if let Some(cursor) = next_cursor {
+        txn_put(txn, cursor_key, cursor).await?;
+        if done_value.is_some() {
+            txn_delete(txn, done_key).await?;
+        }
+    } else {
+        let next_due_ms = next_hnsw_dirty_backfill_due_ms(fallback_interval_sec);
+        txn_put(
+            txn,
+            done_key,
+            encode_hnsw_dirty_backfill_due_ms(next_due_ms),
+        )
+        .await?;
+        txn_delete(txn, cursor_key).await?;
+    }
+
+    Ok(true)
+}
+
+/// Scan dirty HNSW indexes in (keyspace, db_id), then enqueue merge tasks for
+/// markers that still have pending deltas. This function does NOT filter by any
+/// registry bit; callers decide whether the database has HNSW work registered.
 pub(crate) async fn enqueue_pending_hnsw_merges(
     system_store: &TikvStore,
     store: &Arc<TikvStore>,
     keyspace: &str,
     db_id: u64,
-    table_start_after: Option<&[u8]>,
-    table_page_size: usize,
+    dirty_start_after: Option<&[u8]>,
+    dirty_page_size: usize,
+    compatibility_backfill_interval_sec: u64,
 ) -> Result<HnswSweepResult> {
     use crate::sql::hnsw::storage::{
-        hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_merge_task_id, hnsw_meta_key, HnswMeta,
+        hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_dirty_prefix, hnsw_dirty_prefix_end,
+        hnsw_merge_task_id, hnsw_meta_key, parse_hnsw_dirty_key, HnswMeta,
     };
+    use crate::txn::txn_delete;
     use rand::Rng;
     use tikv_client::BoundRange;
 
@@ -3110,9 +3256,9 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
     for attempt in 0..=REGION_ERROR_MAX_RETRIES {
         let result: Result<HnswSweepResult> = async {
             let mut txn = store.begin().await?;
-            // This read-only snapshot scans all tables, schemas, and per-index delta
-            // prefixes — proportional to tenant size.  Register with the GC safepoint
-            // so GC does not advance past this snapshot while the sweep runs.
+            // This snapshot scans the compact dirty-marker set for one database.
+            // Register it with the GC safepoint so GC does not advance past the
+            // snapshot while the sweep runs.
             let mut txn_guard = crate::worker::active_txn_registry::global_registry()
                 .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
@@ -3134,100 +3280,170 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
                     observed: 0,
                     enqueued: 0,
                     enqueue_errors: 0,
-                    next_table_cursor: None,
+                    next_dirty_cursor: None,
                 });
             }
 
-            let (table_names, next_table_cursor) = store
-                .scan_tables_page(&mut txn, db_id, table_start_after, table_page_size)
-                .await?;
+            let dirty_prefix = hnsw_dirty_prefix(db_id);
+            let dirty_end = hnsw_dirty_prefix_end(db_id);
+            let dirty_start = match dirty_start_after {
+                Some(last_key) => {
+                    let mut next = last_key.to_vec();
+                    next.push(0);
+                    next
+                }
+                None => dirty_prefix.clone(),
+            };
+            let dirty_page_limit = dirty_page_size.max(1).min(u32::MAX as usize) as u32;
+            let dirty_range: BoundRange = (dirty_start..dirty_end).into();
+            let dirty_pairs: Vec<_> = txn.scan(dirty_range, dirty_page_limit).await?.collect();
+            let dirty_page_len = dirty_pairs.len();
+            let mut last_dirty_key = None;
+            let mut mutated = false;
             let mut observed = 0u32;
             let mut enqueued = 0u32;
             let mut enqueue_errors = 0u32;
 
-            for table_name in table_names {
-                let Some(schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
+            for pair in dirty_pairs {
+                let key: &[u8] = pair.key().as_ref().into();
+                let dirty_key = key.to_vec();
+                last_dirty_key = Some(dirty_key.clone());
+                if !dirty_key.starts_with(&dirty_prefix) {
+                    continue;
+                }
+                let dirty_marker_value = pair.value().to_vec();
+                let Some((table_id, index_id)) = parse_hnsw_dirty_key(db_id, &dirty_key) else {
                     continue;
                 };
-                for index in &schema.indexes {
-                    if !index.is_hnsw() {
-                        continue;
-                    }
 
-                    // Check if index is frozen — skip enqueue entirely.
-                    let mk = hnsw_meta_key(db_id, schema.table_id, index.id);
-                    if let Some(meta_bytes) = txn.get(mk).await? {
-                        if let Ok(meta) = serde_json::from_slice::<HnswMeta>(&meta_bytes) {
+                let mut delete_stale_dirty_marker = false;
+                let mk = hnsw_meta_key(db_id, table_id, index_id);
+                match txn.get(mk).await? {
+                    Some(meta_bytes) => match serde_json::from_slice::<HnswMeta>(&meta_bytes) {
+                        Ok(meta) => {
                             if should_skip_frozen_merge(&meta) {
                                 continue;
                             }
+                            if meta.dropped_at.is_some() {
+                                delete_stale_dirty_marker = true;
+                            }
                         }
-                    }
-
-                    // Probe for pending deltas (limit=1, just checking existence)
-                    let prefix = hnsw_delta_prefix(db_id, schema.table_id, index.id);
-                    let end = hnsw_delta_prefix_end(db_id, schema.table_id, index.id);
-                    let range: BoundRange = (prefix..end).into();
-                    let pairs: Vec<_> = txn.scan(range, 1).await?.collect();
-                    if pairs.is_empty() {
-                        continue;
-                    }
-
-                    observed += 1;
-
-                    // Deltas found → enqueue merge task
-                    let task_id = match hnsw_merge_task_id(schema.table_id, index.id) {
-                        Ok(id) => id,
                         Err(e) => {
                             warn!(
-                                "HNSW sweep: task_id overflow for table_id={} index_id={}: {}",
-                                schema.table_id, index.id, e
+                                table_id,
+                                index_id,
+                                "HNSW sweep: skipping dirty marker with undecodable meta: {}",
+                                e
                             );
-                            enqueue_errors += 1;
                             continue;
                         }
-                    };
-                    let mut entry = TaskQueueEntry::new(
-                        keyspace.to_string(),
-                        db_id,
-                        task_id,
-                        TaskType::HnswMerge,
-                        format!("__hnsw_merge {} {}", schema.table_id, index.id),
-                        "system".to_string(),
-                        192,
-                    );
-                    entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
-
-                    let enqueue_result: Result<bool> = async {
-                        let mut sys_txn = system_store.begin().await?;
-                        let enqueued = system_store
-                            .put_singleton_task_v2(&mut sys_txn, &entry, 0)
-                            .await?;
-                        sys_txn.commit().await?;
-                        Ok(enqueued)
+                    },
+                    None => {
+                        delete_stale_dirty_marker = true;
                     }
-                    .await;
+                }
 
-                    match enqueue_result {
-                        Ok(true) => enqueued += 1,
-                        Ok(false) => {
-                            debug!(
-                                "HNSW sweep: merge already pending for table_id={} index_id={}",
-                                schema.table_id, index.id
-                            );
-                        }
-                        Err(e) => {
-                            enqueue_errors += 1;
-                            warn!(
-                                "HNSW sweep: failed to enqueue merge for table_id={} index_id={}: {}",
-                                schema.table_id, index.id, e
-                            );
-                        }
+                if !delete_stale_dirty_marker {
+                    let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+                    let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+                    let range: BoundRange = (prefix.clone()..end).into();
+                    let pairs: Vec<_> = txn.scan(range, 1).await?.collect();
+                    let has_delta = pairs.iter().any(|pair| {
+                        let key: &[u8] = pair.key().as_ref().into();
+                        key.starts_with(&prefix)
+                    });
+                    if !has_delta {
+                        delete_stale_dirty_marker = true;
+                    }
+                }
+
+                if delete_stale_dirty_marker {
+                    if txn.get_for_update(dirty_key.clone()).await? == Some(dirty_marker_value) {
+                        txn_delete(&mut txn, dirty_key).await?;
+                        mutated = true;
+                    }
+                    continue;
+                }
+
+                observed += 1;
+
+                // Deltas found -> enqueue merge task.
+                let task_id = match hnsw_merge_task_id(table_id, index_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(
+                            "HNSW sweep: task_id overflow for table_id={} index_id={}: {}",
+                            table_id, index_id, e
+                        );
+                        enqueue_errors += 1;
+                        continue;
+                    }
+                };
+                let mut entry = TaskQueueEntry::new(
+                    keyspace.to_string(),
+                    db_id,
+                    task_id,
+                    TaskType::HnswMerge,
+                    format!("__hnsw_merge {} {}", table_id, index_id),
+                    "system".to_string(),
+                    192,
+                );
+                entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
+
+                let enqueue_result: Result<bool> = async {
+                    let mut sys_txn = system_store.begin().await?;
+                    let enqueued = system_store
+                        .enqueue_singleton_task_v2_unless_db_dropped(&mut sys_txn, &entry, 0)
+                        .await?;
+                    sys_txn.commit().await?;
+                    Ok(enqueued)
+                }
+                .await;
+
+                match enqueue_result {
+                    Ok(true) => enqueued += 1,
+                    Ok(false) => {
+                        debug!(
+                            "HNSW sweep: merge already pending or database dropped for table_id={} index_id={}",
+                            table_id, index_id
+                        );
+                    }
+                    Err(e) => {
+                        enqueue_errors += 1;
+                        warn!(
+                            "HNSW sweep: failed to enqueue merge for table_id={} index_id={}: {}",
+                            table_id, index_id, e
+                        );
                     }
                 }
             }
 
-            if txn.rollback().await.is_err() {
+            mutated |= backfill_hnsw_dirty_markers_page(
+                store,
+                &mut txn,
+                db_id,
+                dirty_page_size,
+                compatibility_backfill_interval_sec,
+            )
+            .await?;
+
+            let next_dirty_cursor =
+                if dirty_page_len < dirty_page_limit as usize || last_dirty_key.is_none() {
+                    None
+                } else {
+                    last_dirty_key
+                };
+
+            if mutated {
+                if txn.commit().await.is_err() {
+                    if let Some(g) = txn_guard.as_mut() {
+                        g.quarantine();
+                    }
+                    return Err(anyhow!(
+                        "HNSW sweep: failed to commit stale dirty marker cleanup"
+                    ));
+                }
+            } else if txn.rollback().await.is_err() {
                 if let Some(g) = txn_guard.as_mut() {
                     g.quarantine();
                 }
@@ -3236,7 +3452,7 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
                 observed,
                 enqueued,
                 enqueue_errors,
-                next_table_cursor,
+                next_dirty_cursor,
             })
         }
         .await;
@@ -3318,8 +3534,11 @@ const STORAGE_SCAN_RATE_LIMIT_MS: u64 = 5;
 /// classifies each key by prefix, and accumulates logical sizes (key.len + value.len).
 /// Results are persisted to TiKV and cached in memory.
 async fn execute_storage_size_scan(
+    system_store: &Arc<TikvStore>,
     store: &Arc<TikvStore>,
+    keyspace: &str,
     db_id: u64,
+    dirty_marker: Option<StorageScanDirtyMarker>,
     lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
     use crate::storage::encode_database_data_range;
@@ -3490,7 +3709,39 @@ async fn execute_storage_size_scan(
         .await?;
     persist_txn.commit().await?;
 
-    let keyspace = store.keyspace().unwrap_or("default");
+    if let Some(marker) = dirty_marker {
+        match system_store
+            .clear_storage_size_dirty_if_version(keyspace, db_id, marker.version)
+            .await
+        {
+            Ok(true) => {
+                debug!(
+                    keyspace,
+                    db_id,
+                    dirty_version = marker.version,
+                    "Storage size dirty marker cleared after scan"
+                );
+            }
+            Ok(false) => {
+                debug!(
+                    keyspace,
+                    db_id,
+                    dirty_version = marker.version,
+                    "Storage size dirty marker changed during scan; leaving it for a follow-up scan"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    keyspace,
+                    db_id,
+                    dirty_version = marker.version,
+                    "Storage size scan persisted stats but failed to clear dirty marker: {}",
+                    e
+                );
+            }
+        }
+    }
+
     global_storage_stats_cache().put(keyspace, db_id, stats);
 
     info!(
@@ -3524,13 +3775,13 @@ pub(crate) async fn enqueue_storage_scan(
     let fire_time = 0;
     let mut txn = system_store.begin().await?;
     if !system_store
-        .put_singleton_task_v2(&mut txn, &entry, fire_time)
+        .enqueue_singleton_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)
         .await?
     {
         txn.rollback().await.ok();
         debug!(
             keyspace,
-            db_id, "Storage size scan already pending; skipping duplicate enqueue"
+            db_id, "Storage size scan already pending or database dropped; skipping enqueue"
         );
         return Ok(());
     }

@@ -438,7 +438,11 @@ fn specialized_task_paths_thread_lease_cancel() {
     );
     // Each of the three specialized dispatch calls must forward it.
     assert!(
-        dispatch.contains("execute_storage_size_scan(&store, entry.db_id, &lease_cancel)"),
+        dispatch.contains("execute_storage_size_scan(")
+            && dispatch.contains("&system_store")
+            && dispatch.contains("&store")
+            && dispatch.contains("dirty_marker")
+            && dispatch.contains("&lease_cancel"),
         "StorageSizeScan path must thread lease_cancel"
     );
     assert!(
@@ -640,6 +644,65 @@ fn storage_size_scan_tracks_its_long_lived_read_transaction() {
     assert!(
         scan_source.contains("track_worker_txn(txn.start_timestamp().version())"),
         "storage size scan must publish its long-lived scan transaction in the active txn registry"
+    );
+}
+
+#[test]
+fn storage_scan_sweep_uses_dirty_marker_before_interval_fallback() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let entry_fn = prod_source
+        .split("async fn process_registry_sweep_entry(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn record_registry_sweep_kind_result")
+                .next()
+        })
+        .expect("process_registry_sweep_entry must exist before result recorder");
+
+    let marker_pos = entry_fn
+        .find("get_storage_size_dirty_marker")
+        .expect("storage sweep must read the dirty marker");
+    let due_pos = entry_fn
+        .find("storage_scan_due")
+        .expect("storage sweep must keep interval fallback");
+    assert!(
+        marker_pos < due_pos,
+        "dirty marker must be checked before the interval fallback"
+    );
+    assert!(
+        entry_fn.contains("Ok(Some(_))") && entry_fn.contains("enqueue_storage_scan"),
+        "dirty marker presence must enqueue a StorageSizeScan task"
+    );
+}
+
+#[test]
+fn storage_size_scan_clears_only_the_observed_dirty_version() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let scan_start = prod_source
+        .find("async fn execute_storage_size_scan(")
+        .expect("execute_storage_size_scan must exist");
+    let scan_end = prod_source[scan_start..]
+        .find("/// Enqueue a storage size scan task")
+        .map(|offset| scan_start + offset)
+        .expect("execute_storage_size_scan must appear before enqueue helper");
+    let scan_source = &prod_source[scan_start..scan_end];
+
+    assert!(
+        scan_source.contains("dirty_marker: Option<StorageScanDirtyMarker>"),
+        "storage scan must carry the dirty marker version it observed before scanning"
+    );
+    assert!(
+        scan_source.contains("clear_storage_size_dirty_if_version")
+            && scan_source.contains("marker.version"),
+        "storage scan must clear dirty state only if no newer dirty version appeared"
     );
 }
 
@@ -913,8 +976,8 @@ fn storage_scan_enqueue_uses_kernel_singleton_helper() {
         "StorageSizeScan uses a deterministic key and must assign a fresh non-zero nonce"
     );
     assert!(
-        enqueue_fn.contains(".put_singleton_task_v2("),
-        "StorageSizeScan is a singleton maintenance task; enqueue must use the kernel helper instead of overwriting its nonce"
+        enqueue_fn.contains(".enqueue_singleton_task_v2_unless_db_dropped("),
+        "StorageSizeScan is a singleton maintenance task and must fence on dropped-DB tombstones before enqueue"
     );
 }
 
@@ -1017,18 +1080,382 @@ fn hnsw_delta_probe_tracks_its_read_transaction() {
     let fn_source = &prod_source[fn_start..fn_end];
 
     assert!(
-            fn_source.contains("track_worker_txn(txn.start_timestamp().version())"),
-            "HNSW delta probe must publish its tenant snapshot in the active txn registry \
-             — the scan is proportional to tenant size and can outlive gc_life_time on large tenants"
+        fn_source.contains("track_worker_txn(txn.start_timestamp().version())"),
+        "HNSW delta probe must publish its tenant snapshot in the active txn registry"
+    );
+    assert!(
+        fn_source.contains("hnsw_dirty_prefix(db_id)")
+            && fn_source.contains("hnsw_dirty_prefix_end(db_id)")
+            && !fn_source.contains(".scan_tables_page(")
+            && !fn_source.contains(".list_tables("),
+        "HNSW delta probe must use bounded dirty-marker pages, not a table/schema scan"
+    );
+    assert!(
+        fn_source.contains(".enqueue_singleton_task_v2_unless_db_dropped("),
+        "HNSW delta probe must enqueue merge work through the dropped-DB fenced singleton helper"
+    );
+}
+
+#[test]
+fn hnsw_dirty_backfill_completion_marker_is_not_permanent() {
+    let now = 10_000;
+    let future = encode_hnsw_dirty_backfill_due_ms(now + 1);
+    let due = encode_hnsw_dirty_backfill_due_ms(now);
+    let past = encode_hnsw_dirty_backfill_due_ms(now - 1);
+
+    assert!(
+        !hnsw_dirty_backfill_due(Some(&future), now),
+        "future completion marker should throttle the compatibility fallback"
+    );
+    assert!(
+        hnsw_dirty_backfill_due(Some(&due), now),
+        "completion marker becomes due at its timestamp"
+    );
+    assert!(
+        hnsw_dirty_backfill_due(Some(&past), now),
+        "past completion marker must allow another compatibility pass"
+    );
+    assert!(
+        hnsw_dirty_backfill_due(Some(b"1"), now),
+        "legacy permanent done values must be treated as due, not permanent"
+    );
+    assert!(
+        hnsw_dirty_backfill_due(None, now),
+        "missing completion marker should allow the initial compatibility pass"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn hnsw_sweep_backfills_pre_marker_deltas_before_enqueueing() {
+    use crate::model::{ColumnDef, DataType, IndexDef, TableSchema};
+    use crate::sql::hnsw::storage::{
+        create_empty_hnsw_index, hnsw_delta_key, hnsw_dirty_backfill_cursor_key,
+        hnsw_dirty_backfill_done_key, hnsw_dirty_key, hnsw_merge_task_id, hnsw_meta_key, HnswDelta,
+    };
+    use crate::txn::txn_put;
+
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let unique = format!(
+        "{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let system_keyspace = format!("_sys_hnswdirty_{unique}");
+    let cfg = crate::worker::config::WorkerConfig {
+        enabled: true,
+        system_keyspace: system_keyspace.clone(),
+        ..Default::default()
+    };
+    let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
+        .await
+        .expect("init system store");
+
+    let keyspace = format!("test_hnswdirty_{unique}");
+    ensure_tenant_keyspace_for_test(&pd_endpoints, &keyspace).await;
+    let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints));
+    let handle = pool
+        .acquire(Some(keyspace.clone()))
+        .await
+        .expect("acquire tenant handle");
+    let tenant_store = handle.store().clone();
+
+    let table_id = 101_u64;
+    let index_id = 7_u64;
+    let post_done_index_id = 8_u64;
+    let db_id = {
+        let mut txn = tenant_store.begin().await.unwrap();
+        let db = tenant_store
+            .create_database(&mut txn, &format!("hnsw_dirty_db_{unique}"), "admin", false)
+            .await
+            .expect("create database")
+            .expect("database should be new");
+        let db_id = db.id;
+        let table_name = format!("public.hnsw_dirty_backfill_{unique}");
+        let mut schema = TableSchema::new(
+            table_name,
+            table_id,
+            vec![
+                ColumnDef::new("id", DataType::Int32, false).primary_key(),
+                ColumnDef::new("v", DataType::Vector(3), true),
+            ],
+            vec![0],
         );
-    assert!(
-        fn_source.contains(".scan_tables_page(") && !fn_source.contains(".list_tables("),
-        "HNSW delta probe must use bounded raw-key schema pages, not a full database table scan"
+        schema.indexes.push(IndexDef {
+            name: format!("idx_hnsw_dirty_backfill_{unique}"),
+            id: index_id,
+            columns: vec!["v".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: Some("hnsw".to_string()),
+            predicate: None,
+            expressions: Vec::new(),
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: Some(16),
+            hnsw_ef_construction: Some(200),
+            hnsw_distance_metric: Some("l2".to_string()),
+            opclasses: vec![Some("vector_l2_ops".to_string())],
+            deferrable: false,
+            initially_deferred: false,
+        });
+        schema.indexes.push(IndexDef {
+            name: format!("idx_hnsw_dirty_post_done_{unique}"),
+            id: post_done_index_id,
+            columns: vec!["v".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: Some("hnsw".to_string()),
+            predicate: None,
+            expressions: Vec::new(),
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: Some(16),
+            hnsw_ef_construction: Some(200),
+            hnsw_distance_metric: Some("l2".to_string()),
+            opclasses: vec![Some("vector_l2_ops".to_string())],
+            deferrable: false,
+            initially_deferred: false,
+        });
+        tenant_store
+            .create_table(&mut txn, db_id, schema)
+            .await
+            .expect("create table");
+
+        let (_, meta) = create_empty_hnsw_index(3, "l2", 16, 200).expect("create hnsw meta");
+        let meta_bytes = serde_json::to_vec(&meta).expect("serialize meta");
+        txn_put(
+            &mut txn,
+            hnsw_meta_key(db_id, table_id, index_id),
+            meta_bytes.clone(),
+        )
+        .await
+        .expect("put hnsw meta");
+        txn_put(
+            &mut txn,
+            hnsw_meta_key(db_id, table_id, post_done_index_id),
+            meta_bytes,
+        )
+        .await
+        .expect("put hnsw meta");
+        let delta_key = hnsw_delta_key(db_id, table_id, index_id, 1);
+        let delta = HnswDelta {
+            label: 1,
+            vector: vec![0.1, 0.2, 0.3],
+        };
+        txn_put(
+            &mut txn,
+            delta_key,
+            bincode::serialize(&delta).expect("serialize delta"),
+        )
+        .await
+        .expect("put old-format delta without dirty marker");
+        assert!(
+            txn.get(hnsw_dirty_key(db_id, table_id, index_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "precondition: simulated old delta must not have a dirty marker"
+        );
+        assert!(
+            txn.get(hnsw_dirty_key(db_id, table_id, post_done_index_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "precondition: second index has no dirty marker"
+        );
+        txn.commit().await.unwrap();
+        db_id
+    };
+
+    let first = enqueue_pending_hnsw_merges(
+        &system_store,
+        &tenant_store,
+        &keyspace,
+        db_id,
+        None,
+        HNSW_DIRTY_MARKER_PAGE_SIZE,
+        600,
+    )
+    .await
+    .expect("first sweep should backfill marker");
+    assert_eq!(
+        (first.observed, first.enqueued, first.enqueue_errors),
+        (0, 0, 0),
+        "first sweep sees no marker page yet; it only writes the compatibility marker"
     );
-    assert!(
-        fn_source.contains(".put_singleton_task_v2("),
-        "HNSW delta probe must enqueue merge work through the singleton helper"
+
+    {
+        let mut txn = tenant_store.begin().await.unwrap();
+        assert!(
+            txn.get(hnsw_dirty_key(db_id, table_id, index_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "backfill must create the missing dirty marker"
+        );
+        assert!(
+            txn.get(hnsw_dirty_backfill_done_key(db_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "single-page backfill should write the compatibility cooldown marker"
+        );
+        let done_value = txn
+            .get(hnsw_dirty_backfill_done_key(db_id))
+            .await
+            .unwrap()
+            .expect("cooldown marker");
+        assert!(
+            !hnsw_dirty_backfill_due(Some(&done_value), crate::worker::now_epoch_ms()),
+            "fresh cooldown marker must not be due immediately"
+        );
+        assert!(
+            txn.get(hnsw_dirty_backfill_cursor_key(db_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "completed backfill should clear the cursor key"
+        );
+        txn.rollback().await.ok();
+    }
+    {
+        let task_id = hnsw_merge_task_id(table_id, index_id).expect("task id");
+        let mut txn = system_store.begin().await.unwrap();
+        assert!(
+            !system_store
+                .task_has_pending(&mut txn, &keyspace, db_id, task_id, TaskType::HnswMerge)
+                .await
+                .expect("check pending hnsw task"),
+            "backfill-only sweep must not enqueue until the next marker page"
+        );
+        txn.rollback().await.ok();
+    }
+
+    let second = enqueue_pending_hnsw_merges(
+        &system_store,
+        &tenant_store,
+        &keyspace,
+        db_id,
+        None,
+        HNSW_DIRTY_MARKER_PAGE_SIZE,
+        600,
+    )
+    .await
+    .expect("second sweep should enqueue from backfilled marker");
+    assert_eq!(
+        (second.observed, second.enqueued, second.enqueue_errors),
+        (1, 1, 0),
+        "second sweep must enqueue the pre-marker delta discovered by backfill"
     );
+
+    let task_id = hnsw_merge_task_id(table_id, index_id).expect("task id");
+    let mut txn = system_store.begin().await.unwrap();
+    assert!(
+        system_store
+            .task_has_pending(&mut txn, &keyspace, db_id, task_id, TaskType::HnswMerge)
+            .await
+            .expect("check pending hnsw task"),
+        "system queue must contain the HNSW merge task after the marker sweep"
+    );
+    txn.rollback().await.ok();
+
+    {
+        let mut txn = tenant_store.begin().await.unwrap();
+        let delta_key = hnsw_delta_key(db_id, table_id, post_done_index_id, 2);
+        let delta = HnswDelta {
+            label: 2,
+            vector: vec![0.4, 0.5, 0.6],
+        };
+        txn_put(
+            &mut txn,
+            delta_key,
+            bincode::serialize(&delta).expect("serialize post-done delta"),
+        )
+        .await
+        .expect("put old-format delta after backfill cooldown");
+        assert!(
+            txn.get(hnsw_dirty_key(db_id, table_id, post_done_index_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "simulated old writer after backfill must still have no dirty marker"
+        );
+        txn_put(
+            &mut txn,
+            hnsw_dirty_backfill_done_key(db_id),
+            encode_hnsw_dirty_backfill_due_ms(crate::worker::now_epoch_ms() - 1),
+        )
+        .await
+        .expect("force compatibility fallback due");
+        txn.commit().await.unwrap();
+    }
+
+    let third = enqueue_pending_hnsw_merges(
+        &system_store,
+        &tenant_store,
+        &keyspace,
+        db_id,
+        None,
+        HNSW_DIRTY_MARKER_PAGE_SIZE,
+        600,
+    )
+    .await
+    .expect("due compatibility fallback should repair post-done markerless delta");
+    assert_eq!(
+        third.enqueue_errors, 0,
+        "post-done compatibility fallback must not hit enqueue errors"
+    );
+    {
+        let mut txn = tenant_store.begin().await.unwrap();
+        assert!(
+            txn.get(hnsw_dirty_key(db_id, table_id, post_done_index_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "due compatibility fallback must create a marker for post-done old-writer delta"
+        );
+        txn.rollback().await.ok();
+    }
+
+    let fourth = enqueue_pending_hnsw_merges(
+        &system_store,
+        &tenant_store,
+        &keyspace,
+        db_id,
+        None,
+        HNSW_DIRTY_MARKER_PAGE_SIZE,
+        600,
+    )
+    .await
+    .expect("marker sweep should enqueue post-done old-writer delta");
+    assert_eq!(
+        fourth.enqueue_errors, 0,
+        "post-done marker sweep must not hit enqueue errors"
+    );
+
+    let post_done_task_id = hnsw_merge_task_id(table_id, post_done_index_id).expect("task id");
+    let mut txn = system_store.begin().await.unwrap();
+    assert!(
+        system_store
+            .task_has_pending(
+                &mut txn,
+                &keyspace,
+                db_id,
+                post_done_task_id,
+                TaskType::HnswMerge,
+            )
+            .await
+            .expect("check pending post-done hnsw task"),
+        "system queue must contain the post-done HNSW merge task after fallback repair"
+    );
+    txn.rollback().await.ok();
 }
 
 #[test]
@@ -2001,6 +2428,7 @@ async fn dropped_db_suppresses_enqueue_across_all_cross_store_sites() {
         missing_db_id,
         None,
         128,
+        600,
     )
     .await
     .expect("enqueue_pending_hnsw_merges must not error on a dropped DB");
@@ -2010,8 +2438,8 @@ async fn dropped_db_suppresses_enqueue_across_all_cross_store_sites() {
         "HNSW sweep must observe/enqueue nothing for a dropped DB"
     );
     assert!(
-        sweep.next_table_cursor.is_none(),
-        "HNSW sweep must not advance a table cursor for a dropped DB"
+        sweep.next_dirty_cursor.is_none(),
+        "HNSW sweep must not advance a dirty cursor for a dropped DB"
     );
 
     // 4. load_next_cron_queue_entry → None (no next cron fire scheduled).

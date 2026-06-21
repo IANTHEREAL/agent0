@@ -358,6 +358,7 @@ impl TikvStore {
             let short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
             return Err(anyhow!("relation \"{}\" already exists", short_name));
         }
+        crate::session_context::record_statement_dirty_table_id(schema.table_id);
         let schema_data = serialize_schema(&schema)?;
         txn_put(txn, schema_key, schema_data).await?;
         info!(
@@ -390,6 +391,7 @@ impl TikvStore {
     ) -> Result<bool> {
         let schema_opt = self.get_schema(txn, db_id, table_name).await?;
         if let Some(schema) = schema_opt {
+            crate::session_context::record_statement_dirty_table_id(schema.table_id);
             let schema_key = self.key(&encode_schema_key_v2(db_id, table_name));
             txn_delete(txn, schema_key).await?;
 

@@ -66,6 +66,7 @@ impl Executor {
                         session.commit().await?;
                         self.flush_trigger_activations();
                         self.flush_pending_hnsw_merges();
+                        self.flush_pending_storage_dirty();
                     } else {
                         session.rollback().await?;
                         self.clear_trigger_activations();

@@ -132,6 +132,8 @@ pub struct Executor {
     pending_async_triggers: Mutex<Vec<PendingAsyncTrigger>>,
     /// HNSW merge requests accumulated during DML, flushed after commit.
     pending_hnsw_merges: Mutex<Vec<PendingHnswMerge>>,
+    /// Databases whose committed writes should refresh exact storage stats.
+    pending_storage_dirty_dbs: Mutex<HashSet<u64>>,
     /// Set when ALTER ROLE or DROP ROLE executes inside a transaction.
     /// Flushed after commit to call `invalidate_initialized` only once the
     /// role mutation is durable, avoiding a race where another session
@@ -161,6 +163,7 @@ impl Executor {
             pending_trigger_activations: Mutex::new(HashSet::new()),
             pending_async_triggers: Mutex::new(Vec::new()),
             pending_hnsw_merges: Mutex::new(Vec::new()),
+            pending_storage_dirty_dbs: Mutex::new(HashSet::new()),
             pending_init_cache_invalidation: AtomicBool::new(false),
         }
     }
@@ -242,6 +245,20 @@ impl Executor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(merge);
+    }
+
+    pub(crate) fn note_storage_dirty_if_tables_changed(
+        &self,
+        db_id: u64,
+        dirty_table_ids: &HashSet<u64>,
+    ) {
+        if dirty_table_ids.is_empty() {
+            return;
+        }
+        self.pending_storage_dirty_dbs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(db_id);
     }
 
     pub(crate) fn flush_trigger_activations(&self) {
@@ -386,6 +403,17 @@ impl Executor {
                     // fresh entries from legacy entries with default nonce=0.
                     entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
                     let mut txn = system_store.begin().await?;
+                    if system_store
+                        .dropped_db_tombstone_exists_for_update(
+                            &mut txn,
+                            &merge.keyspace,
+                            merge.db_id,
+                        )
+                        .await?
+                    {
+                        txn.rollback().await.ok();
+                        return Ok(());
+                    }
                     system_store
                         .put_singleton_task_v2(&mut txn, &entry, fire_time_ms)
                         .await?;
@@ -405,6 +433,68 @@ impl Executor {
                 .await;
                 if let Err(e) = result {
                     tracing::debug!("HNSW merge enqueue failed (best-effort): {}", e);
+                }
+            }
+        });
+    }
+
+    /// Mark storage stats dirty after the tenant transaction commits.
+    /// The marker is durable producer work, so it uses the always-on system
+    /// store and is not gated by local worker execution.
+    pub(crate) fn flush_pending_storage_dirty(&self) {
+        let db_ids: Vec<u64> = self
+            .pending_storage_dirty_dbs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        if db_ids.is_empty() {
+            return;
+        }
+
+        let keyspace = self.tenant_keyspace.clone();
+        let system_store = match crate::worker::system_store() {
+            Ok(store) => store.clone(),
+            Err(e) => {
+                tracing::warn!("Storage-size dirty marker skipped: {}", e);
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            for db_id in db_ids {
+                let marker = match system_store.mark_storage_size_dirty(&keyspace, db_id).await {
+                    Ok(Some(marker)) => marker,
+                    Ok(None) => {
+                        tracing::debug!(
+                            keyspace = %keyspace,
+                            db_id,
+                            "Storage-size dirty marker suppressed for dropped database"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            keyspace = %keyspace,
+                            db_id,
+                            "Failed to mark storage stats dirty after commit: {}",
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                if let Err(e) =
+                    crate::worker::engine::enqueue_storage_scan(&system_store, &keyspace, db_id)
+                        .await
+                {
+                    tracing::warn!(
+                        keyspace = %keyspace,
+                        db_id,
+                        dirty_version = marker.version,
+                        "Storage stats dirty marker persisted but scan enqueue failed: {}",
+                        e
+                    );
                 }
             }
         });
@@ -444,6 +534,10 @@ impl Executor {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.pending_hnsw_merges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_storage_dirty_dbs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();

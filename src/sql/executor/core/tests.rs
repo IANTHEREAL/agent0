@@ -303,7 +303,9 @@ fn test_cast_current_setting_value_integer() {
 
 mod write_conflict_retry_tests {
     use super::super::{extract_write_conflict_reason, is_retryable_tikv_error};
+    use crate::sql::error::SqlError;
     use crate::storage::{StorageError, WriteConflictReason};
+    use anyhow::Context;
 
     #[test]
     fn test_unrelated_tikv_error_not_retryable() {
@@ -393,6 +395,25 @@ mod write_conflict_retry_tests {
         });
         assert!(is_retryable_tikv_error(&pessimistic));
         assert_eq!(extract_write_conflict_reason(&pessimistic), Some(2));
+    }
+
+    #[test]
+    fn test_retryable_tikv_error_survives_sql_error_context_chain() {
+        let tikv_err =
+            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict {
+                    reason: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        let sql_err = SqlError::Internal(anyhow::Error::new(tikv_err));
+        let anyhow_err = Err::<(), SqlError>(sql_err)
+            .context("failed to write HNSW delta")
+            .unwrap_err();
+
+        assert!(is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), Some(2));
     }
 
     #[test]
@@ -582,6 +603,72 @@ fn test_flush_pending_hnsw_merges_clears_buffer_without_system_store() {
     // drain the pending buffer to avoid stale accumulation.
     executor.flush_pending_hnsw_merges();
     assert_eq!(executor.pending_hnsw_merges.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn flush_pending_hnsw_merges_is_dropped_db_tombstone_fenced() {
+    let source = include_str!("mod.rs");
+    let flush_fn = source
+        .split("pub(crate) fn flush_pending_hnsw_merges(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("/// Mark storage stats dirty after").next())
+        .expect("flush_pending_hnsw_merges must exist");
+    let fence_pos = flush_fn
+        .find("dropped_db_tombstone_exists_for_update")
+        .expect("HNSW merge producer must fence on dropped-DB tombstone");
+    let put_pos = flush_fn
+        .find("put_singleton_task_v2(&mut txn, &entry, fire_time_ms)")
+        .expect("HNSW merge producer must write singleton queue row");
+    let registry_pos = flush_fn
+        .find("update_registry_task_types")
+        .expect("HNSW merge producer must update registry");
+
+    assert!(
+        fence_pos < put_pos && put_pos < registry_pos,
+        "HNSW merge queue and registry writes must happen after the tombstone fence"
+    );
+}
+
+#[test]
+fn storage_dirty_pending_tracks_committed_table_writes_only() {
+    let store = crate::storage::TikvStore::new_stub();
+    let keyspace = "core_tests_storage_dirty_pending".to_string();
+    let observability = crate::observability::registry().tenant(&keyspace);
+    let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let rls_policy_cache = std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
+    let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+    let executor = super::Executor::new(
+        store,
+        keyspace,
+        observability,
+        crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
+        trigger_cache,
+        rls_policy_cache,
+        stats_cache,
+    );
+
+    let no_dirty_tables = std::collections::HashSet::new();
+    executor.note_storage_dirty_if_tables_changed(7, &no_dirty_tables);
+    assert!(executor
+        .pending_storage_dirty_dbs
+        .lock()
+        .unwrap()
+        .is_empty());
+
+    let dirty_tables = [42_u64].into_iter().collect();
+    executor.note_storage_dirty_if_tables_changed(7, &dirty_tables);
+    assert!(executor
+        .pending_storage_dirty_dbs
+        .lock()
+        .unwrap()
+        .contains(&7));
+
+    executor.clear_trigger_activations();
+    assert!(executor
+        .pending_storage_dirty_dbs
+        .lock()
+        .unwrap()
+        .is_empty());
 }
 
 // ── Lock resolution backoff tests (#2156) ──────────────────

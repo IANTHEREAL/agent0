@@ -62,6 +62,7 @@ pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
 pub(super) const GC_INSTANCE_STATE_PREFIX: &[u8] = b"_gc_instance_";
 pub(super) const WORKER_BG_TASK_SEQ_PREFIX: &[u8] = b"_worker_bg_task_seq_";
+pub(super) const WORKER_STORAGE_SCAN_DIRTY_PREFIX: &[u8] = b"_worker_storage_dirty_";
 /// V2 due-queue (global). Same key STRUCTURE as `_worker_queue_` so the
 /// priority/fire_time ordering, scan bounds, and fire_time decode are reusable,
 /// but a distinct prefix: old binaries only read `_worker_queue_`, so the
@@ -518,6 +519,20 @@ pub fn encode_worker_dropped_db_tombstone_key(keyspace: &str, db_id: u64) -> Vec
     let mut key =
         Vec::with_capacity(WORKER_DROPPED_DB_TOMBSTONE_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
     key.extend_from_slice(WORKER_DROPPED_DB_TOMBSTONE_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+/// Encode a storage-size dirty marker key (global, system store).
+///
+/// Format: `_worker_storage_dirty_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}`
+pub fn encode_worker_storage_scan_dirty_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_STORAGE_SCAN_DIRTY_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_STORAGE_SCAN_DIRTY_PREFIX);
     key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
     key.extend_from_slice(keyspace.as_bytes());
     key.push(b'_');

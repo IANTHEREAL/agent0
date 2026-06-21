@@ -44,6 +44,35 @@ fn hnsw_merge_task_id_overflow_index_id() {
     );
 }
 
+#[test]
+fn hnsw_dirty_key_round_trips_table_and_index() {
+    let key = hnsw_dirty_key(7, 42, 99);
+    assert_eq!(parse_hnsw_dirty_key(7, &key), Some((42, 99)));
+    assert!(key.starts_with(&hnsw_dirty_prefix(7)));
+    assert!(key < hnsw_dirty_prefix_end(7));
+    assert_eq!(parse_hnsw_dirty_key(8, &key), None);
+}
+
+#[test]
+fn hnsw_dirty_backfill_state_keys_do_not_scan_as_dirty_markers() {
+    let cursor = hnsw_dirty_backfill_cursor_key(7);
+    let done = hnsw_dirty_backfill_done_key(7);
+    let dirty_prefix = hnsw_dirty_prefix(7);
+    let dirty_end = hnsw_dirty_prefix_end(7);
+
+    for key in [cursor, done] {
+        assert!(
+            !key.starts_with(&dirty_prefix),
+            "backfill state key must not live under the dirty-marker prefix"
+        );
+        assert!(
+            !(key.as_slice() >= dirty_prefix.as_slice() && key.as_slice() < dirty_end.as_slice()),
+            "backfill state key must not be paged as a dirty marker"
+        );
+        assert_eq!(parse_hnsw_dirty_key(7, &key), None);
+    }
+}
+
 /// Verifies that HnswMeta with legacy v0 storage version produces
 /// a clear error when deserialized from JSON. This locks the fail-fast
 /// behavior that replaced the old v0→v1 migration path.

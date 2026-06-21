@@ -1,10 +1,19 @@
 //! Retry helpers
 
+use crate::sql::error::SqlError;
 use crate::storage::StorageError;
 
 fn storage_error(err: &anyhow::Error) -> Option<&StorageError> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<StorageError>())
+}
+
+fn sql_internal_error(err: &anyhow::Error) -> Option<&anyhow::Error> {
+    err.chain()
+        .find_map(|cause| match cause.downcast_ref::<SqlError>() {
+            Some(SqlError::Internal(inner)) => Some(inner),
+            _ => None,
+        })
 }
 
 pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
@@ -46,11 +55,15 @@ pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
         }
     }
 
-    err.chain().any(|cause| {
+    if err.chain().any(|cause| {
         cause
             .downcast_ref::<tikv_client::Error>()
             .is_some_and(contains_retryable_error)
-    })
+    }) {
+        return true;
+    }
+
+    sql_internal_error(err).is_some_and(is_retryable_tikv_error)
 }
 
 /// Extract the write-conflict reason code from a retryable error.
@@ -74,11 +87,15 @@ pub(super) fn extract_write_conflict_reason(err: &anyhow::Error) -> Option<i32> 
         }
     }
 
-    err.chain().find_map(|cause| {
+    if let Some(reason) = err.chain().find_map(|cause| {
         cause
             .downcast_ref::<tikv_client::Error>()
             .and_then(first_reason)
-    })
+    }) {
+        return Some(reason);
+    }
+
+    sql_internal_error(err).and_then(extract_write_conflict_reason)
 }
 
 /// Exponential backoff with jitter for autocommit retry loops.

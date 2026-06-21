@@ -330,10 +330,10 @@ pub(super) async fn execute_hnsw_merge(
 ) -> Result<()> {
     use crate::sql::hnsw::storage::{
         create_empty_hnsw_index, delete_delta_keys, hnsw_delta_prefix, hnsw_delta_prefix_end,
-        hnsw_graph_key, hnsw_meta_key, hnsw_s3_retired_version_key, load_base_graph,
-        serialize_hnsw_snapshot, HnswDelta, HnswMeta, HnswS3RetiredVersionGc,
+        hnsw_dirty_key, hnsw_graph_key, hnsw_meta_key, hnsw_s3_retired_version_key,
+        load_base_graph, serialize_hnsw_snapshot, HnswDelta, HnswMeta, HnswS3RetiredVersionGc,
     };
-    use crate::txn::txn_put;
+    use crate::txn::{txn_delete, txn_put};
     use tikv_client::BoundRange;
 
     let merge_start = std::time::Instant::now();
@@ -395,9 +395,14 @@ pub(super) async fn execute_hnsw_merge(
             // manual requeue / operator mistakes must still not let two merges
             // compute the same next graph_version from a stale snapshot.
             let meta_key = hnsw_meta_key(db_id, table_id, index_id);
+            let dirty_key = hnsw_dirty_key(db_id, table_id, index_id);
+            let dirty_marker_at_start = txn.get(dirty_key.clone()).await?;
             let Some(meta_bytes) = txn.get_for_update(meta_key.clone()).await? else {
                 // Index metadata missing — index was dropped. Abort silently.
-                if txn.rollback().await.is_err() {
+                if txn.get_for_update(dirty_key.clone()).await? == dirty_marker_at_start {
+                    txn_delete(&mut txn, dirty_key).await?;
+                }
+                if txn.commit().await.is_err() {
                     if let Some(g) = txn_guard.as_mut() {
                         g.quarantine();
                     }
@@ -464,7 +469,10 @@ pub(super) async fn execute_hnsw_merge(
             }
 
             if batch_deltas.is_empty() {
-                if txn.rollback().await.is_err() {
+                if txn.get_for_update(dirty_key.clone()).await? == dirty_marker_at_start {
+                    txn_delete(&mut txn, dirty_key).await?;
+                }
+                if txn.commit().await.is_err() {
                     if let Some(g) = txn_guard.as_mut() {
                         g.quarantine();
                     }
@@ -650,6 +658,11 @@ pub(super) async fn execute_hnsw_merge(
                 )
                 .await;
                 return Err(e.into());
+            }
+            if batch_count < MERGE_BATCH_SIZE
+                && txn.get_for_update(dirty_key.clone()).await? == dirty_marker_at_start
+            {
+                txn_delete(&mut txn, dirty_key).await?;
             }
 
             // 7. Commit.
