@@ -1,5 +1,6 @@
 # db9 快照隔离(SI)故障注入测试 — 易懂版设计
 
+> **Status**: Draft
 > 通俗易懂版(中文)。详细英文版见 [`si_fault_injection_test_program.md`](./si_fault_injection_test_program.md)。
 > 参考 issue: [db9-ai/db9-server#2739](https://github.com/db9-ai/db9-server/issues/2739)
 

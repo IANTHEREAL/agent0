@@ -333,36 +333,80 @@ pub(crate) fn build_pd_client() -> Result<reqwest::Client> {
         std::env::var("TIKV_CERT_PATH"),
         std::env::var("TIKV_KEY_PATH"),
     ) {
-        let ca_pem =
-            std::fs::read(&ca).with_context(|| format!("failed to read PD CA cert: {}", ca))?;
-        let ca_cert =
-            reqwest::tls::Certificate::from_pem(&ca_pem).context("failed to parse PD CA cert")?;
-
-        let cert_pem = std::fs::read(&cert_path)
-            .with_context(|| format!("failed to read PD client cert: {}", cert_path))?;
-        let key_pem = std::fs::read(&key_path)
-            .with_context(|| format!("failed to read PD client key: {}", key_path))?;
-        let mut identity_pem = cert_pem;
-        identity_pem.extend_from_slice(&key_pem);
-        let identity = reqwest::tls::Identity::from_pem(&identity_pem)
-            .context("failed to parse PD client identity")?;
-
-        builder = builder
-            .add_root_certificate(ca_cert)
-            .identity(identity)
-            .danger_accept_invalid_certs(false);
+        let tls_config = build_pd_rustls_config(&ca, &cert_path, &key_path)?;
+        builder = builder.use_preconfigured_tls(tls_config);
     }
 
     builder.build().context("failed to build PD HTTP client")
 }
 
+/// Build a rustls client config for PD mTLS directly.
+///
+/// `reqwest::tls::Identity::from_pem` with the rustls backend only accepts
+/// PKCS#8 keys. The TiKV client secret can contain PKCS#1 or SEC1 keys, so use
+/// `rustls_pemfile::private_key`, which accepts all three PEM key shapes.
+fn build_pd_rustls_config(
+    ca_path: &str,
+    cert_path: &str,
+    key_path: &str,
+) -> Result<rustls::ClientConfig> {
+    use rustls_pki_types::CertificateDer;
+
+    let ca_pem =
+        std::fs::read(ca_path).with_context(|| format!("failed to read PD CA cert: {ca_path}"))?;
+    let mut ca_reader = std::io::BufReader::new(ca_pem.as_slice());
+    let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
+        .collect::<std::result::Result<_, _>>()
+        .context("failed to parse PD CA cert")?;
+    if ca_certs.is_empty() {
+        anyhow::bail!("no CA certificates found in {ca_path}");
+    }
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        root_store
+            .add(cert)
+            .context("failed to register PD CA cert in rustls root store")?;
+    }
+
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("failed to read PD client cert: {cert_path}"))?;
+    let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
+    let client_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<_, _>>()
+        .context("failed to parse PD client cert")?;
+    if client_certs.is_empty() {
+        anyhow::bail!("no client certificates found in {cert_path}");
+    }
+
+    let key_pem = std::fs::read(key_path)
+        .with_context(|| format!("failed to read PD client key: {key_path}"))?;
+    let mut key_reader = std::io::BufReader::new(key_pem.as_slice());
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("failed to parse PD client key")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {key_path}"))?;
+
+    rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, key)
+        .context("failed to build rustls ClientConfig for PD HTTP client")
+}
+
 /// PD API base URL (HTTPS when TLS is configured, HTTP otherwise).
 pub(crate) fn pd_base_url(pd_endpoint: &str) -> String {
+    let pd_endpoint = pd_endpoint.trim().trim_end_matches('/');
+    if pd_endpoint.starts_with("http://") || pd_endpoint.starts_with("https://") {
+        return pd_endpoint.to_string();
+    }
+
     if std::env::var("TIKV_CA_PATH").is_ok() {
         format!("https://{}", pd_endpoint)
     } else {
         format!("http://{}", pd_endpoint)
     }
+}
+
+fn pd_keyspaces_base_url(pd_endpoint: &str) -> String {
+    format!("{}/pd/api/v2/keyspaces", pd_base_url(pd_endpoint))
 }
 
 /// Query PD for the state of a keyspace.
@@ -371,11 +415,7 @@ pub(crate) fn pd_base_url(pd_endpoint: &str) -> String {
 /// keyspace does not exist or the query fails.
 pub async fn check_keyspace_state(pd_endpoints: &[String], keyspace: &str) -> Option<String> {
     let pd_primary = pd_endpoints.first()?;
-    let url = format!(
-        "{}/pd/api/v2/keyspaces/{}",
-        pd_base_url(pd_primary),
-        keyspace
-    );
+    let url = format!("{}/{}", pd_keyspaces_base_url(pd_primary), keyspace);
 
     let client = match build_pd_client() {
         Ok(c) => c,
@@ -426,7 +466,7 @@ pub(crate) async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &s
     let pd_primary = pd_endpoints
         .first()
         .ok_or_else(|| anyhow::anyhow!("no PD endpoint configured"))?;
-    let base = format!("http://{}/pd/api/v2/keyspaces", pd_primary);
+    let base = pd_keyspaces_base_url(pd_primary);
     let keyspace_url = format!("{}/{}", base, keyspace);
 
     let client = reqwest::Client::builder()
@@ -557,6 +597,53 @@ mod tests {
         let cfg = WorkerConfig::default();
         let fut = init_gc_registry_store(Vec::new(), &cfg);
         drop(fut);
+    }
+
+    #[test]
+    fn pd_base_url_preserves_explicit_scheme_and_trims_slash() {
+        assert_eq!(
+            pd_base_url("https://pd.example:2379/"),
+            "https://pd.example:2379"
+        );
+        assert_eq!(
+            pd_base_url("http://pd.example:2379/"),
+            "http://pd.example:2379"
+        );
+    }
+
+    #[test]
+    fn pd_keyspaces_base_url_preserves_explicit_scheme() {
+        assert_eq!(
+            pd_keyspaces_base_url("http://127.0.0.1:2379/"),
+            "http://127.0.0.1:2379/pd/api/v2/keyspaces"
+        );
+        assert_eq!(
+            pd_keyspaces_base_url("https://pd.example:2379/"),
+            "https://pd.example:2379/pd/api/v2/keyspaces"
+        );
+    }
+
+    #[test]
+    fn pd_client_uses_rustls_config_not_reqwest_identity_from_pem() {
+        let source = include_str!("mod.rs");
+        let build_fn = source
+            .split("pub(crate) fn build_pd_client()")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Build a rustls client config").next())
+            .expect("build_pd_client must exist before pd_base_url");
+
+        assert!(
+            build_fn.contains("build_pd_rustls_config"),
+            "PD client must use the rustls config helper"
+        );
+        assert!(
+            build_fn.contains("use_preconfigured_tls"),
+            "PD client must pass a preconfigured rustls ClientConfig to reqwest"
+        );
+        assert!(
+            !build_fn.contains("Identity::from_pem"),
+            "reqwest Identity::from_pem rejects non-PKCS#8 keys with rustls-tls"
+        );
     }
 
     #[tokio::test]

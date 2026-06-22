@@ -2024,6 +2024,17 @@ async fn cluster_already_terminal_minute_still_requeues_next_fire() {
         }
     }
 
+    // `compute_next_fire_time()` is intentionally wall-clock based. Keep the
+    // two synthetic reclaims below away from a minute boundary so this test
+    // exercises idempotency for the same computed next fire, not clock rollover.
+    let millis_into_minute = chrono::Utc::now().timestamp_millis().rem_euclid(60_000);
+    if millis_into_minute > 45_000 {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            (60_000 - millis_into_minute + 1_000) as u64,
+        ))
+        .await;
+    }
+
     // finalize_fn must NEVER run for an AlreadyTerminalForMinute reclaim: the
     // minute is already done, so this worker owns no run to finalize.
     let no_finalize = |_store, _db_id, _run, _status, _msg, _start, _end, _sched_min| async {

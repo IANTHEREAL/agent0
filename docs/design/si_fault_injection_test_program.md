@@ -1,5 +1,6 @@
 # Snapshot-Isolation Consistency + Fault-Injection Test Program — Detailed Design
 
+> **Status**: Draft
 > **Detailed design (English).** Source of truth tracked in issue [#2739](https://github.com/db9-ai/db9-server/issues/2739); this file mirrors its latest revision.
 > Plain-language Chinese overview: [`si_fault_injection_test_program.zh-CN.md`](./si_fault_injection_test_program.zh-CN.md).
 
@@ -326,6 +327,5 @@ expect:  { verdict: clean, terminates_within_ms: 90000 }   # GCTooEarly OK; a wr
 7. **Safety/fork ownership:** approve NetworkPolicy/sentinel/secrets requirements for in-cell fault APIs and name an owner for vendored `tikv-client` fork-carry/upstreaming.
 
 *Parent: #2640. Refines: #2641 (WS10). Related: #2642 (PG-compat correctness — the orthogonal "answers correct?" axis). Single consistency contract: Snapshot Isolation; Elle configured `:snapshot-isolation`, never `:serializable` (regression-guarded).*
-
 
 
