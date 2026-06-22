@@ -439,9 +439,9 @@ fn specialized_task_paths_thread_lease_cancel() {
     // Each of the three specialized dispatch calls must forward it.
     assert!(
         dispatch.contains("execute_storage_size_scan(")
-            && dispatch.contains("&system_store")
             && dispatch.contains("&store")
-            && dispatch.contains("dirty_marker")
+            && dispatch.contains("pool.pd_endpoints()")
+            && dispatch.contains("config.storage_scan_pd_rate_limit_ms")
             && dispatch.contains("&lease_cancel"),
         "StorageSizeScan path must thread lease_cancel"
     );
@@ -622,7 +622,7 @@ fn worker_tick_dequeues_v2_only() {
 }
 
 #[test]
-fn storage_size_scan_tracks_its_long_lived_read_transaction() {
+fn storage_size_scan_uses_pd_region_stats_not_tenant_kv_scan() {
     let source = include_str!("../engine.rs");
     let prod_source = source
         .split("#[cfg(test)]")
@@ -638,17 +638,23 @@ fn storage_size_scan_tracks_its_long_lived_read_transaction() {
     let scan_source = &prod_source[scan_start..scan_end];
 
     assert!(
-        scan_source.contains("let mut txn = store.begin_optimistic().await?;"),
-        "storage size scan must keep its paginated snapshot in a single optimistic transaction"
+        scan_source.contains("fetch_database_region_stats("),
+        "storage size scan must fetch PD Region stats"
     );
     assert!(
-        scan_source.contains("track_worker_txn(txn.start_timestamp().version())"),
-        "storage size scan must publish its long-lived scan transaction in the active txn registry"
+        scan_source.contains("DbStorageStats::pd_region_estimate("),
+        "storage size scan must persist explicit PD estimate stats"
+    );
+    assert!(
+        !scan_source.contains(".scan(")
+            && !scan_source.contains("begin_optimistic()")
+            && !scan_source.contains("track_worker_txn("),
+        "PD storage stats path must not scan tenant KV pages or hold a long-lived snapshot"
     );
 }
 
 #[test]
-fn storage_scan_sweep_uses_dirty_marker_before_interval_fallback() {
+fn storage_scan_sweep_uses_interval_due_with_jitter_not_dirty_marker() {
     let source = include_str!("../engine.rs");
     let prod_source = source
         .split("#[cfg(test)]")
@@ -663,24 +669,24 @@ fn storage_scan_sweep_uses_dirty_marker_before_interval_fallback() {
         })
         .expect("process_registry_sweep_entry must exist before result recorder");
 
-    let marker_pos = entry_fn
-        .find("get_storage_size_dirty_marker")
-        .expect("storage sweep must read the dirty marker");
     let due_pos = entry_fn
         .find("storage_scan_due")
         .expect("storage sweep must keep interval fallback");
+    let enqueue_pos = entry_fn
+        .find("enqueue_storage_scan_with_jitter")
+        .expect("storage sweep must enqueue due scans with jitter");
     assert!(
-        marker_pos < due_pos,
-        "dirty marker must be checked before the interval fallback"
+        due_pos < enqueue_pos,
+        "storage sweep must decide due before enqueueing with jitter"
     );
     assert!(
-        entry_fn.contains("Ok(Some(_))") && entry_fn.contains("enqueue_storage_scan"),
-        "dirty marker presence must enqueue a StorageSizeScan task"
+        !entry_fn.contains("get_storage_size_dirty_marker"),
+        "storage sweep must not read dirty markers"
     );
 }
 
 #[test]
-fn storage_size_scan_clears_only_the_observed_dirty_version() {
+fn storage_size_scan_leaves_old_stats_intact_on_pd_failure() {
     let source = include_str!("../engine.rs");
     let prod_source = source
         .split("#[cfg(test)]")
@@ -696,13 +702,15 @@ fn storage_size_scan_clears_only_the_observed_dirty_version() {
     let scan_source = &prod_source[scan_start..scan_end];
 
     assert!(
-        scan_source.contains("dirty_marker: Option<StorageScanDirtyMarker>"),
-        "storage scan must carry the dirty marker version it observed before scanning"
+        scan_source
+            .contains("PD Region storage stats failed; leaving previous storage stats intact"),
+        "PD failure must be logged as leaving previous stats intact"
     );
     assert!(
-        scan_source.contains("clear_storage_size_dirty_if_version")
-            && scan_source.contains("marker.version"),
-        "storage scan must clear dirty state only if no newer dirty version appeared"
+        !scan_source.contains("serialize_storage_stats(&stats)")
+            || scan_source.find("return Err").unwrap()
+                < scan_source.find("serialize_storage_stats(&stats)").unwrap(),
+        "PD failure branch must return before stats serialization/persist"
     );
 }
 
@@ -4045,9 +4053,11 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "execute_bg_ddl_backfill",
         // [enqueue] Single put to system store queue + commit.
         "enqueue_storage_scan",
-        // [finalize] Single stats key write after scan completes; immediate commit.
-        // (The long-lived scan txn in execute_storage_size_scan IS tracked; this is
-        // just the final persist_txn that writes the result.)
+        // [enqueue] Shared storage-scan enqueue helper; writes one singleton
+        // queue entry in the system store, then commits or rolls back.
+        "enqueue_storage_scan_at",
+        // [pd lookup + finalize] PD HTTP stats lookup, then one short tenant
+        // stats-key write with immediate commit.
         "execute_storage_size_scan",
         // [reconcile] Scans DDL journal + cleans orphaned data in batches with txn rotation.
         "reconcile_ddl_journal_for_db",

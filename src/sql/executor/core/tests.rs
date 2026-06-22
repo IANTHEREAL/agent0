@@ -611,7 +611,10 @@ fn flush_pending_hnsw_merges_is_dropped_db_tombstone_fenced() {
     let flush_fn = source
         .split("pub(crate) fn flush_pending_hnsw_merges(&self)")
         .nth(1)
-        .and_then(|rest| rest.split("/// Mark storage stats dirty after").next())
+        .and_then(|rest| {
+            rest.split("/// Mark that the `is_initialized` cache")
+                .next()
+        })
         .expect("flush_pending_hnsw_merges must exist");
     let fence_pos = flush_fn
         .find("dropped_db_tombstone_exists_for_update")
@@ -630,45 +633,19 @@ fn flush_pending_hnsw_merges_is_dropped_db_tombstone_fenced() {
 }
 
 #[test]
-fn storage_dirty_pending_tracks_committed_table_writes_only() {
-    let store = crate::storage::TikvStore::new_stub();
-    let keyspace = "core_tests_storage_dirty_pending".to_string();
-    let observability = crate::observability::registry().tenant(&keyspace);
-    let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
-    let rls_policy_cache = std::sync::Arc::new(crate::sql::rls::cache::RlsPolicyCache::new());
-    let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
-    let executor = super::Executor::new(
-        store,
-        keyspace,
-        observability,
-        crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
-        trigger_cache,
-        rls_policy_cache,
-        stats_cache,
+fn storage_dirty_producer_path_is_removed_from_executor() {
+    let source = include_str!("mod.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("core/mod.rs must contain #[cfg(test)]");
+    assert!(
+        !prod_source.contains("pending_storage_dirty_dbs")
+            && !prod_source.contains("note_storage_dirty_if_tables_changed")
+            && !prod_source.contains("flush_pending_storage_dirty")
+            && !prod_source.contains("mark_storage_size_dirty"),
+        "executor must not produce storage dirty markers; interval PD refresh is the automatic path"
     );
-
-    let no_dirty_tables = std::collections::HashSet::new();
-    executor.note_storage_dirty_if_tables_changed(7, &no_dirty_tables);
-    assert!(executor
-        .pending_storage_dirty_dbs
-        .lock()
-        .unwrap()
-        .is_empty());
-
-    let dirty_tables = [42_u64].into_iter().collect();
-    executor.note_storage_dirty_if_tables_changed(7, &dirty_tables);
-    assert!(executor
-        .pending_storage_dirty_dbs
-        .lock()
-        .unwrap()
-        .contains(&7));
-
-    executor.clear_trigger_activations();
-    assert!(executor
-        .pending_storage_dirty_dbs
-        .lock()
-        .unwrap()
-        .is_empty());
 }
 
 // ── Lock resolution backoff tests (#2156) ──────────────────

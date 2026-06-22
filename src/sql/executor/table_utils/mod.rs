@@ -321,13 +321,35 @@ impl Executor {
                     Value::Null
                 };
 
+                let exact_breakdown = stats.exact_breakdown_available();
+                let data_bytes = if exact_breakdown {
+                    Value::Int64(stats.data_bytes as i64)
+                } else {
+                    Value::Null
+                };
+                let index_bytes = if exact_breakdown {
+                    Value::Int64(stats.index_bytes as i64)
+                } else {
+                    Value::Null
+                };
+                let metadata_bytes = if exact_breakdown {
+                    Value::Int64(stats.metadata_bytes as i64)
+                } else {
+                    Value::Null
+                };
+
                 rows.push(Row::new(vec![
                     Value::Int64(stats.database_id as i64),
                     Value::Text(db_name),
-                    Value::Int64(stats.data_bytes as i64),
-                    Value::Int64(stats.index_bytes as i64),
-                    Value::Int64(stats.metadata_bytes as i64),
+                    Value::Text(stats.source.as_str().to_string()),
+                    Value::Boolean(exact_breakdown),
+                    data_bytes,
+                    index_bytes,
+                    metadata_bytes,
                     Value::Int64(stats.total_bytes() as i64),
+                    Value::Int64(stats.region_count as i64),
+                    Value::Int64(stats.empty_region_count as i64),
+                    Value::Int64(stats.storage_keys as i64),
                     scanned_at,
                     Value::Int64(stats.scan_duration_ms),
                 ]));
@@ -348,7 +370,7 @@ impl Executor {
             let db_stats = cache.get(self.tenant_keyspace(), db_id);
 
             let mut rows = Vec::new();
-            if let Some(stats) = db_stats {
+            if let Some(stats) = db_stats.filter(|stats| stats.exact_breakdown_available()) {
                 let scanned_at = if stats.scanned_at_ms > 0 {
                     Value::Text(
                         chrono::DateTime::from_timestamp_millis(stats.scanned_at_ms)

@@ -3,7 +3,6 @@ use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{
     HnswS3DbPrefixCleanupIntent, HnswS3GraphUploadIntent, TaskDescriptorV2, TaskPayloadV2,
     TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim, TASK_TYPE_CRON,
-    TASK_TYPE_STORAGE_SIZE_SCAN,
 };
 use std::time::Duration;
 
@@ -21,7 +20,6 @@ pub struct WqIndexRow {
 
 const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
 const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
-const STORAGE_SCAN_DIRTY_MARKER_VALUE_LEN: usize = 16;
 const WORKER_QUEUE_SCHEMA_V2: u8 = 2;
 /// Max rows migrated by ONE `drain_legacy_worker_queue_batch` call. Exposed at
 /// crate scope so the worker engine's drain-tick budget-cap orchestration test
@@ -39,12 +37,6 @@ pub struct GcInstanceState {
     /// Legacy 25-byte row compatibility during mixed-version rollout.
     /// New-format rows do not publish this timeout tail.
     pub legacy_max_untracked_timeout_sec: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageScanDirtyMarker {
-    pub version: u64,
-    pub dirty_at_ms: i64,
 }
 
 enum WorkerQueueMigrationLock {
@@ -86,23 +78,6 @@ fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64, Optio
         None
     };
     Some((min_ts, updated_at, legacy_max_untracked_timeout_sec))
-}
-
-fn encode_storage_scan_dirty_marker(marker: StorageScanDirtyMarker) -> Vec<u8> {
-    let mut data = Vec::with_capacity(STORAGE_SCAN_DIRTY_MARKER_VALUE_LEN);
-    data.extend_from_slice(&marker.version.to_be_bytes());
-    data.extend_from_slice(&marker.dirty_at_ms.to_be_bytes());
-    data
-}
-
-fn decode_storage_scan_dirty_marker(val: &[u8]) -> Option<StorageScanDirtyMarker> {
-    if val.len() < STORAGE_SCAN_DIRTY_MARKER_VALUE_LEN {
-        return None;
-    }
-    Some(StorageScanDirtyMarker {
-        version: u64::from_be_bytes(val[0..8].try_into().ok()?),
-        dirty_at_ms: i64::from_be_bytes(val[8..16].try_into().ok()?),
-    })
 }
 
 fn gc_instance_state_scan_end(prefix: &[u8]) -> Vec<u8> {
@@ -285,8 +260,6 @@ impl TikvStore {
         let deleted = self.reap_db_queue_entries(keyspace, db_id).await?;
 
         let mut txn = self.begin().await?;
-        self.delete_storage_size_dirty_marker(&mut txn, keyspace, db_id)
-            .await?;
         self.delete_worker_registry(&mut txn, keyspace, db_id)
             .await?;
         txn.commit().await?;
@@ -441,106 +414,6 @@ impl TikvStore {
 
         self.put_worker_registry(txn, &entry).await?;
         Ok(())
-    }
-
-    pub async fn mark_storage_size_dirty(
-        &self,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<Option<StorageScanDirtyMarker>> {
-        let mut txn = self.begin().await?;
-        let marker = self
-            .mark_storage_size_dirty_in_txn(&mut txn, keyspace, db_id)
-            .await?;
-        txn.commit().await?;
-        Ok(marker)
-    }
-
-    pub async fn mark_storage_size_dirty_in_txn(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<Option<StorageScanDirtyMarker>> {
-        if self
-            .dropped_db_tombstone_exists_for_update(txn, keyspace, db_id)
-            .await?
-        {
-            return Ok(None);
-        }
-
-        let dirty_key = self.key(&encode_worker_storage_scan_dirty_key(keyspace, db_id));
-        let current = tikv_op!(txn.get_for_update(dirty_key.clone()).await)?;
-        let current_version = current
-            .as_deref()
-            .and_then(decode_storage_scan_dirty_marker)
-            .map(|marker| marker.version)
-            .unwrap_or(0);
-        let version = current_version.checked_add(1).unwrap_or(1);
-        let marker = StorageScanDirtyMarker {
-            version,
-            dirty_at_ms: crate::worker::now_epoch_ms(),
-        };
-
-        txn_put(txn, dirty_key, encode_storage_scan_dirty_marker(marker)).await?;
-        self.update_registry_task_types(txn, keyspace, db_id, TASK_TYPE_STORAGE_SIZE_SCAN, 0)
-            .await?;
-        Ok(Some(marker))
-    }
-
-    async fn delete_storage_size_dirty_marker(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<()> {
-        let dirty_key = self.key(&encode_worker_storage_scan_dirty_key(keyspace, db_id));
-        txn_delete(txn, dirty_key).await?;
-        Ok(())
-    }
-
-    pub async fn get_storage_size_dirty_marker(
-        &self,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<Option<StorageScanDirtyMarker>> {
-        let mut txn = self.begin().await?;
-        let dirty_key = self.key(&encode_worker_storage_scan_dirty_key(keyspace, db_id));
-        let marker = tikv_op!(txn.get(dirty_key).await)?
-            .as_deref()
-            .and_then(decode_storage_scan_dirty_marker);
-        txn.rollback().await.ok();
-        Ok(marker)
-    }
-
-    pub async fn clear_storage_size_dirty_if_version(
-        &self,
-        keyspace: &str,
-        db_id: u64,
-        version: u64,
-    ) -> Result<bool> {
-        let mut txn = self.begin().await?;
-        let dirty_key = self.key(&encode_worker_storage_scan_dirty_key(keyspace, db_id));
-        let current = tikv_op!(txn.get_for_update(dirty_key.clone()).await)?;
-        let Some(marker) = current
-            .as_deref()
-            .and_then(decode_storage_scan_dirty_marker)
-        else {
-            txn.rollback().await.ok();
-            return Ok(false);
-        };
-        if marker.version != version {
-            txn.rollback().await.ok();
-            return Ok(false);
-        }
-
-        txn_delete(&mut txn, dirty_key).await?;
-        if let Some(mut entry) = self.get_worker_registry(&mut txn, keyspace, db_id).await? {
-            entry.task_types &= !TASK_TYPE_STORAGE_SIZE_SCAN;
-            self.put_worker_registry(&mut txn, &entry).await?;
-        }
-        txn.commit().await?;
-        Ok(true)
     }
 
     // ========================================================================
@@ -2081,16 +1954,9 @@ mod tests {
         let delete_pos = helper
             .find("delete_worker_registry(&mut txn, keyspace, db_id)")
             .expect("helper must delete registry after queue reap");
-        let dirty_pos = helper
-            .find("delete_storage_size_dirty_marker(&mut txn, keyspace, db_id)")
-            .expect("helper must delete storage dirty marker before registry delete");
         assert!(
             reap_pos < delete_pos,
             "registry row must be deleted only after queue reap succeeds"
-        );
-        assert!(
-            reap_pos < dirty_pos && dirty_pos < delete_pos,
-            "DROP DATABASE reap must delete the storage dirty marker in the same final cleanup before deleting registry"
         );
     }
 
@@ -2108,30 +1974,18 @@ mod tests {
     }
 
     #[test]
-    fn storage_dirty_producers_are_dropped_db_tombstone_fenced() {
+    fn storage_dirty_marker_producers_are_removed() {
         let source = include_str!("worker.rs");
-        let mark_fn = source
-            .split("pub async fn mark_storage_size_dirty_in_txn")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("pub async fn get_storage_size_dirty_marker")
-                    .next()
-            })
-            .expect("mark_storage_size_dirty_in_txn must exist");
-        let fence_pos = mark_fn
-            .find("dropped_db_tombstone_exists_for_update(txn, keyspace, db_id)")
-            .expect("storage dirty marker writes must fence on the dropped-DB tombstone");
-        let dirty_pos = mark_fn
-            .find("encode_worker_storage_scan_dirty_key(keyspace, db_id)")
-            .expect("storage dirty marker key must be written");
-        let registry_pos = mark_fn
-            .find(
-                "update_registry_task_types(txn, keyspace, db_id, TASK_TYPE_STORAGE_SIZE_SCAN, 0)",
-            )
-            .expect("storage dirty marker must update registry only after the fence");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("worker.rs must contain #[cfg(test)]");
         assert!(
-            fence_pos < dirty_pos && dirty_pos < registry_pos,
-            "storage dirty marker and registry writes must happen after the tombstone fence"
+            !prod_source.contains("mark_storage_size_dirty")
+                && !prod_source.contains("get_storage_size_dirty_marker")
+                && !prod_source.contains("clear_storage_size_dirty_if_version")
+                && !prod_source.contains("encode_worker_storage_scan_dirty_key"),
+            "storage-size dirty marker producer/API/key path must stay removed"
         );
 
         let singleton_fn = source

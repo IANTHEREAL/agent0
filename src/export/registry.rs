@@ -709,4 +709,26 @@ mod tests {
         // No stats cached for a random keyspace/db_id → should return 0.
         assert_eq!(estimate_database_size("nonexistent-ks", 999999), 0);
     }
+
+    #[test]
+    fn estimate_database_size_returns_pd_region_estimate() {
+        let keyspace = "export-pd-estimate-test";
+        let db_id = 424242;
+        let estimate = 17 * 1024 * 1024;
+        crate::storage_stats::global_storage_stats_cache().put(
+            keyspace,
+            db_id,
+            crate::storage_stats::DbStorageStats::pd_region_estimate(
+                db_id,
+                estimate,
+                4,
+                1,
+                123,
+                1700000000000,
+                25,
+            ),
+        );
+
+        assert_eq!(estimate_database_size(keyspace, db_id), estimate);
+    }
 }

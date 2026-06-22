@@ -36,7 +36,6 @@ pub(super) async fn check_observability_statement_permission(
             if tag == "COMMIT" {
                 executor.flush_trigger_activations();
                 executor.flush_pending_hnsw_merges();
-                executor.flush_pending_storage_dirty();
                 executor.flush_pending_init_cache_invalidation();
             } else {
                 executor.clear_trigger_activations();
@@ -354,7 +353,6 @@ impl Executor {
             if is_autocommit {
                 match res {
                     Ok((notices, result)) => {
-                        self.note_storage_dirty_if_tables_changed(db_id, &statement_dirty_tables);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         if is_observability_query {
                             session.rollback().await?;
@@ -367,7 +365,6 @@ impl Executor {
                             session.commit().await?;
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
-                            self.flush_pending_storage_dirty();
                             self.flush_pending_init_cache_invalidation();
                         }
                         let mut stmt_results = notices;
@@ -427,7 +424,6 @@ impl Executor {
             } else {
                 match res {
                     Ok((notices, result)) => {
-                        self.note_storage_dirty_if_tables_changed(db_id, &statement_dirty_tables);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         session.note_statement_success_in_transaction();
                         if matches!(result, ExecuteResult::AlterRole | ExecuteResult::DropRole) {

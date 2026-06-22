@@ -3,6 +3,7 @@ pub mod config;
 pub mod engine;
 pub mod gc;
 pub mod metrics;
+pub(crate) mod pd_region_stats;
 pub mod types;
 
 use crate::storage::TikvStore;
@@ -324,7 +325,7 @@ pub fn get_worker_metrics() -> Option<&'static Arc<metrics::WorkerMetrics>> {
 }
 
 /// Build an HTTP client for PD API calls, with mutual TLS if configured.
-fn build_pd_client() -> Result<reqwest::Client> {
+pub(crate) fn build_pd_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
 
     if let (Ok(ca), Ok(cert_path), Ok(key_path)) = (
@@ -356,7 +357,7 @@ fn build_pd_client() -> Result<reqwest::Client> {
 }
 
 /// PD API base URL (HTTPS when TLS is configured, HTTP otherwise).
-fn pd_base_url(pd_endpoint: &str) -> String {
+pub(crate) fn pd_base_url(pd_endpoint: &str) -> String {
     if std::env::var("TIKV_CA_PATH").is_ok() {
         format!("https://{}", pd_endpoint)
     } else {

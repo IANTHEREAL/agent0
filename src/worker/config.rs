@@ -22,13 +22,14 @@ const DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC: u64 = 60;
 const MIN_REGISTRY_SWEEP_INTERVAL_SEC: u64 = 1;
 const DEFAULT_SWEEP_PAGE_INTERVAL_SEC: u64 = 30;
 const MIN_SWEEP_PAGE_INTERVAL_SEC: u64 = 1;
-// Storage-size accounting (StorageSizeScan) re-reads the FULL key+value of every
-// database's entire data range just to sum logical sizes. Dirty markers enqueue
-// changed DBs quickly; this interval is now only the recovery fallback for missed
-// markers or disabled producer paths. Keep it much slower than the old 30-min
-// all-tenant scan while still self-healing within the same day.
+// Storage-size accounting (StorageSizeScan) refreshes a PD Region/MiB estimate
+// for each database. With the storage dirty-marker producer removed, this
+// interval is the only automatic refresh cadence; keep it much slower than the
+// old 30-min all-tenant scan while still self-healing within the same day.
 const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 21_600;
 const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
+const DEFAULT_STORAGE_SCAN_JITTER_SEC: u64 = 300;
+const DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS: u64 = 100;
 const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 
@@ -65,6 +66,8 @@ pub struct WorkerConfig {
     pub registry_sweep_interval_sec: u64,
     pub sweep_page_interval_sec: u64,
     pub storage_scan_interval_sec: u64,
+    pub storage_scan_jitter_sec: u64,
+    pub storage_scan_pd_rate_limit_ms: u64,
     pub registry_reconcile_batch_size: usize,
     pub system_keyspace: String,
 
@@ -99,6 +102,8 @@ impl Default for WorkerConfig {
             registry_sweep_interval_sec: DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC,
             sweep_page_interval_sec: DEFAULT_SWEEP_PAGE_INTERVAL_SEC,
             storage_scan_interval_sec: DEFAULT_STORAGE_SCAN_INTERVAL_SEC,
+            storage_scan_jitter_sec: DEFAULT_STORAGE_SCAN_JITTER_SEC,
+            storage_scan_pd_rate_limit_ms: DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS,
             registry_reconcile_batch_size: DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
 
@@ -347,6 +352,30 @@ impl WorkerConfig {
                 }
             }
         }
+        if let Ok(v) = env::var("DB9_WORKER_STORAGE_SCAN_JITTER_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) => cfg.storage_scan_jitter_sec = parsed,
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_STORAGE_SCAN_JITTER_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.storage_scan_jitter_sec
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS") {
+            match v.parse::<u64>() {
+                Ok(parsed) => cfg.storage_scan_pd_rate_limit_ms = parsed,
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS='{}' is not a valid integer; using default {}ms",
+                        v,
+                        cfg.storage_scan_pd_rate_limit_ms
+                    );
+                }
+            }
+        }
         if let Ok(v) = env::var("DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE") {
             cfg.registry_reconcile_batch_size = v
                 .parse::<u64>()
@@ -482,6 +511,8 @@ mod tests {
             "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC",
             "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC",
             "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC",
+            "DB9_WORKER_STORAGE_SCAN_JITTER_SEC",
+            "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS",
             "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE",
             "DB9_WORKER_SYSTEM_KEYSPACE",
         ];
@@ -518,6 +549,11 @@ mod tests {
         assert_eq!(
             cfg.storage_scan_interval_sec,
             DEFAULT_STORAGE_SCAN_INTERVAL_SEC
+        );
+        assert_eq!(cfg.storage_scan_jitter_sec, DEFAULT_STORAGE_SCAN_JITTER_SEC);
+        assert_eq!(
+            cfg.storage_scan_pd_rate_limit_ms,
+            DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS
         );
         assert_eq!(
             cfg.registry_reconcile_batch_size,
@@ -693,8 +729,38 @@ mod tests {
         assert_eq!(cfg.registry_sweep_interval_sec, 60);
         assert_eq!(cfg.sweep_page_interval_sec, 30);
         assert_eq!(cfg.storage_scan_interval_sec, 21_600);
+        assert_eq!(cfg.storage_scan_jitter_sec, 300);
+        assert_eq!(cfg.storage_scan_pd_rate_limit_ms, 100);
         assert_eq!(cfg.registry_reconcile_batch_size, 32);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
+    }
+
+    #[test]
+    fn from_env_applies_storage_scan_jitter_and_pd_rate_limit() {
+        let _guard = test_lock().lock();
+
+        let jitter_key = "DB9_WORKER_STORAGE_SCAN_JITTER_SEC";
+        let rate_key = "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS";
+        let jitter_saved = env::var(jitter_key).ok();
+        let rate_saved = env::var(rate_key).ok();
+
+        unsafe {
+            env::set_var(jitter_key, "17");
+            env::set_var(rate_key, "250");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.storage_scan_jitter_sec, 17);
+        assert_eq!(cfg.storage_scan_pd_rate_limit_ms, 250);
+
+        match jitter_saved {
+            Some(v) => unsafe { env::set_var(jitter_key, v) },
+            None => unsafe { env::remove_var(jitter_key) },
+        }
+        match rate_saved {
+            Some(v) => unsafe { env::set_var(rate_key, v) },
+            None => unsafe { env::remove_var(rate_key) },
+        }
     }
 
     #[test]

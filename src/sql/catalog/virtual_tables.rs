@@ -79,10 +79,15 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
         "_DB9_SYS_STORAGE_STATS" => vec![
             col("database_id", DataType::Int64),
             col("database_name", DataType::Text),
-            col("data_bytes", DataType::Int64),
-            col("index_bytes", DataType::Int64),
-            col("metadata_bytes", DataType::Int64),
+            col("stats_source", DataType::Text),
+            col("breakdown_available", DataType::Boolean),
+            col_nullable("data_bytes", DataType::Int64),
+            col_nullable("index_bytes", DataType::Int64),
+            col_nullable("metadata_bytes", DataType::Int64),
             col("total_bytes", DataType::Int64),
+            col("region_count", DataType::Int64),
+            col("empty_region_count", DataType::Int64),
+            col("storage_keys", DataType::Int64),
             col_nullable("scanned_at", DataType::Text),
             col("scan_duration_ms", DataType::Int64),
         ],
@@ -156,6 +161,22 @@ mod tests {
             .find(|c| c.name == "error_msg")
             .unwrap();
         assert!(error_msg.nullable);
+    }
+
+    #[test]
+    fn storage_stats_schema_marks_pd_breakdown_unavailable_explicitly() {
+        let schema = virtual_table_schema("_DB9_SYS_STORAGE_STATS").unwrap();
+        let names: Vec<_> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"stats_source"));
+        assert!(names.contains(&"breakdown_available"));
+        assert!(names.contains(&"region_count"));
+        assert!(names.contains(&"empty_region_count"));
+        assert!(names.contains(&"storage_keys"));
+
+        for name in ["data_bytes", "index_bytes", "metadata_bytes"] {
+            let col = schema.columns.iter().find(|c| c.name == name).unwrap();
+            assert!(col.nullable, "{name} must be nullable for PD estimate rows");
+        }
     }
 
     #[test]

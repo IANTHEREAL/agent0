@@ -10,7 +10,7 @@ use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
-use crate::storage::{CronClaimOutcome, StorageScanDirtyMarker, TikvStore, WqIndexRow};
+use crate::storage::{CronClaimOutcome, TikvStore, WqIndexRow};
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 
@@ -1094,45 +1094,25 @@ impl WorkerEngine {
         }
 
         let kind = RegistrySweepKind::StorageScan;
-        let storage_dirty = self
-            .system_store
-            .get_storage_size_dirty_marker(&entry.keyspace, entry.db_id)
-            .await;
-        match storage_dirty {
-            Ok(Some(_)) => {
-                let result =
-                    enqueue_storage_scan(&self.system_store, &entry.keyspace, entry.db_id).await;
-                self.record_registry_sweep_kind_result(entry, kind, result)
-                    .await;
-            }
-            Ok(None) => {
-                if !self
-                    .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
-                    .await
-                {
-                    let result = async {
-                        if self.storage_scan_due(store, entry.db_id).await? {
-                            enqueue_storage_scan(&self.system_store, &entry.keyspace, entry.db_id)
-                                .await?;
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await;
-                    self.record_registry_sweep_kind_result(entry, kind, result)
-                        .await;
+        if !self
+            .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
+            .await
+        {
+            let result = async {
+                if self.storage_scan_due(store, entry.db_id).await? {
+                    enqueue_storage_scan_with_jitter(
+                        &self.system_store,
+                        &entry.keyspace,
+                        entry.db_id,
+                        self.config.storage_scan_jitter_sec,
+                    )
+                    .await?;
                 }
+                Ok::<(), anyhow::Error>(())
             }
-            Err(e) => {
-                self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
-                    .await;
-                warn!(
-                    keyspace = %entry.keyspace,
-                    db_id = entry.db_id,
-                    kind = kind.label(),
-                    "Worker registry sweep task failed: {}",
-                    e
-                );
-            }
+            .await;
+            self.record_registry_sweep_kind_result(entry, kind, result)
+                .await;
         }
 
         Ok(outcome)
@@ -2796,16 +2776,12 @@ impl WorkerEngine {
         let lease_cancel = crate::worker::LeaseCancel::new(shutdown_signal.clone());
 
         if entry.task_type == TaskType::StorageSizeScan {
-            let system_store = crate::worker::system_store()?.clone();
-            let dirty_marker = system_store
-                .get_storage_size_dirty_marker(&entry.keyspace, entry.db_id)
-                .await?;
             execute_storage_size_scan(
-                &system_store,
                 &store,
                 &entry.keyspace,
                 entry.db_id,
-                dirty_marker,
+                pool.pd_endpoints(),
+                config.storage_scan_pd_rate_limit_ms,
                 &lease_cancel,
             )
             .await?;
@@ -3522,180 +3498,65 @@ where
     }
 }
 
-/// Page size for storage size scan: keys per TiKV scan request.
-const STORAGE_SCAN_PAGE_SIZE: u32 = 4096;
-
-/// Rate-limit sleep between scan pages to avoid interfering with foreground traffic.
-const STORAGE_SCAN_RATE_LIMIT_MS: u64 = 5;
-
 /// Execute a storage size scan for a single database.
 ///
-/// Performs a full paginated range scan over `[d_{db_id}_, d_{db_id+1}_)`,
-/// classifies each key by prefix, and accumulates logical sizes (key.len + value.len).
-/// Results are persisted to TiKV and cached in memory.
+/// Uses PD Region stats over DB9's encoded database key range. PD returns a
+/// whole-Region physical/MVCC estimate in MiB; this path intentionally does not
+/// provide exact data/index/table breakdowns and does not fall back to a tenant
+/// KV scan on PD failure.
 async fn execute_storage_size_scan(
-    system_store: &Arc<TikvStore>,
     store: &Arc<TikvStore>,
     keyspace: &str,
     db_id: u64,
-    dirty_marker: Option<StorageScanDirtyMarker>,
+    pd_endpoints: &[String],
+    pd_rate_limit_ms: u64,
     lease_cancel: &crate::worker::LeaseCancel,
 ) -> Result<()> {
-    use crate::storage::encode_database_data_range;
     use crate::storage_stats::{
-        classify_key, global_storage_stats_cache, parse_legacy_hnsw_table_id,
-        serialize_storage_stats, DbStorageStats, KeyCategory, TableStorageStats,
+        global_storage_stats_cache, serialize_storage_stats, DbStorageStats,
     };
-    use tikv_client::BoundRange;
 
     let scan_start = std::time::Instant::now();
-    let (range_start, range_end) = encode_database_data_range(db_id);
-
-    let mut data_bytes: u64 = 0;
-    let mut index_bytes: u64 = 0;
-    let mut metadata_bytes: u64 = 0;
-    let mut table_stats: std::collections::HashMap<u64, TableStorageStats> =
-        std::collections::HashMap::new();
-
-    let mut txn = store.begin_optimistic().await?;
-    // This snapshot spans the full paginated scan (including rate-limit sleeps),
-    // so it must participate in GC safepoint protection like other worker txns.
-    let _txn_guard = crate::worker::active_txn_registry::global_registry()
-        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
-    let mut cursor = range_start;
-
-    loop {
-        let range: BoundRange = (cursor.clone()..range_end.clone()).into();
-        let kv_pairs: Vec<tikv_client::KvPair> =
-            txn.scan(range, STORAGE_SCAN_PAGE_SIZE).await?.collect();
-        let page_count = kv_pairs.len();
-
-        if page_count == 0 {
-            break;
+    crate::worker::pd_region_stats::enforce_pd_stats_rate_limit(pd_rate_limit_ms).await;
+    let pd = match crate::worker::pd_region_stats::fetch_database_region_stats(
+        pd_endpoints,
+        keyspace,
+        db_id,
+    )
+    .await
+    {
+        Ok(pd) => pd,
+        Err(e) => {
+            metrics::counter!(
+                "db9_server_worker_storage_pd_region_stats_total",
+                "result" => "err",
+            )
+            .increment(1);
+            warn!(
+                keyspace,
+                db_id,
+                "PD Region storage stats failed; leaving previous storage stats intact: {}",
+                e
+            );
+            return Err(e.context("PD Region storage stats failed"));
         }
-
-        for pair in &kv_pairs {
-            let key: Vec<u8> = pair.key().clone().into();
-            let value: &[u8] = pair.value();
-            let entry_bytes = (key.len() + value.len()) as u64;
-
-            let classification = classify_key(&key);
-            match classification.category {
-                KeyCategory::Data => {
-                    data_bytes += entry_bytes;
-                    if let Some(table_id) = classification.table_id {
-                        let ts = table_stats
-                            .entry(table_id)
-                            .or_insert_with(|| TableStorageStats {
-                                table_id,
-                                ..Default::default()
-                            });
-                        ts.data_bytes += entry_bytes;
-                    }
-                }
-                KeyCategory::Index => {
-                    index_bytes += entry_bytes;
-                    if let Some(table_id) = classification.table_id {
-                        let ts = table_stats
-                            .entry(table_id)
-                            .or_insert_with(|| TableStorageStats {
-                                table_id,
-                                ..Default::default()
-                            });
-                        ts.index_bytes += entry_bytes;
-                    }
-                }
-                KeyCategory::Metadata => {
-                    metadata_bytes += entry_bytes;
-                }
-                KeyCategory::Unknown => {
-                    metadata_bytes += entry_bytes;
-                }
-            }
-        }
-
-        let last_key: Vec<u8> = kv_pairs.last().unwrap().key().clone().into();
-        cursor = last_key;
-        cursor.push(0x00);
-
-        if (page_count as u32) < STORAGE_SCAN_PAGE_SIZE {
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(STORAGE_SCAN_RATE_LIMIT_MS)).await;
-    }
-
-    // Legacy: HNSW index KV is encoded as string keys (decimal IDs) outside the
-    // v2 database range, so we need an extra scan for those bytes.
-    //
-    // Example prefix: `d_{db_id}_hnsw_...`
-    let hnsw_prefix: Vec<u8> = format!("d_{db_id}_hnsw_").into_bytes();
-    let mut hnsw_end = hnsw_prefix.clone();
-    if let Some(last) = hnsw_end.last_mut() {
-        *last = last.wrapping_add(1);
-    }
-    let mut hnsw_cursor = hnsw_prefix.clone();
-
-    loop {
-        let range: BoundRange = (hnsw_cursor.clone()..hnsw_end.clone()).into();
-        let kv_pairs: Vec<tikv_client::KvPair> =
-            txn.scan(range, STORAGE_SCAN_PAGE_SIZE).await?.collect();
-        let page_count = kv_pairs.len();
-
-        if page_count == 0 {
-            break;
-        }
-
-        for pair in &kv_pairs {
-            let key: Vec<u8> = pair.key().clone().into();
-            let value: &[u8] = pair.value();
-            let entry_bytes = (key.len() + value.len()) as u64;
-
-            index_bytes += entry_bytes;
-
-            // Best-effort table attribution for legacy HNSW keys.
-            if key.len() >= hnsw_prefix.len() && key[..hnsw_prefix.len()] == hnsw_prefix[..] {
-                if let Some(table_id) = parse_legacy_hnsw_table_id(&key[hnsw_prefix.len()..]) {
-                    let ts = table_stats
-                        .entry(table_id)
-                        .or_insert_with(|| TableStorageStats {
-                            table_id,
-                            ..Default::default()
-                        });
-                    ts.index_bytes += entry_bytes;
-                }
-            }
-        }
-
-        let last_key: Vec<u8> = kv_pairs.last().unwrap().key().clone().into();
-        hnsw_cursor = last_key;
-        hnsw_cursor.push(0x00);
-
-        if (page_count as u32) < STORAGE_SCAN_PAGE_SIZE {
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(STORAGE_SCAN_RATE_LIMIT_MS)).await;
-    }
-
-    // Read-only transaction — just drop it, no commit needed.
-    txn.rollback().await.ok();
+    };
 
     let scan_duration_ms = scan_start.elapsed().as_millis() as i64;
     let scanned_at_ms = now_epoch_ms();
 
-    let stats = DbStorageStats {
-        database_id: db_id,
-        data_bytes,
-        index_bytes,
-        metadata_bytes,
-        tables: table_stats,
+    let stats = DbStorageStats::pd_region_estimate(
+        db_id,
+        pd.stats.total_bytes_estimate(),
+        pd.stats.count,
+        pd.stats.empty_count,
+        pd.stats.storage_keys,
         scanned_at_ms,
         scan_duration_ms,
-    };
+    );
 
     // Lease fence before the only tenant write in this path: if the claim lease
-    // was lost/stolen during the (potentially long, rate-limited) scan, abandon
+    // was lost/stolen during the PD lookup / rate-limit wait, abandon
     // the stats persist so the new owner can re-run it. Returning here leaves the
     // task for the new owner exactly as the generic run_with_guards path bails.
     lease_cancel.bail_if_cancelled()?;
@@ -3709,44 +3570,24 @@ async fn execute_storage_size_scan(
         .await?;
     persist_txn.commit().await?;
 
-    if let Some(marker) = dirty_marker {
-        match system_store
-            .clear_storage_size_dirty_if_version(keyspace, db_id, marker.version)
-            .await
-        {
-            Ok(true) => {
-                debug!(
-                    keyspace,
-                    db_id,
-                    dirty_version = marker.version,
-                    "Storage size dirty marker cleared after scan"
-                );
-            }
-            Ok(false) => {
-                debug!(
-                    keyspace,
-                    db_id,
-                    dirty_version = marker.version,
-                    "Storage size dirty marker changed during scan; leaving it for a follow-up scan"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    keyspace,
-                    db_id,
-                    dirty_version = marker.version,
-                    "Storage size scan persisted stats but failed to clear dirty marker: {}",
-                    e
-                );
-            }
-        }
-    }
-
     global_storage_stats_cache().put(keyspace, db_id, stats);
+    metrics::counter!(
+        "db9_server_worker_storage_pd_region_stats_total",
+        "result" => "ok",
+    )
+    .increment(1);
 
     info!(
         db_id,
-        data_bytes, index_bytes, metadata_bytes, scan_duration_ms, "Storage size scan complete"
+        keyspace,
+        keyspace_id = pd.keyspace_id,
+        region_count = pd.stats.count,
+        empty_region_count = pd.stats.empty_count,
+        storage_size_mib = pd.stats.storage_size_mib,
+        storage_keys = pd.stats.storage_keys,
+        total_bytes_estimate = pd.stats.total_bytes_estimate(),
+        scan_duration_ms,
+        "Storage size PD Region estimate complete"
     );
 
     Ok(())
@@ -3760,6 +3601,32 @@ pub(crate) async fn enqueue_storage_scan(
     keyspace: &str,
     db_id: u64,
 ) -> Result<()> {
+    enqueue_storage_scan_at(system_store, keyspace, db_id, 0).await
+}
+
+async fn enqueue_storage_scan_with_jitter(
+    system_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+    jitter_sec: u64,
+) -> Result<()> {
+    use rand::Rng;
+
+    let delay_ms = if jitter_sec == 0 {
+        0
+    } else {
+        rand::thread_rng().gen_range(0..=jitter_sec.saturating_mul(1000))
+    };
+    let fire_time = now_epoch_ms().saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
+    enqueue_storage_scan_at(system_store, keyspace, db_id, fire_time).await
+}
+
+async fn enqueue_storage_scan_at(
+    system_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+    fire_time: i64,
+) -> Result<()> {
     use rand::Rng;
 
     let mut entry = TaskQueueEntry::new(
@@ -3772,7 +3639,6 @@ pub(crate) async fn enqueue_storage_scan(
         200, // low priority — background housekeeping
     );
     entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
-    let fire_time = 0;
     let mut txn = system_store.begin().await?;
     if !system_store
         .enqueue_singleton_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)

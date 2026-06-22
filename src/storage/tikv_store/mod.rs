@@ -40,7 +40,7 @@ pub mod worker;
 pub use cron::CronClaimOutcome;
 pub use ddl_journal::{DdlJournalEntry, DdlOperation};
 pub use tables::RowScanCursor;
-pub use worker::{StorageScanDirtyMarker, WqIndexRow};
+pub use worker::WqIndexRow;
 
 // Import helper functions for tests
 #[cfg(test)]

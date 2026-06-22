@@ -428,7 +428,6 @@ impl Executor {
             if is_autocommit {
                 match res {
                     Ok(PreparedTxnResult::Executed(result)) => {
-                        self.note_storage_dirty_if_tables_changed(db_id, &statement_dirty_tables);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         if is_observability_query {
                             session.rollback().await?;
@@ -441,7 +440,6 @@ impl Executor {
                             session.commit().await?;
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
-                            self.flush_pending_storage_dirty();
                             self.flush_pending_init_cache_invalidation();
                         }
                         return Ok(ExecuteResults::single(result));
@@ -512,7 +510,6 @@ impl Executor {
             } else {
                 return match res? {
                     PreparedTxnResult::Executed(result) => {
-                        self.note_storage_dirty_if_tables_changed(db_id, &statement_dirty_tables);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         Ok(ExecuteResults::single(result))
                     }
@@ -1082,7 +1079,6 @@ impl Executor {
                     session.commit().await?;
                     self.flush_trigger_activations();
                     self.flush_pending_hnsw_merges();
-                    self.flush_pending_storage_dirty();
                 }
                 prepared_stmt
             }
