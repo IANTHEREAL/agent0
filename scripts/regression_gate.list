@@ -107,6 +107,7 @@ tests/104_write_conflict_retry.sql
 tests/120_savepoint_trigger_enqueue_undo_issue34.sql
 tests/123_copy_from_stdin_txn_savepoint_issue32.sql
 tests/124_copy_from_stdin_autocommit_atomic_issue32.sql
+tests/2638_database_activity_sql_surface.sql
 # NULL / operator semantics (correctness-critical)
 tests/121_any_all_null_3vl_issue43.sql
 tests/136_and_or_nullif.sql

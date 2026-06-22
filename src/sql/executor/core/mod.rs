@@ -177,6 +177,32 @@ impl Executor {
         &self.observability
     }
 
+    fn record_sql_activity(
+        &self,
+        session: &Session,
+        kind: crate::database_activity::DatabaseActivityKind,
+    ) {
+        crate::database_activity::record_sql_activity(
+            self.tenant_keyspace(),
+            session.current_database_id(),
+            kind,
+        );
+    }
+
+    fn record_sql_modified_after_success(&self, session: &mut Session, modified: bool) {
+        if !modified {
+            return;
+        }
+        if session.is_in_transaction() {
+            session.note_transaction_activity_modified();
+        } else {
+            self.record_sql_activity(
+                session,
+                crate::database_activity::DatabaseActivityKind::Modified,
+            );
+        }
+    }
+
     pub fn tenant_memory_accountant(&self) -> &TenantMemoryAccountant {
         &self.tenant_memory_accountant
     }

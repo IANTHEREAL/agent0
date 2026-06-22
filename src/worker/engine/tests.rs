@@ -391,8 +391,8 @@ fn execute_task_applies_timeout_to_whole_worker_transaction() {
         "execute_task must compute a task-scoped deadline"
     );
     assert!(
-        execute_task_source.contains("let _ = fut.await?;"),
-        "individual statements must execute without per-statement timeout wrapping"
+        execute_task_source.contains("let result = fut.await?;"),
+        "individual statements must execute without per-statement timeout wrapping while preserving the statement result"
     );
     assert!(
         execute_task_source.contains("run_with_guards(")

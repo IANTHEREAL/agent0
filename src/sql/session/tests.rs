@@ -1694,6 +1694,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transaction_activity_modified_rollback_to_savepoint_restores_snapshot() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_activity_modified_sp");
+        let mut session =
+            Session::new_with_database(store, observability, 1, 1, "postgres".to_string(), 0, 0)
+                .unwrap();
+
+        session.force_test_transaction_state(true, false);
+        session.push_transaction_activity_modified_savepoint("sp1".to_string());
+        session.note_transaction_activity_modified();
+        assert!(session.transaction_activity_modified());
+
+        session.rollback_transaction_activity_modified_to_savepoint("sp1");
+        assert!(!session.transaction_activity_modified());
+    }
+
+    #[test]
+    fn transaction_activity_modified_release_savepoint_keeps_current_state() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_activity_modified_release");
+        let mut session =
+            Session::new_with_database(store, observability, 1, 1, "postgres".to_string(), 0, 0)
+                .unwrap();
+
+        session.force_test_transaction_state(true, false);
+        session.push_transaction_activity_modified_savepoint("sp1".to_string());
+        session.note_transaction_activity_modified();
+        session.push_transaction_activity_modified_savepoint("sp2".to_string());
+        session.release_transaction_activity_modified_savepoint("sp2");
+        session.rollback_transaction_activity_modified_to_savepoint("sp1");
+
+        assert!(!session.transaction_activity_modified());
+    }
+
     // --- bytea_output GUC validation (#1538) ---
 
     #[test]

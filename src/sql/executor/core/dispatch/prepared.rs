@@ -171,6 +171,30 @@ impl Executor {
         table_versions: &[(String, u64, u64)],
         rls_sensitive: bool,
     ) -> Result<ExecuteResults> {
+        self.execute_prepared_internal(
+            session,
+            sql,
+            exec,
+            params,
+            param_data_types,
+            table_versions,
+            rls_sensitive,
+            true,
+        )
+        .await
+    }
+
+    async fn execute_prepared_internal(
+        &self,
+        session: &mut Session,
+        sql: &str,
+        exec: &PreparedExec,
+        params: Vec<Option<Value>>,
+        param_data_types: &[DataType],
+        table_versions: &[(String, u64, u64)],
+        rls_sensitive: bool,
+        record_activity: bool,
+    ) -> Result<ExecuteResults> {
         if matches!(exec, PreparedExec::RawSqlUtility) {
             unreachable!("RawSqlUtility should not be routed to execute_prepared")
         }
@@ -194,6 +218,7 @@ impl Executor {
             table_versions,
             rls_sensitive,
             &qctx,
+            record_activity,
         )
         .await
     }
@@ -223,9 +248,12 @@ impl Executor {
         table_versions: &[(String, u64, u64)],
         rls_sensitive: bool,
         qctx: &Arc<crate::sql::query_context::QueryContext>,
+        record_activity: bool,
     ) -> Result<ExecuteResults> {
         let savepoints = session.savepoints();
-        crate::sql::query_context::with_scoped_query_context(
+        let should_record_activity = record_activity
+            && (session.current_user() != Some(OBSERVABILITY_USER) || session.is_superuser());
+        let result = crate::sql::query_context::with_scoped_query_context(
             qctx.as_ref(),
             crate::txn::with_savepoints(savepoints, async {
                 let sql_stripped = strip_leading_sql_comments(sql);
@@ -293,7 +321,14 @@ impl Executor {
                 exec_result
             }),
         )
-        .await
+        .await;
+        if result.is_ok() && should_record_activity {
+            self.record_sql_activity(
+                session,
+                crate::database_activity::DatabaseActivityKind::Active,
+            );
+        }
+        result
     }
 
     fn execute_prepared_with_runtime_context<'a>(
@@ -428,6 +463,8 @@ impl Executor {
             if is_autocommit {
                 match res {
                     Ok(PreparedTxnResult::Executed(result)) => {
+                        let statement_modified = !statement_dirty_tables.is_empty()
+                            || super::transaction::execute_result_modifies_database(&result);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         if is_observability_query {
                             session.rollback().await?;
@@ -441,6 +478,7 @@ impl Executor {
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
                             self.flush_pending_init_cache_invalidation();
+                            self.record_sql_modified_after_success(session, statement_modified);
                         }
                         return Ok(ExecuteResults::single(result));
                     }
@@ -510,7 +548,12 @@ impl Executor {
             } else {
                 return match res? {
                     PreparedTxnResult::Executed(result) => {
+                        let statement_modified = !statement_dirty_tables.is_empty()
+                            || super::transaction::execute_result_modifies_database(&result);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
+                        if statement_modified {
+                            session.note_transaction_activity_modified();
+                        }
                         Ok(ExecuteResults::single(result))
                     }
                     PreparedTxnResult::SchemaDrift {
@@ -1144,7 +1187,7 @@ impl Executor {
                 )?));
             }
 
-            self.execute_prepared(
+            self.execute_prepared_internal(
                 session,
                 &prepared.sql,
                 &prepared.exec,
@@ -1152,6 +1195,7 @@ impl Executor {
                 &prepared.param_data_types,
                 &prepared.table_versions,
                 prepared.rls_sensitive,
+                false,
             )
             .await
             .map(|r| r.into_vec())

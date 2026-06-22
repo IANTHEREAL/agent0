@@ -176,6 +176,10 @@ fn is_plan_cache_invalidating_ddl(stmt: &Statement) -> bool {
     )
 }
 
+pub(super) fn execute_result_modifies_database(result: &ExecuteResult) -> bool {
+    result.modifies_database()
+}
+
 // DDL can contend with background schema writers (e.g. CIC backfill phases).
 // Default retry budget; configurable via `db9.retry_max_attempts` GUC.
 #[cfg(test)]
@@ -353,6 +357,8 @@ impl Executor {
             if is_autocommit {
                 match res {
                     Ok((notices, result)) => {
+                        let statement_modified = !statement_dirty_tables.is_empty()
+                            || execute_result_modifies_database(&result);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         if is_observability_query {
                             session.rollback().await?;
@@ -366,6 +372,7 @@ impl Executor {
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
                             self.flush_pending_init_cache_invalidation();
+                            self.record_sql_modified_after_success(session, statement_modified);
                         }
                         let mut stmt_results = notices;
                         stmt_results.push(result);
@@ -424,7 +431,12 @@ impl Executor {
             } else {
                 match res {
                     Ok((notices, result)) => {
+                        let statement_modified = !statement_dirty_tables.is_empty()
+                            || execute_result_modifies_database(&result);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
+                        if statement_modified {
+                            session.note_transaction_activity_modified();
+                        }
                         session.note_statement_success_in_transaction();
                         if matches!(result, ExecuteResult::AlterRole | ExecuteResult::DropRole) {
                             self.mark_init_cache_invalidation_pending();

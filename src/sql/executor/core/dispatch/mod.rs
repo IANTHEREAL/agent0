@@ -118,7 +118,9 @@ impl Executor {
         let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
         let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
         let savepoints = session.savepoints();
-        crate::sql::query_context::with_scoped_query_context(
+        let should_record_activity =
+            session.current_user() != Some(OBSERVABILITY_USER) || session.is_superuser();
+        let result = crate::sql::query_context::with_scoped_query_context(
             &qctx,
             crate::txn::with_savepoints(savepoints, async {
                 // Attach SQL + start_ts to the per-statement memory scope for the
@@ -166,7 +168,14 @@ impl Executor {
                 self.dispatch_parsed_statements(session, sql, &ctx).await
             }),
         )
-        .await
+        .await;
+        if result.is_ok() && should_record_activity {
+            self.record_sql_activity(
+                session,
+                crate::database_activity::DatabaseActivityKind::Active,
+            );
+        }
+        result
     }
 }
 
@@ -367,6 +376,30 @@ mod tests {
         assert_eq!(after.errors, before.errors + errors_delta);
     }
 
+    #[derive(Default)]
+    struct RecordingActivitySink {
+        events: parking_lot::Mutex<Vec<crate::database_activity::DatabaseActivityEvent>>,
+    }
+
+    impl crate::database_activity::DatabaseActivitySink for RecordingActivitySink {
+        fn try_record(&self, event: crate::database_activity::DatabaseActivityEvent) -> Result<()> {
+            self.events.lock().push(event);
+            Ok(())
+        }
+    }
+
+    fn activity_events_for_keyspace(
+        sink: &RecordingActivitySink,
+        keyspace: &str,
+    ) -> Vec<crate::database_activity::DatabaseActivityEvent> {
+        sink.events
+            .lock()
+            .iter()
+            .filter(|event| event.tenant_keyspace.as_ref() == keyspace)
+            .cloned()
+            .collect()
+    }
+
     static NEXT_TEST_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
     fn run_async_on_large_stack<F>(future: F) -> F::Output
@@ -447,7 +480,7 @@ mod tests {
     /// T1: failed-txn precheck allows ROLLBACK.
     #[test]
     fn t1_failed_txn_precheck_gate_allows_rollback() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             assert_failed_txn_gate_allows("ROLLBACK").await;
         });
     }
@@ -455,7 +488,7 @@ mod tests {
     /// T1: failed-txn precheck allows COMMIT.
     #[test]
     fn t1_failed_txn_precheck_gate_allows_commit() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             assert_failed_txn_gate_allows("COMMIT").await;
         });
     }
@@ -463,7 +496,7 @@ mod tests {
     /// T1: failed-txn precheck allows END.
     #[test]
     fn t1_failed_txn_precheck_gate_allows_end() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             assert_failed_txn_gate_allows("END TRANSACTION").await;
         });
     }
@@ -471,7 +504,7 @@ mod tests {
     /// T1 (continued): other statements are blocked by the precheck.
     #[test]
     fn t1_failed_txn_precheck_gate_blocks_other_statements() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN", "SET x = 1"] {
                 let (exec, mut session, _) = make_executor_and_session(false);
                 session.force_test_transaction_state(true, true);
@@ -490,7 +523,7 @@ mod tests {
     /// T2: failed-txn precheck records a failure for non-observability user.
     #[test]
     fn t2_failed_txn_precheck_records_failure_for_non_observability_user() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             let (exec, mut session, obs) = make_executor_and_session(false);
             session.force_test_transaction_state(true, true);
             let before = obs_counts(&obs);
@@ -507,7 +540,7 @@ mod tests {
     /// T2 (continued): observability user does not get precheck observability record.
     #[test]
     fn t2_failed_txn_precheck_no_record_for_observability_user() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             let (exec, mut session, obs) = make_executor_and_session(true);
             session.force_test_transaction_state(true, true);
             let before = obs_counts(&obs);
@@ -536,7 +569,7 @@ mod tests {
     /// T4: RESET success goes through passthrough dispatch (no raw instrumentation).
     #[test]
     fn t4_reset_success_passthrough_without_raw_instrumentation() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             let (exec, mut session, obs) = make_executor_and_session(false);
             session.force_test_transaction_state(true, false);
             let before = obs_counts(&obs);
@@ -584,7 +617,7 @@ mod tests {
     /// SQL matching `get_unsupported_reason` returns Unsupported immediately.
     #[test]
     fn t6_unsupported_remap_short_circuits() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             let (exec, mut session, obs) = make_executor_and_session(false);
             session.force_test_transaction_state(true, false);
             let before = obs_counts(&obs);
@@ -603,7 +636,7 @@ mod tests {
     /// Non-observability user: record zero-duration failure, then mark failed.
     #[test]
     fn t7_ordinary_parse_error_records_then_marks() {
-        run_async_on_large_stack(async {
+        run_async_on_large_stack(async move {
             let (exec, mut session, obs) = make_executor_and_session(false);
             session.force_test_transaction_state(true, false);
             let before = obs_counts(&obs);
@@ -636,5 +669,73 @@ mod tests {
             assert!(session.is_transaction_failed());
             assert_obs_delta(&obs, before, 0, 0);
         });
+    }
+
+    #[test]
+    fn successful_statement_records_active_activity() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
+        run_async_on_large_stack(async move {
+            let (exec, mut session, _) = make_executor_and_session(false);
+            let keyspace = exec.tenant_keyspace().to_string();
+
+            exec.execute_single(&mut session, "RESET TIMEZONE")
+                .await
+                .expect("RESET should succeed");
+
+            let events = activity_events_for_keyspace(&sink, &keyspace);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].kind,
+                crate::database_activity::DatabaseActivityKind::Active
+            );
+            assert_eq!(events[0].database_id, 1);
+            assert_eq!(events[0].tenant_keyspace.as_ref(), keyspace);
+        });
+    }
+
+    #[test]
+    fn failed_statement_does_not_record_activity() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
+        run_async_on_large_stack(async move {
+            let (exec, mut session, _) = make_executor_and_session(false);
+            let keyspace = exec.tenant_keyspace().to_string();
+
+            exec.execute_single(&mut session, "SELCT typo")
+                .await
+                .expect_err("syntax error should fail");
+
+            assert!(activity_events_for_keyspace(&sink, &keyspace).is_empty());
+        });
+    }
+
+    #[test]
+    fn modified_activity_emits_outside_transaction() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
+        let (exec, mut session, _) = make_executor_and_session(false);
+
+        exec.record_sql_modified_after_success(&mut session, true);
+
+        let events = sink.events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            crate::database_activity::DatabaseActivityKind::Modified
+        );
+    }
+
+    #[test]
+    fn modified_activity_is_pending_inside_transaction() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
+        let (exec, mut session, _) = make_executor_and_session(false);
+        session.force_test_transaction_state(true, false);
+
+        exec.record_sql_modified_after_success(&mut session, true);
+
+        assert!(sink.events.lock().is_empty());
+        assert!(session.transaction_activity_modified());
     }
 }

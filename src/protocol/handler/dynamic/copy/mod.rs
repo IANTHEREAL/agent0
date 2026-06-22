@@ -37,6 +37,48 @@ use super::super::rollback_autocommit_or_mark_failed;
 
 use helpers::{copy_display_table_name, parse_copy_input_line, should_add_copy_insert_context};
 
+fn copy_from_modified(
+    row_count: usize,
+    dirty_table_ids: &crate::session_context::TxnDirtyTableIds,
+) -> bool {
+    row_count > 0 || !dirty_table_ids.is_empty()
+}
+
+pub(super) fn record_copy_active(tenant_keyspace: &str, database_id: u64) {
+    crate::database_activity::record_sql_activity(
+        tenant_keyspace,
+        database_id,
+        crate::database_activity::DatabaseActivityKind::Active,
+    );
+}
+
+pub(super) fn record_copy_modified(tenant_keyspace: &str, database_id: u64) {
+    crate::database_activity::record_sql_activity(
+        tenant_keyspace,
+        database_id,
+        crate::database_activity::DatabaseActivityKind::Modified,
+    );
+}
+
+fn record_copy_from_success_activity(
+    session: &mut crate::sql::session::Session,
+    tenant_keyspace: &str,
+    database_id: u64,
+    started_txn: bool,
+    modified: bool,
+) {
+    record_copy_active(tenant_keyspace, database_id);
+    if !modified {
+        return;
+    }
+
+    if started_txn {
+        record_copy_modified(tenant_keyspace, database_id);
+    } else {
+        session.note_transaction_activity_modified();
+    }
+}
+
 async fn with_copy_statement_context<R: Send>(
     qctx: &crate::sql::query_context::QueryContext,
     runtime: &crate::sql::runtime_context::StatementRuntimeContext,
@@ -326,12 +368,14 @@ impl CopyHandler for DynamicPgHandler {
                         && accumulated_deferred_fk.is_empty()
                         && batch_rows_since_commit >= COPY_STDIN_COMMIT_SIZE
                     {
+                        let database_id = session.current_database_id();
                         session.commit().await.map_err(|e| {
                             user_error(
                                 "XX000",
                                 format!("COPY transaction rotation commit failed: {}", e),
                             )
                         })?;
+                        record_copy_modified(executor.tenant_keyspace(), database_id);
                         session.begin().await.map_err(|e| {
                             user_error(
                                 "XX000",
@@ -392,7 +436,9 @@ impl CopyHandler for DynamicPgHandler {
             ctx_guard.take()
         };
 
-        let (row_count, started_txn, dirty_table_ids) = if let Some(mut ctx) = ctx_opt {
+        let (row_count, started_txn, dirty_table_ids, had_copy_context) = if let Some(mut ctx) =
+            ctx_opt
+        {
             let executor = &self.auth().executor;
             let qctx = ctx.query_context.clone();
             let runtime = ctx.runtime_context.clone();
@@ -526,18 +572,34 @@ impl CopyHandler for DynamicPgHandler {
                 })
                 .await?;
             ctx.dirty_table_ids.extend(statement_dirty_tables);
-            (row_count, ctx.started_txn, ctx.dirty_table_ids)
+            (row_count, ctx.started_txn, ctx.dirty_table_ids, true)
         } else {
-            (0, false, crate::session_context::TxnDirtyTableIds::new())
+            (
+                0,
+                false,
+                crate::session_context::TxnDirtyTableIds::new(),
+                false,
+            )
         };
 
         let mut session = self.auth().session.lock().await;
+        let database_id = session.current_database_id();
+        let modified = copy_from_modified(row_count, &dirty_table_ids);
         session.note_transaction_dirty_tables(dirty_table_ids);
         if started_txn {
             session
                 .commit()
                 .await
                 .map_err(|e| user_error("XX000", e.to_string()))?;
+        }
+        if had_copy_context {
+            record_copy_from_success_activity(
+                &mut session,
+                self.auth().executor.tenant_keyspace(),
+                database_id,
+                started_txn,
+                modified,
+            );
         }
 
         client
@@ -597,11 +659,31 @@ impl CopyHandler for DynamicPgHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::with_copy_statement_context;
+    use super::{
+        copy_from_modified, record_copy_from_success_activity, with_copy_statement_context,
+    };
+    use crate::database_activity::{
+        install_test_database_activity_sink, DatabaseActivityEvent, DatabaseActivityKind,
+        DatabaseActivitySink,
+    };
     use crate::sql::query_context::QueryContext;
     use crate::sql::runtime_context::{RuntimeSettings, StatementRuntimeContext};
+    use anyhow::Result;
+    use parking_lot::Mutex;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[derive(Default)]
+    struct RecordingActivitySink {
+        events: Mutex<Vec<DatabaseActivityEvent>>,
+    }
+
+    impl DatabaseActivitySink for RecordingActivitySink {
+        fn try_record(&self, event: DatabaseActivityEvent) -> Result<()> {
+            self.events.lock().push(event);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn copy_statement_context_provides_full_statement_runtime_context() {
@@ -744,5 +826,78 @@ mod tests {
 
         let ((), dirty_tables) = result.expect("copy statement context should succeed");
         assert_eq!(dirty_tables, HashSet::from([42_u64]));
+    }
+
+    fn make_activity_session() -> crate::sql::session::Session {
+        let store = crate::storage::TikvStore::new_stub();
+        let observability = crate::observability::registry().tenant("copy_activity_test");
+        crate::sql::session::Session::new_with_user_and_database(
+            store,
+            observability,
+            "copy_user".to_string(),
+            false,
+            false,
+            1,
+            7,
+            "postgres".to_string(),
+            0,
+            0,
+        )
+        .expect("test session")
+    }
+
+    #[test]
+    fn copy_from_modified_requires_rows_or_dirty_tables() {
+        let mut dirty_table_ids = crate::session_context::TxnDirtyTableIds::new();
+        assert!(!copy_from_modified(0, &dirty_table_ids));
+
+        assert!(copy_from_modified(1, &dirty_table_ids));
+
+        dirty_table_ids.insert(42);
+        assert!(copy_from_modified(0, &dirty_table_ids));
+    }
+
+    #[test]
+    fn copy_from_success_records_active_and_defers_modified_inside_transaction() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = install_test_database_activity_sink(sink.clone());
+        let mut session = make_activity_session();
+        session.force_test_transaction_state(true, false);
+
+        record_copy_from_success_activity(&mut session, "copy_activity_test", 7, false, true);
+
+        let events = sink.events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, DatabaseActivityKind::Active);
+        drop(events);
+        assert!(session.transaction_activity_modified());
+    }
+
+    #[test]
+    fn copy_from_success_records_modified_after_autocommit() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = install_test_database_activity_sink(sink.clone());
+        let mut session = make_activity_session();
+
+        record_copy_from_success_activity(&mut session, "copy_activity_test", 7, true, true);
+
+        let events = sink.events.lock();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, DatabaseActivityKind::Active);
+        assert_eq!(events[1].kind, DatabaseActivityKind::Modified);
+        assert!(!session.transaction_activity_modified());
+    }
+
+    #[test]
+    fn empty_copy_from_success_records_active_only() {
+        let sink = Arc::new(RecordingActivitySink::default());
+        let _guard = install_test_database_activity_sink(sink.clone());
+        let mut session = make_activity_session();
+
+        record_copy_from_success_activity(&mut session, "copy_activity_test", 7, true, false);
+
+        let events = sink.events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, DatabaseActivityKind::Active);
     }
 }

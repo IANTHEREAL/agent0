@@ -111,6 +111,61 @@ pub enum ExecuteResult {
     },
 }
 
+impl ExecuteResult {
+    pub(crate) fn modifies_database(&self) -> bool {
+        match self {
+            ExecuteResult::CreateTable
+            | ExecuteResult::DropTable
+            | ExecuteResult::TruncateTable
+            | ExecuteResult::AlterTable
+            | ExecuteResult::AlterSequence
+            | ExecuteResult::AlterFunction
+            | ExecuteResult::AlterIndex
+            | ExecuteResult::CreateIndex
+            | ExecuteResult::DropIndex
+            | ExecuteResult::CreateView
+            | ExecuteResult::DropView
+            | ExecuteResult::CreateMaterializedView
+            | ExecuteResult::DropMaterializedView
+            | ExecuteResult::RefreshMaterializedView
+            | ExecuteResult::CreateProcedure
+            | ExecuteResult::DropProcedure
+            | ExecuteResult::CreateFunction
+            | ExecuteResult::DropFunction
+            | ExecuteResult::CreateTrigger
+            | ExecuteResult::DropTrigger
+            | ExecuteResult::CreateExtension
+            | ExecuteResult::DropExtension
+            | ExecuteResult::CreateRole
+            | ExecuteResult::AlterRole
+            | ExecuteResult::DropRole
+            | ExecuteResult::Grant
+            | ExecuteResult::Revoke => true,
+            ExecuteResult::Insert { affected_rows }
+            | ExecuteResult::Delete { affected_rows }
+            | ExecuteResult::Update { affected_rows } => *affected_rows > 0,
+            ExecuteResult::CommandComplete { tag } => command_tag_modifies_database(tag),
+            _ => false,
+        }
+    }
+}
+
+fn command_tag_modifies_database(tag: &str) -> bool {
+    if tag.eq_ignore_ascii_case("ALTER SYSTEM") {
+        return false;
+    }
+
+    tag.starts_with("CREATE ")
+        || tag.starts_with("DROP ")
+        || tag.starts_with("ALTER ")
+        || tag.starts_with("TRUNCATE ")
+        || tag.starts_with("COMMENT")
+        || tag.starts_with("GRANT")
+        || tag.starts_with("REVOKE")
+        || tag.starts_with("REFRESH MATERIALIZED VIEW")
+        || tag.starts_with("ANALYZE")
+}
+
 /// Results from executing multiple statements in a batch
 #[derive(Debug)]
 pub struct ExecuteResults(pub Vec<ExecuteResult>);
@@ -126,5 +181,30 @@ impl ExecuteResults {
 
     pub fn last(self) -> ExecuteResult {
         self.0.into_iter().last().unwrap_or(ExecuteResult::Empty)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecuteResult;
+
+    #[test]
+    fn modifies_database_classifies_reads_and_writes() {
+        assert!(ExecuteResult::Insert { affected_rows: 1 }.modifies_database());
+        assert!(ExecuteResult::Update { affected_rows: 1 }.modifies_database());
+        assert!(ExecuteResult::Delete { affected_rows: 1 }.modifies_database());
+        assert!(!ExecuteResult::Insert { affected_rows: 0 }.modifies_database());
+        assert!(!ExecuteResult::Update { affected_rows: 0 }.modifies_database());
+        assert!(!ExecuteResult::Delete { affected_rows: 0 }.modifies_database());
+        assert!(ExecuteResult::CreateTable.modifies_database());
+        assert!(ExecuteResult::CommandComplete { tag: "CREATE TYPE" }.modifies_database());
+        assert!(ExecuteResult::CommandComplete { tag: "ANALYZE" }.modifies_database());
+
+        assert!(!ExecuteResult::CommandComplete { tag: "SET" }.modifies_database());
+        assert!(!ExecuteResult::CommandComplete {
+            tag: "ALTER SYSTEM"
+        }
+        .modifies_database());
+        assert!(!ExecuteResult::Empty.modifies_database());
     }
 }

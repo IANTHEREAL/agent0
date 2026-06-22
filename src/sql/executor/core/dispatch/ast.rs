@@ -156,11 +156,17 @@ impl Executor {
                             } else {
                                 "COMMIT"
                             };
+                            let transaction_modified =
+                                tag == "COMMIT" && session.transaction_activity_modified();
                             session.commit().await?;
                             if tag == "COMMIT" {
                                 self.flush_trigger_activations();
                                 self.flush_pending_hnsw_merges();
                                 self.flush_pending_init_cache_invalidation();
+                                self.record_sql_modified_after_success(
+                                    session,
+                                    transaction_modified,
+                                );
                             } else {
                                 self.clear_trigger_activations();
                             }

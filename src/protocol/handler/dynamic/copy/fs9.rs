@@ -468,6 +468,8 @@ impl DynamicPgHandler {
 
         match result {
             Ok((row_count, dirty_table_ids)) => {
+                let database_id = session.current_database_id();
+                let modified = super::copy_from_modified(row_count, &dirty_table_ids);
                 session.note_transaction_dirty_tables(dirty_table_ids);
                 if started_txn {
                     session.commit().await.map_err(|e| {
@@ -478,6 +480,13 @@ impl DynamicPgHandler {
                         )))
                     })?;
                 }
+                super::record_copy_from_success_activity(
+                    &mut session,
+                    executor.tenant_keyspace(),
+                    database_id,
+                    started_txn,
+                    modified,
+                );
                 Ok(Some(vec![pgwire::api::results::Response::Execution(
                     pgwire::api::results::Tag::new("COPY").with_rows(row_count),
                 )]))
@@ -701,6 +710,8 @@ impl DynamicPgHandler {
 
         match result {
             Ok((row_count, dirty_table_ids)) => {
+                let database_id = session.current_database_id();
+                let modified = super::copy_from_modified(row_count, &dirty_table_ids);
                 session.note_transaction_dirty_tables(dirty_table_ids);
                 if started_txn {
                     session
@@ -708,6 +719,13 @@ impl DynamicPgHandler {
                         .await
                         .map_err(|e| user_error("XX000", e.to_string()))?;
                 }
+                super::record_copy_from_success_activity(
+                    &mut session,
+                    executor.tenant_keyspace(),
+                    database_id,
+                    started_txn,
+                    modified,
+                );
                 Ok(Some(vec![pgwire::api::results::Response::Execution(
                     pgwire::api::results::Tag::new("COPY").with_rows(row_count),
                 )]))

@@ -248,6 +248,7 @@ impl DynamicPgHandler {
             table_name,
             snapshot_id, total_rows, "export snapshot copy complete"
         );
+        super::record_copy_active(self.auth().executor.tenant_keyspace(), db_id);
 
         Ok(Some(vec![]))
     }

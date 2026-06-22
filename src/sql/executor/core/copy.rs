@@ -743,6 +743,11 @@ impl Executor {
                 // not be silently committed mid-COPY.
                 if started_txn && batch_writes >= commit_size {
                     txn.commit().await?;
+                    crate::database_activity::record_sql_activity(
+                        self.tenant_keyspace(),
+                        db_id,
+                        crate::database_activity::DatabaseActivityKind::Modified,
+                    );
                     crate::session_context::clear_current_session_txn_registration();
                     crate::session_context::begin_replacement_session_owned_txn(&self.store, txn)
                         .await?;

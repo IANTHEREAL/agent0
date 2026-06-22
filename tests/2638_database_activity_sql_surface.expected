@@ -1,0 +1,14 @@
+id|note
+(0 rows)
+id|note
+2|kept
+(1 row)
+id|note
+2|kept
+4|copy_committed
+(2 rows)
+2	kept
+4	copy_committed
+row_count
+2
+(1 row)

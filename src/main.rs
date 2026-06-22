@@ -19,6 +19,7 @@ mod auth;
 mod cli;
 mod config;
 mod cron;
+mod database_activity;
 mod export;
 mod extensions;
 pub(crate) mod metrics;

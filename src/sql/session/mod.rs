@@ -56,6 +56,12 @@ pub(crate) struct DirtyTableSavepoint {
     snapshot: HashSet<u64>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ActivityModifiedSavepoint {
+    name: String,
+    snapshot: bool,
+}
+
 /// Saved session authorization state for SET LOCAL session_authorization.
 /// Captured before the first SET LOCAL in a transaction, restored on COMMIT/ROLLBACK.
 #[derive(Clone)]
@@ -152,6 +158,11 @@ pub struct Session {
     /// TiKV coprocessor reads do not see the transaction's local write buffer.
     pub(crate) transaction_dirty_table_ids: HashSet<u64>,
     pub(crate) transaction_dirty_table_savepoints: Vec<DirtyTableSavepoint>,
+    /// True once the current transaction has a committed-write candidate.
+    /// Restored by savepoint rollback so `last_modified_at` only advances for
+    /// mutations that survive to COMMIT.
+    pub(crate) transaction_activity_modified: bool,
+    pub(crate) transaction_activity_modified_savepoints: Vec<ActivityModifiedSavepoint>,
     /// True when executing a multi-statement simple-query batch (implicit transaction).
     /// LOCAL mutations should persist across statements within the batch, matching
     /// PostgreSQL's implicit transaction semantics for multi-statement simple queries.
@@ -251,6 +262,8 @@ impl Session {
             extension_delta_savepoints: Vec::new(),
             transaction_dirty_table_ids: HashSet::new(),
             transaction_dirty_table_savepoints: Vec::new(),
+            transaction_activity_modified: false,
+            transaction_activity_modified_savepoints: Vec::new(),
             in_implicit_batch: false,
             pending_notices: Vec::new(),
             local_session_auth_save: None,
@@ -328,6 +341,8 @@ impl Session {
             extension_delta_savepoints: Vec::new(),
             transaction_dirty_table_ids: HashSet::new(),
             transaction_dirty_table_savepoints: Vec::new(),
+            transaction_activity_modified: false,
+            transaction_activity_modified_savepoints: Vec::new(),
             in_implicit_batch: false,
             pending_notices: Vec::new(),
             local_session_auth_save: None,
@@ -636,6 +651,14 @@ impl Session {
         Arc::new(self.transaction_dirty_table_ids.clone())
     }
 
+    pub(crate) fn transaction_activity_modified(&self) -> bool {
+        self.transaction_activity_modified
+    }
+
+    pub(crate) fn note_transaction_activity_modified(&mut self) {
+        self.transaction_activity_modified = true;
+    }
+
     pub(crate) fn note_transaction_dirty_tables<I>(&mut self, table_ids: I)
     where
         I: IntoIterator<Item = u64>,
@@ -714,6 +737,42 @@ impl Session {
         };
 
         self.transaction_dirty_table_savepoints.truncate(target_idx);
+    }
+
+    pub(crate) fn push_transaction_activity_modified_savepoint(&mut self, name: String) {
+        self.transaction_activity_modified_savepoints
+            .push(ActivityModifiedSavepoint {
+                name,
+                snapshot: self.transaction_activity_modified,
+            });
+    }
+
+    pub(crate) fn rollback_transaction_activity_modified_to_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .transaction_activity_modified_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.transaction_activity_modified =
+            self.transaction_activity_modified_savepoints[target_idx].snapshot;
+        self.transaction_activity_modified_savepoints
+            .truncate(target_idx + 1);
+    }
+
+    pub(crate) fn release_transaction_activity_modified_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .transaction_activity_modified_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.transaction_activity_modified_savepoints
+            .truncate(target_idx);
     }
 
     #[cfg(test)]

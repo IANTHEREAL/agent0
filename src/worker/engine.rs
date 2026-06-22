@@ -2869,6 +2869,7 @@ impl WorkerEngine {
             let mut sequence_values = crate::sql::sequences::SequenceSession::new();
 
             let task_fut = async {
+                let mut cron_activity_modified = false;
                 let statements = parse_sql(&entry.command)?;
                 for stmt in &statements {
                     let stmt_ts = now_epoch_ms();
@@ -2889,6 +2890,8 @@ impl WorkerEngine {
                         &entry.username,
                         tikv_client.clone(),
                     );
+                    let statement_dirty_table_ids =
+                        Arc::new(parking_lot::Mutex::new(HashSet::new()));
                     let fut = crate::pool::run_with_statement_memory_scope(
                         Some(statement_memory_accountant.clone()),
                         0, // background task: no client connection
@@ -2905,26 +2908,48 @@ impl WorkerEngine {
                                 ext_ctx,
                                 query_context::with_scoped_query_context(
                                     &qctx,
-                                    exec.execute_statement_on_txn(
-                                        &mut txn,
-                                        entry.db_id,
-                                        &mut sequence_values,
-                                        &search_path,
-                                        stmt,
-                                        None,
-                                        None,
+                                    crate::session_context::with_statement_dirty_table_ids(
+                                        statement_dirty_table_ids.clone(),
+                                        exec.execute_statement_on_txn(
+                                            &mut txn,
+                                            entry.db_id,
+                                            &mut sequence_values,
+                                            &search_path,
+                                            stmt,
+                                            None,
+                                            None,
+                                        ),
                                     ),
                                 ),
                             )
                             .await
                         },
                     );
-                    let _ = fut.await?;
+                    let result = fut.await?;
+                    if is_cron {
+                        crate::database_activity::record_sql_activity(
+                            &entry.keyspace,
+                            entry.db_id,
+                            crate::database_activity::DatabaseActivityKind::Active,
+                        );
+                        if result.modifies_database()
+                            || !statement_dirty_table_ids.lock().is_empty()
+                        {
+                            cron_activity_modified = true;
+                        }
+                    }
                 }
                 store
                     .assert_database_alive_for_update(&mut txn, entry.db_id)
                     .await?;
                 txn.commit().await?;
+                if is_cron && cron_activity_modified {
+                    crate::database_activity::record_sql_activity(
+                        &entry.keyspace,
+                        entry.db_id,
+                        crate::database_activity::DatabaseActivityKind::Modified,
+                    );
+                }
                 Ok(statements.len())
             };
 

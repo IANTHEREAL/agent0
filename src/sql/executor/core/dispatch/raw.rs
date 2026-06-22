@@ -575,11 +575,13 @@ impl Executor {
         start: Instant,
         res: Result<ExecuteResult>,
     ) -> Result<ExecuteResults> {
+        let modified = res.as_ref().is_ok_and(|result| result.modifies_database());
         if res.is_err() && session.is_in_transaction() {
             session.mark_transaction_failed();
         }
         self.observability
             .record_statement(start.elapsed(), res.is_ok(), || sql_obs.to_string());
+        self.record_sql_modified_after_success(session, modified);
         res.map(ExecuteResults::single)
     }
 
@@ -592,11 +594,15 @@ impl Executor {
         start: Instant,
         res: Result<ExecuteResults>,
     ) -> Result<ExecuteResults> {
+        let modified = res
+            .as_ref()
+            .is_ok_and(|results| results.0.iter().any(ExecuteResult::modifies_database));
         if res.is_err() && session.is_in_transaction() {
             session.mark_transaction_failed();
         }
         self.observability
             .record_statement(start.elapsed(), res.is_ok(), || sql_obs.to_string());
+        self.record_sql_modified_after_success(session, modified);
         res
     }
 
