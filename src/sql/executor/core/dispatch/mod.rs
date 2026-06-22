@@ -715,10 +715,11 @@ mod tests {
         let sink = Arc::new(RecordingActivitySink::default());
         let _guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
         let (exec, mut session, _) = make_executor_and_session(false);
+        let keyspace = exec.tenant_keyspace().to_string();
 
         exec.record_sql_modified_after_success(&mut session, true);
 
-        let events = sink.events.lock();
+        let events = activity_events_for_keyspace(&sink, &keyspace);
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].kind,
@@ -731,11 +732,12 @@ mod tests {
         let sink = Arc::new(RecordingActivitySink::default());
         let _guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
         let (exec, mut session, _) = make_executor_and_session(false);
+        let keyspace = exec.tenant_keyspace().to_string();
         session.force_test_transaction_state(true, false);
 
         exec.record_sql_modified_after_success(&mut session, true);
 
-        assert!(sink.events.lock().is_empty());
+        assert!(activity_events_for_keyspace(&sink, &keyspace).is_empty());
         assert!(session.transaction_activity_modified());
     }
 }
