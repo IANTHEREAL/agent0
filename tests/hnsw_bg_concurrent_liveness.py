@@ -10,12 +10,16 @@ Goals:
 """
 
 import argparse
+import os
 import random
 import string
 import subprocess
 import sys
 import time
 from typing import List, Tuple
+
+BG_TASK_TIMEOUT_SEC = float(os.getenv("DB9_HNSW_BG_TASK_TIMEOUT_SEC", "180"))
+BG_TASK_POLL_INTERVAL_SEC = float(os.getenv("DB9_HNSW_BG_TASK_POLL_INTERVAL_SEC", "0.25"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_sql(dsn: str, sql: str) -> str:
+def run_sql(dsn: str, sql: str, timeout: float = 120) -> str:
     result = subprocess.run(
         [
             "psql",
@@ -46,7 +50,7 @@ def run_sql(dsn: str, sql: str) -> str:
         ],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -89,18 +93,60 @@ def launch_bg_sql(dsn: str, sql_body: str) -> int:
         raise AssertionError(f"pg_background_launch returned non-int: {out!r}") from exc
 
 
-def poll_bg_result(dsn: str, task_id: int, timeout_sec: float = 40.0) -> str:
+def drop_table_best_effort(dsn: str, table_name: str) -> None:
+    try:
+        run_sql(
+            dsn,
+            f"SET statement_timeout = 0; DROP TABLE IF EXISTS {table_name};",
+            timeout=180,
+        )
+    except Exception:
+        pass
+
+
+def poll_bg_results(
+    dsn: str,
+    task_ids: List[Tuple[int, int, int, int]],
+    timeout_sec: float = BG_TASK_TIMEOUT_SEC,
+) -> None:
     deadline = time.time() + timeout_sec
-    last = ""
-    while time.time() < deadline:
-        last = run_sql(dsn, f"SELECT pg_background_result({task_id});")
-        if last == "pending":
-            time.sleep(0.1)
-            continue
-        return last
-    raise AssertionError(
-        f"task {task_id} did not finish within timeout, last result={last!r}"
-    )
+    pending = {
+        task_id: (marker, start_id, end_id)
+        for task_id, marker, start_id, end_id in task_ids
+    }
+    last_results = {task_id: "pending" for task_id, _, _, _ in task_ids}
+
+    while pending and time.time() < deadline:
+        for task_id in list(pending):
+            result = run_sql(dsn, f"SELECT pg_background_result({task_id});")
+            last_results[task_id] = result
+            if result == "pending":
+                continue
+
+            marker, start_id, end_id = pending.pop(task_id)
+            assert result != "not found", (
+                f"task {task_id} became not found "
+                f"(marker={marker}, range={start_id}-{end_id})"
+            )
+            assert result == "OK", (
+                f"task {task_id} returned {result!r} "
+                f"(marker={marker}, range={start_id}-{end_id})"
+            )
+
+        if pending:
+            time.sleep(BG_TASK_POLL_INTERVAL_SEC)
+
+    if pending:
+        details = []
+        for task_id, (marker, start_id, end_id) in sorted(pending.items()):
+            details.append(
+                f"task={task_id} marker={marker} range={start_id}-{end_id} "
+                f"last={last_results[task_id]!r}"
+            )
+        raise AssertionError(
+            f"{len(pending)} background task(s) did not finish within "
+            f"{timeout_sec:.0f}s: {', '.join(details)}"
+        )
 
 
 def make_update_jobs(table_name: str) -> List[Tuple[int, int, int, str]]:
@@ -134,7 +180,7 @@ def main() -> int:
     print(f"[INFO] table={table_name}")
 
     try:
-        run_sql(dsn, f"DROP TABLE IF EXISTS {table_name};")
+        drop_table_best_effort(dsn, table_name)
         run_sql(
             dsn,
             f"""
@@ -175,11 +221,7 @@ def main() -> int:
             task_ids.append((task_id, marker, start_id, end_id))
 
         # Poll every task to completion. 'not found' is treated as failure for launched tasks.
-        for task_id, marker, start_id, end_id in task_ids:
-            result = poll_bg_result(dsn, task_id)
-            assert result != "not found", (
-                f"task {task_id} became not found (marker={marker}, range={start_id}-{end_id})"
-            )
+        poll_bg_results(dsn, task_ids)
 
         # Validate all disjoint segments were updated as expected.
         expect_int_eq(
@@ -250,7 +292,7 @@ def main() -> int:
         return 1
     finally:
         try:
-            run_sql(dsn, f"DROP TABLE IF EXISTS {table_name};")
+            drop_table_best_effort(dsn, table_name)
         except Exception:
             pass
 

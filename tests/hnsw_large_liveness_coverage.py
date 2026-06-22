@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_sql(dsn: str, sql: str) -> str:
+def run_sql(dsn: str, sql: str, timeout: float = 120) -> str:
     result = subprocess.run(
         [
             "psql",
@@ -45,7 +45,7 @@ def run_sql(dsn: str, sql: str) -> str:
         ],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -83,6 +83,17 @@ def random_suffix() -> str:
     return f"{ts}_{rand}"
 
 
+def drop_table_best_effort(dsn: str, table_name: str) -> None:
+    try:
+        run_sql(
+            dsn,
+            f"SET statement_timeout = 0; DROP TABLE IF EXISTS {table_name};",
+            timeout=180,
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
     args = parse_args()
     dsn = args.dsn
@@ -94,7 +105,7 @@ def main() -> int:
     print(f"[INFO] table={table_name}")
 
     try:
-        run_sql(dsn, f"DROP TABLE IF EXISTS {table_name};")
+        drop_table_best_effort(dsn, table_name)
         run_sql(
             dsn,
             f"""
@@ -230,11 +241,10 @@ def main() -> int:
         return 1
     finally:
         try:
-            run_sql(dsn, f"DROP TABLE IF EXISTS {table_name};")
+            drop_table_best_effort(dsn, table_name)
         except Exception:
             pass
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
