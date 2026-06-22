@@ -447,22 +447,9 @@ func explainContainsSubstrings(
 		return nil
 	}
 
-	rows, err := db.WithContext(ctx).Raw("EXPLAIN VERBOSE "+query, args...).Rows()
+	lines, err := explainLines(db, ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("explain pushdown candidate %q: %w", query, err)
-	}
-	defer rows.Close()
-
-	var lines []string
-	for rows.Next() {
-		var line string
-		if err := rows.Scan(&line); err != nil {
-			return fmt.Errorf("scan EXPLAIN row for %q: %w", query, err)
-		}
-		lines = append(lines, line)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate EXPLAIN rows for %q: %w", query, err)
+		return err
 	}
 
 	for _, needle := range expected {
@@ -483,6 +470,58 @@ func explainContainsSubstrings(
 		}
 	}
 	return nil
+}
+
+func explainDoesNotContainSubstrings(
+	db *gorm.DB,
+	ctx context.Context,
+	query string,
+	unexpected []string,
+	args ...any,
+) error {
+	if !gormPushdownEnabled() {
+		return nil
+	}
+
+	lines, err := explainLines(db, ctx, query, args...)
+	if err != nil {
+		return err
+	}
+
+	for _, needle := range unexpected {
+		for _, line := range lines {
+			if strings.Contains(line, needle) {
+				return fmt.Errorf(
+					"did not expect %q in EXPLAIN VERBOSE for %q, got %#v",
+					needle,
+					query,
+					lines,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func explainLines(db *gorm.DB, ctx context.Context, query string, args ...any) ([]string, error) {
+	rows, err := db.WithContext(ctx).Raw("EXPLAIN VERBOSE "+query, args...).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("explain pushdown candidate %q: %w", query, err)
+	}
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return nil, fmt.Errorf("scan EXPLAIN row for %q: %w", query, err)
+		}
+		lines = append(lines, line)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate EXPLAIN rows for %q: %w", query, err)
+	}
+	return lines, nil
 }
 
 func assertExplainContainsSubstrings(

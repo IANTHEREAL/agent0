@@ -35,14 +35,13 @@ use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tikv_client::TimestampExt;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 const STATEMENT_TIMEOUT_ERROR: &str = "canceling statement due to statement timeout";
@@ -99,6 +98,7 @@ pub struct WorkerEngine {
     pool: Arc<TikvClientPool>,
     active_jobs: Arc<AtomicU32>,
     semaphore: Arc<Semaphore>,
+    backlog_wakeup: Arc<AtomicBool>,
     metrics: Arc<WorkerMetrics>,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
@@ -341,6 +341,7 @@ impl WorkerEngine {
             pool,
             active_jobs: Arc::new(AtomicU32::new(0)),
             semaphore,
+            backlog_wakeup: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(WorkerMetrics::new()),
             notify,
             shutdown,
@@ -434,46 +435,52 @@ impl WorkerEngine {
             return Ok(());
         }
 
-        let mut join_set = JoinSet::new();
+        let due_count = due_entries.len();
+        let mut dispatched = 0usize;
         for (key, entry) in due_entries {
             let permit = match self.semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => break,
+                Err(_) => {
+                    self.backlog_wakeup.store(true, Ordering::Relaxed);
+                    break;
+                }
             };
+            dispatched += 1;
 
             let engine_system_store = self.system_store.clone();
             let engine_pool = self.pool.clone();
             let engine_config = self.config.clone();
             let active_jobs = self.active_jobs.clone();
+            let backlog_wakeup = self.backlog_wakeup.clone();
             let engine_metrics = self.metrics.clone();
             let engine_shutdown = self.shutdown.clone();
 
-            join_set.spawn(async move {
-                let _permit = permit;
-                let _active_jobs_guard = ActiveJobGuard::new(active_jobs);
-                let result = Self::claim_and_execute(
-                    &engine_system_store,
-                    &engine_pool,
-                    &engine_config,
-                    &engine_metrics,
-                    key,
-                    entry,
-                    engine_shutdown,
-                )
-                .await;
+            tokio::spawn(async move {
+                {
+                    let _permit = permit;
+                    let _active_jobs_guard = ActiveJobGuard::new(active_jobs);
+                    let result = Self::claim_and_execute(
+                        &engine_system_store,
+                        &engine_pool,
+                        &engine_config,
+                        &engine_metrics,
+                        key,
+                        entry,
+                        engine_shutdown,
+                    )
+                    .await;
 
-                if let Err(ref e) = result {
-                    warn!("Worker task execution error: {}", e);
+                    if let Err(ref e) = result {
+                        warn!("Worker task execution error: {}", e);
+                    }
                 }
-
-                result
+                if backlog_wakeup.swap(false, Ordering::Relaxed) {
+                    crate::worker::wake_worker();
+                }
             });
         }
-
-        while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                warn!("Worker task join error: {}", e);
-            }
+        if dispatched < due_count {
+            self.backlog_wakeup.store(true, Ordering::Relaxed);
         }
 
         Ok(())

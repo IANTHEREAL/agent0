@@ -45,18 +45,13 @@ impl TableStorageStats {
 }
 
 /// Semantics/source of a persisted database storage row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StorageStatsSource {
     /// Exact logical bytes from the legacy scanner: `key.len() + value.len()`.
+    #[default]
     ExactLogicalScanV1,
     /// Physical/MVCC-inclusive PD Region estimate, reported in MiB by PD.
     PdRegionEstimateV2,
-}
-
-impl Default for StorageStatsSource {
-    fn default() -> Self {
-        Self::ExactLogicalScanV1
-    }
 }
 
 impl StorageStatsSource {

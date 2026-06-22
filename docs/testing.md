@@ -384,6 +384,7 @@ regression gate now covers:
 - composite-index prefix + bounded-range access detail
 - function-whitelist projection parity
 - unsupported-expression fallback parity
+- ordered secondary-index TopN with pushed `LIMIT + OFFSET`
 
 The pushdown-only gate manifest lives in:
 

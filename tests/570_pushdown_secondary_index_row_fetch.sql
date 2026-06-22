@@ -1,4 +1,4 @@
--- DB9 cop pushdown: secondary-index row fetch keeps PG-shaped EXPLAIN and adds DB9 Cop annotations.
+-- DB9 cop pushdown: non-covered secondary-index scans stay local.
 
 DROP TABLE IF EXISTS ab_pushdown_demo;
 DROP TABLE IF EXISTS ab_pushdown_demo_on;
@@ -20,10 +20,13 @@ ANALYZE ab_pushdown_demo;
 
 SET db9.enable_cop_pushdown = on;
 SELECT 'pushdown_on' AS phase;
+\o /tmp/570_pushdown_secondary_index_row_fetch_explain.txt
 EXPLAIN
 SELECT id, payload
 FROM ab_pushdown_demo
 WHERE a = 1234 AND b = abs(-1);
+\o
+\! if grep -Fq "Index Scan using ab_pushdown_demo_ab_idx on ab_pushdown_demo" /tmp/570_pushdown_secondary_index_row_fetch_explain.txt && ! grep -Fq "DB9 Cop Access:" /tmp/570_pushdown_secondary_index_row_fetch_explain.txt && ! grep -Fq "DB9 Cop Output:" /tmp/570_pushdown_secondary_index_row_fetch_explain.txt; then echo "non_covering_secondary_index_stays_local|1"; else echo "non_covering_secondary_index_stays_local|0"; fi
 SELECT id, payload
 FROM ab_pushdown_demo
 WHERE a = 1234 AND b = abs(-1);
@@ -43,7 +46,7 @@ SELECT id, payload
 FROM ab_pushdown_demo
 WHERE a = 1234 AND b = abs(-1);
 
-SELECT 'secondary_index_row_fetch_parity' AS check_name, mismatch_count
+SELECT 'non_covering_secondary_index_parity' AS check_name, mismatch_count
 FROM (
     SELECT (
         SELECT COUNT(*) FROM (
@@ -63,3 +66,4 @@ FROM (
 DROP TABLE ab_pushdown_demo;
 DROP TABLE ab_pushdown_demo_on;
 DROP TABLE ab_pushdown_demo_off;
+\! rm -f /tmp/570_pushdown_secondary_index_row_fetch_explain.txt

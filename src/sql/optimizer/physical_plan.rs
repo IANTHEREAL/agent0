@@ -38,7 +38,11 @@ pub struct PhysicalCost {
 #[derive(Debug, Clone)]
 pub enum Db9CopScan {
     Seq,
-    Index { scan_type: ScanType },
+    Index {
+        scan_type: ScanType,
+        desc: bool,
+        require_row_fetch: bool,
+    },
 }
 
 /// Ordered storage-side operations fused into a DB9 coprocessor node.

@@ -113,7 +113,11 @@ impl PhysicalPlanner {
             if base_table_keys.is_empty() {
                 plan
             } else {
-                super::pushdown::apply_db9_cop_folding_for_base_tables(plan, &base_table_keys)
+                super::pushdown::apply_db9_cop_folding_for_base_tables(
+                    plan,
+                    &base_table_keys,
+                    &ctx.table_schemas,
+                )
             }
         } else {
             plan

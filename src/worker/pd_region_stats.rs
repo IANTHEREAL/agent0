@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
+use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tikv_client::request::{EncodeKeyspace, KeyMode, Keyspace};
 use tokio::sync::Mutex;
@@ -153,12 +154,7 @@ pub(crate) async fn fetch_keyspace_id(pd_endpoints: &[String], keyspace: &str) -
     let keyspace = pd_keyspace_name(keyspace);
     let cluster_key = cache_cluster_key(pd_endpoints);
     let cache_key = (cluster_key.clone(), keyspace.to_string());
-    if let Some(id) = keyspace_id_cache()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&cache_key)
-        .copied()
-    {
+    if let Some(id) = keyspace_id_cache().read().get(&cache_key).copied() {
         return Ok(id);
     }
 
@@ -176,10 +172,7 @@ pub(crate) async fn fetch_keyspace_id(pd_endpoints: &[String], keyspace: &str) -
                     format!("failed to parse PD keyspace '{}' response", keyspace)
                 })?;
                 let id = parse_keyspace_id(body, keyspace)?;
-                keyspace_id_cache()
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(cache_key, id);
+                keyspace_id_cache().write().insert(cache_key, id);
                 return Ok(id);
             }
             Ok(resp) => {
@@ -365,7 +358,7 @@ mod tests {
             r#"{"count":0,"empty_count":0,"storage_size":0,"storage_keys":0}"#,
         );
 
-        let stats = fetch_region_stats(&[endpoint], &[b'x'], &[b'y'])
+        let stats = fetch_region_stats(&[endpoint], b"x", b"y")
             .await
             .expect("zero stats response is valid");
 

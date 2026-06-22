@@ -1,6 +1,7 @@
-use crate::model::{DataType, Value};
+use crate::model::{DataType, TableSchema, Value};
 use crate::sql::analyzer::types::{
-    AnalyzedProjection, BinaryOp, FunctionKind, IsTestKind, TypedExpr, TypedExprKind, UnaryOp,
+    AnalyzedProjection, BinaryOp, FunctionKind, IsTestKind, TypedExpr, TypedExprKind,
+    TypedOrderByExpr, UnaryOp,
 };
 use crate::sql::expr::functions::regex::translate_pg_regex_escapes;
 use crate::sql::optimizer::extract_constant_usize;
@@ -14,25 +15,27 @@ use crate::sql::optimizer::physical_plan::{
     Db9CopOp, Db9CopScan, PhysicalCost, PhysicalNode, PhysicalPlan,
 };
 use crate::sql::planner::ScanType;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const DB9_COP_MAX_TO_CHAR_PATTERN_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) fn apply_db9_cop_folding(plan: PhysicalPlan) -> PhysicalPlan {
-    apply_db9_cop_folding_inner(plan, None)
+    apply_db9_cop_folding_inner(plan, None, None)
 }
 
 pub(crate) fn apply_db9_cop_folding_for_base_tables(
     plan: PhysicalPlan,
     base_table_keys: &HashSet<String>,
+    table_schemas: &HashMap<String, TableSchema>,
 ) -> PhysicalPlan {
-    apply_db9_cop_folding_inner(plan, Some(base_table_keys))
+    apply_db9_cop_folding_inner(plan, Some(base_table_keys), Some(table_schemas))
 }
 
 fn apply_db9_cop_folding_inner(
     plan: PhysicalPlan,
     base_table_keys: Option<&HashSet<String>>,
+    table_schemas: Option<&HashMap<String, TableSchema>>,
 ) -> PhysicalPlan {
     if let PhysicalNode::Limit {
         limit,
@@ -40,6 +43,17 @@ fn apply_db9_cop_folding_inner(
         input,
     } = &plan.node
     {
+        if let Some(folded) = try_fold_ordered_limit_preserving_global(
+            limit,
+            offset,
+            input,
+            &plan.schema,
+            &plan.cost,
+            base_table_keys,
+            table_schemas,
+        ) {
+            return folded;
+        }
         if let Some(folded) = try_fold_limit_preserving_global(
             limit,
             offset,
@@ -47,6 +61,7 @@ fn apply_db9_cop_folding_inner(
             &plan.schema,
             &plan.cost,
             base_table_keys,
+            table_schemas,
         ) {
             return folded;
         }
@@ -54,7 +69,9 @@ fn apply_db9_cop_folding_inner(
 
     if let Some(candidate) = try_extract_candidate(&plan, base_table_keys) {
         if db9_cop_output_schema_supported(&plan.schema) {
-            return candidate.into_plan(plan.schema.clone(), plan.cost.clone());
+            if let Some(candidate) = prepare_candidate_for_pushdown(candidate, table_schemas) {
+                return candidate.into_plan(plan.schema.clone(), plan.cost.clone());
+            }
         }
     }
 
@@ -62,11 +79,19 @@ fn apply_db9_cop_folding_inner(
     let node = match node {
         Filter { predicate, input } => Filter {
             predicate,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         Project { projections, input } => Project {
             projections,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         HashAggregate {
             group_by,
@@ -75,11 +100,19 @@ fn apply_db9_cop_folding_inner(
         } => HashAggregate {
             group_by,
             projections,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         Sort { order_by, input } => Sort {
             order_by,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         TopNSort {
             order_by,
@@ -88,7 +121,11 @@ fn apply_db9_cop_folding_inner(
         } => TopNSort {
             order_by,
             limit,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         Limit {
             limit,
@@ -97,21 +134,37 @@ fn apply_db9_cop_folding_inner(
         } => Limit {
             limit,
             offset,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         Distinct { input } => Distinct {
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         DistinctOn { on_exprs, input } => DistinctOn {
             on_exprs,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         Window {
             window_functions,
             input,
         } => Window {
             window_functions,
-            input: Box::new(apply_db9_cop_folding_inner(*input, base_table_keys)),
+            input: Box::new(apply_db9_cop_folding_inner(
+                *input,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         NestedLoopJoin {
             left,
@@ -119,8 +172,16 @@ fn apply_db9_cop_folding_inner(
             join_type,
             condition,
         } => NestedLoopJoin {
-            left: Box::new(apply_db9_cop_folding_inner(*left, base_table_keys)),
-            right: Box::new(apply_db9_cop_folding_inner(*right, base_table_keys)),
+            left: Box::new(apply_db9_cop_folding_inner(
+                *left,
+                base_table_keys,
+                table_schemas,
+            )),
+            right: Box::new(apply_db9_cop_folding_inner(
+                *right,
+                base_table_keys,
+                table_schemas,
+            )),
             join_type,
             condition,
         },
@@ -131,8 +192,16 @@ fn apply_db9_cop_folding_inner(
             condition,
             left_is_build,
         } => HashJoin {
-            left: Box::new(apply_db9_cop_folding_inner(*left, base_table_keys)),
-            right: Box::new(apply_db9_cop_folding_inner(*right, base_table_keys)),
+            left: Box::new(apply_db9_cop_folding_inner(
+                *left,
+                base_table_keys,
+                table_schemas,
+            )),
+            right: Box::new(apply_db9_cop_folding_inner(
+                *right,
+                base_table_keys,
+                table_schemas,
+            )),
             join_type,
             condition,
             left_is_build,
@@ -145,8 +214,16 @@ fn apply_db9_cop_folding_inner(
         } => SetOperation {
             op,
             all,
-            left: Box::new(apply_db9_cop_folding_inner(*left, base_table_keys)),
-            right: Box::new(apply_db9_cop_folding_inner(*right, base_table_keys)),
+            left: Box::new(apply_db9_cop_folding_inner(
+                *left,
+                base_table_keys,
+                table_schemas,
+            )),
+            right: Box::new(apply_db9_cop_folding_inner(
+                *right,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         HashSemiJoin {
             left,
@@ -154,13 +231,25 @@ fn apply_db9_cop_folding_inner(
             anti,
             condition,
         } => HashSemiJoin {
-            left: Box::new(apply_db9_cop_folding_inner(*left, base_table_keys)),
-            right: Box::new(apply_db9_cop_folding_inner(*right, base_table_keys)),
+            left: Box::new(apply_db9_cop_folding_inner(
+                *left,
+                base_table_keys,
+                table_schemas,
+            )),
+            right: Box::new(apply_db9_cop_folding_inner(
+                *right,
+                base_table_keys,
+                table_schemas,
+            )),
             anti,
             condition,
         },
         Subquery { subplan } => Subquery {
-            subplan: Box::new(apply_db9_cop_folding_inner(*subplan, base_table_keys)),
+            subplan: Box::new(apply_db9_cop_folding_inner(
+                *subplan,
+                base_table_keys,
+                table_schemas,
+            )),
         },
         other => other,
     };
@@ -175,6 +264,7 @@ fn try_fold_limit_preserving_global(
     schema: &PlanSchema,
     cost: &PhysicalCost,
     base_table_keys: Option<&HashSet<String>>,
+    table_schemas: Option<&HashMap<String, TableSchema>>,
 ) -> Option<PhysicalPlan> {
     if !db9_cop_output_schema_supported(schema) {
         return None;
@@ -188,6 +278,7 @@ fn try_fold_limit_preserving_global(
     candidate.ops.push(Db9CopOp::Limit {
         limit: pushed_limit,
     });
+    let candidate = prepare_candidate_for_pushdown(candidate, table_schemas)?;
 
     Some(PhysicalPlan {
         node: PhysicalNode::Limit {
@@ -200,12 +291,465 @@ fn try_fold_limit_preserving_global(
     })
 }
 
+struct OrderedLimitShape<'a> {
+    order_by: &'a [TypedOrderByExpr],
+    topn_limit: Option<usize>,
+    sort_input: &'a PhysicalPlan,
+    project_wrapper: Option<&'a [AnalyzedProjection]>,
+}
+
+fn ordered_limit_shape(input: &PhysicalPlan) -> Option<OrderedLimitShape<'_>> {
+    match &input.node {
+        TopNSort {
+            order_by,
+            limit,
+            input,
+        } => Some(OrderedLimitShape {
+            order_by,
+            topn_limit: Some(*limit),
+            sort_input: input,
+            project_wrapper: None,
+        }),
+        Sort { order_by, input } => Some(OrderedLimitShape {
+            order_by,
+            topn_limit: None,
+            sort_input: input,
+            project_wrapper: None,
+        }),
+        Project {
+            projections,
+            input: project_input,
+        } => match &project_input.node {
+            TopNSort {
+                order_by,
+                limit,
+                input,
+            } => Some(OrderedLimitShape {
+                order_by,
+                topn_limit: Some(*limit),
+                sort_input: input,
+                project_wrapper: Some(projections),
+            }),
+            Sort { order_by, input } => Some(OrderedLimitShape {
+                order_by,
+                topn_limit: None,
+                sort_input: input,
+                project_wrapper: Some(projections),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn try_fold_ordered_limit_preserving_global(
+    limit: &Option<crate::sql::analyzer::types::TypedExpr>,
+    offset: &Option<crate::sql::analyzer::types::TypedExpr>,
+    input: &PhysicalPlan,
+    schema: &PlanSchema,
+    cost: &PhysicalCost,
+    base_table_keys: Option<&HashSet<String>>,
+    table_schemas: Option<&HashMap<String, TableSchema>>,
+) -> Option<PhysicalPlan> {
+    let table_schemas = table_schemas?;
+    let global_pushed_limit = extract_pushdown_limit(limit, offset)?;
+    let shape = ordered_limit_shape(input)?;
+    let pushed_limit = shape
+        .topn_limit
+        .map(|topn_limit| topn_limit.min(global_pushed_limit))
+        .unwrap_or(global_pushed_limit);
+    if shape.order_by.is_empty() {
+        return None;
+    }
+
+    let mut candidate = try_extract_candidate(shape.sort_input, base_table_keys)?;
+    let key =
+        crate::sql::optimizer::schema_map_key(&candidate.table_name, candidate.alias.as_deref());
+    let table_schema = table_schemas.get(&key)?;
+    let desc = ordered_index_scan_desc(&candidate.scan, table_schema, shape.order_by)?;
+
+    let mut cop_schema = shape.sort_input.schema.clone();
+    let mut project_pushed = false;
+    if let Some(projections) = shape.project_wrapper {
+        if candidate.can_append_project()
+            && db9_cop_projections_supported(projections)
+            && db9_cop_output_schema_supported(&input.schema)
+        {
+            candidate.ops.push(Db9CopOp::Project {
+                projections: projections.to_vec(),
+            });
+            cop_schema = input.schema.clone();
+            project_pushed = true;
+        }
+    }
+    if !db9_cop_output_schema_supported(&cop_schema) {
+        return None;
+    }
+
+    if !candidate.can_append_limit() {
+        return None;
+    }
+    set_db9_cop_scan_desc(&mut candidate.scan, desc)?;
+    candidate.ops.push(Db9CopOp::Limit {
+        limit: pushed_limit,
+    });
+    let candidate = prepare_candidate_for_pushdown_with_schema(candidate, Some(table_schema))?;
+
+    let cop_plan = candidate.into_plan(cop_schema, shape.sort_input.cost.clone());
+    let limit_child = if let (Some(projections), false) = (shape.project_wrapper, project_pushed) {
+        PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: projections.to_vec(),
+                input: Box::new(cop_plan),
+            },
+            schema: input.schema.clone(),
+            cost: input.cost.clone(),
+        }
+    } else {
+        cop_plan
+    };
+
+    Some(PhysicalPlan {
+        node: PhysicalNode::Limit {
+            limit: limit.clone(),
+            offset: offset.clone(),
+            input: Box::new(limit_child),
+        },
+        schema: schema.clone(),
+        cost: cost.clone(),
+    })
+}
+
+fn set_db9_cop_scan_desc(scan: &mut Db9CopScan, desc: bool) -> Option<()> {
+    let Db9CopScan::Index {
+        desc: scan_desc, ..
+    } = scan
+    else {
+        return None;
+    };
+    *scan_desc = desc;
+    Some(())
+}
+
+fn prepare_candidate_for_pushdown(
+    candidate: Db9CopCandidate,
+    table_schemas: Option<&HashMap<String, TableSchema>>,
+) -> Option<Db9CopCandidate> {
+    if !matches!(candidate.scan, Db9CopScan::Index { .. }) {
+        return Some(candidate);
+    }
+    let key =
+        crate::sql::optimizer::schema_map_key(&candidate.table_name, candidate.alias.as_deref());
+    let table_schema = table_schemas.and_then(|table_schemas| table_schemas.get(&key));
+    prepare_candidate_for_pushdown_with_schema(candidate, table_schema)
+}
+
+fn prepare_candidate_for_pushdown_with_schema(
+    candidate: Db9CopCandidate,
+    table_schema: Option<&TableSchema>,
+) -> Option<Db9CopCandidate> {
+    if !matches!(candidate.scan, Db9CopScan::Index { .. }) {
+        return Some(candidate);
+    }
+    if db9_cop_index_scan_is_covering(
+        &candidate.scan,
+        table_schema?,
+        &candidate.output_schema,
+        &candidate.ops,
+    ) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn db9_cop_index_scan_is_covering(
+    scan: &Db9CopScan,
+    table_schema: &TableSchema,
+    output_schema: &PlanSchema,
+    ops: &[Db9CopOp],
+) -> bool {
+    let Some(index_id) = db9_cop_scan_index_id(scan) else {
+        return false;
+    };
+    let Some(index) = table_schema
+        .indexes
+        .iter()
+        .find(|index| index.id == index_id)
+    else {
+        return false;
+    };
+    if !index
+        .method
+        .as_deref()
+        .unwrap_or("btree")
+        .eq_ignore_ascii_case("btree")
+    {
+        return false;
+    }
+    if !index.expressions.is_empty() {
+        return false;
+    }
+
+    let Some(covered_columns) = db9_cop_index_covered_columns(table_schema, index) else {
+        return false;
+    };
+    let Some(required_columns) = db9_cop_required_columns(table_schema, output_schema, ops) else {
+        return false;
+    };
+    required_columns
+        .iter()
+        .all(|column_index| covered_columns.contains(column_index))
+}
+
+fn db9_cop_scan_index_id(scan: &Db9CopScan) -> Option<u64> {
+    let Db9CopScan::Index { scan_type, .. } = scan else {
+        return None;
+    };
+    match scan_type {
+        ScanType::IndexScan { index_id, .. }
+        | ScanType::IndexRangeScan { index_id, .. }
+        | ScanType::IndexBoundedRangeScan { index_id, .. }
+        | ScanType::InListScan { index_id, .. } => Some(*index_id),
+        _ => None,
+    }
+}
+
+fn db9_cop_index_covered_columns(
+    table_schema: &TableSchema,
+    index: &crate::model::IndexDef,
+) -> Option<HashSet<usize>> {
+    let mut covered = HashSet::new();
+    for column_name in &index.columns {
+        let column_index = table_schema
+            .columns
+            .iter()
+            .position(|column| column.name == *column_name)?;
+        if !db9_cop_index_only_column_type_supported(&table_schema.columns[column_index].data_type)
+        {
+            return None;
+        }
+        covered.insert(column_index);
+    }
+    for &pk_index in &table_schema.pk_indices {
+        let column = table_schema.columns.get(pk_index)?;
+        if !db9_cop_index_only_column_type_supported(&column.data_type) {
+            return None;
+        }
+        covered.insert(pk_index);
+    }
+    Some(covered)
+}
+
+fn db9_cop_required_columns(
+    table_schema: &TableSchema,
+    output_schema: &PlanSchema,
+    ops: &[Db9CopOp],
+) -> Option<HashSet<usize>> {
+    let mut required = HashSet::new();
+    let mut has_project = false;
+    for op in ops {
+        match op {
+            Db9CopOp::Filter { predicate } => {
+                collect_db9_cop_expr_columns(table_schema, predicate, &mut required)?;
+            }
+            Db9CopOp::Project { projections } => {
+                has_project = true;
+                for projection in projections {
+                    collect_db9_cop_expr_columns(table_schema, &projection.expr, &mut required)?;
+                }
+            }
+            Db9CopOp::Limit { .. } => {}
+        }
+    }
+    if !has_project {
+        collect_db9_cop_output_columns(table_schema, output_schema, &mut required)?;
+    }
+    Some(required)
+}
+
+fn collect_db9_cop_output_columns(
+    table_schema: &TableSchema,
+    output_schema: &PlanSchema,
+    required: &mut HashSet<usize>,
+) -> Option<()> {
+    for (output_name, output_type) in &output_schema.columns {
+        let column_index = table_schema
+            .columns
+            .iter()
+            .position(|column| column.name == *output_name && column.data_type == *output_type)?;
+        required.insert(column_index);
+    }
+    Some(())
+}
+
+fn collect_db9_cop_expr_columns(
+    table_schema: &TableSchema,
+    expr: &TypedExpr,
+    required: &mut HashSet<usize>,
+) -> Option<()> {
+    match &expr.kind {
+        TypedExprKind::ColumnRef {
+            scope_depth,
+            column_index,
+            column_name,
+        } => {
+            if *scope_depth != 0 {
+                return None;
+            }
+            let column = table_schema.columns.get(*column_index)?;
+            if column.name != *column_name {
+                return None;
+            }
+            required.insert(*column_index);
+            Some(())
+        }
+        TypedExprKind::ScalarSubquery(_)
+        | TypedExprKind::ArraySubquery(_)
+        | TypedExprKind::Exists { .. }
+        | TypedExprKind::InSubquery { .. }
+        | TypedExprKind::TupleInSubquery { .. }
+        | TypedExprKind::AnyAll { .. }
+        | TypedExprKind::Default
+        | TypedExprKind::Parameter { .. } => None,
+        _ => {
+            let mut ok = Some(());
+            crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+                if ok.is_some() {
+                    ok = collect_db9_cop_expr_columns(table_schema, child, required);
+                }
+            });
+            ok
+        }
+    }
+}
+
+fn db9_cop_index_only_column_type_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Text
+            | DataType::Bytes
+            | DataType::Date
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Interval
+            | DataType::Name
+            | DataType::Varchar(_)
+    )
+}
+
+fn ordered_index_scan_desc(
+    scan: &Db9CopScan,
+    table_schema: &TableSchema,
+    order_by: &[TypedOrderByExpr],
+) -> Option<bool> {
+    let Db9CopScan::Index { scan_type, .. } = scan else {
+        return None;
+    };
+
+    let (index_id, ordered_suffix_start) = match scan_type {
+        ScanType::IndexScan {
+            index_id, values, ..
+        } => (*index_id, values.len()),
+        ScanType::IndexRangeScan {
+            index_id,
+            prefix_values,
+            ..
+        }
+        | ScanType::IndexBoundedRangeScan {
+            index_id,
+            prefix_values,
+            ..
+        } => (*index_id, prefix_values.len()),
+        // IN-list ranges are not globally ordered by the target ORDER BY keys.
+        ScanType::InListScan { .. } => return None,
+        _ => return None,
+    };
+
+    let index = table_schema
+        .indexes
+        .iter()
+        .find(|index| index.id == index_id)?;
+    if !index
+        .method
+        .as_deref()
+        .unwrap_or("btree")
+        .eq_ignore_ascii_case("btree")
+    {
+        return None;
+    }
+    if !index.expressions.is_empty() || ordered_suffix_start > index.columns.len() {
+        return None;
+    }
+
+    let mut physical_order_columns: Vec<&str> = index
+        .columns
+        .iter()
+        .skip(ordered_suffix_start)
+        .map(String::as_str)
+        .collect();
+    if !index.unique {
+        for &pk_idx in &table_schema.pk_indices {
+            let pk_name = table_schema.columns.get(pk_idx)?.name.as_str();
+            physical_order_columns.push(pk_name);
+        }
+    }
+    if order_by.len() > physical_order_columns.len() {
+        return None;
+    }
+
+    let first_asc = order_by.first()?.asc;
+    for (order_expr, expected_column) in order_by.iter().zip(physical_order_columns.iter()) {
+        if order_expr.asc != first_asc {
+            return None;
+        }
+        let (column_idx, column_name) = order_by_column(table_schema, &order_expr.expr)?;
+        if column_name != *expected_column {
+            return None;
+        }
+        if table_schema.columns.get(column_idx)?.nullable {
+            return None;
+        }
+    }
+
+    Some(!first_asc)
+}
+
+fn order_by_column<'a>(
+    table_schema: &'a TableSchema,
+    expr: &'a TypedExpr,
+) -> Option<(usize, &'a str)> {
+    let TypedExprKind::ColumnRef {
+        scope_depth,
+        column_index,
+        column_name,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    if *scope_depth != 0 {
+        return None;
+    }
+    let schema_column = table_schema.columns.get(*column_index)?;
+    if schema_column.name == *column_name {
+        Some((*column_index, schema_column.name.as_str()))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Db9CopCandidate {
     table_name: String,
     alias: Option<String>,
     scan: Db9CopScan,
     ops: Vec<Db9CopOp>,
+    output_schema: PlanSchema,
     display_column_count: usize,
 }
 
@@ -265,6 +809,7 @@ fn try_extract_candidate(
                 alias: alias.clone(),
                 scan: Db9CopScan::Seq,
                 ops: Vec::new(),
+                output_schema: plan.schema.clone(),
                 display_column_count: plan.schema.columns.len(),
             })
         }
@@ -281,8 +826,11 @@ fn try_extract_candidate(
                 alias: alias.clone(),
                 scan: Db9CopScan::Index {
                     scan_type: scan_type.clone(),
+                    desc: false,
+                    require_row_fetch: false,
                 },
                 ops: Vec::new(),
+                output_schema: plan.schema.clone(),
                 display_column_count: plan.schema.columns.len(),
             })
         }
@@ -290,6 +838,7 @@ fn try_extract_candidate(
         Filter { predicate, input } => {
             let mut candidate = try_extract_candidate(input, base_table_keys)?;
             if filter_is_redundant_for_scan(&candidate.scan, predicate) {
+                candidate.output_schema = plan.schema.clone();
                 return Some(candidate);
             }
             if !db9_cop_expr_supported(predicate) {
@@ -301,6 +850,7 @@ fn try_extract_candidate(
             candidate.ops.push(Db9CopOp::Filter {
                 predicate: predicate.clone(),
             });
+            candidate.output_schema = plan.schema.clone();
             Some(candidate)
         }
         Project { projections, input } => {
@@ -314,6 +864,7 @@ fn try_extract_candidate(
             candidate.ops.push(Db9CopOp::Project {
                 projections: projections.clone(),
             });
+            candidate.output_schema = plan.schema.clone();
             Some(candidate)
         }
         Limit {
@@ -329,6 +880,7 @@ fn try_extract_candidate(
             candidate.ops.push(Db9CopOp::Limit {
                 limit: pushed_limit,
             });
+            candidate.output_schema = plan.schema.clone();
             Some(candidate)
         }
         Db9Cop { .. }
@@ -350,14 +902,14 @@ fn try_extract_candidate(
     }
 }
 
-fn eligible_db9_cop_index_scan(_scan_type: &ScanType) -> bool {
-    // M0 pushdown wave: DB9 Cop only supports SeqScan-based execution on this
-    // exact pair.
-    //
-    // Index scans imply base-table row fetch, and DB9 Cop cannot safely
-    // orchestrate cross-region fetches in a single cop task. Index-only /
-    // covering scans and late materialization are tracked as M3 work.
-    false
+fn eligible_db9_cop_index_scan(scan_type: &ScanType) -> bool {
+    matches!(
+        scan_type,
+        ScanType::IndexScan { .. }
+            | ScanType::IndexRangeScan { .. }
+            | ScanType::IndexBoundedRangeScan { .. }
+            | ScanType::InListScan { .. }
+    )
 }
 
 fn eligible_db9_cop_relation(
@@ -373,14 +925,12 @@ fn extract_pushdown_limit(
     limit: &Option<crate::sql::analyzer::types::TypedExpr>,
     offset: &Option<crate::sql::analyzer::types::TypedExpr>,
 ) -> Option<usize> {
-    let offset = offset
-        .as_ref()
-        .and_then(extract_constant_usize)
-        .unwrap_or(0);
-    if offset != 0 {
-        return None;
-    }
-    limit.as_ref().and_then(extract_constant_usize)
+    let offset = match offset {
+        Some(offset) => extract_constant_usize(offset)?,
+        None => 0,
+    };
+    let limit = limit.as_ref().and_then(extract_constant_usize)?;
+    limit.checked_add(offset)
 }
 
 fn db9_cop_projections_supported(projections: &[AnalyzedProjection]) -> bool {
@@ -2004,7 +2554,7 @@ fn db9_cop_overlay_input_types_supported(left_type: &DataType, right_type: &Data
 }
 
 fn filter_is_redundant_for_scan(scan: &Db9CopScan, predicate: &TypedExpr) -> bool {
-    let Db9CopScan::Index { scan_type } = scan else {
+    let Db9CopScan::Index { scan_type, .. } = scan else {
         return false;
     };
 
@@ -2150,13 +2700,14 @@ fn normalized_single_column_in_list_constants(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DataType, Value};
+    use crate::model::{ColumnDef, DataType, IndexDef, Value};
     use crate::sql::analyzer::catalog::MockCatalog;
     use crate::sql::analyzer::scope::Scope;
     use crate::sql::analyzer::types::{ResolvedFunction, TypedExprKind};
     use crate::sql::analyzer::{AnalyzedQueryBody, Analyzer};
     use crate::sql::optimizer::logical_plan::PlanSchema;
     use crate::sql::types::CastContext;
+    use crate::worker::types::IndexState;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
@@ -2205,6 +2756,10 @@ mod tests {
         )
     }
 
+    fn parameter_expr(index: usize, data_type: DataType) -> TypedExpr {
+        TypedExpr::new(TypedExprKind::Parameter { index }, data_type)
+    }
+
     fn binary_expr(
         op: BinaryOp,
         left_type: DataType,
@@ -2250,6 +2805,70 @@ mod tests {
             expr,
             output_name: output_name.to_owned(),
         }
+    }
+
+    fn test_column(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        primary_key: bool,
+    ) -> ColumnDef {
+        ColumnDef {
+            name: name.to_owned(),
+            data_type,
+            nullable,
+            primary_key,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+            generation_expr: None,
+            generation_expr_authorized_by: None,
+            collation: None,
+            is_dropped: false,
+        }
+    }
+
+    fn test_btree_index(id: u64, name: &str, columns: &[&str]) -> IndexDef {
+        IndexDef {
+            name: name.to_owned(),
+            id,
+            columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+            unique: false,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            deferrable: false,
+            initially_deferred: false,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+            opclasses: Vec::new(),
+        }
+    }
+
+    fn users_email_index_schema() -> (HashSet<String>, HashMap<String, TableSchema>) {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("id", DataType::Int64, false, true),
+                test_column("email", DataType::Text, true, false),
+                test_column("active", DataType::Boolean, false, false),
+                test_column("status", DataType::Text, true, false),
+            ],
+            vec![0],
+        );
+        table_schema
+            .indexes
+            .push(test_btree_index(8, "users_email_idx", &["email"]));
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        (
+            HashSet::from([schema_key.clone()]),
+            HashMap::from([(schema_key, table_schema)]),
+        )
     }
 
     fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
@@ -2550,7 +3169,7 @@ mod tests {
     }
 
     #[test]
-    fn index_scan_does_not_fold_to_db9_cop_in_m0() {
+    fn index_scan_without_schema_does_not_fold_to_db9_cop() {
         let plan = PhysicalPlan {
             node: PhysicalNode::IndexScan {
                 table_name: "users".to_owned(),
@@ -2567,16 +3186,11 @@ mod tests {
         };
 
         let folded = apply_db9_cop_folding(plan);
-        match folded.node {
-            PhysicalNode::IndexScan { scan_type, .. } => {
-                assert!(matches!(scan_type, ScanType::IndexScan { .. }))
-            }
-            other => panic!("expected IndexScan (no DB9 Cop fold), got {other:?}"),
-        }
+        assert!(matches!(folded.node, PhysicalNode::IndexScan { .. }));
     }
 
     #[test]
-    fn in_list_scan_does_not_fold_to_db9_cop_in_m0() {
+    fn in_list_scan_without_schema_does_not_fold_to_db9_cop() {
         let plan = PhysicalPlan {
             node: PhysicalNode::IndexScan {
                 table_name: "users".to_owned(),
@@ -2596,16 +3210,11 @@ mod tests {
         };
 
         let folded = apply_db9_cop_folding(plan);
-        match folded.node {
-            PhysicalNode::IndexScan { scan_type, .. } => {
-                assert!(matches!(scan_type, ScanType::InListScan { .. }))
-            }
-            other => panic!("expected IndexScan (no DB9 Cop fold), got {other:?}"),
-        }
+        assert!(matches!(folded.node, PhysicalNode::IndexScan { .. }));
     }
 
     #[test]
-    fn index_range_scan_does_not_fold_to_db9_cop_in_m0() {
+    fn index_range_scan_without_schema_does_not_fold_to_db9_cop() {
         let plan = PhysicalPlan {
             node: PhysicalNode::IndexScan {
                 table_name: "users".to_owned(),
@@ -2621,16 +3230,11 @@ mod tests {
         };
 
         let folded = apply_db9_cop_folding(plan);
-        match folded.node {
-            PhysicalNode::IndexScan { scan_type, .. } => {
-                assert!(matches!(scan_type, ScanType::IndexRangeScan { .. }))
-            }
-            other => panic!("expected IndexScan (no DB9 Cop fold), got {other:?}"),
-        }
+        assert!(matches!(folded.node, PhysicalNode::IndexScan { .. }));
     }
 
     #[test]
-    fn bounded_index_range_does_not_fold_to_db9_cop_in_m0() {
+    fn bounded_index_range_without_schema_does_not_fold_to_db9_cop() {
         let plan = PhysicalPlan {
             node: PhysicalNode::IndexScan {
                 table_name: "users".to_owned(),
@@ -2650,11 +3254,716 @@ mod tests {
         };
 
         let folded = apply_db9_cop_folding(plan);
+        assert!(matches!(folded.node, PhysicalNode::IndexScan { .. }));
+    }
+
+    #[test]
+    fn covered_in_list_scan_with_schema_folds_to_db9_cop() {
+        let plan = PhysicalPlan {
+            node: PhysicalNode::IndexScan {
+                table_name: "users".to_owned(),
+                alias: None,
+                scan_type: ScanType::InListScan {
+                    index_id: 8,
+                    index_name: "users_email_idx".to_owned(),
+                    lookup_column: Some("email".to_owned()),
+                    column_values: vec![
+                        vec![Value::Text("a@example.com".to_owned())],
+                        vec![Value::Text("b@example.com".to_owned())],
+                    ],
+                },
+            },
+            schema: PlanSchema::from_columns(vec![
+                ("id".to_owned(), DataType::Int64),
+                ("email".to_owned(), DataType::Text),
+            ]),
+            cost: PhysicalCost::default(),
+        };
+
+        let (base_table_keys, table_schemas) = users_email_index_schema();
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
         match folded.node {
-            PhysicalNode::IndexScan { scan_type, .. } => {
-                assert!(matches!(scan_type, ScanType::IndexBoundedRangeScan { .. }))
+            PhysicalNode::Db9Cop {
+                scan:
+                    Db9CopScan::Index {
+                        require_row_fetch, ..
+                    },
+                ..
+            } => {
+                assert!(!require_row_fetch);
             }
-            other => panic!("expected IndexScan (no DB9 Cop fold), got {other:?}"),
+            other => panic!("expected covered Db9Cop InListScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_topn_index_range_desc_folds_to_db9_cop_with_limit_offset_bound() {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("tenant_id", DataType::Int32, false, false),
+                test_column("status", DataType::Text, false, false),
+                test_column("created_at", DataType::Int64, false, false),
+                test_column("id", DataType::Int64, false, true),
+            ],
+            vec![3],
+        );
+        table_schema.indexes.push(test_btree_index(
+            9,
+            "users_tenant_status_created_idx",
+            &["tenant_id", "status", "created_at"],
+        ));
+
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        let base_table_keys = HashSet::from([schema_key.clone()]);
+        let table_schemas = HashMap::from([(schema_key, table_schema)]);
+        let base_schema = PlanSchema::from_columns(vec![
+            ("tenant_id".to_owned(), DataType::Int32),
+            ("status".to_owned(), DataType::Text),
+            ("created_at".to_owned(), DataType::Int64),
+            ("id".to_owned(), DataType::Int64),
+        ]);
+        let projected_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("created_at".to_owned(), DataType::Int64),
+        ]);
+
+        let tenant_predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(column_ref(0, "tenant_id", DataType::Int32)),
+                op: BinaryOp::Eq,
+                right: Box::new(int32_constant(1)),
+            },
+            DataType::Boolean,
+        );
+        let status_predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(column_ref(1, "status", DataType::Text)),
+                op: BinaryOp::Eq,
+                right: Box::new(text_constant("active")),
+            },
+            DataType::Boolean,
+        );
+        let predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(tenant_predicate),
+                op: BinaryOp::And,
+                right: Box::new(status_predicate),
+            },
+            DataType::Boolean,
+        );
+
+        let scan = PhysicalPlan {
+            node: PhysicalNode::IndexScan {
+                table_name: "users".to_owned(),
+                alias: None,
+                scan_type: ScanType::IndexRangeScan {
+                    index_id: 9,
+                    index_name: "users_tenant_status_created_idx".to_owned(),
+                    prefix_values: vec![Value::Int32(1), Value::Text("active".to_owned())],
+                },
+            },
+            schema: base_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let filter = PhysicalPlan {
+            node: PhysicalNode::Filter {
+                predicate,
+                input: Box::new(scan),
+            },
+            schema: base_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let topn = PhysicalPlan {
+            node: PhysicalNode::TopNSort {
+                order_by: vec![
+                    TypedOrderByExpr {
+                        expr: column_ref(2, "created_at", DataType::Int64),
+                        asc: false,
+                        nulls_first: true,
+                    },
+                    TypedOrderByExpr {
+                        expr: column_ref(3, "id", DataType::Int64),
+                        asc: false,
+                        nulls_first: true,
+                    },
+                ],
+                limit: 15,
+                input: Box::new(filter),
+            },
+            schema: base_schema,
+            cost: PhysicalCost::default(),
+        };
+        let project = PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: vec![
+                    projection("id", column_ref(3, "id", DataType::Int64)),
+                    projection("created_at", column_ref(2, "created_at", DataType::Int64)),
+                ],
+                input: Box::new(topn),
+            },
+            schema: projected_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Limit {
+                limit: Some(int32_constant(10)),
+                offset: Some(int32_constant(5)),
+                input: Box::new(project),
+            },
+            schema: projected_schema,
+            cost: PhysicalCost::default(),
+        };
+
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
+        match folded.node {
+            PhysicalNode::Limit { input, .. } => match input.node {
+                PhysicalNode::Db9Cop {
+                    scan:
+                        Db9CopScan::Index {
+                            scan_type,
+                            desc,
+                            require_row_fetch,
+                        },
+                    ops,
+                    ..
+                } => {
+                    assert!(desc);
+                    assert!(!require_row_fetch);
+                    assert!(matches!(scan_type, ScanType::IndexRangeScan { .. }));
+                    assert!(matches!(
+                        ops.as_slice(),
+                        [
+                            Db9CopOp::Filter { .. },
+                            Db9CopOp::Project { .. },
+                            Db9CopOp::Limit { limit: 15 }
+                        ]
+                    ));
+                }
+                other => {
+                    panic!("expected Db9Cop child after DESC ordered fold, got {other:?}")
+                }
+            },
+            other => panic!("expected outer Limit after ordered DESC fold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_topn_index_range_mixed_order_keeps_local_ordering() {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("tenant_id", DataType::Int32, false, false),
+                test_column("status", DataType::Text, false, false),
+                test_column("created_at", DataType::Int64, false, false),
+                test_column("id", DataType::Int64, false, true),
+            ],
+            vec![3],
+        );
+        table_schema.indexes.push(test_btree_index(
+            9,
+            "users_tenant_status_created_idx",
+            &["tenant_id", "status", "created_at"],
+        ));
+
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        let base_table_keys = HashSet::from([schema_key.clone()]);
+        let table_schemas = HashMap::from([(schema_key, table_schema)]);
+        let base_schema = PlanSchema::from_columns(vec![
+            ("tenant_id".to_owned(), DataType::Int32),
+            ("status".to_owned(), DataType::Text),
+            ("created_at".to_owned(), DataType::Int64),
+            ("id".to_owned(), DataType::Int64),
+        ]);
+        let projected_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("created_at".to_owned(), DataType::Int64),
+        ]);
+
+        let tenant_predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(column_ref(0, "tenant_id", DataType::Int32)),
+                op: BinaryOp::Eq,
+                right: Box::new(int32_constant(1)),
+            },
+            DataType::Boolean,
+        );
+        let status_predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(column_ref(1, "status", DataType::Text)),
+                op: BinaryOp::Eq,
+                right: Box::new(text_constant("active")),
+            },
+            DataType::Boolean,
+        );
+        let predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(tenant_predicate),
+                op: BinaryOp::And,
+                right: Box::new(status_predicate),
+            },
+            DataType::Boolean,
+        );
+
+        let scan = PhysicalPlan {
+            node: PhysicalNode::IndexScan {
+                table_name: "users".to_owned(),
+                alias: None,
+                scan_type: ScanType::IndexRangeScan {
+                    index_id: 9,
+                    index_name: "users_tenant_status_created_idx".to_owned(),
+                    prefix_values: vec![Value::Int32(1), Value::Text("active".to_owned())],
+                },
+            },
+            schema: base_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let filter = PhysicalPlan {
+            node: PhysicalNode::Filter {
+                predicate,
+                input: Box::new(scan),
+            },
+            schema: base_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let topn = PhysicalPlan {
+            node: PhysicalNode::TopNSort {
+                order_by: vec![
+                    TypedOrderByExpr {
+                        expr: column_ref(2, "created_at", DataType::Int64),
+                        asc: false,
+                        nulls_first: true,
+                    },
+                    TypedOrderByExpr {
+                        expr: column_ref(3, "id", DataType::Int64),
+                        asc: true,
+                        nulls_first: false,
+                    },
+                ],
+                limit: 15,
+                input: Box::new(filter),
+            },
+            schema: base_schema,
+            cost: PhysicalCost::default(),
+        };
+        let project = PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: vec![
+                    projection("id", column_ref(3, "id", DataType::Int64)),
+                    projection("created_at", column_ref(2, "created_at", DataType::Int64)),
+                ],
+                input: Box::new(topn),
+            },
+            schema: projected_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Limit {
+                limit: Some(int32_constant(10)),
+                offset: Some(int32_constant(5)),
+                input: Box::new(project),
+            },
+            schema: projected_schema,
+            cost: PhysicalCost::default(),
+        };
+
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
+        match folded.node {
+            PhysicalNode::Limit { input, .. } => match input.node {
+                PhysicalNode::Project { input, .. } => match input.node {
+                    PhysicalNode::TopNSort {
+                        order_by,
+                        limit,
+                        input,
+                    } => {
+                        assert_eq!(limit, 15);
+                        assert_eq!(order_by.len(), 2);
+                        assert!(!order_by[0].asc);
+                        assert!(order_by[1].asc);
+                        match input.node {
+                            PhysicalNode::Db9Cop {
+                                scan:
+                                    Db9CopScan::Index {
+                                        scan_type,
+                                        desc,
+                                        require_row_fetch,
+                                    },
+                                ops,
+                                ..
+                            } => {
+                                assert!(!desc);
+                                assert!(!require_row_fetch);
+                                assert!(matches!(scan_type, ScanType::IndexRangeScan { .. }));
+                                assert!(matches!(ops.as_slice(), [Db9CopOp::Filter { .. }]));
+                            }
+                            other => panic!("expected Db9Cop under local TopNSort, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected local TopNSort under Project, got {other:?}"),
+                },
+                other => {
+                    panic!(
+                        "expected Project child after mixed-order fail-closed fold, got {other:?}"
+                    )
+                }
+            },
+            other => panic!("expected outer Limit after mixed-order fold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_topn_index_range_asc_folds_to_db9_cop_with_limit_offset_bound() {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("tenant_id", DataType::Int32, false, false),
+                test_column("status", DataType::Text, false, false),
+                test_column("created_at", DataType::Int64, false, false),
+                test_column("id", DataType::Int64, false, true),
+                test_column("payload", DataType::Text, false, false),
+            ],
+            vec![3],
+        );
+        table_schema.indexes.push(test_btree_index(
+            9,
+            "users_tenant_status_created_idx",
+            &["tenant_id", "status", "created_at"],
+        ));
+
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        let base_table_keys = HashSet::from([schema_key.clone()]);
+        let table_schemas = HashMap::from([(schema_key, table_schema)]);
+        let base_schema = PlanSchema::from_columns(vec![
+            ("tenant_id".to_owned(), DataType::Int32),
+            ("status".to_owned(), DataType::Text),
+            ("created_at".to_owned(), DataType::Int64),
+            ("id".to_owned(), DataType::Int64),
+            ("payload".to_owned(), DataType::Text),
+        ]);
+        let projected_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("created_at".to_owned(), DataType::Int64),
+        ]);
+
+        let tenant_predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(column_ref(0, "tenant_id", DataType::Int32)),
+                op: BinaryOp::Eq,
+                right: Box::new(int32_constant(1)),
+            },
+            DataType::Boolean,
+        );
+        let status_predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(column_ref(1, "status", DataType::Text)),
+                op: BinaryOp::Eq,
+                right: Box::new(text_constant("active")),
+            },
+            DataType::Boolean,
+        );
+        let predicate = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(tenant_predicate),
+                op: BinaryOp::And,
+                right: Box::new(status_predicate),
+            },
+            DataType::Boolean,
+        );
+
+        let scan = PhysicalPlan {
+            node: PhysicalNode::IndexScan {
+                table_name: "users".to_owned(),
+                alias: None,
+                scan_type: ScanType::IndexRangeScan {
+                    index_id: 9,
+                    index_name: "users_tenant_status_created_idx".to_owned(),
+                    prefix_values: vec![Value::Int32(1), Value::Text("active".to_owned())],
+                },
+            },
+            schema: base_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let filter = PhysicalPlan {
+            node: PhysicalNode::Filter {
+                predicate,
+                input: Box::new(scan),
+            },
+            schema: base_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let topn = PhysicalPlan {
+            node: PhysicalNode::TopNSort {
+                order_by: vec![
+                    TypedOrderByExpr {
+                        expr: column_ref(2, "created_at", DataType::Int64),
+                        asc: true,
+                        nulls_first: false,
+                    },
+                    TypedOrderByExpr {
+                        expr: column_ref(3, "id", DataType::Int64),
+                        asc: true,
+                        nulls_first: false,
+                    },
+                ],
+                limit: 15,
+                input: Box::new(filter),
+            },
+            schema: base_schema,
+            cost: PhysicalCost::default(),
+        };
+        let project = PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: vec![
+                    projection("id", column_ref(3, "id", DataType::Int64)),
+                    projection("created_at", column_ref(2, "created_at", DataType::Int64)),
+                ],
+                input: Box::new(topn),
+            },
+            schema: projected_schema.clone(),
+            cost: PhysicalCost::default(),
+        };
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Limit {
+                limit: Some(int32_constant(10)),
+                offset: Some(int32_constant(5)),
+                input: Box::new(project),
+            },
+            schema: projected_schema,
+            cost: PhysicalCost::default(),
+        };
+
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
+        match folded.node {
+            PhysicalNode::Limit { input, .. } => match input.node {
+                PhysicalNode::Db9Cop {
+                    scan:
+                        Db9CopScan::Index {
+                            scan_type,
+                            desc,
+                            require_row_fetch,
+                        },
+                    ops,
+                    ..
+                } => {
+                    assert!(!desc);
+                    assert!(!require_row_fetch);
+                    assert!(matches!(scan_type, ScanType::IndexRangeScan { .. }));
+                    assert!(matches!(ops.first(), Some(Db9CopOp::Filter { .. })));
+                    assert!(matches!(ops.get(1), Some(Db9CopOp::Project { .. })));
+                    assert!(matches!(ops.get(2), Some(Db9CopOp::Limit { limit }) if *limit == 15));
+                }
+                other => panic!("expected Db9Cop child after ASC ordered fold, got {other:?}"),
+            },
+            other => panic!("expected outer Limit after ASC ordered fold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn covering_projected_index_scan_disables_row_fetch() {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("id", DataType::Int64, false, true),
+                test_column("email", DataType::Text, false, false),
+                test_column("payload", DataType::Text, true, false),
+            ],
+            vec![0],
+        );
+        table_schema
+            .indexes
+            .push(test_btree_index(7, "users_email_idx", &["email"]));
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        let base_table_keys = HashSet::from([schema_key.clone()]);
+        let table_schemas = HashMap::from([(schema_key, table_schema)]);
+        let base_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("email".to_owned(), DataType::Text),
+            ("payload".to_owned(), DataType::Text),
+        ]);
+        let projected_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("email".to_owned(), DataType::Text),
+        ]);
+
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: vec![
+                    projection("id", column_ref(0, "id", DataType::Int64)),
+                    projection("email", column_ref(1, "email", DataType::Text)),
+                ],
+                input: Box::new(PhysicalPlan {
+                    node: PhysicalNode::IndexScan {
+                        table_name: "users".to_owned(),
+                        alias: None,
+                        scan_type: ScanType::IndexScan {
+                            index_id: 7,
+                            index_name: "users_email_idx".to_owned(),
+                            lookup_column: Some("email".to_owned()),
+                            values: vec![Value::Text("a@example.com".to_owned())],
+                        },
+                    },
+                    schema: base_schema,
+                    cost: PhysicalCost::default(),
+                }),
+            },
+            schema: projected_schema,
+            cost: PhysicalCost::default(),
+        };
+
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
+        match folded.node {
+            PhysicalNode::Db9Cop {
+                scan:
+                    Db9CopScan::Index {
+                        require_row_fetch, ..
+                    },
+                ops,
+                ..
+            } => {
+                assert!(!require_row_fetch);
+                assert!(matches!(ops.as_slice(), [Db9CopOp::Project { .. }]));
+            }
+            other => panic!("expected covering Db9Cop index scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_covering_projected_index_scan_stays_local() {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("id", DataType::Int64, false, true),
+                test_column("email", DataType::Text, false, false),
+                test_column("payload", DataType::Text, true, false),
+            ],
+            vec![0],
+        );
+        table_schema
+            .indexes
+            .push(test_btree_index(7, "users_email_idx", &["email"]));
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        let base_table_keys = HashSet::from([schema_key.clone()]);
+        let table_schemas = HashMap::from([(schema_key, table_schema)]);
+        let base_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("email".to_owned(), DataType::Text),
+            ("payload".to_owned(), DataType::Text),
+        ]);
+        let projected_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            ("payload".to_owned(), DataType::Text),
+        ]);
+
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: vec![
+                    projection("id", column_ref(0, "id", DataType::Int64)),
+                    projection("payload", column_ref(2, "payload", DataType::Text)),
+                ],
+                input: Box::new(PhysicalPlan {
+                    node: PhysicalNode::IndexScan {
+                        table_name: "users".to_owned(),
+                        alias: None,
+                        scan_type: ScanType::IndexScan {
+                            index_id: 7,
+                            index_name: "users_email_idx".to_owned(),
+                            lookup_column: Some("email".to_owned()),
+                            values: vec![Value::Text("a@example.com".to_owned())],
+                        },
+                    },
+                    schema: base_schema,
+                    cost: PhysicalCost::default(),
+                }),
+            },
+            schema: projected_schema,
+            cost: PhysicalCost::default(),
+        };
+
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
+        match folded.node {
+            PhysicalNode::Project { input, .. } => {
+                assert!(matches!(input.node, PhysicalNode::IndexScan { .. }));
+            }
+            other => panic!("expected non-covering index scan to stay local, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_defined_index_only_scan_stays_local() {
+        let mut table_schema = TableSchema::new(
+            "users".to_owned(),
+            42,
+            vec![
+                test_column("id", DataType::Int64, false, true),
+                test_column(
+                    "mood",
+                    DataType::UserDefined("public.mood".to_owned()),
+                    false,
+                    false,
+                ),
+            ],
+            vec![0],
+        );
+        table_schema
+            .indexes
+            .push(test_btree_index(7, "users_mood_idx", &["mood"]));
+        let schema_key = crate::sql::optimizer::schema_map_key("users", None);
+        let base_table_keys = HashSet::from([schema_key.clone()]);
+        let table_schemas = HashMap::from([(schema_key, table_schema)]);
+        let base_schema = PlanSchema::from_columns(vec![
+            ("id".to_owned(), DataType::Int64),
+            (
+                "mood".to_owned(),
+                DataType::UserDefined("public.mood".to_owned()),
+            ),
+        ]);
+
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Project {
+                projections: vec![
+                    projection("id", column_ref(0, "id", DataType::Int64)),
+                    projection(
+                        "mood",
+                        column_ref(1, "mood", DataType::UserDefined("public.mood".to_owned())),
+                    ),
+                ],
+                input: Box::new(PhysicalPlan {
+                    node: PhysicalNode::IndexScan {
+                        table_name: "users".to_owned(),
+                        alias: None,
+                        scan_type: ScanType::IndexScan {
+                            index_id: 7,
+                            index_name: "users_mood_idx".to_owned(),
+                            lookup_column: Some("mood".to_owned()),
+                            values: vec![Value::Text("happy".to_owned())],
+                        },
+                    },
+                    schema: base_schema.clone(),
+                    cost: PhysicalCost::default(),
+                }),
+            },
+            schema: base_schema,
+            cost: PhysicalCost::default(),
+        };
+
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
+        match folded.node {
+            PhysicalNode::Project { input, .. } => {
+                assert!(matches!(input.node, PhysicalNode::IndexScan { .. }));
+            }
+            other => panic!("expected user-defined index-only scan to stay local, got {other:?}"),
         }
     }
 
@@ -2706,26 +4015,36 @@ mod tests {
                             ],
                         },
                     },
-                    schema: PlanSchema::from_columns(vec![("id".to_owned(), DataType::Int64)]),
+                    schema: PlanSchema::from_columns(vec![
+                        ("id".to_owned(), DataType::Int64),
+                        ("email".to_owned(), DataType::Text),
+                    ]),
                     cost: PhysicalCost::default(),
                 }),
             },
-            schema: PlanSchema::from_columns(vec![("id".to_owned(), DataType::Int64)]),
+            schema: PlanSchema::from_columns(vec![
+                ("id".to_owned(), DataType::Int64),
+                ("email".to_owned(), DataType::Text),
+            ]),
             cost: PhysicalCost::default(),
         };
 
-        let folded = apply_db9_cop_folding(plan);
+        let (base_table_keys, table_schemas) = users_email_index_schema();
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
         match folded.node {
-            PhysicalNode::Filter { input, .. } => {
-                assert!(
-                    matches!(input.node, PhysicalNode::IndexScan { .. }),
-                    "expected IndexScan under local Filter, got {:?}",
-                    input.node
-                );
+            PhysicalNode::Db9Cop { scan, ops, .. } => {
+                assert!(matches!(
+                    scan,
+                    Db9CopScan::Index {
+                        scan_type: ScanType::InListScan { .. },
+                        desc: false,
+                        require_row_fetch: false,
+                    }
+                ));
+                assert!(ops.is_empty(), "redundant IN-list filter should be elided");
             }
-            other => {
-                panic!("expected local Filter over IndexScan (no DB9 Cop fold), got {other:?}")
-            }
+            other => panic!("expected DB9 Cop InListScan with no filter op, got {other:?}"),
         }
     }
 
@@ -2750,7 +4069,7 @@ mod tests {
                         table_name: "users".to_owned(),
                         alias: None,
                         scan_type: ScanType::IndexScan {
-                            index_id: 7,
+                            index_id: 8,
                             index_name: "users_email_idx".to_owned(),
                             lookup_column: Some("email".to_owned()),
                             values: vec![Value::Null],
@@ -2770,23 +4089,27 @@ mod tests {
             cost: PhysicalCost::default(),
         };
 
-        let folded = apply_db9_cop_folding(plan);
+        let (base_table_keys, table_schemas) = users_email_index_schema();
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
         match folded.node {
-            PhysicalNode::Filter { input, .. } => {
-                assert!(
-                    matches!(input.node, PhysicalNode::IndexScan { .. }),
-                    "expected IndexScan under local Filter, got {:?}",
-                    input.node
-                );
+            PhysicalNode::Db9Cop { scan, ops, .. } => {
+                assert!(matches!(
+                    scan,
+                    Db9CopScan::Index {
+                        scan_type: ScanType::IndexScan { .. },
+                        desc: false,
+                        require_row_fetch: false,
+                    }
+                ));
+                assert!(matches!(ops.as_slice(), [Db9CopOp::Filter { .. }]));
             }
-            other => {
-                panic!("expected local Filter over IndexScan (no DB9 Cop fold), got {other:?}")
-            }
+            other => panic!("expected DB9 Cop IndexScan with retained filter op, got {other:?}"),
         }
     }
 
     #[test]
-    fn residual_filter_above_in_list_scan_still_pushes() {
+    fn non_covering_filter_above_in_list_scan_stays_local() {
         let predicate = TypedExpr::new(
             TypedExprKind::BinaryOp {
                 left: Box::new(TypedExpr::new(
@@ -2819,25 +4142,33 @@ mod tests {
                             column_values: vec![vec![Value::Text("a@example.com".to_owned())]],
                         },
                     },
-                    schema: PlanSchema::from_columns(vec![("id".to_owned(), DataType::Int64)]),
+                    schema: PlanSchema::from_columns(vec![
+                        ("id".to_owned(), DataType::Int64),
+                        ("email".to_owned(), DataType::Text),
+                        ("active".to_owned(), DataType::Boolean),
+                        ("status".to_owned(), DataType::Text),
+                    ]),
                     cost: PhysicalCost::default(),
                 }),
             },
-            schema: PlanSchema::from_columns(vec![("id".to_owned(), DataType::Int64)]),
+            schema: PlanSchema::from_columns(vec![
+                ("id".to_owned(), DataType::Int64),
+                ("email".to_owned(), DataType::Text),
+                ("active".to_owned(), DataType::Boolean),
+                ("status".to_owned(), DataType::Text),
+            ]),
             cost: PhysicalCost::default(),
         };
 
-        let folded = apply_db9_cop_folding(plan);
+        let (base_table_keys, table_schemas) = users_email_index_schema();
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
         match folded.node {
             PhysicalNode::Filter { input, .. } => {
-                assert!(
-                    matches!(input.node, PhysicalNode::IndexScan { .. }),
-                    "expected IndexScan under local Filter, got {:?}",
-                    input.node
-                );
+                assert!(matches!(input.node, PhysicalNode::IndexScan { .. }));
             }
             other => {
-                panic!("expected local Filter over IndexScan (no DB9 Cop fold), got {other:?}")
+                panic!("expected non-covering filtered index scan to stay local, got {other:?}")
             }
         }
     }
@@ -2849,7 +4180,7 @@ mod tests {
                 expr: Box::new(TypedExpr::new(
                     TypedExprKind::ColumnRef {
                         scope_depth: 0,
-                        column_index: 2,
+                        column_index: 3,
                         column_name: "status".to_owned(),
                     },
                     DataType::Text,
@@ -2885,25 +4216,33 @@ mod tests {
                             ],
                         },
                     },
-                    schema: PlanSchema::from_columns(vec![("id".to_owned(), DataType::Int64)]),
+                    schema: PlanSchema::from_columns(vec![
+                        ("id".to_owned(), DataType::Int64),
+                        ("email".to_owned(), DataType::Text),
+                        ("active".to_owned(), DataType::Boolean),
+                        ("status".to_owned(), DataType::Text),
+                    ]),
                     cost: PhysicalCost::default(),
                 }),
             },
-            schema: PlanSchema::from_columns(vec![("id".to_owned(), DataType::Int64)]),
+            schema: PlanSchema::from_columns(vec![
+                ("id".to_owned(), DataType::Int64),
+                ("email".to_owned(), DataType::Text),
+                ("active".to_owned(), DataType::Boolean),
+                ("status".to_owned(), DataType::Text),
+            ]),
             cost: PhysicalCost::default(),
         };
 
-        let folded = apply_db9_cop_folding(plan);
+        let (base_table_keys, table_schemas) = users_email_index_schema();
+        let folded =
+            apply_db9_cop_folding_inner(plan, Some(&base_table_keys), Some(&table_schemas));
         match folded.node {
             PhysicalNode::Filter { input, .. } => {
-                assert!(
-                    matches!(input.node, PhysicalNode::IndexScan { .. }),
-                    "expected IndexScan under local Filter, got {:?}",
-                    input.node
-                );
+                assert!(matches!(input.node, PhysicalNode::IndexScan { .. }));
             }
             other => {
-                panic!("expected local Filter over IndexScan (no DB9 Cop fold), got {other:?}")
+                panic!("expected wrong-column filtered index scan to stay local, got {other:?}")
             }
         }
     }
@@ -6605,7 +7944,8 @@ mod tests {
         let mut base_table_keys = HashSet::new();
         base_table_keys.insert("public.users".to_owned());
 
-        let folded = apply_db9_cop_folding_for_base_tables(plan, &base_table_keys);
+        let table_schemas = HashMap::new();
+        let folded = apply_db9_cop_folding_for_base_tables(plan, &base_table_keys, &table_schemas);
         assert!(matches!(folded.node, PhysicalNode::SeqScan { .. }));
     }
 
@@ -6708,6 +8048,52 @@ mod tests {
                 }
                 other => panic!("expected Db9Cop under outer Limit, got {other:?}"),
             },
+            other => panic!("expected outer Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_constant_offset_does_not_push_limit() {
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Limit {
+                limit: Some(int32_constant(1)),
+                offset: Some(parameter_expr(0, DataType::Int64)),
+                input: Box::new(PhysicalPlan {
+                    node: PhysicalNode::SeqScan {
+                        table_name: "users".to_owned(),
+                        alias: None,
+                    },
+                    schema: PlanSchema::from_columns(vec![
+                        ("id".to_owned(), DataType::Int64),
+                        ("email".to_owned(), DataType::Text),
+                    ]),
+                    cost: PhysicalCost::default(),
+                }),
+            },
+            schema: PlanSchema::from_columns(vec![
+                ("id".to_owned(), DataType::Int64),
+                ("email".to_owned(), DataType::Text),
+            ]),
+            cost: PhysicalCost::default(),
+        };
+
+        let folded = apply_db9_cop_folding(plan);
+        match folded.node {
+            PhysicalNode::Limit { offset, input, .. } => {
+                assert!(matches!(
+                    offset.map(|expr| expr.kind),
+                    Some(TypedExprKind::Parameter { index: 0 })
+                ));
+                match input.node {
+                    PhysicalNode::Db9Cop { ops, .. } => {
+                        assert!(
+                            ops.iter().all(|op| !matches!(op, Db9CopOp::Limit { .. })),
+                            "non-constant OFFSET must not push a DB9 Cop limit: {ops:?}"
+                        );
+                    }
+                    other => panic!("expected Db9Cop under outer Limit, got {other:?}"),
+                }
+            }
             other => panic!("expected outer Limit, got {other:?}"),
         }
     }

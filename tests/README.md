@@ -29,9 +29,8 @@ python3 scripts/integration_test.py --dsn "$PG_DSN" tests/96_dify_schema.sql tes
 
 ## DB9 cop pushdown regression pack
 
-The DB9 cop pushdown golden pack currently includes `tests/550_pushdown_seq_scan.sql`
-through `tests/557_pushdown_prefix_access.sql`, plus `tests/566_pushdown_datetime_types.sql`
-through `tests/577_pushdown_update_delete_txn_visibility.sql`.
+The DB9 cop pushdown golden pack currently includes the `tests/*pushdown*.sql`
+cases listed in `scripts/regression_gate_pushdown.list`.
 
 It covers:
 
@@ -45,8 +44,10 @@ It covers:
 - composite-index prefix access detail
 - composite-index prefix + bounded-range access detail
 - verbose and non-verbose PG-shaped EXPLAIN annotations
-- secondary-index row fetch with DB9 Cop access/filter/output detail
+- non-covered secondary-index scans staying local
 - same-transaction UPDATE/DELETE dirty-table visibility under pushdown
+- ordered secondary-index TopN with `LIMIT + OFFSET` pushed to DB9 Cop
+- covered ordered secondary-index projections that can run index-only without row fetch on the paired codec v3 runtime
 
 Run the full pack with:
 

@@ -21,7 +21,7 @@ use tikv_client::BoundRange;
 // Exact DB9 Cop wire/runtime surface sent by this server. Keep this in lockstep
 // with cloud-storage-engine's `DB9_CODEC_VERSION` so mixed runtime pairs fail
 // fast before expression execution.
-const DB9_COP_CODEC_VERSION: u32 = 2;
+const DB9_COP_CODEC_VERSION: u32 = 3;
 // Must stay aligned with the engine-side REQ_TYPE_DB9_DAG contract.
 const DB9_COP_REQUEST_TYPE_DAG: i64 = 10_001;
 const DB9_JSONB_BINARY_MAGIC: &[u8] = b"\0db9jb1";
@@ -364,7 +364,7 @@ impl TikvStore {
             )
         })?;
         let request_summary = summarize_db9_request(db_id, table_schema, scan, ops, ranges.len());
-        let responses = txn
+        let mut responses = txn
             .coprocessor(
                 DB9_COP_REQUEST_TYPE_DAG,
                 request.encode_to_vec(),
@@ -372,6 +372,7 @@ impl TikvStore {
             )
             .await
             .map_err(|err| map_db9_coprocessor_rpc_error(err, &request_summary))?;
+        order_db9_cop_responses_for_scan(&mut responses, scan);
         decode_db9_select_chunks(responses, output_schema, &request_summary)
     }
 }
@@ -511,7 +512,33 @@ fn summarize_db9_request(
 fn summarize_db9_scan(scan: &Db9CopScan) -> String {
     match scan {
         Db9CopScan::Seq => "seq".to_string(),
-        Db9CopScan::Index { scan_type } => summarize_db9_scan_type(scan_type),
+        Db9CopScan::Index {
+            scan_type,
+            desc,
+            require_row_fetch,
+        } => {
+            let summary = summarize_db9_scan_type(scan_type);
+            let mut parts = vec![summary];
+            if *desc {
+                parts.push("desc".to_string());
+            }
+            if !*require_row_fetch {
+                parts.push("index_only".to_string());
+            }
+            parts.join(",")
+        }
+    }
+}
+
+fn db9_cop_scan_desc(scan: &Db9CopScan) -> bool {
+    matches!(scan, Db9CopScan::Index { desc: true, .. })
+}
+
+fn order_db9_cop_responses_for_scan<T>(responses: &mut [T], scan: &Db9CopScan) {
+    if db9_cop_scan_desc(scan) {
+        // Match TiDB's KeepOrder DESC path: reverse task response order,
+        // while CSE handles range order and backward scanning inside a task.
+        responses.reverse();
     }
 }
 
@@ -656,7 +683,11 @@ fn build_scan_spec(scan: &Db9CopScan) -> Result<wire::Db9ScanSpec> {
             desc: false,
             require_row_fetch: false,
         }),
-        Db9CopScan::Index { scan_type } => {
+        Db9CopScan::Index {
+            scan_type,
+            desc,
+            require_row_fetch,
+        } => {
             let (kind, index_id, index_name) = match scan_type {
                 ScanType::PrimaryKeyScan { .. } | ScanType::PrimaryKeyRangeScan { .. } => {
                     return Err(anyhow!("DB9 cop runtime does not support primary-key scan"));
@@ -697,8 +728,8 @@ fn build_scan_spec(scan: &Db9CopScan) -> Result<wire::Db9ScanSpec> {
                 kind: kind as i32,
                 index_id,
                 index_name,
-                desc: false,
-                require_row_fetch: true,
+                desc: *desc,
+                require_row_fetch: *require_row_fetch,
             })
         }
     }
@@ -720,7 +751,7 @@ fn build_db9_request_ranges(
             let (start, end) = encode_table_data_range_v2(db_id, table_schema.table_id);
             Ok(vec![(start..end).into()])
         }
-        Db9CopScan::Index { scan_type } => match scan_type {
+        Db9CopScan::Index { scan_type, .. } => match scan_type {
             ScanType::PrimaryKeyScan { .. } => {
                 Err(anyhow!("DB9 cop runtime does not support primary-key scan"))
             }
@@ -1763,7 +1794,7 @@ mod tests {
 
     #[test]
     fn db9_cop_codec_version_mismatch_is_reported_as_unsupported_with_hint() {
-        let message = "unsupported DB9 codec_version 1, expected 2";
+        let message = "unsupported DB9 codec_version 1, expected 3";
         let err =
             db9_cop_sql_error_from_message(message).expect("codec mismatch must map to SqlError");
 
@@ -1774,6 +1805,40 @@ mod tests {
             }
             other => panic!("expected SqlError::Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn desc_index_scan_reverses_cop_response_chunks_only() {
+        let asc_scan = Db9CopScan::Index {
+            scan_type: ScanType::IndexRangeScan {
+                index_id: 9,
+                index_name: "idx".to_owned(),
+                prefix_values: vec![],
+            },
+            desc: false,
+            require_row_fetch: false,
+        };
+        let desc_scan = Db9CopScan::Index {
+            scan_type: ScanType::IndexRangeScan {
+                index_id: 9,
+                index_name: "idx".to_owned(),
+                prefix_values: vec![],
+            },
+            desc: true,
+            require_row_fetch: false,
+        };
+
+        let mut asc_chunks = vec![1, 2, 3];
+        order_db9_cop_responses_for_scan(&mut asc_chunks, &asc_scan);
+        assert_eq!(asc_chunks, vec![1, 2, 3]);
+
+        let mut desc_chunks = vec![1, 2, 3];
+        order_db9_cop_responses_for_scan(&mut desc_chunks, &desc_scan);
+        assert_eq!(desc_chunks, vec![3, 2, 1]);
+
+        let mut seq_chunks = vec![1, 2, 3];
+        order_db9_cop_responses_for_scan(&mut seq_chunks, &Db9CopScan::Seq);
+        assert_eq!(seq_chunks, vec![1, 2, 3]);
     }
 
     #[test]
@@ -2652,6 +2717,8 @@ mod tests {
                     lookup_column: Some("name".to_string()),
                     column_values: vec![vec![Value::Text("alpha".to_string())]],
                 },
+                desc: false,
+                require_row_fetch: false,
             },
             &[
                 Db9CopOp::Filter {
@@ -2673,7 +2740,7 @@ mod tests {
 
         assert!(summary.contains("db_id=11"));
         assert!(summary.contains("table=public.t#42"));
-        assert!(summary.contains("scan=in_list(name=t_name_idx, tuples=1)"));
+        assert!(summary.contains("scan=in_list(name=t_name_idx, tuples=1),index_only"));
         assert!(summary.contains("ops=[filter,project(1),limit(5)]"));
         assert!(summary.contains("ranges=2"));
     }

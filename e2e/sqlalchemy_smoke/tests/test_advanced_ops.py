@@ -101,7 +101,7 @@ def test_sqlalchemy_join_subquery_prepared_and_vector_ops():
                 assert row1 == ("a",)
                 assert row2 == ("b",)
 
-            # secondary-index row fetch + join over the same lookup table
+            # non-covered secondary-index lookup + join over the same lookup table
             with engine.begin() as conn:
                 conn.exec_driver_sql(
                     f"""

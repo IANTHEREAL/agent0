@@ -261,6 +261,7 @@ tests/571_pushdown_copy_txn_visibility.sql
 tests/575_prepared_pushdown_txn_visibility.sql
 tests/576_pushdown_copy_secondary_index_visibility.sql
 tests/577_pushdown_update_delete_txn_visibility.sql
+tests/584_pushdown_ordered_topn.sql
 # #605 – parameterized LIMIT/OFFSET in deferred-limit path (FOR UPDATE)
 tests/605_parameterized_limit_offset.sql
 # --- Safety regression tests (2026-03-24, pre-launch gate) ---

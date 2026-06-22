@@ -622,6 +622,37 @@ fn worker_tick_dequeues_v2_only() {
 }
 
 #[test]
+fn worker_tick_does_not_wait_for_dispatched_tasks() {
+    let source = include_str!("../engine.rs");
+    let tick_fn = source
+        .split("async fn tick(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn registry_sweep_tick").next())
+        .expect("tick must exist before registry_sweep_tick");
+
+    assert!(
+        tick_fn.contains("tokio::spawn(async move"),
+        "worker tick must dispatch due tasks asynchronously"
+    );
+    assert!(
+        !tick_fn.contains("join_next") && !tick_fn.contains("JoinSet"),
+        "worker tick must not await task completion; long HNSW/DDL jobs must not block BgSql wakeups"
+    );
+    assert!(
+        tick_fn.contains("crate::worker::wake_worker();"),
+        "completed tasks must wake the worker so queued overflow does not wait for the poll interval"
+    );
+    assert!(
+        tick_fn.contains("backlog_wakeup.swap(false, Ordering::Relaxed)"),
+        "worker tick must gate completion wakeups on observed queue backlog"
+    );
+    assert!(
+        tick_fn.contains("self.backlog_wakeup.store(true, Ordering::Relaxed)"),
+        "worker tick must mark backlog only when concurrency slots are exhausted"
+    );
+}
+
+#[test]
 fn storage_size_scan_uses_pd_region_stats_not_tenant_kv_scan() {
     let source = include_str!("../engine.rs");
     let prod_source = source

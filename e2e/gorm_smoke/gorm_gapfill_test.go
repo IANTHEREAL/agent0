@@ -184,7 +184,7 @@ func TestGormGapfillOps(t *testing.T) {
 		t.Fatalf("window: unexpected rows: %#v", windowRows)
 	}
 
-	// secondary-index row fetch: exact composite-index predicate returns non-index payload
+	// non-covered secondary-index lookup: exact composite-index predicate returns non-index payload locally
 	if err := db.WithContext(ctx).Exec(
 		fmt.Sprintf(`
 			CREATE TABLE %s.lookup_owner (
@@ -263,10 +263,10 @@ func TestGormGapfillOps(t *testing.T) {
 	if err := db.WithContext(ctx).Raw(
 		rowFetchSQL,
 	).Scan(&rowFetchRows).Error; err != nil {
-		t.Fatalf("secondary-index row fetch: %v", err)
+		t.Fatalf("non-covered secondary-index lookup: %v", err)
 	}
 	if len(rowFetchRows) != 1 || rowFetchRows[0].ID != 100 || rowFetchRows[0].Payload != "target-hit" {
-		t.Fatalf("secondary-index row fetch: unexpected rows: %#v", rowFetchRows)
+		t.Fatalf("non-covered secondary-index lookup: unexpected rows: %#v", rowFetchRows)
 	}
 	withPushdownProof(t, db, ctx, func(pushdownDB *gorm.DB) error {
 		if err := explainContainsSubstrings(
@@ -275,9 +275,18 @@ func TestGormGapfillOps(t *testing.T) {
 			rowFetchSQL,
 			[]string{
 				fmt.Sprintf("Index Scan using idx_lookup_rows_ab on %s.lookup_rows", schemaName),
-				"DB9 Cop Access: prefix (1234)",
-				"DB9 Cop Output: id, payload",
-				"DB9 Cop Limit: 1",
+			},
+		); err != nil {
+			return err
+		}
+		if err := explainDoesNotContainSubstrings(
+			pushdownDB,
+			ctx,
+			rowFetchSQL,
+			[]string{
+				"DB9 Cop Access:",
+				"DB9 Cop Output:",
+				"DB9 Cop Limit:",
 			},
 		); err != nil {
 			return err
@@ -288,10 +297,10 @@ func TestGormGapfillOps(t *testing.T) {
 			Payload string `gorm:"column:payload"`
 		}
 		if err := pushdownDB.WithContext(ctx).Raw(rowFetchSQL).Scan(&proofRows).Error; err != nil {
-			return fmt.Errorf("pushdown secondary-index row fetch: %w", err)
+			return fmt.Errorf("pushdown non-covered secondary-index lookup: %w", err)
 		}
 		if len(proofRows) != 1 || proofRows[0].ID != 100 || proofRows[0].Payload != "target-hit" {
-			return fmt.Errorf("pushdown secondary-index row fetch: unexpected rows: %#v", proofRows)
+			return fmt.Errorf("pushdown non-covered secondary-index lookup: unexpected rows: %#v", proofRows)
 		}
 		return nil
 	})
@@ -314,10 +323,10 @@ func TestGormGapfillOps(t *testing.T) {
 			quoteIdent(schemaName),
 		),
 	).Scan(&joinRows).Error; err != nil {
-		t.Fatalf("join + secondary-index row fetch: %v", err)
+		t.Fatalf("join + non-covered secondary-index lookup: %v", err)
 	}
 	if len(joinRows) != 1 || joinRows[0].ID != 100 || joinRows[0].Payload != "target-hit" || joinRows[0].Label != "target-owner" {
-		t.Fatalf("join + secondary-index row fetch: unexpected rows: %#v", joinRows)
+		t.Fatalf("join + non-covered secondary-index lookup: unexpected rows: %#v", joinRows)
 	}
 
 	// function pushdown correctness: scalar/text/numeric/datetime projections

@@ -12,10 +12,14 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 fn simple_column(name: &str, dt: DataType) -> TypedExpr {
+    indexed_column(usize::MAX, name, dt)
+}
+
+fn indexed_column(column_index: usize, name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::ColumnRef {
             scope_depth: 0,
-            column_index: usize::MAX,
+            column_index,
             column_name: name.to_string(),
         },
         data_type: dt,
@@ -1859,7 +1863,7 @@ fn test_db9_cop_folding_bounded_range_limit() {
     );
     let predicate = TypedExpr {
         kind: TypedExprKind::BinaryOp {
-            left: Box::new(simple_column("id", DataType::Int64)),
+            left: Box::new(indexed_column(0, "id", DataType::Int64)),
             op: BinaryOp::Gt,
             right: Box::new(simple_constant(
                 crate::model::Value::Int64(100),
@@ -1879,19 +1883,28 @@ fn test_db9_cop_folding_bounded_range_limit() {
     let physical = PhysicalPlanner::plan(&logical, &ctx);
     match &physical.node {
         PhysicalNode::Limit { input, .. } => match &input.node {
-            PhysicalNode::Filter { input, .. } => match &input.node {
-                PhysicalNode::IndexScan { scan_type, .. } => {
-                    assert!(matches!(
+            PhysicalNode::Db9Cop {
+                scan:
+                    crate::sql::optimizer::physical_plan::Db9CopScan::Index {
                         scan_type,
-                        crate::sql::planner::ScanType::IndexBoundedRangeScan { .. }
-                    ));
-                }
-                other => panic!(
-                    "expected IndexScan under outer Limit filter, got {:?}",
-                    other
-                ),
-            },
-            other => panic!("expected Filter under outer Limit, got {:?}", other),
+                        desc,
+                        require_row_fetch,
+                    },
+                ops,
+                ..
+            } => {
+                assert!(!desc);
+                assert!(!require_row_fetch);
+                assert!(matches!(
+                    scan_type,
+                    crate::sql::planner::ScanType::IndexBoundedRangeScan { .. }
+                ));
+                assert!(matches!(
+                    ops.last(),
+                    Some(crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 10 })
+                ));
+            }
+            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
         },
         other => panic!(
             "expected outer Limit for bounded range plan, got {:?}",
@@ -1922,7 +1935,7 @@ fn test_db9_cop_folding_prefix_range_limit() {
     );
     let predicate = TypedExpr {
         kind: TypedExprKind::BinaryOp {
-            left: Box::new(simple_column("status", DataType::Text)),
+            left: Box::new(indexed_column(1, "status", DataType::Text)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
                 crate::model::Value::Text("active".to_string()),
@@ -1942,19 +1955,28 @@ fn test_db9_cop_folding_prefix_range_limit() {
     let physical = PhysicalPlanner::plan(&logical, &ctx);
     match &physical.node {
         PhysicalNode::Limit { input, .. } => match &input.node {
-            PhysicalNode::Filter { input, .. } => match &input.node {
-                PhysicalNode::IndexScan { scan_type, .. } => {
-                    assert!(matches!(
+            PhysicalNode::Db9Cop {
+                scan:
+                    crate::sql::optimizer::physical_plan::Db9CopScan::Index {
                         scan_type,
-                        crate::sql::planner::ScanType::IndexRangeScan { .. }
-                    ));
-                }
-                other => panic!(
-                    "expected IndexScan under outer Limit filter, got {:?}",
-                    other
-                ),
-            },
-            other => panic!("expected Filter under outer Limit, got {:?}", other),
+                        desc,
+                        require_row_fetch,
+                    },
+                ops,
+                ..
+            } => {
+                assert!(!desc);
+                assert!(!require_row_fetch);
+                assert!(matches!(
+                    scan_type,
+                    crate::sql::planner::ScanType::IndexRangeScan { .. }
+                ));
+                assert!(matches!(
+                    ops.last(),
+                    Some(crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 5 })
+                ));
+            }
+            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
         },
         other => panic!(
             "expected outer Limit for prefix range plan, got {:?}",
@@ -1964,7 +1986,7 @@ fn test_db9_cop_folding_prefix_range_limit() {
 }
 
 #[test]
-fn test_db9_cop_folding_keeps_offset_limit_local() {
+fn test_db9_cop_folding_pushes_limit_plus_offset_bound() {
     let mut ctx = PlanningContext::empty();
     ctx.enable_db9_cop_pushdown = true;
     ctx.table_schemas.insert(
@@ -2011,12 +2033,15 @@ fn test_db9_cop_folding_keeps_offset_limit_local() {
 
     let physical = PhysicalPlanner::plan(&logical, &ctx);
     match &physical.node {
-        PhysicalNode::Limit { input, .. } => {
-            assert!(matches!(
-                input.node,
-                crate::sql::optimizer::physical_plan::PhysicalNode::Db9Cop { .. }
-            ));
-        }
+        PhysicalNode::Limit { input, .. } => match &input.node {
+            crate::sql::optimizer::physical_plan::PhysicalNode::Db9Cop { ops, .. } => {
+                assert!(matches!(
+                    ops.last(),
+                    Some(crate::sql::optimizer::physical_plan::Db9CopOp::Limit { limit: 7 })
+                ));
+            }
+            other => panic!("expected Db9Cop under outer Limit, got {:?}", other),
+        },
         other => panic!("expected outer Limit, got {:?}", other),
     }
 }

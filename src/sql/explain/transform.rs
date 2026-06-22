@@ -324,11 +324,16 @@ fn format_db9_bounded_range(
 }
 
 fn format_db9_scan_access_detail(scan: &Db9CopScan) -> Option<String> {
-    let Db9CopScan::Index { scan_type } = scan else {
+    let Db9CopScan::Index {
+        scan_type,
+        desc,
+        require_row_fetch,
+    } = scan
+    else {
         return None;
     };
 
-    match scan_type {
+    let detail = match scan_type {
         ScanType::PrimaryKeyScan { values, .. } | ScanType::IndexScan { values, .. } => {
             Some(format!("point {}", format_db9_value_tuple(values)))
         }
@@ -370,7 +375,16 @@ fn format_db9_scan_access_detail(scan: &Db9CopScan) -> Option<String> {
                 .join(", ")
         )),
         _ => None,
+    }?;
+
+    let mut parts = vec![detail];
+    if *desc {
+        parts.push("scan desc".to_string());
     }
+    if !*require_row_fetch {
+        parts.push("index only".to_string());
+    }
+    Some(parts.join(", "))
 }
 
 fn db9_cop_filter(ops: &[Db9CopOp]) -> Option<String> {
@@ -437,7 +451,7 @@ fn db9_cop_plan_node(
             annotations,
             cost,
         },
-        Db9CopScan::Index { scan_type } => PlanNode::IndexScan {
+        Db9CopScan::Index { scan_type, .. } => PlanNode::IndexScan {
             table_name: table_name.to_string(),
             alias: alias.clone(),
             index_name: extract_index_name(scan_type),
@@ -970,6 +984,8 @@ mod tests {
                         lookup_column: Some("email".to_string()),
                         values: vec![Value::Text("a@example.com".to_string())],
                     },
+                    desc: false,
+                    require_row_fetch: false,
                 },
                 ops: vec![
                     Db9CopOp::Filter {
@@ -1022,7 +1038,7 @@ mod tests {
                 );
                 assert_eq!(
                     annotations.storage_access.as_deref(),
-                    Some("point ('a@example.com')")
+                    Some("point ('a@example.com'), index only")
                 );
                 assert_eq!(annotations.storage_limit, Some(10));
             }
@@ -1039,10 +1055,12 @@ mod tests {
                 lookup_column: Some("point_col".to_string()),
                 values: vec![Value::Int32(20)],
             },
+            desc: false,
+            require_row_fetch: false,
         };
         assert_eq!(
             format_db9_scan_access_detail(&point),
-            Some("point (20)".to_string())
+            Some("point (20), index only".to_string())
         );
 
         let prefix = Db9CopScan::Index {
@@ -1051,10 +1069,12 @@ mod tests {
                 index_name: "idx_prefix".to_string(),
                 prefix_values: vec![Value::Text("active".to_string())],
             },
+            desc: false,
+            require_row_fetch: false,
         };
         assert_eq!(
             format_db9_scan_access_detail(&prefix),
-            Some("prefix ('active')".to_string())
+            Some("prefix ('active'), index only".to_string())
         );
 
         let bounded = Db9CopScan::Index {
@@ -1067,10 +1087,12 @@ mod tests {
                 range_end: None,
                 end_inclusive: false,
             },
+            desc: true,
+            require_row_fetch: false,
         };
         assert_eq!(
             format_db9_scan_access_detail(&bounded),
-            Some("prefix ('active'), range [100, +inf)".to_string())
+            Some("prefix ('active'), range [100, +inf), scan desc, index only".to_string())
         );
 
         let in_list = Db9CopScan::Index {
@@ -1084,10 +1106,12 @@ mod tests {
                     vec![Value::Int32(30)],
                 ],
             },
+            desc: false,
+            require_row_fetch: false,
         };
         assert_eq!(
             format_db9_scan_access_detail(&in_list),
-            Some("in-list (10), (20), (30)".to_string())
+            Some("in-list (10), (20), (30), index only".to_string())
         );
 
         assert_eq!(format_db9_scan_access_detail(&Db9CopScan::Seq), None);

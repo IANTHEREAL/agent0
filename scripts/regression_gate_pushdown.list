@@ -36,6 +36,7 @@ tests/579_pushdown_string_regex.sql
 tests/580_pushdown_rejected_agg_guc.sql
 tests/582_pushdown_pg17_edge_parity.sql
 tests/583_pushdown_array_carrier_contract.sql
+tests/584_pushdown_ordered_topn.sql
 
 [python]
 
