@@ -417,6 +417,12 @@ where
                     let write_result = state.writer.terminate(Ok(())).await;
                     let response = match write_result {
                         Ok(written) => {
+                            // Successful streaming write → per-database activity (#2638).
+                            crate::database_activity::record_fs9_activity(
+                                &session.keyspace,
+                                0,
+                                crate::database_activity::DatabaseActivityKind::Modified,
+                            );
                             WsResponse::success(&state.request_id, json!({ "written": written }))
                         }
                         Err(err) => {
@@ -1056,7 +1062,7 @@ pub(crate) fn tenant_from_keyspace(keyspace: &str) -> String {
         .to_string()
 }
 
-async fn handle_ws_read_tx(
+pub(crate) async fn handle_ws_read_tx(
     out_tx: &mpsc::Sender<Message>,
     session: &WsSession,
     id: &str,
@@ -1136,14 +1142,18 @@ async fn handle_ws_read_tx(
             _ => unreachable!("read size validation already checked offset/length pairing"),
         };
         let response = match data {
-            Ok(data) => WsResponse::success(
-                id,
-                json!({
-                    "content": STANDARD.encode(&data),
-                    "size": data.len(),
-                    "encoding": "base64"
-                }),
-            ),
+            Ok(data) => {
+                // Successful inline read → per-database activity (#2638).
+                record_fs9_read_activity(session);
+                WsResponse::success(
+                    id,
+                    json!({
+                        "content": STANDARD.encode(&data),
+                        "size": data.len(),
+                        "encoding": "base64"
+                    }),
+                )
+            }
             Err(err) => {
                 let (code, msg) = map_fs_error(&err);
                 WsResponse::error(id, code, msg)
@@ -1200,7 +1210,23 @@ async fn handle_ws_read_tx(
         _ => unreachable!("read size validation already checked offset/length pairing"),
     }
 
+    // Successful streaming read fully sent → per-database activity (#2638).
+    record_fs9_read_activity(session);
     Ok(())
+}
+
+/// Emit a best-effort fs9 read/list activity event (`Active`) for a session.
+///
+/// fs9 WS sessions carry only the keyspace (the backend's row-identity key);
+/// the numeric database id is unknown here, so we pass 0 ("diagnostic unknown")
+/// — see `database_activity::record_fs9_activity`. Nonblocking; no-op when no
+/// sink is installed.
+fn record_fs9_read_activity(session: &WsSession) {
+    crate::database_activity::record_fs9_activity(
+        &session.keyspace,
+        0,
+        crate::database_activity::DatabaseActivityKind::Active,
+    );
 }
 
 fn compute_read_size(

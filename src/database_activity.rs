@@ -22,7 +22,10 @@ pub(crate) enum DatabaseActivityKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatabaseActivitySource {
+    /// SQL execution (pgwire / HTTP SQL / cron-run statements).
     Sql,
+    /// fs9 filesystem WS operations observed by db9-server.
+    Fs9,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,12 +44,56 @@ pub(crate) trait DatabaseActivitySink: Send + Sync + 'static {
 static ACTIVITY_SINK: Lazy<RwLock<Option<Arc<dyn DatabaseActivitySink>>>> =
     Lazy::new(|| RwLock::new(None));
 
+/// Record a SQL-sourced activity event (pgwire / HTTP SQL / cron-run).
 pub(crate) fn record_sql_activity(
     tenant_keyspace: &str,
     database_id: u64,
     kind: DatabaseActivityKind,
 ) {
-    if tenant_keyspace.is_empty() || database_id == 0 {
+    record_activity(
+        DatabaseActivitySource::Sql,
+        tenant_keyspace,
+        database_id,
+        kind,
+    );
+}
+
+/// Record an fs9-sourced activity event (db9-server-observed WS filesystem ops).
+///
+/// `Active` for served reads/lists; `Modified` for served writes — the caller
+/// (the fs9 WS handler) is responsible for emitting only on successful ops and
+/// for classifying write-vs-read. This reuses the same installed sink as
+/// [`record_sql_activity`]; there is no separate fs9 flush path.
+pub(crate) fn record_fs9_activity(
+    tenant_keyspace: &str,
+    database_id: u64,
+    kind: DatabaseActivityKind,
+) {
+    record_activity(
+        DatabaseActivitySource::Fs9,
+        tenant_keyspace,
+        database_id,
+        kind,
+    );
+}
+
+/// Shared nonblocking emit path for all activity sources.
+///
+/// `tenant_keyspace` is the backend's row-identity key and is always required.
+/// `database_id` is diagnostic-only (the backend keys on keyspace), so it is
+/// required for [`DatabaseActivitySource::Sql`] (the pgwire session always has
+/// a real id) but may be `0` ("diagnostic unknown") for
+/// [`DatabaseActivitySource::Fs9`], whose WS session carries only the keyspace.
+fn record_activity(
+    source: DatabaseActivitySource,
+    tenant_keyspace: &str,
+    database_id: u64,
+    kind: DatabaseActivityKind,
+) {
+    if tenant_keyspace.is_empty() {
+        return;
+    }
+    if database_id == 0 && !matches!(source, DatabaseActivitySource::Fs9) {
         return;
     }
 
@@ -57,7 +104,7 @@ pub(crate) fn record_sql_activity(
     let event = DatabaseActivityEvent {
         tenant_keyspace: Arc::from(tenant_keyspace),
         database_id,
-        source: DatabaseActivitySource::Sql,
+        source,
         kind,
     };
 
@@ -65,7 +112,7 @@ pub(crate) fn record_sql_activity(
         tracing::warn!(
             database_id,
             kind = ?kind,
-            source = ?DatabaseActivitySource::Sql,
+            source = ?source,
             error = %err,
             "dropping database activity event"
         );
@@ -153,6 +200,49 @@ mod tests {
 
         record_sql_activity("", 7, DatabaseActivityKind::Active);
         record_sql_activity("activity_sink_test", 0, DatabaseActivityKind::Active);
+
+        assert!(sink.events.lock().is_empty());
+    }
+
+    #[test]
+    fn record_fs9_activity_emits_with_unknown_database_id() {
+        // fs9 sessions carry the keyspace but no numeric db id; the backend keys
+        // on keyspace, so db_id == 0 ("diagnostic unknown") must still emit.
+        let sink = Arc::new(RecordingSink::default());
+        let _guard = install_test_database_activity_sink(sink.clone());
+
+        record_fs9_activity("activity_sink_test", 0, DatabaseActivityKind::Active);
+
+        let events = sink.events.lock();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            DatabaseActivityEvent {
+                tenant_keyspace: Arc::from("activity_sink_test"),
+                database_id: 0,
+                source: DatabaseActivitySource::Fs9,
+                kind: DatabaseActivityKind::Active,
+            }
+        );
+    }
+
+    #[test]
+    fn record_fs9_activity_still_requires_keyspace() {
+        let sink = Arc::new(RecordingSink::default());
+        let _guard = install_test_database_activity_sink(sink.clone());
+
+        record_fs9_activity("", 0, DatabaseActivityKind::Modified);
+
+        assert!(sink.events.lock().is_empty());
+    }
+
+    #[test]
+    fn record_sql_activity_still_rejects_zero_database_id() {
+        // The db_id == 0 relaxation is fs9-only; SQL must keep passing a real id.
+        let sink = Arc::new(RecordingSink::default());
+        let _guard = install_test_database_activity_sink(sink.clone());
+
+        record_sql_activity("activity_sink_test", 0, DatabaseActivityKind::Modified);
 
         assert!(sink.events.lock().is_empty());
     }

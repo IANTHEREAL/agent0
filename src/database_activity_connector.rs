@@ -107,7 +107,12 @@ impl DatabaseActivitySink for HttpActivitySink {
         if let Some(entry) = map.get_mut(event.tenant_keyspace.as_ref()) {
             entry.active |= active;
             entry.modified |= modified;
-            entry.database_id = event.database_id;
+            // `database_id` is diagnostic-only; fs9 events carry 0 ("unknown").
+            // Never clobber a known nonzero id with 0 when an fs9 event coalesces
+            // into a keyspace already marked by a SQL event.
+            if event.database_id != 0 {
+                entry.database_id = event.database_id;
+            }
             Ok(())
         } else if map.len() >= self.max_keyspaces {
             // Bounded: drop a new keyspace over capacity. The seam logs the
@@ -349,6 +354,44 @@ mod tests {
         assert_eq!(v["modified"], true);
         assert_eq!(v["source"], "pgwire_sql");
         assert_eq!(v["database_id"], 7);
+    }
+
+    #[test]
+    fn fs9_zero_id_does_not_clobber_existing_nonzero_id() {
+        use crate::database_activity::DatabaseActivitySource;
+        let sink = HttpActivitySink::new(16);
+        // SQL marks ks1 with a real diagnostic id.
+        sink.try_record(event("ks1", 7, DatabaseActivityKind::Active))
+            .unwrap();
+        // A later fs9 event (db_id = 0, "diagnostic unknown") coalesces in.
+        sink.try_record(DatabaseActivityEvent {
+            tenant_keyspace: Arc::from("ks1"),
+            database_id: 0,
+            source: DatabaseActivitySource::Fs9,
+            kind: DatabaseActivityKind::Modified,
+        })
+        .unwrap();
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 1);
+        // Nonzero diagnostic id preserved; flags still coalesce (modified set).
+        assert_eq!(drained[0].1.database_id, 7);
+        assert!(drained[0].1.active);
+        assert!(drained[0].1.modified);
+    }
+
+    #[test]
+    fn fs9_only_keyspace_keeps_zero_id() {
+        use crate::database_activity::DatabaseActivitySource;
+        let sink = HttpActivitySink::new(16);
+        sink.try_record(DatabaseActivityEvent {
+            tenant_keyspace: Arc::from("ksfs"),
+            database_id: 0,
+            source: DatabaseActivitySource::Fs9,
+            kind: DatabaseActivityKind::Active,
+        })
+        .unwrap();
+        let drained = sink.drain();
+        assert_eq!(drained[0].1.database_id, 0);
     }
 }
 

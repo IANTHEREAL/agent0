@@ -45,6 +45,59 @@ fn is_write_operation(request: &WsRequest) -> bool {
     )
 }
 
+/// Returns `true` for batch operations whose outer `WsResponse.ok` can be
+/// `true` even when every entry failed — so activity must be judged per-entry.
+fn is_batch_operation(request: &WsRequest) -> bool {
+    matches!(
+        request,
+        WsRequest::BatchStat { .. }
+            | WsRequest::BatchInlineRead { .. }
+            | WsRequest::BatchWrite { .. }
+            | WsRequest::BatchWriteAtomic { .. }
+    )
+}
+
+/// Classify the per-database activity effect of a completed fs9 WS request.
+///
+/// `None` means emit nothing. A failed op (`ok == false`) is never activity.
+/// Writes map to `Modified` (implies active), reads to `Active`. For batch ops
+/// the outer `ok` can be `true` with all entries failed (the handlers wrap
+/// backend errors as `success` + per-entry `ok: false`), so a batch counts only
+/// when at least one entry under `data.entries[]` succeeded.
+fn fs_ws_activity_effect(
+    request: &WsRequest,
+    response: &WsResponse,
+) -> Option<crate::database_activity::DatabaseActivityKind> {
+    use crate::database_activity::DatabaseActivityKind;
+
+    if !response.ok {
+        return None;
+    }
+
+    if is_batch_operation(request) {
+        let any_entry_ok = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("entries"))
+            .and_then(|e| e.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .any(|e| e.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
+            })
+            .unwrap_or(false);
+        if !any_entry_ok {
+            return None;
+        }
+    }
+
+    if is_write_operation(request) {
+        Some(DatabaseActivityKind::Modified)
+    } else {
+        Some(DatabaseActivityKind::Active)
+    }
+}
+
 pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> WsResponse {
     if session.access_mode == FsAccessMode::ReadOnly && is_write_operation(request) {
         return WsResponse::error(
@@ -54,7 +107,7 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
         );
     }
 
-    match request {
+    let response = match request {
         WsRequest::Auth { id, .. } => {
             WsResponse::error(id, WsErrorCode::Eproto, "already authenticated")
         }
@@ -196,7 +249,18 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
                 "watch operations must be handled at connection level",
             )
         }
+    };
+
+    // Best-effort per-database activity emission (#2638). fs9 sessions carry the
+    // keyspace but no numeric database id; the backend keys on keyspace, so we
+    // pass 0 ("diagnostic unknown"). This is a nonblocking enqueue into the
+    // shared activity sink — never a sync flush — so it stays off the WS hot
+    // path. No-op when no sink is installed.
+    if let Some(kind) = fs_ws_activity_effect(request, &response) {
+        crate::database_activity::record_fs9_activity(&session.keyspace, 0, kind);
     }
+
+    response
 }
 
 async fn handle_stat(session: &WsSession, id: &str, path: &str) -> WsResponse {
@@ -1887,12 +1951,27 @@ mod tests {
             fail_dirs: std::collections::HashSet<String>,
             /// Optional readdir result for readdir_with_meta testing.
             readdir_result: Option<FsReaddirResult>,
+            /// Optional file content served by stat/read_file (activity tests).
+            file_content: Option<Vec<u8>>,
         }
 
         #[async_trait]
         impl FsBackend for MockFsBackend {
-            async fn stat(&self, _path: &str) -> Result<FsFileInfo> {
-                Err(anyhow!("not implemented"))
+            async fn stat(&self, path: &str) -> Result<FsFileInfo> {
+                match &self.file_content {
+                    Some(content) => Ok(FsFileInfo {
+                        path: path.to_string(),
+                        is_dir: false,
+                        is_symlink: false,
+                        size: content.len() as u64,
+                        mode: 0o644,
+                        generation: 1,
+                        mtime: 0,
+                        storage: None,
+                        sealed: None,
+                    }),
+                    None => Err(anyhow!("not implemented")),
+                }
             }
             async fn readdir(&self, _path: &str) -> Result<Vec<FsFileInfo>> {
                 if let Some(ref result) = self.readdir_result {
@@ -1907,7 +1986,10 @@ mod tests {
                 Err(anyhow!("not implemented"))
             }
             async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
-                Err(anyhow!("not implemented"))
+                match &self.file_content {
+                    Some(content) => Ok(content.clone()),
+                    None => Err(anyhow!("not implemented")),
+                }
             }
             async fn read_file_stream(
                 &self,
@@ -2008,10 +2090,17 @@ mod tests {
             async fn read_file_at(
                 &self,
                 _path: &str,
-                _offset: u64,
-                _length: usize,
+                offset: u64,
+                length: usize,
             ) -> Result<Vec<u8>> {
-                Err(anyhow!("not implemented"))
+                match &self.file_content {
+                    Some(content) => {
+                        let start = (offset as usize).min(content.len());
+                        let end = start.saturating_add(length).min(content.len());
+                        Ok(content[start..end].to_vec())
+                    }
+                    None => Err(anyhow!("not implemented")),
+                }
             }
             async fn write_file_at(
                 &self,
@@ -2077,6 +2166,7 @@ mod tests {
                 atomic_supported,
                 fail_dirs: std::collections::HashSet::new(),
                 readdir_result: None,
+                file_content: None,
             }))
         }
 
@@ -2085,6 +2175,7 @@ mod tests {
                 atomic_supported: true,
                 fail_dirs: fail_dirs.into_iter().map(String::from).collect(),
                 readdir_result: None,
+                file_content: None,
             }))
         }
 
@@ -2093,7 +2184,104 @@ mod tests {
                 atomic_supported: false,
                 fail_dirs: std::collections::HashSet::new(),
                 readdir_result: Some(result),
+                file_content: None,
             }))
+        }
+
+        // ── Connection-level read route → per-database activity (#2638) ──
+        //
+        // The real WS loop routes `WsRequest::Read` to `handle_ws_read_tx`
+        // directly (not through `handle_request`), so the activity emission for
+        // reads must be proven on that actual route, not just the classifier.
+
+        fn recording_activity_sink() -> (
+            std::sync::Arc<ActivityRecorder>,
+            crate::database_activity::DatabaseActivitySinkGuard,
+        ) {
+            let sink = std::sync::Arc::new(ActivityRecorder::default());
+            let guard = crate::database_activity::install_test_database_activity_sink(sink.clone());
+            (sink, guard)
+        }
+
+        #[derive(Default)]
+        struct ActivityRecorder {
+            events: parking_lot::Mutex<Vec<crate::database_activity::DatabaseActivityEvent>>,
+        }
+
+        impl crate::database_activity::DatabaseActivitySink for ActivityRecorder {
+            fn try_record(
+                &self,
+                event: crate::database_activity::DatabaseActivityEvent,
+            ) -> anyhow::Result<()> {
+                self.events.lock().push(event);
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn ws_read_route_emits_active_on_success() {
+            use crate::database_activity::{DatabaseActivityKind, DatabaseActivitySource};
+
+            // The activity sink is process-global; other tests may emit into it
+            // concurrently. Use a keyspace unique to this test and filter on it
+            // so the assertions are isolated from any concurrent emitter.
+            const KS: &str = "fs9_read_active_route_test";
+            let (sink, _guard) = recording_activity_sink();
+            let mut session = WsSession::new_for_test(Arc::new(MockFsBackend {
+                atomic_supported: false,
+                fail_dirs: std::collections::HashSet::new(),
+                readdir_result: None,
+                file_content: Some(b"hello".to_vec()),
+            }));
+            session.keyspace = KS.to_string();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+            crate::extensions::fs::ws::handle_ws_read_tx(
+                &tx, &session, "r1", "/a.txt", None, None, false,
+            )
+            .await
+            .unwrap();
+
+            let events = sink.events.lock();
+            let mine: Vec<_> = events
+                .iter()
+                .filter(|e| &*e.tenant_keyspace == KS)
+                .collect();
+            assert_eq!(mine.len(), 1, "successful read must emit one event");
+            assert_eq!(mine[0].kind, DatabaseActivityKind::Active);
+            assert_eq!(mine[0].source, DatabaseActivitySource::Fs9);
+        }
+
+        #[tokio::test]
+        async fn ws_read_route_emits_nothing_on_not_found() {
+            // `file_content: None` -> stat fails -> error response, no activity.
+            const KS: &str = "fs9_read_notfound_route_test";
+            let (sink, _guard) = recording_activity_sink();
+            let mut session = WsSession::new_for_test(Arc::new(MockFsBackend {
+                atomic_supported: false,
+                fail_dirs: std::collections::HashSet::new(),
+                readdir_result: None,
+                file_content: None,
+            }));
+            session.keyspace = KS.to_string();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+            crate::extensions::fs::ws::handle_ws_read_tx(
+                &tx,
+                &session,
+                "r1",
+                "/missing.txt",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                sink.events.lock().iter().all(|e| &*e.tenant_keyspace != KS),
+                "a failed read must emit no activity"
+            );
         }
 
         #[tokio::test]
@@ -2349,6 +2537,7 @@ mod tests {
                 atomic_supported: true,
                 fail_dirs: std::collections::HashSet::new(),
                 readdir_result: None,
+                file_content: None,
             });
             let subgroup_size =
                 crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
@@ -2387,6 +2576,7 @@ mod tests {
                 atomic_supported: true,
                 fail_dirs: std::collections::HashSet::new(),
                 readdir_result: None,
+                file_content: None,
             });
             let subgroup_size =
                 crate::extensions::fs::config::fs9_config().grouped_write_subgroup_size;
@@ -2437,6 +2627,7 @@ mod tests {
                     atomic_supported: false,
                     fail_dirs: std::collections::HashSet::new(),
                     readdir_result: None,
+                    file_content: None,
                 }),
                 FsAccessMode::ReadOnly,
             )
@@ -2496,6 +2687,115 @@ mod tests {
                     "read operations must not be blocked by read-only mode"
                 );
             }
+        }
+    }
+
+    mod activity_effect {
+        use crate::database_activity::DatabaseActivityKind;
+        use crate::extensions::fs::ws::handler::fs_ws_activity_effect;
+        use crate::extensions::fs::ws::protocol::{WsErrorCode, WsRequest, WsResponse};
+        use serde_json::json;
+
+        fn stat(id: &str) -> WsRequest {
+            WsRequest::Stat {
+                id: id.to_string(),
+                path: "/a".to_string(),
+            }
+        }
+
+        fn write(id: &str) -> WsRequest {
+            WsRequest::Write {
+                id: id.to_string(),
+                path: "/a".to_string(),
+                content: Some("eA==".to_string()),
+                encoding: "base64".to_string(),
+                streaming: false,
+                size: None,
+                mode: None,
+            }
+        }
+
+        fn batch_write(id: &str) -> WsRequest {
+            WsRequest::BatchWrite {
+                id: id.to_string(),
+                files: vec![],
+            }
+        }
+
+        fn batch_stat(id: &str) -> WsRequest {
+            WsRequest::BatchStat {
+                id: id.to_string(),
+                paths: vec![],
+            }
+        }
+
+        #[test]
+        fn single_read_success_is_active() {
+            let resp = WsResponse::success("1", json!({}));
+            assert_eq!(
+                fs_ws_activity_effect(&stat("1"), &resp),
+                Some(DatabaseActivityKind::Active)
+            );
+        }
+
+        #[test]
+        fn single_write_success_is_modified() {
+            let resp = WsResponse::success("1", json!({"written": 1}));
+            assert_eq!(
+                fs_ws_activity_effect(&write("1"), &resp),
+                Some(DatabaseActivityKind::Modified)
+            );
+        }
+
+        #[test]
+        fn failed_op_is_no_activity() {
+            let resp = WsResponse::error("1", WsErrorCode::Eio, "boom");
+            assert_eq!(fs_ws_activity_effect(&write("1"), &resp), None);
+            assert_eq!(fs_ws_activity_effect(&stat("1"), &resp), None);
+        }
+
+        #[test]
+        fn batch_write_all_failed_is_no_activity() {
+            // Handlers wrap backend errors as outer-ok success + per-entry ok:false.
+            let resp = WsResponse::success(
+                "1",
+                json!({"entries": [{"path": "/a", "ok": false}, {"path": "/b", "ok": false}]}),
+            );
+            assert_eq!(fs_ws_activity_effect(&batch_write("1"), &resp), None);
+        }
+
+        #[test]
+        fn batch_write_partial_success_is_modified() {
+            let resp = WsResponse::success(
+                "1",
+                json!({"entries": [{"path": "/a", "ok": true}, {"path": "/b", "ok": false}]}),
+            );
+            assert_eq!(
+                fs_ws_activity_effect(&batch_write("1"), &resp),
+                Some(DatabaseActivityKind::Modified)
+            );
+        }
+
+        #[test]
+        fn batch_read_any_success_is_active() {
+            let resp = WsResponse::success("1", json!({"entries": [{"path": "/a", "ok": true}]}));
+            assert_eq!(
+                fs_ws_activity_effect(&batch_stat("1"), &resp),
+                Some(DatabaseActivityKind::Active)
+            );
+        }
+
+        #[test]
+        fn batch_read_all_failed_is_no_activity() {
+            let resp = WsResponse::success("1", json!({"entries": [{"path": "/a", "ok": false}]}));
+            assert_eq!(fs_ws_activity_effect(&batch_stat("1"), &resp), None);
+        }
+
+        #[test]
+        fn batch_missing_entries_is_no_activity() {
+            // Defensive: outer ok but no parseable per-entry data → emit nothing.
+            let resp = WsResponse::success("1", json!({}));
+            assert_eq!(fs_ws_activity_effect(&batch_write("1"), &resp), None);
         }
     }
 }
