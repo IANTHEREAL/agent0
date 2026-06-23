@@ -20,6 +20,7 @@ mod cli;
 mod config;
 mod cron;
 mod database_activity;
+mod database_activity_connector;
 mod export;
 mod extensions;
 pub(crate) mod metrics;
@@ -285,6 +286,11 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         "runtime_metrics sampler",
         runtime_metrics::sampler_loop,
     ));
+
+    // Install the per-database activity connector (#2638): forwards the SQL
+    // executor's activity events to the backend control plane. No-op unless the
+    // backend endpoint + internal secret are configured.
+    database_activity_connector::start_database_activity_connector();
 
     let pd_endpoints = cli_args.pd_endpoints.unwrap_or_else(|| {
         env::var("PD_ENDPOINTS").unwrap_or_else(|_| DEFAULT_PD_ENDPOINTS.to_string())

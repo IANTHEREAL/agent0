@@ -72,6 +72,15 @@ pub(crate) fn record_sql_activity(
     }
 }
 
+/// Install the process-global activity sink (production path).
+///
+/// Called once at startup by the control-plane connector when the backend
+/// endpoint + auth are configured. Replacement is supported (last writer wins);
+/// when no sink is installed, [`record_sql_activity`] is a no-op.
+pub(crate) fn install_database_activity_sink(sink: Arc<dyn DatabaseActivitySink>) {
+    *ACTIVITY_SINK.write() = Some(sink);
+}
+
 #[cfg(test)]
 pub(crate) struct DatabaseActivitySinkGuard {
     previous: Option<Arc<dyn DatabaseActivitySink>>,
