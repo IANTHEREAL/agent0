@@ -12,6 +12,7 @@ This document is a convenience overview. The authoritative list of config keys +
 | `PG_PORT` | `5433` | PostgreSQL protocol listen port |
 | `PG_LISTEN_ADDR` | `127.0.0.1` | Listen address (loopback by default) |
 | `PG_KEYSPACE` | `default` | Default keyspace when not specified in username |
+| `DB9_METRICS_ADDR` | `0.0.0.0:9102` | Prometheus metrics HTTP listener address. Use port `0` to disable it. |
 | `PG_TLS_CERT` | (unset) | TLS cert path (PEM); enable TLS only when both cert+key are set |
 | `PG_TLS_KEY` | (unset) | TLS key path (PEM; PKCS#8 or RSA) |
 | `PG_REQUIRE_TLS` | `false` | Require TLS for all pgwire connections |

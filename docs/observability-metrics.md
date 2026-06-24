@@ -6,7 +6,7 @@ db9-server installs a global `metrics-exporter-prometheus` recorder at startup a
 GET /internal/metrics
 ```
 
-The endpoint is disabled when `DB9_METRICS_PORT=0`. Metrics are process-local; counters reset on process restart. SQL-visible per-tenant summaries remain available through `_DB9_SYS_OBSERVABILITY` and `_DB9_SYS_QUERY_SAMPLES`, but this document describes the Prometheus surface.
+The listener address defaults to `0.0.0.0:9102` and can be overridden with `--metrics-addr` or `DB9_METRICS_ADDR`. The endpoint is disabled when the configured metrics address uses port `0`, for example `DB9_METRICS_ADDR=:0`. Metrics are process-local; counters reset on process restart. SQL-visible per-tenant summaries remain available through `_DB9_SYS_OBSERVABILITY` and `_DB9_SYS_QUERY_SAMPLES`, but this document describes the Prometheus surface.
 
 ## Naming and Labels
 

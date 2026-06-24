@@ -115,7 +115,7 @@ For local side benchmark runs against db9:
 - prefer one isolated benchmark database per run
 - set `DB9_AUTO_ANALYZE_ENABLED=false` to avoid background analyze noise in
   latency and throughput results
-- expose db9 metrics with `DB9_METRICS_PORT=9090`
+- expose db9 metrics with `DB9_METRICS_ADDR=127.0.0.1:9090`
 - ensure Redis is reachable if the current db9 binary still requires
   `REDIS_URL` during startup
 - when using keyspaces on TiKV or CSE, ensure the storage side is configured for
@@ -140,7 +140,7 @@ DB9_AUTO_ANALYZE_ENABLED=false \
 DB9_TENANT_MEMORY_QUOTA_BYTES=0 \
 DB9_STATEMENT_TIMEOUT_MS=0 \
 DB9_STATEMENT_TIMEOUT_HARD_CAP_MS=0 \
-DB9_METRICS_PORT=9090 \
+DB9_METRICS_ADDR=127.0.0.1:9090 \
 PD_ENDPOINTS=127.0.0.1:<pd_port> \
 PG_PORT=5433 \
 ./target/release/db9-server

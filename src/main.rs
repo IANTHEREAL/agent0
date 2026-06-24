@@ -45,7 +45,7 @@ use protocol::DynamicHandlerFactory;
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::env;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -58,6 +58,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 const DEFAULT_PG_PORT: u16 = 5433;
 const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
+const DEFAULT_METRICS_ADDR: &str = "0.0.0.0:9102";
 const DEFAULT_TOKIO_STACK_MB: usize = 8;
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -140,6 +141,44 @@ impl ConnectionTaskRegistry {
             }
         }
     }
+}
+
+fn resolve_metrics_addr(
+    cli_metrics_addr: Option<&str>,
+    env_metrics_addr: Option<&str>,
+) -> Result<SocketAddr> {
+    if let Some(raw) = cli_metrics_addr
+        .and_then(non_empty_trimmed)
+        .or_else(|| env_metrics_addr.and_then(non_empty_trimmed))
+    {
+        return parse_metrics_addr(raw);
+    }
+
+    parse_metrics_addr(DEFAULT_METRICS_ADDR)
+}
+
+fn parse_metrics_addr(raw: &str) -> Result<SocketAddr> {
+    let normalized = if raw.starts_with(':') {
+        format!("0.0.0.0{}", raw)
+    } else {
+        raw.to_string()
+    };
+
+    normalized.parse::<SocketAddr>().map_err(|e| {
+        anyhow::anyhow!(
+            "Invalid metrics address '{}': {}. Expected an IP socket address like 0.0.0.0:9102",
+            raw,
+            e
+        )
+    })
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed)
 }
 
 fn main() -> Result<()> {
@@ -713,13 +752,13 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
 
     // Prometheus metrics endpoint
     {
-        let metrics_port: u16 = env::var("DB9_METRICS_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0);
+        let metrics_addr = resolve_metrics_addr(
+            cli_args.metrics_addr.as_deref(),
+            env::var("DB9_METRICS_ADDR").ok().as_deref(),
+        )?;
         let prom_handle = prometheus_handle.clone();
         tokio::spawn(async move {
-            metrics::start_metrics_server(metrics_port, prom_handle).await;
+            metrics::start_metrics_server(metrics_addr, prom_handle).await;
         });
     }
 
@@ -1108,6 +1147,35 @@ mod tests {
     use super::*;
     use socket2::SockRef;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn resolve_metrics_addr_defaults_to_9102() {
+        assert_eq!(
+            resolve_metrics_addr(None, None).unwrap(),
+            "0.0.0.0:9102".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_addr_uses_env_when_cli_absent() {
+        assert_eq!(
+            resolve_metrics_addr(None, Some("127.0.0.1:9191")).unwrap(),
+            "127.0.0.1:9191".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_addr_prefers_cli_over_env() {
+        assert_eq!(
+            resolve_metrics_addr(Some("127.0.0.1:9292"), Some("127.0.0.1:9191")).unwrap(),
+            "127.0.0.1:9292".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_metrics_addr_accepts_disable_port_zero() {
+        assert_eq!(resolve_metrics_addr(Some(":0"), None).unwrap().port(), 0);
+    }
 
     #[tokio::test]
     async fn test_semaphore_admission_control() {

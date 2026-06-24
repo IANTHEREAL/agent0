@@ -6,11 +6,19 @@
 /// "not provided" from "provided" for merge with env vars.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CliArgs {
+    /// PostgreSQL protocol listen host from `--host`.
     pub host: Option<String>,
+    /// PostgreSQL protocol listen port from `--port`.
     pub port: Option<u16>,
+    /// TiKV PD endpoint list from `--pd-endpoints`.
     pub pd_endpoints: Option<String>,
+    /// Default TiKV keyspace from `--keyspace`.
     pub keyspace: Option<String>,
+    /// Prometheus metrics HTTP listener address from `--metrics-addr`.
+    pub metrics_addr: Option<String>,
+    /// TLS certificate path from `--tls-cert`.
     pub tls_cert: Option<String>,
+    /// TLS private key path from `--tls-key`.
     pub tls_key: Option<String>,
 }
 
@@ -46,6 +54,7 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
             port: None,
             pd_endpoints: None,
             keyspace: None,
+            metrics_addr: None,
             tls_cert: None,
             tls_key: None,
         }));
@@ -56,6 +65,7 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
         port: None,
         pd_endpoints: None,
         keyspace: None,
+        metrics_addr: None,
         tls_cert: None,
         tls_key: None,
     };
@@ -93,6 +103,7 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     }
                     "--pd-endpoints" => cli_args.pd_endpoints = Some(value.to_string()),
                     "--keyspace" => cli_args.keyspace = Some(value.to_string()),
+                    "--metrics-addr" => cli_args.metrics_addr = Some(value.to_string()),
                     "--tls-cert" => cli_args.tls_cert = Some(value.to_string()),
                     "--tls-key" => cli_args.tls_key = Some(value.to_string()),
                     _ => return Err(format!("Unknown option: '{}'", flag)),
@@ -104,7 +115,8 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
         // Value flags with space syntax
         match arg.as_str() {
-            "--host" | "--port" | "--pd-endpoints" | "--keyspace" | "--tls-cert" | "--tls-key" => {
+            "--host" | "--port" | "--pd-endpoints" | "--keyspace" | "--metrics-addr"
+            | "--tls-cert" | "--tls-key" => {
                 if i + 1 >= args.len() {
                     return Err(format!("Option '{}' requires a value", arg));
                 }
@@ -116,6 +128,7 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     }
                     "--pd-endpoints" => cli_args.pd_endpoints = Some(value.clone()),
                     "--keyspace" => cli_args.keyspace = Some(value.clone()),
+                    "--metrics-addr" => cli_args.metrics_addr = Some(value.clone()),
                     "--tls-cert" => cli_args.tls_cert = Some(value.clone()),
                     "--tls-key" => cli_args.tls_key = Some(value.clone()),
                     _ => unreachable!(),
@@ -162,6 +175,7 @@ pub fn print_help() {
     println!("        --port <PORT>              Listen port [default: 5433] [env: PG_PORT]");
     println!("        --pd-endpoints <ENDPOINTS> PD endpoints, comma-separated [default: 127.0.0.1:2379] [env: PD_ENDPOINTS]");
     println!("        --keyspace <NAME>          Default TiKV keyspace for multi-tenancy [env: PG_KEYSPACE]");
+    println!("        --metrics-addr <ADDR>      Prometheus metrics HTTP address [default: 0.0.0.0:9102] [env: DB9_METRICS_ADDR]");
     println!("        --tls-cert <PATH>          Path to TLS certificate file [env: PG_TLS_CERT]");
     println!("        --tls-key <PATH>           Path to TLS private key file [env: PG_TLS_KEY]");
     println!();
@@ -198,6 +212,7 @@ mod tests {
                 assert_eq!(cli_args.port, None);
                 assert_eq!(cli_args.pd_endpoints, None);
                 assert_eq!(cli_args.keyspace, None);
+                assert_eq!(cli_args.metrics_addr, None);
                 assert_eq!(cli_args.tls_cert, None);
                 assert_eq!(cli_args.tls_key, None);
             }
@@ -274,6 +289,29 @@ mod tests {
     }
 
     #[test]
+    fn test_metrics_addr_space() {
+        let result =
+            parse_args(&args(&["db9-server", "--metrics-addr", "127.0.0.1:9102"])).unwrap();
+        match result {
+            CliAction::Run(cli_args) => {
+                assert_eq!(cli_args.metrics_addr, Some("127.0.0.1:9102".to_string()));
+            }
+            _ => panic!("Expected Run action"),
+        }
+    }
+
+    #[test]
+    fn test_metrics_addr_equals() {
+        let result = parse_args(&args(&["db9-server", "--metrics-addr=:0"])).unwrap();
+        match result {
+            CliAction::Run(cli_args) => {
+                assert_eq!(cli_args.metrics_addr, Some(":0".to_string()));
+            }
+            _ => panic!("Expected Run action"),
+        }
+    }
+
+    #[test]
     fn test_pd_endpoints() {
         let result = parse_args(&args(&["db9-server", "--pd-endpoints", "a:1,b:2"])).unwrap();
         match result {
@@ -338,6 +376,8 @@ mod tests {
             "pd1:2379,pd2:2379",
             "--keyspace",
             "tenant1",
+            "--metrics-addr",
+            "127.0.0.1:9102",
             "--tls-cert",
             "cert.pem",
             "--tls-key",
@@ -350,6 +390,7 @@ mod tests {
                 assert_eq!(cli_args.port, Some(9999));
                 assert_eq!(cli_args.pd_endpoints, Some("pd1:2379,pd2:2379".to_string()));
                 assert_eq!(cli_args.keyspace, Some("tenant1".to_string()));
+                assert_eq!(cli_args.metrics_addr, Some("127.0.0.1:9102".to_string()));
                 assert_eq!(cli_args.tls_cert, Some("cert.pem".to_string()));
                 assert_eq!(cli_args.tls_key, Some("key.pem".to_string()));
             }

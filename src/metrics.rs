@@ -8,6 +8,7 @@
 //! anywhere in the codebase are captured automatically.
 
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use std::net::SocketAddr;
 use std::time::SystemTime;
 use tracing::{info, warn};
 
@@ -552,28 +553,27 @@ pub(crate) fn record_spill_cleanup_failure() {
     metrics::counter!("db9_spill_cleanup_failures_total").increment(1);
 }
 
-/// Start a lightweight HTTP server that serves `/internal/metrics`.
-///
-/// Listens on `0.0.0.0:{port}`. Disabled when `port == 0`.
-/// Uses raw TCP + manual HTTP parsing (no framework dependency) to stay
-/// consistent with the break-glass admin server pattern.
 /// Maximum concurrent connections to the metrics HTTP server.
 const MAX_METRICS_CONNECTIONS: usize = 8;
 
-pub async fn start_metrics_server(port: u16, handle: PrometheusHandle) {
-    if port == 0 {
-        info!("Metrics endpoint disabled (DB9_METRICS_PORT=0)");
+/// Start a lightweight HTTP server that serves `/internal/metrics`.
+///
+/// Disabled when the configured address uses port `0`. Uses raw TCP plus
+/// manual HTTP parsing to stay consistent with the break-glass admin server
+/// pattern without adding another HTTP framework dependency.
+pub async fn start_metrics_server(addr: SocketAddr, handle: PrometheusHandle) {
+    if addr.port() == 0 {
+        info!("Metrics endpoint disabled (DB9_METRICS_ADDR port is 0)");
         return;
     }
 
-    let addr = format!("0.0.0.0:{}", port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
             info!("Prometheus metrics listening on {}", addr);
             l
         }
         Err(e) => {
-            warn!("Failed to bind metrics port {}: {}", addr, e);
+            warn!("Failed to bind metrics address {}: {}", addr, e);
             return;
         }
     };

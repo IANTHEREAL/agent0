@@ -54,7 +54,7 @@ DB9_HOST="${DB9_HOST:-127.0.0.1}"
 DB9_PORT="${DB9_PORT:-5433}"
 DB9_USER="${DB9_USER:-admin}"
 DB9_PASSWORD="${DB9_PASSWORD:-admin}"
-DB9_METRICS_PORT="${DB9_METRICS_PORT:-9090}"
+DB9_METRICS_ADDR="${DB9_METRICS_ADDR:-127.0.0.1:9090}"
 DB9_REDIS_URL="${DB9_REDIS_URL:-redis://127.0.0.1:6379/0}"
 DB9_TENANT_MEMORY_QUOTA_BYTES="${DB9_TENANT_MEMORY_QUOTA_BYTES:-0}"
 DB9_STATEMENT_TIMEOUT_MS="${DB9_STATEMENT_TIMEOUT_MS:-0}"
@@ -97,7 +97,7 @@ Options:
 
 Environment overrides:
   DB9_BIN, CSE_TIKV_BIN
-  DB9_HOST, DB9_PORT, DB9_USER, DB9_PASSWORD, DB9_METRICS_PORT, DB9_REDIS_URL
+  DB9_HOST, DB9_PORT, DB9_USER, DB9_PASSWORD, DB9_METRICS_ADDR, DB9_REDIS_URL
   DB9_TENANT_MEMORY_QUOTA_BYTES, DB9_STATEMENT_TIMEOUT_MS,
   DB9_STATEMENT_TIMEOUT_HARD_CAP_MS
   PG18_HOST, PG18_PORT, PG18_USER, PG18_PASSWORD
@@ -219,6 +219,17 @@ raise SystemExit(1)
 PY
 }
 
+db9_metrics_url() {
+  local path="$1"
+  local addr="$DB9_METRICS_ADDR"
+  if [[ "$addr" == :* ]]; then
+    addr="127.0.0.1${addr}"
+  elif [[ "$addr" == 0.0.0.0:* ]]; then
+    addr="127.0.0.1:${addr#0.0.0.0:}"
+  fi
+  printf 'http://%s%s' "$addr" "$path"
+}
+
 psql_cmd() {
   local host="$1"
   local port="$2"
@@ -306,13 +317,13 @@ start_db9() {
   DB9_TENANT_MEMORY_QUOTA_BYTES="$DB9_TENANT_MEMORY_QUOTA_BYTES" \
   DB9_STATEMENT_TIMEOUT_MS="$DB9_STATEMENT_TIMEOUT_MS" \
   DB9_STATEMENT_TIMEOUT_HARD_CAP_MS="$DB9_STATEMENT_TIMEOUT_HARD_CAP_MS" \
-  DB9_METRICS_PORT="$DB9_METRICS_PORT" \
+  DB9_METRICS_ADDR="$DB9_METRICS_ADDR" \
   PD_ENDPOINTS="127.0.0.1:${CSE_PD_PORT}" \
   PG_PORT="$DB9_PORT" \
   "$DB9_BIN" >"$LOG_DIR/db9-server.log" 2>&1 &
   DB9_PID="$!"
   wait_for_port "$DB9_HOST" "$DB9_PORT" 120 >/dev/null
-  wait_for_http_ok "http://${DB9_HOST}:${DB9_METRICS_PORT}/health" 120 >/dev/null
+  wait_for_http_ok "$(db9_metrics_url /health)" 120 >/dev/null
 }
 
 reset_db() {
@@ -330,7 +341,7 @@ reset_db() {
 
 run_db9_metrics_snapshot() {
   local output="$1"
-  curl -sS --max-time 10 "http://${DB9_HOST}:${DB9_METRICS_PORT}/internal/metrics" >"$output"
+  curl -sS --max-time 10 "$(db9_metrics_url /internal/metrics)" >"$output"
 }
 
 run_tpch_prepare() {
@@ -430,7 +441,7 @@ Scope:
 - cse tikv binary: \`$CSE_TIKV_BIN\`
 - PostgreSQL 18.3: \`${PG18_HOST}:${PG18_PORT}\`
 - db9 pgwire: \`${DB9_HOST}:${DB9_PORT}\`
-- db9 metrics: \`http://${DB9_HOST}:${DB9_METRICS_PORT}/internal/metrics\`
+- db9 metrics: \`$(db9_metrics_url /internal/metrics)\`
 - cse PD: \`127.0.0.1:${CSE_PD_PORT}\`
 - cse TiKV: \`127.0.0.1:${CSE_KV_PORT}\`
 

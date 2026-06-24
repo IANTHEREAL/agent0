@@ -47,6 +47,7 @@
 | `--port` | `PG_PORT` | `5433` | `src/cli.rs`, `src/main.rs` | pgwire listen port. |
 | `--pd-endpoints` | `PD_ENDPOINTS` | `127.0.0.1:2379` | `src/cli.rs`, `src/main.rs` | Comma-separated PD endpoints. |
 | `--keyspace` | `PG_KEYSPACE` | `default` | `src/cli.rs`, `src/main.rs` | Default tenant keyspace when username has no explicit override. |
+| `--metrics-addr` | `DB9_METRICS_ADDR` | `0.0.0.0:9102` | `src/cli.rs`, `src/main.rs` | Prometheus metrics HTTP listen address. Port `0` disables the listener. |
 | `--tls-cert` | `PG_TLS_CERT` | unset | `src/cli.rs`, `src/main.rs` | Requires matching `--tls-key` / `PG_TLS_KEY`. |
 | `--tls-key` | `PG_TLS_KEY` | unset | `src/cli.rs`, `src/main.rs` | Requires matching `--tls-cert` / `PG_TLS_CERT`. |
 | `--help` / `-h` | none | n/a | `src/cli.rs` | Prints usage and exits. |
@@ -60,6 +61,7 @@
 | `PG_LISTEN_ADDR` | `127.0.0.1` | `src/main.rs` | Non-loopback cleartext startup is refused unless TLS or insecure escape hatch is enabled. |
 | `PG_PORT` | `5433` | `src/main.rs` | pgwire listen port. |
 | `PG_KEYSPACE` | `default` | `src/main.rs` | Default tenant keyspace when username has no keyspace prefix. |
+| `DB9_METRICS_ADDR` | `0.0.0.0:9102` | `src/main.rs`, `src/metrics.rs` | Prometheus metrics HTTP listener address. Use port `0`, such as `:0`, to disable it. |
 | `PG_TLS_CERT` | unset | `src/main.rs`, `src/tls.rs` | Enables pgwire TLS only when paired with `PG_TLS_KEY`. |
 | `PG_TLS_KEY` | unset | `src/main.rs`, `src/tls.rs` | Enables pgwire TLS only when paired with `PG_TLS_CERT`. |
 | `PG_REQUIRE_TLS` | `false` | `src/main.rs` | Refuses non-TLS pgwire startup when enabled. |
