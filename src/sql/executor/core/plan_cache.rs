@@ -522,6 +522,7 @@ impl PreparedPlanCache {
         };
         self.entries.remove(&evict_key);
         self.counters.remove(&evict_key);
+        crate::metrics::record_plan_cache_event("eviction");
         true
     }
 

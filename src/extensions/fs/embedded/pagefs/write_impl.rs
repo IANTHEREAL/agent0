@@ -895,6 +895,7 @@ impl EmbeddedPageFs {
 
                 match outcome.result {
                     Ok(written_sizes) => {
+                        crate::metrics::record_batch_write_atomic_subgroup_latency(t0.elapsed());
                         let elapsed_ms = t0.elapsed().as_millis();
                         if outcome.retried {
                             debug!(
@@ -919,6 +920,7 @@ impl EmbeddedPageFs {
                         }
                     }
                     Err(err) => {
+                        crate::metrics::record_batch_write_atomic_subgroup_latency(t0.elapsed());
                         let elapsed_ms = t0.elapsed().as_millis();
                         let category = classify_group_commit_error(&err);
                         if category == "execution.txn_conflict" {

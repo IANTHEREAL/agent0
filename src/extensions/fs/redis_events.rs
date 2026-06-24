@@ -222,6 +222,7 @@ pub fn enqueue_events(keyspace: &str, builders: Vec<FsEventBuilder>) {
         let sent = enqueue_with_accounting(tx, keyspace, builders);
         if sent > 0 {
             let depth = EVENT_QUEUE_DEPTH.load(Ordering::Relaxed);
+            crate::metrics::sample_fs9_redis_event_queue_depth(depth);
             if depth >= QUEUE_DEPTH_WARN_THRESHOLD {
                 tracing::warn!(
                     "fs9_redis: event queue depth {depth} (threshold {QUEUE_DEPTH_WARN_THRESHOLD})"
@@ -321,6 +322,7 @@ pub fn spawn_event_loop() {
                 // of whether Redis accepted them.
             }
             let remaining = EVENT_QUEUE_DEPTH.fetch_sub(flushed, Ordering::Relaxed) - flushed;
+            crate::metrics::sample_fs9_redis_event_queue_depth(remaining);
             if remaining >= QUEUE_DEPTH_WARN_THRESHOLD {
                 tracing::warn!(
                     "fs9_redis: queue depth still high after flush: {remaining} pending"
@@ -338,7 +340,8 @@ pub fn spawn_event_loop() {
             let to_flush = std::mem::take(&mut batch);
             let flushed = to_flush.len() as u64;
             let _ = flush_batch(&mut conn, to_flush).await;
-            EVENT_QUEUE_DEPTH.fetch_sub(flushed, Ordering::Relaxed);
+            let remaining = EVENT_QUEUE_DEPTH.fetch_sub(flushed, Ordering::Relaxed) - flushed;
+            crate::metrics::sample_fs9_redis_event_queue_depth(remaining);
         }
         tracing::info!("fs9_redis: event loop exited");
     });

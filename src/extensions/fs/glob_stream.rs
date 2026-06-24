@@ -31,6 +31,7 @@ async fn start_glob_stream_with_budget(
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     let backend = backend::acquire_statement_backend(tenant).await?;
     start_glob_stream_with_budget_for_backend(
+        tenant,
         backend,
         pattern,
         format,
@@ -43,6 +44,7 @@ async fn start_glob_stream_with_budget(
 }
 
 async fn start_glob_stream_with_budget_for_backend(
+    tenant: &str,
     backend: Arc<dyn backend::FsBackend>,
     pattern: &str,
     format: Option<&str>,
@@ -166,6 +168,7 @@ async fn start_glob_stream_with_budget_for_backend(
     let (tx, rx) = mpsc::channel(256);
     let fmt_owned = fmt.to_string();
     let pattern_owned = pattern.to_string();
+    let tenant_owned = tenant.to_string();
     tokio::spawn(async move {
         let mut total_bytes: usize = 0;
         let mut files_read_count: usize = 0;
@@ -173,6 +176,7 @@ async fn start_glob_stream_with_budget_for_backend(
         for file_path in matching_files {
             let remaining_budget = max_total_bytes.saturating_sub(total_bytes);
             if remaining_budget == 0 {
+                crate::metrics::record_fs9_glob_truncated(&tenant_owned, "stream");
                 warn!(
                     "fs9: bytes budget exhausted ({} MB), {} files were streamed for pattern {}",
                     total_bytes / (1024 * 1024),
@@ -280,6 +284,7 @@ async fn start_glob_stream_with_budget_for_backend(
             }
 
             if total_bytes >= max_total_bytes {
+                crate::metrics::record_fs9_glob_truncated(&tenant_owned, "stream");
                 warn!(
                     "fs9: bytes budget exhausted ({} MB), {} files were streamed for pattern {}",
                     total_bytes / (1024 * 1024),
@@ -305,6 +310,7 @@ pub(crate) async fn start_glob_stream_with_budget_for_test_backend(
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     start_glob_stream_with_budget_for_backend(
+        "test",
         Arc::from(backend),
         pattern,
         format,

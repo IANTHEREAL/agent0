@@ -114,16 +114,19 @@ pub(crate) async fn execute_table_function(
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
     let backend = backend::acquire_statement_backend(tenant).await?;
-    execute_table_function_with_budget_for_backend(backend.as_ref(), mode, MAX_TOTAL_BYTES).await
+    execute_table_function_with_budget_for_backend(tenant, backend.as_ref(), mode, MAX_TOTAL_BYTES)
+        .await
 }
 
 async fn execute_table_function_with_budget_for_backend(
+    tenant: &str,
     backend: &dyn backend::FsBackend,
     mode: Fs9Mode,
     max_total_bytes: usize,
 ) -> Result<(TableSchema, Vec<Row>)> {
     let log_budget_exhausted =
         |total_bytes_read: usize, files_read_count: usize, total_files: usize| {
+            crate::metrics::record_fs9_glob_truncated(tenant, "table_function");
             warn!(
                 "fs9: bytes budget exhausted ({} MB), {} of {} matched files were scanned",
                 total_bytes_read / (1024 * 1024),
@@ -299,5 +302,6 @@ pub(crate) async fn execute_table_function_with_budget_for_test_backend(
     mode: Fs9Mode,
     max_total_bytes: usize,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    execute_table_function_with_budget_for_backend(backend.as_ref(), mode, max_total_bytes).await
+    execute_table_function_with_budget_for_backend("test", backend.as_ref(), mode, max_total_bytes)
+        .await
 }

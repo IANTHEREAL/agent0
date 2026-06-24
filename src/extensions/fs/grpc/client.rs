@@ -746,7 +746,9 @@ impl GrpcMultipartUploadStream {
             offset: self.cursor,
             data,
         };
+        let send_start = std::time::Instant::now();
         let send_result = tx.send(req).await;
+        crate::metrics::record_upload_mpsc_send_latency(send_start.elapsed());
         if send_result.is_err() {
             return Err(self.drain_task_err().await);
         }
@@ -1023,6 +1025,10 @@ impl tokio::io::AsyncRead for GrpcReadStream {
 
 #[async_trait]
 impl FsBackend for GrpcFsBackend {
+    fn backend_kind(&self) -> &'static str {
+        "grpc"
+    }
+
     // ---------------------------------------------------------------
     // Reads
     // ---------------------------------------------------------------

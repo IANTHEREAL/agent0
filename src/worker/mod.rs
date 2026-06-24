@@ -10,9 +10,11 @@ use crate::storage::TikvStore;
 use crate::worker::types::{HnswS3DbPrefixCleanupIntent, TaskRegistryEntry};
 use anyhow::{Context, Result};
 use config::WorkerConfig;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -123,6 +125,86 @@ static WORKER_EXECUTION_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static WORKER_METRICS: OnceLock<Arc<metrics::WorkerMetrics>> = OnceLock::new();
+static ASYNC_TRIGGER_DEPTH_SAMPLER: OnceLock<Mutex<AsyncTriggerDepthSampler>> = OnceLock::new();
+
+const ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const ASYNC_TRIGGER_QUEUE_DEPTH_IDLE_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Default)]
+struct AsyncTriggerDepthSampler {
+    dirty: HashSet<String>,
+    last_attempted: HashMap<String, Instant>,
+}
+
+impl AsyncTriggerDepthSampler {
+    fn mark_dirty(&mut self, keyspace: &str) {
+        self.dirty.insert(keyspace.to_string());
+    }
+
+    fn due(&self, keyspace: &str, now: Instant) -> bool {
+        self.last_attempted
+            .get(keyspace)
+            .and_then(|last| now.checked_duration_since(*last))
+            .is_none_or(|elapsed| elapsed >= ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL)
+    }
+
+    fn dirty_due_keyspaces(&self, now: Instant) -> Vec<String> {
+        self.dirty
+            .iter()
+            .filter(|keyspace| self.due(keyspace, now))
+            .cloned()
+            .collect()
+    }
+
+    fn prune_idle(&mut self, now: Instant) {
+        let dirty = &self.dirty;
+        self.last_attempted.retain(|keyspace, last| {
+            dirty.contains(keyspace)
+                || now
+                    .checked_duration_since(*last)
+                    .is_none_or(|elapsed| elapsed < ASYNC_TRIGGER_QUEUE_DEPTH_IDLE_RETENTION)
+        });
+    }
+
+    fn mark_attempted(&mut self, keyspace: &str, now: Instant) {
+        self.prune_idle(now);
+        self.last_attempted.insert(keyspace.to_string(), now);
+    }
+
+    fn mark_sampled(&mut self, keyspace: &str, now: Instant) {
+        self.prune_idle(now);
+        self.last_attempted.insert(keyspace.to_string(), now);
+        self.dirty.remove(keyspace);
+    }
+}
+
+fn async_trigger_depth_sampler() -> &'static Mutex<AsyncTriggerDepthSampler> {
+    ASYNC_TRIGGER_DEPTH_SAMPLER.get_or_init(|| Mutex::new(AsyncTriggerDepthSampler::default()))
+}
+
+fn begin_async_trigger_queue_depth_sample(keyspace: &str, now: Instant) -> bool {
+    let mut sampler = async_trigger_depth_sampler().lock();
+    sampler.prune_idle(now);
+    sampler.mark_dirty(keyspace);
+    if !sampler.due(keyspace, now) {
+        return false;
+    }
+    sampler.mark_attempted(keyspace, now);
+    true
+}
+
+fn mark_async_trigger_queue_depth_sampled(keyspace: &str, now: Instant) {
+    async_trigger_depth_sampler()
+        .lock()
+        .mark_sampled(keyspace, now);
+}
+
+pub(crate) fn async_trigger_queue_depth_dirty_keyspaces_due() -> Vec<String> {
+    let now = Instant::now();
+    async_trigger_depth_sampler()
+        .lock()
+        .dirty_due_keyspaces(now)
+}
 
 pub(crate) fn now_epoch_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -147,6 +229,40 @@ pub fn system_store() -> Result<&'static Arc<TikvStore>> {
             "worker system store is not initialized; recovery metadata cannot be written"
         )
     })
+}
+
+/// Refresh the Prometheus async-trigger queue-depth gauge for one tenant.
+///
+/// Uses the V2 identity index plus active worker claims only; it never reads
+/// command payloads. This keeps Prometheus queue depth independent from the SQL
+/// diagnostics table while preserving the same tenant-scoped definition. Calls
+/// from enqueue/finalize/tick paths are tenant-rate-limited to avoid turning the
+/// gauge into a storage scan on every task transition.
+pub(crate) async fn sample_async_trigger_queue_depth(
+    system_store: &Arc<TikvStore>,
+    keyspace: &str,
+) -> Result<()> {
+    let now = Instant::now();
+    if !begin_async_trigger_queue_depth_sample(keyspace, now) {
+        return Ok(());
+    }
+    let mut txn = system_store.begin().await?;
+    let pending = system_store
+        .pending_async_trigger_task_ids(&mut txn, keyspace)
+        .await?
+        .len() as u64;
+    let mut processing = 0u64;
+    for (key, claim) in system_store.list_worker_claims(&mut txn).await? {
+        if claim.task_type == types::TaskType::AsyncTrigger
+            && crate::storage::worker_claim_keyspace_matches(&key, keyspace)
+        {
+            processing = processing.saturating_add(1);
+        }
+    }
+    txn.rollback().await.ok();
+    crate::metrics::sample_trigger_queue_depth(keyspace, pending.saturating_add(processing));
+    mark_async_trigger_queue_depth_sampled(keyspace, now);
+    Ok(())
 }
 
 pub async fn request_hnsw_s3_db_prefix_cleanup(
@@ -620,6 +736,82 @@ mod tests {
         assert_eq!(
             pd_keyspaces_base_url("https://pd.example:2379/"),
             "https://pd.example:2379/pd/api/v2/keyspaces"
+        );
+    }
+
+    #[test]
+    fn async_trigger_depth_sampler_throttles_dirty_keyspace_until_interval_elapsed() {
+        let mut sampler = AsyncTriggerDepthSampler::default();
+        let now = Instant::now();
+
+        sampler.mark_dirty("tenant_a");
+        assert!(sampler.due("tenant_a", now));
+        sampler.mark_attempted("tenant_a", now);
+
+        sampler.mark_dirty("tenant_a");
+        assert!(
+            !sampler.due(
+                "tenant_a",
+                now + ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL / 2
+            ),
+            "same tenant should not trigger another storage scan inside the sample interval"
+        );
+        assert!(
+            sampler
+                .dirty_due_keyspaces(now + ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL / 2)
+                .is_empty(),
+            "dirty keyspace should wait for the next due interval"
+        );
+
+        let due = sampler.dirty_due_keyspaces(now + ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL);
+        assert_eq!(due, vec!["tenant_a".to_string()]);
+    }
+
+    #[test]
+    fn async_trigger_depth_sampler_keeps_dirty_keyspace_after_failed_attempt() {
+        let mut sampler = AsyncTriggerDepthSampler::default();
+        let now = Instant::now();
+
+        sampler.mark_dirty("tenant_a");
+        sampler.mark_attempted("tenant_a", now);
+
+        assert!(
+            sampler.dirty.contains("tenant_a"),
+            "failed samples must keep the keyspace dirty for a later retry"
+        );
+        assert!(
+            !sampler.due(
+                "tenant_a",
+                now + ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL / 2
+            ),
+            "failed samples should still be rate-limited to avoid retry storms"
+        );
+        assert!(
+            sampler.due("tenant_a", now + ASYNC_TRIGGER_QUEUE_DEPTH_SAMPLE_INTERVAL),
+            "dirty keyspace should become retryable after the interval"
+        );
+    }
+
+    #[test]
+    fn async_trigger_depth_sampler_prunes_idle_tenant_attempts() {
+        let mut sampler = AsyncTriggerDepthSampler::default();
+        let now = Instant::now();
+        let old = now - ASYNC_TRIGGER_QUEUE_DEPTH_IDLE_RETENTION - Duration::from_secs(1);
+
+        sampler
+            .last_attempted
+            .insert("idle_tenant".to_string(), old);
+        sampler.mark_dirty("active_tenant");
+        sampler.mark_attempted("active_tenant", now);
+        sampler.prune_idle(now);
+
+        assert!(
+            !sampler.last_attempted.contains_key("idle_tenant"),
+            "idle tenants should not remain in process-global sampler state forever"
+        );
+        assert!(
+            sampler.last_attempted.contains_key("active_tenant"),
+            "dirty tenants must stay rate-limited while waiting for a retry"
         );
     }
 

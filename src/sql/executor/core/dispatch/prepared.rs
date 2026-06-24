@@ -95,21 +95,28 @@ fn decide_and_update_prepared_cache_action(
     use crate::sql::executor::core::plan_cache::PromotionCounterOutcome;
 
     if !cache_eligible {
+        crate::metrics::record_plan_cache_event("ineligible");
         return (None, false);
     }
 
     let cached = plan_cache.get(cache_key).cloned();
     if cached.is_some() {
+        crate::metrics::record_plan_cache_event("hit");
         return (cached, false);
     }
 
     let min_exec = plan_cache.min_exec();
     // Promotion must be miss-only. NotTracked must never drive promotion, even
     // when min_exec = 0.
+    let outcome = plan_cache.record_execution(cache_key);
+    crate::metrics::record_plan_cache_event("miss");
     let should_promote = matches!(
-        plan_cache.record_execution(cache_key),
+        outcome,
         PromotionCounterOutcome::MissCount(exec_count) if exec_count >= min_exec
     );
+    if should_promote {
+        crate::metrics::record_plan_cache_event("promote");
+    }
     (None, should_promote)
 }
 
@@ -126,6 +133,7 @@ fn update_plan_cache_after_attempt(
     use crate::sql::executor::core::plan_cache::{PlanCacheEntry, PlanDependency};
 
     if invalidate_cached_hit {
+        crate::metrics::record_plan_cache_event("invalidation");
         plan_cache.invalidate(cache_key);
     }
 
@@ -148,6 +156,7 @@ fn update_plan_cache_after_attempt(
                     dependencies: deps,
                 },
             );
+            crate::metrics::record_plan_cache_event("insert");
         }
     }
 }

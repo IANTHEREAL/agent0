@@ -319,6 +319,24 @@ impl Executor {
                                     .await?;
                             }
                             txn.commit().await?;
+                            let keyspaces: std::collections::HashSet<String> = triggers
+                                .iter()
+                                .map(|trigger| trigger.keyspace.clone())
+                                .collect();
+                            for keyspace in keyspaces {
+                                if let Err(err) = crate::worker::sample_async_trigger_queue_depth(
+                                    &system_store,
+                                    &keyspace,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to sample async trigger queue depth for {}: {}",
+                                        keyspace,
+                                        err
+                                    );
+                                }
+                            }
                             Ok::<(), anyhow::Error>(())
                         }
                         .await;

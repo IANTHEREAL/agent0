@@ -50,6 +50,12 @@ fn set_cached_fs_stats(stats: CachedFsStats) {
     *guard = Some(stats);
 }
 
+fn cached_stats_staleness_secs() -> u64 {
+    get_cached_fs_stats()
+        .map(|stats| now_epoch_secs().saturating_sub(stats.computed_at).max(0) as u64)
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Background worker loop
 // ---------------------------------------------------------------------------
@@ -117,9 +123,16 @@ pub(crate) async fn run_fs9_stats_worker(client: std::sync::Arc<TransactionClien
                     total_logical_bytes: stats.total_logical_bytes,
                     computed_at: now_epoch_secs(),
                 });
+                crate::metrics::record_fs9_stats_worker_scan("ok", elapsed, 0);
             }
             Err(e) => {
+                let elapsed = scan_start.elapsed();
                 warn!("fs9 stats worker: aggregate_storage_stats failed: {e}");
+                crate::metrics::record_fs9_stats_worker_scan(
+                    "err",
+                    elapsed,
+                    cached_stats_staleness_secs(),
+                );
                 // Keep stale cache rather than clearing it.
             }
         }

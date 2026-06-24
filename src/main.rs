@@ -265,6 +265,7 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // Register HELP/TYPE for every metric before the first emit so the
     // initial scrape carries full metadata.
     runtime_metrics::describe_metrics();
+    metrics::describe_observability_metrics();
 
     ::metrics::gauge!("db9_server_start_time_seconds").set(metrics::unix_now_seconds());
     ::metrics::gauge!(

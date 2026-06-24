@@ -430,6 +430,23 @@ impl WorkerEngine {
             due_entries.len() as u64,
             self.active_jobs.load(Ordering::Relaxed),
         );
+        let mut async_trigger_keyspaces: HashSet<String> = due_entries
+            .iter()
+            .filter(|(_, entry)| entry.task_type() == TaskType::AsyncTrigger)
+            .map(|(_, entry)| entry.keyspace().to_string())
+            .collect();
+        async_trigger_keyspaces
+            .extend(crate::worker::async_trigger_queue_depth_dirty_keyspaces_due());
+        for keyspace in async_trigger_keyspaces {
+            if let Err(err) =
+                crate::worker::sample_async_trigger_queue_depth(&self.system_store, &keyspace).await
+            {
+                warn!(
+                    "Failed to sample async trigger queue depth for {}: {}",
+                    keyspace, err
+                );
+            }
+        }
 
         if due_entries.is_empty() {
             return Ok(());
@@ -2356,6 +2373,20 @@ impl WorkerEngine {
         match exec_result {
             Ok(_) => {
                 metrics.record_task_result(entry.task_type, true);
+                if entry.task_type == crate::worker::types::TaskType::AsyncTrigger {
+                    crate::metrics::record_trigger_event(&entry.keyspace, "completed");
+                    if let Err(err) = crate::worker::sample_async_trigger_queue_depth(
+                        system_store,
+                        &entry.keyspace,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to sample async trigger queue depth for {}: {}",
+                            entry.keyspace, err
+                        );
+                    }
+                }
                 info!(
                     "Worker task completed: keyspace={} db_id={} task_id={} type={:?}",
                     entry.keyspace, entry.db_id, entry.task_id, entry.task_type
@@ -2363,6 +2394,20 @@ impl WorkerEngine {
             }
             Err(ref e) => {
                 metrics.record_task_result(entry.task_type, false);
+                if entry.task_type == crate::worker::types::TaskType::AsyncTrigger {
+                    crate::metrics::record_trigger_event(&entry.keyspace, "failed");
+                    if let Err(err) = crate::worker::sample_async_trigger_queue_depth(
+                        system_store,
+                        &entry.keyspace,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to sample async trigger queue depth for {}: {}",
+                            entry.keyspace, err
+                        );
+                    }
+                }
                 warn!(
                     "Worker task failed: keyspace={} db_id={} task_id={} type={:?} error={}",
                     entry.keyspace, entry.db_id, entry.task_id, entry.task_type, e

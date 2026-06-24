@@ -67,16 +67,22 @@ async fn init_volume(
     match resp.result {
         Some(init_volume_response::Result::Success(success)) => {
             if success.created {
+                crate::metrics::record_fs9_juicefs_lifecycle(tenant_id, "created");
                 tracing::info!(tenant_id, volume_id, "fs9 volume initialized");
             } else {
+                crate::metrics::record_fs9_juicefs_lifecycle(tenant_id, "existing");
                 tracing::debug!(tenant_id, volume_id, "fs9 volume already initialized");
             }
             Ok(())
         }
         Some(init_volume_response::Result::Error(err)) => {
+            crate::metrics::record_fs9_juicefs_lifecycle(tenant_id, "err");
             Err(fs_error_to_anyhow(err, &format!("init_volume {volume_id}")))
         }
-        None => Err(anyhow!("fs9 InitVolume response missing result oneof")),
+        None => {
+            crate::metrics::record_fs9_juicefs_lifecycle(tenant_id, "err");
+            Err(anyhow!("fs9 InitVolume response missing result oneof"))
+        }
     }
 }
 

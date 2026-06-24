@@ -21,28 +21,6 @@ use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
-fn worker_claim_keyspace_matches(key: &[u8], keyspace: &str) -> bool {
-    const PREFIX: &[u8] = b"_worker_claim_";
-    if !key.starts_with(PREFIX) {
-        return false;
-    }
-    let mut idx = PREFIX.len();
-    if idx + 1 > key.len() {
-        return false;
-    }
-    idx += 1; // task_type:u8
-    if idx + 2 > key.len() {
-        return false;
-    }
-    let keyspace_len = u16::from_be_bytes([key[idx], key[idx + 1]]) as usize;
-    idx += 2;
-    if idx + keyspace_len > key.len() {
-        return false;
-    }
-    let claim_keyspace = &key[idx..idx + keyspace_len];
-    claim_keyspace == keyspace.as_bytes()
-}
-
 pub(crate) fn create_sequence_state_table_schema(
     full_name: &str,
     def: &SequenceDef,
@@ -267,7 +245,7 @@ impl Executor {
                     if claim.task_type != crate::worker::types::TaskType::AsyncTrigger {
                         continue;
                     }
-                    if worker_claim_keyspace_matches(&key, self.tenant_keyspace()) {
+                    if crate::storage::worker_claim_keyspace_matches(&key, self.tenant_keyspace()) {
                         processing += 1;
                     }
                 }
@@ -279,6 +257,10 @@ impl Executor {
             } else {
                 (latency_sum_ms as f64) / (latency_cnt as f64)
             };
+            crate::metrics::sample_trigger_queue_depth(
+                self.tenant_keyspace(),
+                pending.saturating_add(processing) as u64,
+            );
 
             let mut schema = virtual_table_schema("_DB9_SYS_TRIGGER_QUEUE_STATS").unwrap();
             schema.name = table_name.to_string();

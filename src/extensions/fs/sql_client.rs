@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use crate::extensions::context;
 use crate::extensions::fs::backend::{self, FsBackend, FsFileInfo};
 use crate::extensions::fs::glob;
-use crate::extensions::fs::{MAX_BYTES_PER_FILE, MAX_FILES_PER_GLOB};
+use crate::extensions::fs::MAX_FILES_PER_GLOB;
 
 pub(crate) struct SqlFsClient {
     backend: Arc<dyn FsBackend>,
@@ -22,10 +22,6 @@ impl SqlFsClient {
         Ok(Self { backend })
     }
 
-    pub(crate) async fn read_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        self.backend.read_file(path, MAX_BYTES_PER_FILE).await
-    }
-
     pub(crate) async fn read_bytes_at(
         &self,
         path: &str,
@@ -35,20 +31,28 @@ impl SqlFsClient {
         self.backend.read_file_at(path, offset, length).await
     }
 
-    pub(crate) async fn read_text(&self, path: &str) -> Result<String> {
-        decode_utf8(self.read_bytes(path).await?, "fs9_read", "fs9_read_bytea")
-    }
-
     pub(crate) async fn read_text_at(
         &self,
         path: &str,
         offset: u64,
         length: usize,
     ) -> Result<String> {
+        self.read_text_at_with_diagnostics(path, offset, length, "fs9_read_at", "fs9_read_at_bytea")
+            .await
+    }
+
+    pub(crate) async fn read_text_at_with_diagnostics(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+        fn_name: &str,
+        binary_fn_name: &str,
+    ) -> Result<String> {
         decode_utf8(
             self.read_bytes_at(path, offset, length).await?,
-            "fs9_read_at",
-            "fs9_read_at_bytea",
+            fn_name,
+            binary_fn_name,
         )
     }
 
@@ -134,6 +138,7 @@ mod tests {
         FsCreateUpload, FsMultipartCompletedPart, FsPreparedDownload, FsPresignedRequest,
         FsStorage, FsWriteStream, FsWriteStreamOptions,
     };
+    use crate::extensions::fs::MAX_BYTES_PER_FILE;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -419,19 +424,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_text_rejects_invalid_utf8() {
-        let backend = Arc::new(MockBackend::new());
-        backend.insert_file("/bad.bin", vec![0xff, 0xfe], false);
-        let client = SqlFsClient { backend };
-
-        let err = client
-            .read_text("/bad.bin")
-            .await
-            .expect_err("invalid UTF-8 must fail");
-        assert!(err.to_string().contains("fs9_read_bytea"));
-    }
-
-    #[tokio::test]
     async fn read_bytes_at_passes_requested_length_through() {
         let backend = Arc::new(MockBackend::new());
         backend.insert_file("/tiny.bin", b"tiny".to_vec(), false);
@@ -462,6 +454,23 @@ mod tests {
             .await
             .expect_err("misaligned utf-8 slice must fail");
         assert!(err.to_string().contains("fs9_read_at_bytea"));
+    }
+
+    #[tokio::test]
+    async fn read_text_at_with_scalar_diagnostics_preserves_full_read_error_names() {
+        let backend = Arc::new(MockBackend::new());
+        backend.insert_file("/bad.bin", vec![0xff, 0xfe], false);
+        let client = SqlFsClient { backend };
+
+        let err = client
+            .read_text_at_with_diagnostics("/bad.bin", 0, 2, "fs9_read", "fs9_read_bytea")
+            .await
+            .expect_err("invalid UTF-8 must fail");
+
+        let message = err.to_string();
+        assert!(message.contains("fs9_read:"));
+        assert!(message.contains("fs9_read_bytea"));
+        assert!(!message.contains("fs9_read_at"));
     }
 
     #[tokio::test]

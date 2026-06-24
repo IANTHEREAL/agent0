@@ -63,12 +63,35 @@ use crate::extensions::fs::backend::{
 use crate::extensions::fs::to_fs9_canonical_path;
 
 pub(crate) struct NormalizingFsBackend {
+    tenant_keyspace: String,
     inner: Arc<dyn FsBackend>,
 }
 
 impl NormalizingFsBackend {
-    pub(crate) fn new(inner: Arc<dyn FsBackend>) -> Self {
-        Self { inner }
+    pub(crate) fn new(tenant_keyspace: impl Into<String>, inner: Arc<dyn FsBackend>) -> Self {
+        Self {
+            tenant_keyspace: tenant_keyspace.into(),
+            inner,
+        }
+    }
+
+    fn record_op(&self, operation: &'static str, start: std::time::Instant, result: &'static str) {
+        crate::metrics::record_fs9_operation_latency(
+            &self.tenant_keyspace,
+            self.inner.backend_kind(),
+            operation,
+            result,
+            start.elapsed(),
+        );
+    }
+
+    fn record_result<T>(
+        &self,
+        operation: &'static str,
+        start: std::time::Instant,
+        result: &Result<T>,
+    ) {
+        self.record_op(operation, start, result_label(result.is_ok()));
     }
 
     fn shape_each(paths: &[String]) -> Result<Vec<String>> {
@@ -89,30 +112,86 @@ impl NormalizingFsBackend {
     }
 }
 
+fn result_label(ok: bool) -> &'static str {
+    if ok {
+        "ok"
+    } else {
+        "err"
+    }
+}
+
+fn entry_results_label<T>(entries: &[Result<T>]) -> &'static str {
+    if entries.iter().all(Result::is_ok) {
+        "ok"
+    } else if entries.iter().any(Result::is_ok) {
+        "partial"
+    } else {
+        "err"
+    }
+}
+
+fn batch_write_entries_label(entries: &[FsBatchWriteEntry]) -> &'static str {
+    if entries.iter().all(|entry| entry.result.is_ok()) {
+        "ok"
+    } else if entries.iter().any(|entry| entry.result.is_ok()) {
+        "partial"
+    } else {
+        "err"
+    }
+}
+
 #[async_trait]
 impl FsBackend for NormalizingFsBackend {
+    fn backend_kind(&self) -> &'static str {
+        self.inner.backend_kind()
+    }
+
     async fn stat(&self, path: &str) -> Result<FsFileInfo> {
-        self.inner.stat(&to_fs9_canonical_path(path)?).await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.stat(&path).await;
+        self.record_result("stat", start, &result);
+        result
     }
 
     async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<FsFileInfo>>> {
         let shaped = Self::shape_each(paths)?;
-        self.inner.batch_stat(&shaped).await
+        let start = std::time::Instant::now();
+        let result = self.inner.batch_stat(&shaped).await;
+        let label = result
+            .as_ref()
+            .map(|entries| entry_results_label(entries))
+            .unwrap_or("err");
+        self.record_op("batch_stat", start, label);
+        result
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
-        self.inner.readdir(&to_fs9_canonical_path(path)?).await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.readdir(&path).await;
+        self.record_result("readdir", start, &result);
+        result
     }
 
     async fn readdir_with_meta(&self, path: &str) -> Result<FsReaddirResult> {
-        self.inner
-            .readdir_with_meta(&to_fs9_canonical_path(path)?)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.readdir_with_meta(&path).await;
+        self.record_result("readdir_with_meta", start, &result);
+        result
     }
 
     async fn batch_readdir(&self, paths: &[String]) -> Result<Vec<Result<Vec<FsFileInfo>>>> {
         let shaped = Self::shape_each(paths)?;
-        self.inner.batch_readdir(&shaped).await
+        let start = std::time::Instant::now();
+        let result = self.inner.batch_readdir(&shaped).await;
+        let label = result
+            .as_ref()
+            .map(|entries| entry_results_label(entries))
+            .unwrap_or("err");
+        self.record_op("batch_readdir", start, label);
+        result
     }
 
     async fn readdir_recursive(
@@ -120,15 +199,19 @@ impl FsBackend for NormalizingFsBackend {
         path: &str,
         opts: FsRecursiveReaddirOptions,
     ) -> Result<FsRecursiveReaddirResult> {
-        self.inner
-            .readdir_recursive(&to_fs9_canonical_path(path)?, opts)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.readdir_recursive(&path, opts).await;
+        self.record_result("readdir_recursive", start, &result);
+        result
     }
 
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        self.inner
-            .read_file(&to_fs9_canonical_path(path)?, max_bytes)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.read_file(&path, max_bytes).await;
+        self.record_result("read_file", start, &result);
+        result
     }
 
     async fn batch_inline_read(
@@ -138,9 +221,17 @@ impl FsBackend for NormalizingFsBackend {
         max_total_bytes: usize,
     ) -> Result<Vec<Result<Vec<u8>>>> {
         let shaped = Self::shape_each(paths)?;
-        self.inner
+        let start = std::time::Instant::now();
+        let result = self
+            .inner
             .batch_inline_read(&shaped, max_file_bytes, max_total_bytes)
-            .await
+            .await;
+        let label = result
+            .as_ref()
+            .map(|entries| entry_results_label(entries))
+            .unwrap_or("err");
+        self.record_op("batch_inline_read", start, label);
+        result
     }
 
     async fn read_file_stream(
@@ -148,37 +239,55 @@ impl FsBackend for NormalizingFsBackend {
         path: &str,
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
-        self.inner
-            .read_file_stream(&to_fs9_canonical_path(path)?, max_bytes)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.read_file_stream(&path, max_bytes).await;
+        self.record_result("read_file_stream", start, &result);
+        result
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
-        self.inner.remove(&to_fs9_canonical_path(path)?).await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.remove(&path).await;
+        self.record_result("remove", start, &result);
+        result
     }
 
     async fn remove_recursive(&self, path: &str) -> Result<u64> {
-        self.inner
-            .remove_recursive(&to_fs9_canonical_path(path)?)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.remove_recursive(&path).await;
+        self.record_result("remove_recursive", start, &result);
+        result
     }
 
     async fn mkdir(&self, path: &str, recursive: bool, mode: Option<u32>) -> Result<()> {
-        self.inner
-            .mkdir(&to_fs9_canonical_path(path)?, recursive, mode)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.mkdir(&path, recursive, mode).await;
+        self.record_result("mkdir", start, &result);
+        result
     }
 
     async fn write_file(&self, path: &str, data: &[u8], mode: Option<u32>) -> Result<usize> {
-        self.inner
-            .write_file(&to_fs9_canonical_path(path)?, data, mode)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.write_file(&path, data, mode).await;
+        self.record_result("write_file", start, &result);
+        result
     }
 
     async fn batch_write(&self, files: Vec<FsBatchWriteFile>) -> Result<Vec<FsBatchWriteEntry>> {
-        self.inner
-            .batch_write(Self::shape_batch_write_files(files)?)
-            .await
+        let files = Self::shape_batch_write_files(files)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.batch_write(files).await;
+        let label = result
+            .as_ref()
+            .map(|entries| batch_write_entries_label(entries))
+            .unwrap_or("err");
+        self.record_op("batch_write", start, label);
+        result
     }
 
     fn supports_batch_write_atomic(&self) -> bool {
@@ -193,9 +302,15 @@ impl FsBackend for NormalizingFsBackend {
         &self,
         files: Vec<FsBatchWriteFile>,
     ) -> Result<FsBatchWriteGroupedResult> {
-        self.inner
-            .batch_write_grouped(Self::shape_batch_write_files(files)?)
-            .await
+        let files = Self::shape_batch_write_files(files)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.batch_write_grouped(files).await;
+        let label = result
+            .as_ref()
+            .map(|grouped| batch_write_entries_label(&grouped.entries))
+            .unwrap_or("err");
+        self.record_op("batch_write_grouped", start, label);
+        result
     }
 
     async fn begin_write_stream(
@@ -203,39 +318,52 @@ impl FsBackend for NormalizingFsBackend {
         path: &str,
         opts: FsWriteStreamOptions,
     ) -> Result<Box<dyn FsWriteStream>> {
-        self.inner
-            .begin_write_stream(&to_fs9_canonical_path(path)?, opts)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.begin_write_stream(&path, opts).await;
+        self.record_result("begin_write_stream", start, &result);
+        result
     }
 
     async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
-        self.inner
-            .read_file_at(&to_fs9_canonical_path(path)?, offset, length)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.read_file_at(&path, offset, length).await;
+        self.record_result("read_file_at", start, &result);
+        result
     }
 
     async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
-        self.inner
-            .write_file_at(&to_fs9_canonical_path(path)?, offset, data)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.write_file_at(&path, offset, data).await;
+        self.record_result("write_file_at", start, &result);
+        result
     }
 
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
-        self.inner
-            .append_file(&to_fs9_canonical_path(path)?, data)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.append_file(&path, data).await;
+        self.record_result("append_file", start, &result);
+        result
     }
 
     async fn truncate(&self, path: &str, size: u64) -> Result<()> {
-        self.inner
-            .truncate(&to_fs9_canonical_path(path)?, size)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.truncate(&path, size).await;
+        self.record_result("truncate", start, &result);
+        result
     }
 
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         let old = to_fs9_canonical_path(old_path)?;
         let new = to_fs9_canonical_path(new_path)?;
-        self.inner.rename(&old, &new).await
+        let start = std::time::Instant::now();
+        let result = self.inner.rename(&old, &new).await;
+        self.record_result("rename", start, &result);
+        result
     }
 
     async fn create_upload(
@@ -245,14 +373,14 @@ impl FsBackend for NormalizingFsBackend {
         mode: Option<u32>,
         checksum_algorithm: Option<&str>,
     ) -> Result<FsCreateUpload> {
-        self.inner
-            .create_upload(
-                &to_fs9_canonical_path(path)?,
-                expected_size,
-                mode,
-                checksum_algorithm,
-            )
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self
+            .inner
+            .create_upload(&path, expected_size, mode, checksum_algorithm)
+            .await;
+        self.record_result("create_upload", start, &result);
+        result
     }
 
     async fn presign_upload_part(
@@ -263,9 +391,13 @@ impl FsBackend for NormalizingFsBackend {
     ) -> Result<FsPresignedRequest> {
         // `upload_token` is an opaque server-issued credential, not a
         // path — do not reshape.
-        self.inner
+        let start = std::time::Instant::now();
+        let result = self
+            .inner
             .presign_upload_part(upload_token, part_number, checksum_crc32c)
-            .await
+            .await;
+        self.record_result("presign_upload_part", start, &result);
+        result
     }
 
     async fn complete_upload(
@@ -274,35 +406,54 @@ impl FsBackend for NormalizingFsBackend {
         parts: Vec<FsMultipartCompletedPart>,
         checksum: Option<[u8; 32]>,
     ) -> Result<usize> {
-        self.inner
+        let start = std::time::Instant::now();
+        let result = self
+            .inner
             .complete_upload(upload_token, parts, checksum)
-            .await
+            .await;
+        self.record_result("complete_upload", start, &result);
+        result
     }
 
     async fn abort_upload(&self, upload_token: &str) -> Result<()> {
-        self.inner.abort_upload(upload_token).await
+        let start = std::time::Instant::now();
+        let result = self.inner.abort_upload(upload_token).await;
+        self.record_result("abort_upload", start, &result);
+        result
     }
 
     async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload> {
-        self.inner
-            .prepare_download(&to_fs9_canonical_path(path)?)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.prepare_download(&path).await;
+        self.record_result("prepare_download", start, &result);
+        result
     }
 
     async fn symlink(&self, path: &str, target: &str) -> Result<()> {
         // `target` is the symlink's contents (may be relative under
         // POSIX); only the link `path` is shaped.
-        self.inner
-            .symlink(&to_fs9_canonical_path(path)?, target)
-            .await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.symlink(&path, target).await;
+        self.record_result("symlink", start, &result);
+        result
     }
 
     async fn readlink(&self, path: &str) -> Result<String> {
-        self.inner.readlink(&to_fs9_canonical_path(path)?).await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.readlink(&path).await;
+        self.record_result("readlink", start, &result);
+        result
     }
 
     async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
-        self.inner.chmod(&to_fs9_canonical_path(path)?, mode).await
+        let path = to_fs9_canonical_path(path)?;
+        let start = std::time::Instant::now();
+        let result = self.inner.chmod(&path, mode).await;
+        self.record_result("chmod", start, &result);
+        result
     }
 }
 
@@ -319,6 +470,15 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
     use tokio::io::{empty, AsyncBufRead};
+
+    fn test_recorder() -> (
+        metrics_exporter_prometheus::PrometheusRecorder,
+        metrics_exporter_prometheus::PrometheusHandle,
+    ) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        (recorder, handle)
+    }
 
     /// Records every path-typed argument the adapter forwarded to inner.
     #[derive(Default)]
@@ -480,6 +640,150 @@ mod tests {
         }
     }
 
+    struct PartialBatchBackend;
+
+    #[async_trait]
+    impl FsBackend for PartialBatchBackend {
+        fn backend_kind(&self) -> &'static str {
+            "partial_test"
+        }
+
+        async fn stat(&self, path: &str) -> Result<FsFileInfo> {
+            Ok(RecordingBackend::stub_info(path))
+        }
+
+        async fn readdir(&self, _path: &str) -> Result<Vec<FsFileInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn read_file_stream(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+            Ok(Box::new(empty()))
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool, _mode: Option<u32>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8], _mode: Option<u32>) -> Result<usize> {
+            Ok(0)
+        }
+
+        async fn batch_write(
+            &self,
+            files: Vec<FsBatchWriteFile>,
+        ) -> Result<Vec<FsBatchWriteEntry>> {
+            Ok(files
+                .into_iter()
+                .enumerate()
+                .map(|(idx, file)| FsBatchWriteEntry {
+                    path: file.path,
+                    result: if idx == 0 {
+                        Ok(file.data.len())
+                    } else {
+                        Err(anyhow::anyhow!("entry failed"))
+                    },
+                    failure_category: if idx == 0 {
+                        None
+                    } else {
+                        Some("execution.test")
+                    },
+                })
+                .collect())
+        }
+
+        async fn begin_write_stream(
+            &self,
+            _path: &str,
+            _opts: FsWriteStreamOptions,
+        ) -> Result<Box<dyn FsWriteStream>> {
+            Err(anyhow::anyhow!("stub"))
+        }
+
+        async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, data: &[u8]) -> Result<usize> {
+            Ok(data.len())
+        }
+
+        async fn append_file(&self, _path: &str, data: &[u8]) -> Result<usize> {
+            Ok(data.len())
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn create_upload(
+            &self,
+            _path: &str,
+            _expected_size: u64,
+            _mode: Option<u32>,
+            _checksum_algorithm: Option<&str>,
+        ) -> Result<FsCreateUpload> {
+            Err(anyhow::anyhow!("stub"))
+        }
+
+        async fn presign_upload_part(
+            &self,
+            _upload_token: &str,
+            _part_number: i32,
+            _checksum_crc32c: Option<&str>,
+        ) -> Result<FsPresignedRequest> {
+            Err(anyhow::anyhow!("stub"))
+        }
+
+        async fn complete_upload(
+            &self,
+            _upload_token: &str,
+            _parts: Vec<FsMultipartCompletedPart>,
+            _checksum: Option<[u8; 32]>,
+        ) -> Result<usize> {
+            Ok(0)
+        }
+
+        async fn abort_upload(&self, _upload_token: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn prepare_download(&self, _path: &str) -> Result<FsPreparedDownload> {
+            Err(anyhow::anyhow!("stub"))
+        }
+
+        async fn symlink(&self, _path: &str, _target: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn readlink(&self, _path: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn shape(input: &str) -> String {
         to_fs9_canonical_path(input).unwrap()
     }
@@ -543,7 +847,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_shapes_single_path_methods() {
         let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new(inner);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
 
         adapter.stat("tests/x").await.unwrap();
         adapter.readdir("dir/").await.unwrap();
@@ -571,10 +875,82 @@ mod tests {
         assert!(seen.iter().any(|(op, p)| op == "read_file" && p == "/a/b"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_metrics_use_constructor_keyspace_outside_statement_context() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (_rec, inner) = RecordingBackend::new_pair();
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
+        adapter.stat("tests/x").await.unwrap();
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"db9_fs9_operation_duration_seconds{keyspace="tenant_metrics""#)
+                || rendered.contains(
+                    r#"db9_fs9_operation_duration_seconds_bucket{keyspace="tenant_metrics""#
+                ),
+            "metric must use explicit tenant keyspace, not session fallback: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"keyspace="default""#),
+            "metric must not fall back to default outside statement context: {rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_metrics_record_previously_uncovered_methods() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (_rec, inner) = RecordingBackend::new_pair();
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
+        adapter.append_file("rel/ap", b"x").await.unwrap();
+        adapter.rename("old/x", "new/y").await.unwrap();
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"operation="append_file""#),
+            "append_file latency should be exported: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"operation="rename""#),
+            "rename latency should be exported: {rendered}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_operation_metrics_distinguish_partial_failures() {
+        let (recorder, handle) = test_recorder();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let inner: Arc<dyn FsBackend> = Arc::new(PartialBatchBackend);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
+        let files = vec![
+            FsBatchWriteFile {
+                path: "ok".to_string(),
+                data: b"ok".to_vec(),
+                mode: None,
+            },
+            FsBatchWriteFile {
+                path: "bad".to_string(),
+                data: b"bad".to_vec(),
+                mode: None,
+            },
+        ];
+        let _ = adapter.batch_write(files).await.unwrap();
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"operation="batch_write",result="partial""#),
+            "partial per-entry failure must not be exported as ok: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn adapter_shapes_rename_both_paths() {
         let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new(inner);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
         adapter.rename("old/x", "new/y").await.unwrap();
         let seen = rec.snapshot();
         assert!(seen
@@ -588,7 +964,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_does_not_reshape_symlink_target_or_upload_token() {
         let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new(inner);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
 
         adapter
             .symlink("links/foo", "../target/path")
@@ -619,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_shapes_each_path_in_batch_lists() {
         let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new(inner);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
         let _ = adapter
             .batch_stat(&[
                 "tests/a".to_string(),
@@ -647,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_collapses_dot_segments_for_mutating_ops() {
         let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new(inner);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
 
         adapter.write_file("/./foo", b"x", None).await.unwrap();
         adapter.remove("/foo/.").await.unwrap();
@@ -682,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_rejects_parent_traversal_on_mutators() {
         let (_, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new(inner);
+        let adapter = NormalizingFsBackend::new("tenant_metrics", inner);
 
         for op_name in ["write_file", "remove", "chmod", "rename_old", "rename_new"] {
             let err = match op_name {

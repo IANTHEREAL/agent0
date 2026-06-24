@@ -78,6 +78,10 @@ impl EmbeddedFsBackend {
 
 #[async_trait]
 impl FsBackend for EmbeddedFsBackend {
+    fn backend_kind(&self) -> &'static str {
+        "embedded"
+    }
+
     async fn stat(&self, path: &str) -> Result<FsFileInfo> {
         let inode = self.pagefs.stat(path).await?;
         inode_to_file_info(path, &inode)

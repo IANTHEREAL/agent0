@@ -22,7 +22,7 @@ pub(crate) use encoding::{
     deserialize_row, deserialize_schema, encode_database_data_range, encode_embedding_usage_key_v2,
     encode_extension_key_v2, encode_pk_values, encode_prefix_end, encode_schema_key_v2,
     encode_sequence_value_key_v2, encode_storage_stats_key_v2, encode_table_data_range_v2,
-    serialize_row,
+    serialize_row, worker_claim_keyspace_matches,
 };
 pub(crate) use error::StorageError;
 #[allow(unused_imports)]

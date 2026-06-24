@@ -25,11 +25,14 @@ impl Drop for ReadBudgetGuard {
 
 /// Try to reserve `n` bytes from the global read budget.
 /// Returns a guard that auto-releases on drop, or an error if budget exceeded.
-fn reserve_read_budget(n: usize) -> Result<ReadBudgetGuard> {
+fn reserve_read_budget(operation: &'static str, n: usize) -> Result<ReadBudgetGuard> {
     // CAS loop: only succeed if adding `n` stays within budget.
     loop {
         let current = FS9_READ_IN_FLIGHT.load(Ordering::Relaxed);
         if current + n > FS9_READ_BUDGET {
+            let keyspace = crate::extensions::context::tenant_keyspace()
+                .unwrap_or_else(|| crate::session_context::current_keyspace().to_string());
+            crate::metrics::record_fs9_read_budget_rejected(&keyspace, operation);
             return Err(anyhow!(
                 "fs9_read: concurrent read budget exceeded ({} + {} > {} bytes). \
                  Try again later or use FROM extensions.fs9() for large files.",
@@ -132,6 +135,20 @@ fn checked_read_at_len(fn_name: &str, file_size: u64, offset: u64, length: usize
         .map_err(|_| anyhow!("{fn_name}: read length exceeds addressable memory"))
 }
 
+fn checked_full_read_len(fn_name: &str, file_size: u64) -> Result<usize> {
+    let max = u64::try_from(crate::extensions::fs::MAX_BYTES_PER_FILE)
+        .map_err(|_| anyhow!("{fn_name}: max read size exceeds u64"))?;
+    if file_size > max {
+        return Err(anyhow!(
+            "{fn_name}: file too large: {} bytes exceeds limit {}",
+            file_size,
+            crate::extensions::fs::MAX_BYTES_PER_FILE
+        ));
+    }
+    usize::try_from(file_size)
+        .map_err(|_| anyhow!("{fn_name}: file size exceeds addressable memory"))
+}
+
 pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
     let path = match expect_text_arg("fs9_read", args.first().cloned().unwrap_or(Value::Null), 0)? {
@@ -139,8 +156,16 @@ pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
         None => return Ok(Value::Null),
     };
     let client = get_client_sync()?;
-    let text = run_async(client.read_text(&path))?;
-    let _budget = reserve_read_budget(text.len())?;
+    let info = run_async(client.stat(&path))?;
+    let reserve_len = checked_full_read_len("fs9_read", info.size)?;
+    let _budget = reserve_read_budget("fs9_read", reserve_len)?;
+    let text = run_async(client.read_text_at_with_diagnostics(
+        &path,
+        0,
+        reserve_len,
+        "fs9_read",
+        "fs9_read_bytea",
+    ))?;
     Ok(Value::Text(text))
 }
 
@@ -318,8 +343,8 @@ pub fn fs9_read_at(args: Vec<Value>) -> Result<Value> {
     let client = get_client_sync()?;
     let info = run_async(client.stat(&path))?;
     let actual_len = checked_read_at_len("fs9_read_at", info.size, offset, length)?;
+    let _budget = reserve_read_budget("fs9_read_at", actual_len)?;
     let text = run_async(client.read_text_at(&path, offset, actual_len))?;
-    let _budget = reserve_read_budget(text.len())?;
     Ok(Value::Text(text))
 }
 
@@ -334,8 +359,10 @@ pub fn fs9_read_bytea(args: Vec<Value>) -> Result<Value> {
         None => return Ok(Value::Null),
     };
     let client = get_client_sync()?;
-    let bytes = run_async(client.read_bytes(&path))?;
-    let _budget = reserve_read_budget(bytes.len())?;
+    let info = run_async(client.stat(&path))?;
+    let reserve_len = checked_full_read_len("fs9_read_bytea", info.size)?;
+    let _budget = reserve_read_budget("fs9_read_bytea", reserve_len)?;
+    let bytes = run_async(client.read_bytes_at(&path, 0, reserve_len))?;
     Ok(Value::Bytes(bytes))
 }
 
@@ -394,8 +421,8 @@ pub fn fs9_read_at_bytea(args: Vec<Value>) -> Result<Value> {
     let client = get_client_sync()?;
     let info = run_async(client.stat(&path))?;
     let actual_len = checked_read_at_len("fs9_read_at_bytea", info.size, offset, length)?;
+    let _budget = reserve_read_budget("fs9_read_at_bytea", actual_len)?;
     let bytes = run_async(client.read_bytes_at(&path, offset, actual_len))?;
-    let _budget = reserve_read_budget(bytes.len())?;
     Ok(Value::Bytes(bytes))
 }
 

@@ -57,6 +57,24 @@ fn is_batch_operation(request: &WsRequest) -> bool {
     )
 }
 
+fn ws_error_code_metric_label(code: WsErrorCode) -> &'static str {
+    match code {
+        WsErrorCode::Enoent => "ENOENT",
+        WsErrorCode::Eisdir => "EISDIR",
+        WsErrorCode::Enotdir => "ENOTDIR",
+        WsErrorCode::Eexist => "EEXIST",
+        WsErrorCode::Enotempty => "ENOTEMPTY",
+        WsErrorCode::Eacces => "EACCES",
+        WsErrorCode::Efbig => "EFBIG",
+        WsErrorCode::Eagain => "EAGAIN",
+        WsErrorCode::Eauth => "EAUTH",
+        WsErrorCode::Einval => "EINVAL",
+        WsErrorCode::Eproto => "EPROTO",
+        WsErrorCode::Enosys => "ENOSYS",
+        WsErrorCode::Eio => "EIO",
+    }
+}
+
 /// Classify the per-database activity effect of a completed fs9 WS request.
 ///
 /// `None` means emit nothing. A failed op (`ok == false`) is never activity.
@@ -1278,6 +1296,8 @@ async fn handle_batch_write_atomic(
 ) -> WsResponse {
     // ── Capability gate: reject if backend doesn't support atomic writes ─
     if !session.backend.supports_batch_write_atomic() {
+        crate::metrics::record_batch_write_atomic_request("unsupported");
+        crate::metrics::record_batch_write_atomic_error("ENOSYS");
         return WsResponse::error(
             id,
             WsErrorCode::Enosys,
@@ -1288,14 +1308,21 @@ async fn handle_batch_write_atomic(
     // ── Validation (shared with batch_write) ────────────────────────────
     let batch_files = match validate_and_decode_batch_write(id, "batch_write_atomic", files) {
         Ok(files) => files,
-        Err(resp) => return resp,
+        Err(resp) => {
+            crate::metrics::record_batch_write_atomic_request("invalid");
+            crate::metrics::record_batch_write_atomic_error("validation");
+            return resp;
+        }
     };
+    crate::metrics::record_batch_write_atomic_files(batch_files.len());
 
     // ── Execute grouped write ────────────────────────────────────────────
     let grouped_result = match session.backend.batch_write_grouped(batch_files).await {
         Ok(result) => result,
         Err(err) => {
             let (code, msg) = map_fs_error(&err);
+            crate::metrics::record_batch_write_atomic_request("err");
+            crate::metrics::record_batch_write_atomic_error(ws_error_code_metric_label(code));
             return WsResponse::success(
                 id,
                 json!({
@@ -1360,11 +1387,20 @@ async fn handle_batch_write_atomic(
 
     let mut fallback_reasons = serde_json::Map::new();
     for (category, count) in &category_counts {
+        crate::metrics::record_batch_write_atomic_entry_errors(category, *count as u64);
         fallback_reasons.insert(
             category.to_string(),
             serde_json::Value::Number((*count).into()),
         );
     }
+    let result_label = if failed == 0 {
+        "ok"
+    } else if committed == 0 {
+        "err"
+    } else {
+        "partial"
+    };
+    crate::metrics::record_batch_write_atomic_request(result_label);
 
     WsResponse::success(
         id,

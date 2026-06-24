@@ -1801,6 +1801,7 @@ impl EmbeddedPageFs {
                     match fs.run_background_maintenance_once().await {
                         Ok(()) => {
                             consecutive_maintenance_failures = 0;
+                            crate::metrics::sample_fs9_gc_backoff(&fs.keyspace, 0, 0);
                             next_maintenance_at = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(
                                     fs9_config().gc_interval_secs.max(1),
@@ -1814,6 +1815,11 @@ impl EmbeddedPageFs {
                             let max_secs = fs9_config().gc_max_backoff_secs.max(base_secs);
                             let factor = 1u64 << consecutive_maintenance_failures.min(10);
                             let sleep_secs = base_secs.saturating_mul(factor).min(max_secs);
+                            crate::metrics::sample_fs9_gc_backoff(
+                                &fs.keyspace,
+                                consecutive_maintenance_failures,
+                                sleep_secs,
+                            );
                             next_maintenance_at = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(sleep_secs);
                         }

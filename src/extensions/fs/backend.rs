@@ -206,6 +206,11 @@ pub(crate) trait FsWriteStream: Send {
 
 #[async_trait]
 pub(crate) trait FsBackend: Send + Sync {
+    /// Stable low-cardinality backend kind used as a Prometheus label.
+    fn backend_kind(&self) -> &'static str {
+        "unknown"
+    }
+
     async fn stat(&self, path: &str) -> Result<FsFileInfo>;
     async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<FsFileInfo>>> {
         let mut entries = Vec::with_capacity(paths.len());
@@ -511,8 +516,27 @@ fn normalize_readdir_path(path: &str) -> String {
 pub(crate) async fn ensure_juicefs_lifecycle_allows_init(tenant_keyspace: &str) -> Result<()> {
     let jfs_keyspace = juicefs_lifecycle_keyspace_name(tenant_keyspace);
     let pd_endpoints = crate::extensions::fs::juicefs_pd_endpoints();
-    let state = query_pd_keyspace_state(&pd_endpoints, &jfs_keyspace).await?;
-    validate_juicefs_lifecycle_state(tenant_keyspace, &jfs_keyspace, state.as_deref())
+    let state = match query_pd_keyspace_state(&pd_endpoints, &jfs_keyspace).await {
+        Ok(state) => state,
+        Err(err) => {
+            crate::metrics::record_fs9_pd_lifecycle_probe(tenant_keyspace, "err");
+            return Err(err);
+        }
+    };
+    match validate_juicefs_lifecycle_state_for_metrics(
+        tenant_keyspace,
+        &jfs_keyspace,
+        state.as_deref(),
+    ) {
+        Ok(result) => {
+            crate::metrics::record_fs9_pd_lifecycle_probe(tenant_keyspace, result);
+            Ok(())
+        }
+        Err((result, err)) => {
+            crate::metrics::record_fs9_pd_lifecycle_probe(tenant_keyspace, result);
+            Err(err)
+        }
+    }
 }
 
 pub(crate) async fn ensure_fs9_sql_surface_allowed(tenant_keyspace: &str) -> Result<()> {
@@ -537,6 +561,17 @@ fn validate_juicefs_lifecycle_state(
              (expected absent or ENABLED). Tenant `{tenant_keyspace}` is being \
              torn down; refusing to initialize or use the JuiceFS backend."
         ),
+    }
+}
+
+fn validate_juicefs_lifecycle_state_for_metrics(
+    tenant_keyspace: &str,
+    jfs_keyspace: &str,
+    state: Option<&str>,
+) -> std::result::Result<&'static str, (&'static str, anyhow::Error)> {
+    match validate_juicefs_lifecycle_state(tenant_keyspace, jfs_keyspace, state) {
+        Ok(()) => Ok("ok"),
+        Err(err) => Err(("blocked", err)),
     }
 }
 
@@ -751,7 +786,7 @@ pub(crate) async fn init_backend_with_args(
             );
         }
     };
-    Ok(Arc::new(NormalizingFsBackend::new(inner)) as Arc<dyn FsBackend>)
+    Ok(Arc::new(NormalizingFsBackend::new(tenant_keyspace, inner)) as Arc<dyn FsBackend>)
 }
 
 /// Instantiate the fs9 v2 gRPC backend for a tenant. This function has no
@@ -1197,6 +1232,32 @@ mod tests {
                 "error should explain fail-closed behavior: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn juicefs_lifecycle_metric_result_uses_final_validation_outcome() {
+        assert_eq!(
+            validate_juicefs_lifecycle_state_for_metrics("db9_tenant_abc", "jfs_t_abc", None)
+                .expect("absent lifecycle state should pass"),
+            "ok"
+        );
+        assert_eq!(
+            validate_juicefs_lifecycle_state_for_metrics(
+                "db9_tenant_abc",
+                "jfs_t_abc",
+                Some("ENABLED"),
+            )
+            .expect("enabled lifecycle state should pass"),
+            "ok"
+        );
+        let err = validate_juicefs_lifecycle_state_for_metrics(
+            "db9_tenant_abc",
+            "jfs_t_abc",
+            Some("DISABLED"),
+        )
+        .expect_err("blocked lifecycle state should fail");
+        assert_eq!(err.0, "blocked");
+        assert!(err.1.to_string().contains("DISABLED"));
     }
 
     #[test]

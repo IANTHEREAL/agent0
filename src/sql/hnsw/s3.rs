@@ -721,17 +721,24 @@ impl HnswS3Client {
     ) -> anyhow::Result<()> {
         let key = self.graph_key(keyspace, db_id, table_id, index_id, version);
         let size = data.len();
+        let start = Instant::now();
 
-        self.client
+        let result = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(ByteStream::from(data))
             .send()
             .await
-            .with_context(|| {
-                format!("hnsw-s3: PutObject failed for s3://{}/{}", self.bucket, key)
-            })?;
+            .with_context(|| format!("hnsw-s3: PutObject failed for s3://{}/{}", self.bucket, key));
+
+        crate::metrics::record_hnsw_s3_operation(
+            "put",
+            if result.is_ok() { "ok" } else { "err" },
+            start.elapsed(),
+        );
+        result?;
 
         debug!(
             key = %key,
@@ -753,6 +760,7 @@ impl HnswS3Client {
         version: u64,
     ) -> anyhow::Result<Option<Bytes>> {
         let key = self.graph_key(keyspace, db_id, table_id, index_id, version);
+        let start = Instant::now();
 
         let result = self
             .client
@@ -769,6 +777,7 @@ impl HnswS3Client {
                 if let Some(content_length) = output.content_length() {
                     let max_download = hnsw_max_index_memory();
                     if max_download > 0 && (content_length as usize) > max_download {
+                        crate::metrics::record_hnsw_s3_operation("get", "err", start.elapsed());
                         return Err(anyhow!(
                             "hnsw-s3: graph s3://{}/{} is {} bytes, exceeds \
                              HNSW_MAX_INDEX_MEMORY ({} bytes)",
@@ -779,28 +788,39 @@ impl HnswS3Client {
                         ));
                     }
                 }
-                let agg = output.body.collect().await.with_context(|| {
+                let agg = match output.body.collect().await.with_context(|| {
                     format!(
                         "hnsw-s3: failed to read GetObject body for s3://{}/{}",
                         self.bucket, key
                     )
-                })?;
+                }) {
+                    Ok(agg) => agg,
+                    Err(err) => {
+                        crate::metrics::record_hnsw_s3_operation("get", "err", start.elapsed());
+                        return Err(err);
+                    }
+                };
                 let bytes = agg.into_bytes();
                 debug!(
                     key = %key,
                     size_bytes = bytes.len(),
                     "hnsw-s3: downloaded graph"
                 );
+                crate::metrics::record_hnsw_s3_operation("get", "ok", start.elapsed());
                 Ok(Some(bytes))
             }
             Err(SdkError::ServiceError(service_err)) if service_err.err().is_no_such_key() => {
                 debug!(key = %key, "hnsw-s3: graph not found (NoSuchKey)");
+                crate::metrics::record_hnsw_s3_operation("get", "not_found", start.elapsed());
                 Ok(None)
             }
-            Err(err) => Err(anyhow!(err).context(format!(
-                "hnsw-s3: GetObject failed for s3://{}/{}",
-                self.bucket, key
-            ))),
+            Err(err) => {
+                crate::metrics::record_hnsw_s3_operation("get", "err", start.elapsed());
+                Err(anyhow!(err).context(format!(
+                    "hnsw-s3: GetObject failed for s3://{}/{}",
+                    self.bucket, key
+                )))
+            }
         }
     }
 

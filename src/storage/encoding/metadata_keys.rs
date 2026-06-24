@@ -943,6 +943,30 @@ pub fn encode_worker_claim_prefix() -> Vec<u8> {
     WORKER_CLAIM_PREFIX.to_vec()
 }
 
+/// Return true when a raw worker-claim key belongs to `keyspace`.
+///
+/// Keeps claim-key parsing next to the key encoder so observability callers do
+/// not duplicate the binary key layout.
+pub fn worker_claim_keyspace_matches(key: &[u8], keyspace: &str) -> bool {
+    if !key.starts_with(WORKER_CLAIM_PREFIX) {
+        return false;
+    }
+    let mut idx = WORKER_CLAIM_PREFIX.len();
+    if idx + 1 > key.len() {
+        return false;
+    }
+    idx += 1; // task_type:u8
+    if idx + 2 > key.len() {
+        return false;
+    }
+    let keyspace_len = u16::from_be_bytes([key[idx], key[idx + 1]]) as usize;
+    idx += 2;
+    if idx + keyspace_len > key.len() {
+        return false;
+    }
+    &key[idx..idx + keyspace_len] == keyspace.as_bytes()
+}
+
 /// Encode a GC instance state key.
 /// Format: `_gc_instance_{instance_id_bytes}`
 pub fn encode_gc_instance_state_key(instance_id: &str) -> Vec<u8> {
