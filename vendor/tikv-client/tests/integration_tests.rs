@@ -28,6 +28,7 @@ use tikv_client::Key;
 use tikv_client::KvPair;
 use tikv_client::RawClient;
 use tikv_client::Result;
+use tikv_client::TimestampExt;
 use tikv_client::TransactionClient;
 use tikv_client::TransactionOptions;
 use tikv_client::Value;
@@ -1271,6 +1272,139 @@ async fn raw_cas() -> Result<()> {
             .unwrap(),
         Error::UnsupportedMode
     ));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+#[allow(clippy::disallowed_methods)]
+async fn txn_lock_current_reports_conflict_ts_after_start_ts() -> Result<()> {
+    init().await?;
+    let client =
+        TransactionClient::new_with_config(pd_addrs(), Config::default().with_default_keyspace())
+            .await?;
+    let key = format!(
+        "lock-current-conflict-key-{}",
+        client.current_timestamp().await?.version()
+    );
+    let value1 = b"value-before".to_vec();
+    let value2 = b"value-after".to_vec();
+
+    let mut seed = client.begin_pessimistic().await?;
+    seed.put(key.clone(), value1).await?;
+    seed.commit().await?;
+
+    let mut t1 = client.begin_pessimistic().await?;
+    let start_ts = t1.start_version();
+    assert_eq!(
+        t1.get(key.clone()).await?.as_deref(),
+        Some(&b"value-before"[..])
+    );
+
+    let mut t2 = client.begin_pessimistic().await?;
+    t2.put(key.clone(), value2.clone()).await?;
+    let t2_commit_ts = t2
+        .commit()
+        .await?
+        .expect("pessimistic commit should return commit timestamp")
+        .version();
+    assert!(
+        t2_commit_ts > start_ts,
+        "test setup must commit in (start_ts, lock_time] window"
+    );
+
+    let locked = t1.lock_current_and_check_not_newer_than(key).await?;
+    assert_eq!(locked.value.as_deref(), Some(value2.as_slice()));
+    assert_eq!(locked.latest_commit_ts, Some(t2_commit_ts));
+    assert!(locked.is_newer_than_baseline());
+
+    t1.rollback().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+#[allow(clippy::disallowed_methods)]
+async fn txn_lock_current_reports_delete_tombstone_conflict_ts_after_start_ts() -> Result<()> {
+    init().await?;
+    let client =
+        TransactionClient::new_with_config(pd_addrs(), Config::default().with_default_keyspace())
+            .await?;
+    let key = format!(
+        "lock-current-delete-conflict-key-{}",
+        client.current_timestamp().await?.version()
+    );
+
+    let mut seed = client.begin_pessimistic().await?;
+    seed.put(key.clone(), b"value-before".to_vec()).await?;
+    seed.commit().await?;
+
+    let mut t1 = client.begin_pessimistic().await?;
+    let start_ts = t1.start_version();
+    assert_eq!(
+        t1.get(key.clone()).await?.as_deref(),
+        Some(&b"value-before"[..])
+    );
+
+    let mut t2 = client.begin_pessimistic().await?;
+    t2.delete(key.clone()).await?;
+    let t2_commit_ts = t2
+        .commit()
+        .await?
+        .expect("pessimistic delete commit should return commit timestamp")
+        .version();
+    assert!(
+        t2_commit_ts > start_ts,
+        "test setup must delete in (start_ts, lock_time] window"
+    );
+
+    let locked = t1.lock_current_and_check_not_newer_than(key).await?;
+    assert_eq!(locked.value, None);
+    assert_eq!(locked.latest_commit_ts, Some(t2_commit_ts));
+    assert!(locked.is_newer_than_baseline());
+
+    t1.rollback().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+#[allow(clippy::disallowed_methods)]
+async fn txn_lock_current_without_conflict_can_write_and_commit() -> Result<()> {
+    init().await?;
+    let client =
+        TransactionClient::new_with_config(pd_addrs(), Config::default().with_default_keyspace())
+            .await?;
+    let key = format!(
+        "lock-current-non-stale-key-{}",
+        client.current_timestamp().await?.version()
+    );
+    let value1 = b"value-before".to_vec();
+    let value2 = b"value-after".to_vec();
+
+    let mut seed = client.begin_pessimistic().await?;
+    seed.put(key.clone(), value1.clone()).await?;
+    seed.commit().await?;
+
+    let mut txn = client.begin_pessimistic().await?;
+    let locked = txn
+        .lock_current_and_check_not_newer_than(key.clone())
+        .await?;
+    assert_eq!(locked.value.as_deref(), Some(value1.as_slice()));
+    assert_eq!(locked.latest_commit_ts, None);
+    assert!(!locked.is_newer_than_baseline());
+
+    txn.put(key.clone(), value2.clone()).await?;
+    txn.commit()
+        .await?
+        .expect("non-stale pessimistic write should commit");
+
+    let mut verify = client.begin_optimistic().await?;
+    assert_eq!(verify.get(key).await?.as_deref(), Some(value2.as_slice()));
+    verify.rollback().await?;
 
     Ok(())
 }

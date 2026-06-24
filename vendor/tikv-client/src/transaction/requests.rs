@@ -1,6 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cmp;
+use std::collections::BTreeMap;
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ use crate::timestamp::TimestampExt;
 use crate::transaction::requests::kvrpcpb::prewrite_request::PessimisticAction;
 use crate::transaction::HasLocks;
 use crate::util::iter::FlatMapOkIterExt;
+use crate::Error;
 use crate::Key;
 use crate::KvPair;
 use crate::Result;
@@ -305,16 +307,61 @@ impl Shardable for kvrpcpb::PrewriteRequest {
     }
 
     fn apply_shard(&mut self, shard: Self::Shard) {
-        // Only need to set secondary keys if we're sending the primary key.
-        if self.use_async_commit && !self.mutations.iter().any(|m| m.key == self.primary_lock) {
-            self.secondaries = vec![];
-        }
+        let contains_primary_key = shard.iter().any(|m| m.key == self.primary_lock);
+        let pessimistic_action_by_key = self
+            .mutations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mutation)| {
+                self.pessimistic_actions
+                    .get(index)
+                    .map(|action| (mutation.key.clone(), *action))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let for_update_ts_by_key = self
+            .for_update_ts_constraints
+            .iter()
+            .filter_map(|constraint| {
+                self.mutations
+                    .get(constraint.index as usize)
+                    .map(|mutation| (mutation.key.clone(), constraint.expected_for_update_ts))
+            })
+            .collect::<BTreeMap<_, _>>();
 
-        // Only if there is only one request to send
-        if self.try_one_pc && shard.len() != self.secondaries.len() + 1 {
+        // Only if there is only one request to send.
+        if self.try_one_pc && (!contains_primary_key || shard.len() != self.secondaries.len() + 1) {
             self.try_one_pc = false;
         }
 
+        // Only need to set secondary keys if we're sending the primary key.
+        if self.use_async_commit && !contains_primary_key {
+            self.secondaries = vec![];
+        }
+
+        self.pessimistic_actions = if pessimistic_action_by_key.is_empty() {
+            Vec::new()
+        } else {
+            shard
+                .iter()
+                .map(|mutation| {
+                    *pessimistic_action_by_key
+                        .get(&mutation.key)
+                        .expect("prewrite shard key must come from original mutations")
+                })
+                .collect()
+        };
+        self.for_update_ts_constraints = shard
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mutation)| {
+                for_update_ts_by_key.get(&mutation.key).map(|ts| {
+                    kvrpcpb::prewrite_request::ForUpdateTsConstraint {
+                        index: index as u32,
+                        expected_for_update_ts: *ts,
+                    }
+                })
+            })
+            .collect();
         self.mutations = shard;
     }
 
@@ -449,6 +496,13 @@ pub fn new_pessimistic_lock_request(
     req
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PessimisticLockResult {
+    pub key: Key,
+    pub value: Option<Value>,
+    pub locked_with_conflict_ts: u64,
+}
+
 impl KvRequest for kvrpcpb::PessimisticLockRequest {
     type Response = kvrpcpb::PessimisticLockResponse;
 }
@@ -471,6 +525,79 @@ impl Shardable for kvrpcpb::PessimisticLockRequest {
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
         self.set_leader(&store.region_with_leader)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CollectPessimisticLockResultsWithShard;
+
+impl Merge<ResponseWithShard<kvrpcpb::PessimisticLockResponse, Vec<kvrpcpb::Mutation>>>
+    for CollectPessimisticLockResultsWithShard
+{
+    type Out = Vec<PessimisticLockResult>;
+
+    fn merge(
+        &self,
+        input: Vec<
+            Result<ResponseWithShard<kvrpcpb::PessimisticLockResponse, Vec<kvrpcpb::Mutation>>>,
+        >,
+    ) -> Result<Self::Out> {
+        if input.iter().any(Result::is_err) {
+            let (success, mut errors): (Vec<_>, Vec<_>) =
+                input.into_iter().partition(Result::is_ok);
+            let first_err = errors.pop().unwrap();
+            let success_keys = success
+                .into_iter()
+                .map(Result::unwrap)
+                .flat_map(|ResponseWithShard(_resp, mutations)| {
+                    mutations.into_iter().map(|m| m.key)
+                })
+                .collect();
+            return Err(PessimisticLockError {
+                inner: Box::new(first_err.unwrap_err()),
+                success_keys,
+            });
+        }
+
+        let mut out = Vec::new();
+        for ResponseWithShard(resp, mutations) in input.into_iter().map(Result::unwrap) {
+            if resp.results.len() != mutations.len() {
+                return Err(Error::StringError(format!(
+                    "pessimistic lock force result count mismatch: {} results for {} mutations",
+                    resp.results.len(),
+                    mutations.len()
+                )));
+            }
+
+            for (mutation, result) in mutations.into_iter().zip(resp.results) {
+                let result_type = kvrpcpb::PessimisticLockKeyResultType::try_from(result.r#type)
+                    .map_err(|_| {
+                        Error::StringError(format!(
+                            "unknown pessimistic lock result type {}",
+                            result.r#type
+                        ))
+                    })?;
+
+                match result_type {
+                    kvrpcpb::PessimisticLockKeyResultType::LockResultNormal
+                    | kvrpcpb::PessimisticLockKeyResultType::LockResultLockedWithConflict => {
+                        out.push(PessimisticLockResult {
+                            key: Key::from(mutation.key),
+                            value: result.existence.then_some(result.value),
+                            locked_with_conflict_ts: result.locked_with_conflict_ts,
+                        });
+                    }
+                    kvrpcpb::PessimisticLockKeyResultType::LockResultFailed => {
+                        return Err(Error::StringError(format!(
+                            "pessimistic lock failed for key {:?}",
+                            mutation.key
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -1028,7 +1155,95 @@ mod tests {
     use crate::request::plan::Merge;
     use crate::request::CollectWithShard;
     use crate::request::ResponseWithShard;
+    use crate::request::Shardable;
+    use crate::transaction::requests::CollectPessimisticLockResultsWithShard;
     use crate::KvPair;
+
+    fn put_mutation(key: &[u8]) -> kvrpcpb::Mutation {
+        kvrpcpb::Mutation {
+            op: kvrpcpb::Op::Put.into(),
+            key: key.to_vec(),
+            value: b"value".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_prewrite_apply_shard_remaps_for_update_ts_constraints() {
+        let key1 = b"key1";
+        let key2 = b"key2";
+        let key3 = b"key3";
+        let mut request = kvrpcpb::PrewriteRequest {
+            mutations: vec![put_mutation(key1), put_mutation(key2), put_mutation(key3)],
+            pessimistic_actions: vec![
+                kvrpcpb::prewrite_request::PessimisticAction::DoPessimisticCheck.into(),
+                kvrpcpb::prewrite_request::PessimisticAction::SkipPessimisticCheck.into(),
+                kvrpcpb::prewrite_request::PessimisticAction::DoConstraintCheck.into(),
+            ],
+            for_update_ts_constraints: vec![
+                kvrpcpb::prewrite_request::ForUpdateTsConstraint {
+                    index: 0,
+                    expected_for_update_ts: 10,
+                },
+                kvrpcpb::prewrite_request::ForUpdateTsConstraint {
+                    index: 2,
+                    expected_for_update_ts: 30,
+                },
+            ],
+            ..Default::default()
+        };
+
+        request.apply_shard(vec![put_mutation(key3), put_mutation(key1)]);
+
+        assert_eq!(
+            request.pessimistic_actions,
+            vec![
+                kvrpcpb::prewrite_request::PessimisticAction::DoConstraintCheck.into(),
+                kvrpcpb::prewrite_request::PessimisticAction::DoPessimisticCheck.into(),
+            ]
+        );
+        assert_eq!(
+            request.for_update_ts_constraints,
+            vec![
+                kvrpcpb::prewrite_request::ForUpdateTsConstraint {
+                    index: 0,
+                    expected_for_update_ts: 30,
+                },
+                kvrpcpb::prewrite_request::ForUpdateTsConstraint {
+                    index: 1,
+                    expected_for_update_ts: 10,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_prewrite_apply_shard_scopes_async_commit_metadata_to_primary_shard() {
+        let key1 = b"key1";
+        let key2 = b"key2";
+        let key3 = b"key3";
+        let request = kvrpcpb::PrewriteRequest {
+            mutations: vec![put_mutation(key1), put_mutation(key2), put_mutation(key3)],
+            primary_lock: key1.to_vec(),
+            use_async_commit: true,
+            secondaries: vec![key2.to_vec(), key3.to_vec()],
+            try_one_pc: true,
+            ..Default::default()
+        };
+
+        let mut primary_shard = request.clone();
+        primary_shard.apply_shard(vec![put_mutation(key3), put_mutation(key1)]);
+        assert_eq!(
+            primary_shard.secondaries,
+            vec![key2.to_vec(), key3.to_vec()]
+        );
+        assert!(!primary_shard.try_one_pc);
+
+        let mut secondary_shard = request;
+        secondary_shard.apply_shard(vec![put_mutation(key2)]);
+        assert!(secondary_shard.secondaries.is_empty());
+        assert!(!secondary_shard.try_one_pc);
+    }
 
     #[tokio::test]
     async fn test_merge_pessimistic_lock_response() {
@@ -1121,5 +1336,60 @@ mod tests {
                 panic!();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_merge_pessimistic_lock_force_results() {
+        let key1 = b"key1";
+        let key2 = b"key2";
+        let value1 = b"value1";
+        let value2 = b"value2";
+        let conflict_ts = 150;
+
+        let resp = ResponseWithShard(
+            kvrpcpb::PessimisticLockResponse {
+                results: vec![
+                    kvrpcpb::PessimisticLockKeyResult {
+                        r#type: kvrpcpb::PessimisticLockKeyResultType::LockResultNormal.into(),
+                        value: value1.to_vec(),
+                        existence: true,
+                        ..Default::default()
+                    },
+                    kvrpcpb::PessimisticLockKeyResult {
+                        r#type: kvrpcpb::PessimisticLockKeyResultType::LockResultLockedWithConflict
+                            .into(),
+                        value: value2.to_vec(),
+                        existence: true,
+                        locked_with_conflict_ts: conflict_ts,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            vec![
+                kvrpcpb::Mutation {
+                    op: kvrpcpb::Op::PessimisticLock.into(),
+                    key: key1.to_vec(),
+                    ..Default::default()
+                },
+                kvrpcpb::Mutation {
+                    op: kvrpcpb::Op::PessimisticLock.into(),
+                    key: key2.to_vec(),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let result = CollectPessimisticLockResultsWithShard
+            .merge(vec![Ok(resp)])
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].key, key1.to_vec().into());
+        assert_eq!(result[0].value, Some(value1.to_vec()));
+        assert_eq!(result[0].locked_with_conflict_ts, 0);
+        assert_eq!(result[1].key, key2.to_vec().into());
+        assert_eq!(result[1].value, Some(value2.to_vec()));
+        assert_eq!(result[1].locked_with_conflict_ts, conflict_ts);
     }
 }
