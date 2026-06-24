@@ -1,0 +1,2947 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "DB9 server Prometheus dashboard based on docs/observability-metrics.md, styled after the Sys9 platform overview dashboard.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 100,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 0,
+            "y": 1
+          },
+          "id": 1,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "last"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "time() - max(db9_server_start_time_seconds{pod=~\"$instance\"})",
+              "legendFormat": "uptime",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Server Uptime",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 4,
+            "y": 1
+          },
+          "id": 2,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "last"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "max(db9_server_connections_active{pod=~\"$instance\"})",
+              "legendFormat": "active",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_connections_accepted_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "accepted/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_connections_rejected_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "rejected/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Connections",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 8,
+            "y": 1
+          },
+          "id": 3,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "last"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_statements_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "statements/s",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Statement Rate",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 12,
+            "y": 1
+          },
+          "id": 4,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "last"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_query_errors_total{pod=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(db9_server_statements_total{pod=~\"$instance\"}[$__rate_interval])), 1e-9)",
+              "legendFormat": "error ratio",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Query Error Ratio",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 16,
+            "y": 1
+          },
+          "id": 5,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "last"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(db9_server_query_duration_seconds_bucket{pod=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "p99",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Query Latency p99",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 4,
+            "x": 20,
+            "y": 1
+          },
+          "id": 6,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "last"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showPercentChange": false,
+            "textMode": "auto",
+            "wideLayout": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "1 - (sum(rate(db9_cgroup_cpu_throttled_usec_total{pod=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(db9_cgroup_cpu_usage_usec_total{pod=~\"$instance\"}[$__rate_interval])), 1e-9))",
+              "legendFormat": "non-throttled share",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "CPU Headroom",
+          "type": "stat"
+        }
+      ],
+      "title": "DB9 Health",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "id": 110,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 2
+          },
+          "id": 7,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(db9_server_query_duration_seconds_bucket{pod=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "p50",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(db9_server_query_duration_seconds_bucket{pod=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "p95",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(db9_server_query_duration_seconds_bucket{pod=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "p99",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Query Latency Quantiles",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 2
+          },
+          "id": 8,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_statements_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "statements/s",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_query_errors_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "errors/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_write_conflict_retries_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "write conflict retries/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_expensive_queries_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "expensive queries/s",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Query Throughput and Errors",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 2
+          },
+          "id": 20,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (event) (rate(db9_plan_cache_events_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{event}}/s",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Plan Cache Events",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        }
+      ],
+      "title": "Query Execution",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 2
+      },
+      "id": 120,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 3
+          },
+          "id": 9,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "avg(db9_tokio_worker_busy_ratio{pod=~\"$instance\"})",
+              "legendFormat": "avg busy",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "max(db9_tokio_worker_busy_ratio{pod=~\"$instance\"})",
+              "legendFormat": "max busy",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Tokio Worker Busy Ratio",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 3
+          },
+          "id": 10,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_tokio_worker_local_queue_depth{pod=~\"$instance\"})",
+              "legendFormat": "local queues",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_tokio_global_queue_depth{pod=~\"$instance\"})",
+              "legendFormat": "global queue",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_tokio_blocking_queue_depth{pod=~\"$instance\"})",
+              "legendFormat": "blocking queue",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Runtime Queue Depth",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 3
+          },
+          "id": 11,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_cgroup_cpu_usage_usec_total{pod=~\"$instance\"}[$__rate_interval])) / 1000000",
+              "legendFormat": "cpu seconds/s",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_cgroup_cpu_throttled_usec_total{pod=~\"$instance\"}[$__rate_interval])) / 1000000",
+              "legendFormat": "throttled seconds/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_cgroup_cpu_nr_throttled_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "throttle events/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "cgroup CPU",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        }
+      ],
+      "title": "Runtime",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 3
+      },
+      "id": 130,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 4
+          },
+          "id": 12,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_server_worker_queue_depth{pod=~\"$instance\"})",
+              "legendFormat": "queue depth",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_server_worker_active_jobs{pod=~\"$instance\"})",
+              "legendFormat": "active jobs",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_worker_claim_attempts_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "claim attempts/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_worker_claim_successes_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "claim successes/s",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Worker Queue and Claims",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 4
+          },
+          "id": 13,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (task_type, result) (rate(db9_server_worker_tasks_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{task_type}} {{result}}",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (result) (rate(db9_server_worker_storage_pd_region_stats_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "pd region stats {{result}}",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Worker Task Outcomes",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 4
+          },
+          "id": 14,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_server_storage_memory_active_txns{pod=~\"$instance\"})",
+              "legendFormat": "active txns",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_storage_memory_commits_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "commits/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_storage_memory_write_conflicts_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "write conflicts/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(db9_server_storage_memory_lock_wait_seconds_bucket{pod=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "lock wait p99",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "In-Memory Storage",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        }
+      ],
+      "title": "Worker and Storage",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "id": 140,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 5
+          },
+          "id": 15,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, backend, operation, result) (rate(db9_fs9_operation_duration_seconds_bucket{pod=~\"$instance\",keyspace=~\"$keyspace\"}[$__rate_interval])))",
+              "legendFormat": "{{backend}} {{operation}} {{result}} p95",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.99, sum by (le, backend, operation, result) (rate(db9_fs9_operation_duration_seconds_bucket{pod=~\"$instance\",keyspace=~\"$keyspace\"}[$__rate_interval])))",
+              "legendFormat": "{{backend}} {{operation}} {{result}} p99",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "fs9 Operation Latency",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 5
+          },
+          "id": 16,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (mode) (rate(db9_fs9_glob_truncations_total{pod=~\"$instance\",keyspace=~\"$keyspace\"}[$__rate_interval]))",
+              "legendFormat": "glob truncations {{mode}}/s",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (operation) (rate(db9_fs9_read_budget_rejections_total{pod=~\"$instance\",keyspace=~\"$keyspace\"}[$__rate_interval]))",
+              "legendFormat": "read budget rejects {{operation}}/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_upload_sha256_seconds_count{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "upload sha256 ops/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_upload_mpsc_send_seconds_count{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "upload mpsc sends/s",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "fs9 Throughput and Rejections",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 5
+          },
+          "id": 17,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_fs9_redis_event_queue_depth{pod=~\"$instance\"})",
+              "legendFormat": "redis event queue",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (result) (rate(db9_fs9_stats_worker_scans_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "stats scans {{result}}/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "max by (result) (db9_fs9_stats_worker_staleness_seconds{pod=~\"$instance\"})",
+              "legendFormat": "stats staleness {{result}}",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (result) (rate(db9_fs9_pd_lifecycle_probe_total{pod=~\"$instance\",keyspace=~\"$keyspace\"}[$__rate_interval]))",
+              "legendFormat": "pd lifecycle {{result}}/s",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "fs9 Control Plane",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        }
+      ],
+      "title": "fs9",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "id": 150,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 6
+          },
+          "id": 18,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_trigger_queue_depth{pod=~\"$instance\",keyspace=~\"$keyspace\"})",
+              "legendFormat": "trigger queue depth",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (event) (rate(db9_trigger_events_total{pod=~\"$instance\",keyspace=~\"$keyspace\"}[$__rate_interval]))",
+              "legendFormat": "{{event}}/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "Async Triggers",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 6
+          },
+          "id": 19,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (result) (rate(db9_batch_write_atomic_requests_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "requests {{result}}/s",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_batch_write_atomic_files_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "files/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (code) (rate(db9_batch_write_atomic_errors_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "request error {{code}}/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (code) (rate(db9_batch_write_atomic_entry_errors_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "entry error {{code}}/s",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "batch_write_atomic",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        }
+      ],
+      "title": "Triggers and Batch Write",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "id": 160,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 7
+          },
+          "id": 21,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_server_hnsw_pending_indexes{pod=~\"$instance\"})",
+              "legendFormat": "pending indexes",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(db9_server_hnsw_pending_indexes_observed{pod=~\"$instance\"})",
+              "legendFormat": "pending observed",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_hnsw_sweep_enqueued_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "sweep enqueued/s",
+              "refId": "C",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_hnsw_sweep_enqueue_errors_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "sweep enqueue errors/s",
+              "refId": "D",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum(rate(db9_server_hnsw_scan_deltas_applied_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "scan deltas applied/s",
+              "refId": "E",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "HNSW Worker State",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisGridShow": true,
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 7
+          },
+          "id": 22,
+          "options": {
+            "legend": {
+              "calcs": [
+                "max",
+                "mean"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true,
+              "sortBy": "Mean",
+              "sortDesc": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, operation, result) (rate(db9_hnsw_s3_operation_duration_seconds_bucket{pod=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "{{operation}} {{result}} p95",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "sum by (operation, result) (rate(db9_hnsw_s3_operations_total{pod=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{operation}} {{result}}/s",
+              "refId": "B",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": true,
+              "hide": false
+            }
+          ],
+          "title": "HNSW S3 Operations",
+          "type": "timeseries",
+          "pluginVersion": "12.3.1"
+        }
+      ],
+      "title": "HNSW",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "id": 170,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$metrics_datasource"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "mappings": [],
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 6,
+            "w": 24,
+            "x": 0,
+            "y": 8
+          },
+          "id": 23,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "countRows": false,
+              "fields": "",
+              "reducer": [
+                "sum"
+              ],
+              "show": false
+            },
+            "showHeader": true
+          },
+          "pluginVersion": "12.3.1",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$metrics_datasource"
+              },
+              "expr": "db9_server_build_info{pod=~\"$instance\"}",
+              "format": "table",
+              "instant": true,
+              "legendFormat": "build info",
+              "refId": "A",
+              "editorMode": "code",
+              "exemplar": false,
+              "interval": "",
+              "range": false,
+              "hide": false
+            }
+          ],
+          "title": "Build Info",
+          "type": "table"
+        }
+      ],
+      "title": "Metadata",
+      "type": "row"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 42,
+  "tags": [
+    "sys9",
+    "platform",
+    "db9"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "metrics_datasource",
+        "hide": 2,
+        "label": "Metrics datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "sys9-victoria-metrics",
+          "value": "sys9-victoria-metrics"
+        },
+        "regex": "",
+        "refresh": 1
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$metrics_datasource"
+        },
+        "definition": "label_values(db9_server_start_time_seconds, pod)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Pod",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": {
+          "query": "label_values(db9_server_start_time_seconds, pod)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "$metrics_datasource"
+        },
+        "definition": "label_values(db9_fs9_operation_duration_seconds_count, keyspace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Keyspace",
+        "multi": true,
+        "name": "keyspace",
+        "options": [],
+        "query": {
+          "query": "label_values(db9_fs9_operation_duration_seconds_count, keyspace)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ]
+  },
+  "timezone": "browser",
+  "title": "Sys9 Platform / DB9 Server",
+  "uid": "sys9-platform-db9",
+  "version": 1,
+  "weekStart": ""
+}
