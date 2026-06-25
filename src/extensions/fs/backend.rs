@@ -8,7 +8,9 @@ use std::time::Duration;
 use tokio::io::AsyncBufRead;
 
 use crate::extensions::fs::embedded::types::EmbeddedFsError;
-use crate::extensions::fs::normalizing::NormalizingFsBackend;
+use crate::extensions::fs::normalizing::{
+    DatabaseLifecycleAdmission, FsLifecycleAdmission, NormalizingFsBackend,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -762,8 +764,25 @@ async fn init_backend(tenant_keyspace: &str) -> Result<Arc<dyn FsBackend>> {
 /// treated as a signal to open embedded PageFS metadata.
 pub(crate) async fn init_backend_with_args(
     tenant_keyspace: &str,
-    _tikv_client: Arc<tikv_client::TransactionClient>,
+    tikv_client: Arc<tikv_client::TransactionClient>,
     authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
+) -> Result<Arc<dyn FsBackend>> {
+    let db_id = crate::session_context::current_database_id();
+    let lifecycle_database_id = (db_id != 0).then_some(db_id);
+    init_backend_with_args_for_database(
+        tenant_keyspace,
+        tikv_client,
+        authenticated_principal,
+        lifecycle_database_id,
+    )
+    .await
+}
+
+pub(crate) async fn init_backend_with_args_for_database(
+    tenant_keyspace: &str,
+    tikv_client: Arc<tikv_client::TransactionClient>,
+    authenticated_principal: Option<crate::auth::fs_plane_token::Fs9Principal>,
+    lifecycle_database_id: Option<u64>,
 ) -> Result<Arc<dyn FsBackend>> {
     // Every leaf backend constructed here is wrapped in
     // `NormalizingFsBackend` so callers cannot bypass path shaping by
@@ -786,7 +805,23 @@ pub(crate) async fn init_backend_with_args(
             );
         }
     };
-    Ok(Arc::new(NormalizingFsBackend::new(tenant_keyspace, inner)) as Arc<dyn FsBackend>)
+    let Some(db_id) = lifecycle_database_id.filter(|db_id| *db_id != 0) else {
+        return Ok(
+            Arc::new(NormalizingFsBackend::new(tenant_keyspace, inner)) as Arc<dyn FsBackend>
+        );
+    };
+
+    let store = Arc::new(crate::storage::TikvStore::from_transaction_client(
+        tikv_client,
+        Some(tenant_keyspace.to_string()),
+    ));
+    let admission: Arc<dyn FsLifecycleAdmission> =
+        Arc::new(DatabaseLifecycleAdmission::new(store, db_id));
+    Ok(Arc::new(NormalizingFsBackend::new_with_lifecycle_admission(
+        tenant_keyspace,
+        inner,
+        admission,
+    )) as Arc<dyn FsBackend>)
 }
 
 /// Instantiate the fs9 v2 gRPC backend for a tenant. This function has no

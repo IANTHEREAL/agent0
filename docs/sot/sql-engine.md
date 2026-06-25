@@ -84,22 +84,19 @@
   - Treat this as experimental until session/effective role state is separated in expression evaluation, `CURRENT_ROLE` exists as a real SQL value function, and rollback-aware role-state undo exists.
   - Evidence: `src/sql/executor/core/dispatch/roles.rs`, `src/sql/session/mod.rs`, `src/sql/query_context.rs`, `src/sql/expr/typed_eval/helpers.rs`.
 
-- **[Experimental] Transaction read-only semantics**
-  - `SET TRANSACTION READ ONLY` / `BEGIN READ ONLY` currently do not provide a real PostgreSQL `transaction_read_only` surface.
-  - Plain `SET transaction_read_only = ...` and `set_config('transaction_read_only', ..., false)` currently route through generic GUC storage instead of a real transaction-local state model.
-  - `SET LOCAL transaction_read_only = ...` and tableless `set_config('transaction_read_only', ..., true)` can already fabricate `SHOW transaction_read_only = on`, but writes still succeed inside the supposedly read-only transaction.
-  - As a result, db9 can expose both sticky session-visible and transaction-local-looking `transaction_read_only` readback without PostgreSQL-compatible scope or write enforcement.
-  - `SET default_transaction_read_only = on` currently only changes session readback; it does not make subsequent explicit transactions or autocommit statements read-only.
-  - Current transaction-access-mode behavior mutates `default_transaction_read_only`, leaks across `ROLLBACK`, and does not prevent writes inside the supposedly read-only transaction.
-  - PostgreSQL-parity follow-ups are tracked in `#1522` and `#1524`.
-  - Treat this as experimental until session-default read-only state, transaction-local read-only state, readback, and write enforcement all exist and are wired together.
-  - Evidence: `src/sql/executor/core/dispatch/utils.rs`, `src/sql/executor/core/dispatch/ast.rs`, `src/sql/session/settings.rs`.
+- **[Stable] Transaction read-only semantics**
+  - `BEGIN READ ONLY`, `START TRANSACTION READ ONLY`, and `SET TRANSACTION READ ONLY` set the effective `transaction_read_only` surface without mutating `default_transaction_read_only`.
+  - `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` and `SET default_transaction_read_only = on` make later transactions default to read-only.
+  - Writes and row-level locking in read-only transactions fail with SQLSTATE `25006`; this includes DML, DDL/RBAC mutation paths, `SELECT FOR UPDATE/SHARE`, raw SQL mutation handlers, and pgwire `COPY FROM` fast paths.
+  - `SHOW transaction_read_only` reports the effective current transaction mode; transaction end clears transaction-local state.
+  - User value: db9 no longer says a transaction is read-only while still allowing writes.
+  - Governance / history: design `docs/design/36_transaction_lifecycle_correctness.md`, issue family `#2754` / `#2755` / `#2763`.
+  - Evidence: `src/sql/executor/core/dispatch/transaction.rs`, `src/sql/executor/core/dispatch/mod.rs`, `src/protocol/handler/dynamic/query.rs`, `src/sql/session/settings.rs`, `tests/safety_transaction_modes.py`.
 
 - **[Experimental] `SET TRANSACTION` context rules**
-  - Plain `SET TRANSACTION ...` currently does not enforce PostgreSQL's context rules.
+  - `SET TRANSACTION ...` now rejects changes after a statement has already run in an explicit transaction.
   - Outside an explicit transaction block, current behavior succeeds and can mutate session-visible state instead of emitting PostgreSQL's warning/no-op behavior.
-  - Inside an explicit transaction, `SET TRANSACTION ISOLATION LEVEL ...` is currently accepted even after earlier queries in the same transaction.
-  - The current handler also discards the parser's `session` flag, so `SET TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION` do not yet have clearly separated scope rules.
+  - `SET TRANSACTION`, `SET SESSION CHARACTERISTICS AS TRANSACTION`, `SET transaction_read_only`, `set_config('transaction_read_only', ...)`, and `RESET transaction_read_only` now share the same after-first-query guard for transaction characteristics.
   - PostgreSQL-parity follow-up is tracked in `#1525`.
   - Treat this as experimental until transaction-context validation and session-vs-transaction scope handling are enforced explicitly.
   - Evidence: `src/sql/executor/core/dispatch/ast.rs`, `src/sql/executor/core/dispatch/utils.rs`, `src/sql/session/mod.rs`.

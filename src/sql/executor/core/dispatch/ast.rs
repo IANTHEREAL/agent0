@@ -15,7 +15,10 @@ use super::super::*;
 use super::guc::{build_show_all_result, execute_set_variable};
 use super::scaffold::DispatchContext;
 use super::transaction::check_observability_statement_permission;
-use super::utils::{apply_pending_set_config_mutations, validate_transaction_modes};
+use super::utils::{
+    apply_pending_set_config_mutations, validate_begin_transaction_modes,
+    validate_transaction_modes,
+};
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 
 fn sync_runtime_setting_override_from_session(session: &Session, name: &str) {
@@ -45,7 +48,11 @@ fn sync_runtime_setting_overrides_for_statement(session: &Session, stmt: &Statem
         Statement::SetNames { .. } => {
             sync_runtime_setting_override_from_session(session, "client_encoding");
         }
-        Statement::SetTransaction { modes, .. } => {
+        Statement::SetTransaction {
+            modes,
+            session: session_default,
+            ..
+        } => {
             for mode in modes {
                 match mode {
                     TransactionMode::IsolationLevel(_) => {
@@ -55,10 +62,17 @@ fn sync_runtime_setting_overrides_for_statement(session: &Session, stmt: &Statem
                         );
                     }
                     TransactionMode::AccessMode(_) => {
-                        sync_runtime_setting_override_from_session(
-                            session,
-                            "default_transaction_read_only",
-                        );
+                        if *session_default {
+                            sync_runtime_setting_override_from_session(
+                                session,
+                                "default_transaction_read_only",
+                            );
+                        } else {
+                            sync_runtime_setting_override_from_session(
+                                session,
+                                "transaction_read_only",
+                            );
+                        }
                     }
                 }
             }
@@ -146,7 +160,7 @@ impl Executor {
                     match stmt {
                         // Transaction Control
                         Statement::StartTransaction { modes, .. } => {
-                            validate_transaction_modes(session, modes)?;
+                            validate_begin_transaction_modes(session, modes)?;
                             session.begin().await?;
                             Ok(vec![ExecuteResult::TransactionStart { tag: "BEGIN" }])
                         }
@@ -259,7 +273,7 @@ impl Executor {
                         Statement::SetTransaction {
                             modes,
                             snapshot,
-                            session: _,
+                            session: session_default,
                         } => {
                             if snapshot.is_some() {
                                 return Err(SqlError::Unsupported(
@@ -267,7 +281,20 @@ impl Executor {
                                 )
                                 .into());
                             }
-                            validate_transaction_modes(session, modes)?;
+                            let changes_access_mode = modes
+                                .iter()
+                                .any(|mode| matches!(mode, TransactionMode::AccessMode(_)));
+                            if !*session_default
+                                && changes_access_mode
+                                && session.is_in_transaction()
+                                && session.has_executed_statement_in_transaction()
+                            {
+                                return Err(SqlError::ActiveSqlTransaction {
+                                    message: "SET TRANSACTION must be called before any query in a transaction".into(),
+                                }
+                                .into());
+                            }
+                            validate_transaction_modes(session, modes, *session_default)?;
                             Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
                         }
                         Statement::ShowVariable { variable } => {
@@ -648,6 +675,87 @@ mod tests {
             out.as_slice(),
             [ExecuteResult::CommandComplete { tag: "SET" }]
         ));
+        assert_eq!(
+            session
+                .show_setting_value("transaction_read_only")
+                .as_deref(),
+            Some("on")
+        );
+        assert_eq!(
+            session
+                .show_setting_value("default_transaction_read_only")
+                .as_deref(),
+            Some("off")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_late_isolation_only_set_transaction_succeeds() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        session.note_statement_success_in_transaction();
+
+        let sql = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_late_access_mode_set_transaction_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        session.note_statement_success_in_transaction();
+
+        let sql = "SET TRANSACTION READ ONLY";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("SET TRANSACTION must be called before any query"));
+    }
+
+    #[test]
+    fn start_transaction_uses_nested_begin_safe_mode_helper() {
+        let source = include_str!("ast.rs");
+        let prod_source = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("ast.rs must contain the test module");
+        let start_branch = prod_source
+            .split("Statement::StartTransaction { modes, .. } => {")
+            .nth(1)
+            .expect("AST dispatch must handle START TRANSACTION");
+        let branch_prefix = start_branch
+            .split("Ok(vec![ExecuteResult::TransactionStart { tag: \"BEGIN\" }])")
+            .next()
+            .expect("START TRANSACTION branch must return BEGIN");
+        let validate_pos = branch_prefix
+            .find("validate_begin_transaction_modes(session, modes)?")
+            .expect("START TRANSACTION branch must use nested-BEGIN-safe mode validation");
+        let begin_pos = branch_prefix
+            .find("session.begin().await?")
+            .expect("START TRANSACTION branch must call session.begin");
+
+        assert!(
+            validate_pos < begin_pos,
+            "BEGIN modes must be applied only before opening a new transaction; nested BEGIN must not rewrite active transaction modes"
+        );
+        assert!(
+            !branch_prefix.contains("validate_transaction_modes(session, modes, false)"),
+            "START TRANSACTION must not directly mutate transaction modes inside an active transaction"
+        );
     }
 
     #[tokio::test]

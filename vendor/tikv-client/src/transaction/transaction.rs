@@ -259,14 +259,23 @@ impl<PdC: PdClient> Transaction<PdC> {
         }
 
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
+        if self.buffer.is_locked_or_mutated(&key) {
+            if let Some(value) = self.buffer.get_if_determined(&key) {
+                return Ok(LockCurrentResult {
+                    value,
+                    latest_commit_ts: None,
+                });
+            }
+        }
         let result = self
             .pessimistic_lock_allow_conflict(key, self.timestamp.clone())
             .await?;
 
+        let baseline_ts = self.timestamp.version();
         Ok(match result {
             Some(result) => LockCurrentResult {
                 value: result.value,
-                latest_commit_ts: (result.locked_with_conflict_ts != 0)
+                latest_commit_ts: (result.locked_with_conflict_ts > baseline_ts)
                     .then_some(result.locked_with_conflict_ts),
             },
             None => LockCurrentResult {
@@ -526,7 +535,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         trace!("invoking transactional put request");
         self.check_allow_operation().await?;
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
-        if self.is_pessimistic() {
+        if self.is_pessimistic() && !self.buffer.is_locked_or_mutated(&key) {
             self.pessimistic_lock(iter::once(key.clone()), false)
                 .await?;
         }
@@ -560,7 +569,8 @@ impl<PdC: PdClient> Transaction<PdC> {
         if self.buffer.get(&key).is_some() {
             return Err(Error::DuplicateKeyInsertion);
         }
-        if self.is_pessimistic() {
+        let locally_absent = self.buffer.is_locally_absent_mutation(&key);
+        if self.is_pessimistic() && !locally_absent {
             self.pessimistic_lock(
                 iter::once((key.clone(), kvrpcpb::Assertion::NotExist)),
                 false,
@@ -592,7 +602,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         debug!("invoking transactional delete request");
         self.check_allow_operation().await?;
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
-        if self.is_pessimistic() {
+        if self.is_pessimistic() && !self.buffer.is_locked_or_mutated(&key) {
             self.pessimistic_lock(iter::once(key.clone()), false)
                 .await?;
         }
@@ -631,8 +641,14 @@ impl<PdC: PdClient> Transaction<PdC> {
             .map(|mutation| mutation.encode_keyspace(self.keyspace, KeyMode::Txn))
             .collect();
         if self.is_pessimistic() {
-            self.pessimistic_lock(mutations.iter().map(|m| m.key().clone()), false)
-                .await?;
+            let keys_to_lock = mutations
+                .iter()
+                .map(|m| m.key().clone())
+                .filter(|key| !self.buffer.is_locked_or_mutated(key))
+                .collect::<Vec<_>>();
+            if !keys_to_lock.is_empty() {
+                self.pessimistic_lock(keys_to_lock, false).await?;
+            }
             for m in mutations {
                 self.buffer.mutate(m);
             }
@@ -1922,6 +1938,25 @@ mod tests {
 
         let repaired = repair_scan_result_key(encoded_key.clone(), &start, end.as_ref(), keyspace);
         assert_eq!(repaired, encoded_key);
+    }
+
+    #[test]
+    fn lock_current_rechecks_locked_keys_without_cached_values() {
+        let source = include_str!("transaction.rs");
+        let body = source
+            .split("pub async fn lock_current_and_check_not_newer_than")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Check whether a key exists.").next())
+            .expect("lock_current_and_check_not_newer_than must be present");
+
+        assert!(
+            body.contains("get_if_determined(&key)"),
+            "locked-but-uncached keys must not be treated as known-absent"
+        );
+        assert!(
+            !body.contains("value: self.buffer.get(&key)"),
+            "lock_current must not collapse undetermined locked keys into None"
+        );
     }
 
     #[rstest::rstest]

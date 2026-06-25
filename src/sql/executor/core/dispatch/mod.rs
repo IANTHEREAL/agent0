@@ -20,6 +20,78 @@ mod utils;
 use super::*;
 use scaffold::DispatchContext;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlDispatchClass {
+    NoDb,
+    Read,
+    Write,
+    AdminWrite,
+}
+
+impl SqlDispatchClass {
+    fn is_write(self) -> bool {
+        matches!(self, Self::Write | Self::AdminWrite)
+    }
+}
+
+fn raw_kind_dispatch_class(kind: crate::sql::raw_sql::RawSqlKind) -> SqlDispatchClass {
+    use crate::sql::raw_sql::RawSqlKind;
+
+    match kind {
+        RawSqlKind::CreateDatabase
+        | RawSqlKind::DropDatabase
+        | RawSqlKind::AlterDatabase
+        | RawSqlKind::AlterSystemSet => SqlDispatchClass::AdminWrite,
+
+        RawSqlKind::AlterDefaultPrivileges
+        | RawSqlKind::CreateExtension
+        | RawSqlKind::DropExtension
+        | RawSqlKind::CommentOn
+        | RawSqlKind::CreateFunction
+        | RawSqlKind::DropFunction
+        | RawSqlKind::CreateTrigger
+        | RawSqlKind::DropTrigger
+        | RawSqlKind::AlterOwnerTo
+        | RawSqlKind::AlterSequenceOwnedBy
+        | RawSqlKind::RefreshMaterializedView
+        | RawSqlKind::DropMaterializedView
+        | RawSqlKind::Call
+        | RawSqlKind::DropProcedure
+        | RawSqlKind::CreateProcedure
+        | RawSqlKind::CreateTypeEnum
+        | RawSqlKind::AlterType
+        | RawSqlKind::DropType
+        | RawSqlKind::CreateCollation
+        | RawSqlKind::DropCollation
+        | RawSqlKind::CreateTextSearchConfiguration
+        | RawSqlKind::DropTextSearchConfiguration
+        | RawSqlKind::AlterTextSearchConfiguration
+        | RawSqlKind::Do
+        | RawSqlKind::Analyze
+        | RawSqlKind::AlterIndexIfExists
+        | RawSqlKind::CreatePolicy
+        | RawSqlKind::AlterPolicy
+        | RawSqlKind::DropPolicy
+        | RawSqlKind::AlterTableRls => SqlDispatchClass::Write,
+
+        RawSqlKind::ExportSnapshotList => SqlDispatchClass::Read,
+
+        RawSqlKind::PsqlMetaCommand
+        | RawSqlKind::Copy
+        | RawSqlKind::Reset
+        | RawSqlKind::ExportSnapshotBegin
+        | RawSqlKind::ExportSnapshotRelease
+        | RawSqlKind::Listen
+        | RawSqlKind::Notify
+        | RawSqlKind::Unlisten
+        | RawSqlKind::UnsupportedExecutorSkips => SqlDispatchClass::NoDb,
+    }
+}
+
+fn raw_kind_forbidden_in_transaction_block(kind: crate::sql::raw_sql::RawSqlKind) -> bool {
+    matches!(kind, crate::sql::raw_sql::RawSqlKind::AlterSystemSet)
+}
+
 /// Dispatch a raw-SQL command: time it, record observability, handle txn failure.
 ///
 /// Retained for unit tests that verify the instrumented-dispatch contract
@@ -150,8 +222,49 @@ impl Executor {
                     return Err(SqlError::InFailedTransaction.into());
                 }
 
+                if ctx
+                    .raw_kind
+                    .is_some_and(raw_kind_forbidden_in_transaction_block)
+                    && session.is_in_transaction()
+                {
+                    return Err(SqlError::ActiveSqlTransaction {
+                        message: "ALTER SYSTEM cannot run inside a transaction block".into(),
+                    }
+                    .into());
+                }
+
+                // ── Phase 1.5: Database lifecycle guard ────────────────
+                //
+                // A session captures its db_id at startup. In multi-node
+                // deployments another node may drop that database after this
+                // connection is established. Reject new work as soon as the
+                // metadata row disappears; COMMIT is fenced in Session::commit
+                // and ROLLBACK must remain available for cleanup.
+                if !ctx.starts_with("ROLLBACK")
+                    && !ctx.starts_with("COMMIT")
+                    && !ctx.starts_with("END")
+                {
+                    session
+                        .ensure_current_database_alive_for_statement()
+                        .await?;
+                }
+
                 // ── Phase 2: Raw instrumented dispatch ─────────────────
                 if !ctx.is_observability_user {
+                    if session.transaction_read_only()
+                        && ctx
+                            .raw_kind
+                            .is_some_and(|kind| raw_kind_dispatch_class(kind).is_write())
+                    {
+                        return Err(SqlError::ReadOnlySqlTransaction {
+                            statement: ctx
+                                .raw_kind
+                                .map(|kind| format!("{:?}", kind))
+                                .unwrap_or_else(|| "statement".to_string()),
+                        }
+                        .into());
+                    }
+
                     if let Some(result) =
                         self.try_dispatch_raw_instrumented(session, sql, &ctx).await
                     {
@@ -564,6 +677,67 @@ mod tests {
         assert_eq!(kind, Some(crate::sql::raw_sql::RawSqlKind::AlterSystemSet));
         // Verify it does NOT match any first-block or second-block kind.
         // The passthrough handler catches AlterSystemSet, not the instrumented path.
+    }
+
+    #[test]
+    fn raw_passthrough_kinds_have_explicit_dispatch_classes() {
+        use crate::sql::raw_sql::RawSqlKind;
+
+        assert_eq!(
+            raw_kind_dispatch_class(RawSqlKind::AlterSystemSet),
+            SqlDispatchClass::AdminWrite
+        );
+        assert!(raw_kind_dispatch_class(RawSqlKind::AlterSystemSet).is_write());
+        assert!(raw_kind_forbidden_in_transaction_block(
+            RawSqlKind::AlterSystemSet
+        ));
+
+        assert_eq!(
+            raw_kind_dispatch_class(RawSqlKind::Reset),
+            SqlDispatchClass::NoDb
+        );
+        assert!(!raw_kind_dispatch_class(RawSqlKind::Reset).is_write());
+        assert!(!raw_kind_forbidden_in_transaction_block(RawSqlKind::Reset));
+    }
+
+    #[test]
+    fn representative_raw_kinds_are_classified_before_dispatch() {
+        use crate::sql::raw_sql::RawSqlKind;
+
+        assert_eq!(
+            raw_kind_dispatch_class(RawSqlKind::CreateDatabase),
+            SqlDispatchClass::AdminWrite
+        );
+        assert_eq!(
+            raw_kind_dispatch_class(RawSqlKind::CreateExtension),
+            SqlDispatchClass::Write
+        );
+        assert_eq!(
+            raw_kind_dispatch_class(RawSqlKind::ExportSnapshotList),
+            SqlDispatchClass::Read
+        );
+        assert_eq!(
+            raw_kind_dispatch_class(RawSqlKind::Listen),
+            SqlDispatchClass::NoDb
+        );
+    }
+
+    #[test]
+    fn alter_system_set_rejected_inside_transaction_block() {
+        run_async_on_large_stack(async move {
+            let (exec, mut session, _) = make_executor_and_session(false);
+            session.force_test_transaction_state(true, false);
+
+            let err = exec
+                .execute_single(&mut session, "ALTER SYSTEM SET statement_timeout = '1s'")
+                .await
+                .expect_err("ALTER SYSTEM must be rejected inside a transaction block");
+            assert!(
+                err.to_string()
+                    .contains("ALTER SYSTEM cannot run inside a transaction block"),
+                "unexpected error: {err}"
+            );
+        });
     }
 
     /// T4: RESET success goes through passthrough dispatch (no raw instrumentation).

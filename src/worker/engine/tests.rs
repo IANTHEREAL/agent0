@@ -207,14 +207,6 @@ fn background_statement_extension_context_uses_fresh_statement_state_per_call() 
 }
 
 #[test]
-fn should_start_cic_backfill_only_when_building() {
-    assert!(should_start_cic_backfill(IndexState::Building));
-    assert!(!should_start_cic_backfill(IndexState::Ready));
-    assert!(!should_start_cic_backfill(IndexState::Invalid));
-    assert!(!should_start_cic_backfill(IndexState::WriteOnly));
-}
-
-#[test]
 fn cic_repair_checks_pending_bgddl_before_invalidating() {
     let source = include_str!("../engine.rs");
     let prod_source = source
@@ -451,8 +443,68 @@ fn specialized_task_paths_thread_lease_cancel() {
         "HnswMerge path must thread lease_cancel"
     );
     assert!(
-        dispatch.contains("Self::execute_bg_ddl_backfill(&store, entry, &lease_cancel)"),
+        dispatch.contains("Self::execute_bg_ddl_backfill(")
+            && dispatch.contains("&lease_cancel")
+            && dispatch.contains("mark_retryable_invalid"),
         "BgDdl backfill path must thread lease_cancel"
+    );
+}
+
+#[test]
+fn bg_ddl_backfill_retries_transient_storage_conflicts() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let execute_task_start = prod_source
+        .find("async fn execute_task(")
+        .expect("execute_task must exist");
+    let execute_bg_ddl_start = prod_source[execute_task_start..]
+        .find("async fn execute_bg_ddl_backfill(")
+        .map(|offset| execute_task_start + offset)
+        .expect("execute_bg_ddl_backfill must exist after execute_task");
+    let dispatch = &prod_source[execute_task_start..execute_bg_ddl_start];
+
+    assert!(
+        prod_source.contains("const WORKER_BGDDL_MAX_RETRY_ATTEMPTS: usize"),
+        "BgDdl backfill must have an explicit retry budget"
+    );
+    assert!(
+        dispatch.contains("for attempt in 0..WORKER_BGDDL_MAX_RETRY_ATTEMPTS"),
+        "BgDdl backfill must retry inside its specialized path"
+    );
+    assert!(
+        dispatch.contains("is_retryable_tikv_error(&e)")
+            && dispatch.contains("worker_bgsql_backoff(attempt).await")
+            && dispatch.contains("continue;"),
+        "BgDdl backfill must back off and retry transient TiKV/storage conflicts"
+    );
+}
+
+#[test]
+fn bg_ddl_backfill_resumes_from_write_only_after_retry() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let start = prod_source
+        .find("async fn execute_bg_ddl_backfill(")
+        .expect("execute_bg_ddl_backfill must exist");
+    let body = &prod_source[start..];
+
+    assert!(
+        body.contains("IndexState::Building | IndexState::WriteOnly => {}"),
+        "CIC retry must treat WriteOnly as resumable, not terminal"
+    );
+    assert!(
+        body.contains("if index.state == IndexState::Building"),
+        "phase 1 must only run from Building so WriteOnly resumes at phase 2"
+    );
+    assert!(
+        body.contains("IndexState::Ready | IndexState::Invalid"),
+        "only terminal CIC states should be skipped as duplicate/stale tasks"
     );
 }
 
@@ -480,6 +532,15 @@ fn cancelled_backfill_is_not_marked_invalid() {
     assert!(
         guards >= 3,
         "each CIC phase must bypass mark_invalid on a claim-cancelled error (found {guards})"
+    );
+    let retryable_guards = body
+        .matches(
+            "Err(e) if is_retryable_tikv_error(&e) && !mark_retryable_invalid => return Err(e),",
+        )
+        .count();
+    assert!(
+        retryable_guards >= 3,
+        "each CIC phase must bypass mark_invalid for retryable conflicts before the final retry (found {retryable_guards})"
     );
     // And the helper must exist with the right intent.
     assert!(

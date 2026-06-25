@@ -82,8 +82,8 @@ pub(crate) fn record_fs9_activity(
 /// `tenant_keyspace` is the backend's row-identity key and is always required.
 /// `database_id` is diagnostic-only (the backend keys on keyspace), so it is
 /// required for [`DatabaseActivitySource::Sql`] (the pgwire session always has
-/// a real id) but may be `0` ("diagnostic unknown") for
-/// [`DatabaseActivitySource::Fs9`], whose WS session carries only the keyspace.
+/// a real id). [`DatabaseActivitySource::Fs9`] accepts `0` for legacy/test
+/// callers, but normal WebSocket sessions should pass their bound database id.
 fn record_activity(
     source: DatabaseActivitySource,
     tenant_keyspace: &str,
@@ -206,8 +206,8 @@ mod tests {
 
     #[test]
     fn record_fs9_activity_emits_with_unknown_database_id() {
-        // fs9 sessions carry the keyspace but no numeric db id; the backend keys
-        // on keyspace, so db_id == 0 ("diagnostic unknown") must still emit.
+        // Legacy/test fs9 callers may not know a numeric db id; the backend
+        // keys on keyspace, so db_id == 0 ("diagnostic unknown") still emits.
         let sink = Arc::new(RecordingSink::default());
         let _guard = install_test_database_activity_sink(sink.clone());
 

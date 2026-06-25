@@ -1776,17 +1776,16 @@ async fn reconcile_index_pass(
                         &pk_types,
                     )?
                 };
-                let existing_rows = store
-                    .batch_get_rows(
+                let existing_row = store
+                    .lock_row_current_and_get_not_newer_than(
                         &mut txn,
                         db_id,
                         schema.table_id,
-                        vec![pk_values.clone()],
-                        &schema,
+                        &pk_values,
                     )
                     .await?;
 
-                let stale = if let Some(mut row) = existing_rows.into_iter().next() {
+                let stale = if let Some(mut row) = existing_row {
                     fill_row_defaults(&mut row, &schema)?;
                     if !index_helpers::eval_index_predicate(&index, &schema, &row)? {
                         true
@@ -2243,5 +2242,28 @@ mod tests {
                 "{fn_name}: must quarantine the GC guard when rollback fails"
             );
         }
+    }
+
+    #[test]
+    fn reconcile_cleanup_uses_current_locked_row() {
+        let source = include_str!("create_index.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("create_index.rs must contain test module marker");
+        let body = prod_source
+            .split("async fn reconcile_index_pass")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn reconcile_index").next())
+            .expect("reconcile_index_pass must be present");
+
+        assert!(
+            body.contains(".lock_row_current_and_get_not_newer_than("),
+            "reconcile stale cleanup must validate the current row under SI conflict checks"
+        );
+        assert!(
+            !body.contains(".batch_get_rows("),
+            "reconcile stale cleanup must not decide from snapshot row reads"
+        );
     }
 }

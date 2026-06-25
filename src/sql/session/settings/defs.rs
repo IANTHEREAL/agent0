@@ -496,6 +496,15 @@ pub(crate) const GUC_TABLE: &[GucDef] = &[
         validate_fn: Some(validate_transaction_isolation),
     },
     GucDef {
+        name: "transaction_read_only",
+        guc_type: GucType::Bool,
+        context: GucContext::Userset,
+        description: "",
+        boot_default: "off",
+        flags: 0,
+        validate_fn: Some(validate_transaction_read_only),
+    },
+    GucDef {
         name: "work_mem",
         guc_type: GucType::String,
         context: GucContext::Userset,

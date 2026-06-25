@@ -158,6 +158,27 @@ impl Executor {
             .map(|r| pk_to_hash_key(&schema.get_pk_values(r)))
             .collect();
 
+        if !rows_to_delete.is_empty() {
+            let mut keyed_pks: Vec<(Vec<u8>, Vec<_>)> = rows_to_delete
+                .iter()
+                .map(|r| {
+                    let pk = schema.get_pk_values(r);
+                    (crate::storage::encode_pk_values(&pk), pk)
+                })
+                .collect();
+            keyed_pks.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let sorted_pks = keyed_pks.into_iter().map(|(_, pk)| pk).collect();
+            self.store()
+                .lock_rows_current_and_check_not_newer_than(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    sorted_pks,
+                    qctx.lock_timeout,
+                )
+                .await?;
+        }
+
         // Build FK context once for the entire statement.
         // Skip expensive metadata/data loads when no rows match DELETE.
         let mut fk_ctx = if rows_to_delete.is_empty() {

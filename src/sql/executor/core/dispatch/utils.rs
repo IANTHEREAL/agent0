@@ -3,15 +3,19 @@
 
 use super::super::*;
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 /// Validate and apply transaction modes (isolation level, access mode) from
-/// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
+/// `BEGIN`, `START TRANSACTION`, `SET TRANSACTION`, or
+/// `SET SESSION CHARACTERISTICS AS TRANSACTION`.
 ///
 /// Downgrades SERIALIZABLE to REPEATABLE READ (TiKV snapshot isolation)
-/// and stores accepted modes in the session for `SHOW` readback.
+/// and stores access mode on either the current/pending transaction or the
+/// session default depending on `session_default`.
 pub(in crate::sql::executor::core) fn validate_transaction_modes(
     session: &mut Session,
     modes: &[TransactionMode],
+    session_default: bool,
 ) -> Result<()> {
     for mode in modes {
         match mode {
@@ -32,11 +36,29 @@ pub(in crate::sql::executor::core) fn validate_transaction_modes(
                     TransactionAccessMode::ReadOnly => "on",
                     TransactionAccessMode::ReadWrite => "off",
                 };
-                session.set_known_setting("default_transaction_read_only", mode_str.to_string())?;
+                let setting = if session_default {
+                    "default_transaction_read_only"
+                } else {
+                    "transaction_read_only"
+                };
+                session.set_known_setting(setting, mode_str.to_string())?;
             }
         }
     }
     Ok(())
+}
+
+/// Apply BEGIN/START TRANSACTION modes only when starting a new transaction.
+/// PostgreSQL treats nested BEGIN as a no-op for the active transaction, so a
+/// nested `BEGIN READ WRITE` must not revoke an existing READ ONLY transaction.
+pub(in crate::sql::executor::core) fn validate_begin_transaction_modes(
+    session: &mut Session,
+    modes: &[TransactionMode],
+) -> Result<()> {
+    if session.is_in_transaction() {
+        return Ok(());
+    }
+    validate_transaction_modes(session, modes, false)
 }
 
 impl Executor {
@@ -148,6 +170,8 @@ pub(in crate::sql::executor::core) fn apply_pending_set_config_mutations(
             continue;
         }
 
+        session.ensure_transaction_characteristics_change_allowed(&mutation.name)?;
+
         // is_reset: NULL value in set_config() → RESET to boot default.
         if mutation.is_reset {
             if mutation.is_local {
@@ -240,6 +264,25 @@ pub(in crate::sql::executor::core) async fn apply_statement_timeout<T>(
     }
 }
 
+pub(in crate::sql::executor::core) fn effective_retry_timeout(
+    retry_timeout: Option<Duration>,
+    statement_timeout: Option<Duration>,
+) -> Option<Duration> {
+    match (retry_timeout, statement_timeout) {
+        (Some(retry), Some(statement)) => Some(retry.min(statement)),
+        (Some(retry), None) => Some(retry),
+        (None, Some(statement)) => Some(statement),
+        (None, None) => None,
+    }
+}
+
+pub(in crate::sql::executor::core) fn remaining_statement_timeout(
+    started_at: Instant,
+    statement_timeout: Option<Duration>,
+) -> Option<Duration> {
+    statement_timeout.map(|timeout| timeout.saturating_sub(started_at.elapsed()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,20 +313,52 @@ mod tests {
                 TransactionMode::IsolationLevel(TransactionIsolationLevel::ReadCommitted),
                 TransactionMode::AccessMode(TransactionAccessMode::ReadOnly),
             ],
+            false,
         )
         .unwrap();
 
-        // SHOW returns user-set value (PG parity). Internal behavior is
-        // always repeatable read regardless.
         assert_eq!(
             session
                 .show_setting_value("transaction_isolation")
                 .as_deref(),
-            Some("read committed")
+            Some("repeatable read")
+        );
+        assert_eq!(
+            session
+                .show_setting_value("transaction_read_only")
+                .as_deref(),
+            Some("on")
         );
         assert_eq!(
             session
                 .show_setting_value("default_transaction_read_only")
+                .as_deref(),
+            Some("off")
+        );
+    }
+
+    #[test]
+    fn validate_begin_transaction_modes_ignores_modes_inside_active_transaction() {
+        let mut session = test_session(false);
+        validate_transaction_modes(
+            &mut session,
+            &[TransactionMode::AccessMode(TransactionAccessMode::ReadOnly)],
+            false,
+        )
+        .unwrap();
+        session.force_test_transaction_state(true, false);
+
+        validate_begin_transaction_modes(
+            &mut session,
+            &[TransactionMode::AccessMode(
+                TransactionAccessMode::ReadWrite,
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            session
+                .show_setting_value("transaction_read_only")
                 .as_deref(),
             Some("on")
         );
@@ -297,14 +372,14 @@ mod tests {
             &[TransactionMode::IsolationLevel(
                 TransactionIsolationLevel::Serializable,
             )],
+            false,
         )
         .unwrap();
-        // SHOW returns user-set value (PG parity).
         assert_eq!(
             session
                 .show_setting_value("transaction_isolation")
                 .as_deref(),
-            Some("serializable")
+            Some("repeatable read")
         );
     }
 
@@ -346,6 +421,38 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("statement timeout"));
+    }
+
+    #[test]
+    fn effective_retry_timeout_uses_the_tighter_statement_or_retry_limit() {
+        let retry = Duration::from_millis(200);
+        let statement = Duration::from_millis(50);
+
+        assert_eq!(
+            effective_retry_timeout(Some(retry), Some(statement)),
+            Some(statement)
+        );
+        assert_eq!(
+            effective_retry_timeout(Some(statement), Some(retry)),
+            Some(statement)
+        );
+        assert_eq!(
+            effective_retry_timeout(None, Some(statement)),
+            Some(statement)
+        );
+        assert_eq!(effective_retry_timeout(Some(retry), None), Some(retry));
+        assert_eq!(effective_retry_timeout(None, None), None);
+    }
+
+    #[test]
+    fn remaining_statement_timeout_saturates_at_zero() {
+        let started = Instant::now() - Duration::from_millis(10);
+
+        assert_eq!(
+            remaining_statement_timeout(started, Some(Duration::from_millis(5))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(remaining_statement_timeout(started, None), None);
     }
 
     #[tokio::test]

@@ -417,6 +417,34 @@ mod write_conflict_retry_tests {
     }
 
     #[test]
+    fn test_retryable_storage_error_survives_sql_error_context_chain() {
+        let storage_err = StorageError::WriteConflict {
+            reason: WriteConflictReason::Pessimistic,
+        };
+        let sql_err = SqlError::Internal(anyhow::Error::new(storage_err));
+        let anyhow_err = Err::<(), SqlError>(sql_err)
+            .context("failed to write HNSW delta")
+            .unwrap_err();
+
+        assert!(is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), Some(2));
+    }
+
+    #[test]
+    fn test_retryable_storage_error_survives_anyhow_macro_wrapper() {
+        let storage_err = StorageError::WriteConflict {
+            reason: WriteConflictReason::Pessimistic,
+        };
+        let sql_err = SqlError::Internal(anyhow::anyhow!(storage_err));
+        let anyhow_err = Err::<(), SqlError>(sql_err)
+            .context("failed to write HNSW delta")
+            .unwrap_err();
+
+        assert!(is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), Some(2));
+    }
+
+    #[test]
     fn test_storage_deadlock_retryable() {
         let anyhow_err = anyhow::Error::new(StorageError::Deadlock);
         assert!(is_retryable_tikv_error(&anyhow_err));
@@ -424,9 +452,30 @@ mod write_conflict_retry_tests {
     }
 
     #[test]
-    fn test_storage_lock_conflict_not_retryable() {
+    fn test_tikv_locked_key_retryable() {
+        let tikv_err =
+            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                locked: Some(tikv_client::proto::kvrpcpb::LockInfo::default()),
+                ..Default::default()
+            }));
+        let anyhow_err = anyhow::Error::new(tikv_err);
+
+        assert!(is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
+    }
+
+    #[test]
+    fn test_tikv_resolve_lock_error_retryable() {
+        let anyhow_err = anyhow::Error::new(tikv_client::Error::ResolveLockError(Vec::new()));
+
+        assert!(is_retryable_tikv_error(&anyhow_err));
+        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
+    }
+
+    #[test]
+    fn test_storage_lock_conflict_retryable() {
         let anyhow_err = anyhow::Error::new(StorageError::LockConflict);
-        assert!(!is_retryable_tikv_error(&anyhow_err));
+        assert!(is_retryable_tikv_error(&anyhow_err));
         assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
     }
 

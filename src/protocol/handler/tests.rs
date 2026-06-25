@@ -19,6 +19,7 @@ use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
 use pgwire::api::DefaultClient;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState, Type};
+use pgwire::error::ErrorInfo;
 use pgwire::messages::response::CommandComplete;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -30,7 +31,8 @@ use super::errors::{executor_error_info, pg_error_message, sqlstate_for_executor
 use super::params::{count_sql_parameters, decode_parameters};
 use super::portal::{
     max_suspended_portal_buffer_rows, max_suspended_portals, on_execute_with_tx_status_fix,
-    update_tx_status_after_execution, SuspendedPortalState,
+    send_limited_query_response, send_query_response_with_lifecycle,
+    update_tx_status_after_execution, QueryOutputLifecycleCheck, SuspendedPortalState,
 };
 use super::prepared::{PreparedExec, PreparedStatement};
 use super::tenant::parse_tenant_username;
@@ -1004,6 +1006,39 @@ impl StubExtendedQueryHandler {
     }
 }
 
+struct FailsOnLifecycleCheck {
+    fail_on_call: u64,
+    calls: AtomicU64,
+}
+
+impl FailsOnLifecycleCheck {
+    fn new(fail_on_call: u64) -> Self {
+        Self {
+            fail_on_call,
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl QueryOutputLifecycleCheck for FailsOnLifecycleCheck {
+    async fn ensure_active(&self) -> PgWireResult<()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call >= self.fail_on_call {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "3D000".to_owned(),
+                "database \"dropped\" does not exist".to_owned(),
+            ))));
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ExtendedQueryHandler for StubExtendedQueryHandler {
     type Statement = String;
@@ -1308,6 +1343,88 @@ async fn execute_max_rows_zero_returns_all_rows() {
             .collect::<Vec<_>>(),
         vec!["0", "1", "2", "3", "4"]
     );
+}
+
+#[tokio::test]
+async fn query_response_lifecycle_guard_stops_rows_mid_send() {
+    let Response::Query(results) = StubExtendedQueryHandler::select_range_response(5) else {
+        panic!("expected query response");
+    };
+    let mut client = TestClient::new();
+    let guard = FailsOnLifecycleCheck::new(3);
+
+    let err = send_query_response_with_lifecycle(&mut client, results, true, Some(&guard))
+        .await
+        .expect_err("lifecycle guard should fence the row stream");
+
+    match err {
+        PgWireError::UserError(info) => assert_eq!(info.code, "3D000"),
+        other => panic!("expected user error, got {other:?}"),
+    }
+    assert_eq!(guard.calls(), 3);
+    assert_eq!(
+        client
+            .sent
+            .iter()
+            .filter_map(|m| match m {
+                PgWireBackendMessage::DataRow(r) => Some(decode_single_text_field(r)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["0", "1"]
+    );
+    assert!(!client
+        .sent
+        .iter()
+        .any(|m| matches!(m, PgWireBackendMessage::CommandComplete(_))));
+}
+
+#[tokio::test]
+async fn limited_query_response_lifecycle_guard_does_not_suspend_after_fence() {
+    let Response::Query(results) = StubExtendedQueryHandler::select_range_response(5) else {
+        panic!("expected query response");
+    };
+    let mut client = TestClient::new();
+    let suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+    let guard = FailsOnLifecycleCheck::new(2);
+
+    let err = send_limited_query_response(
+        &mut client,
+        &suspended,
+        "portal",
+        results,
+        3,
+        true,
+        Some(&guard),
+    )
+    .await
+    .expect_err("lifecycle guard should fence the limited row stream");
+
+    match err {
+        PgWireError::UserError(info) => assert_eq!(info.code, "3D000"),
+        other => panic!("expected user error, got {other:?}"),
+    }
+    assert_eq!(guard.calls(), 2);
+    assert!(suspended.lock().await.is_empty());
+    assert_eq!(
+        client
+            .sent
+            .iter()
+            .filter_map(|m| match m {
+                PgWireBackendMessage::DataRow(r) => Some(decode_single_text_field(r)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["0"]
+    );
+    assert!(!client
+        .sent
+        .iter()
+        .any(|m| matches!(m, PgWireBackendMessage::PortalSuspended(_))));
+    assert!(!client
+        .sent
+        .iter()
+        .any(|m| matches!(m, PgWireBackendMessage::CommandComplete(_))));
 }
 
 #[tokio::test]

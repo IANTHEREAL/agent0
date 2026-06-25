@@ -5,7 +5,10 @@ use super::super::prepared_analysis::PreparedAnalysis;
 use super::super::prepared_stmt::PreparedExec;
 use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
-use super::utils::{apply_pending_set_config_mutations, apply_statement_timeout};
+use super::utils::{
+    apply_pending_set_config_mutations, apply_statement_timeout, effective_retry_timeout,
+    remaining_statement_timeout,
+};
 use crate::sql::expr::bridge::eval_execute_param;
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 use crate::sql::scanner::count_sql_parameters;
@@ -68,6 +71,37 @@ fn is_plan_cache_eligible(exec: &PreparedExec, rls_sensitive: bool) -> bool {
             ..
         } => !crate::sql::executor::select::analyzed::query_needs_pre_materialization(analyzed),
         _ => false,
+    }
+}
+
+fn prepared_exec_requires_database_write_fence(exec: &PreparedExec) -> bool {
+    match exec {
+        PreparedExec::AnalyzedDml { .. } => true,
+        PreparedExec::AnalyzedQuery { select_into, .. } => select_into.is_some(),
+        PreparedExec::RawSqlUtility => false,
+    }
+}
+
+fn prepared_read_only_forbidden_statement_tag(exec: &PreparedExec) -> Option<&'static str> {
+    match exec {
+        PreparedExec::AnalyzedDml { analyzed, .. } => match analyzed {
+            crate::sql::analyzer::types::AnalyzedStatement::Insert(_) => Some("INSERT"),
+            crate::sql::analyzer::types::AnalyzedStatement::Update(_) => Some("UPDATE"),
+            crate::sql::analyzer::types::AnalyzedStatement::Delete(_) => Some("DELETE"),
+            crate::sql::analyzer::types::AnalyzedStatement::Query(_) => Some("DML"),
+        },
+        PreparedExec::AnalyzedQuery {
+            locks, select_into, ..
+        } => {
+            if select_into.is_some() {
+                Some("SELECT INTO")
+            } else if !locks.is_empty() {
+                Some("SELECT FOR UPDATE/SHARE")
+            } else {
+                None
+            }
+        }
+        PreparedExec::RawSqlUtility => None,
     }
 }
 
@@ -381,6 +415,15 @@ impl Executor {
         qctx: &crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Result<ExecuteResults> {
+        if session.transaction_read_only() {
+            if let Some(statement) = prepared_read_only_forbidden_statement_tag(exec) {
+                return Err(SqlError::ReadOnlySqlTransaction {
+                    statement: statement.to_string(),
+                }
+                .into());
+            }
+        }
+
         let is_autocommit = !session.is_in_transaction();
         let db_id = session.current_database_id();
         let max_attempts = if is_autocommit {
@@ -390,7 +433,8 @@ impl Executor {
         };
 
         let retry_start = std::time::Instant::now();
-        let retry_timeout = {
+        let statement_timeout = session.statement_timeout();
+        let configured_retry_timeout = {
             let ms = session.settings().retry_timeout_ms;
             if ms > 0 {
                 Some(std::time::Duration::from_millis(ms))
@@ -398,6 +442,7 @@ impl Executor {
                 None
             }
         };
+        let retry_timeout = effective_retry_timeout(configured_retry_timeout, statement_timeout);
 
         for attempt in 0..max_attempts {
             // Restart per-attempt peak/component tracking: the operator tree is
@@ -426,6 +471,67 @@ impl Executor {
             if is_autocommit {
                 session.begin().await?;
             }
+            if prepared_exec_requires_database_write_fence(exec) {
+                if let Err(err) = apply_statement_timeout(
+                    remaining_statement_timeout(retry_start, statement_timeout),
+                    session.ensure_current_database_write_fence(),
+                )
+                .await
+                {
+                    let retryable = is_retryable_tikv_error(&err);
+                    if is_autocommit {
+                        session
+                            .rollback_for_retry_or_abandon("prepared_lifecycle_fence_error")
+                            .await;
+                        self.clear_trigger_activations();
+                    }
+
+                    let should_retry = is_autocommit && attempt + 1 < max_attempts && retryable;
+                    if should_retry {
+                        if let Some(timeout) = retry_timeout {
+                            if retry_start.elapsed() >= timeout {
+                                tracing::warn!(
+                                    attempt = attempt + 1,
+                                    max_attempts,
+                                    elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                    timeout_ms = timeout.as_millis() as u64,
+                                    "prepared: retry timeout exceeded, aborting lifecycle fence retries"
+                                );
+                                self.observability.record_retry_timeout_abort();
+                                return Err(SqlError::RetryTimeout {
+                                    elapsed_ms: retry_start.elapsed().as_millis() as u64,
+                                    limit_ms: timeout.as_millis() as u64,
+                                }
+                                .into());
+                            }
+                        }
+                        tracing::info!(
+                            attempt = attempt + 1,
+                            max_attempts,
+                            elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                            "prepared: write conflict while acquiring lifecycle fence, retrying statement"
+                        );
+                        self.observability
+                            .record_retry_attempt(extract_write_conflict_reason(&err));
+                        autocommit_backoff(attempt).await;
+                        continue;
+                    }
+                    if retryable {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_attempts,
+                            elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                            "prepared: lifecycle fence write conflict retry budget exhausted"
+                        );
+                        self.observability.record_retry_budget_exhausted();
+                    }
+                    if err.is::<StatementTimeoutError>() && !is_autocommit {
+                        session.rollback().await?;
+                        self.clear_trigger_activations();
+                    }
+                    return Err(err);
+                }
+            }
 
             let current_role = session.current_user().map(|u| u.to_string());
             let txn_snapshot_ts_version = session.active_txn_start_ts_version();
@@ -449,6 +555,7 @@ impl Executor {
                         table_versions,
                         rls_sensitive,
                         current_role.as_deref(),
+                        remaining_statement_timeout(retry_start, statement_timeout),
                     ),
                 ),
             )
@@ -483,7 +590,55 @@ impl Executor {
                             {
                                 self.mark_init_cache_invalidation_pending();
                             }
-                            session.commit().await?;
+                            if let Err(err) = session.commit().await {
+                                let retryable = is_retryable_tikv_error(&err);
+                                session
+                                    .rollback_for_retry_or_abandon("prepared_commit_error")
+                                    .await;
+                                self.clear_trigger_activations();
+                                let should_retry = attempt + 1 < max_attempts && retryable;
+                                if should_retry {
+                                    if let Some(timeout) = retry_timeout {
+                                        if retry_start.elapsed() >= timeout {
+                                            tracing::warn!(
+                                                attempt = attempt + 1,
+                                                max_attempts,
+                                                elapsed_ms =
+                                                    retry_start.elapsed().as_millis() as u64,
+                                                timeout_ms = timeout.as_millis() as u64,
+                                                "prepared: retry timeout exceeded, aborting commit retries"
+                                            );
+                                            self.observability.record_retry_timeout_abort();
+                                            return Err(SqlError::RetryTimeout {
+                                                elapsed_ms: retry_start.elapsed().as_millis()
+                                                    as u64,
+                                                limit_ms: timeout.as_millis() as u64,
+                                            }
+                                            .into());
+                                        }
+                                    }
+                                    tracing::info!(
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                        "prepared: write conflict at commit, retrying statement"
+                                    );
+                                    self.observability
+                                        .record_retry_attempt(extract_write_conflict_reason(&err));
+                                    autocommit_backoff(attempt).await;
+                                    continue;
+                                }
+                                if retryable {
+                                    tracing::warn!(
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                        "prepared: write conflict commit retry budget exhausted"
+                                    );
+                                    self.observability.record_retry_budget_exhausted();
+                                }
+                                return Err(err);
+                            }
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
                             self.flush_pending_init_cache_invalidation();
@@ -509,10 +664,12 @@ impl Executor {
                             .await;
                     }
                     Err(err) => {
-                        session.rollback().await?;
+                        let retryable = is_retryable_tikv_error(&err);
+                        session
+                            .rollback_for_retry_or_abandon("prepared_statement_error")
+                            .await;
                         self.clear_trigger_activations();
-                        let should_retry =
-                            attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
+                        let should_retry = attempt + 1 < max_attempts && retryable;
                         if should_retry {
                             if let Some(timeout) = retry_timeout {
                                 if retry_start.elapsed() >= timeout {
@@ -542,7 +699,7 @@ impl Executor {
                             autocommit_backoff(attempt).await;
                             continue;
                         }
-                        if is_retryable_tikv_error(&err) {
+                        if retryable {
                             tracing::warn!(
                                 attempt = attempt + 1,
                                 max_attempts,
@@ -596,6 +753,7 @@ impl Executor {
         table_versions: &[(String, u64, u64)],
         rls_sensitive: bool,
         current_role: Option<&str>,
+        timeout: Option<std::time::Duration>,
     ) -> Result<PreparedTxnResult> {
         use crate::sql::executor::core::plan_cache::PlanCacheKey;
 
@@ -645,7 +803,6 @@ impl Executor {
                     .collect()
             });
 
-        let timeout = session.statement_timeout();
         let table_versions_for_cache: Vec<(String, u64, u64)> = table_versions.to_vec();
         let fut = async {
             let (txn, sequence_values, search_path) = session
@@ -1266,6 +1423,7 @@ mod tests {
         TypedExprKind,
     };
     use crate::sql::analyzer::AnalyzedQuery;
+    use sqlparser::ast::{Ident, LockClause, LockType, ObjectName, SelectInto};
 
     fn const_int(v: i32) -> TypedExpr {
         TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)
@@ -1315,6 +1473,84 @@ mod tests {
             required_privileges: vec![],
             has_recursive_cte,
         }
+    }
+
+    #[test]
+    fn prepared_lifecycle_write_fence_classifier_excludes_locking_reads() {
+        let mut locking_read = analyzed_query_exec(values_query(), false);
+        let PreparedExec::AnalyzedQuery { locks, .. } = &mut locking_read else {
+            unreachable!("helper builds a query exec")
+        };
+        locks.push(LockClause {
+            lock_type: LockType::Update,
+            of: None,
+            nonblock: None,
+        });
+        assert!(
+            !prepared_exec_requires_database_write_fence(&locking_read),
+            "prepared SELECT FOR UPDATE must rely on row locks, not the database lifecycle fence"
+        );
+
+        let mut select_into = analyzed_query_exec(values_query(), false);
+        let PreparedExec::AnalyzedQuery {
+            select_into: target,
+            ..
+        } = &mut select_into
+        else {
+            unreachable!("helper builds a query exec")
+        };
+        *target = Some(SelectInto {
+            temporary: false,
+            unlogged: false,
+            table: false,
+            name: ObjectName(vec![Ident::new("prepared_select_into_target")]),
+        });
+        assert!(
+            prepared_exec_requires_database_write_fence(&select_into),
+            "prepared SELECT INTO creates a table and must acquire the database lifecycle fence"
+        );
+    }
+
+    #[test]
+    fn prepared_read_only_classifier_keeps_locking_reads_forbidden() {
+        let plain_query = analyzed_query_exec(values_query(), false);
+        assert_eq!(
+            prepared_read_only_forbidden_statement_tag(&plain_query),
+            None
+        );
+
+        let mut locking_read = analyzed_query_exec(values_query(), false);
+        let PreparedExec::AnalyzedQuery { locks, .. } = &mut locking_read else {
+            unreachable!("helper builds a query exec")
+        };
+        locks.push(LockClause {
+            lock_type: LockType::Share,
+            of: None,
+            nonblock: None,
+        });
+        assert_eq!(
+            prepared_read_only_forbidden_statement_tag(&locking_read),
+            Some("SELECT FOR UPDATE/SHARE")
+        );
+
+        let mut select_into = analyzed_query_exec(values_query(), false);
+        let PreparedExec::AnalyzedQuery {
+            select_into: target,
+            ..
+        } = &mut select_into
+        else {
+            unreachable!("helper builds a query exec")
+        };
+        *target = Some(SelectInto {
+            temporary: false,
+            unlogged: false,
+            table: false,
+            name: ObjectName(vec![Ident::new("prepared_read_only_target")]),
+        });
+        assert_eq!(
+            prepared_read_only_forbidden_statement_tag(&select_into),
+            Some("SELECT INTO")
+        );
     }
 
     #[test]
@@ -1973,5 +2209,84 @@ mod prepared_policy_tests {
             .enforce_observability_prepared_policy(&mut session, " ; ", &analyzed_query_exec())
             .unwrap_err();
         assert!(session.is_transaction_failed());
+    }
+
+    #[test]
+    fn prepared_lifecycle_write_fence_is_taken_before_attempt_execution() {
+        let source = include_str!("prepared.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("prepared.rs must contain #[cfg(test)]");
+        let exec_fn = prod_source
+            .split("async fn execute_prepared_autocommit(")
+            .nth(1)
+            .expect("execute_prepared_autocommit must exist");
+
+        let begin_pos = exec_fn
+            .find("session.begin().await?")
+            .expect("prepared write execution must begin a transaction");
+        let fence_pos = exec_fn
+            .find("session.ensure_current_database_write_fence()")
+            .expect("prepared write execution must take the lifecycle fence");
+        let fence_timeout_pos = exec_fn[..fence_pos]
+            .rfind("apply_statement_timeout(")
+            .expect("prepared lifecycle fence acquisition must be statement-timeout bounded");
+        let fence_remaining_pos = fence_timeout_pos
+            + exec_fn[fence_timeout_pos..fence_pos]
+                .find("remaining_statement_timeout(retry_start, statement_timeout)")
+                .expect("prepared lifecycle fence must use the remaining statement timeout");
+        let fence_retry_pos = exec_fn
+            .find("prepared_lifecycle_fence_error")
+            .expect("prepared lifecycle fence conflicts must participate in retry cleanup");
+        let attempt_pos = exec_fn
+            .find("self.execute_prepared_attempt(")
+            .expect("prepared write execution must enter the attempt executor");
+        let attempt_timeout_pos = attempt_pos
+            + exec_fn[attempt_pos..]
+                .find("remaining_statement_timeout(retry_start, statement_timeout)")
+                .expect("prepared execution attempts must use the remaining statement timeout");
+
+        assert!(
+            begin_pos < fence_timeout_pos
+                && fence_timeout_pos < fence_pos
+                && fence_remaining_pos < fence_pos
+                && fence_pos < fence_retry_pos
+                && attempt_pos < attempt_timeout_pos
+                && fence_retry_pos < attempt_pos,
+            "prepared DML must acquire the database lifecycle write fence before user-row locks or mutations"
+        );
+    }
+
+    #[test]
+    fn prepared_autocommit_retry_classifies_original_error_before_rollback_cleanup() {
+        let source = include_str!("prepared.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("prepared.rs must contain #[cfg(test)]");
+        let exec_fn = prod_source
+            .split("async fn execute_prepared_autocommit(")
+            .nth(1)
+            .expect("execute_prepared_autocommit must exist");
+
+        for context in ["prepared_commit_error", "prepared_statement_error"] {
+            let context_pos = exec_fn
+                .find(context)
+                .unwrap_or_else(|| panic!("{context} cleanup must be present"));
+            let prefix = &exec_fn[..context_pos];
+            let retryable_pos = prefix
+                .rfind("let retryable = is_retryable_tikv_error(&err);")
+                .unwrap_or_else(|| panic!("{context} must classify the original error"));
+            assert!(
+                retryable_pos < context_pos,
+                "{context} must classify retryability before rollback cleanup can fail"
+            );
+        }
+
+        assert!(
+            exec_fn.contains("rollback_for_retry_or_abandon"),
+            "prepared autocommit retry cleanup must abandon a failed rollback instead of leaking 25P02"
+        );
     }
 }

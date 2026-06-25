@@ -741,21 +741,60 @@ For blind writes:
 - Avoid blind put/delete for user-visible SQL mutations.
 - If a blind write is unavoidable internally, attach an existence/version precondition.
 
+### Execution Closure Rules (KISS)
+
+The implementation should stay simple by making correctness a property of a few
+shared entry points, not by relying on every caller to remember every rule.
+
+1. User-data writes have only two approved paths:
+   - `lock_current_row_or_40001(txn, row_key)` for `UPDATE`, `DELETE`, and the
+     update arm of `UPSERT`.
+   - `insert_if_absent_current(txn, key)` for primary keys, unique indexes,
+     `INSERT`, `COPY`, batch insert, and unique-index cleanup.
+
+   Callers must not make stale-write decisions from `start_ts` snapshot helpers
+   such as `scan_index` or `batch_get_rows` after they have observed a unique
+   conflict.
+
+2. Database lifecycle has one admission shape:
+   `admit_db_operation(db_id, kind)`, where `kind` is only `Read`, `Write`, or
+   `Stream`.
+   - `Read` checks the database is still active and binds the current epoch.
+   - `Write` checks the database is still active and reaches the commit-permit
+     path before TiKV prewrite/commit.
+   - `Stream` binds the epoch at open and re-checks before each emitted or
+     accepted chunk.
+
+3. Every wait has one deadline source. Any retry loop, lock wait, lifecycle
+   fence wait, background-completion wait, drain wait, lease wait, or
+   post-commit wait must receive the remaining statement/retry deadline. A naked
+   `sleep` loop is only valid for background maintenance that is not holding a
+   user request.
+
+4. SQL dispatch has one classification before execution: `NoDb`, `Read`,
+   `Write`, `TxnControl`, or `AdminWrite`. AST SQL, prepared SQL, raw SQL,
+   passthrough utilities, `COPY`, FS-backed SQL operations, and WebSocket/API
+   entry points are not exceptions. `READ ONLY` rejects `Write` and
+   `AdminWrite`; PostgreSQL no-transaction-block rules such as `ALTER SYSTEM`
+   are checked before passthrough execution.
+
+These rules are intentionally small. When a new surface is added, the reviewer
+should only need to ask four questions: how is it classified, which lifecycle
+admission does it use, which write primitive does it use, and which deadline
+bounds its waits?
+
 ### Mutation Guard Choke Point
 
 The runtime implementation should centralize stale-write and lifecycle
 enforcement at the mutation choke point instead of relying on a permanent manual
-audit of every caller.
+audit of every caller. Keep the mechanism small:
 
-`txn_put`, `txn_delete`, `txn_batch_mutate`, `txn_batch_mutate_mixed`, direct
-`txn.put`, direct `txn.delete`, and external-object publish/cleanup helpers
-should require a typed mutation proof. A proof can be produced only by:
-
-- a locked current-read row path;
-- the shared primary-key/unique-key lock/check primitive;
-- a lifecycle-checked internal metadata path; or
-- an explicit blind-write escape hatch that is private, reviewed, and not
-  available to ordinary user-visible SQL mutations.
+- user table rows and indexes must go through the two approved user-data write
+  paths above;
+- internal metadata writes may use the existing transaction wrappers when they
+  are already behind lifecycle/admission checks; and
+- direct `txn.put`, `txn.delete`, `txn.insert`, or external-object publish
+  helpers are private escape hatches, not ordinary user-data mutation APIs.
 
 The one-time migration audit should include:
 

@@ -339,6 +339,16 @@ tests/hnsw_s3_offload_meta_compat_1971.py
 tests/safety_kv_value_size_guard.py
 # #2033/#2044 – COPY self-FK deferred validation + ALTER TABLE deps (RLS, matview)
 tests/safety_copy_selfref_fk.py
+# #2754/#2763 – dropped/deleting database lifecycle must reject old/new use
+tests/safety_drop_database_lifecycle.py
+# #2755 – stale snapshot writes must fail with 40001 instead of losing updates
+tests/safety_si_stale_update.py
+tests/safety_si_stale_delete.py
+tests/safety_si_stale_upsert.py
+# #2755 – INSERT/COPY/PK-shift paths must use insert-if-absent, not overwrite
+tests/safety_insert_if_absent.py
+# #2755/#2763 – transaction modes and read-only enforcement must be truthful
+tests/safety_transaction_modes.py
 #
 # --- E2E dev-only tests (NOT in regression gate) ---
 # Timing-sensitive (sleep/GC tick), large data, or special infra.

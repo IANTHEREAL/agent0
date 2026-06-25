@@ -48,10 +48,6 @@ pub(crate) async fn region_error_backoff(attempt: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
-pub(super) fn should_start_cic_backfill(state: IndexState) -> bool {
-    matches!(state, IndexState::Building)
-}
-
 pub(super) fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
     let args = command
         .strip_prefix("__backfill_index ")

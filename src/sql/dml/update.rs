@@ -1,5 +1,6 @@
 //! UPDATE row execution: index maintenance, PK change detection, and row upsert.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -317,7 +318,7 @@ pub fn collect_update_new_gin_mutations(
     Ok(mutations)
 }
 
-/// Encode a data row mutation (Put) for batch flush.
+/// Encode a data row value for batch flush.
 ///
 /// Returns `(data_key, serialized_row)`.
 pub fn encode_data_row_mutation(
@@ -392,6 +393,7 @@ async fn update_row_indexes(
         }
 
         let old_matches = index_helpers::eval_index_predicate(index, schema, old_row)?;
+        let mut deleted_unique_idx: Option<Vec<Value>> = None;
         if old_matches {
             let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
             store
@@ -405,22 +407,42 @@ async fn update_row_indexes(
                     index.unique,
                 )
                 .await?;
+            if index.unique && !TikvStore::index_key_has_null(&old_idx) {
+                deleted_unique_idx = Some(old_idx);
+            }
         }
 
         let new_matches = index_helpers::eval_index_predicate(index, schema, new_row)?;
         if new_matches {
             let new_idx = index_helpers::get_index_values_with_expressions(index, schema, new_row)?;
-            let create_result = store
-                .create_index_entry(
-                    txn,
-                    db_id,
-                    schema.table_id,
-                    index.id,
-                    &new_idx,
-                    pk_values,
-                    index.unique,
-                )
-                .await;
+            let recreate_deleted_key = deleted_unique_idx
+                .as_ref()
+                .is_some_and(|old_idx| old_idx == &new_idx);
+            let create_result = if recreate_deleted_key {
+                store
+                    .recreate_deleted_index_entry(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &new_idx,
+                        pk_values,
+                        index.unique,
+                    )
+                    .await
+            } else {
+                store
+                    .create_index_entry(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &new_idx,
+                        pk_values,
+                        index.unique,
+                    )
+                    .await
+            };
             if let Err(e) = create_result {
                 if index.unique
                     && matches!(
@@ -869,6 +891,8 @@ async fn execute_update_row_inner(
         }
     }
 
+    let mut deleted_unique_index_keys: HashSet<Vec<u8>> = HashSet::new();
+
     for index in &schema.indexes {
         if matches!(index.state, IndexState::Invalid)
             || (matches!(index.state, IndexState::Building) && !index.unique)
@@ -906,6 +930,16 @@ async fn execute_update_row_inner(
         let old_matches = index_helpers::eval_index_predicate(index, schema, old_row)?;
         if old_matches {
             let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
+            if index.unique && !TikvStore::index_key_has_null(&old_idx) {
+                deleted_unique_index_keys.insert(store.encode_index_deletion_key(
+                    db_id,
+                    schema.table_id,
+                    index.id,
+                    &old_idx,
+                    &old_pks,
+                    index.unique,
+                ));
+            }
             store
                 .delete_index_entry(
                     txn,
@@ -924,9 +958,15 @@ async fn execute_update_row_inner(
         store.delete_by_pk(txn, db_id, table_name, &old_pks).await?;
     }
 
-    store
-        .upsert(txn, db_id, table_name, new_row.clone())
-        .await?;
+    if pk_changed && !schema.pk_indices.is_empty() {
+        store
+            .insert(txn, db_id, table_name, new_row.clone())
+            .await?;
+    } else {
+        store
+            .upsert(txn, db_id, table_name, new_row.clone())
+            .await?;
+    }
 
     for index in &schema.indexes {
         if matches!(index.state, IndexState::Invalid)
@@ -965,17 +1005,46 @@ async fn execute_update_row_inner(
         if new_matches {
             let new_idx =
                 index_helpers::get_index_values_with_expressions(index, schema, &new_row)?;
-            let create_result = store
-                .create_index_entry(
-                    txn,
+            let new_idx_key = if index.unique && !TikvStore::index_key_has_null(&new_idx) {
+                Some(store.encode_index_deletion_key(
                     db_id,
                     schema.table_id,
                     index.id,
                     &new_idx,
                     &new_pks,
                     index.unique,
-                )
-                .await;
+                ))
+            } else {
+                None
+            };
+            let recreate_deleted_key = new_idx_key
+                .as_ref()
+                .is_some_and(|key| deleted_unique_index_keys.contains(key));
+            let create_result = if recreate_deleted_key {
+                store
+                    .recreate_deleted_index_entry(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &new_idx,
+                        &new_pks,
+                        index.unique,
+                    )
+                    .await
+            } else {
+                store
+                    .create_index_entry(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &new_idx,
+                        &new_pks,
+                        index.unique,
+                    )
+                    .await
+            };
             if let Err(e) = create_result {
                 if is_unique_duplicate_error(&e) {
                     if index.unique

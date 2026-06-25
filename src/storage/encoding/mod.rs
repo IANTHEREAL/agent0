@@ -97,6 +97,10 @@ pub(super) const SYS_NEXT_DATABASE_ID: &[u8] = b"_sys_next_database_id";
 pub(super) const SYS_FORMAT_VERSION: &[u8] = b"_sys_format_version";
 pub(super) const SYS_DATABASE_BY_NAME_PREFIX: &[u8] = b"_sys_dbname_";
 pub(super) const SYS_DATABASE_BY_ID_PREFIX: &[u8] = b"_sys_dbid_";
+pub(super) const SYS_DATABASE_LIFECYCLE_PREFIX: &[u8] = b"_sys_dblifecycle_";
+pub(super) const SYS_DATABASE_NODE_LEASE_PREFIX: &[u8] = b"_sys_dbnodelease_";
+pub(super) const SYS_DATABASE_DRAIN_PREFIX: &[u8] = b"_sys_dbdrain_";
+pub(super) const SYS_DATABASE_DROP_CLAIM_PREFIX: &[u8] = b"_sys_dbdropclaim_";
 pub(super) const SYS_MIGRATION_PREFIX: &[u8] = b"_sys_migration_";
 
 // === Storage format v2 (database-scoped prefixes) ===
@@ -152,6 +156,69 @@ pub fn encode_database_id_key(db_id: u64) -> Vec<u8> {
 
 pub fn encode_database_id_prefix() -> Vec<u8> {
     SYS_DATABASE_BY_ID_PREFIX.to_vec()
+}
+
+/// Encode database lifecycle metadata key (keyspace-level, storage format v2).
+pub fn encode_database_lifecycle_key(db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_DATABASE_LIFECYCLE_PREFIX.len() + 8);
+    key.extend_from_slice(SYS_DATABASE_LIFECYCLE_PREFIX);
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+/// Encode a per-process database lifecycle node lease key.
+pub fn encode_database_node_lease_key(node_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_DATABASE_NODE_LEASE_PREFIX.len() + node_id.len());
+    key.extend_from_slice(SYS_DATABASE_NODE_LEASE_PREFIX);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+pub fn encode_database_node_lease_prefix() -> Vec<u8> {
+    SYS_DATABASE_NODE_LEASE_PREFIX.to_vec()
+}
+
+/// Encode per-node drain state for a database lifecycle epoch.
+pub fn encode_database_drain_state_key(
+    keyspace: &str,
+    db_id: u64,
+    epoch: u64,
+    node_id: &str,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        SYS_DATABASE_DRAIN_PREFIX.len() + 2 + keyspace.len() + 1 + 16 + node_id.len(),
+    );
+    key.extend_from_slice(SYS_DATABASE_DRAIN_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+pub fn encode_database_drain_state_prefix(keyspace: &str, db_id: u64, epoch: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_DATABASE_DRAIN_PREFIX.len() + 2 + keyspace.len() + 1 + 16);
+    key.extend_from_slice(SYS_DATABASE_DRAIN_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+pub fn encode_database_drop_claim_key(keyspace: &str, db_id: u64, epoch: u64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(SYS_DATABASE_DROP_CLAIM_PREFIX.len() + 2 + keyspace.len() + 1 + 16);
+    key.extend_from_slice(SYS_DATABASE_DROP_CLAIM_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
 }
 
 /// Encode the prefix for all keys belonging to a database (storage format v2).

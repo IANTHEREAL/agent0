@@ -59,6 +59,9 @@ impl SessionSettings {
 
     fn show_value_impl(&self, name: &str, skip_local: bool) -> Option<String> {
         let canonical = Self::canonical_setting_name(name);
+        if canonical == "transaction_isolation" {
+            return Some("repeatable read".to_string());
+        }
         if !skip_local && !Self::is_immutable_setting(canonical) {
             if let Some(v) = self.local_overrides.get(canonical) {
                 return Some(v.clone());
@@ -204,17 +207,19 @@ impl SessionSettings {
             ),
             "transaction_deferrable" | "default_transaction_deferrable" => Some("off".to_string()),
             // `transaction.isolation.level` alias is canonicalized above.
-            "transaction_isolation" => Some(
-                self.transaction_isolation
-                    .as_deref()
-                    .unwrap_or("repeatable read")
-                    .to_string(),
-            ),
+            "transaction_isolation" => Some("repeatable read".to_string()),
             "default_transaction_isolation" => Some(
                 self.extra_settings
                     .get("default_transaction_isolation")
                     .cloned()
                     .unwrap_or_else(|| "read committed".to_string()),
+            ),
+            "transaction_read_only" => Some(
+                self.transaction_read_only
+                    .as_deref()
+                    .or(self.default_transaction_read_only.as_deref())
+                    .unwrap_or("off")
+                    .to_string(),
             ),
             "default_transaction_read_only" => Some(
                 self.default_transaction_read_only
@@ -459,6 +464,12 @@ impl SessionSettings {
             }
         }
         self.password_grace_seconds
+    }
+
+    pub(crate) fn transaction_read_only(&self) -> bool {
+        self.show_value("transaction_read_only")
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("on"))
     }
 
     /// Collect all current settings into a flat map.

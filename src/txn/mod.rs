@@ -250,53 +250,33 @@ pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>)
     tikv_op!(txn.put(key, value).await).map_err(|e| anyhow!(e))
 }
 
-/// TiKV `batch_mutate` wrapper that records undo information when SAVEPOINT is
-/// active and acquires pessimistic locks for **all** keys in a single RPC
-/// (vs one lock RPC per key with individual `txn_put` calls).
+/// TiKV `insert` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
-pub(crate) async fn txn_batch_mutate(
-    txn: &mut Transaction,
-    mutations: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Result<()> {
-    if mutations.is_empty() {
-        return Ok(());
-    }
-
-    for (key, _) in &mutations {
-        record_statement_dirty_table_for_key(key);
-    }
-
-    // Size guards must run before any TiKV I/O (including savepoint undo
-    // recording) so that oversized keys never hit the network.
-    for (k, v) in &mutations {
-        check_key_size(k)?;
-        check_value_size(k, v)?;
-    }
-
+pub(crate) async fn txn_insert(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+    record_statement_dirty_table_for_key(&key);
+    check_key_size(&key)?;
+    check_value_size(&key, &value)?;
     let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
+    let should_record = match savepoints.as_ref() {
+        Some(sp) => sp.should_record_key(&key).await?,
+        None => false,
+    };
 
-    if let Some(ref sp) = savepoints {
-        for (key, _) in &mutations {
-            if sp.should_record_key(key).await? {
-                let prev = txn.get(key.clone()).await.map_err(|e| anyhow!(e))?;
-                sp.record_prev_value(key.clone(), prev).await?;
-            }
+    if should_record {
+        let prev = tikv_op!(txn.get(key.clone()).await).map_err(|e| anyhow!(e))?;
+        if let Some(sp) = savepoints {
+            sp.record_prev_value(key.clone(), prev).await?;
         }
     }
 
-    let tikv_mutations: Vec<Mutation> = mutations
-        .into_iter()
-        .map(|(k, v)| Mutation::Put(k.into(), v))
-        .collect();
-    txn.batch_mutate(tikv_mutations)
-        .await
-        .map_err(|e| anyhow!(e))
+    tikv_op!(txn.insert(key, value).await).map_err(|e| anyhow!(e))
 }
 
-/// A mutation that can be either a Put or a Delete, for use with
+/// A mutation that can be a Put, Insert, or Delete, for use with
 /// [`txn_batch_mutate_mixed`].
 pub(crate) enum BatchMutation {
     Put(Vec<u8>, Vec<u8>),
+    Insert(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
 }
 
@@ -304,16 +284,24 @@ impl BatchMutation {
     pub(crate) fn key(&self) -> &[u8] {
         match self {
             BatchMutation::Put(k, _) => k,
+            BatchMutation::Insert(k, _) => k,
             BatchMutation::Delete(k) => k,
+        }
+    }
+
+    pub(crate) fn same_key_order(&self) -> u8 {
+        match self {
+            BatchMutation::Delete(_) => 0,
+            BatchMutation::Put(_, _) => 1,
+            BatchMutation::Insert(_, _) => 2,
         }
     }
 }
 
-/// Batch mutate wrapper supporting mixed Put and Delete mutations.
+/// Batch mutate wrapper supporting mixed Put, Insert, and Delete mutations.
 ///
-/// Like [`txn_batch_mutate`] but accepts both Put and Delete operations,
-/// enabling batch DELETE and UPDATE to flush all key mutations in a single
-/// pessimistic lock RPC instead of one RPC per key.
+/// Put/Delete operations are flushed in chunks through TiKV `batch_mutate`;
+/// Insert operations use TiKV's insert-if-absent assertion.
 ///
 /// Large batches are automatically chunked to stay within TiKV's
 /// `raft-entry-max-size` limit.
@@ -331,7 +319,7 @@ pub(crate) async fn txn_batch_mutate_mixed(
     // undo recording) so that oversized keys never hit the network.
     for m in &mutations {
         check_key_size(m.key())?;
-        if let BatchMutation::Put(k, v) = m {
+        if let BatchMutation::Put(k, v) | BatchMutation::Insert(k, v) = m {
             check_value_size(k, v)?;
         }
     }
@@ -355,20 +343,30 @@ pub(crate) async fn txn_batch_mutate_mixed(
     const CHUNK_SIZE: usize = 10_000;
 
     let mut chunk: Vec<Mutation> = Vec::with_capacity(CHUNK_SIZE.min(mutations.len()));
+    async fn flush_chunk(txn: &mut Transaction, chunk: &mut Vec<Mutation>) -> Result<()> {
+        if !chunk.is_empty() {
+            let to_flush = std::mem::take(chunk);
+            txn.batch_mutate(to_flush).await.map_err(|e| anyhow!(e))?;
+        }
+        Ok(())
+    }
+
     for m in mutations {
         let tikv_m = match m {
             BatchMutation::Put(k, v) => Mutation::Put(k.into(), v),
+            BatchMutation::Insert(k, v) => {
+                flush_chunk(txn, &mut chunk).await?;
+                tikv_op!(txn.insert(k, v).await).map_err(|e| anyhow!(e))?;
+                continue;
+            }
             BatchMutation::Delete(k) => Mutation::Delete(k.into()),
         };
         chunk.push(tikv_m);
         if chunk.len() >= CHUNK_SIZE {
-            txn.batch_mutate(chunk).await.map_err(|e| anyhow!(e))?;
-            chunk = Vec::with_capacity(CHUNK_SIZE);
+            flush_chunk(txn, &mut chunk).await?;
         }
     }
-    if !chunk.is_empty() {
-        txn.batch_mutate(chunk).await.map_err(|e| anyhow!(e))?;
-    }
+    flush_chunk(txn, &mut chunk).await?;
 
     Ok(())
 }

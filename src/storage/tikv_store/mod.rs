@@ -7,7 +7,7 @@ use crate::model::{
     ViewDef,
 };
 use crate::storage::backpressure::tikv_op;
-use crate::txn::{txn_delete, txn_put};
+use crate::txn::{txn_delete, txn_insert, txn_put, BatchMutation};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,6 +38,7 @@ mod types;
 mod views;
 pub mod worker;
 pub use cron::CronClaimOutcome;
+pub(crate) use database::{DatabaseDrainState, DatabaseNodeLease};
 pub use ddl_journal::{DdlJournalEntry, DdlOperation};
 pub use tables::RowScanCursor;
 pub use worker::WqIndexRow;
@@ -117,6 +118,21 @@ impl TikvStore {
     /// Returns the keyspace this store is scoped to.
     pub fn keyspace(&self) -> Option<&str> {
         self.keyspace.as_deref()
+    }
+
+    /// Rebuild a store handle around an already keyspace-scoped transaction client.
+    ///
+    /// This is for admission/liveness checks in subsystems that only receive the
+    /// shared TiKV client from statement context. It intentionally does not run
+    /// bootstrap or migrations; the owning tenant handle already did that.
+    pub(crate) fn from_transaction_client(
+        client: Arc<TransactionClient>,
+        keyspace: Option<String>,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            keyspace,
+        }
     }
 
     pub async fn new_with_keyspace(

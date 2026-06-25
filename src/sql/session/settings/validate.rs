@@ -148,16 +148,24 @@ pub(super) fn validate_transaction_deferrable(value: &str) -> Result<String> {
     }
 }
 
-pub(super) fn validate_default_transaction_read_only(value: &str) -> Result<String> {
+fn validate_transaction_read_only_value(name: &str, value: &str) -> Result<String> {
     let normalized = value.trim().to_lowercase();
     match normalized.as_str() {
         "on" | "true" | "yes" | "1" => Ok("on".to_string()),
         "off" | "false" | "no" | "0" => Ok("off".to_string()),
         _ => Err(SqlError::InvalidParameterValue {
-            message: "parameter \"default_transaction_read_only\" requires a Boolean value".into(),
+            message: format!("parameter \"{}\" requires a Boolean value", name),
         }
         .into()),
     }
+}
+
+pub(super) fn validate_default_transaction_read_only(value: &str) -> Result<String> {
+    validate_transaction_read_only_value("default_transaction_read_only", value)
+}
+
+pub(super) fn validate_transaction_read_only(value: &str) -> Result<String> {
+    validate_transaction_read_only_value("transaction_read_only", value)
 }
 
 pub(super) fn validate_bytea_output(value: &str) -> Result<String> {

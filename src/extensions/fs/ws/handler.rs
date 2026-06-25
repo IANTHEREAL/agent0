@@ -269,13 +269,10 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
         }
     };
 
-    // Best-effort per-database activity emission (#2638). fs9 sessions carry the
-    // keyspace but no numeric database id; the backend keys on keyspace, so we
-    // pass 0 ("diagnostic unknown"). This is a nonblocking enqueue into the
-    // shared activity sink — never a sync flush — so it stays off the WS hot
-    // path. No-op when no sink is installed.
+    // Best-effort per-database activity emission (#2638). Nonblocking enqueue
+    // into the shared activity sink; never a sync flush on the WS hot path.
     if let Some(kind) = fs_ws_activity_effect(request, &response) {
-        crate::database_activity::record_fs9_activity(&session.keyspace, 0, kind);
+        crate::database_activity::record_fs9_activity(&session.keyspace, session.database_id, kind);
     }
 
     response
@@ -2286,6 +2283,7 @@ mod tests {
             assert_eq!(mine.len(), 1, "successful read must emit one event");
             assert_eq!(mine[0].kind, DatabaseActivityKind::Active);
             assert_eq!(mine[0].source, DatabaseActivitySource::Fs9);
+            assert_eq!(mine[0].database_id, 42);
         }
 
         #[tokio::test]
@@ -2474,6 +2472,8 @@ mod tests {
 
             assert_eq!(auth_data["user"], "test_user");
             assert_eq!(auth_data["keyspace"], "db9_tenant_test");
+            assert_eq!(auth_data["database"], "postgres");
+            assert_eq!(auth_data["database_id"], 42);
             assert!(auth_data.get("tenant").is_some(), "tenant field must exist");
 
             let caps = auth_data["capabilities"]
@@ -2496,6 +2496,8 @@ mod tests {
 
             assert_eq!(auth_data["user"], "test_user");
             assert_eq!(auth_data["keyspace"], "db9_tenant_test");
+            assert_eq!(auth_data["database"], "postgres");
+            assert_eq!(auth_data["database_id"], 42);
 
             let caps = auth_data["capabilities"]
                 .as_array()

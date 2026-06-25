@@ -22,7 +22,8 @@ pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     }
 
     fn contains_retryable_error(err: &tikv_client::Error) -> bool {
-        // Retry on WriteConflict AND Deadlock errors.
+        // Retry on WriteConflict, Deadlock, and transient lock-resolution
+        // failures for single-statement retry loops.
         //
         // WriteConflict: emulates PostgreSQL's row-lock wait behavior where
         // concurrent UPDATEs on the same row succeed (second waits for first).
@@ -31,6 +32,11 @@ pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
         // concurrent DML touches overlapping rows via different index scans.
         // PostgreSQL detects and resolves these automatically; we do the same
         // by retrying the statement with exponential backoff.
+        //
+        // Lock-resolution/locked-key errors: these are MVCC waits that escaped
+        // the client lock resolver. The wire layer already maps them to 40001
+        // with a retry hint; autocommit should consume them locally when it is
+        // safe to rerun the statement.
         //
         // WriteConflict reasons (from kvrpcpb.proto):
         //   0 = Unknown
@@ -49,9 +55,12 @@ pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
                 errors.iter().any(contains_retryable_error)
             }
             tikv_client::Error::KeyError(key_error) => {
-                key_error.conflict.is_some() || key_error.deadlock.is_some()
+                key_error.conflict.is_some()
+                    || key_error.deadlock.is_some()
+                    || key_error.locked.is_some()
             }
-            _ => false,
+            tikv_client::Error::ResolveLockError(_) => true,
+            _ => err.is_lock_conflict(),
         }
     }
 

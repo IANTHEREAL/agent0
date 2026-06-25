@@ -82,8 +82,8 @@ impl StorageError {
             Self::WriteConflict { .. } => "40001",
             Self::Deadlock => "40P01",
             // Keep legacy TiKV protocol parity for lock-conflict style MVCC
-            // errors during the staged migration: they surface as 40001, but
-            // are not currently part of the retry loop.
+            // errors during the staged migration: they surface as 40001 and
+            // are retryable for single-statement retry loops.
             Self::LockConflict => "40001",
             Self::LockNotAvailable | Self::LockTimeout => "55P03",
             Self::CapabilityUnavailable(_) => "0A000",
@@ -95,13 +95,12 @@ impl StorageError {
     /// Return `true` when the error is the kind that the SQL retry loop should
     /// re-run a single-statement transaction for.
     ///
-    /// This intentionally matches today's TiKV retry loop rather than a more
-    /// aggressive lock-conflict policy: write conflicts and deadlocks retry,
-    /// lock-conflict classification does not yet.
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
-            StorageError::WriteConflict { .. } | StorageError::Deadlock
+            StorageError::WriteConflict { .. }
+                | StorageError::Deadlock
+                | StorageError::LockConflict
         )
     }
 
@@ -140,6 +139,7 @@ mod tests {
         }
         .is_retryable());
         assert!(StorageError::Deadlock.is_retryable());
+        assert!(StorageError::LockConflict.is_retryable());
         assert!(!StorageError::LockTimeout.is_retryable());
         assert!(!StorageError::CapabilityUnavailable("db9_cop").is_retryable());
         assert!(!StorageError::Internal("explosion".to_string()).is_retryable());

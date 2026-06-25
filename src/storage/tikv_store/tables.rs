@@ -576,7 +576,7 @@ impl TikvStore {
             }
             .into());
         }
-        txn_put(txn, data_key, row_data).await?;
+        txn_insert(txn, data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);
         Ok(pk_values)
     }
@@ -589,8 +589,8 @@ impl TikvStore {
     ///
     /// Returns `(pk_results, mutations)`:
     /// - `pk_results`: PK values and row_offset for each prepared row.
-    /// - `mutations`: encoded `(data_key, row_data)` pairs — caller is
-    ///   responsible for flushing via `txn_batch_mutate`.
+    /// - `mutations`: encoded insert-if-absent row mutations — caller is
+    ///   responsible for flushing via `txn_batch_mutate_mixed`.
     pub async fn insert_batch(
         &self,
         txn: &mut Transaction,
@@ -598,7 +598,7 @@ impl TikvStore {
         table_name: &str,
         schema: &TableSchema,
         rows: &[(Row, usize)],
-    ) -> Result<(Vec<(Vec<Value>, usize)>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    ) -> Result<(Vec<(Vec<Value>, usize)>, Vec<BatchMutation>)> {
         if rows.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -694,11 +694,11 @@ impl TikvStore {
             }
         }
 
-        // ── Phase 4: collect mutations (caller flushes via txn_batch_mutate) ──
+        // ── Phase 4: collect mutations (caller flushes via mixed mutate) ──
         let mut result = Vec::with_capacity(prepared.len());
         let mut mutations = Vec::with_capacity(prepared.len());
         for p in prepared {
-            mutations.push((p.data_key, p.row_data));
+            mutations.push(BatchMutation::Insert(p.data_key, p.row_data));
             result.push((p.pk_values, p.row_offset));
         }
         debug!(

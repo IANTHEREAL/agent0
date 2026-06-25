@@ -1170,6 +1170,70 @@ async fn txn_get_for_update() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn txn_pessimistic_writes_do_not_relock_locked_keys() -> Result<()> {
+    init().await?;
+    let client =
+        TransactionClient::new_with_config(pd_addrs(), Config::default().with_default_keyspace())
+            .await?;
+    let suffix = client.current_timestamp().await?.version();
+    let key1 = format!("pessimistic-relock-put-{suffix}");
+    let key2 = format!("pessimistic-relock-delete-{suffix}");
+    let key3 = format!("pessimistic-relock-batch-{suffix}");
+
+    let mut seed = client.begin_pessimistic().await?;
+    seed.put(key1.clone(), b"value-1".to_vec()).await?;
+    seed.put(key2.clone(), b"value-2".to_vec()).await?;
+    seed.put(key3.clone(), b"value-3".to_vec()).await?;
+    seed.commit().await?;
+
+    let mut txn = client.begin_pessimistic().await?;
+    assert_eq!(
+        txn.get_for_update(key1.clone()).await?.as_deref(),
+        Some(&b"value-1"[..])
+    );
+    let locked: HashMap<_, _> = txn
+        .batch_get_for_update(vec![key2.clone(), key3.clone()])
+        .await?
+        .into_iter()
+        .map(From::from)
+        .collect();
+    assert_eq!(
+        locked.get(&Key::from(key2.clone())).map(Vec::as_slice),
+        Some(&b"value-2"[..])
+    );
+    assert_eq!(
+        locked.get(&Key::from(key3.clone())).map(Vec::as_slice),
+        Some(&b"value-3"[..])
+    );
+
+    txn.put(key1.clone(), b"value-1-updated".to_vec()).await?;
+    txn.delete(key2.clone()).await?;
+    txn.batch_mutate(vec![Mutation::Put(
+        Key::from(key3.clone()),
+        Value::from(b"value-3-updated".to_vec()),
+    )])
+    .await?;
+    txn.commit()
+        .await?
+        .expect("pessimistic writes after existing locks should commit");
+
+    let mut verify = client.begin_optimistic().await?;
+    assert_eq!(
+        verify.get(key1).await?.as_deref(),
+        Some(&b"value-1-updated"[..])
+    );
+    assert_eq!(verify.get(key2).await?, None);
+    assert_eq!(
+        verify.get(key3).await?.as_deref(),
+        Some(&b"value-3-updated"[..])
+    );
+    verify.rollback().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn txn_pessimistic_heartbeat() -> Result<()> {
     init().await?;
 

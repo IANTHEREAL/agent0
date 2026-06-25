@@ -191,6 +191,7 @@ where
         id,
         username,
         password,
+        database,
     } = auth_request
     else {
         send_response(
@@ -206,6 +207,7 @@ where
         &id,
         &username,
         &password,
+        database.as_deref(),
         &pool,
         default_keyspace.as_deref(),
         is_secure,
@@ -420,7 +422,7 @@ where
                             // Successful streaming write → per-database activity (#2638).
                             crate::database_activity::record_fs9_activity(
                                 &session.keyspace,
-                                0,
+                                session.database_id,
                                 crate::database_activity::DatabaseActivityKind::Modified,
                             );
                             WsResponse::success(&state.request_id, json!({ "written": written }))
@@ -1217,14 +1219,11 @@ pub(crate) async fn handle_ws_read_tx(
 
 /// Emit a best-effort fs9 read/list activity event (`Active`) for a session.
 ///
-/// fs9 WS sessions carry only the keyspace (the backend's row-identity key);
-/// the numeric database id is unknown here, so we pass 0 ("diagnostic unknown")
-/// — see `database_activity::record_fs9_activity`. Nonblocking; no-op when no
-/// sink is installed.
+/// Nonblocking; no-op when no sink is installed.
 fn record_fs9_read_activity(session: &WsSession) {
     crate::database_activity::record_fs9_activity(
         &session.keyspace,
-        0,
+        session.database_id,
         crate::database_activity::DatabaseActivityKind::Active,
     );
 }

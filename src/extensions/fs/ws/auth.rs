@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use crate::auth::fs_plane_token::{fs_plane_access_for, Fs9Access, Fs9Principal};
 use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
-use crate::extensions::fs::backend::{init_backend_with_args, FsBackend};
+use crate::extensions::fs::backend::{init_backend_with_args_for_database, FsBackend};
 use crate::extensions::fs::config::fs9_config;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
 use crate::extensions::fs::ws::tenant_from_keyspace;
@@ -59,6 +59,8 @@ pub(crate) struct WsSession {
     pub(crate) backend: Arc<dyn FsBackend>,
     pub(crate) user: String,
     pub(crate) keyspace: String,
+    pub(crate) database_id: u64,
+    pub(crate) database_name: String,
     pub(crate) access_mode: FsAccessMode,
     upload_slots: Arc<Semaphore>,
     inflight_uploads: TokioMutex<HashMap<String, OwnedSemaphorePermit>>,
@@ -82,6 +84,8 @@ impl WsSession {
             backend,
             user: "test_user".to_string(),
             keyspace: "db9_tenant_test".to_string(),
+            database_id: 42,
+            database_name: "postgres".to_string(),
             access_mode,
             upload_slots: Arc::new(Semaphore::new(16)),
             inflight_uploads: TokioMutex::new(HashMap::new()),
@@ -103,6 +107,8 @@ impl WsSession {
             "user": self.user,
             "tenant": tenant_from_keyspace(&self.keyspace),
             "keyspace": self.keyspace,
+            "database": self.database_name,
+            "database_id": self.database_id,
             "capabilities": capabilities,
         })
     }
@@ -130,11 +136,13 @@ pub(crate) async fn handle_auth(
     id: &str,
     username: &str,
     password: &str,
+    database: Option<&str>,
     pool: &TikvClientPool,
     default_keyspace: Option<&str>,
     is_secure: bool,
 ) -> Result<WsSession, WsResponse> {
     let (keyspace, actual_user) = resolve_auth_target(username, default_keyspace);
+    let database_name = resolve_database_name(database);
 
     let auth_mode = config::db9_auth_mode();
     let dev_mode = config::env_bool("DB9_DEV");
@@ -253,6 +261,8 @@ pub(crate) async fn handle_auth(
         WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}"))
     })?;
 
+    let database_id = resolve_database_id(id, &store, &database_name).await?;
+
     let client = store.transaction_client().ok_or_else(|| {
         WsResponse::error(
             id,
@@ -273,27 +283,108 @@ pub(crate) async fn handle_auth(
         },
     });
 
-    let backend = init_backend_with_args(&keyspace, client, principal)
-        .await
-        .map_err(|err| {
-            WsResponse::error(
-                id,
-                WsErrorCode::Eio,
-                format!("failed to initialize fs backend: {err}"),
-            )
-        })?;
+    let backend =
+        init_backend_with_args_for_database(&keyspace, client, principal, Some(database_id))
+            .await
+            .map_err(|err| {
+                WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("failed to initialize fs backend: {err}"),
+                )
+            })?;
 
     Ok(WsSession {
         _tenant_handle: tenant_handle,
         backend,
         user: actual_user,
         keyspace,
+        database_id,
+        database_name,
         access_mode,
         upload_slots: Arc::new(Semaphore::new(
             fs9_config().ws_max_inflight_uploads_per_connection,
         )),
         inflight_uploads: TokioMutex::new(HashMap::new()),
     })
+}
+
+fn resolve_database_name(database: Option<&str>) -> String {
+    let database = database.unwrap_or("postgres").trim();
+    if database.is_empty() {
+        "postgres".to_string()
+    } else {
+        database.to_ascii_lowercase()
+    }
+}
+
+fn default_database_bootstrap_owner() -> String {
+    config::env_string("DB9_BOOTSTRAP_ADMIN_USER").unwrap_or_else(|| "admin".to_string())
+}
+
+async fn resolve_database_id(
+    id: &str,
+    store: &crate::storage::TikvStore,
+    database_name: &str,
+) -> Result<u64, WsResponse> {
+    let database_id = if database_name == "postgres" {
+        store
+            .ensure_default_database_visible(&default_database_bootstrap_owner())
+            .await
+            .map_err(|err| {
+                WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("database lookup failed: {err}"),
+                )
+            })?
+    } else {
+        match store
+            .lookup_database_id(database_name)
+            .await
+            .map_err(|err| {
+                WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("database lookup failed: {err}"),
+                )
+            })? {
+            Some(database_id) => database_id,
+            None => {
+                return Err(WsResponse::error(
+                    id,
+                    WsErrorCode::Enoent,
+                    format!("database \"{database_name}\" does not exist"),
+                ));
+            }
+        }
+    };
+
+    crate::worker::database_lifecycle::ensure_database_lifecycle_accepts_traffic().map_err(
+        |err| {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("database lifecycle lease check failed: {err}"),
+            )
+        },
+    )?;
+
+    if store.database_active(database_id).await.map_err(|err| {
+        WsResponse::error(
+            id,
+            WsErrorCode::Eio,
+            format!("database lifecycle check failed: {err}"),
+        )
+    })? {
+        Ok(database_id)
+    } else {
+        Err(WsResponse::error(
+            id,
+            WsErrorCode::Enoent,
+            format!("database \"{database_name}\" does not exist"),
+        ))
+    }
 }
 
 fn resolve_auth_target(username: &str, default_keyspace: Option<&str>) -> (String, String) {
@@ -549,6 +640,15 @@ mod tests {
         let (keyspace, user) = resolve_auth_target("admin", None);
         assert_eq!(keyspace, "default");
         assert_eq!(user, "admin");
+    }
+
+    #[test]
+    fn test_resolve_database_name_defaults_and_normalizes() {
+        assert_eq!(resolve_database_name(None), "postgres");
+        assert_eq!(resolve_database_name(Some("")), "postgres");
+        assert_eq!(resolve_database_name(Some("  ")), "postgres");
+        assert_eq!(resolve_database_name(Some("AppDB")), "appdb");
+        assert_eq!(resolve_database_name(Some(" appdb ")), "appdb");
     }
 
     #[test]

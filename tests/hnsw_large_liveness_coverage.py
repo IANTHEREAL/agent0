@@ -55,6 +55,30 @@ def run_sql(dsn: str, sql: str, timeout: float = 120) -> str:
     return result.stdout.strip()
 
 
+def is_serialization_failure(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "could not serialize access" in text
+        or "serialization failure" in text.lower()
+        or "SQLSTATE 40001" in text
+    )
+
+
+def run_sql_retry_serialization(
+    dsn: str, sql: str, timeout: float = 120, attempts: int = 8
+) -> str:
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return run_sql(dsn, sql, timeout=timeout)
+        except RuntimeError as exc:
+            if not is_serialization_failure(exc):
+                raise
+            last_exc = exc
+            time.sleep(min(0.05 * (attempt + 1), 0.5))
+    raise last_exc  # type: ignore[misc]
+
+
 def expect_int_eq(dsn: str, sql: str, expected: int, msg: str) -> None:
     out = run_sql(dsn, sql)
     try:
@@ -122,7 +146,7 @@ def main() -> int:
         )
 
         # Seed 4,000 rows (large enough to stress row + index write path, still CI-friendly).
-        run_sql(
+        run_sql_retry_serialization(
             dsn,
             f"""
             INSERT INTO {table_name} (id, v, marker)
@@ -146,15 +170,15 @@ def main() -> int:
         )
 
         # Burst updates on a hot subset to simulate delta backlog pressure.
-        run_sql(
+        run_sql_retry_serialization(
             dsn,
             f"UPDATE {table_name} SET v='[9,0,0]', marker=1 WHERE id BETWEEN 1 AND 600;",
         )
-        run_sql(
+        run_sql_retry_serialization(
             dsn,
             f"UPDATE {table_name} SET v='[0,9,0]', marker=2 WHERE id BETWEEN 1 AND 600;",
         )
-        run_sql(
+        run_sql_retry_serialization(
             dsn,
             f"UPDATE {table_name} SET v='[0,0,9]', marker=3 WHERE id BETWEEN 1 AND 600;",
         )
@@ -174,7 +198,7 @@ def main() -> int:
         )
 
         # Multi-row update over another wide range.
-        run_sql(
+        run_sql_retry_serialization(
             dsn,
             f"""
             UPDATE {table_name}
@@ -191,7 +215,7 @@ def main() -> int:
         )
 
         # Insert additional 1,000 rows in a single statement.
-        run_sql(
+        run_sql_retry_serialization(
             dsn,
             f"""
             INSERT INTO {table_name} (id, v, marker)
@@ -215,7 +239,7 @@ def main() -> int:
 
         # Repeated singleton updates: ensure latest write is visible on read-path.
         for i in range(1, 41):
-            run_sql(
+            run_sql_retry_serialization(
                 dsn,
                 f"""
                 UPDATE {table_name}
