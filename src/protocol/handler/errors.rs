@@ -1,5 +1,6 @@
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::timeout::StatementTimeoutError;
+use crate::storage::retry::is_retryable_tikv_transient_error;
 use crate::storage::StorageError;
 use pgwire::error::{ErrorInfo, PgWireError};
 
@@ -14,7 +15,7 @@ fn is_tikv_write_conflict(err: &anyhow::Error) -> bool {
         match err {
             tikv_client::Error::KeyError(key_err) => key_err.conflict.is_some(),
             tikv_client::Error::PessimisticLockError { inner, .. } => has_conflict(inner),
-            tikv_client::Error::UndeterminedError(inner) => has_conflict(inner),
+            tikv_client::Error::UndeterminedError(_) => false,
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_conflict),
             _ => false,
@@ -34,7 +35,7 @@ fn is_tikv_deadlock(err: &anyhow::Error) -> bool {
         match err {
             tikv_client::Error::KeyError(key_err) => key_err.deadlock.is_some(),
             tikv_client::Error::PessimisticLockError { inner, .. } => has_deadlock(inner),
-            tikv_client::Error::UndeterminedError(inner) => has_deadlock(inner),
+            tikv_client::Error::UndeterminedError(_) => false,
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_deadlock),
             _ => false,
@@ -56,7 +57,7 @@ fn is_tikv_lock_resolution_failure(err: &anyhow::Error) -> bool {
             tikv_client::Error::ResolveLockError(_) => true,
             tikv_client::Error::KeyError(key_err) => key_err.locked.is_some(),
             tikv_client::Error::PessimisticLockError { inner, .. } => has_lock_failure(inner),
-            tikv_client::Error::UndeterminedError(inner) => has_lock_failure(inner),
+            tikv_client::Error::UndeterminedError(_) => false,
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_lock_failure),
             _ => err.is_lock_conflict(),
@@ -69,13 +70,59 @@ fn is_tikv_lock_resolution_failure(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Check if TiKV rejected an insert-if-absent because the key already exists.
+/// PostgreSQL equivalent: `23505 unique_violation`.
+fn is_tikv_already_exists(err: &anyhow::Error) -> bool {
+    fn has_already_exists(err: &tikv_client::Error) -> bool {
+        match err {
+            tikv_client::Error::KeyError(key_err) => key_err.already_exist.is_some(),
+            tikv_client::Error::PessimisticLockError { inner, .. } => has_already_exists(inner),
+            tikv_client::Error::UndeterminedError(_) => false,
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => {
+                errors.iter().any(has_already_exists)
+            }
+            _ => false,
+        }
+    }
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(has_already_exists)
+    })
+}
+
 fn storage_error(err: &anyhow::Error) -> Option<&StorageError> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<StorageError>())
 }
 
+fn is_tikv_undetermined_outcome(err: &anyhow::Error) -> bool {
+    fn has_undetermined(err: &tikv_client::Error) -> bool {
+        match err {
+            tikv_client::Error::UndeterminedError(_) => true,
+            tikv_client::Error::PessimisticLockError { inner, .. } => has_undetermined(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(has_undetermined),
+            _ => false,
+        }
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(has_undetermined)
+    })
+}
+
 pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     if let Some(sql_err) = err.downcast_ref::<SqlError>() {
+        if let SqlError::Internal(inner) = sql_err {
+            let inner_sqlstate = sqlstate_for_executor_error(inner);
+            if inner_sqlstate != "XX000" {
+                return inner_sqlstate;
+            }
+        }
         return sql_err.sqlstate();
     }
     // Statement timeout → 57014 (query_canceled), matching PostgreSQL.
@@ -85,6 +132,12 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     // StorageError → the staged facade SQLSTATE surface from issue #2523.
     if let Some(storage_err) = storage_error(err) {
         return storage_err.sqlstate();
+    }
+    // TiKV could not determine whether commit-primary succeeded. Retrying the
+    // statement locally could double-apply committed writes, so surface the
+    // SQL-standard "statement completion unknown" state instead.
+    if is_tikv_undetermined_outcome(err) {
+        return "40003";
     }
     // WriteConflict → 40001 (serialization_failure): client should retry the txn.
     if is_tikv_write_conflict(err) {
@@ -99,6 +152,19 @@ pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     // (routed through SqlError::LockNotAvailable / SqlError::LockTimeout).
     if is_tikv_lock_resolution_failure(err) {
         return "40001";
+    }
+    // TiKV transient failures that escape the safe local retry boundaries cannot
+    // be retried one KV call at a time inside an active SQL transaction. Surface
+    // them as serialization failures so clients retry the whole transaction.
+    if is_retryable_tikv_transient_error(err) {
+        return "40001";
+    }
+    // AlreadyExists from TiKV's insert-if-absent path is a unique violation,
+    // not an internal server failure. This closes the stale-insert race where
+    // a snapshot duplicate check misses a concurrent insert but TiKV correctly
+    // rejects the final insert.
+    if is_tikv_already_exists(err) {
+        return "23505";
     }
     "XX000"
 }
@@ -120,6 +186,13 @@ pub(super) fn pg_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 /// leaking internal implementation details to clients. Non-TiKV errors
 /// preserve their original message text.
 pub(super) fn pg_error_message(err: &anyhow::Error, sqlstate: &str) -> String {
+    if let Some(SqlError::Internal(inner)) = err.downcast_ref::<SqlError>() {
+        let inner_sqlstate = sqlstate_for_executor_error(inner);
+        if inner_sqlstate == sqlstate && inner_sqlstate != "XX000" {
+            return pg_error_message(inner, sqlstate);
+        }
+    }
+
     if let Some(storage_err) = storage_error(err) {
         if let Some(message) = storage_err.pg_message() {
             return message.to_string();
@@ -127,13 +200,22 @@ pub(super) fn pg_error_message(err: &anyhow::Error, sqlstate: &str) -> String {
     }
 
     match sqlstate {
+        "40003" if is_tikv_undetermined_outcome(err) => {
+            "transaction outcome is unknown; manual reconciliation may be required".to_string()
+        }
         "40001" => {
             if is_tikv_write_conflict(err) || is_tikv_lock_resolution_failure(err) {
                 return "could not serialize access due to concurrent update".to_string();
             }
+            if is_retryable_tikv_transient_error(err) {
+                return "could not serialize access due to transient storage failure".to_string();
+            }
             err.to_string()
         }
         "40P01" => "deadlock detected".to_string(),
+        "23505" if is_tikv_already_exists(err) => {
+            "duplicate key value violates unique constraint".to_string()
+        }
         _ => err.to_string(),
     }
 }

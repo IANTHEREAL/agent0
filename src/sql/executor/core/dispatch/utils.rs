@@ -5,6 +5,34 @@ use super::super::*;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::sql::executor::core) struct TransactionCharacteristics {
+    isolation: String,
+    read_only: String,
+}
+
+pub(in crate::sql::executor::core) fn capture_transaction_characteristics(
+    session: &Session,
+) -> TransactionCharacteristics {
+    TransactionCharacteristics {
+        isolation: session
+            .show_setting_value("transaction_isolation")
+            .unwrap_or_else(|| "repeatable read".to_string()),
+        read_only: session
+            .show_setting_value("transaction_read_only")
+            .unwrap_or_else(|| "off".to_string()),
+    }
+}
+
+pub(in crate::sql::executor::core) fn restore_transaction_characteristics(
+    session: &mut Session,
+    characteristics: &TransactionCharacteristics,
+) -> Result<()> {
+    session.set_known_setting("transaction_isolation", characteristics.isolation.clone())?;
+    session.set_known_setting("transaction_read_only", characteristics.read_only.clone())?;
+    Ok(())
+}
+
 /// Validate and apply transaction modes (isolation level, access mode) from
 /// `BEGIN`, `START TRANSACTION`, `SET TRANSACTION`, or
 /// `SET SESSION CHARACTERISTICS AS TRANSACTION`.
@@ -356,6 +384,34 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            session
+                .show_setting_value("transaction_read_only")
+                .as_deref(),
+            Some("on")
+        );
+    }
+
+    #[test]
+    fn transaction_characteristics_restore_preserves_read_only() {
+        let mut session = test_session(false);
+        validate_transaction_modes(
+            &mut session,
+            &[TransactionMode::AccessMode(TransactionAccessMode::ReadOnly)],
+            false,
+        )
+        .unwrap();
+
+        let characteristics = capture_transaction_characteristics(&session);
+        session.clear_local_overrides();
+        assert_eq!(
+            session
+                .show_setting_value("transaction_read_only")
+                .as_deref(),
+            Some("off")
+        );
+
+        restore_transaction_characteristics(&mut session, &characteristics).unwrap();
         assert_eq!(
             session
                 .show_setting_value("transaction_read_only")

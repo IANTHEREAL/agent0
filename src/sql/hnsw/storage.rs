@@ -25,6 +25,9 @@ use usearch::ffi::{new_index, Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::sql::error::SqlError;
 use crate::sql::hnsw::HnswDistanceMetric;
+use crate::storage::retry::{
+    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+};
 use crate::storage::TikvStore;
 use crate::txn::{txn_delete, txn_put};
 
@@ -250,46 +253,77 @@ pub fn parse_hnsw_s3_prefix_gc_key(key: &[u8]) -> Option<(u64, u64, u64)> {
 /// dropped-index tombstones and GC markers do not make query serving depend on
 /// S3, while live `graph_version > 0` indexes do.
 pub async fn keyspace_requires_hnsw_s3(store: &TikvStore) -> anyhow::Result<bool> {
-    let mut txn = store.begin().await?;
-    let result = async {
-        for db in store.list_databases(&mut txn).await? {
-            let table_names = store.list_tables(&mut txn, db.id).await?;
-            let schemas = store
-                .list_table_schemas(&mut txn, db.id, &table_names)
-                .await?;
-            for schema in schemas {
-                for index in &schema.indexes {
-                    if !index.is_hnsw() {
-                        continue;
-                    }
-                    let Some(meta_bytes) = txn
-                        .get(hnsw_meta_key(db.id, schema.table_id, index.id))
-                        .await?
-                    else {
-                        continue;
-                    };
-                    let meta: HnswMeta = serde_json::from_slice(&meta_bytes).context(
-                        "Failed to deserialize HNSW meta while checking live S3 requirement",
-                    )?;
-                    if meta.dropped_at.is_none() && meta.graph_version > 0 {
-                        return Ok::<bool, anyhow::Error>(true);
+    for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+        let mut txn = match store.begin().await {
+            Ok(txn) => txn,
+            Err(err) => {
+                if retry_hnsw_s3_requirement_read("begin", attempt, &err).await {
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+        let result = async {
+            for db in store.list_databases(&mut txn).await? {
+                let table_names = store.list_tables(&mut txn, db.id).await?;
+                let schemas = store
+                    .list_table_schemas(&mut txn, db.id, &table_names)
+                    .await?;
+                for schema in schemas {
+                    for index in &schema.indexes {
+                        if !index.is_hnsw() {
+                            continue;
+                        }
+                        let Some(meta_bytes) = txn
+                            .get(hnsw_meta_key(db.id, schema.table_id, index.id))
+                            .await?
+                        else {
+                            continue;
+                        };
+                        let meta: HnswMeta = serde_json::from_slice(&meta_bytes).context(
+                            "Failed to deserialize HNSW meta while checking live S3 requirement",
+                        )?;
+                        if meta.dropped_at.is_none() && meta.graph_version > 0 {
+                            return Ok::<bool, anyhow::Error>(true);
+                        }
                     }
                 }
             }
+            Ok(false)
         }
-        Ok(false)
-    }
-    .await;
+        .await;
 
-    match result {
-        Ok(required) => {
-            txn.rollback().await.ok();
-            Ok(required)
+        txn.rollback().await.ok();
+        match result {
+            Ok(required) => return Ok(required),
+            Err(err) => {
+                if retry_hnsw_s3_requirement_read("scan", attempt, &err).await {
+                    continue;
+                }
+                return Err(err);
+            }
         }
-        Err(e) => {
-            txn.rollback().await.ok();
-            Err(e)
-        }
+    }
+
+    unreachable!("HNSW S3 requirement read retry loop must return");
+}
+
+async fn retry_hnsw_s3_requirement_read(
+    operation: &'static str,
+    attempt: u32,
+    err: &anyhow::Error,
+) -> bool {
+    if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err) {
+        tracing::info!(
+            attempt = attempt + 1,
+            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+            operation,
+            "retrying HNSW S3 requirement read after transient TiKV error"
+        );
+        region_error_backoff(attempt).await;
+        true
+    } else {
+        false
     }
 }
 

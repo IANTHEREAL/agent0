@@ -1,11 +1,15 @@
 use super::*;
 use crate::storage::backpressure::tikv_op;
+use crate::storage::tikv_store::retry::{
+    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+};
 use serde::{Deserialize, Serialize};
 
 const DATABASE_LIFECYCLE_FORMAT_V1: u8 = 1;
 const DATABASE_NODE_LEASE_FORMAT_V1: u8 = 1;
 const DATABASE_DRAIN_STATE_FORMAT_V1: u8 = 1;
 const DATABASE_DROP_CLAIM_FORMAT_V1: u8 = 1;
+const DATABASE_DRAIN_REQUEST_FORMAT_V1: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DatabaseLifecycleState {
@@ -79,6 +83,20 @@ struct DatabaseDropClaim {
     generation: u64,
     claimed_at_ms: i64,
     lease_until_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DatabaseDrainRequest {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub epoch: u64,
+    pub requested_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FencedDatabase {
+    pub db_id: u64,
+    pub epoch: u64,
 }
 
 #[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
@@ -195,11 +213,36 @@ fn deserialize_database_drop_claim(data: &[u8]) -> Result<DatabaseDropClaim> {
     }
 }
 
+fn serialize_database_drain_request(request: &DatabaseDrainRequest) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.push(DATABASE_DRAIN_REQUEST_FORMAT_V1);
+    bincode::serialize_into(&mut out, request)
+        .context("Failed to serialize database drain request")?;
+    Ok(out)
+}
+
+fn deserialize_database_drain_request(data: &[u8]) -> Result<DatabaseDrainRequest> {
+    match data.split_first() {
+        Some((&DATABASE_DRAIN_REQUEST_FORMAT_V1, rest)) => {
+            bincode::deserialize(rest).context("Failed to deserialize database drain request")
+        }
+        Some((&version, _)) => Err(anyhow!(
+            "unknown database drain request format version {version}"
+        )),
+        None => Err(anyhow!("empty database drain request value")),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefaultDatabaseRepairAction {
     UseVisible(u64),
     RestoreNameMapping(u64),
     BootstrapNew,
+}
+
+enum DefaultDatabaseVisibleStep {
+    Done(u64),
+    RetryAfterConflict,
 }
 
 fn visible_default_database_id(
@@ -236,15 +279,9 @@ fn visible_default_database_id(
 fn choose_default_database_repair_action(
     mapped_id: Option<u64>,
     mapped_def: Option<&DatabaseDef>,
-    databases: &[DatabaseDef],
+    matching_ids: &[u64],
 ) -> Result<DefaultDatabaseRepairAction> {
     const DEFAULT_DB: &str = "postgres";
-
-    let matching_ids: Vec<u64> = databases
-        .iter()
-        .filter(|db| db.name == DEFAULT_DB)
-        .map(|db| db.id)
-        .collect();
 
     match matching_ids.len() {
         0 => Ok(DefaultDatabaseRepairAction::BootstrapNew),
@@ -271,12 +308,39 @@ fn tikv_error_contains_write_conflict(err: &tikv_client::Error) -> bool {
         tikv_client::Error::PessimisticLockError { inner, .. } => {
             tikv_error_contains_write_conflict(inner)
         }
-        tikv_client::Error::UndeterminedError(inner) => tikv_error_contains_write_conflict(inner),
+        tikv_client::Error::UndeterminedError(_) => false,
         tikv_client::Error::ExtractedErrors(errors)
         | tikv_client::Error::MultipleKeyErrors(errors) => {
             errors.iter().any(tikv_error_contains_write_conflict)
         }
         _ => false,
+    }
+}
+
+fn error_chain_contains_write_conflict(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(tikv_error_contains_write_conflict)
+    })
+}
+
+async fn retry_database_metadata_read(
+    operation: &'static str,
+    attempt: u32,
+    err: &anyhow::Error,
+) -> bool {
+    if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err) {
+        tracing::info!(
+            attempt = attempt + 1,
+            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+            operation,
+            "retrying database metadata read after transient TiKV error"
+        );
+        region_error_backoff(attempt).await;
+        true
+    } else {
+        false
     }
 }
 
@@ -486,6 +550,58 @@ impl TikvStore {
         Ok(states)
     }
 
+    pub(crate) async fn put_database_drain_request(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        epoch: u64,
+        requested_at_ms: i64,
+    ) -> Result<()> {
+        let keyspace = crate::worker::canonical_registry_keyspace(keyspace);
+        let request = DatabaseDrainRequest {
+            keyspace: keyspace.clone(),
+            db_id,
+            epoch,
+            requested_at_ms,
+        };
+        let key = self.key(&encode_database_drain_request_key(&keyspace, db_id, epoch));
+        let data = serialize_database_drain_request(&request)?;
+        txn_put(txn, key, data).await
+    }
+
+    pub(crate) async fn delete_database_drain_request(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        epoch: u64,
+    ) -> Result<()> {
+        let keyspace = crate::worker::canonical_registry_keyspace(keyspace);
+        let key = self.key(&encode_database_drain_request_key(&keyspace, db_id, epoch));
+        txn_delete(txn, key).await
+    }
+
+    pub(crate) async fn list_database_drain_requests(
+        &self,
+        txn: &mut Transaction,
+    ) -> Result<Vec<DatabaseDrainRequest>> {
+        let prefix = encode_database_drain_request_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
+
+        let mut requests = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if key.starts_with(&prefix) {
+                requests.push(deserialize_database_drain_request(pair.value())?);
+            }
+        }
+        Ok(requests)
+    }
+
     pub(crate) async fn claim_database_drop_with_lease(
         &self,
         txn: &mut Transaction,
@@ -558,54 +674,268 @@ impl TikvStore {
             return Ok(true);
         }
 
-        let mut txn = self.begin_optimistic().await?;
-        let result = self.database_active_in_txn(&mut txn, db_id).await;
-        txn.rollback().await.ok();
-        result
+        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+            let mut txn = match self.begin_optimistic().await {
+                Ok(txn) => txn,
+                Err(err) => {
+                    if retry_database_metadata_read("database_active begin", attempt, &err).await {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let result = self.database_active_in_txn(&mut txn, db_id).await;
+            txn.rollback().await.ok();
+            match result {
+                Ok(active) => return Ok(active),
+                Err(err) => {
+                    if retry_database_metadata_read("database_active", attempt, &err).await {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        unreachable!("database metadata read retry loop must return");
+    }
+
+    /// Fence every active SQL database in this tenant keyspace for customer
+    /// tenant deletion.
+    ///
+    /// Unlike SQL `DROP DATABASE`, tenant deletion must work while sessions are
+    /// connected: the fence is published first, then sessions and streams drain.
+    /// Each per-database lifecycle row is still the commit permit, so this
+    /// conflicts with in-flight writers that already took that permit.
+    pub(crate) async fn fence_all_databases_for_tenant_delete(
+        &self,
+    ) -> Result<Vec<FencedDatabase>> {
+        const MAX_FENCE_RETRIES: usize = 5;
+
+        for attempt in 0..=MAX_FENCE_RETRIES {
+            match self.fence_all_databases_for_tenant_delete_once().await {
+                Ok(fenced) => return Ok(fenced),
+                Err(err) => {
+                    let retry_transient = is_retryable_tikv_transient_error(&err);
+                    let retry_write_conflict = error_chain_contains_write_conflict(&err);
+                    if attempt < MAX_FENCE_RETRIES && (retry_transient || retry_write_conflict) {
+                        tracing::info!(
+                            attempt = attempt + 1,
+                            retry_transient,
+                            retry_write_conflict,
+                            "retrying tenant delete database fence after transient TiKV error"
+                        );
+                        if retry_transient {
+                            region_error_backoff(attempt as u32).await;
+                        } else {
+                            let delay_ms = 20_u64.saturating_mul((attempt + 1) as u64);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        unreachable!("tenant delete fence retry loop must return");
+    }
+
+    async fn fence_all_databases_for_tenant_delete_once(&self) -> Result<Vec<FencedDatabase>> {
+        let mut txn = self.begin().await?;
+        let prefix = encode_database_id_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
+        let now = now_epoch_ms();
+        let mut fenced = Vec::new();
+
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+
+            let def: DatabaseDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize database")?;
+            let mut lifecycle = self
+                .get_database_lifecycle_for_update(&mut txn, def.id)
+                .await?
+                .unwrap_or_else(|| DatabaseLifecycle::active(def.id, def.created_at));
+
+            match lifecycle.state {
+                DatabaseLifecycleState::Active => {
+                    lifecycle.epoch = lifecycle.epoch.checked_add(1).ok_or_else(|| {
+                        anyhow!("database lifecycle epoch overflow for db_id {}", def.id)
+                    })?;
+                    lifecycle.state = DatabaseLifecycleState::Fencing;
+                    lifecycle.fence_ts_ms = Some(now);
+                    lifecycle.drop_started_at_ms = Some(now);
+                    self.put_database_lifecycle(&mut txn, &lifecycle).await?;
+                    fenced.push(FencedDatabase {
+                        db_id: def.id,
+                        epoch: lifecycle.epoch,
+                    });
+                }
+                DatabaseLifecycleState::Fencing => {
+                    fenced.push(FencedDatabase {
+                        db_id: def.id,
+                        epoch: lifecycle.epoch,
+                    });
+                }
+                DatabaseLifecycleState::Dropped
+                | DatabaseLifecycleState::Purging
+                | DatabaseLifecycleState::Purged => {}
+            }
+        }
+
+        tikv_op!(txn.commit().await)?;
+        Ok(fenced)
     }
 
     pub(crate) async fn database_fencing_epoch(&self, db_id: u64) -> Result<Option<u64>> {
-        let mut txn = self.begin_optimistic().await?;
-        let result = self
-            .get_database_lifecycle(&mut txn, db_id)
-            .await?
-            .filter(|lifecycle| lifecycle.state == DatabaseLifecycleState::Fencing)
-            .map(|lifecycle| lifecycle.epoch);
-        txn.rollback().await.ok();
-        Ok(result)
+        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+            let mut txn = match self.begin_optimistic().await {
+                Ok(txn) => txn,
+                Err(err) => {
+                    if retry_database_metadata_read("database_fencing_epoch begin", attempt, &err)
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let result = async {
+                Ok(self
+                    .get_database_lifecycle(&mut txn, db_id)
+                    .await?
+                    .filter(|lifecycle| lifecycle.state == DatabaseLifecycleState::Fencing)
+                    .map(|lifecycle| lifecycle.epoch))
+            }
+            .await;
+            txn.rollback().await.ok();
+            match result {
+                Ok(epoch) => return Ok(epoch),
+                Err(err) => {
+                    if retry_database_metadata_read("database_fencing_epoch", attempt, &err).await {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        unreachable!("database metadata read retry loop must return");
+    }
+
+    pub(crate) async fn database_is_fencing_epoch(&self, db_id: u64, epoch: u64) -> Result<bool> {
+        Ok(self.database_fencing_epoch(db_id).await? == Some(epoch))
     }
 
     /// Look up a database ID in its own short-lived transaction.
     pub async fn lookup_database_id(&self, db_name: &str) -> Result<Option<u64>> {
-        let mut txn = self.begin_optimistic().await?;
-        let result = async {
-            let Some(db_id) = self.get_database_id(&mut txn, db_name).await? else {
-                return Ok(None);
+        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+            let mut txn = match self.begin_optimistic().await {
+                Ok(txn) => txn,
+                Err(err) => {
+                    if retry_database_metadata_read("lookup_database_id begin", attempt, &err).await
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
             };
-            if self.database_active_in_txn(&mut txn, db_id).await? {
-                Ok(Some(db_id))
-            } else {
-                Ok(None)
+            let result = async {
+                let Some(db_id) = self.get_database_id(&mut txn, db_name).await? else {
+                    return Ok(None);
+                };
+                if self.database_active_in_txn(&mut txn, db_id).await? {
+                    Ok(Some(db_id))
+                } else {
+                    Ok(None)
+                }
+            }
+            .await;
+            if let Err(err) = txn.rollback().await {
+                tracing::warn!(
+                    "rollback failed after database lookup for '{}': {}",
+                    db_name,
+                    err
+                );
+            }
+            match result {
+                Ok(db_id) => return Ok(db_id),
+                Err(err) => {
+                    if retry_database_metadata_read("lookup_database_id", attempt, &err).await {
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
-        .await;
-        if let Err(err) = txn.rollback().await {
-            tracing::warn!(
-                "rollback failed after database lookup for '{}': {}",
-                db_name,
-                err
-            );
-        }
-        result
+
+        unreachable!("database metadata read retry loop must return");
     }
 
     /// Ensure the default `postgres` database is both bootstrapped and visible.
     pub async fn ensure_default_database_visible(&self, owner: &str) -> Result<u64> {
-        const DEFAULT_DB: &str = "postgres";
         let mut allow_conflict_retry = true;
+        let mut transient_attempt = 0;
 
         loop {
-            let mut txn = self.begin().await?;
+            match self
+                .ensure_default_database_visible_step(owner, &mut allow_conflict_retry)
+                .await
+            {
+                Ok(DefaultDatabaseVisibleStep::Done(id)) => return Ok(id),
+                Ok(DefaultDatabaseVisibleStep::RetryAfterConflict) => continue,
+                Err(err) => {
+                    if transient_attempt < REGION_ERROR_MAX_RETRIES
+                        && is_retryable_tikv_transient_error(&err)
+                    {
+                        retry_database_metadata_read(
+                            "ensure_default_database_visible",
+                            transient_attempt,
+                            &err,
+                        )
+                        .await;
+                        transient_attempt += 1;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Resolve a database name for new client admission.
+    ///
+    /// The default `postgres` database is bootstrapped/repaired when missing,
+    /// but a lifecycle-fenced default database is treated the same as any other
+    /// non-active database: it is not returned for new sessions.
+    pub async fn resolve_active_database_id(
+        &self,
+        db_name: &str,
+        default_owner: &str,
+    ) -> Result<Option<u64>> {
+        if db_name == "postgres" {
+            let db_id = self.ensure_default_database_visible(default_owner).await?;
+            return Ok(self.database_active(db_id).await?.then_some(db_id));
+        }
+
+        self.lookup_database_id(db_name).await
+    }
+
+    async fn ensure_default_database_visible_step(
+        &self,
+        owner: &str,
+        allow_conflict_retry: &mut bool,
+    ) -> Result<DefaultDatabaseVisibleStep> {
+        const DEFAULT_DB: &str = "postgres";
+        let mut txn = self.begin().await?;
+        let result = async {
             let mapped_id = self.get_database_id(&mut txn, DEFAULT_DB).await?;
             let mapped_def = match mapped_id {
                 Some(id) => self.get_database_by_id(&mut txn, id).await?,
@@ -621,7 +951,7 @@ impl TikvStore {
                     visible_default_database_id(mapped_id, mapped_def.as_ref(), &matching_ids)?
                 {
                     txn.rollback().await.ok();
-                    return Ok(id);
+                    return Ok(DefaultDatabaseVisibleStep::Done(id));
                 }
             }
 
@@ -641,14 +971,19 @@ impl TikvStore {
                     _ => {}
                 }
             }
-            let databases = self.list_databases(&mut txn).await?;
-            let repair_action =
-                choose_default_database_repair_action(mapped_id, mapped_def.as_ref(), &databases)?;
+            let matching_ids = self
+                .list_exact_default_database_definition_ids(&mut txn)
+                .await?;
+            let repair_action = choose_default_database_repair_action(
+                mapped_id,
+                mapped_def.as_ref(),
+                &matching_ids,
+            )?;
 
             match repair_action {
                 DefaultDatabaseRepairAction::UseVisible(id) => {
                     txn.rollback().await.ok();
-                    return Ok(id);
+                    Ok(DefaultDatabaseVisibleStep::Done(id))
                 }
                 DefaultDatabaseRepairAction::RestoreNameMapping(id) => {
                     let name_key = self.key(&encode_database_name_key(DEFAULT_DB));
@@ -659,12 +994,12 @@ impl TikvStore {
                                 "Restored default database '{}' name mapping to existing ID {}",
                                 DEFAULT_DB, id
                             );
-                            return Ok(id);
+                            Ok(DefaultDatabaseVisibleStep::Done(id))
                         }
                         Err(err)
-                            if allow_conflict_retry && tikv_error_contains_write_conflict(&err) =>
+                            if *allow_conflict_retry && tikv_error_contains_write_conflict(&err) =>
                         {
-                            allow_conflict_retry = false;
+                            *allow_conflict_retry = false;
                             if let Some(visible_id) =
                                 self.read_visible_default_database_id().await?
                             {
@@ -672,14 +1007,15 @@ impl TikvStore {
                                     "Recovered default database '{}' after commit conflict with visible ID {}",
                                     DEFAULT_DB, visible_id
                                 );
-                                return Ok(visible_id);
+                                return Ok(DefaultDatabaseVisibleStep::Done(visible_id));
                             }
                             tracing::info!(
                                 "Retrying default database '{}' repair after commit conflict",
                                 DEFAULT_DB
                             );
+                            Ok(DefaultDatabaseVisibleStep::RetryAfterConflict)
                         }
-                        Err(err) => return Err(anyhow!(err)),
+                        Err(err) => Err(anyhow!(err)),
                     }
                 }
                 DefaultDatabaseRepairAction::BootstrapNew => {
@@ -705,12 +1041,12 @@ impl TikvStore {
                                 "Bootstrapped default database '{}' with ID {}",
                                 DEFAULT_DB, db_id
                             );
-                            return Ok(db_id);
+                            Ok(DefaultDatabaseVisibleStep::Done(db_id))
                         }
                         Err(err)
-                            if allow_conflict_retry && tikv_error_contains_write_conflict(&err) =>
+                            if *allow_conflict_retry && tikv_error_contains_write_conflict(&err) =>
                         {
-                            allow_conflict_retry = false;
+                            *allow_conflict_retry = false;
                             if let Some(visible_id) =
                                 self.read_visible_default_database_id().await?
                             {
@@ -718,37 +1054,78 @@ impl TikvStore {
                                     "Recovered default database '{}' after bootstrap conflict with visible ID {}",
                                     DEFAULT_DB, visible_id
                                 );
-                                return Ok(visible_id);
+                                return Ok(DefaultDatabaseVisibleStep::Done(visible_id));
                             }
                             tracing::info!(
                                 "Retrying default database '{}' bootstrap after commit conflict",
                                 DEFAULT_DB
                             );
+                            Ok(DefaultDatabaseVisibleStep::RetryAfterConflict)
                         }
-                        Err(err) => return Err(anyhow!(err)),
+                        Err(err) => Err(anyhow!(err)),
                     }
                 }
             }
         }
+        .await;
+        if matches!(
+            &result,
+            Err(_) | Ok(DefaultDatabaseVisibleStep::RetryAfterConflict)
+        ) {
+            txn.rollback().await.ok();
+        }
+        result
     }
 
     async fn read_visible_default_database_id(&self) -> Result<Option<u64>> {
         const DEFAULT_DB: &str = "postgres";
-        let mut txn = self.begin_optimistic().await?;
-        let result = async {
-            let mapped_id = self.get_database_id(&mut txn, DEFAULT_DB).await?;
-            let mapped_def = match mapped_id {
-                Some(id) => self.get_database_by_id(&mut txn, id).await?,
-                None => None,
+        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+            let mut txn = match self.begin_optimistic().await {
+                Ok(txn) => txn,
+                Err(err) => {
+                    if retry_database_metadata_read(
+                        "read_visible_default_database_id begin",
+                        attempt,
+                        &err,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
             };
-            let matching_ids = self
-                .list_exact_default_database_definition_ids(&mut txn)
-                .await?;
-            visible_default_database_id(mapped_id, mapped_def.as_ref(), &matching_ids)
+            let result = async {
+                let mapped_id = self.get_database_id(&mut txn, DEFAULT_DB).await?;
+                let mapped_def = match mapped_id {
+                    Some(id) => self.get_database_by_id(&mut txn, id).await?,
+                    None => None,
+                };
+                let matching_ids = self
+                    .list_exact_default_database_definition_ids(&mut txn)
+                    .await?;
+                visible_default_database_id(mapped_id, mapped_def.as_ref(), &matching_ids)
+            }
+            .await;
+            txn.rollback().await.ok();
+            match result {
+                Ok(id) => return Ok(id),
+                Err(err) => {
+                    if retry_database_metadata_read(
+                        "read_visible_default_database_id",
+                        attempt,
+                        &err,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
-        .await;
-        txn.rollback().await.ok();
-        result
+
+        unreachable!("default database visibility read retry loop must return");
     }
 
     /// Fetch a database definition by ID (storage format v2).
@@ -1176,12 +1553,7 @@ mod tests {
     #[test]
     fn default_database_repair_uses_visible_mapping_when_target_exists() {
         let mapped = postgres_def(1);
-        let action = choose_default_database_repair_action(
-            Some(1),
-            Some(&mapped),
-            std::slice::from_ref(&mapped),
-        )
-        .unwrap();
+        let action = choose_default_database_repair_action(Some(1), Some(&mapped), &[1]).unwrap();
         assert_eq!(action, DefaultDatabaseRepairAction::UseVisible(1));
     }
 
@@ -1224,12 +1596,8 @@ mod tests {
     #[test]
     fn default_database_repair_fails_closed_when_visible_mapping_has_ghost_duplicate() {
         let mapped = postgres_def(1);
-        let err = choose_default_database_repair_action(
-            Some(1),
-            Some(&mapped),
-            &[mapped.clone(), postgres_def(42)],
-        )
-        .unwrap_err();
+        let err =
+            choose_default_database_repair_action(Some(1), Some(&mapped), &[1, 42]).unwrap_err();
         assert!(
             err.to_string().contains("ambiguous"),
             "unexpected error: {err:?}"
@@ -1237,46 +1605,34 @@ mod tests {
     }
 
     #[test]
-    fn default_database_repair_restores_unique_existing_postgres_definition() {
-        let other = named_db(7, "appdb");
-        let ghost = postgres_def(42);
-        let action = choose_default_database_repair_action(None, None, &[other, ghost]).unwrap();
+    fn default_database_repair_restores_unique_raw_postgres_definition() {
+        let action = choose_default_database_repair_action(None, None, &[42]).unwrap();
         assert_eq!(action, DefaultDatabaseRepairAction::RestoreNameMapping(42));
     }
 
     #[test]
     fn default_database_repair_restores_when_mapping_points_to_missing_definition() {
-        let ghost = postgres_def(42);
-        let action =
-            choose_default_database_repair_action(Some(5), None, std::slice::from_ref(&ghost))
-                .unwrap();
+        let action = choose_default_database_repair_action(Some(5), None, &[42]).unwrap();
         assert_eq!(action, DefaultDatabaseRepairAction::RestoreNameMapping(42));
     }
 
     #[test]
     fn default_database_repair_bootstraps_when_no_postgres_definition_exists() {
-        let action =
-            choose_default_database_repair_action(None, None, &[named_db(7, "appdb")]).unwrap();
+        let action = choose_default_database_repair_action(None, None, &[]).unwrap();
         assert_eq!(action, DefaultDatabaseRepairAction::BootstrapNew);
     }
 
     #[test]
     fn default_database_repair_bootstraps_when_only_mixed_case_postgres_exists() {
         let mixed_case = named_db(42, "Postgres");
-        let action = choose_default_database_repair_action(
-            Some(42),
-            Some(&mixed_case),
-            std::slice::from_ref(&mixed_case),
-        )
-        .unwrap();
+        let action =
+            choose_default_database_repair_action(Some(42), Some(&mixed_case), &[]).unwrap();
         assert_eq!(action, DefaultDatabaseRepairAction::BootstrapNew);
     }
 
     #[test]
     fn default_database_repair_fails_closed_on_ambiguous_postgres_definitions() {
-        let err =
-            choose_default_database_repair_action(None, None, &[postgres_def(1), postgres_def(2)])
-                .unwrap_err();
+        let err = choose_default_database_repair_action(None, None, &[1, 2]).unwrap_err();
         assert!(
             err.to_string().contains("ambiguous"),
             "unexpected error: {err:?}"
@@ -1286,12 +1642,7 @@ mod tests {
     #[test]
     fn default_database_repair_ignores_distinct_mixed_case_postgres_name() {
         let mapped = postgres_def(1);
-        let action = choose_default_database_repair_action(
-            Some(1),
-            Some(&mapped),
-            &[mapped.clone(), named_db(42, "Postgres")],
-        )
-        .unwrap();
+        let action = choose_default_database_repair_action(Some(1), Some(&mapped), &[1]).unwrap();
         assert_eq!(action, DefaultDatabaseRepairAction::UseVisible(1));
     }
 
@@ -1305,9 +1656,39 @@ mod tests {
     }
 
     #[test]
+    fn database_fence_retry_detector_matches_wrapped_tikv_write_conflict() {
+        let err = anyhow::Error::new(tikv_client::Error::PessimisticLockError {
+            inner: Box::new(tikv_client::Error::MultipleKeyErrors(vec![
+                tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                    conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                    ..Default::default()
+                })),
+            ])),
+            success_keys: vec![],
+        })
+        .context("failed to fence tenant databases");
+
+        assert!(error_chain_contains_write_conflict(&err));
+    }
+
+    #[test]
     fn default_database_commit_conflict_detector_ignores_non_conflict_errors() {
         let err = tikv_client::Error::StringError("boom".to_string());
         assert!(!tikv_error_contains_write_conflict(&err));
+    }
+
+    #[test]
+    fn database_commit_conflict_detector_rejects_undetermined_outcome() {
+        let err = tikv_client::Error::UndeterminedError(Box::new(tikv_client::Error::KeyError(
+            Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }),
+        )));
+        assert!(!tikv_error_contains_write_conflict(&err));
+
+        let anyhow_err = anyhow::Error::new(err).context("commit outcome unknown");
+        assert!(!error_chain_contains_write_conflict(&anyhow_err));
     }
 
     #[test]
@@ -1451,6 +1832,69 @@ mod tests {
         TikvStore::new_system(pd_endpoints, &keyspace)
             .await
             .expect("init raw system store")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn default_database_active_resolution_rejects_fencing_postgres() {
+        let store = liveness_test_store("default_active").await;
+        let db_id = store
+            .resolve_active_database_id("postgres", "admin")
+            .await
+            .expect("bootstrap default database")
+            .expect("default database should be active after bootstrap");
+
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let def = store
+                .get_database_by_id(&mut txn, db_id)
+                .await
+                .expect("load default database")
+                .expect("default database metadata must exist");
+            let mut lifecycle = DatabaseLifecycle::active(db_id, def.created_at);
+            lifecycle.state = DatabaseLifecycleState::Fencing;
+            lifecycle.epoch = 2;
+            lifecycle.fence_ts_ms = Some(1235);
+            lifecycle.drop_started_at_ms = Some(1235);
+            store
+                .put_database_lifecycle(&mut txn, &lifecycle)
+                .await
+                .expect("put fencing lifecycle");
+            txn.commit().await.expect("commit fencing lifecycle");
+        }
+        {
+            let mut txn = store.begin().await.expect("begin");
+            let name_key = store.key(&encode_database_name_key("postgres"));
+            txn_delete(&mut txn, name_key)
+                .await
+                .expect("delete default database name mapping");
+            txn.commit().await.expect("commit missing name mapping");
+        }
+
+        assert_eq!(
+            store
+                .ensure_default_database_visible("admin")
+                .await
+                .expect("visible resolver repairs to existing metadata"),
+            db_id,
+            "default database repair must not bootstrap a replacement for a fenced definition"
+        );
+        assert_eq!(
+            store
+                .resolve_active_database_id("postgres", "admin")
+                .await
+                .expect("active resolver should not error"),
+            None,
+            "new admission must reject a lifecycle-fenced default database"
+        );
+        assert_eq!(
+            store
+                .lookup_database_id("postgres")
+                .await
+                .expect("non-default resolver should not error"),
+            None,
+            "default and non-default admission must agree on fenced databases"
+        );
     }
 
     #[tokio::test]

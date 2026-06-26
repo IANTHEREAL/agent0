@@ -13,6 +13,9 @@ use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
 use crate::extensions::fs::ws::tenant_from_keyspace;
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::protocol::parse_tenant_username;
+use crate::storage::retry::{
+    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 /// File-system access mode derived from the authenticated PG role.
@@ -171,95 +174,119 @@ pub(crate) async fn handle_auth(
     let store = tenant_handle.store().clone();
     let auth_manager = AuthManager::new();
 
-    if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
-        let mut bootstrap_txn = store.begin().await.map_err(|err| {
-            WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
+    auth_manager
+        .ensure_bootstrapped_with_retry(&store, "fs websocket auth bootstrap")
+        .await
+        .map_err(|err| {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("auth bootstrap failed: {err}"),
+            )
         })?;
-        match auth_manager.bootstrap(&mut bootstrap_txn).await {
-            Ok(()) => {
-                if let Err(err) = bootstrap_txn.commit().await {
-                    let _ = bootstrap_txn.rollback().await;
-                    if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
-                        return Err(WsResponse::error(
-                            id,
-                            WsErrorCode::Eio,
-                            format!("txn commit failed: {err}"),
-                        ));
-                    }
+
+    let mut resolved_access_mode = None;
+    for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+        let mut auth_txn = match store.begin().await {
+            Ok(txn) => txn,
+            Err(err) => {
+                if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(&err) {
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+                        "retrying FS websocket auth begin after transient TiKV error"
+                    );
+                    region_error_backoff(attempt).await;
+                    continue;
                 }
+                return Err(WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("txn begin failed: {err}"),
+                ));
+            }
+        };
+
+        let auth_result = dispatch_db9_auth(
+            &auth_manager,
+            &mut auth_txn,
+            auth_mode,
+            &keyspace,
+            &actual_user,
+            password,
+        )
+        .await;
+
+        let success = match auth_result {
+            Ok((Some(success), _)) => success,
+            Ok((None, failure)) => {
+                let _ = auth_txn.rollback().await;
+                let response = map_auth_failure(id, &actual_user, failure);
+                return Err(response);
             }
             Err(err) => {
-                let _ = bootstrap_txn.rollback().await;
-                if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
-                    return Err(WsResponse::error(
-                        id,
-                        WsErrorCode::Eio,
-                        format!("auth bootstrap failed: {err}"),
-                    ));
+                let _ = auth_txn.rollback().await;
+                if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(&err) {
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+                        "retrying FS websocket auth dispatch after transient TiKV error"
+                    );
+                    region_error_backoff(attempt).await;
+                    continue;
                 }
+                return Err(WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("authentication query failed: {err}"),
+                ));
             }
-        }
-    }
+        };
 
-    let mut auth_txn = store.begin().await.map_err(|err| {
-        WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
-    })?;
-
-    let (success, failure) = match dispatch_db9_auth(
-        &auth_manager,
-        &mut auth_txn,
-        auth_mode,
-        &keyspace,
-        &actual_user,
-        password,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
+        if !success.user.can_login {
             let _ = auth_txn.rollback().await;
             return Err(WsResponse::error(
                 id,
-                WsErrorCode::Eio,
-                format!("authentication query failed: {err}"),
+                WsErrorCode::Eauth,
+                format!("role \"{actual_user}\" is not permitted to log in"),
             ));
         }
-    };
 
-    let success = match success {
-        Some(s) => s,
-        None => {
-            let _ = auth_txn.rollback().await;
-            let response = map_auth_failure(id, &actual_user, failure);
-            return Err(response);
+        // Determine fs access mode from verified privilege facts, not
+        // from the role name string. A custom-named superuser
+        // (`DB9_BOOTSTRAP_ADMIN_USER=postgres` or any later
+        // `CREATE ROLE ... SUPERUSER`) gets the same ReadWrite tier a
+        // session named `admin` would, matching SQL fs9_* perms.
+        let access_mode = match access_mode_for_principal(success.user.is_superuser, &actual_user) {
+            Ok(mode) => mode,
+            Err(msg) => {
+                let _ = auth_txn.rollback().await;
+                return Err(WsResponse::error(id, WsErrorCode::Eacces, msg));
+            }
+        };
+
+        if let Err(commit_err) = auth_txn.commit().await {
+            let err = anyhow::anyhow!(commit_err);
+            if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(&err) {
+                tracing::info!(
+                    attempt = attempt + 1,
+                    max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+                    "retrying FS websocket auth commit after transient TiKV error"
+                );
+                region_error_backoff(attempt).await;
+                continue;
+            }
+            return Err(WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("txn commit failed: {err}"),
+            ));
         }
-    };
 
-    if !success.user.can_login {
-        let _ = auth_txn.rollback().await;
-        return Err(WsResponse::error(
-            id,
-            WsErrorCode::Eauth,
-            format!("role \"{actual_user}\" is not permitted to log in"),
-        ));
+        resolved_access_mode = Some(access_mode);
+        break;
     }
-
-    // Determine fs access mode from verified privilege facts, not
-    // from the role name string. A custom-named superuser
-    // (`DB9_BOOTSTRAP_ADMIN_USER=postgres` or any later
-    // `CREATE ROLE ... SUPERUSER`) gets the same ReadWrite tier a
-    // session named `admin` would, matching SQL fs9_* perms.
-    let access_mode = match access_mode_for_principal(success.user.is_superuser, &actual_user) {
-        Ok(mode) => mode,
-        Err(msg) => {
-            let _ = auth_txn.rollback().await;
-            return Err(WsResponse::error(id, WsErrorCode::Eacces, msg));
-        }
-    };
-
-    auth_txn.commit().await.map_err(|err| {
-        WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}"))
-    })?;
+    let access_mode = resolved_access_mode.expect("FS websocket auth retry loop must return");
 
     let database_id = resolve_database_id(id, &store, &database_name).await?;
 
@@ -327,36 +354,23 @@ async fn resolve_database_id(
     store: &crate::storage::TikvStore,
     database_name: &str,
 ) -> Result<u64, WsResponse> {
-    let database_id = if database_name == "postgres" {
-        store
-            .ensure_default_database_visible(&default_database_bootstrap_owner())
-            .await
-            .map_err(|err| {
-                WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("database lookup failed: {err}"),
-                )
-            })?
-    } else {
-        match store
-            .lookup_database_id(database_name)
-            .await
-            .map_err(|err| {
-                WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("database lookup failed: {err}"),
-                )
-            })? {
-            Some(database_id) => database_id,
-            None => {
-                return Err(WsResponse::error(
-                    id,
-                    WsErrorCode::Enoent,
-                    format!("database \"{database_name}\" does not exist"),
-                ));
-            }
+    let database_id = match store
+        .resolve_active_database_id(database_name, &default_database_bootstrap_owner())
+        .await
+        .map_err(|err| {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("database lookup failed: {err}"),
+            )
+        })? {
+        Some(database_id) => database_id,
+        None => {
+            return Err(WsResponse::error(
+                id,
+                WsErrorCode::Enoent,
+                format!("database \"{database_name}\" does not exist"),
+            ));
         }
     };
 

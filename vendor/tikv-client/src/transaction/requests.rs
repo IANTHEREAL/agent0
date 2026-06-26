@@ -561,6 +561,73 @@ impl Merge<ResponseWithShard<kvrpcpb::PessimisticLockResponse, Vec<kvrpcpb::Muta
 
         let mut out = Vec::new();
         for ResponseWithShard(resp, mutations) in input.into_iter().map(Result::unwrap) {
+            if resp.results.is_empty() && !mutations.is_empty() {
+                let legacy_single_value = {
+                    #[allow(deprecated)]
+                    {
+                        resp.value
+                    }
+                };
+                let legacy_single_commit_ts = {
+                    #[allow(deprecated)]
+                    {
+                        resp.commit_ts
+                    }
+                };
+                let values = resp.values;
+                let not_founds = resp.not_founds;
+                if values.is_empty() && not_founds.is_empty() {
+                    if legacy_single_commit_ts != 0 || !legacy_single_value.is_empty() {
+                        if mutations.len() != 1 {
+                            return Err(Error::StringError(format!(
+                                "pessimistic lock legacy singular force result is valid only for one mutation, got {}",
+                                mutations.len()
+                            )));
+                        }
+
+                        let mutation = mutations.into_iter().next().unwrap();
+                        // The deprecated singular response has no explicit existence bit.
+                        // Preserve the legacy empty-value heuristic used by plural fallback.
+                        out.push(PessimisticLockResult {
+                            key: Key::from(mutation.key),
+                            value: (!legacy_single_value.is_empty()).then_some(legacy_single_value),
+                            locked_with_conflict_ts: legacy_single_commit_ts,
+                        });
+                        continue;
+                    }
+
+                    return Err(Error::StringError(format!(
+                        "pessimistic lock returned neither force results nor legacy values for {} mutations",
+                        mutations.len()
+                    )));
+                }
+
+                if (!values.is_empty() && values.len() != mutations.len())
+                    || (!not_founds.is_empty() && not_founds.len() != mutations.len())
+                {
+                    return Err(Error::StringError(format!(
+                        "pessimistic lock legacy result count mismatch: {} values / {} not_founds for {} mutations",
+                        values.len(),
+                        not_founds.len(),
+                        mutations.len()
+                    )));
+                }
+
+                for (idx, mutation) in mutations.into_iter().enumerate() {
+                    let value = values.get(idx).cloned().unwrap_or_default();
+                    let exists = not_founds
+                        .get(idx)
+                        .map(|not_found| !*not_found)
+                        .unwrap_or_else(|| !value.is_empty());
+                    out.push(PessimisticLockResult {
+                        key: Key::from(mutation.key),
+                        value: exists.then_some(value),
+                        locked_with_conflict_ts: 0,
+                    });
+                }
+                continue;
+            }
+
             if resp.results.len() != mutations.len() {
                 return Err(Error::StringError(format!(
                     "pessimistic lock force result count mismatch: {} results for {} mutations",
@@ -1391,5 +1458,139 @@ mod tests {
         assert_eq!(result[1].key, key2.to_vec().into());
         assert_eq!(result[1].value, Some(value2.to_vec()));
         assert_eq!(result[1].locked_with_conflict_ts, conflict_ts);
+    }
+
+    #[tokio::test]
+    async fn test_merge_pessimistic_lock_force_falls_back_to_legacy_values() {
+        let key = b"key";
+        let value = b"value";
+
+        let resp = ResponseWithShard(
+            kvrpcpb::PessimisticLockResponse {
+                values: vec![value.to_vec()],
+                not_founds: vec![false],
+                results: vec![],
+                ..Default::default()
+            },
+            vec![kvrpcpb::Mutation {
+                op: kvrpcpb::Op::PessimisticLock.into(),
+                key: key.to_vec(),
+                ..Default::default()
+            }],
+        );
+
+        let result = CollectPessimisticLockResultsWithShard
+            .merge(vec![Ok(resp)])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key, key.to_vec().into());
+        assert_eq!(result[0].value, Some(value.to_vec()));
+        assert_eq!(result[0].locked_with_conflict_ts, 0);
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn test_merge_pessimistic_lock_force_falls_back_to_legacy_singular_value() {
+        let key = b"key";
+        let value = b"value";
+        let conflict_ts = 150;
+
+        let resp = ResponseWithShard(
+            kvrpcpb::PessimisticLockResponse {
+                value: value.to_vec(),
+                commit_ts: conflict_ts,
+                results: vec![],
+                ..Default::default()
+            },
+            vec![kvrpcpb::Mutation {
+                op: kvrpcpb::Op::PessimisticLock.into(),
+                key: key.to_vec(),
+                ..Default::default()
+            }],
+        );
+
+        let result = CollectPessimisticLockResultsWithShard
+            .merge(vec![Ok(resp)])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].key, key.to_vec().into());
+        assert_eq!(result[0].value, Some(value.to_vec()));
+        assert_eq!(result[0].locked_with_conflict_ts, conflict_ts);
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn test_merge_pessimistic_lock_legacy_singular_rejects_multi_key() {
+        let key1 = b"key1";
+        let key2 = b"key2";
+
+        let resp = ResponseWithShard(
+            kvrpcpb::PessimisticLockResponse {
+                value: b"value".to_vec(),
+                commit_ts: 150,
+                results: vec![],
+                ..Default::default()
+            },
+            vec![
+                kvrpcpb::Mutation {
+                    op: kvrpcpb::Op::PessimisticLock.into(),
+                    key: key1.to_vec(),
+                    ..Default::default()
+                },
+                kvrpcpb::Mutation {
+                    op: kvrpcpb::Op::PessimisticLock.into(),
+                    key: key2.to_vec(),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let err = CollectPessimisticLockResultsWithShard
+            .merge(vec![Ok(resp)])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pessimistic lock legacy singular force result"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_pessimistic_lock_legacy_rejects_partial_nonempty_results() {
+        let key1 = b"key1";
+        let key2 = b"key2";
+        let value = b"value";
+
+        let resp = ResponseWithShard(
+            kvrpcpb::PessimisticLockResponse {
+                values: vec![value.to_vec()],
+                not_founds: vec![false, false],
+                results: vec![],
+                ..Default::default()
+            },
+            vec![
+                kvrpcpb::Mutation {
+                    op: kvrpcpb::Op::PessimisticLock.into(),
+                    key: key1.to_vec(),
+                    ..Default::default()
+                },
+                kvrpcpb::Mutation {
+                    op: kvrpcpb::Op::PessimisticLock.into(),
+                    key: key2.to_vec(),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let err = CollectPessimisticLockResultsWithShard
+            .merge(vec![Ok(resp)])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pessimistic lock legacy result count mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -1100,7 +1100,7 @@ fn tikv_error_contains_write_conflict(err: &tikv_client::Error) -> bool {
         tikv_client::Error::PessimisticLockError { inner, .. } => {
             tikv_error_contains_write_conflict(inner)
         }
-        tikv_client::Error::UndeterminedError(inner) => tikv_error_contains_write_conflict(inner),
+        tikv_client::Error::UndeterminedError(_) => false,
         tikv_client::Error::ExtractedErrors(errors)
         | tikv_client::Error::MultipleKeyErrors(errors) => {
             errors.iter().any(tikv_error_contains_write_conflict)
@@ -1138,10 +1138,9 @@ where
 /// Classify a subgroup commit error into a stable `execution.*` category
 /// by downcasting the error chain (no string parsing).
 ///
-/// For TiKV container errors (`ExtractedErrors`, `MultipleKeyErrors`,
-/// `UndeterminedError`), recursively inspects inner errors rather than
-/// blanket-labeling — only classifies as `txn_conflict` when the inner
-/// errors actually indicate conflict.
+/// For TiKV container errors (`ExtractedErrors`, `MultipleKeyErrors`),
+/// recursively inspects inner errors rather than blanket-labeling. An
+/// `UndeterminedError` is terminal because retrying can double-apply writes.
 fn classify_group_commit_error(err: &anyhow::Error) -> &'static str {
     // Check for TiKV write conflict via recursive inspection of the error chain.
     if err.chain().any(|cause| {
@@ -1270,6 +1269,18 @@ mod classify_tests {
         let container = tikv_client::Error::ExtractedErrors(vec![non_conflict]);
         let err = anyhow::anyhow!(container);
         assert_eq!(classify_group_commit_error(&err), "execution.unknown");
+    }
+
+    #[test]
+    fn classify_undetermined_commit_outcome_is_not_txn_conflict() {
+        let key_err =
+            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                ..Default::default()
+            }));
+        let err = anyhow::anyhow!(tikv_client::Error::UndeterminedError(Box::new(key_err)));
+        assert_eq!(classify_group_commit_error(&err), "execution.unknown");
+        assert!(!is_retryable_subgroup_error(&err));
     }
 
     #[test]
@@ -1480,6 +1491,32 @@ mod classify_tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "should fail on first attempt without retrying"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_undetermined_outcome_not_retried() {
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_on_lifecycle_conflict(5, |_attempt| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                let key_err =
+                    tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
+                        conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
+                        ..Default::default()
+                    }));
+                Err::<&str, _>(anyhow::anyhow!(tikv_client::Error::UndeterminedError(
+                    Box::new(key_err)
+                )))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unknown commit outcomes must fail closed without retry"
         );
     }
 }

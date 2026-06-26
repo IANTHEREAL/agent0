@@ -8,6 +8,9 @@ use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure, Verifi
 use crate::config;
 use crate::observability;
 use crate::sql::{Executor, Session};
+use crate::storage::retry::{
+    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+};
 use crate::storage::TikvStore;
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -107,6 +110,35 @@ fn apply_budget_hard_guard_tightening(
 }
 
 type AuthDispatchOutcome = (Option<crate::auth::Db9AuthDispatchSuccess>, Option<String>);
+
+fn should_retry_auth_dispatch_error(attempt: u32, err: &anyhow::Error) -> bool {
+    attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err)
+}
+
+async fn retry_auth_metadata_error(
+    operation: &'static str,
+    attempt: u32,
+    err: &anyhow::Error,
+) -> bool {
+    if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err) {
+        info!(
+            attempt = attempt + 1,
+            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+            operation,
+            "retrying authentication metadata operation after transient TiKV error"
+        );
+        region_error_backoff(attempt).await;
+        true
+    } else {
+        false
+    }
+}
+
+fn is_missing_tenant_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:?}");
+    text.contains("does not exist")
+        && (text.contains("Tenant") || text.contains("tenant") || text.contains("keyspace"))
+}
 
 fn default_database_bootstrap_owner() -> String {
     config::env_string("DB9_BOOTSTRAP_ADMIN_USER").unwrap_or_else(|| "admin".to_string())
@@ -227,27 +259,31 @@ impl DynamicPgHandler {
             )
         };
 
-        let database_id = if database_name == "postgres" {
-            store
-                .ensure_default_database_visible(&default_database_bootstrap_owner())
-                .await
-                .map_err(|e| fatal_internal(e.to_string()))?
-        } else {
-            match store
-                .lookup_database_id(&database_name)
-                .await
-                .map_err(|e| fatal_internal(e.to_string()))?
-            {
-                Some(id) => id,
-                None => {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "3D000".to_owned(),
-                        format!("database \"{}\" does not exist", database_name),
-                    ))));
-                }
+        let database_id = match store
+            .resolve_active_database_id(&database_name, &default_database_bootstrap_owner())
+            .await
+            .map_err(|e| fatal_internal(e.to_string()))?
+        {
+            Some(id) => id,
+            None => {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    "3D000".to_owned(),
+                    format!("database \"{}\" does not exist", database_name),
+                ))));
             }
         };
+        if !store
+            .database_active(database_id)
+            .await
+            .map_err(|e| fatal_internal(e.to_string()))?
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(),
+                "3D000".to_owned(),
+                format!("database \"{}\" does not exist", database_name),
+            ))));
+        }
 
         // Cache the principal identity before the username is moved into session.
         let principal_id = username.as_deref().unwrap_or("unknown").to_string();
@@ -323,156 +359,160 @@ impl DynamicPgHandler {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        let store = if let Some(pool) = &self.client_pool {
-            match pool.get_client(effective_keyspace).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("does not exist") {
-                        error!("Tenant '{}' does not exist (user: {})", ks_name, username);
-                    } else {
-                        error!("Failed to connect to TiKV for tenant '{}': {}", ks_name, e);
+        let store = {
+            let mut resolved = None;
+            for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+                let result = if let Some(pool) = &self.client_pool {
+                    pool.get_client(effective_keyspace.clone()).await
+                } else {
+                    TikvStore::new_with_keyspace(
+                        self.pd_endpoints.clone(),
+                        effective_keyspace.clone(),
+                    )
+                    .await
+                    .map(Arc::new)
+                };
+
+                match result {
+                    Ok(store) => {
+                        resolved = Some(store);
+                        break;
                     }
-                    return Ok(AuthResult {
-                        is_authenticated: false,
-                        is_superuser: false,
-                        bypass_rls: false,
-                        connection_limit: -1,
-                        trusted_jwt_claims: None,
-                        failure_reason: None,
-                    });
+                    Err(err) if is_missing_tenant_error(&err) => {
+                        error!("Tenant '{}' does not exist (user: {})", ks_name, username);
+                        return Ok(AuthResult {
+                            is_authenticated: false,
+                            is_superuser: false,
+                            bypass_rls: false,
+                            connection_limit: -1,
+                            trusted_jwt_claims: None,
+                            failure_reason: None,
+                        });
+                    }
+                    Err(err) => {
+                        let err = err.context(format!(
+                            "Failed to open authentication metadata store for tenant '{}'",
+                            ks_name
+                        ));
+                        if retry_auth_metadata_error("open auth metadata store", attempt, &err)
+                            .await
+                        {
+                            continue;
+                        }
+                        return Err(err);
+                    }
                 }
             }
-        } else {
-            match TikvStore::new_with_keyspace(self.pd_endpoints.clone(), effective_keyspace).await
-            {
-                Ok(s) => Arc::new(s),
-                Err(e) => {
-                    error!("Failed to connect to TiKV: {}", e);
-                    return Ok(AuthResult {
-                        is_authenticated: false,
-                        is_superuser: false,
-                        bypass_rls: false,
-                        connection_limit: -1,
-                        trusted_jwt_claims: None,
-                        failure_reason: None,
-                    });
-                }
-            }
+            resolved.expect("auth metadata store retry loop must return")
         };
 
         let auth_manager = AuthManager::new();
 
-        // Skip bootstrap write transaction if auth is already initialized.
-        if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
-            let mut txn = store.begin().await.context("Failed to bootstrap auth")?;
-            match auth_manager.bootstrap(&mut txn).await {
-                Ok(()) => {
-                    if let Err(commit_err) = txn.commit().await {
-                        if let Err(e) = txn.rollback().await {
-                            tracing::warn!("rollback failed: {e}");
-                        }
-                        if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
-                            return Err(commit_err).context("Failed to bootstrap auth");
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Race: another connection may have bootstrapped concurrently.
-                    // Re-check and proceed if now initialized; otherwise propagate.
-                    if let Err(rb_err) = txn.rollback().await {
-                        warn!("rollback failed after auth bootstrap error: {}", rb_err);
-                    }
-                    if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
-                        return Err(e.context("Failed to bootstrap auth"));
-                    }
-                }
-            }
-        }
-
-        let mut txn = store
-            .begin_optimistic()
+        auth_manager
+            .ensure_bootstrapped_with_retry(&store, "pgwire auth bootstrap")
             .await
-            .context("Failed to begin transaction")?;
+            .context("Failed to bootstrap auth")?;
 
         let auth_mode = config::db9_auth_mode();
-        let auth_outcome: Result<AuthDispatchOutcome, anyhow::Error> = dispatch_db9_auth(
-            &auth_manager,
-            &mut txn,
-            auth_mode,
-            &ks_name,
-            username,
-            password,
-        )
-        .await
-        .and_then(|(success, failure)| {
-            if let Some(success) = success.as_ref() {
-                if !success.user.can_login {
-                    return Err(
-                        crate::sql::error::SqlError::InvalidAuthorizationSpecification {
-                            message: format!("role \"{}\" is not permitted to log in", username),
-                        }
-                        .into(),
-                    );
-                }
-            }
+        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
+            let mut txn = store
+                .begin_optimistic()
+                .await
+                .context("Failed to begin transaction")?;
 
-            let failure_reason = match failure {
-                Some(Db9AuthDispatchFailure::TokenRequired) => {
-                    Some("Token authentication required (DB9_AUTH_MODE=token)".to_string())
+            let auth_outcome: Result<AuthDispatchOutcome, anyhow::Error> = dispatch_db9_auth(
+                &auth_manager,
+                &mut txn,
+                auth_mode,
+                &ks_name,
+                username,
+                password,
+            )
+            .await
+            .and_then(|(success, failure)| {
+                if let Some(success) = success.as_ref() {
+                    if !success.user.can_login {
+                        return Err(
+                            crate::sql::error::SqlError::InvalidAuthorizationSpecification {
+                                message: format!(
+                                    "role \"{}\" is not permitted to log in",
+                                    username
+                                ),
+                            }
+                            .into(),
+                        );
+                    }
                 }
-                Some(Db9AuthDispatchFailure::JwtFailed(err)) => Some(format!(
-                    "Token authentication failed for user \"{username}\": {err}"
-                )),
-                Some(Db9AuthDispatchFailure::JwtUserNotFound) => Some(format!(
-                    "Token authentication failed for user \"{username}\""
-                )),
-                Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => Some(format!(
-                    "Connect-key authentication failed for user \"{username}\": {err}"
-                )),
-                Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => Some(format!(
-                    "Connect-key authentication failed for user \"{username}\""
-                )),
-                None => None,
-            };
 
-            Ok((success, failure_reason))
-        });
+                let failure_reason = match failure {
+                    Some(Db9AuthDispatchFailure::TokenRequired) => {
+                        Some("Token authentication required (DB9_AUTH_MODE=token)".to_string())
+                    }
+                    Some(Db9AuthDispatchFailure::JwtFailed(err)) => Some(format!(
+                        "Token authentication failed for user \"{username}\": {err}"
+                    )),
+                    Some(Db9AuthDispatchFailure::JwtUserNotFound) => Some(format!(
+                        "Token authentication failed for user \"{username}\""
+                    )),
+                    Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => Some(format!(
+                        "Connect-key authentication failed for user \"{username}\": {err}"
+                    )),
+                    Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => Some(format!(
+                        "Connect-key authentication failed for user \"{username}\""
+                    )),
+                    None => None,
+                };
 
-        match auth_outcome {
-            Ok((Some(success), _)) => {
-                if let Err(e) = txn.rollback().await {
-                    warn!("rollback failed after auth success: {}", e);
+                Ok((success, failure_reason))
+            });
+
+            match auth_outcome {
+                Ok((Some(success), _)) => {
+                    if let Err(e) = txn.rollback().await {
+                        warn!("rollback failed after auth success: {}", e);
+                    }
+                    return Ok(AuthResult {
+                        is_authenticated: true,
+                        is_superuser: success.user.is_superuser,
+                        bypass_rls: success.user.bypass_rls,
+                        connection_limit: success.user.connection_limit,
+                        trusted_jwt_claims: success.trusted_jwt_claims,
+                        failure_reason: None,
+                    });
                 }
-                Ok(AuthResult {
-                    is_authenticated: true,
-                    is_superuser: success.user.is_superuser,
-                    bypass_rls: success.user.bypass_rls,
-                    connection_limit: success.user.connection_limit,
-                    trusted_jwt_claims: success.trusted_jwt_claims,
-                    failure_reason: None,
-                })
-            }
-            Ok((None, failure_reason)) => {
-                if let Err(e) = txn.rollback().await {
-                    warn!("rollback failed after auth rejection: {}", e);
+                Ok((None, failure_reason)) => {
+                    if let Err(e) = txn.rollback().await {
+                        warn!("rollback failed after auth rejection: {}", e);
+                    }
+                    return Ok(AuthResult {
+                        is_authenticated: false,
+                        is_superuser: false,
+                        bypass_rls: false,
+                        connection_limit: -1,
+                        trusted_jwt_claims: None,
+                        failure_reason,
+                    });
                 }
-                Ok(AuthResult {
-                    is_authenticated: false,
-                    is_superuser: false,
-                    bypass_rls: false,
-                    connection_limit: -1,
-                    trusted_jwt_claims: None,
-                    failure_reason,
-                })
-            }
-            Err(e) => {
-                if let Err(rb_err) = txn.rollback().await {
-                    warn!("rollback failed after authentication error: {}", rb_err);
+                Err(e) => {
+                    if let Err(rb_err) = txn.rollback().await {
+                        warn!("rollback failed after authentication error: {}", rb_err);
+                    }
+                    let auth_err = e.context("Authentication error");
+                    if should_retry_auth_dispatch_error(attempt, &auth_err) {
+                        info!(
+                            attempt = attempt + 1,
+                            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
+                            "retrying authentication metadata read after transient TiKV error"
+                        );
+                        region_error_backoff(attempt).await;
+                        continue;
+                    }
+                    return Err(auth_err);
                 }
-                Err(e.context("Authentication error"))
             }
         }
+
+        unreachable!("authentication dispatch retry loop must return")
     }
 }
 
@@ -820,7 +860,7 @@ async fn idle_in_transaction_watchdog(
 
 #[cfg(test)]
 mod tests {
-    use super::AuthResult;
+    use super::{should_retry_auth_dispatch_error, AuthResult};
 
     #[test]
     fn auth_result_authenticated_superuser() {
@@ -869,6 +909,48 @@ mod tests {
         assert!(is_authenticated);
         assert!(!is_superuser);
         assert_eq!(connection_limit, 5);
+    }
+
+    #[test]
+    fn auth_dispatch_retry_policy_retries_transient_tikv_errors_within_budget() {
+        let err = anyhow::Error::new(tikv_client::Error::GrpcAPI(tonic::Status::unavailable(
+            "connection refused",
+        )))
+        .context("Authentication error");
+
+        assert!(should_retry_auth_dispatch_error(0, &err));
+        assert!(!should_retry_auth_dispatch_error(
+            crate::storage::retry::REGION_ERROR_MAX_RETRIES,
+            &err
+        ));
+    }
+
+    #[test]
+    fn auth_dispatch_retry_policy_does_not_retry_auth_rejections() {
+        let err =
+            anyhow::Error::msg("password authentication failed").context("Authentication error");
+
+        assert!(!should_retry_auth_dispatch_error(0, &err));
+    }
+
+    #[test]
+    fn startup_init_executor_uses_active_database_admission_gate() {
+        let source = include_str!("startup.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("startup.rs must contain #[cfg(test)]");
+        let init_executor = prod_source
+            .split("pub(in crate::protocol::handler) async fn init_executor")
+            .nth(1)
+            .and_then(|rest| rest.split("let mut session = match username").next())
+            .expect("startup.rs must define init_executor database admission block");
+
+        assert!(
+            init_executor.contains(".resolve_active_database_id(")
+                && init_executor.contains(".database_active(database_id)"),
+            "pgwire startup must check per-database lifecycle before creating a Session"
+        );
     }
 
     /// Watchdog terminates a session that has been idle in a transaction

@@ -1,53 +1,5 @@
 use super::*;
 
-/// Maximum retries for TiKV region errors (RegionNotFound, EpochNotMatch, etc.)
-/// that can occur after region split/merge operations.
-pub(crate) const REGION_ERROR_MAX_RETRIES: u32 = 3;
-
-/// Returns `true` if the error originated from a TiKV region routing issue
-/// (split, merge, leader transfer) that is expected to resolve on retry with
-/// a fresh transaction whose region cache has been refreshed.
-///
-/// Excludes non-routing `RegionError` variants that tikv-client surfaces
-/// without internal retry: `server_is_busy` (handled by AIMD backpressure),
-/// `raft_entry_too_large` (deterministic, won't resolve on retry),
-/// `max_timestamp_not_synced`, and `disk_full`.
-pub(crate) fn is_retryable_region_error(err: &anyhow::Error) -> bool {
-    fn is_retryable_region(err: &tikv_client::Error) -> bool {
-        match err {
-            tikv_client::Error::RegionError(re) => {
-                // tikv-client internally retries most routing errors
-                // (not_leader, epoch_not_match, region_not_found, stale_command).
-                // It only surfaces these non-routing errors as RegionError:
-                re.server_is_busy.is_none()
-                    && re.raft_entry_too_large.is_none()
-                    && re.max_timestamp_not_synced.is_none()
-                    && re.disk_full.is_none()
-            }
-            tikv_client::Error::UndeterminedError(inner) => is_retryable_region(inner),
-            tikv_client::Error::ExtractedErrors(errors)
-            | tikv_client::Error::MultipleKeyErrors(errors) => {
-                // all(): if ANY error in the batch is non-retryable (e.g. DiskFull),
-                // do not retry. Matches TiKV's own aggregate error predicate semantics.
-                !errors.is_empty() && errors.iter().all(is_retryable_region)
-            }
-            _ => false,
-        }
-    }
-
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<tikv_client::Error>()
-            .is_some_and(is_retryable_region)
-    })
-}
-
-/// Backoff sleep for region error retries: 500ms, 1s, 2s, ...
-pub(crate) async fn region_error_backoff(attempt: u32) {
-    let ms = 500u64 * (1u64 << attempt.min(4));
-    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-}
-
 pub(super) fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
     let args = command
         .strip_prefix("__backfill_index ")
@@ -770,7 +722,8 @@ pub(super) async fn execute_hnsw_merge(
             }
             Ok(None) => break,
             Err(e)
-                if is_retryable_region_error(&e) && region_retries < REGION_ERROR_MAX_RETRIES =>
+                if is_retryable_tikv_transient_error(&e)
+                    && region_retries < REGION_ERROR_MAX_RETRIES =>
             {
                 region_retries += 1;
                 warn!(
@@ -778,7 +731,7 @@ pub(super) async fn execute_hnsw_merge(
                     index_id,
                     attempt = region_retries,
                     max_retries = REGION_ERROR_MAX_RETRIES,
-                    "HNSW merge: region error, retrying with fresh transaction: {e}"
+                    "HNSW merge: transient TiKV error, retrying with fresh transaction: {e}"
                 );
                 region_error_backoff(region_retries - 1).await;
             }

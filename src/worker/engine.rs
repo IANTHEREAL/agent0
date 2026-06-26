@@ -16,6 +16,9 @@ use crate::worker::metrics::WorkerMetrics;
 
 mod helpers;
 
+pub(crate) use crate::storage::retry::{
+    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+};
 use crate::worker::now_epoch_ms;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
@@ -27,9 +30,6 @@ use helpers::{
 pub(crate) use helpers::{
     cleanup_hnsw_s3_graph_upload_after_failed_txn, hnsw_s3_graph_version_for_txn,
     put_hnsw_s3_graph_with_intent,
-};
-pub(crate) use helpers::{
-    is_retryable_region_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
 };
 use pgwire::tokio::CancellationToken;
 use std::collections::{HashMap, HashSet};
@@ -3554,13 +3554,15 @@ pub(crate) async fn enqueue_pending_hnsw_merges(
 
         match result {
             Ok(r) => return Ok(r),
-            Err(e) if is_retryable_region_error(&e) && attempt < REGION_ERROR_MAX_RETRIES => {
+            Err(e)
+                if is_retryable_tikv_transient_error(&e) && attempt < REGION_ERROR_MAX_RETRIES =>
+            {
                 warn!(
                     keyspace,
                     db_id,
                     attempt = attempt + 1,
                     max_retries = REGION_ERROR_MAX_RETRIES,
-                    "HNSW sweep: region error, retrying with fresh transaction: {e}"
+                    "HNSW sweep: transient TiKV error, retrying with fresh transaction: {e}"
                 );
                 region_error_backoff(attempt).await;
             }
@@ -3793,6 +3795,8 @@ fn compute_next_fire_time(schedule: &str) -> Result<i64> {
     Ok(next.timestamp_millis())
 }
 
+#[cfg(test)]
+pub(crate) use crate::storage::retry::is_retryable_region_error;
 #[cfg(test)]
 use helpers::check_graph_oversize_freeze;
 #[cfg(test)]

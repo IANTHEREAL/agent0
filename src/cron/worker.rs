@@ -2,7 +2,7 @@ use crate::cron::config::CronConfig;
 use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::storage::TikvStore;
 use crate::worker::engine::{
-    is_retryable_region_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
+    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -202,7 +202,7 @@ async fn gc_database_batch(
             Ok(batch) => return Ok(batch),
             Err(e)
                 if attempt < GC_BATCH_MAX_RETRIES
-                    && (is_retryable_region_error(&e) || is_retryable_tikv_error(&e)) =>
+                    && (is_retryable_tikv_transient_error(&e) || is_retryable_tikv_error(&e)) =>
             {
                 warn!(
                     db_id,

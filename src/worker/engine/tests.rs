@@ -2931,21 +2931,25 @@ async fn dropped_db_tombstone_makes_cross_store_nextfire_orphan_impossible() {
         );
 
         // Reap stages the tombstone put on the SAME key the enqueue locked.
-        let reap_stage = system_store
-            .put_dropped_db_tombstone(&mut reap_txn, &keyspace, race_db_id)
-            .await;
+        let reap_stage = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            system_store.put_dropped_db_tombstone(&mut reap_txn, &keyspace, race_db_id),
+        )
+        .await;
 
-        // Commit both; at most one may succeed — they conflict on the tombstone.
-        let enq_ok = enq_txn.commit().await.is_ok();
-        let reap_ok = match reap_stage {
-            Ok(()) => reap_txn.commit().await.is_ok(),
-            Err(_) => {
+        let reap_staged = match reap_stage {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) | Err(_) => {
                 // Reap staging was blocked by the enqueue's pessimistic lock —
                 // i.e. the enqueue won contention; the reap made no progress.
                 reap_txn.rollback().await.ok();
                 false
             }
         };
+
+        // Commit both; at most one may succeed — they conflict on the tombstone.
+        let enq_ok = enq_txn.commit().await.is_ok();
+        let reap_ok = reap_staged && reap_txn.commit().await.is_ok();
         assert!(
             !(enq_ok && reap_ok),
             "INVARIANT VIOLATED: reap (tombstone) and fenced enqueue BOTH committed \
@@ -4311,6 +4315,9 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
 
         // [lookup] Check for superuser existence; immediate rollback.
         "is_initialized",
+        // [bootstrap] Auth bootstrap retry wrapper; each attempt opens one
+        // short-lived metadata txn and commits or rolls back before retrying.
+        "ensure_bootstrapped_with_retry",
         // ── extensions/fs/ws/auth.rs ──
 
         // [bootstrap] WebSocket auth bootstrap + auth check; immediate commit/rollback.
@@ -4493,14 +4500,30 @@ fn retryable_region_error_rejects_non_region_error() {
 }
 
 #[test]
-fn retryable_region_error_unwraps_undetermined() {
+fn retryable_tikv_transient_accepts_grpc_unavailable() {
+    let err = anyhow_tikv(tikv_client::Error::GrpcAPI(tonic::Status::unavailable(
+        "connection refused",
+    )));
+    assert!(super::is_retryable_tikv_transient_error(&err));
+}
+
+#[test]
+fn retryable_tikv_transient_rejects_grpc_invalid_argument() {
+    let err = anyhow_tikv(tikv_client::Error::GrpcAPI(
+        tonic::Status::invalid_argument("bad request"),
+    ));
+    assert!(!super::is_retryable_tikv_transient_error(&err));
+}
+
+#[test]
+fn retryable_region_error_rejects_undetermined_outcome() {
     let re = tikv_client::proto::errorpb::Error {
         region_not_found: Some(tikv_client::proto::errorpb::RegionNotFound::default()),
         ..Default::default()
     };
     let inner = tikv_client::Error::RegionError(Box::new(re));
     let err = anyhow_tikv(tikv_client::Error::UndeterminedError(Box::new(inner)));
-    assert!(super::is_retryable_region_error(&err));
+    assert!(!super::is_retryable_region_error(&err));
 }
 
 #[test]
