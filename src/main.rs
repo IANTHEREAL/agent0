@@ -62,6 +62,7 @@ const DEFAULT_METRICS_ADDR: &str = "0.0.0.0:9102";
 const DEFAULT_TOKIO_STACK_MB: usize = 8;
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const STARTUP_INVENTORY_REPAIR_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 struct WorkerRuntimeHandles {
     engine_handle: JoinHandle<()>,
@@ -509,22 +510,6 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         })?;
     worker::set_system_store(gc_store.clone());
     worker::set_worker_execution_enabled(worker_config.enabled);
-    let registered = worker::register_database_inventory(&gc_store, &store, &startup_keyspace)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to register startup database inventory for keyspace '{}': {}",
-                startup_keyspace,
-                e
-            )
-        })?;
-    if registered > 0 {
-        info!(
-            keyspace = %startup_keyspace,
-            registered,
-            "Registered startup databases in worker inventory"
-        );
-    }
 
     // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
     // the safepoint, another node in the cluster might. This only checks
@@ -878,6 +863,11 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
 
     let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?;
     info!("PostgreSQL server listening on {}", listener.local_addr()?);
+    let startup_inventory_repair_handle = spawn_startup_database_inventory_repair(
+        gc_store.clone(),
+        store.clone(),
+        startup_keyspace.clone(),
+    );
     let connect_host: &str = if pg_listen_addr == "0.0.0.0" {
         "127.0.0.1"
     } else if pg_listen_addr == "::" {
@@ -971,6 +961,7 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         &worker_config,
         &mut connection_tasks,
         worker_runtime,
+        startup_inventory_repair_handle,
         database_node_lease_handle,
         publisher_handle,
         advancer_handle,
@@ -1044,14 +1035,56 @@ async fn shutdown_server_runtime(
     worker_config: &worker::config::WorkerConfig,
     connection_tasks: &mut ConnectionTaskRegistry,
     worker_runtime: Option<WorkerRuntimeHandles>,
+    startup_inventory_repair_handle: JoinHandle<()>,
     database_node_lease_handle: JoinHandle<()>,
     publisher_handle: JoinHandle<()>,
     advancer_handle: Option<JoinHandle<()>>,
 ) {
     connection_tasks.shutdown().await;
+    abort_task(
+        "Startup database inventory repair",
+        startup_inventory_repair_handle,
+    )
+    .await;
     shutdown_worker_runtime(worker_runtime).await;
     shutdown_database_lifecycle_runtime(gc_store, worker_config, database_node_lease_handle).await;
     shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle).await;
+}
+
+fn spawn_startup_database_inventory_repair(
+    gc_store: Arc<storage::TikvStore>,
+    tenant_store: Arc<storage::TikvStore>,
+    startup_keyspace: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut attempt = 0_u64;
+        loop {
+            attempt += 1;
+            match worker::register_database_inventory(&gc_store, &tenant_store, &startup_keyspace)
+                .await
+            {
+                Ok(registered) => {
+                    info!(
+                        keyspace = %startup_keyspace,
+                        registered,
+                        attempt,
+                        "Startup database inventory repair completed"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        keyspace = %startup_keyspace,
+                        attempt,
+                        retry_delay_seconds = STARTUP_INVENTORY_REPAIR_RETRY_DELAY.as_secs(),
+                        error = %e,
+                        "Startup database inventory repair failed; retrying"
+                    );
+                    tokio::time::sleep(STARTUP_INVENTORY_REPAIR_RETRY_DELAY).await;
+                }
+            }
+        }
+    })
 }
 
 async fn shutdown_database_lifecycle_runtime(
@@ -1407,6 +1440,33 @@ mod tests {
         assert!(
             startup_publish < pg_listener_bind,
             "database lifecycle node lease startup publish must complete before pgwire accepts traffic"
+        );
+    }
+
+    #[test]
+    fn startup_inventory_repair_starts_after_pgwire_bind() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let listener_bind = prod_source
+            .find("let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?")
+            .expect("main.rs must bind the pgwire listener");
+        let repair_spawn = prod_source
+            .find("spawn_startup_database_inventory_repair(")
+            .expect("startup inventory repair must be spawned");
+        let repair_call = prod_source
+            .find("worker::register_database_inventory(")
+            .expect("startup inventory repair must still call register_database_inventory");
+
+        assert!(
+            listener_bind < repair_spawn,
+            "startup inventory repair must not start before pgwire binds"
+        );
+        assert!(
+            repair_spawn < repair_call,
+            "register_database_inventory must run from the spawned repair task, not inline before bind"
         );
     }
 
