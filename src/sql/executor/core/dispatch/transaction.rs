@@ -3,8 +3,7 @@
 use super::super::*;
 use super::guc::build_show_all_result;
 use super::utils::{
-    apply_statement_timeout, capture_transaction_characteristics, effective_retry_timeout,
-    remaining_statement_timeout, restore_transaction_characteristics,
+    apply_statement_timeout, effective_retry_timeout, remaining_statement_timeout,
     validate_begin_transaction_modes,
 };
 
@@ -599,7 +598,7 @@ impl Executor {
                                 self.mark_init_cache_invalidation_pending();
                             }
                             if let Err(err) = session.commit().await {
-                                let retryable = is_retryable_tikv_commit_error(&err);
+                                let retryable = is_retryable_tikv_error(&err);
                                 session
                                     .rollback_for_retry_or_abandon("ddl_dml_commit_error")
                                     .await;
@@ -773,17 +772,11 @@ impl Executor {
                             );
                             self.observability
                                 .record_retry_attempt(extract_write_conflict_reason(&err));
-                            let transaction_characteristics =
-                                capture_transaction_characteristics(session);
                             session
                                 .rollback_for_retry_or_abandon("explicit_first_statement_retry")
                                 .await;
                             self.clear_trigger_activations();
                             session.begin().await?;
-                            restore_transaction_characteristics(
-                                session,
-                                &transaction_characteristics,
-                            )?;
                             autocommit_backoff(attempt).await;
                             continue;
                         }
@@ -1183,13 +1176,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{context} cleanup must be present"));
             if context == "ddl_dml_commit_error" || context == "ddl_dml_statement_error" {
                 let prefix = &execute_fn[..context_pos];
-                let retry_classifier = if context == "ddl_dml_commit_error" {
-                    "let retryable = is_retryable_tikv_commit_error(&err);"
-                } else {
-                    "let retryable = is_retryable_tikv_error(&err);"
-                };
                 let retryable_pos = prefix
-                    .rfind(retry_classifier)
+                    .rfind("let retryable = is_retryable_tikv_error(&err);")
                     .unwrap_or_else(|| panic!("{context} must classify the original error"));
                 assert!(
                     retryable_pos < context_pos,
@@ -1201,11 +1189,6 @@ mod tests {
         assert!(
             execute_fn.contains("rollback_for_retry_or_abandon"),
             "retry cleanup must abandon a failed rollback instead of leaking 25P02"
-        );
-        assert!(
-            execute_fn.contains("capture_transaction_characteristics(session)")
-                && execute_fn.contains("restore_transaction_characteristics("),
-            "explicit first-statement retry must preserve BEGIN transaction characteristics"
         );
     }
 

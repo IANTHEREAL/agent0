@@ -11,9 +11,6 @@ use crate::pool::ConcurrencyGuard;
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::prepared_analysis::PreparedAnalysis;
 use crate::sql::ExecuteResult;
-use crate::storage::retry::{
-    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
-};
 use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::portal::Portal;
@@ -116,10 +113,6 @@ pub(in crate::protocol::handler) fn is_transaction_control_stmts(stmts: &[Statem
                     | Statement::SetTransaction { .. }
             )
         })
-}
-
-fn should_retry_prepared_analysis_error(attempt: u32, err: &anyhow::Error) -> bool {
-    attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err)
 }
 
 /// Reject RawSqlUtility that should have been analyzed.
@@ -1119,153 +1112,130 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             // mint time — without it `init_juicefs_backend` rejects the call.
             let tenant_keyspace = executor.tenant_keyspace().to_string();
             let tikv_client = store.transaction_client();
-            let must_analyze = param_count > 0 || is_data_statement_stmts(stmts);
+            let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
+                is_superuser,
+                bypass_rls,
+                &tenant_keyspace,
+            )
+            .with_tikv_client(tikv_client)
+            .with_authenticated_role(authenticated_role);
 
-            // Temporary read-only transaction for catalog access. Extended Parse
-            // is side-effect free, so transient TiKV catalog failures are safest
-            // to retry by discarding the whole temporary transaction and starting
-            // over with a fresh one.
-            for attempt in 0..=REGION_ERROR_MAX_RETRIES {
-                let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
-                    is_superuser,
-                    bypass_rls,
-                    &tenant_keyspace,
-                )
-                .with_tikv_client(tikv_client.clone())
-                .with_authenticated_role(authenticated_role.clone());
-
-                let mut txn = match store.begin().await {
-                    Ok(txn) => txn,
-                    Err(e) => {
-                        // Can't begin txn -- reject data/parameterized SQL.
-                        // Uses cached AST for classification (no re-parse).
-                        if is_data_statement_stmts(stmts) {
-                            let err = e;
-                            if should_retry_prepared_analysis_error(attempt, &err) {
-                                tracing::info!(
-                                    attempt = attempt + 1,
-                                    max_attempts = REGION_ERROR_MAX_RETRIES + 1,
-                                    "retrying prepared statement catalog begin after transient TiKV error"
-                                );
-                                region_error_backoff(attempt).await;
-                                continue;
-                            }
-                            return Err(PgWireError::UserError(Box::new(executor_error_info(
-                                &err,
-                            ))));
-                        } else if param_count > 0 {
-                            let err: anyhow::Error = SqlError::InvalidParameterUsage {
-                                index: 1,
-                                context: "utility statements do not support parameters".into(),
-                            }
-                            .into();
-                            return Err(PgWireError::UserError(Box::new(executor_error_info(
-                                &err,
-                            ))));
-                        }
-                        // Utility, no params -- keep RawSqlUtility
-                        break;
-                    }
-                };
-
-                let analysis_result = crate::extensions::context::with_context_opts(
-                    ext_opts,
-                    executor.analyze_for_prepared_with_statements(
-                        &mut txn,
-                        db_id,
-                        &search_path,
-                        stmts,
-                        param_count,
-                        &client_oids,
-                    ),
-                )
-                .await;
-                let _ = txn.rollback().await; // read-only, discard
-
-                match analysis_result {
-                    Ok(analysis) => {
-                        match analysis {
-                            PreparedAnalysis::Query {
-                                analyzed,
-                                locks,
-                                select_into,
-                                output_schema,
-                                param_types,
-                                base_table_names,
-                                table_versions,
-                                has_recursive_cte,
-                                rls_sensitive,
-                            } => {
-                                let required_privileges = base_table_names
-                                    .into_iter()
-                                    .map(|t| (t, Privilege::Select))
-                                    .collect();
-                                stored.parameter_types =
-                                    merge_parameter_types(&stored.parameter_types, &param_types);
-                                stored.statement = PreparedStatement {
-                                    sql: stored.statement.sql,
-                                    exec: PreparedExec::AnalyzedQuery {
-                                        analyzed,
-                                        locks,
-                                        select_into,
-                                        required_privileges,
-                                        has_recursive_cte,
-                                    },
+            // Temporary read-only transaction for catalog access
+            match store.begin().await {
+                Ok(mut txn) => {
+                    match crate::extensions::context::with_context_opts(
+                        ext_opts,
+                        executor.analyze_for_prepared_with_statements(
+                            &mut txn,
+                            db_id,
+                            &search_path,
+                            stmts,
+                            param_count,
+                            &client_oids,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(analysis) => {
+                            match analysis {
+                                PreparedAnalysis::Query {
+                                    analyzed,
+                                    locks,
+                                    select_into,
                                     output_schema,
-                                    param_data_types: param_types,
+                                    param_types,
+                                    base_table_names,
+                                    table_versions,
+                                    has_recursive_cte,
+                                    rls_sensitive,
+                                } => {
+                                    let required_privileges = base_table_names
+                                        .into_iter()
+                                        .map(|t| (t, Privilege::Select))
+                                        .collect();
+                                    stored.parameter_types = merge_parameter_types(
+                                        &stored.parameter_types,
+                                        &param_types,
+                                    );
+                                    stored.statement = PreparedStatement {
+                                        sql: stored.statement.sql,
+                                        exec: PreparedExec::AnalyzedQuery {
+                                            analyzed,
+                                            locks,
+                                            select_into,
+                                            required_privileges,
+                                            has_recursive_cte,
+                                        },
+                                        output_schema,
+                                        param_data_types: param_types,
+                                        table_versions,
+                                        rls_sensitive,
+                                    };
+                                }
+                                PreparedAnalysis::Dml {
+                                    analyzed,
+                                    output_schema,
+                                    param_types,
                                     table_versions,
                                     rls_sensitive,
-                                };
-                            }
-                            PreparedAnalysis::Dml {
-                                analyzed,
-                                output_schema,
-                                param_types,
-                                table_versions,
-                                rls_sensitive,
-                                has_with_cte,
-                            } => {
-                                let required_privileges =
-                                    PreparedStatement::compute_privileges(&analyzed, &[]);
-                                stored.parameter_types =
-                                    merge_parameter_types(&stored.parameter_types, &param_types);
-                                stored.statement = PreparedStatement {
-                                    sql: stored.statement.sql,
-                                    exec: PreparedExec::AnalyzedDml {
-                                        analyzed,
-                                        required_privileges,
-                                        has_with_cte,
-                                    },
-                                    output_schema,
-                                    param_data_types: param_types,
-                                    table_versions,
-                                    rls_sensitive,
-                                };
-                            }
-                            PreparedAnalysis::Utility => {
-                                // Keep RawSqlUtility
+                                    has_with_cte,
+                                } => {
+                                    let required_privileges =
+                                        PreparedStatement::compute_privileges(&analyzed, &[]);
+                                    stored.parameter_types = merge_parameter_types(
+                                        &stored.parameter_types,
+                                        &param_types,
+                                    );
+                                    stored.statement = PreparedStatement {
+                                        sql: stored.statement.sql,
+                                        exec: PreparedExec::AnalyzedDml {
+                                            analyzed,
+                                            required_privileges,
+                                            has_with_cte,
+                                        },
+                                        output_schema,
+                                        param_data_types: param_types,
+                                        table_versions,
+                                        rls_sensitive,
+                                    };
+                                }
+                                PreparedAnalysis::Utility => {
+                                    // Keep RawSqlUtility
+                                }
                             }
                         }
-                        break;
-                    }
-                    Err(e) if must_analyze => {
-                        // Data statements and parameterized statements must be analyzed.
-                        if should_retry_prepared_analysis_error(attempt, &e) {
-                            tracing::info!(
-                                attempt = attempt + 1,
-                                max_attempts = REGION_ERROR_MAX_RETRIES + 1,
-                                "retrying prepared statement analysis after transient TiKV error"
-                            );
-                            region_error_backoff(attempt).await;
-                            continue;
+                        Err(e) if param_count > 0 || is_data_statement_stmts(stmts) => {
+                            // Data statements and parameterized statements must be analyzed.
+                            let _ = txn.rollback().await;
+                            return Err(PgWireError::UserError(Box::new(executor_error_info(&e))));
                         }
-
-                        return Err(PgWireError::UserError(Box::new(executor_error_info(&e))));
+                        Err(_) => {
+                            // Utility, no params -- keep RawSqlUtility
+                        }
                     }
-                    Err(_) => {
-                        // Utility, no params -- keep RawSqlUtility
-                        break;
+                    let _ = txn.rollback().await; // read-only, discard
+                }
+                Err(e) => {
+                    // Can't begin txn -- reject data/parameterized SQL.
+                    // Uses cached AST for classification (no re-parse).
+                    if is_data_statement_stmts(stmts) {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "XX000".to_string(),
+                            format!(
+                                "cannot describe data statement: failed to begin catalog transaction: {}",
+                                e
+                            ),
+                        ))));
+                    } else if param_count > 0 {
+                        let err: anyhow::Error = SqlError::InvalidParameterUsage {
+                            index: 1,
+                            context: "utility statements do not support parameters".into(),
+                        }
+                        .into();
+                        return Err(PgWireError::UserError(Box::new(executor_error_info(&err))));
                     }
+                    // Utility, no params -- keep RawSqlUtility
                 }
             }
         }
@@ -1681,51 +1651,6 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prepared_analysis_retry_policy_retries_transient_tikv_errors_within_budget() {
-        let err: anyhow::Error =
-            tikv_client::Error::GrpcAPI(tonic::Status::unavailable("connection refused")).into();
-
-        assert!(should_retry_prepared_analysis_error(0, &err));
-        assert!(should_retry_prepared_analysis_error(
-            REGION_ERROR_MAX_RETRIES - 1,
-            &err
-        ));
-        assert!(!should_retry_prepared_analysis_error(
-            REGION_ERROR_MAX_RETRIES,
-            &err
-        ));
-    }
-
-    #[test]
-    fn prepared_analysis_retry_policy_does_not_retry_non_transient_errors() {
-        let err = anyhow::anyhow!("not a TiKV transient error");
-
-        assert!(!should_retry_prepared_analysis_error(0, &err));
-    }
-
-    #[test]
-    fn prepared_catalog_begin_failure_uses_retry_and_central_error_mapping() {
-        let source = include_str!("query.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("query.rs must contain #[cfg(test)]");
-        let begin_error_branch = prod_source
-            .split("let mut txn = match store.begin().await")
-            .nth(1)
-            .and_then(|rest| rest.split("let analysis_result =").next())
-            .expect("extended parse must contain catalog begin handling");
-
-        assert!(
-            begin_error_branch.contains("should_retry_prepared_analysis_error(attempt, &err)")
-                && begin_error_branch.contains("executor_error_info")
-                && begin_error_branch.contains("&err")
-                && !begin_error_branch.contains("\"XX000\""),
-            "catalog begin failures must retry safe transients and use centralized SQLSTATE mapping"
-        );
-    }
 
     #[test]
     fn transaction_control_detected() {

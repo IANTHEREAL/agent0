@@ -31,16 +31,6 @@ impl FakeBatchStatStore {
     }
 }
 
-#[test]
-fn retryable_tikv_write_conflict_rejects_undetermined_outcome() {
-    let key_err = tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
-        conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-        ..Default::default()
-    }));
-    let err = anyhow::anyhow!(tikv_client::Error::UndeterminedError(Box::new(key_err)));
-    assert!(!is_retryable_tikv_write_conflict(&err));
-}
-
 #[async_trait]
 impl BatchStatStore for FakeBatchStatStore {
     async fn load_root_inode(&mut self) -> Result<Option<Inode>> {

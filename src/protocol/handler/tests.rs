@@ -292,68 +292,6 @@ fn test_sqlstate_for_executor_error() {
     };
     let tikv_wc = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(write_conflict_ke)));
     assert_eq!(sqlstate_for_executor_error(&tikv_wc), "40001");
-    let exhausted_autocommit_wc = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(
-        tikv_client::proto::kvrpcpb::KeyError {
-            conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-            ..Default::default()
-        },
-    )))
-    .context("autocommit update failed after 32 attempts");
-    assert_eq!(
-        sqlstate_for_executor_error(&exhausted_autocommit_wc),
-        "40001"
-    );
-
-    // TiKV transient failures that escape safe local retry boundaries also
-    // force a whole-transaction retry.
-    let tikv_unavailable = anyhow::Error::new(tikv_client::Error::GrpcAPI(
-        tonic::Status::unavailable("connection refused"),
-    ));
-    assert_eq!(sqlstate_for_executor_error(&tikv_unavailable), "40001");
-    let tikv_pessimistic_unavailable =
-        anyhow::Error::new(tikv_client::Error::PessimisticLockError {
-            inner: Box::new(tikv_client::Error::GrpcAPI(tonic::Status::unavailable(
-                "connection refused",
-            ))),
-            success_keys: Vec::new(),
-        });
-    assert_eq!(
-        sqlstate_for_executor_error(&tikv_pessimistic_unavailable),
-        "40001"
-    );
-    let wrapped_tikv_unavailable: anyhow::Error = SqlError::Internal(anyhow::Error::new(
-        tikv_client::Error::GrpcAPI(tonic::Status::unavailable("connection refused")),
-    ))
-    .into();
-    assert_eq!(
-        sqlstate_for_executor_error(&wrapped_tikv_unavailable),
-        "40001"
-    );
-    let undetermined_commit = anyhow::Error::new(tikv_client::Error::UndeterminedError(Box::new(
-        tikv_client::Error::GrpcAPI(tonic::Status::unavailable("commit response lost")),
-    )));
-    assert_eq!(sqlstate_for_executor_error(&undetermined_commit), "40003");
-    let undetermined_write_conflict =
-        anyhow::Error::new(tikv_client::Error::UndeterminedError(Box::new(
-            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
-                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-                ..Default::default()
-            })),
-        )));
-    assert_eq!(
-        sqlstate_for_executor_error(&undetermined_write_conflict),
-        "40003"
-    );
-    let wrapped_undetermined_commit: anyhow::Error = SqlError::Internal(anyhow::Error::new(
-        tikv_client::Error::UndeterminedError(Box::new(tikv_client::Error::GrpcAPI(
-            tonic::Status::unavailable("commit response lost"),
-        ))),
-    ))
-    .into();
-    assert_eq!(
-        sqlstate_for_executor_error(&wrapped_undetermined_commit),
-        "40003"
-    );
 
     // TiKV Deadlock → 40P01 (deadlock_detected).
     let deadlock_ke = tikv_client::proto::kvrpcpb::KeyError {
@@ -362,42 +300,6 @@ fn test_sqlstate_for_executor_error() {
     };
     let tikv_dl = anyhow::Error::new(tikv_client::Error::KeyError(Box::new(deadlock_ke)));
     assert_eq!(sqlstate_for_executor_error(&tikv_dl), "40P01");
-
-    // TiKV AlreadyExist from insert-if-absent → 23505 (unique_violation),
-    // including the nested pessimistic-lock shape observed from stale INSERT.
-    let already_exists_ke = tikv_client::proto::kvrpcpb::KeyError {
-        already_exist: Some(tikv_client::proto::kvrpcpb::AlreadyExist::default()),
-        ..Default::default()
-    };
-    let tikv_already_exists = anyhow::Error::new(tikv_client::Error::PessimisticLockError {
-        inner: Box::new(tikv_client::Error::MultipleKeyErrors(vec![
-            tikv_client::Error::KeyError(Box::new(already_exists_ke)),
-        ])),
-        success_keys: Vec::new(),
-    });
-    assert_eq!(sqlstate_for_executor_error(&tikv_already_exists), "23505");
-    let wrapped_already_exists_ke = tikv_client::proto::kvrpcpb::KeyError {
-        already_exist: Some(tikv_client::proto::kvrpcpb::AlreadyExist::default()),
-        ..Default::default()
-    };
-    let wrapped_tikv_already_exists: anyhow::Error = SqlError::Internal(anyhow::Error::new(
-        tikv_client::Error::PessimisticLockError {
-            inner: Box::new(tikv_client::Error::MultipleKeyErrors(vec![
-                tikv_client::Error::KeyError(Box::new(wrapped_already_exists_ke)),
-            ])),
-            success_keys: Vec::new(),
-        },
-    ))
-    .into();
-    assert_eq!(
-        sqlstate_for_executor_error(&wrapped_tikv_already_exists),
-        "23505"
-    );
-    let wrapped_plain_internal: anyhow::Error = SqlError::Internal(anyhow::anyhow!("boom")).into();
-    assert_eq!(
-        sqlstate_for_executor_error(&wrapped_plain_internal),
-        "XX000"
-    );
 
     // SqlError downcast path: each variant gets correct SQLSTATE
     let cases: Vec<(SqlError, &str)> = vec![
@@ -578,29 +480,6 @@ fn test_pg_error_message_sanitizes_tikv_errors() {
         "could not serialize access due to concurrent update"
     );
 
-    let tikv_unavailable = anyhow::Error::new(tikv_client::Error::GrpcAPI(
-        tonic::Status::unavailable("connection refused"),
-    ));
-    assert_eq!(
-        pg_error_message(&tikv_unavailable, "40001"),
-        "could not serialize access due to transient storage failure"
-    );
-    let wrapped_tikv_unavailable: anyhow::Error = SqlError::Internal(anyhow::Error::new(
-        tikv_client::Error::GrpcAPI(tonic::Status::unavailable("connection refused")),
-    ))
-    .into();
-    assert_eq!(
-        pg_error_message(&wrapped_tikv_unavailable, "40001"),
-        "could not serialize access due to transient storage failure"
-    );
-    let undetermined_commit = anyhow::Error::new(tikv_client::Error::UndeterminedError(Box::new(
-        tikv_client::Error::GrpcAPI(tonic::Status::unavailable("commit response lost")),
-    )));
-    assert_eq!(
-        pg_error_message(&undetermined_commit, "40003"),
-        "transaction outcome is unknown; manual reconciliation may be required"
-    );
-
     let storage_wc = anyhow::Error::new(StorageError::WriteConflict {
         reason: WriteConflictReason::Optimistic,
     });
@@ -619,38 +498,6 @@ fn test_pg_error_message_sanitizes_tikv_errors() {
     assert_eq!(
         pg_error_message(&storage_deadlock, "40P01"),
         "deadlock detected"
-    );
-
-    let already_exists_ke = tikv_client::proto::kvrpcpb::KeyError {
-        already_exist: Some(tikv_client::proto::kvrpcpb::AlreadyExist::default()),
-        ..Default::default()
-    };
-    let tikv_already_exists = anyhow::Error::new(tikv_client::Error::PessimisticLockError {
-        inner: Box::new(tikv_client::Error::MultipleKeyErrors(vec![
-            tikv_client::Error::KeyError(Box::new(already_exists_ke)),
-        ])),
-        success_keys: Vec::new(),
-    });
-    assert_eq!(
-        pg_error_message(&tikv_already_exists, "23505"),
-        "duplicate key value violates unique constraint"
-    );
-    let wrapped_already_exists_ke = tikv_client::proto::kvrpcpb::KeyError {
-        already_exist: Some(tikv_client::proto::kvrpcpb::AlreadyExist::default()),
-        ..Default::default()
-    };
-    let wrapped_tikv_already_exists: anyhow::Error = SqlError::Internal(anyhow::Error::new(
-        tikv_client::Error::PessimisticLockError {
-            inner: Box::new(tikv_client::Error::MultipleKeyErrors(vec![
-                tikv_client::Error::KeyError(Box::new(wrapped_already_exists_ke)),
-            ])),
-            success_keys: Vec::new(),
-        },
-    ))
-    .into();
-    assert_eq!(
-        pg_error_message(&wrapped_tikv_already_exists, "23505"),
-        "duplicate key value violates unique constraint"
     );
 
     // SqlError → preserves original message (not sanitized).

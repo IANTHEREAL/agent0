@@ -432,34 +432,21 @@ impl TikvStore {
             match tikv_op!(txn.commit().await) {
                 Ok(_) => return Ok(Some(def)),
                 Err(e) => {
-                    let retryable_write_conflict = tikv_error_contains_write_conflict(&e);
-                    let retryable = retryable_write_conflict;
                     let _ = txn.rollback().await;
-                    if retryable {
-                        debug!(
-                            "autocommit sequence OID backfill failed (attempt {} of {}): {}",
-                            attempt + 1,
-                            AUTOCOMMIT_MAX_RETRIES,
-                            e
-                        );
-                        if attempt + 1 < AUTOCOMMIT_MAX_RETRIES {
-                            autocommit_retry_backoff(attempt).await;
-                            continue;
-                        }
-                        if !retryable_write_conflict {
-                            return Err(anyhow!(e));
-                        }
-                        return Err(anyhow::Error::new(e).context(format!(
-                            "autocommit sequence OID backfill failed after {} attempts",
-                            AUTOCOMMIT_MAX_RETRIES
-                        )));
-                    }
-                    return Err(anyhow!(e));
+                    debug!(
+                        "autocommit sequence OID backfill failed (attempt {} of {}): {}",
+                        attempt + 1,
+                        AUTOCOMMIT_MAX_RETRIES,
+                        e
+                    );
                 }
             }
         }
 
-        unreachable!("autocommit sequence OID backfill retry loop must return");
+        Err(anyhow!(
+            "autocommit sequence OID backfill failed after {} attempts",
+            AUTOCOMMIT_MAX_RETRIES
+        ))
     }
 
     pub async fn list_sequences(

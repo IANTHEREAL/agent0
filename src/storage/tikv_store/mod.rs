@@ -7,10 +7,6 @@ use crate::model::{
     ViewDef,
 };
 use crate::storage::backpressure::tikv_op;
-use crate::storage::tikv_store::retry::{
-    is_retryable_tikv_transient_error, region_error_backoff, retry_tikv_transient_operation,
-    REGION_ERROR_MAX_RETRIES,
-};
 use crate::txn::{txn_delete, txn_insert, txn_put, BatchMutation};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -32,7 +28,6 @@ pub(crate) mod indexes;
 mod migrations;
 mod policies;
 mod procedures;
-pub(crate) mod retry;
 mod schemas;
 mod sequences;
 mod statistics;
@@ -43,9 +38,7 @@ mod types;
 mod views;
 pub mod worker;
 pub use cron::CronClaimOutcome;
-pub(crate) use database::{
-    DatabaseDrainRequest, DatabaseDrainState, DatabaseNodeLease, FencedDatabase,
-};
+pub(crate) use database::{DatabaseDrainState, DatabaseNodeLease};
 pub use ddl_journal::{DdlJournalEntry, DdlOperation};
 pub use tables::RowScanCursor;
 pub use worker::WqIndexRow;
@@ -54,8 +47,7 @@ pub use worker::WqIndexRow;
 #[cfg(test)]
 use sequences::{nextval_standalone, setval_standalone};
 
-const AUTOCOMMIT_MAX_RETRIES: usize = 32;
-const AUTOCOMMIT_RETRY_MAX_BACKOFF_MS: u64 = 50;
+const AUTOCOMMIT_MAX_RETRIES: usize = 10;
 
 /// Maximum scan limit for TiKV operations.
 const SCAN_LIMIT: u32 = u32::MAX;
@@ -69,31 +61,6 @@ fn scan_limit_to_u32(limit: Option<usize>) -> u32 {
         Some(n) => u32::try_from(n).unwrap_or(u32::MAX),
         None => SCAN_LIMIT,
     }
-}
-
-fn tikv_error_contains_write_conflict(err: &tikv_client::Error) -> bool {
-    match err {
-        tikv_client::Error::KeyError(key_err) => key_err.conflict.is_some(),
-        tikv_client::Error::PessimisticLockError { inner, .. } => {
-            tikv_error_contains_write_conflict(inner)
-        }
-        tikv_client::Error::UndeterminedError(_) => false,
-        tikv_client::Error::ExtractedErrors(errors)
-        | tikv_client::Error::MultipleKeyErrors(errors) => {
-            errors.iter().any(tikv_error_contains_write_conflict)
-        }
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-fn is_retryable_autocommit_update_error(err: &tikv_client::Error) -> bool {
-    tikv_error_contains_write_conflict(err)
-}
-
-async fn autocommit_retry_backoff(attempt: usize) {
-    let delay_ms = (1_u64 << attempt.min(5)).min(AUTOCOMMIT_RETRY_MAX_BACKOFF_MS);
-    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 }
 
 fn column_comment_table_prefix_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
@@ -242,37 +209,6 @@ impl TikvStore {
         Ok(store)
     }
 
-    /// Create a raw TikvStore for an existing keyspace without bootstrapping
-    /// database metadata. Destructive admin paths use this so opening a
-    /// half-deleted tenant cannot recreate the default `postgres` database.
-    pub async fn new_keyspace_without_bootstrap(
-        pd_endpoints: Vec<String>,
-        keyspace: String,
-    ) -> Result<Self> {
-        info!(
-            "Connecting to TiKV at {:?} for raw keyspace {}",
-            pd_endpoints, keyspace
-        );
-        let mut config = Config::default().with_keyspace(&keyspace);
-
-        if let (Ok(ca), Ok(cert), Ok(key)) = (
-            std::env::var("TIKV_CA_PATH"),
-            std::env::var("TIKV_CERT_PATH"),
-            std::env::var("TIKV_KEY_PATH"),
-        ) {
-            info!("TiKV TLS enabled: ca={}, cert={}, key={}", ca, cert, key);
-            config = config.with_security(ca, cert, key);
-        }
-
-        let client = TransactionClient::new_with_config(pd_endpoints, config)
-            .await
-            .context("Failed to connect to TiKV")?;
-        Ok(Self {
-            client: Some(Arc::new(client)),
-            keyspace: Some(keyspace),
-        })
-    }
-
     #[cfg(test)]
     pub(crate) fn new_stub() -> Arc<Self> {
         use std::sync::OnceLock;
@@ -291,21 +227,13 @@ impl TikvStore {
     }
 
     pub async fn begin(&self) -> Result<Transaction> {
-        retry_tikv_transient_operation("pessimistic transaction begin", || async {
-            let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
-            tikv_op!(self.client().begin_with_options(options).await)
-        })
-        .await
-        .map_err(|e| anyhow!(e))
+        let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
+        tikv_op!(self.client().begin_with_options(options).await).map_err(|e| anyhow!(e))
     }
 
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
-        retry_tikv_transient_operation("optimistic transaction begin", || async {
-            let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-            tikv_op!(self.client().begin_with_options(options).await)
-        })
-        .await
-        .map_err(|e| anyhow!(e))
+        let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+        tikv_op!(self.client().begin_with_options(options).await).map_err(|e| anyhow!(e))
     }
 
     /// Begin a pessimistic transaction wrapped in the storage facade.
@@ -382,34 +310,21 @@ impl TikvStore {
             match tikv_op!(txn.commit().await) {
                 Ok(_) => return Ok(result),
                 Err(e) => {
-                    let retryable_write_conflict = tikv_error_contains_write_conflict(&e);
-                    let retryable = retryable_write_conflict;
                     let _ = txn.rollback().await;
-                    if retryable {
-                        debug!(
-                            "autocommit update failed (attempt {} of {}): {}",
-                            attempt + 1,
-                            AUTOCOMMIT_MAX_RETRIES,
-                            e
-                        );
-                        if attempt + 1 < AUTOCOMMIT_MAX_RETRIES {
-                            autocommit_retry_backoff(attempt).await;
-                            continue;
-                        }
-                        if !retryable_write_conflict {
-                            return Err(anyhow!(e));
-                        }
-                        return Err(anyhow::Error::new(e).context(format!(
-                            "autocommit update failed after {} attempts",
-                            AUTOCOMMIT_MAX_RETRIES
-                        )));
-                    }
-                    return Err(anyhow!(e));
+                    debug!(
+                        "autocommit update failed (attempt {} of {}): {}",
+                        attempt + 1,
+                        AUTOCOMMIT_MAX_RETRIES,
+                        e
+                    );
                 }
             }
         }
 
-        unreachable!("autocommit update retry loop must return");
+        Err(anyhow!(
+            "autocommit update failed after {} attempts",
+            AUTOCOMMIT_MAX_RETRIES
+        ))
     }
 
     /// Check or initialize the on-disk storage format version for this keyspace.
@@ -420,75 +335,50 @@ impl TikvStore {
     pub async fn check_format_version(&self) -> Result<()> {
         const STORAGE_FORMAT_VERSION: u32 = 2;
 
-        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
-            let mut txn = self.begin().await?;
-            let key = self.key(&encode_format_version_key());
+        let mut txn = self.begin().await?;
+        let key = self.key(&encode_format_version_key());
 
-            let result = async {
-                match tikv_op!(txn.get(key.clone()).await)? {
-                    Some(data) => {
-                        let bytes: [u8; 4] = data
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow!("Invalid format version value"))?;
-                        let version = u32::from_be_bytes(bytes);
-                        if version != STORAGE_FORMAT_VERSION {
-                            return Err(anyhow!(
-                                "Incompatible storage format: found v{}, expected v{}. \
-                                 Please re-initialize the keyspace or migrate data.",
-                                version,
-                                STORAGE_FORMAT_VERSION
-                            ));
-                        }
-                        txn.rollback().await.ok();
-                        Ok(())
-                    }
-                    None => {
-                        // New keyspace (or a legacy v1 keyspace). Refuse to auto-upgrade if we detect
-                        // v1 table metadata keys.
-                        let has_v1_tables =
-                            tikv_op!(txn.get(self.key(&encode_next_table_id_key())).await)?
-                                .is_some()
-                                || self
-                                    .prefix_has_any(&mut txn, encode_schema_prefix())
-                                    .await?;
-
-                        if has_v1_tables {
-                            return Err(anyhow!(
-                                "Storage format v1 detected (no format marker, but v1 table keys exist). \
-                                 This build requires storage format v2. Please re-initialize the keyspace."
-                            ));
-                        }
-
-                        txn_put(&mut txn, key, STORAGE_FORMAT_VERSION.to_be_bytes().to_vec())
-                            .await?;
-                        tikv_op!(txn.commit().await)?;
-                        Ok(())
-                    }
-                }
-            }
-            .await;
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(err) => {
+        match tikv_op!(txn.get(key.clone()).await)? {
+            Some(data) => {
+                let bytes: [u8; 4] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid format version value"))?;
+                let version = u32::from_be_bytes(bytes);
+                if version != STORAGE_FORMAT_VERSION {
                     txn.rollback().await.ok();
-                    if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(&err)
-                    {
-                        info!(
-                            attempt = attempt + 1,
-                            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
-                            "retrying storage format check after transient TiKV error"
-                        );
-                        region_error_backoff(attempt).await;
-                        continue;
-                    }
-                    return Err(err);
+                    return Err(anyhow!(
+                        "Incompatible storage format: found v{}, expected v{}. \
+                         Please re-initialize the keyspace or migrate data.",
+                        version,
+                        STORAGE_FORMAT_VERSION
+                    ));
                 }
+                txn.rollback().await.ok();
+                Ok(())
+            }
+            None => {
+                // New keyspace (or a legacy v1 keyspace). Refuse to auto-upgrade if we detect
+                // v1 table metadata keys.
+                let has_v1_tables = tikv_op!(txn.get(self.key(&encode_next_table_id_key())).await)?
+                    .is_some()
+                    || self
+                        .prefix_has_any(&mut txn, encode_schema_prefix())
+                        .await?;
+
+                if has_v1_tables {
+                    txn.rollback().await.ok();
+                    return Err(anyhow!(
+                        "Storage format v1 detected (no format marker, but v1 table keys exist). \
+                         This build requires storage format v2. Please re-initialize the keyspace."
+                    ));
+                }
+
+                txn_put(&mut txn, key, STORAGE_FORMAT_VERSION.to_be_bytes().to_vec()).await?;
+                tikv_op!(txn.commit().await)?;
+                Ok(())
             }
         }
-
-        unreachable!("storage format check retry loop must return");
     }
 
     /// Ensure the default `postgres` database exists (storage format v2).
@@ -1057,76 +947,6 @@ mod trigger_rename_tests {
 #[cfg(test)]
 mod util_tests {
     use super::*;
-
-    #[test]
-    fn tikv_transaction_begin_retries_transient_errors() {
-        let source = include_str!("mod.rs");
-        let prod_source = source
-            .split("\n#[cfg(test)]\nmod sequence_tests")
-            .next()
-            .expect("tikv_store/mod.rs must contain test modules");
-
-        for fn_name in [
-            "pub async fn begin(&self)",
-            "pub async fn begin_optimistic(&self)",
-        ] {
-            let begin_fn = prod_source
-                .split(fn_name)
-                .nth(1)
-                .unwrap_or_else(|| panic!("{fn_name} must exist"));
-            let begin_fn = begin_fn.split("\n    ///").next().unwrap_or(begin_fn);
-
-            assert!(
-                begin_fn.contains("retry_tikv_transient_operation("),
-                "{fn_name} must use the shared transient TiKV retry helper"
-            );
-            assert!(
-                begin_fn.contains("tikv_op!(self.client().begin_with_options(options).await)"),
-                "{fn_name} must preserve TiKV begin instrumentation"
-            );
-            assert!(
-                begin_fn.contains(".map_err(|e| anyhow!(e))"),
-                "{fn_name} must keep the existing anyhow error surface"
-            );
-        }
-    }
-
-    #[test]
-    fn autocommit_update_retry_classifier_fails_closed_on_undetermined() {
-        let write_conflict =
-            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
-                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-                ..Default::default()
-            }));
-        assert!(is_retryable_autocommit_update_error(&write_conflict));
-        let write_conflict_container =
-            tikv_client::Error::MultipleKeyErrors(vec![tikv_client::Error::KeyError(Box::new(
-                tikv_client::proto::kvrpcpb::KeyError {
-                    conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-                    ..Default::default()
-                },
-            ))]);
-        assert!(is_retryable_autocommit_update_error(
-            &write_conflict_container
-        ));
-
-        let transient =
-            tikv_client::Error::GrpcAPI(tonic::Status::unavailable("region endpoint unavailable"));
-        assert!(!is_retryable_autocommit_update_error(&transient));
-
-        let undetermined = tikv_client::Error::UndeterminedError(Box::new(
-            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
-                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-                ..Default::default()
-            })),
-        ));
-        assert!(!is_retryable_autocommit_update_error(&undetermined));
-        let undetermined_container =
-            tikv_client::Error::UndeterminedError(Box::new(write_conflict_container));
-        assert!(!is_retryable_autocommit_update_error(
-            &undetermined_container
-        ));
-    }
 
     #[test]
     fn scan_limit_to_u32_handles_none_zero_and_overflow() {

@@ -101,7 +101,6 @@ pub(super) const SYS_DATABASE_LIFECYCLE_PREFIX: &[u8] = b"_sys_dblifecycle_";
 pub(super) const SYS_DATABASE_NODE_LEASE_PREFIX: &[u8] = b"_sys_dbnodelease_";
 pub(super) const SYS_DATABASE_DRAIN_PREFIX: &[u8] = b"_sys_dbdrain_";
 pub(super) const SYS_DATABASE_DROP_CLAIM_PREFIX: &[u8] = b"_sys_dbdropclaim_";
-pub(super) const SYS_DATABASE_DRAIN_REQUEST_PREFIX: &[u8] = b"_sys_dbdrainreq_";
 pub(super) const SYS_MIGRATION_PREFIX: &[u8] = b"_sys_migration_";
 
 // === Storage format v2 (database-scoped prefixes) ===
@@ -208,23 +207,6 @@ pub fn encode_database_drain_state_prefix(keyspace: &str, db_id: u64, epoch: u64
     key.extend_from_slice(&db_id.to_be_bytes());
     key.extend_from_slice(&epoch.to_be_bytes());
     key
-}
-
-/// Encode a cross-node drain request for a fenced database.
-pub fn encode_database_drain_request_key(keyspace: &str, db_id: u64, epoch: u64) -> Vec<u8> {
-    let mut key =
-        Vec::with_capacity(SYS_DATABASE_DRAIN_REQUEST_PREFIX.len() + 2 + keyspace.len() + 1 + 16);
-    key.extend_from_slice(SYS_DATABASE_DRAIN_REQUEST_PREFIX);
-    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
-    key.extend_from_slice(keyspace.as_bytes());
-    key.push(b'_');
-    key.extend_from_slice(&db_id.to_be_bytes());
-    key.extend_from_slice(&epoch.to_be_bytes());
-    key
-}
-
-pub fn encode_database_drain_request_prefix() -> Vec<u8> {
-    SYS_DATABASE_DRAIN_REQUEST_PREFIX.to_vec()
 }
 
 pub fn encode_database_drop_claim_key(keyspace: &str, db_id: u64, epoch: u64) -> Vec<u8> {

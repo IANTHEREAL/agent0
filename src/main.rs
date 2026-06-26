@@ -479,9 +479,9 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // Per-connection auth path skips bootstrap when already initialized (#1171).
     {
         let auth_manager = auth::AuthManager::new();
-        auth_manager
-            .ensure_bootstrapped_with_retry(&store, "startup auth bootstrap")
-            .await?;
+        let mut txn = store.begin().await?;
+        auth_manager.bootstrap(&mut txn).await?;
+        txn.commit().await?;
     }
 
     client_pool.spawn_reaper();
@@ -567,7 +567,6 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         let lease_tenant_store = store.clone();
         let lease_keyspace = startup_keyspace.clone();
         let lease_config = worker_config.clone();
-        let lease_client_pool = client_pool.clone();
         let handle = tokio::spawn(async move {
             supervised_background_loop("Database lifecycle node lease publisher", || {
                 worker::database_lifecycle::run_database_node_lease_publisher_loop(
@@ -575,7 +574,6 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
                     &lease_tenant_store,
                     &lease_keyspace,
                     &lease_config,
-                    lease_client_pool.clone(),
                 )
             })
             .await;
@@ -761,14 +759,9 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
                 "Internal control endpoint listening on {}:{}",
                 ic_addr, ic_port
             );
-            let ic_client_pool = client_pool.clone();
             tokio::spawn(async move {
-                admin::internal_control::start_internal_control_server(
-                    ic_listener,
-                    ic_secret,
-                    ic_client_pool,
-                )
-                .await;
+                admin::internal_control::start_internal_control_server(ic_listener, ic_secret)
+                    .await;
             });
         }
     }

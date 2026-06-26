@@ -4401,7 +4401,7 @@ fn is_retryable_tikv_write_conflict(err: &anyhow::Error) -> bool {
             tikv_client::Error::PessimisticLockError { inner, .. } => {
                 contains_write_conflict(inner)
             }
-            tikv_client::Error::UndeterminedError(_) => false,
+            tikv_client::Error::UndeterminedError(inner) => contains_write_conflict(inner),
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => {
                 errors.iter().any(contains_write_conflict)

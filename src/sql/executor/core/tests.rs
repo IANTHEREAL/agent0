@@ -302,9 +302,7 @@ fn test_cast_current_setting_value_integer() {
 }
 
 mod write_conflict_retry_tests {
-    use super::super::{
-        extract_write_conflict_reason, is_retryable_tikv_commit_error, is_retryable_tikv_error,
-    };
+    use super::super::{extract_write_conflict_reason, is_retryable_tikv_error};
     use crate::sql::error::SqlError;
     use crate::storage::{StorageError, WriteConflictReason};
     use anyhow::Context;
@@ -353,29 +351,6 @@ mod write_conflict_retry_tests {
         let tikv_err = tikv_client::Error::UndeterminedError(Box::new(inner_err));
         let anyhow_err = anyhow::Error::new(tikv_err);
         assert!(!is_retryable_tikv_error(&anyhow_err));
-    }
-
-    #[test]
-    fn test_undetermined_commit_grpc_unavailable_not_retryable() {
-        let tikv_err = tikv_client::Error::UndeterminedError(Box::new(
-            tikv_client::Error::GrpcAPI(tonic::Status::unavailable("commit response lost")),
-        ));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-        assert!(!is_retryable_tikv_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
-    }
-
-    #[test]
-    fn test_undetermined_commit_write_conflict_inner_not_retryable() {
-        let inner_err =
-            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
-                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-                ..Default::default()
-            }));
-        let tikv_err = tikv_client::Error::UndeterminedError(Box::new(inner_err));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-        assert!(!is_retryable_tikv_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
     }
 
     #[test]
@@ -494,72 +469,6 @@ mod write_conflict_retry_tests {
         let anyhow_err = anyhow::Error::new(tikv_client::Error::ResolveLockError(Vec::new()));
 
         assert!(is_retryable_tikv_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
-    }
-
-    #[test]
-    fn test_tikv_not_leader_region_error_retryable() {
-        let tikv_err =
-            tikv_client::Error::RegionError(Box::new(tikv_client::proto::errorpb::Error {
-                not_leader: Some(tikv_client::proto::errorpb::NotLeader::default()),
-                ..Default::default()
-            }));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-
-        assert!(is_retryable_tikv_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
-    }
-
-    #[test]
-    fn test_tikv_grpc_unavailable_retryable() {
-        let tikv_err =
-            tikv_client::Error::GrpcAPI(tonic::Status::unavailable("connection refused"));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-
-        assert!(is_retryable_tikv_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
-    }
-
-    #[test]
-    fn test_commit_retry_does_not_retry_bare_grpc_unavailable() {
-        let tikv_err = tikv_client::Error::GrpcAPI(tonic::Status::unavailable(
-            "commit response may have been lost",
-        ));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-
-        assert!(is_retryable_tikv_error(&anyhow_err));
-        assert!(!is_retryable_tikv_commit_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
-    }
-
-    #[test]
-    fn test_commit_retry_still_retries_write_conflict() {
-        let tikv_err =
-            tikv_client::Error::KeyError(Box::new(tikv_client::proto::kvrpcpb::KeyError {
-                conflict: Some(tikv_client::proto::kvrpcpb::WriteConflict::default()),
-                ..Default::default()
-            }));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-
-        assert!(is_retryable_tikv_commit_error(&anyhow_err));
-    }
-
-    #[test]
-    fn test_tikv_grpc_unavailable_retryable_after_anyhow_macro_wrapper() {
-        let tikv_err =
-            tikv_client::Error::GrpcAPI(tonic::Status::unavailable("connection refused"));
-        let anyhow_err = anyhow::anyhow!(tikv_err);
-
-        assert!(is_retryable_tikv_error(&anyhow_err));
-        assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
-    }
-
-    #[test]
-    fn test_tikv_grpc_invalid_argument_not_retryable() {
-        let tikv_err = tikv_client::Error::GrpcAPI(tonic::Status::invalid_argument("bad request"));
-        let anyhow_err = anyhow::Error::new(tikv_err);
-
-        assert!(!is_retryable_tikv_error(&anyhow_err));
         assert_eq!(extract_write_conflict_reason(&anyhow_err), None);
     }
 

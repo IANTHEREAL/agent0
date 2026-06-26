@@ -65,4 +65,4 @@ COPY --from=builder /usr/local/bin/db9-server /usr/local/bin/db9-server
 
 EXPOSE 5433
 
-ENTRYPOINT ["db9-server"]
+CMD ["db9-server"]

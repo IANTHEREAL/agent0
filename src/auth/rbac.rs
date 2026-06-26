@@ -1,8 +1,5 @@
 use crate::config;
 use crate::sql::error::SqlError;
-use crate::storage::retry::{
-    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
-};
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Result};
 use dashmap::DashSet;
@@ -16,25 +13,6 @@ use tikv_client::Transaction;
 /// invalidated via [`invalidate_initialized`] (called on DROP ROLE / ALTER ROLE
 /// NOSUPERUSER) so that the bootstrap probe re-runs if all superusers are removed.
 static INITIALIZED_KEYSPACES: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
-
-async fn retry_auth_metadata_operation(
-    operation: &'static str,
-    attempt: u32,
-    err: &anyhow::Error,
-) -> bool {
-    if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err) {
-        tracing::info!(
-            attempt = attempt + 1,
-            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
-            operation,
-            "retrying auth metadata operation after transient TiKV error"
-        );
-        region_error_backoff(attempt).await;
-        true
-    } else {
-        false
-    }
-}
 
 /// Remove `keyspace` from the initialized cache so the next
 /// [`AuthManager::is_initialized`] call re-probes TiKV.
@@ -546,84 +524,16 @@ impl AuthManager {
         if INITIALIZED_KEYSPACES.contains(&ks) {
             return Ok(true);
         }
-
-        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
-            let result = async {
-                let mut txn = store.begin_optimistic().await?;
-                let initialized = self.has_any_superuser(&mut txn).await;
-                if let Err(err) = txn.rollback().await {
-                    return Err(err.into());
-                }
-                let initialized = initialized?;
-                if initialized {
-                    INITIALIZED_KEYSPACES.insert(ks.clone());
-                }
-                Ok(initialized)
-            }
-            .await;
-
-            match result {
-                Ok(initialized) => return Ok(initialized),
-                Err(err) => {
-                    if retry_auth_metadata_operation("auth initialized probe", attempt, &err).await
-                    {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
+        let mut txn = store.begin_optimistic().await?;
+        let result = self.has_any_superuser(&mut txn).await;
+        if let Err(err) = txn.rollback().await {
+            return Err(err.into());
         }
-
-        unreachable!("auth initialized probe retry loop must return");
-    }
-
-    pub(crate) async fn ensure_bootstrapped_with_retry(
-        &self,
-        store: &crate::storage::TikvStore,
-        operation: &'static str,
-    ) -> Result<()> {
-        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
-            let result = async {
-                if self.is_initialized(store).await? {
-                    return Ok(());
-                }
-
-                let mut txn = store.begin().await?;
-                match self.bootstrap(&mut txn).await {
-                    Ok(()) => {
-                        if let Err(commit_err) = txn.commit().await {
-                            txn.rollback().await.ok();
-                            if self.is_initialized(store).await? {
-                                return Ok(());
-                            }
-                            return Err(commit_err.into());
-                        }
-                        Ok(())
-                    }
-                    Err(err) => {
-                        txn.rollback().await.ok();
-                        if self.is_initialized(store).await? {
-                            Ok(())
-                        } else {
-                            Err(err)
-                        }
-                    }
-                }
-            }
-            .await;
-
-            match result {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    if retry_auth_metadata_operation(operation, attempt, &err).await {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
+        let result = result?;
+        if result {
+            INITIALIZED_KEYSPACES.insert(ks);
         }
-
-        unreachable!("auth bootstrap retry loop must return");
+        Ok(result)
     }
 
     pub async fn bootstrap(&self, txn: &mut Transaction) -> Result<()> {

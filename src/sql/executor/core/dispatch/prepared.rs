@@ -6,9 +6,8 @@ use super::super::prepared_stmt::PreparedExec;
 use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
 use super::utils::{
-    apply_pending_set_config_mutations, apply_statement_timeout,
-    capture_transaction_characteristics, effective_retry_timeout, remaining_statement_timeout,
-    restore_transaction_characteristics,
+    apply_pending_set_config_mutations, apply_statement_timeout, effective_retry_timeout,
+    remaining_statement_timeout,
 };
 use crate::sql::expr::bridge::eval_execute_param;
 use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
@@ -103,18 +102,6 @@ fn prepared_read_only_forbidden_statement_tag(exec: &PreparedExec) -> Option<&'s
             }
         }
         PreparedExec::RawSqlUtility => None,
-    }
-}
-
-fn prepared_retry_max_attempts(
-    is_autocommit: bool,
-    explicit_first_stmt_retry_eligible: bool,
-    session_max: usize,
-) -> usize {
-    if is_autocommit || explicit_first_stmt_retry_eligible {
-        session_max.max(1)
-    } else {
-        1
     }
 }
 
@@ -438,14 +425,12 @@ impl Executor {
         }
 
         let is_autocommit = !session.is_in_transaction();
-        let explicit_first_stmt_retry_eligible =
-            !is_autocommit && !session.has_executed_statement_in_transaction();
         let db_id = session.current_database_id();
-        let max_attempts = prepared_retry_max_attempts(
-            is_autocommit,
-            explicit_first_stmt_retry_eligible,
-            session.settings().retry_max_attempts as usize,
-        );
+        let max_attempts = if is_autocommit {
+            (session.settings().retry_max_attempts as usize).max(1)
+        } else {
+            1usize
+        };
 
         let retry_start = std::time::Instant::now();
         let statement_timeout = session.statement_timeout();
@@ -474,14 +459,6 @@ impl Executor {
                             timeout_ms = timeout.as_millis() as u64,
                             "prepared: retry timeout exceeded after backoff, aborting"
                         );
-                        if !is_autocommit {
-                            session
-                                .rollback_for_retry_or_abandon(
-                                    "explicit_prepared_first_statement_retry_timeout_after_backoff",
-                                )
-                                .await;
-                            self.clear_trigger_activations();
-                        }
                         self.observability.record_retry_timeout_abort();
                         return Err(SqlError::RetryTimeout {
                             elapsed_ms: retry_start.elapsed().as_millis() as u64,
@@ -509,9 +486,7 @@ impl Executor {
                         self.clear_trigger_activations();
                     }
 
-                    let should_retry = attempt + 1 < max_attempts
-                        && retryable
-                        && (is_autocommit || explicit_first_stmt_retry_eligible);
+                    let should_retry = is_autocommit && attempt + 1 < max_attempts && retryable;
                     if should_retry {
                         if let Some(timeout) = retry_timeout {
                             if retry_start.elapsed() >= timeout {
@@ -523,14 +498,6 @@ impl Executor {
                                     "prepared: retry timeout exceeded, aborting lifecycle fence retries"
                                 );
                                 self.observability.record_retry_timeout_abort();
-                                if !is_autocommit {
-                                    session
-                                        .rollback_for_retry_or_abandon(
-                                            "explicit_prepared_first_statement_lifecycle_fence_retry_timeout",
-                                        )
-                                        .await;
-                                    self.clear_trigger_activations();
-                                }
                                 return Err(SqlError::RetryTimeout {
                                     elapsed_ms: retry_start.elapsed().as_millis() as u64,
                                     limit_ms: timeout.as_millis() as u64,
@@ -546,15 +513,6 @@ impl Executor {
                         );
                         self.observability
                             .record_retry_attempt(extract_write_conflict_reason(&err));
-                        if !is_autocommit {
-                            session
-                                .rollback_for_retry_or_abandon(
-                                    "explicit_prepared_first_statement_lifecycle_fence_retry",
-                                )
-                                .await;
-                            self.clear_trigger_activations();
-                            session.begin().await?;
-                        }
                         autocommit_backoff(attempt).await;
                         continue;
                     }
@@ -633,7 +591,7 @@ impl Executor {
                                 self.mark_init_cache_invalidation_pending();
                             }
                             if let Err(err) = session.commit().await {
-                                let retryable = is_retryable_tikv_commit_error(&err);
+                                let retryable = is_retryable_tikv_error(&err);
                                 session
                                     .rollback_for_retry_or_abandon("prepared_commit_error")
                                     .await;
@@ -754,94 +712,29 @@ impl Executor {
                     }
                 }
             } else {
-                match res {
-                    Ok(PreparedTxnResult::Executed(result)) => {
+                return match res? {
+                    PreparedTxnResult::Executed(result) => {
                         let statement_modified = !statement_dirty_tables.is_empty()
                             || super::transaction::execute_result_modifies_database(&result);
                         session.note_transaction_dirty_tables(statement_dirty_tables);
                         if statement_modified {
                             session.note_transaction_activity_modified();
                         }
-                        session.note_statement_success_in_transaction();
-                        return Ok(ExecuteResults::single(result));
+                        Ok(ExecuteResults::single(result))
                     }
-                    Ok(PreparedTxnResult::SchemaDrift {
+                    PreparedTxnResult::SchemaDrift {
                         table_name,
                         expected,
                         current,
-                    }) => {
+                    } => {
                         warn!(
                             table = %table_name,
                             expected_version = expected,
                             current_version = ?current,
                             "prepared schema drift detected; falling back to SQL parse/analyze"
                         );
-                        return self
-                            .execute_prepared_text_fallback(session, sql, qctx)
-                            .await;
-                    }
-                    Err(err) => {
-                        let should_retry = explicit_first_stmt_retry_eligible
-                            && attempt + 1 < max_attempts
-                            && is_retryable_tikv_error(&err);
-                        if should_retry {
-                            if let Some(timeout) = retry_timeout {
-                                if retry_start.elapsed() >= timeout {
-                                    tracing::warn!(
-                                        attempt = attempt + 1,
-                                        max_attempts,
-                                        elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                        timeout_ms = timeout.as_millis() as u64,
-                                        "prepared: retry timeout exceeded, aborting explicit transaction first-statement retries"
-                                    );
-                                    session
-                                        .rollback_for_retry_or_abandon(
-                                            "explicit_prepared_first_statement_retry_timeout",
-                                        )
-                                        .await;
-                                    self.clear_trigger_activations();
-                                    self.observability.record_retry_timeout_abort();
-                                    return Err(SqlError::RetryTimeout {
-                                        elapsed_ms: retry_start.elapsed().as_millis() as u64,
-                                        limit_ms: timeout.as_millis() as u64,
-                                    }
-                                    .into());
-                                }
-                            }
-                            tracing::info!(
-                                attempt = attempt + 1,
-                                max_attempts,
-                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                "prepared: retryable TiKV error on explicit transaction first statement, retrying statement"
-                            );
-                            self.observability
-                                .record_retry_attempt(extract_write_conflict_reason(&err));
-                            let transaction_characteristics =
-                                capture_transaction_characteristics(session);
-                            session
-                                .rollback_for_retry_or_abandon(
-                                    "explicit_prepared_first_statement_retry",
-                                )
-                                .await;
-                            self.clear_trigger_activations();
-                            session.begin().await?;
-                            restore_transaction_characteristics(
-                                session,
-                                &transaction_characteristics,
-                            )?;
-                            autocommit_backoff(attempt).await;
-                            continue;
-                        }
-                        if is_retryable_tikv_error(&err) {
-                            tracing::warn!(
-                                attempt = attempt + 1,
-                                max_attempts,
-                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
-                                "prepared: explicit transaction first-statement retry budget exhausted"
-                            );
-                            self.observability.record_retry_budget_exhausted();
-                        }
-                        return Err(err);
+                        self.execute_prepared_text_fallback(session, sql, qctx)
+                            .await
                     }
                 };
             }
@@ -2382,13 +2275,8 @@ mod prepared_policy_tests {
                 .find(context)
                 .unwrap_or_else(|| panic!("{context} cleanup must be present"));
             let prefix = &exec_fn[..context_pos];
-            let retry_classifier = if context == "prepared_commit_error" {
-                "let retryable = is_retryable_tikv_commit_error(&err);"
-            } else {
-                "let retryable = is_retryable_tikv_error(&err);"
-            };
             let retryable_pos = prefix
-                .rfind(retry_classifier)
+                .rfind("let retryable = is_retryable_tikv_error(&err);")
                 .unwrap_or_else(|| panic!("{context} must classify the original error"));
             assert!(
                 retryable_pos < context_pos,
@@ -2399,82 +2287,6 @@ mod prepared_policy_tests {
         assert!(
             exec_fn.contains("rollback_for_retry_or_abandon"),
             "prepared autocommit retry cleanup must abandon a failed rollback instead of leaking 25P02"
-        );
-        assert!(
-            exec_fn.contains("capture_transaction_characteristics(session)")
-                && exec_fn.contains("restore_transaction_characteristics("),
-            "prepared explicit first-statement retry must preserve BEGIN transaction characteristics"
-        );
-    }
-
-    #[test]
-    fn prepared_retry_budget_uses_full_budget_for_first_explicit_statement() {
-        assert_eq!(prepared_retry_max_attempts(true, false, 7), 7);
-        assert_eq!(prepared_retry_max_attempts(false, true, 7), 7);
-        assert_eq!(prepared_retry_max_attempts(false, false, 7), 1);
-        assert_eq!(prepared_retry_max_attempts(true, false, 0), 1);
-    }
-
-    #[test]
-    fn prepared_explicit_transaction_success_marks_statement_count() {
-        let source = include_str!("prepared.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("prepared.rs must contain #[cfg(test)]");
-        let exec_fn = prod_source
-            .split("async fn execute_prepared_autocommit(")
-            .nth(1)
-            .expect("execute_prepared_autocommit must exist");
-        let explicit_branch_pos = exec_fn
-            .find("} else {\n                match res")
-            .expect("prepared explicit transaction branch must match attempt result");
-        let success_pos = exec_fn[explicit_branch_pos..]
-            .find("Ok(PreparedTxnResult::Executed(result))")
-            .expect("prepared explicit transaction success branch must exist")
-            + explicit_branch_pos;
-        let count_pos = exec_fn[success_pos..]
-            .find("session.note_statement_success_in_transaction();")
-            .expect("prepared explicit transaction success must increment statement count")
-            + success_pos;
-        let return_pos = exec_fn[success_pos..]
-            .find("return Ok(ExecuteResults::single(result));")
-            .expect("prepared explicit transaction success must return result")
-            + success_pos;
-
-        assert!(
-            success_pos < count_pos && count_pos < return_pos,
-            "prepared explicit transaction success must mark statement count before returning"
-        );
-    }
-
-    #[test]
-    fn prepared_explicit_first_statement_retry_path_restarts_transaction() {
-        let source = include_str!("prepared.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("prepared.rs must contain #[cfg(test)]");
-        let exec_fn = prod_source
-            .split("async fn execute_prepared_autocommit(")
-            .nth(1)
-            .expect("execute_prepared_autocommit must exist");
-
-        assert!(
-            exec_fn.contains("explicit_first_stmt_retry_eligible"),
-            "prepared execution must detect the first explicit transaction statement"
-        );
-        assert!(
-            exec_fn.contains("explicit_prepared_first_statement_retry"),
-            "prepared first explicit statement retry cleanup must be present"
-        );
-        assert!(
-            exec_fn.contains("explicit_prepared_first_statement_retry_timeout_after_backoff"),
-            "prepared first explicit statement retry timeout must roll back the restarted transaction"
-        );
-        assert!(
-            exec_fn.contains("session.begin().await?"),
-            "prepared first explicit statement retry must restart the transaction after rollback"
         );
     }
 }

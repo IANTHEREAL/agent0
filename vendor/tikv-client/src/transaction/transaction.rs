@@ -1723,7 +1723,7 @@ impl<PdC: PdClient> Committer<PdC> {
                 // We don't know whether the transaction is committed or not if we fail to receive
                 // the response. Then, we mark the transaction as undetermined and propagate the
                 // error to the user.
-                if is_commit_outcome_undetermined_error(e) {
+                if let Error::Grpc(_) = e {
                     self.undetermined = true;
                 }
             })
@@ -1829,20 +1829,6 @@ impl<PdC: PdClient> Committer<PdC> {
     }
 }
 
-fn is_commit_outcome_undetermined_error(err: &Error) -> bool {
-    match err {
-        Error::Grpc(_) => true,
-        Error::GrpcAPI(status) => matches!(
-            status.code(),
-            tonic::Code::Unavailable
-                | tonic::Code::Cancelled
-                | tonic::Code::DeadlineExceeded
-                | tonic::Code::Unknown
-        ),
-        _ => false,
-    }
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 #[repr(u8)]
 enum TransactionStatus {
@@ -1923,9 +1909,8 @@ mod tests {
     use crate::transaction::HeartbeatOption;
     use crate::Transaction;
     use crate::TransactionOptions;
-    use crate::{BoundRange, Error, Key};
+    use crate::{BoundRange, Key};
 
-    use super::is_commit_outcome_undetermined_error;
     use super::repair_scan_result_key;
 
     #[test]
@@ -1972,74 +1957,6 @@ mod tests {
             !body.contains("value: self.buffer.get(&key)"),
             "lock_current must not collapse undetermined locked keys into None"
         );
-    }
-
-    #[test]
-    fn commit_primary_marks_response_loss_grpc_api_statuses_undetermined() {
-        for code in [
-            tonic::Code::Unavailable,
-            tonic::Code::Cancelled,
-            tonic::Code::DeadlineExceeded,
-            tonic::Code::Unknown,
-        ] {
-            let err = Error::GrpcAPI(tonic::Status::new(code, "commit response not received"));
-            assert!(
-                is_commit_outcome_undetermined_error(&err),
-                "{code:?} must be treated as an undetermined commit outcome"
-            );
-        }
-    }
-
-    #[test]
-    fn commit_primary_does_not_mark_definitive_grpc_api_statuses_undetermined() {
-        for code in [
-            tonic::Code::InvalidArgument,
-            tonic::Code::PermissionDenied,
-            tonic::Code::Unauthenticated,
-            tonic::Code::OutOfRange,
-        ] {
-            let err = Error::GrpcAPI(tonic::Status::new(code, "definitive commit failure"));
-            assert!(
-                !is_commit_outcome_undetermined_error(&err),
-                "{code:?} must not be treated as response loss"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn commit_wraps_grpc_api_response_loss_as_undetermined() {
-        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
-            |req: &dyn Any| {
-                if req.downcast_ref::<kvrpcpb::PrewriteRequest>().is_some() {
-                    Ok(Box::<kvrpcpb::PrewriteResponse>::default() as Box<dyn Any>)
-                } else if req.downcast_ref::<kvrpcpb::CommitRequest>().is_some() {
-                    Err(Error::GrpcAPI(tonic::Status::unavailable(
-                        "commit response not received",
-                    )))
-                } else {
-                    panic!("unexpected request in commit test")
-                }
-            },
-        )));
-
-        let mut txn = Transaction::new(
-            Timestamp::default(),
-            pd_client,
-            TransactionOptions::new_optimistic().heartbeat_option(HeartbeatOption::NoHeartbeat),
-            Keyspace::Disable,
-        );
-        txn.put("key".to_owned(), "value").await.unwrap();
-
-        let err = txn.commit().await.unwrap_err();
-        match err {
-            Error::UndeterminedError(inner) => match *inner {
-                Error::GrpcAPI(status) => {
-                    assert_eq!(status.code(), tonic::Code::Unavailable);
-                }
-                other => panic!("expected GrpcAPI inside UndeterminedError, got {other:?}"),
-            },
-            other => panic!("expected UndeterminedError, got {other:?}"),
-        }
     }
 
     #[rstest::rstest]

@@ -1428,45 +1428,6 @@ impl TikvClientPool {
         Ok(store_clone)
     }
 
-    /// Open an existing tenant keyspace without running database bootstrap or
-    /// registering inventory. This is for destructive admin paths that must not
-    /// recreate metadata while deleting a tenant.
-    pub(crate) async fn open_keyspace_without_bootstrap(
-        &self,
-        keyspace: String,
-    ) -> Result<Arc<TikvStore>> {
-        let key = keyspace.clone();
-        {
-            let tenants = self.tenants.read().await;
-            if let Some(entry) = tenants.get(&key) {
-                return Ok(entry.store.clone());
-            }
-        }
-
-        let actual_keyspace = if key == "default" {
-            "DEFAULT".to_string()
-        } else {
-            keyspace
-        };
-        let store = match TikvStore::new_keyspace_without_bootstrap(
-            self.pd_endpoints.clone(),
-            actual_keyspace,
-        )
-        .await
-        {
-            Ok(store) => store,
-            Err(e) => {
-                let err_str = format!("{e:?}");
-                if err_str.contains("keyspace does not exist") {
-                    return Err(anyhow!("Tenant '{}' does not exist", key));
-                }
-                return Err(e);
-            }
-        };
-
-        Ok(Arc::new(store))
-    }
-
     /// Remove a per-keyspace creation lock after a slow-path operation
     /// when no concurrent waiters remain.
     async fn cleanup_creation_lock_if_unused(

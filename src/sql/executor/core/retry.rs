@@ -1,7 +1,6 @@
 //! Retry helpers
 
 use crate::sql::error::SqlError;
-use crate::storage::retry::is_retryable_tikv_transient_error;
 use crate::storage::StorageError;
 
 fn storage_error(err: &anyhow::Error) -> Option<&StorageError> {
@@ -17,70 +16,63 @@ fn sql_internal_error(err: &anyhow::Error) -> Option<&anyhow::Error> {
         })
 }
 
-fn contains_retryable_tikv_lock_or_conflict(err: &tikv_client::Error) -> bool {
-    // Retry on WriteConflict, Deadlock, and transient lock-resolution failures
-    // for single-statement retry loops.
-    //
-    // WriteConflict: emulates PostgreSQL's row-lock wait behavior where
-    // concurrent UPDATEs on the same row succeed (second waits for first).
-    //
-    // Deadlock: TiKV's pessimistic locking can produce circular waits when
-    // concurrent DML touches overlapping rows via different index scans.
-    // PostgreSQL detects and resolves these automatically; we do the same by
-    // retrying the statement with exponential backoff.
-    //
-    // Lock-resolution/locked-key errors: these are MVCC waits that escaped the
-    // client lock resolver. The wire layer already maps them to 40001 with a
-    // retry hint; autocommit should consume them locally when it is safe to
-    // rerun the statement.
-    //
-    // WriteConflict reasons (from kvrpcpb.proto):
-    //   0 = Unknown
-    //   1 = Optimistic (optimistic txn conflict)
-    //   2 = PessimisticRetry (lock wait wakeup or newer version)
-    //   3 = SelfRolledBack (txn rolled back during prewrite)
-    //   4 = RcCheckTs (RC isolation check failure)
-    //   5 = LazyUniquenessCheck (pessimistic unique constraint)
-    match err {
-        tikv_client::Error::PessimisticLockError { inner, .. } => {
-            contains_retryable_tikv_lock_or_conflict(inner)
-        }
-        tikv_client::Error::ExtractedErrors(errors)
-        | tikv_client::Error::MultipleKeyErrors(errors) => {
-            errors.iter().any(contains_retryable_tikv_lock_or_conflict)
-        }
-        tikv_client::Error::KeyError(key_error) => {
-            key_error.conflict.is_some()
-                || key_error.deadlock.is_some()
-                || key_error.locked.is_some()
-        }
-        tikv_client::Error::ResolveLockError(_) => true,
-        _ => err.is_lock_conflict(),
-    }
-}
-
-pub(crate) fn is_retryable_tikv_commit_error(err: &anyhow::Error) -> bool {
-    if err.chain().any(|cause| {
-        cause
-            .downcast_ref::<tikv_client::Error>()
-            .is_some_and(contains_retryable_tikv_lock_or_conflict)
-    }) {
-        return true;
-    }
-
+pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     if let Some(storage_err) = storage_error(err) {
         return storage_err.is_retryable();
     }
 
-    sql_internal_error(err).is_some_and(is_retryable_tikv_commit_error)
-}
+    fn contains_retryable_error(err: &tikv_client::Error) -> bool {
+        // Retry on WriteConflict, Deadlock, and transient lock-resolution
+        // failures for single-statement retry loops.
+        //
+        // WriteConflict: emulates PostgreSQL's row-lock wait behavior where
+        // concurrent UPDATEs on the same row succeed (second waits for first).
+        //
+        // Deadlock: TiKV's pessimistic locking can produce circular waits when
+        // concurrent DML touches overlapping rows via different index scans.
+        // PostgreSQL detects and resolves these automatically; we do the same
+        // by retrying the statement with exponential backoff.
+        //
+        // Lock-resolution/locked-key errors: these are MVCC waits that escaped
+        // the client lock resolver. The wire layer already maps them to 40001
+        // with a retry hint; autocommit should consume them locally when it is
+        // safe to rerun the statement.
+        //
+        // WriteConflict reasons (from kvrpcpb.proto):
+        //   0 = Unknown
+        //   1 = Optimistic (optimistic txn conflict)
+        //   2 = PessimisticRetry (lock wait wakeup or newer version)
+        //   3 = SelfRolledBack (txn rolled back during prewrite)
+        //   4 = RcCheckTs (RC isolation check failure)
+        //   5 = LazyUniquenessCheck (pessimistic unique constraint)
+        match err {
+            tikv_client::Error::PessimisticLockError { inner, .. } => {
+                contains_retryable_error(inner)
+            }
+            tikv_client::Error::UndeterminedError(inner) => contains_retryable_error(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => {
+                errors.iter().any(contains_retryable_error)
+            }
+            tikv_client::Error::KeyError(key_error) => {
+                key_error.conflict.is_some()
+                    || key_error.deadlock.is_some()
+                    || key_error.locked.is_some()
+            }
+            tikv_client::Error::ResolveLockError(_) => true,
+            _ => err.is_lock_conflict(),
+        }
+    }
 
-pub(crate) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
-    if is_retryable_tikv_transient_error(err) {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(contains_retryable_error)
+    }) {
         return true;
     }
 
-    is_retryable_tikv_commit_error(err)
+    sql_internal_error(err).is_some_and(is_retryable_tikv_error)
 }
 
 /// Extract the write-conflict reason code from a retryable error.
@@ -96,6 +88,7 @@ pub(super) fn extract_write_conflict_reason(err: &anyhow::Error) -> Option<i32> 
     fn first_reason(err: &tikv_client::Error) -> Option<i32> {
         match err {
             tikv_client::Error::PessimisticLockError { inner, .. } => first_reason(inner),
+            tikv_client::Error::UndeterminedError(inner) => first_reason(inner),
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().find_map(first_reason),
             tikv_client::Error::KeyError(ke) => ke.conflict.as_ref().map(|c| c.reason),

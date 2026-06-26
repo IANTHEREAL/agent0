@@ -17,21 +17,14 @@
 
 use super::control::{AdminControlService, ControlError};
 use super::session_registry::{SessionFilter, SessionSnapshot, SessionState};
-use crate::pool::TikvClientPool;
-use crate::storage::FencedDatabase;
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
 const MAX_HEADER_SIZE: usize = 8192;
 const MAX_BODY_SIZE: usize = 4096;
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
-const DEFAULT_FENCE_DELETE_WAIT_MS: u64 = 60_000;
-const FENCE_DELETE_POLL_MS: u64 = 250;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Required header for actor identity passthrough from the backend proxy.
 const ACTOR_HEADER: &str = "x-admin-actor";
@@ -41,20 +34,14 @@ const ACTOR_HEADER: &str = "x-admin-actor";
 // ---------------------------------------------------------------------------
 
 /// Run the internal control HTTP accept loop. Call from `tokio::spawn`.
-pub async fn start_internal_control_server(
-    listener: TcpListener,
-    secret: String,
-    client_pool: Arc<TikvClientPool>,
-) {
+pub async fn start_internal_control_server(listener: TcpListener, secret: String) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let s = secret.clone();
-                let pool = client_pool.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        tokio::time::timeout(REQUEST_TIMEOUT, handle_connection(stream, &s, pool))
-                            .await
+                        tokio::time::timeout(REQUEST_TIMEOUT, handle_connection(stream, &s)).await
                     {
                         debug!("internal-control connection from {} timed out: {}", peer, e);
                     }
@@ -71,7 +58,7 @@ pub async fn start_internal_control_server(
 // Connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(mut stream: TcpStream, secret: &str, client_pool: Arc<TikvClientPool>) {
+async fn handle_connection(mut stream: TcpStream, secret: &str) {
     let req = match read_request(&mut stream).await {
         Ok(r) => r,
         Err(status) => {
@@ -86,11 +73,7 @@ async fn handle_connection(mut stream: TcpStream, secret: &str, client_pool: Arc
         return;
     }
 
-    let (status, body) = if is_fence_delete_request(&req) {
-        handle_fence_delete(&req, client_pool).await
-    } else {
-        route(&req)
-    };
+    let (status, body) = route(&req);
     let _ = write_response(&mut stream, status, &body).await;
 }
 
@@ -239,246 +222,6 @@ fn extract_actor(req: &HttpRequest) -> Result<String, (u16, String)> {
             error_json(400, "missing or empty X-Admin-Actor header"),
         )),
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct FenceDeleteRequest {
-    keyspace: Option<String>,
-    reason: Option<String>,
-    wait_ms: Option<u64>,
-}
-
-fn is_fence_delete_request(req: &HttpRequest) -> bool {
-    let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
-    matches!(
-        (req.method.as_str(), segments.as_slice()),
-        ("POST", ["internal", "tenants", _, "fence-delete"])
-    )
-}
-
-fn keyspace_from_tenant_segment(segment: &str) -> String {
-    if segment == "default" || segment.starts_with("db9_tenant_") {
-        segment.to_string()
-    } else {
-        format!("db9_tenant_{segment}")
-    }
-}
-
-fn resolve_fence_delete_keyspace(
-    tenant_segment: &str,
-    body: &FenceDeleteRequest,
-) -> Result<String, (u16, String)> {
-    let path_keyspace =
-        crate::worker::canonical_registry_keyspace(&keyspace_from_tenant_segment(tenant_segment));
-    let Some(body_keyspace) = body.keyspace.as_ref().filter(|s| !s.trim().is_empty()) else {
-        return Ok(path_keyspace);
-    };
-
-    let body_keyspace = crate::worker::canonical_registry_keyspace(body_keyspace.trim());
-    if body_keyspace != path_keyspace {
-        return Err((400, error_json(400, "body keyspace must match URL tenant")));
-    }
-    Ok(path_keyspace)
-}
-
-fn fence_delete_response_status(resp: &serde_json::Value) -> u16 {
-    match resp.get("drained").and_then(serde_json::Value::as_bool) {
-        Some(false) => 409,
-        _ => 200,
-    }
-}
-
-fn annotate_fence_delete_not_drained(resp: &mut serde_json::Value) {
-    if let Some(obj) = resp.as_object_mut() {
-        obj.entry("error").or_insert_with(|| {
-            serde_json::json!(
-                "Database deletion is in progress; waiting for active connections to drain"
-            )
-        });
-    }
-}
-
-async fn handle_fence_delete(req: &HttpRequest, client_pool: Arc<TikvClientPool>) -> (u16, String) {
-    let actor = match extract_actor(req) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-
-    let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
-    let tenant_segment = match segments.as_slice() {
-        ["internal", "tenants", id, "fence-delete"] => *id,
-        _ => return (404, error_json(404, "not found")),
-    };
-
-    let body = if req.body.is_empty() {
-        FenceDeleteRequest {
-            keyspace: None,
-            reason: None,
-            wait_ms: None,
-        }
-    } else {
-        match serde_json::from_slice::<FenceDeleteRequest>(&req.body) {
-            Ok(body) => body,
-            Err(_) => return (400, error_json(400, "invalid JSON body")),
-        }
-    };
-
-    let keyspace = match resolve_fence_delete_keyspace(tenant_segment, &body) {
-        Ok(keyspace) => keyspace,
-        Err(resp) => return resp,
-    };
-    let reason = body
-        .reason
-        .as_deref()
-        .unwrap_or("tenant delete fence")
-        .to_string();
-    let wait_ms = body.wait_ms.unwrap_or(DEFAULT_FENCE_DELETE_WAIT_MS);
-
-    match fence_delete_impl(&keyspace, &actor, &reason, wait_ms, client_pool).await {
-        Ok(mut resp) => {
-            let status = fence_delete_response_status(&resp);
-            if status == 409 {
-                annotate_fence_delete_not_drained(&mut resp);
-            }
-            (status, resp.to_string())
-        }
-        Err((status, message)) => (status, error_json(status, &message)),
-    }
-}
-
-async fn fence_delete_impl(
-    keyspace: &str,
-    actor: &str,
-    reason: &str,
-    wait_ms: u64,
-    client_pool: Arc<TikvClientPool>,
-) -> Result<serde_json::Value, (u16, String)> {
-    let system_store = crate::worker::system_store().map_err(|e| (503, e.to_string()))?;
-    let tenant_store = client_pool
-        .open_keyspace_without_bootstrap(keyspace.to_string())
-        .await
-        .map_err(|e| {
-            (
-                502,
-                format!("failed to open tenant keyspace '{keyspace}': {e}"),
-            )
-        })?;
-
-    let fenced = tenant_store
-        .fence_all_databases_for_tenant_delete()
-        .await
-        .map_err(|e| (500, format!("failed to fence tenant databases: {e}")))?;
-
-    crate::worker::database_lifecycle::request_database_drain_once(system_store, keyspace, &fenced)
-        .await
-        .map_err(|e| {
-            (
-                500,
-                format!("failed to publish database drain request: {e}"),
-            )
-        })?;
-
-    let registry = super::global_session_registry();
-    let control = AdminControlService::new(registry);
-    let terminate_result = control
-        .terminate_all(keyspace, actor, Some(reason))
-        .map(|r| {
-            serde_json::json!({
-                "requested": r.requested,
-                "terminated": r.terminated,
-                "already_closed": r.already_closed,
-            })
-        })
-        .unwrap_or_else(|e| {
-            warn!(
-                keyspace = %keyspace,
-                "tenant fence-delete failed to terminate local sessions: {e}"
-            );
-            serde_json::json!({
-                "requested": 0,
-                "terminated": 0,
-                "already_closed": 0,
-                "error": e.to_string(),
-            })
-        });
-
-    if let Err(e) = crate::worker::database_lifecycle::publish_requested_database_drain_states_once(
-        system_store,
-        &client_pool,
-    )
-    .await
-    {
-        warn!(
-            keyspace = %keyspace,
-            "tenant fence-delete failed to publish immediate local drain state: {e}"
-        );
-    }
-
-    let started = Instant::now();
-    let timeout = Duration::from_millis(wait_ms);
-    let mut drained = crate::worker::database_lifecycle::fenced_databases_read_drain_allows_delete(
-        system_store,
-        keyspace,
-        &fenced,
-    )
-    .await
-    .map_err(|e| (500, format!("failed to evaluate database drain: {e}")))?;
-
-    while !drained && started.elapsed() < timeout {
-        tokio::time::sleep(Duration::from_millis(FENCE_DELETE_POLL_MS)).await;
-        if let Err(e) =
-            crate::worker::database_lifecycle::publish_requested_database_drain_states_once(
-                system_store,
-                &client_pool,
-            )
-            .await
-        {
-            warn!(
-                keyspace = %keyspace,
-                "tenant fence-delete failed to refresh local drain state while waiting: {e}"
-            );
-        }
-        drained = crate::worker::database_lifecycle::fenced_databases_read_drain_allows_delete(
-            system_store,
-            keyspace,
-            &fenced,
-        )
-        .await
-        .map_err(|e| (500, format!("failed to evaluate database drain: {e}")))?;
-    }
-
-    if drained {
-        if let Err(e) = crate::worker::database_lifecycle::clear_database_drain_requests_once(
-            system_store,
-            keyspace,
-            &fenced,
-        )
-        .await
-        {
-            warn!(
-                keyspace = %keyspace,
-                "tenant fence-delete drained but failed to clear drain requests: {e}"
-            );
-        }
-    }
-
-    let fenced_json: Vec<serde_json::Value> = fenced
-        .iter()
-        .map(|FencedDatabase { db_id, epoch }| {
-            serde_json::json!({
-                "db_id": db_id,
-                "epoch": epoch,
-            })
-        })
-        .collect();
-
-    Ok(serde_json::json!({
-        "keyspace": keyspace,
-        "fenced_databases": fenced_json,
-        "drained": drained,
-        "waited_ms": started.elapsed().as_millis() as u64,
-        "local_terminate": terminate_result,
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -982,64 +725,6 @@ mod tests {
         };
         let (status, _) = route(&req);
         assert_eq!(status, 400);
-    }
-
-    #[test]
-    fn fence_delete_keyspace_comes_from_url_when_body_omits_keyspace() {
-        let body = FenceDeleteRequest {
-            keyspace: None,
-            reason: None,
-            wait_ms: None,
-        };
-
-        assert_eq!(
-            resolve_fence_delete_keyspace("tenant_a", &body).unwrap(),
-            "db9_tenant_tenant_a"
-        );
-    }
-
-    #[test]
-    fn fence_delete_rejects_body_keyspace_that_disagrees_with_url() {
-        let body = FenceDeleteRequest {
-            keyspace: Some("db9_tenant_b".to_string()),
-            reason: None,
-            wait_ms: None,
-        };
-
-        let (status, response) = resolve_fence_delete_keyspace("tenant_a", &body).unwrap_err();
-        assert_eq!(status, 400);
-        assert!(response.contains("body keyspace must match URL tenant"));
-    }
-
-    #[test]
-    fn fence_delete_response_is_conflict_until_drain_completes() {
-        let mut response = serde_json::json!({
-            "keyspace": "db9_tenant_a",
-            "fenced_databases": [{"db_id": 7, "epoch": 3}],
-            "drained": false,
-            "waited_ms": 0,
-        });
-
-        assert_eq!(fence_delete_response_status(&response), 409);
-        annotate_fence_delete_not_drained(&mut response);
-        assert_eq!(response["drained"], false);
-        assert!(response["error"]
-            .as_str()
-            .unwrap()
-            .contains("waiting for active connections to drain"));
-    }
-
-    #[test]
-    fn fence_delete_response_is_success_after_drain_completes() {
-        let response = serde_json::json!({
-            "keyspace": "db9_tenant_a",
-            "fenced_databases": [{"db_id": 7, "epoch": 3}],
-            "drained": true,
-            "waited_ms": 10,
-        });
-
-        assert_eq!(fence_delete_response_status(&response), 200);
-        assert!(response.get("error").is_none());
     }
 
     #[test]

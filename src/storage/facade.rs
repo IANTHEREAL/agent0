@@ -49,7 +49,6 @@ use tikv_client::{
 use super::backpressure::tikv_op;
 #[cfg(feature = "mock-storage")]
 use super::memory::{MemoryClient, MemorySnapshot, MemoryTxn};
-use super::tikv_store::retry::retry_tikv_transient_operation;
 // `StorageError` and `WriteConflictReason` are owned by `src/storage/error.rs`
 // (canonical surface per #2523 Consensus Amendments §D and architect-2's
 // integration ruling on PR-1 / PR-1.5). The facade re-imports them so PR-2
@@ -64,7 +63,7 @@ fn is_tikv_lock_conflict(err: &tikv_client::Error) -> bool {
             key_err.locked.is_some() || key_err.conflict.is_some() || key_err.deadlock.is_some()
         }
         tikv_client::Error::PessimisticLockError { inner, .. } => is_tikv_lock_conflict(inner),
-        tikv_client::Error::UndeterminedError(_) => false,
+        tikv_client::Error::UndeterminedError(inner) => is_tikv_lock_conflict(inner),
         tikv_client::Error::ExtractedErrors(errors)
         | tikv_client::Error::MultipleKeyErrors(errors) => {
             !errors.is_empty() && errors.iter().all(is_tikv_lock_conflict)
@@ -206,16 +205,8 @@ impl StorageClient {
     pub(crate) async fn begin(&self) -> Result<StorageTxn, anyhow::Error> {
         match self {
             StorageClient::Tikv(client) => {
-                let txn = retry_tikv_transient_operation(
-                    "facade pessimistic transaction begin",
-                    || async {
-                        let options =
-                            TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
-                        tikv_op!(client.begin_with_options(options).await)
-                    },
-                )
-                .await
-                .map_err(anyhow::Error::new)?;
+                let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
+                let txn = tikv_op!(client.begin_with_options(options).await)?;
                 Ok(StorageTxn::from_tikv(txn))
             }
             #[cfg(feature = "mock-storage")]
@@ -231,16 +222,8 @@ impl StorageClient {
     pub(crate) async fn begin_optimistic(&self) -> Result<StorageTxn, anyhow::Error> {
         match self {
             StorageClient::Tikv(client) => {
-                let txn = retry_tikv_transient_operation(
-                    "facade optimistic transaction begin",
-                    || async {
-                        let options =
-                            TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-                        tikv_op!(client.begin_with_options(options).await)
-                    },
-                )
-                .await
-                .map_err(anyhow::Error::new)?;
+                let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+                let txn = tikv_op!(client.begin_with_options(options).await)?;
                 Ok(StorageTxn::from_tikv(txn))
             }
             #[cfg(feature = "mock-storage")]
@@ -797,43 +780,6 @@ mod tests {
         assert!(caps.supports_get_for_update);
         assert!(caps.supports_lock_skip_locked);
         assert!(caps.supports_snapshot_at_ts);
-    }
-
-    #[test]
-    fn storage_facade_begin_retries_transient_tikv_errors() {
-        let source = include_str!("facade.rs");
-        let prod_source = source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("facade.rs must contain tests");
-
-        for fn_name in [
-            "pub(crate) async fn begin(&self)",
-            "pub(crate) async fn begin_optimistic(&self)",
-        ] {
-            let begin_fn = prod_source
-                .split(fn_name)
-                .nth(1)
-                .unwrap_or_else(|| panic!("{fn_name} must exist"));
-            let begin_fn = begin_fn.split("\n    ///").next().unwrap_or(begin_fn);
-
-            assert!(
-                begin_fn.contains("retry_tikv_transient_operation("),
-                "{fn_name} must use the shared transient TiKV retry helper"
-            );
-            assert!(
-                begin_fn.contains("tikv_op!(client.begin_with_options(options).await)"),
-                "{fn_name} must preserve TiKV begin instrumentation"
-            );
-            assert!(
-                begin_fn.contains(".map_err(anyhow::Error::new)?"),
-                "{fn_name} must keep the existing anyhow error surface"
-            );
-            assert!(
-                begin_fn.contains("StorageTxn::from_tikv(txn)"),
-                "{fn_name} must still return a facade transaction"
-            );
-        }
     }
 
     #[cfg(feature = "mock-storage")]

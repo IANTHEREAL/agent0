@@ -6,10 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::pool::TikvClientPool;
-use crate::storage::{
-    DatabaseDrainRequest, DatabaseDrainState, DatabaseNodeLease, FencedDatabase, TikvStore,
-};
+use crate::storage::{DatabaseDrainState, DatabaseNodeLease, TikvStore};
 use crate::worker::config::WorkerConfig;
 
 const NODE_LEASE_TTL_MS: i64 = 30_000;
@@ -18,7 +15,6 @@ const NODE_LEASE_PUBLISH_INTERVAL_MS: u64 = 10_000;
 const NODE_LEASE_TSO_TIMEOUT_SEC: u64 = 30;
 const DROP_COORDINATOR_CLAIM_LEASE_MS: i64 = 300_000;
 const DRAIN_REGISTRY_SCAN_PAGE_SIZE: usize = 256;
-const DRAIN_REQUEST_TTL_MS: i64 = 3_600_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DatabaseLifecycleNodeIdentity {
@@ -156,206 +152,6 @@ pub(crate) async fn publish_database_drain_state_once(
         .await
         .context("failed to commit database lifecycle drain state")?;
     Ok(())
-}
-
-pub(crate) async fn request_database_drain_once(
-    system_store: &TikvStore,
-    keyspace: &str,
-    fenced_databases: &[FencedDatabase],
-) -> Result<()> {
-    if fenced_databases.is_empty() {
-        return Ok(());
-    }
-
-    let keyspace = crate::worker::canonical_registry_keyspace(keyspace);
-    let now_ms = pd_now_ms(system_store).await?;
-    let mut txn = system_store.begin().await?;
-    for fenced in fenced_databases {
-        system_store
-            .put_database_drain_request(&mut txn, &keyspace, fenced.db_id, fenced.epoch, now_ms)
-            .await?;
-    }
-    txn.commit()
-        .await
-        .context("failed to commit database drain requests")?;
-    Ok(())
-}
-
-pub(crate) async fn clear_database_drain_requests_once(
-    system_store: &TikvStore,
-    keyspace: &str,
-    fenced_databases: &[FencedDatabase],
-) -> Result<()> {
-    if fenced_databases.is_empty() {
-        return Ok(());
-    }
-
-    let keyspace = crate::worker::canonical_registry_keyspace(keyspace);
-    let mut txn = system_store.begin().await?;
-    for fenced in fenced_databases {
-        system_store
-            .delete_database_drain_request(&mut txn, &keyspace, fenced.db_id, fenced.epoch)
-            .await?;
-    }
-    txn.commit()
-        .await
-        .context("failed to clear database drain requests")?;
-    Ok(())
-}
-
-async fn clear_database_drain_request_once(
-    system_store: &TikvStore,
-    keyspace: &str,
-    db_id: u64,
-    epoch: u64,
-) -> Result<()> {
-    let mut txn = system_store.begin().await?;
-    system_store
-        .delete_database_drain_request(&mut txn, keyspace, db_id, epoch)
-        .await?;
-    txn.commit()
-        .await
-        .context("failed to clear database drain request")?;
-    Ok(())
-}
-
-fn drain_request_expired(now_ms: i64, requested_at_ms: i64) -> bool {
-    now_ms.saturating_sub(requested_at_ms) > DRAIN_REQUEST_TTL_MS
-}
-
-pub(crate) async fn fenced_databases_read_drain_allows_delete(
-    system_store: &TikvStore,
-    keyspace: &str,
-    fenced_databases: &[FencedDatabase],
-) -> Result<bool> {
-    for fenced in fenced_databases {
-        if !database_read_drain_allows_drop(system_store, keyspace, fenced.db_id, fenced.epoch)
-            .await?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-pub(crate) async fn publish_requested_database_drain_states_once(
-    system_store: &TikvStore,
-    client_pool: &TikvClientPool,
-) -> Result<usize> {
-    let mut requests_by_keyspace: HashMap<String, Vec<DatabaseDrainRequest>> = HashMap::new();
-    for request in {
-        let mut txn = system_store.begin_optimistic().await?;
-        let requests = system_store.list_database_drain_requests(&mut txn).await?;
-        txn.rollback().await.ok();
-        requests
-    } {
-        requests_by_keyspace
-            .entry(request.keyspace.clone())
-            .or_default()
-            .push(request);
-    }
-    let now_ms = pd_now_ms(system_store).await?;
-
-    let registry = crate::admin::global_session_registry();
-    let control = crate::admin::control::AdminControlService::new(registry);
-    let mut published = 0usize;
-
-    for (keyspace, requests) in requests_by_keyspace {
-        let tenant_store = match client_pool
-            .open_keyspace_without_bootstrap(keyspace.clone())
-            .await
-        {
-            Ok(store) => store,
-            Err(e) => {
-                let missing_keyspace = e.to_string().contains("does not exist");
-                for request in requests {
-                    let expired = drain_request_expired(now_ms, request.requested_at_ms);
-                    if missing_keyspace || expired {
-                        warn!(
-                            keyspace = %keyspace,
-                            db_id = request.db_id,
-                            epoch = request.epoch,
-                            expired,
-                            "clearing database drain request because tenant keyspace cannot be validated: {e}"
-                        );
-                        clear_database_drain_request_once(
-                            system_store,
-                            &keyspace,
-                            request.db_id,
-                            request.epoch,
-                        )
-                        .await?;
-                    } else {
-                        warn!(
-                            keyspace = %keyspace,
-                            db_id = request.db_id,
-                            epoch = request.epoch,
-                            "skipping database drain request until tenant keyspace can be validated: {e}"
-                        );
-                    }
-                }
-                continue;
-            }
-        };
-
-        let mut valid_requests = Vec::new();
-        for request in requests {
-            if drain_request_expired(now_ms, request.requested_at_ms)
-                || !tenant_store
-                    .database_is_fencing_epoch(request.db_id, request.epoch)
-                    .await?
-            {
-                clear_database_drain_request_once(
-                    system_store,
-                    &keyspace,
-                    request.db_id,
-                    request.epoch,
-                )
-                .await?;
-            } else {
-                valid_requests.push(request);
-            }
-        }
-        if valid_requests.is_empty() {
-            continue;
-        }
-
-        let active_sessions = registry.count_by_tenant(&keyspace) as u64;
-        if active_sessions > 0 {
-            if let Err(e) = control.terminate_all(
-                &keyspace,
-                "database lifecycle drain publisher",
-                Some("tenant delete fence"),
-            ) {
-                for request in &valid_requests {
-                    warn!(
-                        keyspace = %keyspace,
-                        db_id = request.db_id,
-                        epoch = request.epoch,
-                        "Database lifecycle drain publisher failed to terminate sessions: {e}"
-                    );
-                }
-            }
-        }
-
-        for request in valid_requests {
-            let active_ops = active_sessions
-                + crate::sql::session::db_connections::db_connection_registry()
-                    .active_operation_count(&keyspace, request.db_id) as u64;
-            publish_database_drain_state_once(
-                system_store,
-                &keyspace,
-                request.db_id,
-                request.epoch,
-                active_ops,
-                active_ops == 0,
-            )
-            .await?;
-            published += 1;
-        }
-    }
-
-    Ok(published)
 }
 
 pub(crate) async fn publish_current_keyspace_fencing_drain_states_once(
@@ -663,7 +459,6 @@ pub(crate) async fn run_database_node_lease_publisher_loop(
     tenant_store: &TikvStore,
     keyspace: &str,
     config: &WorkerConfig,
-    client_pool: std::sync::Arc<TikvClientPool>,
 ) {
     let keyspace = crate::worker::canonical_registry_keyspace(keyspace);
     let mut self_fence_at = Some(
@@ -706,11 +501,6 @@ pub(crate) async fn run_database_node_lease_publisher_loop(
         .await
         {
             warn!("Database lifecycle drain-state publish failed: {e}");
-        }
-        if let Err(e) =
-            publish_requested_database_drain_states_once(system_store, &client_pool).await
-        {
-            warn!("Database lifecycle requested drain-state publish failed: {e}");
         }
     }
 }
@@ -852,20 +642,6 @@ mod tests {
         assert!(
             live_undrained_leases(&[inactive], &[], 10_000, NODE_LEASE_GUARD_MS).is_empty(),
             "nodes that no longer accept SQL do not block read drain"
-        );
-    }
-
-    #[test]
-    fn drain_request_ttl_is_bounded_and_saturating() {
-        assert!(!drain_request_expired(10_000, 9_000));
-        assert!(!drain_request_expired(
-            10_000 + DRAIN_REQUEST_TTL_MS,
-            10_000
-        ));
-        assert!(drain_request_expired(10_001 + DRAIN_REQUEST_TTL_MS, 10_000));
-        assert!(
-            !drain_request_expired(1_000, 10_000),
-            "clock/TSO regressions must not make a fresh request expire"
         );
     }
 

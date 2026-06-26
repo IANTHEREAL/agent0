@@ -7,9 +7,6 @@ pub mod metrics;
 pub(crate) mod pd_region_stats;
 pub mod types;
 
-use crate::storage::retry::{
-    is_retryable_tikv_transient_error, region_error_backoff, REGION_ERROR_MAX_RETRIES,
-};
 use crate::storage::TikvStore;
 use crate::worker::types::{HnswS3DbPrefixCleanupIntent, TaskRegistryEntry};
 use anyhow::{Context, Result};
@@ -323,25 +320,6 @@ pub fn canonical_registry_keyspace(keyspace: &str) -> String {
     }
 }
 
-async fn retry_worker_metadata_operation(
-    operation: &'static str,
-    attempt: u32,
-    err: &anyhow::Error,
-) -> bool {
-    if attempt < REGION_ERROR_MAX_RETRIES && is_retryable_tikv_transient_error(err) {
-        info!(
-            attempt = attempt + 1,
-            max_attempts = REGION_ERROR_MAX_RETRIES + 1,
-            operation,
-            "retrying worker metadata operation after transient TiKV error"
-        );
-        region_error_backoff(attempt).await;
-        true
-    } else {
-        false
-    }
-}
-
 pub async fn register_database_inventory(
     system_store: &TikvStore,
     tenant_store: &TikvStore,
@@ -352,95 +330,41 @@ pub async fn register_database_inventory(
     let mut registered = 0usize;
 
     loop {
-        let mut tenant_page = None;
-        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
-            let result = async {
-                let mut tenant_txn = tenant_store.begin().await?;
-                let page = tenant_store
-                    .scan_databases_page(
-                        &mut tenant_txn,
-                        cursor.as_deref(),
-                        DATABASE_INVENTORY_PAGE_SIZE,
-                    )
-                    .await?;
-                tenant_txn.rollback().await.ok();
-                Ok(page)
-            }
-            .await;
-
-            match result {
-                Ok(page) => {
-                    tenant_page = Some(page);
-                    break;
-                }
-                Err(err) => {
-                    if retry_worker_metadata_operation(
-                        "register_database_inventory tenant scan",
-                        attempt,
-                        &err,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        let (databases, next_cursor) =
-            tenant_page.expect("worker tenant inventory scan retry loop must return");
+        let (databases, next_cursor) = {
+            let mut tenant_txn = tenant_store.begin().await?;
+            let page = tenant_store
+                .scan_databases_page(
+                    &mut tenant_txn,
+                    cursor.as_deref(),
+                    DATABASE_INVENTORY_PAGE_SIZE,
+                )
+                .await?;
+            tenant_txn.rollback().await.ok();
+            page
+        };
 
         if databases.is_empty() {
             break;
         }
 
-        let mut system_added = None;
-        for attempt in 0..=REGION_ERROR_MAX_RETRIES {
-            let result = async {
-                let mut sys_txn = system_store.begin().await?;
-                let mut added = 0usize;
-                for db in &databases {
-                    if system_store
-                        .get_worker_registry(&mut sys_txn, &keyspace, db.id)
-                        .await?
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    system_store
-                        .put_worker_registry(
-                            &mut sys_txn,
-                            &TaskRegistryEntry::new(keyspace.clone(), db.id),
-                        )
-                        .await?;
-                    added += 1;
-                }
-                sys_txn.commit().await?;
-                Ok(added)
+        let mut sys_txn = system_store.begin().await?;
+        for db in databases {
+            if system_store
+                .get_worker_registry(&mut sys_txn, &keyspace, db.id)
+                .await?
+                .is_some()
+            {
+                continue;
             }
-            .await;
-
-            match result {
-                Ok(added) => {
-                    system_added = Some(added);
-                    break;
-                }
-                Err(err) => {
-                    if retry_worker_metadata_operation(
-                        "register_database_inventory system registry",
-                        attempt,
-                        &err,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
+            system_store
+                .put_worker_registry(
+                    &mut sys_txn,
+                    &TaskRegistryEntry::new(keyspace.clone(), db.id),
+                )
+                .await?;
+            registered += 1;
         }
-        let added = system_added.expect("worker system inventory retry loop must return");
-        registered += added;
+        sys_txn.commit().await?;
 
         cursor = next_cursor;
         if cursor.is_none() {

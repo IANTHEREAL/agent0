@@ -16,7 +16,7 @@ fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
             key_err.locked.is_some() || key_err.conflict.is_some() || key_err.deadlock.is_some()
         }
         tikv_client::Error::PessimisticLockError { inner, .. } => is_row_lock_conflict(inner),
-        tikv_client::Error::UndeterminedError(_) => false,
+        tikv_client::Error::UndeterminedError(inner) => is_row_lock_conflict(inner),
         tikv_client::Error::ExtractedErrors(errors)
         | tikv_client::Error::MultipleKeyErrors(errors) => {
             !errors.is_empty() && errors.iter().all(is_row_lock_conflict)
