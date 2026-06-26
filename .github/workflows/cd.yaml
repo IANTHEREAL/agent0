@@ -2,6 +2,12 @@ name: cd
 
 on:
   workflow_dispatch:
+    inputs:
+      force_clean:
+        description: Clean db9-server release artifacts before the Docker build.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -29,6 +35,7 @@ jobs:
       version_file: VERSION
       dockerfile: ./Dockerfile
       build_context: .
+      force_clean: ${{ inputs.force_clean }}
       github_app_client_id: ${{ vars.SYS9_INFRA_APP_CLIENT_ID }}
       github_app_repositories: |
         db9-server

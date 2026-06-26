@@ -31,6 +31,7 @@ COPY proto ./proto
 
 ARG BUILD_GIT_HASH=""
 ARG BUILD_DATE=""
+ARG FORCE_CLEAN=false
 # DB9_REQUIRE_PROTOC=1 makes proto-compile failure a hard error so we
 # never ship a release image that silently lost the fs9 v2 gRPC backend.
 ENV BUILD_GIT_HASH=${BUILD_GIT_HASH} \
@@ -47,7 +48,7 @@ RUN --mount=type=secret,id=gh_token,required=true \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     git config --global url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf "https://github.com/" \
-    && cargo clean --release -p db9-server \
+    && case "${FORCE_CLEAN}" in true) cargo clean --release -p db9-server ;; false|"") ;; *) echo "invalid FORCE_CLEAN=${FORCE_CLEAN}; expected true or false" >&2; exit 1 ;; esac \
     && cargo build --release \
     && cp target/release/db9-server /usr/local/bin/db9-server \
     && git config --global --unset url."https://x-access-token:$(cat /run/secrets/gh_token)@github.com/".insteadOf
