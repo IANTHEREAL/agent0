@@ -774,10 +774,12 @@ impl Executor {
             // Step 3 only covers `d_{db_id}_*`; cron/bg/trigger queue entries
             // live under the global worker prefixes and would otherwise leak.
             // Bounded prefix scan of the V2 identity index, no global
-            // due-queue scan. Legacy `_worker_queue_` rows do not exist here:
-            // the one-shot V1->V2 migration runs in init_gc_registry_store at
-            // startup (before any DROP can run), so every queue row is already
-            // V2 by the time this reap executes. See issue #2576.
+            // due-queue scan. Legacy `_worker_queue_` rows are intentionally
+            // not scanned here: startup now enables V2 in O(1), and the
+            // maintenance loop drains V1 rows later in bounded batches. If a
+            // stale legacy row is projected after this reap, worker execution
+            // resolves the db_id before dispatch and skips tasks for dropped
+            // databases. See issue #2576.
             // MUST use tenant_keyspace() (the logical tenant string every
             // enqueue site embeds as entry.keyspace), NOT store().keyspace()
             // — the latter is the API-v2 connection keyspace, which for the

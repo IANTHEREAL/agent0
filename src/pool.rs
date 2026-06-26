@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Index of idle tenants ordered by `(idle_at_epoch_ms, keyspace)`.
 ///
@@ -28,12 +28,198 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How often the reaper scans for idle tenants.
 const DEFAULT_REAPER_INTERVAL: Duration = Duration::from_secs(30);
+const TENANT_INVENTORY_REPAIR_RETRY_DELAY: Duration = Duration::from_secs(60);
+const TENANT_INVENTORY_REPAIR_MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+const TENANT_INVENTORY_REPAIR_MAX_ATTEMPTS: u32 = 10;
+
+#[derive(Clone, Copy, Default)]
+struct TenantInventoryRepairState {
+    in_flight: bool,
+    retry_after_ms: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventoryRepairSpawnMode {
+    Initial,
+    RetryOnly,
+}
+
+struct TenantInventoryRepairTracker {
+    states: StdMutex<HashMap<String, TenantInventoryRepairState>>,
+}
+
+impl TenantInventoryRepairTracker {
+    fn new() -> Self {
+        Self {
+            states: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn begin(
+        self: &Arc<Self>,
+        keyspace: &str,
+        mode: InventoryRepairSpawnMode,
+        now_ms: u64,
+    ) -> Option<TenantInventoryRepairLease> {
+        let mut states = self.states.lock();
+        match states.get_mut(keyspace) {
+            Some(state) => {
+                if state.in_flight {
+                    debug!(keyspace, "Tenant database inventory repair already running");
+                    return None;
+                }
+                if state.retry_after_ms > now_ms {
+                    debug!(
+                        keyspace,
+                        retry_after_ms = state.retry_after_ms,
+                        "Tenant database inventory repair retry cooling down"
+                    );
+                    return None;
+                }
+                state.in_flight = true;
+                state.retry_after_ms = 0;
+            }
+            None if mode == InventoryRepairSpawnMode::RetryOnly => return None,
+            None => {
+                states.insert(
+                    keyspace.to_string(),
+                    TenantInventoryRepairState {
+                        in_flight: true,
+                        retry_after_ms: 0,
+                    },
+                );
+            }
+        }
+
+        Some(TenantInventoryRepairLease {
+            tracker: self.clone(),
+            keyspace: keyspace.to_string(),
+            completed: false,
+        })
+    }
+
+    fn complete(&self, keyspace: &str) {
+        self.states.lock().remove(keyspace);
+    }
+
+    fn schedule_retry(&self, keyspace: &str, retry_after_ms: u64) {
+        let mut states = self.states.lock();
+        let state = states.entry(keyspace.to_string()).or_default();
+        state.in_flight = false;
+        state.retry_after_ms = retry_after_ms;
+    }
+
+    #[cfg(test)]
+    fn state_for(&self, keyspace: &str) -> Option<TenantInventoryRepairState> {
+        self.states.lock().get(keyspace).copied()
+    }
+}
+
+impl Default for TenantInventoryRepairTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct TenantInventoryRepairLease {
+    tracker: Arc<TenantInventoryRepairTracker>,
+    keyspace: String,
+    completed: bool,
+}
+
+impl TenantInventoryRepairLease {
+    fn complete(&mut self) {
+        self.tracker.complete(&self.keyspace);
+        self.completed = true;
+    }
+}
+
+impl Drop for TenantInventoryRepairLease {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.tracker.schedule_retry(
+            &self.keyspace,
+            tenant_inventory_repair_next_retry_after_ms(),
+        );
+    }
+}
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn spawn_tenant_database_inventory_repair(
+    system_store: Arc<TikvStore>,
+    tenant_store: Arc<TikvStore>,
+    tracker: Arc<TenantInventoryRepairTracker>,
+    keyspace: String,
+    mode: InventoryRepairSpawnMode,
+) {
+    let Some(lease) = tracker.begin(&keyspace, mode, now_epoch_ms()) else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        let mut lease = lease;
+        for attempt in 1..=TENANT_INVENTORY_REPAIR_MAX_ATTEMPTS {
+            match crate::worker::register_database_inventory(
+                &system_store,
+                &tenant_store,
+                &keyspace,
+            )
+            .await
+            {
+                Ok(registered) => {
+                    info!(
+                        keyspace = %keyspace,
+                        registered,
+                        attempt,
+                        "Tenant database inventory repair completed"
+                    );
+                    lease.complete();
+                    return;
+                }
+                Err(e) if attempt < TENANT_INVENTORY_REPAIR_MAX_ATTEMPTS => {
+                    let retry_delay = tenant_inventory_repair_retry_delay(attempt);
+                    warn!(
+                        keyspace = %keyspace,
+                        attempt,
+                        max_attempts = TENANT_INVENTORY_REPAIR_MAX_ATTEMPTS,
+                        retry_delay_seconds = retry_delay.as_secs(),
+                        error = %e,
+                        "Tenant database inventory repair failed; retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(e) => {
+                    warn!(
+                        keyspace = %keyspace,
+                        attempt,
+                        max_attempts = TENANT_INVENTORY_REPAIR_MAX_ATTEMPTS,
+                        error = %e,
+                        "Tenant database inventory repair failed; giving up after capped retries"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn tenant_inventory_repair_retry_delay(attempt: u32) -> Duration {
+    let multiplier = 1_u32 << attempt.saturating_sub(1).min(3);
+    TENANT_INVENTORY_REPAIR_RETRY_DELAY
+        .saturating_mul(multiplier)
+        .min(TENANT_INVENTORY_REPAIR_MAX_RETRY_DELAY)
+}
+
+fn tenant_inventory_repair_next_retry_after_ms() -> u64 {
+    now_epoch_ms().saturating_add(TENANT_INVENTORY_REPAIR_MAX_RETRY_DELAY.as_millis() as u64)
 }
 
 /// Read the per-tenant QPS limit from environment once. 0 = disabled.
@@ -1211,6 +1397,8 @@ pub struct TikvClientPool {
     /// Per-principal concurrent query limit. 0 = disabled.
     /// Sourced from `ServerConfig::max_concurrent_queries_per_principal`.
     concurrency_limit: u32,
+    /// Keyspaces with a nonblocking inventory repair task currently running.
+    inventory_repairs: Arc<TenantInventoryRepairTracker>,
 }
 
 impl TikvClientPool {
@@ -1223,6 +1411,7 @@ impl TikvClientPool {
             reaper_interval: DEFAULT_REAPER_INTERVAL,
             idle_index: Arc::new(StdMutex::new(BTreeSet::new())),
             concurrency_limit: 0,
+            inventory_repairs: Arc::new(TenantInventoryRepairTracker::new()),
         }
     }
 
@@ -1252,6 +1441,7 @@ impl TikvClientPool {
             reaper_interval,
             idle_index: Arc::new(StdMutex::new(BTreeSet::new())),
             concurrency_limit: 0,
+            inventory_repairs: Arc::new(TenantInventoryRepairTracker::new()),
         }
     }
 
@@ -1264,7 +1454,7 @@ impl TikvClientPool {
         let key = keyspace.clone().unwrap_or_else(|| "default".to_string());
 
         // Fast path: tenant already exists.
-        {
+        let existing_entry = {
             let tenants = self.tenants.read().await;
             if let Some(entry) = tenants.get(&key) {
                 let prev = entry.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -1276,11 +1466,25 @@ impl TikvClientPool {
                         set.remove(&(prev_idle_at, key.clone()));
                     }
                 }
-                return Ok(TenantHandle {
-                    entry: entry.clone(),
-                    user_slot: None,
-                });
+                Some(entry.clone())
+            } else {
+                None
             }
+        };
+        if let Some(entry) = existing_entry {
+            if let Some(system_store) = crate::worker::get_system_store() {
+                spawn_tenant_database_inventory_repair(
+                    system_store.clone(),
+                    entry.store.clone(),
+                    self.inventory_repairs.clone(),
+                    key.clone(),
+                    InventoryRepairSpawnMode::RetryOnly,
+                );
+            }
+            return Ok(TenantHandle {
+                entry,
+                user_slot: None,
+            });
         }
 
         // Slow path: need to create. Use a per-keyspace lock so only one
@@ -1466,27 +1670,17 @@ impl TikvClientPool {
                 return Err(e);
             }
         };
+        let store = Arc::new(store);
         if let Some(system_store) = crate::worker::get_system_store() {
-            match crate::worker::register_database_inventory(system_store, &store, key).await {
-                Ok(registered) if registered > 0 => {
-                    tracing::info!(
-                        keyspace = key,
-                        registered,
-                        "Registered tenant databases in worker inventory"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(anyhow!(
-                        "Failed to register tenant database inventory for keyspace '{}': {}",
-                        key,
-                        e
-                    ));
-                }
-            }
+            spawn_tenant_database_inventory_repair(
+                system_store.clone(),
+                store.clone(),
+                self.inventory_repairs.clone(),
+                key.to_string(),
+                InventoryRepairSpawnMode::Initial,
+            );
         }
-
-        Ok(Arc::new(store))
+        Ok(store)
     }
 
     /// Number of tenants currently cached in the pool.
@@ -1715,24 +1909,128 @@ mod tests {
     }
 
     #[test]
-    fn tenant_inventory_registration_failure_is_fail_closed() {
+    fn tenant_store_creation_spawns_inventory_repair_without_awaiting_scan() {
         let source = include_str!("pool.rs");
         let create_store = source
             .split("async fn create_store(")
             .nth(1)
-            .expect("create_store must exist");
-        let registration_branch = create_store
-            .split("register_database_inventory")
-            .nth(1)
-            .expect("create_store must register tenant database inventory");
-
+            .and_then(|rest| rest.split("/// Number of tenants currently cached").next())
+            .expect("create_store body must exist");
         assert!(
-            registration_branch.contains("return Err(anyhow!"),
-            "tenant inventory registration failure must fail tenant creation, not log-and-cache"
+            !create_store.contains("register_database_inventory("),
+            "tenant acquisition must not await a full database inventory scan"
         );
         assert!(
-            !registration_branch.contains("tracing::warn!"),
-            "tenant inventory registration failure must not be fail-open"
+            create_store.contains("spawn_tenant_database_inventory_repair("),
+            "tenant acquisition should start nonblocking inventory repair"
+        );
+        assert!(
+            create_store.contains("self.inventory_repairs.clone()"),
+            "tenant inventory repair should share the pool's per-keyspace singleflight guard"
+        );
+        assert!(
+            create_store.contains("InventoryRepairSpawnMode::Initial"),
+            "new tenant store creation should start the first inventory repair"
+        );
+
+        let acquire = source
+            .split("pub async fn acquire(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Remove a per-keyspace creation lock").next())
+            .expect("acquire body must exist");
+        assert!(
+            acquire.contains("InventoryRepairSpawnMode::RetryOnly"),
+            "fast-path cached tenant acquisition should retry exhausted repairs when due"
+        );
+
+        let repair_helper = source
+            .split("fn spawn_tenant_database_inventory_repair(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn tenant_qps_limit").next())
+            .expect("tenant inventory repair helper must exist before tenant config helpers");
+        assert!(
+            repair_helper.contains("tokio::spawn")
+                && repair_helper.contains("register_database_inventory("),
+            "tenant inventory repair must run register_database_inventory from a background task"
+        );
+        assert!(
+            repair_helper.contains("tracker.begin(&keyspace, mode, now_epoch_ms())"),
+            "tenant inventory repair must acquire a tracker lease before spawning"
+        );
+        assert!(
+            repair_helper.contains("TENANT_INVENTORY_REPAIR_MAX_ATTEMPTS")
+                && repair_helper.contains("tenant_inventory_repair_retry_delay"),
+            "tenant inventory repair retries must be capped and backed off"
+        );
+    }
+
+    #[test]
+    fn tenant_inventory_repair_retry_delay_is_bounded() {
+        assert_eq!(
+            tenant_inventory_repair_retry_delay(1),
+            TENANT_INVENTORY_REPAIR_RETRY_DELAY
+        );
+        assert_eq!(
+            tenant_inventory_repair_retry_delay(2),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            tenant_inventory_repair_retry_delay(3),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            tenant_inventory_repair_retry_delay(4),
+            TENANT_INVENTORY_REPAIR_MAX_RETRY_DELAY
+        );
+        assert_eq!(
+            tenant_inventory_repair_retry_delay(100),
+            TENANT_INVENTORY_REPAIR_MAX_RETRY_DELAY
+        );
+    }
+
+    #[test]
+    fn tenant_inventory_repair_tracker_dedupes_cools_down_and_clears_on_success() {
+        let tracker = Arc::new(TenantInventoryRepairTracker::new());
+        let first = tracker
+            .begin("ks", InventoryRepairSpawnMode::Initial, now_epoch_ms())
+            .expect("initial repair should start");
+        assert!(
+            tracker
+                .begin("ks", InventoryRepairSpawnMode::Initial, now_epoch_ms())
+                .is_none(),
+            "second repair for the same keyspace must be deduped while in flight"
+        );
+
+        let before = now_epoch_ms();
+        drop(first);
+        let retry_state = tracker
+            .state_for("ks")
+            .expect("failed repair should stay scheduled");
+        assert!(!retry_state.in_flight);
+        assert!(
+            retry_state.retry_after_ms
+                >= before
+                    .saturating_add(TENANT_INVENTORY_REPAIR_MAX_RETRY_DELAY.as_millis() as u64),
+            "failed repair must set a future retry_after marker"
+        );
+        assert!(
+            tracker
+                .begin("ks", InventoryRepairSpawnMode::RetryOnly, now_epoch_ms())
+                .is_none(),
+            "fast-path retry must respect cooldown"
+        );
+
+        let mut retry = tracker
+            .begin(
+                "ks",
+                InventoryRepairSpawnMode::RetryOnly,
+                retry_state.retry_after_ms,
+            )
+            .expect("retry should start when cooldown expires");
+        retry.complete();
+        assert!(
+            tracker.state_for("ks").is_none(),
+            "successful repair should clear retry state so fast-path acquire does not rescan"
         );
     }
 

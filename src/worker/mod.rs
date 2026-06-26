@@ -658,14 +658,9 @@ pub(crate) async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &s
 /// system-store init used by BOTH production startup and tests/integration —
 /// there is no second "test-only" init that could diverge from production.
 ///
-/// Initialization performs the one-shot V1->V2 worker-queue schema migration
-/// (idempotent: short-circuits once `_wq_schema_version = 2`). This MUST run
-/// here, before the worker engine begins ticking, because the production tick
-/// is V2-only: any pre-existing legacy `_worker_queue_` rows (cron next-fire
-/// entries, in-flight BgDdl/CREATE INDEX CONCURRENTLY backfills, queued BgSql,
-/// pending AsyncTriggers, pending HNSW merges) would otherwise be neither
-/// scanned, executed, nor reaped — a durable orphan / lost-recovery defect on
-/// any node upgrading from a build that still has live V1 rows.
+/// Initialization enables the V2 worker-queue schema marker in O(1). It must
+/// not drain historical legacy `_worker_queue_` rows on the startup/readiness
+/// path; those rows are projected into V2 by the bounded maintenance-loop drain.
 pub async fn init_gc_registry_store(
     pd_endpoints: Vec<String>,
     config: &WorkerConfig,
@@ -690,16 +685,11 @@ pub async fn init_gc_registry_store(
                 config.system_keyspace
             )
         })?;
-    let migrated = store
+    store
         .ensure_worker_queue_schema_v2()
         .await
-        .context("failed to migrate worker queue schema to V2")?;
-    if migrated > 0 {
-        info!(
-            "Migrated {} legacy worker queue entries into V2 schema",
-            migrated
-        );
-    }
+        .context("failed to enable worker queue schema V2")?;
+    info!("Worker queue V2 schema enabled; legacy backlog drains after startup");
     let store = Arc::new(store);
     info!("GC registry store initialized successfully");
     Ok(store)
@@ -895,15 +885,13 @@ mod tests {
         );
     }
 
-    /// Behavioral regression for the V1->V2 migration on the PRODUCTION init
-    /// path. Seeds a legacy `_worker_queue_` row, runs the SAME init function
-    /// that `main.rs` calls at startup (`init_gc_registry_store`), and asserts
-    /// the legacy row is migrated and visible to the V2-only tick (`scan_due_v2`).
-    /// This proves the tested path equals the production path — a source-string
-    /// EXISTS check would not.
+    /// Behavioral regression for the readiness-safe V2 schema enablement path.
+    /// Seeds a legacy `_worker_queue_` row, runs the SAME init function that
+    /// `main.rs` calls at startup (`init_gc_registry_store`), and asserts init
+    /// does not drain the row. The bounded drain then projects it to V2.
     #[tokio::test]
     #[ignore = "requires TiKV / PD cluster"]
-    async fn production_init_migrates_legacy_worker_queue_rows() {
+    async fn production_init_defers_legacy_worker_queue_rows_to_bounded_drain() {
         use crate::worker::types::{TaskQueueEntry, TaskType};
 
         let pd_endpoints = std::env::var("PD_ENDPOINTS")
@@ -932,7 +920,7 @@ mod tests {
             .await
             .expect("pre-create production-init test keyspace in PD");
         // Seed a legacy V1 row directly (pre-upgrade durable state) on a raw
-        // store handle that has NOT run the migration yet.
+        // store handle that has NOT enabled the V2 marker yet.
         let raw = std::sync::Arc::new(
             TikvStore::new_system(pd_endpoints.clone(), &cfg.system_keyspace)
                 .await
@@ -958,7 +946,15 @@ mod tests {
             .await
             .expect("production init must succeed");
 
-        // The legacy row must now be visible to the V2-only tick.
+        assert!(
+            !store
+                .legacy_worker_queue_is_empty()
+                .await
+                .expect("legacy empty probe"),
+            "production init must not drain legacy queue rows before readiness"
+        );
+
+        // The legacy row is not V2-visible until the bounded drain projects it.
         let mut txn = store.begin().await.expect("begin");
         let due = store
             .scan_due_v2(&mut txn, i64::MAX, 1000)
@@ -966,9 +962,28 @@ mod tests {
             .expect("scan_due_v2");
         txn.rollback().await.ok();
         assert!(
+            !due.iter()
+                .any(|(_, d)| d.task_id == 42 && d.db_id == 7 && d.task_type == TaskType::Cron),
+            "production init must not synchronously migrate the legacy row into V2"
+        );
+
+        let migrated = store
+            .drain_legacy_worker_queue_batch()
+            .await
+            .expect("bounded drain")
+            .migrated;
+        assert_eq!(migrated, 1, "bounded drain must migrate the legacy row");
+
+        let mut txn = store.begin().await.expect("begin");
+        let due = store
+            .scan_due_v2(&mut txn, i64::MAX, 1000)
+            .await
+            .expect("scan_due_v2 after drain");
+        txn.rollback().await.ok();
+        assert!(
             due.iter()
                 .any(|(_, d)| d.task_id == 42 && d.db_id == 7 && d.task_type == TaskType::Cron),
-            "production init must migrate the seeded legacy V1 row into V2"
+            "bounded drain must make the legacy row visible to V2"
         );
     }
 }

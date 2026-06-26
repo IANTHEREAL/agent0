@@ -77,10 +77,11 @@ pub(super) const WORKER_PAYLOAD_V2_PREFIX: &[u8] = b"_wq_payload_v2_";
 /// never reads the (potentially large) due-queue value. See issue #2576.
 pub(super) const WORKER_QUEUE_INDEX_V2_PREFIX: &[u8] = b"_wq_idx_v2_";
 /// Worker queue storage schema version. Version 2 means normal production
-/// paths are V2-only; legacy `_worker_queue_` rows must have been migrated.
+/// paths are V2-enabled/V2-only; legacy `_worker_queue_` rows, if any, are
+/// compatibility backlog for the bounded background drain.
 pub(super) const WORKER_QUEUE_SCHEMA_VERSION_KEY: &[u8] = b"_wq_schema_version";
-/// Explicit migration lock for V1 `_worker_queue_` to V2 due/index/payload
-/// conversion. The value stores the lock acquisition time in epoch millis.
+/// Legacy startup-migration lock from the old V1-to-V2 drain protocol. New
+/// startup code ignores/clears it so a stale lock cannot block readiness.
 pub(super) const WORKER_QUEUE_MIGRATION_LOCK_KEY: &[u8] = b"_wq_migration_lock";
 /// Durable dropped-DB tombstone (global, system store). Written by DROP
 /// DATABASE's worker reap and read with `get_for_update` in the SAME system

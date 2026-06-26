@@ -402,11 +402,26 @@ impl WorkerEngine {
                     break;
                 }
                 _ = sweep_interval.tick() => {
-                    if let Err(e) = self.registry_sweep_tick().await {
-                        warn!("Worker registry sweep error: {}", e);
-                    }
                     if let Err(e) = self.legacy_queue_drain_tick().await {
                         warn!("Worker legacy queue drain error: {}", e);
+                    }
+                    match self.system_store.legacy_worker_queue_is_empty().await {
+                        Ok(true) => {
+                            if let Err(e) = self.registry_sweep_tick().await {
+                                warn!("Worker registry sweep error: {}", e);
+                            }
+                        }
+                        Ok(false) => {
+                            debug!(
+                                "Skipping worker registry sweep while legacy V1 queue backlog drains"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Worker legacy queue empty probe failed; skipping registry sweep: {}",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -691,14 +706,12 @@ impl WorkerEngine {
     /// Convergent background drain of legacy `_worker_queue_` rows (design
     /// §II.8 M5).
     ///
-    /// The startup migration only converts V1 rows that exist when this node
-    /// latches `_wq_schema_version = 2`. During a rolling deploy an OLD
-    /// (pre-V2) binary keeps writing V1 rows AFTER that point; the V2-only tick
-    /// would never dequeue or reap them, stranding cron fires / bg DDL / bg SQL
-    /// / auto-analyze forever. This tick keeps draining stragglers in BOUNDED
-    /// batches until the legacy queue is observed empty across a grace window,
-    /// after which it costs only a cheap empty-range probe — and it NEVER stops,
-    /// because an old binary may write a fresh V1 row at any time in the window.
+    /// Startup only enables the V2 schema marker. Any legacy rows from before
+    /// the upgrade, plus any rolling-deploy stragglers from OLD binaries, are
+    /// projected into V2 here in BOUNDED batches. Once the legacy queue is
+    /// observed empty across a grace window, this downshifts to a cheap
+    /// empty-range probe — and it NEVER stops, because an old binary may write
+    /// a fresh V1 row at any time in the window.
     ///
     /// Bounded by construction (issue #2576 invariant): each active sweep does
     /// at most `LEGACY_DRAIN_MAX_BATCHES_PER_TICK` page-sized batch migrations;
@@ -725,10 +738,10 @@ impl WorkerEngine {
         let mut batches = 0u32;
         let mut drained_to_empty = false;
         while batches < LEGACY_DRAIN_MAX_BATCHES_PER_TICK {
-            let migrated = self.system_store.drain_legacy_worker_queue_batch().await?;
+            let batch = self.system_store.drain_legacy_worker_queue_batch().await?;
             batches += 1;
-            migrated_total += migrated;
-            if migrated == 0 {
+            migrated_total += batch.migrated;
+            if batch.drained == 0 {
                 drained_to_empty = true;
                 break;
             }
@@ -1296,10 +1309,9 @@ impl WorkerEngine {
     ) -> Result<(u32, u32)> {
         // 1. Existing cron entries (V2 identity index only). Reconciliation is
         //    bounded: it reads the per-(db, type) V2 index, never the global
-        //    due queue. Legacy `_worker_queue_` rows do not need draining here
-        //    because the one-shot V1->V2 migration runs in
-        //    `init_gc_registry_store` at startup, before the worker tick loop
-        //    or this sweep ever run. After migration the queue is V2-only.
+        //    due queue. The maintenance loop skips registry sweep while the
+        //    legacy V1 prefix is non-empty, so this sweep does not race a
+        //    backlog that has not yet been projected into V2.
         let mut txn = self.system_store.begin().await?;
         let existing_rows = self
             .system_store
@@ -1344,8 +1356,8 @@ impl WorkerEngine {
         if !cron_enabled {
             tenant_txn.commit().await?;
             // Cron disabled but registry has cron bit — clean up bounded V2
-            // entries via the per-(db, type) index. No legacy V1 rows remain:
-            // the startup V1->V2 migration already converted them.
+            // entries via the per-(db, type) index. The maintenance loop skips
+            // registry sweep while legacy V1 rows remain.
             let total = existing_rows.len();
             if total > 0 {
                 let mut sys_txn = self.system_store.begin().await?;
@@ -1426,9 +1438,9 @@ impl WorkerEngine {
         }
 
         // 5. Cleanup bounded V2 orphans: queue entries whose job_id is not in
-        //    active jobs. The queue is V2-only after the startup migration, so
-        //    the V2 identity index is the complete orphan set — no global
-        //    `_worker_queue_` scan is needed.
+        //    active jobs. The maintenance loop only reaches registry sweep
+        //    after the legacy prefix is empty, so the V2 identity index is the
+        //    complete orphan set — no global `_worker_queue_` scan is needed.
         let orphan_rows: Vec<&WqIndexRow> = existing_rows
             .iter()
             .filter(|r| !active_job_ids.contains(&r.task_id))
@@ -1880,8 +1892,9 @@ impl WorkerEngine {
     /// Core implementation of claim_and_execute, parameterized over the finalize
     /// function so tests can inject failures in the real code path.
     ///
-    /// Handles V2 descriptors after startup migration has converted legacy
-    /// `_worker_queue_` rows. A post-claim existence re-check closes the
+    /// Handles V2 descriptors. Legacy `_worker_queue_` rows become visible here
+    /// only after the bounded drain projects them into V2. A post-claim
+    /// existence re-check closes the
     /// read-before/claim-after-release window: if the entry was deleted by
     /// another replica (or unschedule / DROP DATABASE reap) since the tick
     /// scanned it, we release the claim and skip rather than re-execute.

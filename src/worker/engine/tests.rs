@@ -909,6 +909,19 @@ fn registry_sweep_runs_outside_queue_poll_loop() {
         maintenance_fn.contains("registry_sweep_tick().await"),
         "registry recovery sweep must run from the dedicated maintenance loop"
     );
+    let legacy_drain_pos = maintenance_fn
+        .find("legacy_queue_drain_tick().await")
+        .expect("maintenance loop must drain legacy V1 queue backlog");
+    let empty_probe_pos = maintenance_fn
+        .find("legacy_worker_queue_is_empty().await")
+        .expect("maintenance loop must probe legacy V1 queue emptiness");
+    let registry_sweep_pos = maintenance_fn
+        .find("registry_sweep_tick().await")
+        .expect("maintenance loop must run registry sweep");
+    assert!(
+        legacy_drain_pos < empty_probe_pos && empty_probe_pos < registry_sweep_pos,
+        "registry sweep must run only after bounded legacy drain and an empty legacy-prefix probe"
+    );
 }
 
 #[test]
@@ -5191,8 +5204,8 @@ async fn legacy_queue_drain_tick_orchestrates_straggler_migration_budget_and_rea
         system_keyspace,
         ..Default::default()
     };
-    // init_gc_registry_store runs the one-shot startup migration AND latches the
-    // `_wq_schema_version = 2` marker — exactly the production post-startup state.
+    // init_gc_registry_store latches the `_wq_schema_version = 2` marker without
+    // draining legacy rows — exactly the production post-startup state.
     let system_store = crate::worker::init_gc_registry_store(pd_endpoints.clone(), &cfg)
         .await
         .expect("init system store");
