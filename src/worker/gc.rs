@@ -3,6 +3,7 @@ use crate::pool::TikvClientPool;
 use crate::storage::worker::GcInstanceState;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
+use crate::worker::executor_lease::WorkerExecutorLeaseCoordinator;
 use crate::worker::metrics::WorkerMetrics;
 use crate::worker::now_epoch_ms;
 use anyhow::Result;
@@ -30,6 +31,7 @@ pub struct WorkerGc {
     #[allow(dead_code)]
     pool: Arc<TikvClientPool>,
     config: WorkerConfig,
+    executor_lease: Arc<WorkerExecutorLeaseCoordinator>,
 }
 
 pub struct WorkerGcHandles {
@@ -43,15 +45,30 @@ struct ClaimGcBatch {
 }
 
 impl WorkerGc {
+    #[allow(dead_code)] // kept for tests and non-main callers that do not need a shared coordinator
     pub fn new(
         system_store: Arc<TikvStore>,
         pool: Arc<TikvClientPool>,
         config: WorkerConfig,
     ) -> Self {
+        let executor_lease = Arc::new(WorkerExecutorLeaseCoordinator::new(
+            system_store.clone(),
+            config.clone(),
+        ));
+        Self::new_with_executor_lease(system_store, pool, config, executor_lease)
+    }
+
+    pub fn new_with_executor_lease(
+        system_store: Arc<TikvStore>,
+        pool: Arc<TikvClientPool>,
+        config: WorkerConfig,
+        executor_lease: Arc<WorkerExecutorLeaseCoordinator>,
+    ) -> Self {
         Self {
             system_store,
             pool,
             config,
+            executor_lease,
         }
     }
 
@@ -393,6 +410,9 @@ async fn advance_gc_safepoint(
 
 impl WorkerGc {
     async fn gc_tick(&self) -> Result<()> {
+        if !self.executor_lease.ensure_current_executor().await {
+            return Ok(());
+        }
         self.cleanup_hnsw_s3_external_object_intents().await?;
         self.cleanup_orphan_claims().await?;
         Ok(())

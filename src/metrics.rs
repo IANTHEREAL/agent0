@@ -196,6 +196,21 @@ pub fn describe_observability_metrics() {
         Unit::Seconds,
         "HNSW S3 GET/PUT latency"
     );
+    describe_gauge!(
+        "db9_server_worker_executor_active",
+        Unit::Count,
+        "Whether this db9-server process currently holds the active worker executor lease"
+    );
+    describe_counter!(
+        "db9_server_worker_executor_lease_acquisitions_total",
+        Unit::Count,
+        "Worker executor lease acquisitions by this process"
+    );
+    describe_counter!(
+        "db9_server_worker_executor_lease_errors_total",
+        Unit::Count,
+        "Worker executor lease acquire, renew, or release errors"
+    );
     describe_counter!("db9_engine_rows_total", Unit::Count, "Engine row counters");
     describe_histogram!(
         "db9_first_row_latency_seconds",

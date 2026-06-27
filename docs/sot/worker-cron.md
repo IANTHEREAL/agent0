@@ -15,9 +15,12 @@
   - Worker claims use pessimistic transactions so competing workers cannot both acquire the same task.
   - Evidence: `src/worker/engine.rs`, `src/storage/tikv_store/worker.rs`.
 
-- **[Stable] No leader election**
-  - Any db9 instance with worker support enabled can participate; there is no coordinator-only node role.
-  - Evidence: `src/worker/engine.rs`, `src/worker/gc.rs`.
+- **[Stable] Active worker executor lease**
+  - There is no dedicated coordinator-only node role: any worker-enabled db9 instance may hold the active executor lease, and another instance may take over after the lease expires.
+  - Only the active executor scans/drains the worker queues, runs registry sweep maintenance, and performs worker-only GC cleanup. Standby worker-enabled SQL nodes continue serving SQL and remain eligible for takeover.
+  - The executor lease does not replace per-task worker claims; task claims remain the execution-level single-winner fence.
+  - The executor lease MUST NOT gate GC registry publisher participation, which remains unconditional for every SQL-serving process.
+  - Evidence: `src/worker/executor_lease.rs`, `src/worker/engine.rs`, `src/worker/gc.rs`, `src/storage/tikv_store/worker.rs`.
 
 - **[Stable] System-keyspace queue with configurable keyspace name**
   - Background task metadata lives in the worker system keyspace, which defaults to `_sys_worker` and is configurable via `DB9_WORKER_SYSTEM_KEYSPACE`.

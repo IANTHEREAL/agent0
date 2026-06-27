@@ -69,6 +69,8 @@ struct WorkerRuntimeHandles {
     maintenance_handle: JoinHandle<()>,
     engine_shutdown: CancellationToken,
     gc_loop_handle: JoinHandle<()>,
+    executor_lease_handle: JoinHandle<()>,
+    executor_lease: Arc<worker::executor_lease::WorkerExecutorLeaseCoordinator>,
 }
 
 struct ConnectionTaskRegistry {
@@ -581,15 +583,27 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // ================================================================
     let worker_runtime = if worker_config.enabled {
         let system_store = gc_store.clone();
+        let executor_lease = Arc::new(worker::executor_lease::WorkerExecutorLeaseCoordinator::new(
+            system_store.clone(),
+            worker_config.clone(),
+        ));
 
-        let engine = Arc::new(worker::engine::WorkerEngine::new(
+        let engine = Arc::new(worker::engine::WorkerEngine::new_with_executor_lease(
             worker_config.clone(),
             system_store.clone(),
             client_pool.clone(),
+            executor_lease.clone(),
         ));
         let metrics = engine.metrics().clone();
         let engine_shutdown = engine.shutdown_token();
         worker::set_worker_metrics(metrics.clone());
+        let executor_lease_for_keepalive = executor_lease.clone();
+        let executor_lease_shutdown = engine_shutdown.clone();
+        let executor_lease_handle = tokio::spawn(async move {
+            executor_lease_for_keepalive
+                .run_keepalive_loop(executor_lease_shutdown)
+                .await
+        });
         let engine_for_queue = engine.clone();
         let engine_handle = tokio::spawn(async move { engine_for_queue.run().await });
         let engine_for_maintenance = engine.clone();
@@ -598,11 +612,7 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
 
         // WorkerGc: orphan-claim cleanup only. Registry maintenance runs in WorkerEngine.
         // Publisher and advancer are spawned above, not here.
-        let gc = Arc::new(worker::gc::WorkerGc::new(
-            system_store,
-            client_pool.clone(),
-            worker_config.clone(),
-        ));
+        let gc = engine.worker_gc();
         let gc_handles = gc.spawn_worker_gc_only();
 
         info!("WorkerEngine started (cron/triggers/HNSW/DDL)");
@@ -611,6 +621,8 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
             maintenance_handle,
             engine_shutdown,
             gc_loop_handle: gc_handles.gc_loop_handle,
+            executor_lease_handle,
+            executor_lease,
         })
     } else {
         None
@@ -1062,6 +1074,8 @@ async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
         maintenance_handle,
         engine_shutdown,
         gc_loop_handle,
+        executor_lease_handle,
+        executor_lease,
     } = worker_runtime;
 
     engine_shutdown.cancel();
@@ -1090,6 +1104,12 @@ async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
     }
 
     abort_task("Worker GC loop", gc_loop_handle).await;
+    abort_task(
+        "Worker executor lease keepalive loop",
+        executor_lease_handle,
+    )
+    .await;
+    executor_lease.release_if_owned().await;
 }
 
 async fn shutdown_gc_runtime(
@@ -1376,10 +1396,19 @@ mod tests {
         let repair_call = prod_source
             .find("worker::register_database_inventory(")
             .expect("startup inventory repair must still call register_database_inventory");
+        let repair_fn = prod_source
+            .split("fn spawn_startup_database_inventory_repair(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn shutdown_worker_runtime").next())
+            .expect("startup inventory repair helper must exist before shutdown_worker_runtime");
 
         assert!(
             listener_bind < repair_spawn,
             "startup inventory repair must not start before pgwire binds"
+        );
+        assert!(
+            !repair_fn.contains("ensure_current_executor"),
+            "startup inventory repair is per startup keyspace and must not be gated by the global worker executor lease"
         );
         assert!(
             repair_spawn < repair_call,

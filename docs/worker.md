@@ -237,10 +237,12 @@ All settings are controlled via environment variables. Every setting has a sensi
 | `DB9_WORKER_ENABLED` | `true` | Enable background task execution on this instance. `false` does not disable GC registry participation for a SQL-serving node. |
 | `DB9_WORKER_POLL_MS` | `60000` | Queue poll interval in milliseconds (minimum 100). |
 | `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max tasks executing concurrently per instance. |
-| `DB9_WORKER_ID` | `{hostname}:{pid}` | Worker claim/logging identifier. Auto-generated if not set. It is not the GC registry identity. |
+| `DB9_WORKER_ID` | `{hostname}:{pid}` | Worker claim/logging identifier. Auto-generated if not set. It is not the GC registry identity; executor lease ownership appends a per-process UUID so reused worker IDs do not create multiple active executors. |
 | `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Whole-task timeout for non-cron worker SQL (5 minutes). `0` disables the timeout. |
 | `DB9_CRON_JOB_TIMEOUT_MS` | `1800000` | Whole-job timeout for cron execution (30 minutes). `0` disables the timeout. |
 | `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Seconds before an uncompleted claim is considered orphaned (5 minutes). |
+| `DB9_WORKER_CLAIM_LEASE_MS` | `60000` | Per-task claim lease duration in milliseconds. |
+| `DB9_WORKER_EXECUTOR_LEASE_MS` | `30000` | Cluster-wide active worker executor lease. Only the holder scans/drains worker queues; other SQL-serving worker-enabled nodes stay standby. |
 | `DB9_WORKER_GC_BATCH_SIZE` | `100` | Number of keyspaces processed per GC cycle. |
 | `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | TiKV keyspace for global worker state (rarely needs changing). |
 | `DB9_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE on modified tables. |

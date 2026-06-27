@@ -1,6 +1,7 @@
 pub mod active_txn_registry;
 pub mod config;
 pub mod engine;
+pub mod executor_lease;
 pub mod gc;
 pub mod metrics;
 pub(crate) mod pd_region_stats;

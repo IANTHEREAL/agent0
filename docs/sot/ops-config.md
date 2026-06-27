@@ -118,10 +118,12 @@
 | `DB9_WORKER_ENABLED` | `true` | `src/worker/config.rs` | Master switch for background task execution on this node; SQL-serving processes still publish GC registry state. |
 | `DB9_WORKER_POLL_MS` | `60000` | `src/worker/config.rs` | Minimum effective value is `100`. |
 | `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | `src/worker/config.rs` | Per-node worker concurrency cap. |
-| `DB9_WORKER_ID` | `<hostname>:<pid>` | `src/worker/config.rs` | Overrides the auto-derived worker claim/logging ID. This is not the GC registry identity. |
+| `DB9_WORKER_ID` | `<hostname>:<pid>` | `src/worker/config.rs` | Overrides the auto-derived worker claim/logging ID. This is not the GC registry identity; executor lease ownership appends a per-process UUID so reused worker IDs do not create multiple active executors. |
 | `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | `src/worker/config.rs` | Whole-task timeout for non-cron worker SQL. `0` disables the timeout. |
 | `DB9_CRON_JOB_TIMEOUT_MS` | `1800000` | `src/worker/config.rs` | Whole-job timeout for cron execution. `0` disables the timeout. |
 | `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | `src/worker/config.rs` | Claim GC orphan timeout. |
+| `DB9_WORKER_CLAIM_LEASE_MS` | `60000` | `src/worker/config.rs` | Per-task claim lease duration; minimum effective value is `5000`. |
+| `DB9_WORKER_EXECUTOR_LEASE_MS` | `30000` | `src/worker/config.rs`, `src/worker/executor_lease.rs` | Cluster-wide active worker executor lease; minimum effective value is `10000`. |
 | `DB9_WORKER_GC_BATCH_SIZE` | `100` | `src/worker/config.rs` | Claim GC batch size. |
 | `DB9_AUTO_ANALYZE_ENABLED` | `true` | `src/worker/config.rs` | Enables worker-driven auto-analyze. |
 | `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | `src/worker/config.rs` | Base threshold used by current auto-analyze policy. |

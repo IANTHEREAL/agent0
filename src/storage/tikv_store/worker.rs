@@ -2,7 +2,8 @@ use super::*;
 use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{
     HnswS3DbPrefixCleanupIntent, HnswS3GraphUploadIntent, TaskDescriptorV2, TaskPayloadV2,
-    TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim, TASK_TYPE_CRON,
+    TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim, WorkerExecutorLease,
+    WorkerExecutorLeaseResult, TASK_TYPE_CRON,
 };
 
 /// A V2 index row decoded into its identity plus the reconstructed V2 due-queue
@@ -88,6 +89,28 @@ fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64, Optio
         None
     };
     Some((min_ts, updated_at, legacy_max_untracked_timeout_sec))
+}
+
+fn tikv_error_is_worker_claim_contention(err: &tikv_client::Error) -> bool {
+    match err {
+        tikv_client::Error::ResolveLockError(_) => true,
+        tikv_client::Error::KeyError(key_error) => {
+            key_error.locked.is_some()
+                || key_error.conflict.is_some()
+                || key_error.deadlock.is_some()
+        }
+        tikv_client::Error::PessimisticLockError { inner, .. } => {
+            tikv_error_is_worker_claim_contention(inner)
+        }
+        tikv_client::Error::UndeterminedError(inner) => {
+            tikv_error_is_worker_claim_contention(inner)
+        }
+        tikv_client::Error::ExtractedErrors(errors)
+        | tikv_client::Error::MultipleKeyErrors(errors) => {
+            !errors.is_empty() && errors.iter().all(tikv_error_is_worker_claim_contention)
+        }
+        _ => err.is_lock_conflict(),
+    }
 }
 
 fn classify_legacy_worker_queue_row_for_drain(
@@ -592,6 +615,90 @@ impl TikvStore {
     // ========================================================================
     // Queue methods
     // ========================================================================
+
+    pub async fn try_acquire_or_renew_worker_executor_lease(
+        &self,
+        owner_id: &str,
+        lease_ms: i64,
+    ) -> Result<WorkerExecutorLeaseResult> {
+        self.try_acquire_or_renew_worker_executor_lease_with_clock(
+            owner_id,
+            lease_ms,
+            crate::worker::now_epoch_ms,
+        )
+        .await
+    }
+
+    async fn try_acquire_or_renew_worker_executor_lease_with_clock<F>(
+        &self,
+        owner_id: &str,
+        lease_ms: i64,
+        now_fn: F,
+    ) -> Result<WorkerExecutorLeaseResult>
+    where
+        F: Fn() -> i64,
+    {
+        let mut txn = self.begin().await?;
+        let key = self.key(&encode_worker_executor_lease_key());
+        let existing = tikv_op!(txn.get_for_update(key.clone()).await)?;
+        let lease_now_ms = now_fn();
+
+        let lease = match existing {
+            Some(bytes) => match bincode::deserialize::<WorkerExecutorLease>(&bytes) {
+                Ok(current) => {
+                    if current.is_live_at(lease_now_ms) && current.owner_id != owner_id {
+                        txn.rollback().await.ok();
+                        return Ok(WorkerExecutorLeaseResult::HeldByOther(current));
+                    }
+                    if current.owner_id == owner_id {
+                        current.renewed(lease_now_ms, lease_ms)
+                    } else {
+                        WorkerExecutorLease::new(
+                            owner_id.to_string(),
+                            lease_now_ms,
+                            lease_ms,
+                            current.generation.saturating_add(1),
+                        )
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "Overwriting corrupt worker executor lease row"
+                    );
+                    WorkerExecutorLease::new(owner_id.to_string(), lease_now_ms, lease_ms, 1)
+                }
+            },
+            None => WorkerExecutorLease::new(owner_id.to_string(), lease_now_ms, lease_ms, 1),
+        };
+
+        txn_put(
+            &mut txn,
+            key,
+            bincode::serialize(&lease).context("Failed to serialize worker executor lease")?,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(WorkerExecutorLeaseResult::Held(lease))
+    }
+
+    pub async fn release_worker_executor_lease_if_owned(&self, owner_id: &str) -> Result<bool> {
+        let mut txn = self.begin().await?;
+        let key = self.key(&encode_worker_executor_lease_key());
+        let Some(existing) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
+            txn.rollback().await.ok();
+            return Ok(false);
+        };
+        let lease: WorkerExecutorLease = bincode::deserialize(&existing)
+            .context("Failed to deserialize worker executor lease for release")?;
+        if lease.owner_id != owner_id {
+            txn.rollback().await.ok();
+            return Ok(false);
+        }
+        txn_delete(&mut txn, key).await?;
+        txn.commit().await?;
+        Ok(true)
+    }
 
     pub async fn ensure_worker_queue_schema_v2(&self) -> Result<()> {
         let mut txn = self.begin().await?;
@@ -1522,7 +1629,21 @@ impl TikvStore {
             task_id,
             fire_time_ms,
         ));
-        if let Some(existing) = tikv_op!(txn.get_for_update(key.clone()).await)? {
+        if let Some(existing) = match tikv_op!(txn.get_for_update(key.clone()).await) {
+            Ok(existing) => existing,
+            Err(err) if tikv_error_is_worker_claim_contention(&err) => {
+                tracing::debug!(
+                    task_type = claim.task_type.as_str(),
+                    keyspace,
+                    db_id,
+                    task_id,
+                    fire_time_ms,
+                    "Worker claim key is contended; treating as claim miss"
+                );
+                return Ok(false);
+            }
+            Err(err) => return Err(err.into()),
+        } {
             let existing = WorkerClaim::decode_compat(&existing)
                 .context("Failed to deserialize existing worker claim")?;
             // A live lease blocks the claim; an expired lease may be taken over.
@@ -2307,6 +2428,70 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn worker_executor_lease_is_single_owner_and_allows_expired_takeover() {
+        let store = v2_test_store().await;
+        let lease_ms = 30_000;
+        let now = 1_000_000;
+
+        let first = store
+            .try_acquire_or_renew_worker_executor_lease_with_clock("worker-a", lease_ms, || now)
+            .await
+            .unwrap();
+        let WorkerExecutorLeaseResult::Held(first) = first else {
+            panic!("first worker must acquire an empty executor lease");
+        };
+        assert_eq!(first.owner_id, "worker-a");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.lease_until_ms, now + lease_ms);
+
+        let second = store
+            .try_acquire_or_renew_worker_executor_lease_with_clock("worker-b", lease_ms, || now + 1)
+            .await
+            .unwrap();
+        let WorkerExecutorLeaseResult::HeldByOther(second) = second else {
+            panic!("second worker must stand by while first lease is live");
+        };
+        assert_eq!(second.owner_id, "worker-a");
+        assert_eq!(second.generation, 1);
+
+        let renewed = store
+            .try_acquire_or_renew_worker_executor_lease_with_clock("worker-a", lease_ms, || {
+                now + 5_000
+            })
+            .await
+            .unwrap();
+        let WorkerExecutorLeaseResult::Held(renewed) = renewed else {
+            panic!("owner must renew its own executor lease");
+        };
+        assert_eq!(renewed.owner_id, "worker-a");
+        assert_eq!(renewed.generation, 1);
+        assert_eq!(renewed.acquired_at_ms, first.acquired_at_ms);
+        assert_eq!(renewed.lease_until_ms, now + 5_000 + lease_ms);
+
+        let takeover = store
+            .try_acquire_or_renew_worker_executor_lease_with_clock("worker-b", lease_ms, || {
+                now + 40_000
+            })
+            .await
+            .unwrap();
+        let WorkerExecutorLeaseResult::Held(takeover) = takeover else {
+            panic!("second worker must take over after the first lease expires");
+        };
+        assert_eq!(takeover.owner_id, "worker-b");
+        assert_eq!(takeover.generation, 2);
+
+        assert!(!store
+            .release_worker_executor_lease_if_owned("worker-a")
+            .await
+            .unwrap());
+        assert!(store
+            .release_worker_executor_lease_if_owned("worker-b")
+            .await
+            .unwrap());
     }
 
     fn cron_entry(ks: &str, db_id: u64, job_id: i64, command: &str) -> TaskQueueEntry {

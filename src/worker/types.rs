@@ -678,6 +678,51 @@ impl WorkerClaim {
 }
 
 // ============================================================================
+// WorkerExecutorLease
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerExecutorLease {
+    pub owner_id: String,
+    pub acquired_at_ms: i64,
+    pub renewed_at_ms: i64,
+    pub lease_until_ms: i64,
+    pub generation: u64,
+}
+
+impl WorkerExecutorLease {
+    pub fn new(owner_id: String, now_ms: i64, lease_ms: i64, generation: u64) -> Self {
+        Self {
+            owner_id,
+            acquired_at_ms: now_ms,
+            renewed_at_ms: now_ms,
+            lease_until_ms: now_ms.saturating_add(lease_ms.max(0)),
+            generation,
+        }
+    }
+
+    pub fn renewed(&self, now_ms: i64, lease_ms: i64) -> Self {
+        Self {
+            owner_id: self.owner_id.clone(),
+            acquired_at_ms: self.acquired_at_ms,
+            renewed_at_ms: now_ms,
+            lease_until_ms: now_ms.saturating_add(lease_ms.max(0)),
+            generation: self.generation,
+        }
+    }
+
+    pub fn is_live_at(&self, now_ms: i64) -> bool {
+        self.lease_until_ms > now_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerExecutorLeaseResult {
+    Held(WorkerExecutorLease),
+    HeldByOther(WorkerExecutorLease),
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

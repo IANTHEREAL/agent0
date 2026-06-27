@@ -12,6 +12,8 @@ const DEFAULT_ORPHAN_TIMEOUT_SEC: u64 = 300;
 // plausible clock skew; sub-second leases are forbidden (design §K4).
 const DEFAULT_CLAIM_LEASE_MS: u64 = 60_000;
 const MIN_CLAIM_LEASE_MS: u64 = 5_000;
+const DEFAULT_EXECUTOR_LEASE_MS: u64 = 30_000;
+const MIN_EXECUTOR_LEASE_MS: u64 = 10_000;
 const DEFAULT_GC_BATCH_SIZE: usize = 100;
 const DEFAULT_AUTO_ANALYZE_THRESHOLD: u64 = 50;
 const DEFAULT_GC_INTERVAL_SEC: u64 = 600;
@@ -58,6 +60,9 @@ pub struct WorkerConfig {
     /// Worker-claim lease span in ms. The executing worker renews its claim at
     /// ~lease/3; GC reaps only leases that have actually expired.
     pub claim_lease_ms: u64,
+    /// Cluster-wide executor lease span in ms. Only the holder scans/drains the
+    /// worker queues; other db9 processes remain standby SQL-serving nodes.
+    pub executor_lease_ms: u64,
     pub gc_batch_size: usize,
     pub auto_analyze_enabled: bool,
     pub auto_analyze_threshold: u64,
@@ -94,6 +99,7 @@ impl Default for WorkerConfig {
             cron_job_timeout_ms: DEFAULT_CRON_JOB_TIMEOUT_MS,
             orphan_timeout_sec: DEFAULT_ORPHAN_TIMEOUT_SEC,
             claim_lease_ms: DEFAULT_CLAIM_LEASE_MS,
+            executor_lease_ms: DEFAULT_EXECUTOR_LEASE_MS,
             gc_batch_size: DEFAULT_GC_BATCH_SIZE,
             auto_analyze_enabled: true,
             auto_analyze_threshold: DEFAULT_AUTO_ANALYZE_THRESHOLD,
@@ -220,6 +226,28 @@ impl WorkerConfig {
                         "DB9_WORKER_CLAIM_LEASE_MS='{}' is not a valid integer; using default {}ms",
                         v,
                         cfg.claim_lease_ms
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_WORKER_EXECUTOR_LEASE_MS") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_EXECUTOR_LEASE_MS => {
+                    cfg.executor_lease_ms = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_EXECUTOR_LEASE_MS={} is below minimum {}ms; using default {}ms",
+                        parsed,
+                        MIN_EXECUTOR_LEASE_MS,
+                        cfg.executor_lease_ms
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_EXECUTOR_LEASE_MS='{}' is not a valid integer; using default {}ms",
+                        v,
+                        cfg.executor_lease_ms
                     );
                 }
             }
@@ -503,6 +531,8 @@ mod tests {
             "DB9_WORKER_STATEMENT_TIMEOUT_MS",
             "DB9_CRON_JOB_TIMEOUT_MS",
             "DB9_WORKER_ORPHAN_TIMEOUT_SEC",
+            "DB9_WORKER_CLAIM_LEASE_MS",
+            "DB9_WORKER_EXECUTOR_LEASE_MS",
             "DB9_WORKER_GC_BATCH_SIZE",
             "DB9_AUTO_ANALYZE_ENABLED",
             "DB9_AUTO_ANALYZE_THRESHOLD",
@@ -536,6 +566,8 @@ mod tests {
         assert_eq!(cfg.statement_timeout_ms, DEFAULT_STATEMENT_TIMEOUT_MS);
         assert_eq!(cfg.cron_job_timeout_ms, DEFAULT_CRON_JOB_TIMEOUT_MS);
         assert_eq!(cfg.orphan_timeout_sec, DEFAULT_ORPHAN_TIMEOUT_SEC);
+        assert_eq!(cfg.claim_lease_ms, DEFAULT_CLAIM_LEASE_MS);
+        assert_eq!(cfg.executor_lease_ms, DEFAULT_EXECUTOR_LEASE_MS);
         assert_eq!(cfg.gc_batch_size, DEFAULT_GC_BATCH_SIZE);
         assert!(cfg.auto_analyze_enabled);
         assert_eq!(cfg.auto_analyze_threshold, DEFAULT_AUTO_ANALYZE_THRESHOLD);
@@ -783,6 +815,31 @@ mod tests {
         }
         let cfg = WorkerConfig::from_env();
         assert_eq!(cfg.claim_lease_ms, DEFAULT_CLAIM_LEASE_MS);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_applies_executor_lease_ms_and_clamps_below_minimum() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_WORKER_EXECUTOR_LEASE_MS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "45000");
+        }
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.executor_lease_ms, 45_000);
+
+        unsafe {
+            env::set_var(key, "5000");
+        }
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.executor_lease_ms, DEFAULT_EXECUTOR_LEASE_MS);
 
         match saved {
             Some(v) => unsafe { env::set_var(key, v) },

@@ -864,6 +864,67 @@ fn registry_sweep_runs_outside_queue_poll_loop() {
 }
 
 #[test]
+fn worker_execution_loops_are_gated_by_executor_lease() {
+    let engine_source = include_str!("../engine.rs");
+    let engine_prod_source = engine_source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let maintenance_fn = engine_prod_source
+        .split("pub async fn run_maintenance(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn tick(&self)").next())
+        .expect("WorkerEngine::run_maintenance must exist before tick");
+    let tick_fn = engine_prod_source
+        .split("async fn tick(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("let now_ms = now_epoch_ms();").next())
+        .expect("WorkerEngine::tick must start before reading due rows");
+
+    let maintenance_gate_pos = maintenance_fn
+        .find("ensure_current_executor().await")
+        .expect("maintenance loop must check the executor lease");
+    let legacy_drain_pos = maintenance_fn
+        .find("legacy_queue_drain_tick().await")
+        .expect("maintenance loop must drain legacy queue");
+    assert!(
+        maintenance_gate_pos < legacy_drain_pos,
+        "maintenance must acquire the executor lease before draining legacy queue"
+    );
+    assert!(
+        tick_fn.contains("ensure_current_executor().await"),
+        "queue tick must acquire the executor lease before scanning due rows"
+    );
+
+    let gc_source = include_str!("../gc.rs");
+    let gc_tick_fn = gc_source
+        .split("async fn gc_tick(&self)")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("self.cleanup_hnsw_s3_external_object_intents")
+                .next()
+        })
+        .expect("WorkerGc::gc_tick must exist before cleanup calls");
+    assert!(
+        gc_tick_fn.contains("ensure_current_executor().await"),
+        "worker-only GC must acquire the executor lease before cleaning worker state"
+    );
+
+    let main_source = include_str!("../../main.rs");
+    let worker_runtime = main_source
+        .split("let worker_runtime = if worker_config.enabled")
+        .nth(1)
+        .and_then(|rest| rest.split("// Export snapshot janitor").next())
+        .expect("main.rs must wire worker runtime");
+    assert!(
+        worker_runtime.contains("WorkerExecutorLeaseCoordinator::new")
+            && worker_runtime.contains("WorkerEngine::new_with_executor_lease")
+            && worker_runtime.contains("engine.worker_gc()"),
+        "worker queue, maintenance, and worker-only GC must share the engine's executor lease coordinator"
+    );
+}
+
+#[test]
 fn registry_sweep_entry_reuses_outer_tenant_store() {
     let source = include_str!("../engine.rs");
     let prod_source = source

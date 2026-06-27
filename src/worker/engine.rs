@@ -12,6 +12,8 @@ use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
 use crate::storage::{CronClaimOutcome, TikvStore, WqIndexRow};
 use crate::worker::config::WorkerConfig;
+use crate::worker::executor_lease::WorkerExecutorLeaseCoordinator;
+use crate::worker::gc::WorkerGc;
 use crate::worker::metrics::WorkerMetrics;
 
 mod helpers;
@@ -102,6 +104,8 @@ pub struct WorkerEngine {
     metrics: Arc<WorkerMetrics>,
     notify: Arc<Notify>,
     shutdown: CancellationToken,
+    executor_lease: Arc<WorkerExecutorLeaseCoordinator>,
+    worker_gc: Arc<WorkerGc>,
     registry_sweep_state: Mutex<RegistrySweepState>,
 }
 
@@ -326,15 +330,35 @@ fn cron_outcome_requeues_next_fire(outcome: &CronClaimOutcome) -> bool {
 }
 
 impl WorkerEngine {
+    #[allow(dead_code)] // kept for tests and non-main callers that do not need a shared coordinator
     pub fn new(
         config: WorkerConfig,
         system_store: Arc<TikvStore>,
         pool: Arc<TikvClientPool>,
     ) -> Self {
+        let executor_lease = Arc::new(WorkerExecutorLeaseCoordinator::new(
+            system_store.clone(),
+            config.clone(),
+        ));
+        Self::new_with_executor_lease(config, system_store, pool, executor_lease)
+    }
+
+    pub fn new_with_executor_lease(
+        config: WorkerConfig,
+        system_store: Arc<TikvStore>,
+        pool: Arc<TikvClientPool>,
+        executor_lease: Arc<WorkerExecutorLeaseCoordinator>,
+    ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let notify = Arc::new(Notify::new());
         let shutdown = CancellationToken::new();
         crate::worker::set_worker_notify(notify.clone());
+        let worker_gc = Arc::new(WorkerGc::new_with_executor_lease(
+            system_store.clone(),
+            pool.clone(),
+            config.clone(),
+            executor_lease.clone(),
+        ));
         Self {
             config,
             system_store,
@@ -345,6 +369,8 @@ impl WorkerEngine {
             metrics: Arc::new(WorkerMetrics::new()),
             notify,
             shutdown,
+            executor_lease,
+            worker_gc,
             registry_sweep_state: Mutex::new(RegistrySweepState::default()),
         }
     }
@@ -355,6 +381,10 @@ impl WorkerEngine {
 
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
+    }
+
+    pub fn worker_gc(&self) -> Arc<WorkerGc> {
+        self.worker_gc.clone()
     }
 
     pub async fn run(&self) {
@@ -401,8 +431,18 @@ impl WorkerEngine {
                     break;
                 }
                 _ = sweep_interval.tick() => {
+                    if !self.executor_lease.ensure_current_executor().await {
+                        continue;
+                    }
                     if let Err(e) = self.legacy_queue_drain_tick().await {
-                        warn!("Worker legacy queue drain error: {}", e);
+                        if is_retryable_tikv_error(&e) {
+                            debug!(
+                                "Worker legacy queue drain contended; another worker likely drained this batch first: {}",
+                                e
+                            );
+                        } else {
+                            warn!("Worker legacy queue drain error: {}", e);
+                        }
                     }
                     match self.system_store.legacy_worker_queue_is_empty().await {
                         Ok(true) => {
@@ -428,6 +468,10 @@ impl WorkerEngine {
     }
 
     async fn tick(&self) -> Result<()> {
+        if !self.executor_lease.ensure_current_executor().await {
+            return Ok(());
+        }
+
         let now_ms = now_epoch_ms();
 
         let mut txn = self.system_store.begin().await?;
@@ -1119,12 +1163,10 @@ impl WorkerEngine {
                 .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
                 .await
             {
-                let gc = crate::worker::gc::WorkerGc::new(
-                    self.system_store.clone(),
-                    self.pool.clone(),
-                    self.config.clone(),
-                );
-                let result = gc.sweep_hnsw_s3_orphans_for_entry(entry, store).await;
+                let result = self
+                    .worker_gc
+                    .sweep_hnsw_s3_orphans_for_entry(entry, store)
+                    .await;
                 self.record_registry_sweep_kind_result(entry, kind, result)
                     .await;
             }

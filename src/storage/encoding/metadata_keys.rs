@@ -62,6 +62,7 @@ pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
 pub(super) const GC_INSTANCE_STATE_PREFIX: &[u8] = b"_gc_instance_";
 pub(super) const WORKER_BG_TASK_SEQ_PREFIX: &[u8] = b"_worker_bg_task_seq_";
+pub(super) const WORKER_EXECUTOR_LEASE_KEY: &[u8] = b"_worker_executor_lease";
 /// V2 due-queue (global). Same key STRUCTURE as `_worker_queue_` so the
 /// priority/fire_time ordering, scan bounds, and fire_time decode are reusable,
 /// but a distinct prefix: old binaries only read `_worker_queue_`, so the
@@ -942,6 +943,11 @@ pub fn encode_worker_claim_key(
 /// Encode the prefix for all worker claim keys (global).
 pub fn encode_worker_claim_prefix() -> Vec<u8> {
     WORKER_CLAIM_PREFIX.to_vec()
+}
+
+/// Encode the singleton worker executor lease key.
+pub fn encode_worker_executor_lease_key() -> Vec<u8> {
+    WORKER_EXECUTOR_LEASE_KEY.to_vec()
 }
 
 /// Return true when a raw worker-claim key belongs to `keyspace`.
