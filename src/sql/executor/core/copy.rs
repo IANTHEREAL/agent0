@@ -46,50 +46,6 @@ impl CopyInsertBatchError {
     }
 }
 
-fn current_epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn remaining_copy_statement_timeout(session: &Session) -> Option<Duration> {
-    remaining_copy_statement_timeout_from(
-        session.statement_timeout(),
-        statement_time::statement_timestamp_millis_or_now(),
-    )
-}
-
-fn remaining_copy_statement_timeout_from(
-    statement_timeout: Option<Duration>,
-    started_ms: i64,
-) -> Option<Duration> {
-    let timeout = statement_timeout?;
-    let elapsed_ms = current_epoch_millis().saturating_sub(started_ms).max(0) as u64;
-    Some(timeout.saturating_sub(Duration::from_millis(elapsed_ms)))
-}
-
-async fn apply_copy_statement_timeout<T>(
-    timeout: Option<Duration>,
-    fut: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    match timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, fut).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
-        },
-        None => fut.await,
-    }
-}
-
-async fn ensure_copy_write_fence_with_timeout(session: &mut Session) -> Result<()> {
-    apply_copy_statement_timeout(
-        remaining_copy_statement_timeout(session),
-        session.ensure_current_database_write_fence(),
-    )
-    .await
-}
-
 impl Executor {
     pub(crate) async fn execute_copy_insert_batch(
         &self,
@@ -111,9 +67,6 @@ impl Executor {
                 .await
                 .map_err(CopyInsertBatchError::non_row)?;
         }
-        ensure_copy_write_fence_with_timeout(session)
-            .await
-            .map_err(CopyInsertBatchError::non_row)?;
 
         let result = async {
             let db_id = session.current_database_id();
@@ -301,14 +254,12 @@ impl Executor {
                 .insert_batch(txn, db_id, table_name, &schema, &prepared_rows)
                 .await
                 .map_err(CopyInsertBatchError::from_storage_batch_error)?;
-            let pending_row_keys: HashSet<Vec<u8>> = all_mutations
-                .iter()
-                .map(|mutation| mutation.key().to_vec())
-                .collect();
+            let pending_row_keys: HashSet<Vec<u8>> =
+                all_mutations.iter().map(|(key, _)| key.clone()).collect();
             let pending_row_key_by_offset: HashMap<usize, Vec<u8>> = inserted
                 .iter()
                 .zip(all_mutations.iter())
-                .map(|((_, row_offset), mutation)| (*row_offset, mutation.key().to_vec()))
+                .map(|((_, row_offset), (key, _))| (*row_offset, key.clone()))
                 .collect();
 
             // ── Phase 3: batch index entry creation ────────────────────
@@ -473,25 +424,20 @@ impl Executor {
                     if hashes.is_empty() {
                         continue;
                     }
-                    all_mutations.extend(
-                        self.store
-                            .encode_gin_index_mutations(
-                                db_id,
-                                schema.table_id,
-                                index.id,
-                                &hashes,
-                                pk_values,
-                            )
-                            .into_iter()
-                            .map(|(key, value)| crate::txn::BatchMutation::Put(key, value)),
-                    );
+                    all_mutations.extend(self.store.encode_gin_index_mutations(
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &hashes,
+                        pk_values,
+                    ));
                 }
             }
 
             // ── Phase 5: single batch_mutate flush ─────────────────────
             // All data + B-tree index + GIN index mutations flushed in one
-            // pessimistic lock path via mixed mutations.
-            crate::txn::txn_batch_mutate_mixed(txn, all_mutations)
+            // pessimistic lock RPC via batch_mutate.
+            crate::txn::txn_batch_mutate(txn, all_mutations)
                 .await
                 .map_err(CopyInsertBatchError::non_row)?;
 
@@ -569,7 +515,6 @@ impl Executor {
         let _permit = crate::extensions::parquet::limits::acquire_import_permit(&tenant)?;
 
         let db_id = session.current_database_id();
-        let database_name = session.current_database_name_arc();
         let search_path: Vec<String> = session.search_path().to_vec();
         // Extract role info before mutable borrow of session.
         let current_role = session.current_user().map(|s| s.to_string());
@@ -596,9 +541,6 @@ impl Executor {
         let (_parquet_schema, batch_stream) =
             crate::extensions::parquet::reader::open_batch_stream(url).await?;
 
-        let copy_statement_timeout = session.statement_timeout();
-        let copy_statement_started_ms = statement_time::statement_timestamp_millis_or_now();
-        ensure_copy_write_fence_with_timeout(session).await?;
         let (txn, sequence_values, _sp) = session
             .get_mut_txn_sequence_values_and_search_path()
             .ok_or_else(|| anyhow!("Transaction must be active"))?;
@@ -809,21 +751,6 @@ impl Executor {
                     crate::session_context::clear_current_session_txn_registration();
                     crate::session_context::begin_replacement_session_owned_txn(&self.store, txn)
                         .await?;
-                    let db_alive = apply_copy_statement_timeout(
-                        remaining_copy_statement_timeout_from(
-                            copy_statement_timeout,
-                            copy_statement_started_ms,
-                        ),
-                        self.store.database_alive_for_update(txn, db_id),
-                    )
-                    .await?;
-                    if !db_alive {
-                        return Err(SqlError::InvalidCatalogName(format!(
-                            "database \"{}\" does not exist",
-                            database_name
-                        ))
-                        .into());
-                    }
                     batch_writes = 0;
                     tracing::info!(
                         "COPY FROM PARQUET: {} rows imported (committed) into {}",
@@ -922,89 +849,6 @@ mod tests {
         assert!(
             !parquet_fn.contains("*txn = self.store.begin().await?;"),
             "parquet rotation must not bypass the shared session-owned txn replacement helper"
-        );
-    }
-
-    #[test]
-    fn copy_write_fence_waits_are_statement_timeout_bounded() {
-        let source = include_str!("copy.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("copy.rs must contain test module marker");
-        let helper = prod_source
-            .split("async fn ensure_copy_write_fence_with_timeout")
-            .nth(1)
-            .expect("COPY write fence helper must exist");
-        assert!(
-            helper.contains("apply_copy_statement_timeout(")
-                && helper.contains("remaining_copy_statement_timeout(session)")
-                && helper.contains("session.ensure_current_database_write_fence()"),
-            "COPY write fence helper must route fence waits through the timeout wrapper"
-        );
-        let timeout_helper = prod_source
-            .split("async fn apply_copy_statement_timeout")
-            .nth(1)
-            .expect("COPY write fence timeout wrapper must exist");
-        assert!(
-            timeout_helper.contains("tokio::time::timeout")
-                && timeout_helper.contains("StatementTimeoutError"),
-            "COPY write fence timeout wrapper must convert slow fence waits into statement timeout"
-        );
-        assert!(
-            prod_source.contains("statement_time::statement_timestamp_millis_or_now()")
-                && prod_source.contains("current_epoch_millis().saturating_sub(started_ms)")
-                && prod_source
-                    .contains("timeout.saturating_sub(Duration::from_millis(elapsed_ms))"),
-            "COPY write fence timeout must be based on the original COPY statement timestamp"
-        );
-
-        let batch_fn = prod_source
-            .split("pub(crate) async fn execute_copy_insert_batch")
-            .nth(1)
-            .expect("copy.rs must define execute_copy_insert_batch");
-        let batch_prefix = batch_fn
-            .split("let result = async")
-            .next()
-            .expect("batch function must acquire fence before row insertion");
-        assert!(
-            batch_prefix.contains("ensure_copy_write_fence_with_timeout(session)"),
-            "COPY FROM STDIN batch path must use the timeout-bounded write fence"
-        );
-
-        let parquet_fn = prod_source
-            .split("pub async fn execute_copy_from_parquet")
-            .nth(1)
-            .expect("copy.rs must define execute_copy_from_parquet");
-        let parquet_prefix = parquet_fn
-            .split("let (txn, sequence_values")
-            .next()
-            .expect("parquet COPY must acquire fence before taking the transaction");
-        assert!(
-            parquet_prefix.contains("let copy_statement_timeout = session.statement_timeout();")
-                && parquet_prefix.contains(
-                    "let copy_statement_started_ms = statement_time::statement_timestamp_millis_or_now();"
-                )
-                && parquet_prefix.contains("ensure_copy_write_fence_with_timeout(session)"),
-            "COPY FROM PARQUET path must capture the statement deadline and use the timeout-bounded initial write fence"
-        );
-
-        let rotation = parquet_fn
-            .split("crate::session_context::begin_replacement_session_owned_txn(&self.store, txn)")
-            .nth(1)
-            .expect("parquet COPY must rotate replacement transactions through the shared helper");
-        let raw_recheck_pos = rotation
-            .find("self.store.database_alive_for_update(txn, db_id)")
-            .expect("parquet rotation must re-check database liveness for the replacement txn");
-        let wrapper_pos = rotation[..raw_recheck_pos]
-            .rfind("apply_copy_statement_timeout(")
-            .expect("parquet rotation liveness re-check must be statement-timeout bounded");
-        let remaining_pos = rotation[wrapper_pos..raw_recheck_pos]
-            .find("remaining_copy_statement_timeout_from(")
-            .expect("parquet rotation liveness re-check must use the remaining COPY timeout");
-        assert!(
-            wrapper_pos < raw_recheck_pos && remaining_pos > 0,
-            "COPY FROM PARQUET rotation must not take the lifecycle row lock without the remaining statement timeout"
         );
     }
 }

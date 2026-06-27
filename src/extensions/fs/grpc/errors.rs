@@ -16,6 +16,8 @@
 //! `anyhow::Error` wrapping `EmbeddedFsError`. That keeps the upstream
 //! `is_not_found_error` etc. helpers working without touching them.
 
+#![cfg(fsplane_v2_generated)]
+
 use anyhow::anyhow;
 
 use crate::extensions::fs::embedded::types::EmbeddedFsError;

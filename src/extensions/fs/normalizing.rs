@@ -50,15 +50,10 @@
 //!   already comes from inner in canonical form because inner saw
 //!   canonical inputs.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
-
-type LifecycleOperationGuard = crate::sql::session::db_connections::DbOperationGuard;
+use tokio::io::AsyncBufRead;
 
 use crate::extensions::fs::backend::{
     FsBackend, FsBatchWriteEntry, FsBatchWriteFile, FsBatchWriteGroupedResult, FsCreateUpload,
@@ -66,50 +61,10 @@ use crate::extensions::fs::backend::{
     FsRecursiveReaddirOptions, FsRecursiveReaddirResult, FsWriteStream, FsWriteStreamOptions,
 };
 use crate::extensions::fs::to_fs9_canonical_path;
-use crate::sql::error::SqlError;
-use crate::storage::TikvStore;
-
-#[async_trait]
-pub(crate) trait FsLifecycleAdmission: Send + Sync {
-    fn database_id(&self) -> Option<u64> {
-        None
-    }
-
-    async fn ensure_active(&self) -> Result<()>;
-}
-
-pub(crate) struct DatabaseLifecycleAdmission {
-    store: Arc<TikvStore>,
-    database_id: u64,
-}
-
-impl DatabaseLifecycleAdmission {
-    pub(crate) fn new(store: Arc<TikvStore>, database_id: u64) -> Self {
-        Self { store, database_id }
-    }
-}
-
-#[async_trait]
-impl FsLifecycleAdmission for DatabaseLifecycleAdmission {
-    fn database_id(&self) -> Option<u64> {
-        Some(self.database_id)
-    }
-
-    async fn ensure_active(&self) -> Result<()> {
-        crate::worker::database_lifecycle::ensure_database_lifecycle_accepts_traffic()?;
-        if self.store.database_active(self.database_id).await? {
-            return Ok(());
-        }
-        Err(anyhow!(SqlError::InvalidCatalogName(
-            "database is being dropped".to_string()
-        )))
-    }
-}
 
 pub(crate) struct NormalizingFsBackend {
     tenant_keyspace: String,
     inner: Arc<dyn FsBackend>,
-    lifecycle_admission: Option<Arc<dyn FsLifecycleAdmission>>,
 }
 
 impl NormalizingFsBackend {
@@ -117,36 +72,7 @@ impl NormalizingFsBackend {
         Self {
             tenant_keyspace: tenant_keyspace.into(),
             inner,
-            lifecycle_admission: None,
         }
-    }
-
-    pub(crate) fn new_with_lifecycle_admission(
-        tenant_keyspace: impl Into<String>,
-        inner: Arc<dyn FsBackend>,
-        lifecycle_admission: Arc<dyn FsLifecycleAdmission>,
-    ) -> Self {
-        Self {
-            tenant_keyspace: tenant_keyspace.into(),
-            inner,
-            lifecycle_admission: Some(lifecycle_admission),
-        }
-    }
-
-    async fn begin_lifecycle_operation(&self) -> Result<Option<LifecycleOperationGuard>> {
-        let Some(admission) = &self.lifecycle_admission else {
-            return Ok(None);
-        };
-        let guard = admission
-            .database_id()
-            .map(|db_id| {
-                crate::sql::session::db_connections::db_connection_registry()
-                    .try_track_operation(&self.tenant_keyspace, db_id)
-            })
-            .transpose()
-            .map_err(|err| anyhow!(SqlError::InvalidCatalogName(err.to_string())))?;
-        admission.ensure_active().await?;
-        Ok(guard)
     }
 
     fn record_op(&self, operation: &'static str, start: std::time::Instant, result: &'static str) {
@@ -222,7 +148,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn stat(&self, path: &str) -> Result<FsFileInfo> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.stat(&path).await;
         self.record_result("stat", start, &result);
@@ -231,7 +156,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn batch_stat(&self, paths: &[String]) -> Result<Vec<Result<FsFileInfo>>> {
         let shaped = Self::shape_each(paths)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.batch_stat(&shaped).await;
         let label = result
@@ -244,7 +168,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.readdir(&path).await;
         self.record_result("readdir", start, &result);
@@ -253,7 +176,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn readdir_with_meta(&self, path: &str) -> Result<FsReaddirResult> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.readdir_with_meta(&path).await;
         self.record_result("readdir_with_meta", start, &result);
@@ -262,7 +184,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn batch_readdir(&self, paths: &[String]) -> Result<Vec<Result<Vec<FsFileInfo>>>> {
         let shaped = Self::shape_each(paths)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.batch_readdir(&shaped).await;
         let label = result
@@ -279,7 +200,6 @@ impl FsBackend for NormalizingFsBackend {
         opts: FsRecursiveReaddirOptions,
     ) -> Result<FsRecursiveReaddirResult> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.readdir_recursive(&path, opts).await;
         self.record_result("readdir_recursive", start, &result);
@@ -288,7 +208,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.read_file(&path, max_bytes).await;
         self.record_result("read_file", start, &result);
@@ -302,7 +221,6 @@ impl FsBackend for NormalizingFsBackend {
         max_total_bytes: usize,
     ) -> Result<Vec<Result<Vec<u8>>>> {
         let shaped = Self::shape_each(paths)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self
             .inner
@@ -322,31 +240,14 @@ impl FsBackend for NormalizingFsBackend {
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
         let path = to_fs9_canonical_path(path)?;
-        let lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
-        let result = self
-            .inner
-            .read_file_stream(&path, max_bytes)
-            .await
-            .map(|reader| {
-                if let Some(admission) = &self.lifecycle_admission {
-                    Box::new(LifecycleGuardedReadStream {
-                        inner: reader,
-                        lifecycle_admission: admission.clone(),
-                        _operation_guard: lifecycle_guard,
-                        check: None,
-                    }) as Box<dyn AsyncBufRead + Unpin + Send>
-                } else {
-                    reader
-                }
-            });
+        let result = self.inner.read_file_stream(&path, max_bytes).await;
         self.record_result("read_file_stream", start, &result);
         result
     }
 
     async fn remove(&self, path: &str) -> Result<()> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.remove(&path).await;
         self.record_result("remove", start, &result);
@@ -355,7 +256,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn remove_recursive(&self, path: &str) -> Result<u64> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.remove_recursive(&path).await;
         self.record_result("remove_recursive", start, &result);
@@ -364,7 +264,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn mkdir(&self, path: &str, recursive: bool, mode: Option<u32>) -> Result<()> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.mkdir(&path, recursive, mode).await;
         self.record_result("mkdir", start, &result);
@@ -373,7 +272,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn write_file(&self, path: &str, data: &[u8], mode: Option<u32>) -> Result<usize> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.write_file(&path, data, mode).await;
         self.record_result("write_file", start, &result);
@@ -382,7 +280,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn batch_write(&self, files: Vec<FsBatchWriteFile>) -> Result<Vec<FsBatchWriteEntry>> {
         let files = Self::shape_batch_write_files(files)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.batch_write(files).await;
         let label = result
@@ -406,7 +303,6 @@ impl FsBackend for NormalizingFsBackend {
         files: Vec<FsBatchWriteFile>,
     ) -> Result<FsBatchWriteGroupedResult> {
         let files = Self::shape_batch_write_files(files)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.batch_write_grouped(files).await;
         let label = result
@@ -423,30 +319,14 @@ impl FsBackend for NormalizingFsBackend {
         opts: FsWriteStreamOptions,
     ) -> Result<Box<dyn FsWriteStream>> {
         let path = to_fs9_canonical_path(path)?;
-        let lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
-        let result = self
-            .inner
-            .begin_write_stream(&path, opts)
-            .await
-            .map(|stream| {
-                if let Some(admission) = &self.lifecycle_admission {
-                    Box::new(LifecycleGuardedWriteStream {
-                        inner: stream,
-                        lifecycle_admission: admission.clone(),
-                        _operation_guard: lifecycle_guard,
-                    }) as Box<dyn FsWriteStream>
-                } else {
-                    stream
-                }
-            });
+        let result = self.inner.begin_write_stream(&path, opts).await;
         self.record_result("begin_write_stream", start, &result);
         result
     }
 
     async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.read_file_at(&path, offset, length).await;
         self.record_result("read_file_at", start, &result);
@@ -455,7 +335,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.write_file_at(&path, offset, data).await;
         self.record_result("write_file_at", start, &result);
@@ -464,7 +343,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.append_file(&path, data).await;
         self.record_result("append_file", start, &result);
@@ -473,7 +351,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn truncate(&self, path: &str, size: u64) -> Result<()> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.truncate(&path, size).await;
         self.record_result("truncate", start, &result);
@@ -483,7 +360,6 @@ impl FsBackend for NormalizingFsBackend {
     async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         let old = to_fs9_canonical_path(old_path)?;
         let new = to_fs9_canonical_path(new_path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.rename(&old, &new).await;
         self.record_result("rename", start, &result);
@@ -498,7 +374,6 @@ impl FsBackend for NormalizingFsBackend {
         checksum_algorithm: Option<&str>,
     ) -> Result<FsCreateUpload> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self
             .inner
@@ -516,7 +391,6 @@ impl FsBackend for NormalizingFsBackend {
     ) -> Result<FsPresignedRequest> {
         // `upload_token` is an opaque server-issued credential, not a
         // path — do not reshape.
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self
             .inner
@@ -532,7 +406,6 @@ impl FsBackend for NormalizingFsBackend {
         parts: Vec<FsMultipartCompletedPart>,
         checksum: Option<[u8; 32]>,
     ) -> Result<usize> {
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self
             .inner
@@ -543,7 +416,6 @@ impl FsBackend for NormalizingFsBackend {
     }
 
     async fn abort_upload(&self, upload_token: &str) -> Result<()> {
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.abort_upload(upload_token).await;
         self.record_result("abort_upload", start, &result);
@@ -552,7 +424,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn prepare_download(&self, path: &str) -> Result<FsPreparedDownload> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.prepare_download(&path).await;
         self.record_result("prepare_download", start, &result);
@@ -563,7 +434,6 @@ impl FsBackend for NormalizingFsBackend {
         // `target` is the symlink's contents (may be relative under
         // POSIX); only the link `path` is shaped.
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.symlink(&path, target).await;
         self.record_result("symlink", start, &result);
@@ -572,7 +442,6 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn readlink(&self, path: &str) -> Result<String> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.readlink(&path).await;
         self.record_result("readlink", start, &result);
@@ -581,96 +450,10 @@ impl FsBackend for NormalizingFsBackend {
 
     async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
         let path = to_fs9_canonical_path(path)?;
-        let _lifecycle_guard = self.begin_lifecycle_operation().await?;
         let start = std::time::Instant::now();
         let result = self.inner.chmod(&path, mode).await;
         self.record_result("chmod", start, &result);
         result
-    }
-}
-
-type LifecycleCheckFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-
-struct LifecycleGuardedReadStream {
-    inner: Box<dyn AsyncBufRead + Unpin + Send>,
-    lifecycle_admission: Arc<dyn FsLifecycleAdmission>,
-    _operation_guard: Option<LifecycleOperationGuard>,
-    check: Option<LifecycleCheckFuture>,
-}
-
-impl LifecycleGuardedReadStream {
-    fn poll_lifecycle_active(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.check.is_none() {
-            let admission = self.lifecycle_admission.clone();
-            self.check = Some(Box::pin(async move { admission.ensure_active().await }));
-        }
-
-        let Some(check) = &mut self.check else {
-            unreachable!("lifecycle check future must be installed");
-        };
-        match check.as_mut().poll(cx) {
-            Poll::Ready(result) => {
-                self.check = None;
-                Poll::Ready(result)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncRead for LifecycleGuardedReadStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        match this.poll_lifecycle_active(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_read(cx, buf),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(std::io::Error::other(err))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncBufRead for LifecycleGuardedReadStream {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        let this = self.get_mut();
-        match this.poll_lifecycle_active(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_fill_buf(cx),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(std::io::Error::other(err))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn consume(self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.get_mut().inner).consume(amt);
-    }
-}
-
-struct LifecycleGuardedWriteStream {
-    inner: Box<dyn FsWriteStream>,
-    lifecycle_admission: Arc<dyn FsLifecycleAdmission>,
-    _operation_guard: Option<LifecycleOperationGuard>,
-}
-
-#[async_trait]
-impl FsWriteStream for LifecycleGuardedWriteStream {
-    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-        self.lifecycle_admission.ensure_active().await?;
-        self.inner.write_chunk(chunk).await
-    }
-
-    async fn terminate(self: Box<Self>, outcome: Result<()>) -> Result<usize> {
-        let Self {
-            inner,
-            lifecycle_admission,
-            _operation_guard,
-        } = *self;
-        if outcome.is_ok() {
-            lifecycle_admission.ensure_active().await?;
-        }
-        inner.terminate(outcome).await
     }
 }
 
@@ -685,16 +468,8 @@ mod tests {
     use crate::extensions::fs::to_fs9_canonical_path;
     use async_trait::async_trait;
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
-    use tokio::io::{empty, AsyncBufRead, AsyncReadExt};
-
-    static NEXT_DB_ID: AtomicU64 = AtomicU64::new(800_000);
-
-    fn unique_database_identity() -> (String, u64) {
-        let db_id = NEXT_DB_ID.fetch_add(1, Ordering::SeqCst);
-        (format!("fs_lifecycle_test_{db_id}"), db_id)
-    }
+    use tokio::io::{empty, AsyncBufRead};
 
     fn test_recorder() -> (
         metrics_exporter_prometheus::PrometheusRecorder,
@@ -862,65 +637,6 @@ mod tests {
         async fn chmod(&self, path: &str, _m: u32) -> Result<()> {
             self.rec.push("chmod", path);
             Ok(())
-        }
-    }
-
-    struct StaticAdmission {
-        allow: bool,
-    }
-
-    #[async_trait]
-    impl FsLifecycleAdmission for StaticAdmission {
-        async fn ensure_active(&self) -> Result<()> {
-            if self.allow {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("database fenced"))
-            }
-        }
-    }
-
-    fn static_admission(allow: bool) -> Arc<dyn FsLifecycleAdmission> {
-        Arc::new(StaticAdmission { allow })
-    }
-
-    struct ToggleAdmission {
-        allow: AtomicBool,
-        database_id: Option<u64>,
-    }
-
-    impl ToggleAdmission {
-        fn new(allow: bool) -> Self {
-            Self {
-                allow: AtomicBool::new(allow),
-                database_id: None,
-            }
-        }
-
-        fn with_database_id(allow: bool, database_id: u64) -> Self {
-            Self {
-                allow: AtomicBool::new(allow),
-                database_id: Some(database_id),
-            }
-        }
-
-        fn set(&self, allow: bool) {
-            self.allow.store(allow, Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait]
-    impl FsLifecycleAdmission for ToggleAdmission {
-        fn database_id(&self) -> Option<u64> {
-            self.database_id
-        }
-
-        async fn ensure_active(&self) -> Result<()> {
-            if self.allow.load(Ordering::SeqCst) {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("database fenced"))
-            }
         }
     }
 
@@ -1157,136 +873,6 @@ mod tests {
         assert!(seen.iter().any(|(op, p)| op == "stat" && p == "/tests/x"));
         assert!(seen.iter().any(|(op, p)| op == "readdir" && p == "/dir"));
         assert!(seen.iter().any(|(op, p)| op == "read_file" && p == "/a/b"));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_admission_blocks_before_inner_backend() {
-        let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new_with_lifecycle_admission(
-            "tenant_metrics",
-            inner,
-            static_admission(false),
-        );
-
-        let err = adapter.stat("tests/x").await.unwrap_err();
-        assert!(err.to_string().contains("database fenced"));
-        assert!(
-            rec.snapshot().is_empty(),
-            "fenced fs operation must not reach inner backend"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_admission_also_blocks_opaque_token_methods() {
-        let (rec, inner) = RecordingBackend::new_pair();
-        let adapter = NormalizingFsBackend::new_with_lifecycle_admission(
-            "tenant_metrics",
-            inner,
-            static_admission(false),
-        );
-
-        let err = adapter
-            .presign_upload_part("opaque-token", 1, None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("database fenced"));
-        assert!(
-            rec.snapshot().is_empty(),
-            "opaque-token operations must still pass lifecycle admission"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_admission_guards_read_stream_chunks() {
-        let (_rec, inner) = RecordingBackend::new_pair();
-        let admission = Arc::new(ToggleAdmission::new(true));
-        let adapter = NormalizingFsBackend::new_with_lifecycle_admission(
-            "tenant_metrics",
-            inner,
-            admission.clone(),
-        );
-
-        let mut reader = adapter.read_file_stream("tests/x", 1024).await.unwrap();
-        admission.set(false);
-
-        let mut buf = [0_u8; 1];
-        let err = reader.read(&mut buf).await.unwrap_err();
-        assert!(
-            err.to_string().contains("database fenced"),
-            "stream chunks must re-check lifecycle before emitting data: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_operation_guard_releases_after_non_stream_call() {
-        let (_rec, inner) = RecordingBackend::new_pair();
-        let (keyspace, db_id) = unique_database_identity();
-        let adapter = NormalizingFsBackend::new_with_lifecycle_admission(
-            keyspace.clone(),
-            inner,
-            Arc::new(ToggleAdmission::with_database_id(true, db_id)),
-        );
-
-        adapter.stat("tests/x").await.unwrap();
-
-        let mut dropping = crate::sql::session::db_connections::db_connection_registry()
-            .try_mark_dropping(&keyspace, db_id)
-            .expect("finished fs operation should release lifecycle guard");
-        dropping.commit();
-    }
-
-    #[tokio::test]
-    async fn lifecycle_operation_guard_keeps_read_stream_active_until_drop() {
-        let (_rec, inner) = RecordingBackend::new_pair();
-        let (keyspace, db_id) = unique_database_identity();
-        let adapter = NormalizingFsBackend::new_with_lifecycle_admission(
-            keyspace.clone(),
-            inner,
-            Arc::new(ToggleAdmission::with_database_id(true, db_id)),
-        );
-
-        let reader = adapter.read_file_stream("tests/x", 1024).await.unwrap();
-        assert!(
-            matches!(
-                crate::sql::session::db_connections::db_connection_registry()
-                    .try_mark_dropping(&keyspace, db_id),
-                Err(1)
-            ),
-            "open fs read stream must count as active database work"
-        );
-
-        drop(reader);
-        let mut dropping = crate::sql::session::db_connections::db_connection_registry()
-            .try_mark_dropping(&keyspace, db_id)
-            .expect("drop can start once the fs read stream is gone");
-        dropping.commit();
-    }
-
-    #[tokio::test]
-    async fn default_tenant_lifecycle_operation_blocks_uppercase_drop_keyspace() {
-        let (_rec, inner) = RecordingBackend::new_pair();
-        let (_, db_id) = unique_database_identity();
-        let adapter = NormalizingFsBackend::new_with_lifecycle_admission(
-            "default",
-            inner,
-            Arc::new(ToggleAdmission::with_database_id(true, db_id)),
-        );
-
-        let reader = adapter.read_file_stream("tests/x", 1024).await.unwrap();
-        assert!(
-            matches!(
-                crate::sql::session::db_connections::db_connection_registry()
-                    .try_mark_dropping("DEFAULT", db_id),
-                Err(1)
-            ),
-            "default-tenant fs operations must block DROP DATABASE even when DROP uses the store keyspace casing"
-        );
-
-        drop(reader);
-        let mut dropping = crate::sql::session::db_connections::db_connection_registry()
-            .try_mark_dropping("DEFAULT", db_id)
-            .expect("drop can start once the default-tenant fs stream is gone");
-        dropping.commit();
     }
 
     #[tokio::test(flavor = "current_thread")]

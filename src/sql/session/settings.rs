@@ -173,7 +173,6 @@ pub(crate) struct SessionSettings {
     default_tablespace: Option<String>,
     default_table_access_method: Option<String>,
     transaction_isolation: Option<String>,
-    transaction_read_only: Option<String>,
     default_transaction_read_only: Option<String>,
 
     /// Generic storage for GUC parameters that db9 does not actively use but
@@ -695,7 +694,6 @@ impl SessionSettings {
                 self.default_table_access_method = Some(value.to_string())
             }
             "transaction_isolation" => self.transaction_isolation = Some(value.to_string()),
-            "transaction_read_only" => self.transaction_read_only = Some(value.to_string()),
             "default_transaction_read_only" => {
                 self.default_transaction_read_only = Some(value.to_string())
             }
@@ -766,7 +764,6 @@ impl SessionSettings {
         // transaction_isolation is transaction-scoped (set by BEGIN ISOLATION LEVEL).
         // Revert to None so SHOW falls back to the default "repeatable read".
         self.transaction_isolation = None;
-        self.transaction_read_only = None;
     }
 
     pub(crate) fn remove_local_override(&mut self, name: &str) {
@@ -874,7 +871,6 @@ impl SessionSettings {
             "default_tablespace" => self.default_tablespace = None,
             "default_table_access_method" => self.default_table_access_method = None,
             "transaction_isolation" => self.transaction_isolation = None,
-            "transaction_read_only" => self.transaction_read_only = None,
             "default_transaction_read_only" => self.default_transaction_read_only = None,
             _ => {
                 self.extra_settings.remove(canonical);
@@ -926,14 +922,6 @@ impl SessionSettings {
 
     pub(crate) fn begin_transaction_settings(&mut self) {
         self.guc_save_stack = Some(GucSaveStack::default());
-        if self.transaction_read_only.is_none() {
-            self.transaction_read_only = Some(
-                self.default_transaction_read_only
-                    .as_deref()
-                    .unwrap_or("off")
-                    .to_string(),
-            );
-        }
     }
 
     pub(crate) fn commit_transaction_settings(&mut self) {

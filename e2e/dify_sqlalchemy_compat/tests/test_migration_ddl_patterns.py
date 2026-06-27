@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-
 import pytest
 from sqlalchemy import (
     Column,
@@ -16,7 +14,6 @@ from sqlalchemy import (
     inspect,
     text,
 )
-from sqlalchemy.exc import OperationalError
 
 
 def _quote_ident(identifier: str) -> str:
@@ -47,23 +44,6 @@ def _relation_exists(conn, *, schema: str, name: str, relkind: str) -> bool:
         ).scalar()
         is not None
     )
-
-
-def _is_serialization_failure(exc: OperationalError) -> bool:
-    orig = getattr(exc, "orig", None)
-    return getattr(orig, "pgcode", None) == "40001"
-
-
-def _drop_table_if_exists_cascade_with_retry(db, qualified_table: str) -> None:
-    for attempt in range(8):
-        try:
-            with db.engine.begin() as conn:
-                conn.exec_driver_sql(f"DROP TABLE IF EXISTS {qualified_table} CASCADE")
-            return
-        except OperationalError as exc:
-            if not _is_serialization_failure(exc) or attempt == 7:
-                raise
-            time.sleep(0.05 * (2**attempt))
 
 
 def test_add_column_backfill_then_set_not_null(schema, db):
@@ -130,7 +110,8 @@ def test_drop_and_recreate_index_same_name_with_concurrently_desc(schema, db):
         with db.engine.begin() as conn:
             assert _relation_exists(conn, schema=pg_schema, name=index_name, relkind="i")
     finally:
-        _drop_table_if_exists_cascade_with_retry(db, qualified_table)
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {qualified_table} CASCADE")
 
 
 def test_rename_table_and_index_visibility_in_pg_class(schema, db):

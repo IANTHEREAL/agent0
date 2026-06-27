@@ -121,6 +121,10 @@ mod tests {
         assert_eq!(settings.show_value("unknown_setting").as_deref(), Some("x"));
 
         assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("repeatable read")
+        );
+        assert_eq!(
             settings
                 .show_value("transaction.isolation.level")
                 .as_deref(),
@@ -319,10 +323,6 @@ mod tests {
                 .as_deref(),
             Some("off")
         );
-        assert_eq!(
-            settings.show_value("transaction_read_only").as_deref(),
-            Some("off")
-        );
 
         // Set and readback
         assert!(settings
@@ -361,30 +361,22 @@ mod tests {
             Some("off")
         );
 
-        // SERIALIZABLE is accepted, but SHOW reports the effective TiKV
-        // snapshot-isolation behavior.
+        // SERIALIZABLE is accepted — SHOW returns user-set value (PG parity).
+        // Internal behavior always uses repeatable read regardless.
         assert!(settings
             .set_known_setting("transaction_isolation", "serializable".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("serializable")
         );
         assert!(settings
             .set_known_setting("transaction_isolation", "SERIALIZABLE".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("serializable")
         );
-        assert!(settings
-            .set_local_override("transaction_isolation", "serializable".to_string())
-            .unwrap());
-        assert_eq!(
-            settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
-        );
-        settings.clear_local_overrides();
 
         // Garbage values must be rejected
         assert!(settings
@@ -394,22 +386,22 @@ mod tests {
             .set_known_setting("transaction_isolation", "snapshot".to_string())
             .is_err());
 
-        // READ UNCOMMITTED is accepted, but effective behavior remains SI.
+        // READ UNCOMMITTED — SHOW returns user-set value
         assert!(settings
             .set_known_setting("transaction_isolation", "read uncommitted".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("read uncommitted")
         );
 
-        // READ COMMITTED is accepted, but effective behavior remains SI.
+        // READ COMMITTED — SHOW returns user-set value
         assert!(settings
             .set_known_setting("transaction_isolation", "read committed".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("repeatable read")
+            Some("read committed")
         );
 
         // default_transaction_read_only: boolean aliases
@@ -439,13 +431,6 @@ mod tests {
         assert!(settings
             .set_known_setting("default_transaction_read_only", "maybe".to_string())
             .is_err());
-        assert!(settings
-            .set_known_setting("transaction_read_only", "on".to_string())
-            .unwrap());
-        assert_eq!(
-            settings.show_value("transaction_read_only").as_deref(),
-            Some("on")
-        );
     }
 
     /// #1529: transaction_deferrable and default_transaction_deferrable must

@@ -689,26 +689,6 @@ impl Executor {
 
         if permissive.name == "all" && !permissive.first_quoted {
             // RESET ALL — reset all settings to defaults.
-            if session.is_in_transaction() && session.has_executed_statement_in_transaction() {
-                if session
-                    .show_setting_value("transaction_read_only")
-                    .as_deref()
-                    != Some("off")
-                {
-                    session.ensure_transaction_characteristics_change_allowed(
-                        "transaction_read_only",
-                    )?;
-                }
-                if session
-                    .show_setting_value("transaction_isolation")
-                    .as_deref()
-                    != Some("repeatable read")
-                {
-                    session.ensure_transaction_characteristics_change_allowed(
-                        "transaction_isolation",
-                    )?;
-                }
-            }
             session.reset_all_settings();
         } else if permissive.name == "all" && permissive.first_quoted {
             // RESET "ALL" — PG treats quoted ALL as a parameter name, not the
@@ -754,7 +734,6 @@ impl Executor {
                     ))
                     .into());
                 }
-                session.ensure_transaction_characteristics_change_allowed(&rn.name)?;
                 session.reset_setting(&rn.name);
             }
         }
@@ -902,43 +881,6 @@ mod tests {
             .unwrap();
         let all = Executor::execute_reset(&mut session, "RESET ALL").unwrap();
         assert_command_tag(all, "RESET");
-    }
-
-    #[test]
-    fn execute_reset_all_after_statement_allows_unchanged_transaction_characteristics() {
-        let (_, mut session) = make_executor_and_session(true, false);
-        session.force_test_transaction_state(true, false);
-        session.note_statement_success_in_transaction();
-        session
-            .set_known_setting("row_security", "off".to_string())
-            .unwrap();
-
-        let all = Executor::execute_reset(&mut session, "RESET ALL").unwrap();
-        assert_command_tag(all, "RESET");
-        assert_eq!(
-            session.show_setting_value("row_security").as_deref(),
-            Some("on")
-        );
-    }
-
-    #[test]
-    fn execute_reset_all_after_statement_rejects_transaction_read_only_change() {
-        let (_, mut session) = make_executor_and_session(true, false);
-        session.force_test_transaction_state(true, false);
-        session.note_statement_success_in_transaction();
-        session
-            .set_known_setting("transaction_read_only", "on".to_string())
-            .unwrap();
-
-        let err = Executor::execute_reset(&mut session, "RESET ALL").unwrap_err();
-        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
-        assert_eq!(sql_err.sqlstate(), "25001");
-        assert_eq!(
-            session
-                .show_setting_value("transaction_read_only")
-                .as_deref(),
-            Some("on")
-        );
     }
 
     #[test]

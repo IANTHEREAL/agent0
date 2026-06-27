@@ -71,9 +71,3 @@ Each document may include:
   outer protocol design (v2) — single load-bearing inventory row, leased
   CAS claims, shared observation walk, database liveness fence, trigger
   outbox, and recovery contracts.
-
-## Correctness and Lifecycle
-
-- `docs/design/36_transaction_lifecycle_correctness.md`: transaction contract,
-  database lifecycle fencing, stale-write prevention, and delete/drop semantics
-  based on TiDB and CockroachDB design patterns.

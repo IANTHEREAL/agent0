@@ -254,12 +254,6 @@ pub enum SqlError {
     #[error("{message}")]
     NoActiveTransaction { message: String },
 
-    #[error("{message}")]
-    ActiveSqlTransaction { message: String },
-
-    #[error("cannot execute {statement} in a read-only transaction")]
-    ReadOnlySqlTransaction { statement: String },
-
     // Type/grouping/window errors
     #[error("{message}")]
     DataTypeMismatch { message: String },
@@ -371,8 +365,6 @@ impl SqlError {
             Self::DependentObjectsStillExist { .. } => "2BP01",
             Self::ObjectInUse { .. } => "55006",
             Self::NoActiveTransaction { .. } => "25P01",
-            Self::ActiveSqlTransaction { .. } => "25001",
-            Self::ReadOnlySqlTransaction { .. } => "25006",
             Self::DataTypeMismatch { .. } => "42804",
             Self::GroupingError { .. } => "42803",
             Self::WindowFunctionError { .. } => "42P20",
@@ -704,20 +696,6 @@ mod tests {
             }
             .sqlstate(),
             "25P01"
-        );
-        assert_eq!(
-            SqlError::ActiveSqlTransaction {
-                message: "active txn".into()
-            }
-            .sqlstate(),
-            "25001"
-        );
-        assert_eq!(
-            SqlError::ReadOnlySqlTransaction {
-                statement: "INSERT".into()
-            }
-            .sqlstate(),
-            "25006"
         );
         assert_eq!(
             SqlError::DataTypeMismatch {

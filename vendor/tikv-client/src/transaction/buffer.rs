@@ -18,7 +18,6 @@ use super::transaction::Mutation;
 pub struct Buffer {
     primary_key: Option<Key>,
     entry_map: BTreeMap<Key, BufferEntry>,
-    for_update_ts_constraints: BTreeMap<Key, u64>,
     is_pessimistic: bool,
 }
 
@@ -27,7 +26,6 @@ impl Buffer {
         Buffer {
             primary_key: None,
             entry_map: BTreeMap::new(),
-            for_update_ts_constraints: BTreeMap::new(),
             is_pessimistic,
         }
     }
@@ -47,16 +45,6 @@ impl Buffer {
     pub fn get(&self, key: &Key) -> Option<Value> {
         match self.get_from_mutations(key) {
             MutationValue::Determined(value) => value,
-            MutationValue::Undetermined => None,
-        }
-    }
-
-    /// Return the locally determined value for a key, if this buffer can prove
-    /// one. `None` means the key is not determined locally; `Some(None)` means
-    /// the buffer knows the key is absent.
-    pub fn get_if_determined(&self, key: &Key) -> Option<Option<Value>> {
-        match self.get_from_mutations(key) {
-            MutationValue::Determined(value) => Some(value),
             MutationValue::Undetermined => None,
         }
     }
@@ -160,7 +148,7 @@ impl Buffer {
         // override using local data
         for (k, m) in mutation_range {
             match m {
-                BufferEntry::Put(v) | BufferEntry::Insert(v) => {
+                BufferEntry::Put(v) => {
                     results.insert(k.clone(), v.clone());
                 }
                 BufferEntry::Del => {
@@ -206,37 +194,6 @@ impl Buffer {
         }
     }
 
-    /// Lock the given key and remember the for_update_ts that TiKV should see
-    /// on the pessimistic lock during prewrite.
-    pub fn lock_with_for_update_ts(&mut self, key: Key, expected_for_update_ts: u64) {
-        self.lock(key.clone());
-        self.for_update_ts_constraints
-            .insert(key, expected_for_update_ts);
-    }
-
-    /// Return true when this transaction already has a local write intent or
-    /// lock for the key. Cached snapshot reads alone do not count.
-    pub fn is_locked_or_mutated(&self, key: &Key) -> bool {
-        matches!(
-            self.entry_map.get(key),
-            Some(
-                BufferEntry::Locked(_)
-                    | BufferEntry::Put(_)
-                    | BufferEntry::Del
-                    | BufferEntry::Insert(_)
-                    | BufferEntry::CheckNotExist
-            )
-        )
-    }
-
-    /// Return true when this transaction already made the key absent locally.
-    pub fn is_locally_absent_mutation(&self, key: &Key) -> bool {
-        matches!(
-            self.entry_map.get(key),
-            Some(BufferEntry::Del | BufferEntry::CheckNotExist)
-        )
-    }
-
     /// Unlock the given key if locked.
     pub fn unlock(&mut self, key: &Key) {
         if let Some(value) = self.entry_map.get_mut(key) {
@@ -248,7 +205,6 @@ impl Buffer {
                 }
             }
         }
-        self.for_update_ts_constraints.remove(key);
     }
 
     /// Put a value into the buffer (does not write through).
@@ -305,26 +261,6 @@ impl Buffer {
         self.entry_map
             .iter()
             .filter_map(|(key, mutation)| mutation.to_proto_with_key(key))
-            .collect()
-    }
-
-    pub fn for_update_ts_constraints(
-        &self,
-        mutations: &[kvrpcpb::Mutation],
-    ) -> Vec<kvrpcpb::prewrite_request::ForUpdateTsConstraint> {
-        mutations
-            .iter()
-            .enumerate()
-            .filter_map(|(index, mutation)| {
-                self.for_update_ts_constraints
-                    .get(&Key::from(mutation.key.clone()))
-                    .map(|expected_for_update_ts| {
-                        kvrpcpb::prewrite_request::ForUpdateTsConstraint {
-                            index: index as u32,
-                            expected_for_update_ts: *expected_for_update_ts,
-                        }
-                    })
-            })
             .collect()
     }
 
@@ -581,90 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn for_update_ts_constraints_follow_locked_mutations() {
-        let mut buffer = Buffer::new(true);
-        let kept_key: Key = b"kept".to_vec().into();
-        let unlocked_key: Key = b"unlocked".to_vec().into();
-
-        buffer.lock_with_for_update_ts(kept_key.clone(), 10);
-        buffer.put(kept_key.clone(), b"value".to_vec());
-        buffer.lock_with_for_update_ts(unlocked_key.clone(), 20);
-        buffer.unlock(&unlocked_key);
-
-        let mutations = buffer.to_proto_mutations();
-        let constraints = buffer.for_update_ts_constraints(&mutations);
-
-        assert_eq!(mutations.len(), 1);
-        assert_eq!(mutations[0].key, Vec::<u8>::from(kept_key));
-        assert_eq!(
-            constraints,
-            vec![kvrpcpb::prewrite_request::ForUpdateTsConstraint {
-                index: 0,
-                expected_for_update_ts: 10,
-            }]
-        );
-    }
-
-    #[test]
-    fn locked_or_mutated_excludes_plain_cached_reads() {
-        let mut buffer = Buffer::new(true);
-        let cached_key: Key = b"cached".to_vec().into();
-        let locked_key: Key = b"locked".to_vec().into();
-        let put_key: Key = b"put".to_vec().into();
-        let deleted_key: Key = b"deleted".to_vec().into();
-        let inserted_key: Key = b"inserted".to_vec().into();
-        let check_not_exist_key: Key = b"check-not-exist".to_vec().into();
-
-        buffer.update_cache(cached_key.clone(), Some(b"v".to_vec()));
-        buffer.lock(locked_key.clone());
-        buffer.put(put_key.clone(), b"v".to_vec());
-        buffer.delete(deleted_key.clone());
-        buffer.insert(inserted_key.clone(), b"v".to_vec());
-        buffer.insert(check_not_exist_key.clone(), b"v".to_vec());
-        buffer.delete(check_not_exist_key.clone());
-
-        assert!(!buffer.is_locked_or_mutated(&cached_key));
-        assert!(buffer.is_locked_or_mutated(&locked_key));
-        assert!(buffer.is_locked_or_mutated(&put_key));
-        assert!(buffer.is_locked_or_mutated(&deleted_key));
-        assert!(buffer.is_locked_or_mutated(&inserted_key));
-        assert!(buffer.is_locked_or_mutated(&check_not_exist_key));
-    }
-
-    #[test]
-    fn locked_without_cached_value_is_not_determined_absent() {
-        let mut buffer = Buffer::new(true);
-        let locked_key: Key = b"locked".to_vec().into();
-        let cached_absent_key: Key = b"cached-absent".to_vec().into();
-        let deleted_key: Key = b"deleted".to_vec().into();
-
-        buffer.lock(locked_key.clone());
-        buffer.update_cache(cached_absent_key.clone(), None);
-        buffer.delete(deleted_key.clone());
-
-        assert_eq!(buffer.get_if_determined(&locked_key), None);
-        assert_eq!(buffer.get_if_determined(&cached_absent_key), Some(None));
-        assert_eq!(buffer.get_if_determined(&deleted_key), Some(None));
-    }
-
-    #[test]
-    fn local_absent_mutation_detects_delete_not_snapshot_miss() {
-        let mut buffer = Buffer::new(true);
-        let cached_absent_key: Key = b"cached-absent".to_vec().into();
-        let deleted_key: Key = b"deleted".to_vec().into();
-        let check_not_exist_key: Key = b"check-not-exist".to_vec().into();
-
-        buffer.update_cache(cached_absent_key.clone(), None);
-        buffer.delete(deleted_key.clone());
-        buffer.insert(check_not_exist_key.clone(), b"v".to_vec());
-        buffer.delete(check_not_exist_key.clone());
-
-        assert!(!buffer.is_locally_absent_mutation(&cached_absent_key));
-        assert!(buffer.is_locally_absent_mutation(&deleted_key));
-        assert!(buffer.is_locally_absent_mutation(&check_not_exist_key));
-    }
-
-    #[test]
     fn scan_and_fetch_redundant_limit_does_not_overflow() {
         let mut buffer = Buffer::new(false);
         buffer.delete(b"key1".to_vec().into());
@@ -681,27 +533,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(res.is_empty());
-    }
-
-    #[test]
-    fn scan_and_fetch_includes_local_insert_mutations() {
-        let mut buffer = Buffer::new(false);
-        buffer.insert(b"key2".to_vec().into(), b"local-insert".to_vec());
-
-        let range: BoundRange = (b"key1".to_vec()..b"key3".to_vec()).into();
-        let res = block_on(buffer.scan_and_fetch(range, 10, false, false, |_, _| {
-            ready(Ok(Vec::<KvPair>::new()))
-        }))
-        .unwrap()
-        .collect::<Vec<_>>();
-
-        assert_eq!(
-            res,
-            vec![KvPair(
-                Key::from(b"key2".to_vec()),
-                b"local-insert".to_vec(),
-            )]
-        );
     }
 
     // Check that multiple writes to the same key combine in the correct way.

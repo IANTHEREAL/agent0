@@ -33,32 +33,12 @@ use crate::request::TruncateKeyspace;
 use crate::timestamp::TimestampExt;
 use crate::transaction::buffer::Buffer;
 use crate::transaction::lowering::*;
-use crate::transaction::requests::{CollectPessimisticLockResultsWithShard, PessimisticLockResult};
 use crate::BoundRange;
 use crate::Error;
 use crate::Key;
 use crate::KvPair;
 use crate::Result;
 use crate::Value;
-
-/// Result of locking the current version of a key while allowing TiKV to
-/// surface a newer committed version as a conflict timestamp.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LockCurrentResult {
-    /// Latest value returned by TiKV while taking the pessimistic lock.
-    pub value: Option<Value>,
-    /// Commit timestamp of the latest committed version when it is newer than
-    /// the transaction start timestamp.
-    pub latest_commit_ts: Option<u64>,
-}
-
-impl LockCurrentResult {
-    /// Returns true when TiKV reported a committed version newer than the
-    /// transaction start timestamp.
-    pub fn is_newer_than_baseline(&self) -> bool {
-        self.latest_commit_ts.is_some()
-    }
-}
 
 /// An undo-able set of actions on the dataset.
 ///
@@ -131,11 +111,6 @@ impl<PdC: PdClient> Transaction<PdC> {
             is_heartbeat_started: false,
             start_instant: std::time::Instant::now(),
         }
-    }
-
-    /// Return this transaction's start timestamp as a raw TiKV version.
-    pub fn start_version(&self) -> u64 {
-        self.timestamp.version()
     }
 
     /// Create a new 'get' request
@@ -237,52 +212,6 @@ impl<PdC: PdClient> Transaction<PdC> {
                 None => Ok(None),
             }
         }
-    }
-
-    /// Lock the current version of `key` and report whether TiKV observed a
-    /// committed version newer than this transaction's start timestamp.
-    ///
-    /// This is intended for PostgreSQL-compatible SI write checks. The conflict
-    /// baseline is always derived from the transaction start timestamp, not from
-    /// a caller-supplied statement timestamp or freshly acquired `for_update_ts`.
-    /// Internally the lock request uses `WakeUpModeForceLock`, which lets TiKV
-    /// lock the key even when the latest commit is newer than that baseline and
-    /// returns that commit timestamp as `latest_commit_ts`.
-    pub async fn lock_current_and_check_not_newer_than(
-        &mut self,
-        key: impl Into<Key>,
-    ) -> Result<LockCurrentResult> {
-        debug!("invoking transactional lock_current_and_check_not_newer_than request");
-        self.check_allow_operation().await?;
-        if !self.is_pessimistic() {
-            return Err(Error::InvalidTransactionType);
-        }
-
-        let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
-        if self.buffer.is_locked_or_mutated(&key) {
-            if let Some(value) = self.buffer.get_if_determined(&key) {
-                return Ok(LockCurrentResult {
-                    value,
-                    latest_commit_ts: None,
-                });
-            }
-        }
-        let result = self
-            .pessimistic_lock_allow_conflict(key, self.timestamp.clone())
-            .await?;
-
-        let baseline_ts = self.timestamp.version();
-        Ok(match result {
-            Some(result) => LockCurrentResult {
-                value: result.value,
-                latest_commit_ts: (result.locked_with_conflict_ts > baseline_ts)
-                    .then_some(result.locked_with_conflict_ts),
-            },
-            None => LockCurrentResult {
-                value: None,
-                latest_commit_ts: None,
-            },
-        })
     }
 
     /// Check whether a key exists.
@@ -535,7 +464,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         trace!("invoking transactional put request");
         self.check_allow_operation().await?;
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
-        if self.is_pessimistic() && !self.buffer.is_locked_or_mutated(&key) {
+        if self.is_pessimistic() {
             self.pessimistic_lock(iter::once(key.clone()), false)
                 .await?;
         }
@@ -569,8 +498,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         if self.buffer.get(&key).is_some() {
             return Err(Error::DuplicateKeyInsertion);
         }
-        let locally_absent = self.buffer.is_locally_absent_mutation(&key);
-        if self.is_pessimistic() && !locally_absent {
+        if self.is_pessimistic() {
             self.pessimistic_lock(
                 iter::once((key.clone(), kvrpcpb::Assertion::NotExist)),
                 false,
@@ -602,7 +530,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         debug!("invoking transactional delete request");
         self.check_allow_operation().await?;
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
-        if self.is_pessimistic() && !self.buffer.is_locked_or_mutated(&key) {
+        if self.is_pessimistic() {
             self.pessimistic_lock(iter::once(key.clone()), false)
                 .await?;
         }
@@ -641,14 +569,8 @@ impl<PdC: PdClient> Transaction<PdC> {
             .map(|mutation| mutation.encode_keyspace(self.keyspace, KeyMode::Txn))
             .collect();
         if self.is_pessimistic() {
-            let keys_to_lock = mutations
-                .iter()
-                .map(|m| m.key().clone())
-                .filter(|key| !self.buffer.is_locked_or_mutated(key))
-                .collect::<Vec<_>>();
-            if !keys_to_lock.is_empty() {
-                self.pessimistic_lock(keys_to_lock, false).await?;
-            }
+            self.pessimistic_lock(mutations.iter().map(|m| m.key().clone()), false)
+                .await?;
             for m in mutations {
                 self.buffer.mutate(m);
             }
@@ -772,7 +694,6 @@ impl<PdC: PdClient> Transaction<PdC> {
             assert!(primary_key.is_none());
             return Ok(None);
         }
-        let for_update_ts_constraints = self.buffer.for_update_ts_constraints(&mutations);
 
         self.start_auto_heartbeat().await;
 
@@ -783,7 +704,6 @@ impl<PdC: PdClient> Transaction<PdC> {
             self.rpc.clone(),
             self.options.clone(),
             self.keyspace,
-            for_update_ts_constraints,
             self.buffer.get_write_size() as u64,
             self.start_instant,
         )
@@ -830,7 +750,6 @@ impl<PdC: PdClient> Transaction<PdC> {
 
         let primary_key = self.buffer.get_primary_key();
         let mutations = self.buffer.to_proto_mutations();
-        let for_update_ts_constraints = self.buffer.for_update_ts_constraints(&mutations);
         let res = Committer::new(
             primary_key,
             mutations,
@@ -838,7 +757,6 @@ impl<PdC: PdClient> Transaction<PdC> {
             self.rpc.clone(),
             self.options.clone(),
             self.keyspace,
-            for_update_ts_constraints,
             self.buffer.get_write_size() as u64,
             self.start_instant,
         )
@@ -1045,94 +963,11 @@ impl<PdC: PdClient> Transaction<PdC> {
 
             self.start_auto_heartbeat().await;
 
-            let expected_for_update_ts = for_update_ts.version();
             for key in keys {
-                self.buffer
-                    .lock_with_for_update_ts(key.key(), expected_for_update_ts);
+                self.buffer.lock(key.key());
             }
 
             pairs
-        }
-    }
-
-    /// Pessimistically lock one key while allowing TiKV to return the latest
-    /// committed version as `locked_with_conflict_ts` when it is newer than
-    /// `conflict_baseline_ts`.
-    async fn pessimistic_lock_allow_conflict(
-        &mut self,
-        key: impl PessimisticLock,
-        conflict_baseline_ts: Timestamp,
-    ) -> Result<Option<PessimisticLockResult>> {
-        debug!("acquiring pessimistic lock with conflict timestamp reporting");
-        assert!(
-            matches!(self.options.kind, TransactionKind::Pessimistic(_)),
-            "`pessimistic_lock_allow_conflict` is only valid to use with pessimistic transactions"
-        );
-
-        let first_key = key.clone().key();
-        let primary_lock = self
-            .buffer
-            .get_primary_key()
-            .unwrap_or_else(|| first_key.clone());
-        self.options
-            .push_for_update_ts(conflict_baseline_ts.clone());
-        let mut request = new_pessimistic_lock_request(
-            iter::once(key),
-            primary_lock,
-            self.timestamp.clone(),
-            MAX_TTL,
-            conflict_baseline_ts.clone(),
-            true,
-        );
-        request.check_existence = true;
-        request.wake_up_mode = kvrpcpb::PessimisticLockWakeUpMode::WakeUpModeForceLock.into();
-        if let Some(wt) = self.options.pessimistic_lock_wait_timeout {
-            request.wait_timeout = wt;
-        }
-        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
-            .resolve_lock(
-                self.options.retry_options.lock_backoff.clone(),
-                self.keyspace,
-            )
-            .preserve_shard()
-            .retry_multi_region_preserve_results(self.options.retry_options.region_backoff.clone())
-            .merge(CollectPessimisticLockResultsWithShard)
-            .plan();
-        let lock_results = plan.execute().await;
-
-        match lock_results {
-            Err(Error::PessimisticLockError {
-                inner,
-                success_keys,
-            }) if !success_keys.is_empty() => {
-                let keys = success_keys.into_iter().map(Key::from);
-                self.pessimistic_lock_rollback(keys, self.timestamp.clone(), conflict_baseline_ts)
-                    .await?;
-                Err(*inner)
-            }
-            Err(err) => Err(err),
-            Ok(results) => {
-                self.buffer.primary_key_or(&first_key);
-
-                self.start_auto_heartbeat().await;
-
-                let mut max_lock_ts = conflict_baseline_ts.version();
-                for result in &results {
-                    let expected_for_update_ts = if result.locked_with_conflict_ts != 0 {
-                        result.locked_with_conflict_ts
-                    } else {
-                        conflict_baseline_ts.version()
-                    };
-                    self.buffer
-                        .lock_with_for_update_ts(result.key.clone(), expected_for_update_ts);
-                    max_lock_ts = std::cmp::max(max_lock_ts, result.locked_with_conflict_ts);
-                }
-                self.options
-                    .push_for_update_ts(Timestamp::from_version(max_lock_ts));
-
-                debug_assert!(results.len() <= 1);
-                Ok(results.into_iter().next())
-            }
         }
     }
 
@@ -1198,10 +1033,8 @@ impl<PdC: PdClient> Transaction<PdC> {
         } else {
             self.buffer.primary_key_or(&first_key);
             self.start_auto_heartbeat().await;
-            let expected_for_update_ts = for_update_ts.version();
             for key in keys {
-                self.buffer
-                    .lock_with_for_update_ts(key.key(), expected_for_update_ts);
+                self.buffer.lock(key.key());
             }
             pairs
         }
@@ -1583,7 +1416,6 @@ struct Committer<PdC: PdClient = PdRpcClient> {
     rpc: Arc<PdC>,
     options: TransactionOptions,
     keyspace: Keyspace,
-    for_update_ts_constraints: Vec<kvrpcpb::prewrite_request::ForUpdateTsConstraint>,
     #[new(default)]
     undetermined: bool,
     write_size: u64,
@@ -1642,19 +1474,13 @@ impl<PdC: PdClient> Committer<PdC> {
                 self.start_version.clone(),
                 lock_ttl + elapsed,
             ),
-            TransactionKind::Pessimistic(for_update_ts) => {
-                let mut request = new_pessimistic_prewrite_request(
-                    self.mutations.clone(),
-                    primary_lock,
-                    self.start_version.clone(),
-                    lock_ttl + elapsed,
-                    for_update_ts.clone(),
-                );
-                request
-                    .for_update_ts_constraints
-                    .clone_from(&self.for_update_ts_constraints);
-                request
-            }
+            TransactionKind::Pessimistic(for_update_ts) => new_pessimistic_prewrite_request(
+                self.mutations.clone(),
+                primary_lock,
+                self.start_version.clone(),
+                lock_ttl + elapsed,
+                for_update_ts.clone(),
+            ),
         };
 
         request.use_async_commit = self.options.async_commit;
@@ -1938,25 +1764,6 @@ mod tests {
 
         let repaired = repair_scan_result_key(encoded_key.clone(), &start, end.as_ref(), keyspace);
         assert_eq!(repaired, encoded_key);
-    }
-
-    #[test]
-    fn lock_current_rechecks_locked_keys_without_cached_values() {
-        let source = include_str!("transaction.rs");
-        let body = source
-            .split("pub async fn lock_current_and_check_not_newer_than")
-            .nth(1)
-            .and_then(|rest| rest.split("/// Check whether a key exists.").next())
-            .expect("lock_current_and_check_not_newer_than must be present");
-
-        assert!(
-            body.contains("get_if_determined(&key)"),
-            "locked-but-uncached keys must not be treated as known-absent"
-        );
-        assert!(
-            !body.contains("value: self.buffer.get(&key)"),
-            "lock_current must not collapse undetermined locked keys into None"
-        );
     }
 
     #[rstest::rstest]

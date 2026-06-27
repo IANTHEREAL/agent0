@@ -121,7 +121,6 @@ pub(super) fn execute_set_variable(
             return Ok(drain_notices_to_results(session));
         }
 
-        session.ensure_transaction_characteristics_change_allowed(&var_name)?;
         if local {
             session.set_local_setting(&var_name, value)?;
         } else {

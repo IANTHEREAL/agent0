@@ -1,5 +1,4 @@
 use crate::sql::Session;
-use async_trait::async_trait;
 use futures::{Sink, SinkExt, StreamExt};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -14,77 +13,18 @@ use pgwire::tokio::CancellationToken;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::datatype_to_pgtype;
-use super::errors::executor_error_info;
 use super::prepared::{PreparedExec, PreparedStatement};
 use crate::pool::{
     run_with_statement_memory_scope, split_statement_memory_scope, try_grow_statement_memory_scope,
     TenantMemoryAccountant, TenantMemoryReservation,
 };
-use crate::sql::error::SqlError;
-use crate::storage::TikvStore;
 
 fn is_empty_simple_query(query: &str) -> bool {
     let trimmed = query.trim();
     trimmed.is_empty() || trimmed == ";"
-}
-
-#[async_trait]
-pub(in crate::protocol::handler) trait QueryOutputLifecycleCheck:
-    Send + Sync
-{
-    async fn ensure_active(&self) -> PgWireResult<()>;
-}
-
-pub(in crate::protocol::handler) struct DatabaseQueryOutputLifecycleGuard {
-    store: Arc<TikvStore>,
-    database_id: u64,
-    database_name: Arc<str>,
-}
-
-impl DatabaseQueryOutputLifecycleGuard {
-    pub(in crate::protocol::handler) fn from_session(session: &Session) -> Self {
-        Self {
-            store: Arc::clone(&session.store),
-            database_id: session.current_database_id(),
-            database_name: session.current_database_name_arc(),
-        }
-    }
-}
-
-#[async_trait]
-impl QueryOutputLifecycleCheck for DatabaseQueryOutputLifecycleGuard {
-    async fn ensure_active(&self) -> PgWireResult<()> {
-        if let Err(err) =
-            crate::worker::database_lifecycle::ensure_database_lifecycle_accepts_traffic()
-        {
-            return Err(PgWireError::UserError(Box::new(executor_error_info(&err))));
-        }
-        match self.store.database_active(self.database_id).await {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                let err: anyhow::Error = SqlError::InvalidCatalogName(format!(
-                    "database \"{}\" does not exist",
-                    self.database_name
-                ))
-                .into();
-                Err(PgWireError::UserError(Box::new(executor_error_info(&err))))
-            }
-            Err(err) => Err(PgWireError::UserError(Box::new(executor_error_info(&err)))),
-        }
-    }
-}
-
-async fn ensure_query_output_lifecycle_active(
-    lifecycle_check: Option<&dyn QueryOutputLifecycleCheck>,
-) -> PgWireResult<()> {
-    if let Some(check) = lifecycle_check {
-        check.ensure_active().await?;
-    }
-    Ok(())
 }
 
 pub(in crate::protocol::handler) fn update_tx_status_after_execution(
@@ -104,7 +44,6 @@ pub(in crate::protocol::handler) async fn on_query_with_tx_status_fix<H, C>(
     handler: &H,
     statement_memory_accountant: Option<TenantMemoryAccountant>,
     conn_id: i64,
-    lifecycle_check: Option<&dyn QueryOutputLifecycleCheck>,
     client: &mut C,
     query: pgwire::messages::simplequery::Query,
 ) -> PgWireResult<()>
@@ -144,8 +83,7 @@ where
                             .await?;
                     }
                     Response::Query(results) => {
-                        send_query_response_with_lifecycle(client, results, true, lifecycle_check)
-                            .await?;
+                        pgwire::api::query::send_query_response(client, results, true).await?;
                     }
                     Response::Execution(tag) => {
                         transaction_status =
@@ -256,16 +194,6 @@ where
         };
 
         if let Some(portal) = client.portal_store().get_portal(portal_name) {
-            let database_lifecycle_guard = if let Some(session) = session {
-                let session = session.lock().await;
-                Some(DatabaseQueryOutputLifecycleGuard::from_session(&session))
-            } else {
-                None
-            };
-            let lifecycle_check = database_lifecycle_guard
-                .as_ref()
-                .map(|guard| guard as &dyn QueryOutputLifecycleCheck);
-
             if let Some((
                 command_tag,
                 chunk,
@@ -318,7 +246,6 @@ where
                     }
                 }
                 for row in chunk {
-                    ensure_query_output_lifecycle_active(lifecycle_check).await?;
                     client.feed(PgWireBackendMessage::DataRow(row)).await?;
                 }
 
@@ -356,13 +283,8 @@ where
                         let send_describe =
                             should_send_row_description_for_portal(portal.as_ref(), &results);
                         if max_rows == 0 {
-                            send_query_response_with_lifecycle(
-                                client,
-                                results,
-                                send_describe,
-                                lifecycle_check,
-                            )
-                            .await?;
+                            pgwire::api::query::send_query_response(client, results, send_describe)
+                                .await?;
                         } else {
                             send_limited_query_response(
                                 client,
@@ -371,7 +293,6 @@ where
                                 results,
                                 max_rows,
                                 send_describe,
-                                lifecycle_check,
                             )
                             .await?;
                         }
@@ -464,49 +385,6 @@ fn max_suspended_portal_buffer_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_BYTES)
 }
 
-pub(in crate::protocol::handler) async fn send_query_response_with_lifecycle<C>(
-    client: &mut C,
-    results: QueryResponse<'_>,
-    send_describe: bool,
-    lifecycle_check: Option<&dyn QueryOutputLifecycleCheck>,
-) -> PgWireResult<()>
-where
-    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-    C::Error: Debug,
-    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-{
-    let command_tag = results.command_tag().to_owned();
-    if send_describe {
-        let row_schema = results.row_schema();
-        let row_desc = RowDescription::new(
-            row_schema
-                .iter()
-                .map(FieldDescription::from)
-                .collect::<Vec<_>>(),
-        );
-        client
-            .send(PgWireBackendMessage::RowDescription(row_desc))
-            .await?;
-    }
-
-    let mut data_rows = results.data_rows();
-    let mut rows_sent = 0usize;
-    while let Some(row) = data_rows.next().await {
-        let row = row?;
-        ensure_query_output_lifecycle_active(lifecycle_check).await?;
-        rows_sent += 1;
-        client.feed(PgWireBackendMessage::DataRow(row)).await?;
-    }
-
-    ensure_query_output_lifecycle_active(lifecycle_check).await?;
-    let tag = Tag::new(&command_tag).with_rows(rows_sent);
-    client
-        .send(PgWireBackendMessage::CommandComplete(tag.into()))
-        .await?;
-
-    Ok(())
-}
-
 async fn take_suspended_rows(
     suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
     portal_name: &str,
@@ -561,14 +439,13 @@ async fn take_suspended_rows(
     ))
 }
 
-pub(in crate::protocol::handler) async fn send_limited_query_response<C>(
+async fn send_limited_query_response<C>(
     client: &mut C,
     suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
     portal_name: &str,
     results: QueryResponse<'_>,
     max_rows: usize,
     send_describe: bool,
-    lifecycle_check: Option<&dyn QueryOutputLifecycleCheck>,
 ) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -599,7 +476,6 @@ where
     while let Some(row) = data_rows.next().await {
         let row = row?;
         if rows_sent < max_rows {
-            ensure_query_output_lifecycle_active(lifecycle_check).await?;
             rows_sent += 1;
             client.feed(PgWireBackendMessage::DataRow(row)).await?;
         } else {
@@ -627,7 +503,6 @@ where
         }
     }
 
-    ensure_query_output_lifecycle_active(lifecycle_check).await?;
     if !remainder.is_empty() {
         let max_suspended = max_suspended_portals();
         let mut guard = suspended_portals.lock().await;

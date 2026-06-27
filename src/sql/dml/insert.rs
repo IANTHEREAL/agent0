@@ -672,29 +672,36 @@ async fn execute_insert_row_inner(
                                 return Ok(InsertRowResult::Skipped);
                             }
                             UniqueConflictPolicy::Upsert => {
-                                let existing_pk = store
-                                    .get_unique_index_pk_for_update(
+                                let pks = store
+                                    .scan_index(
                                         txn,
                                         db_id,
                                         schema.table_id,
                                         index.id,
                                         &idx_values,
+                                        true,
                                         &pk_types,
+                                        None,
                                     )
-                                    .await?
-                                    .ok_or_else(|| {
-                                        anyhow!("Failed to find conflicting row in unique index")
-                                    })?;
+                                    .await?;
+                                if pks.is_empty() {
+                                    return Err(anyhow!(
+                                        "Failed to find conflicting row in unique index"
+                                    ));
+                                }
+                                let existing_pk = pks.into_iter().next().unwrap();
 
-                                let existing_row = store
-                                    .lock_row_current_and_get_not_newer_than(
+                                let existing_rows = store
+                                    .batch_get_rows(
                                         txn,
                                         db_id,
                                         schema.table_id,
-                                        &existing_pk,
+                                        vec![existing_pk.clone()],
+                                        schema,
                                     )
-                                    .await?
-                                    .ok_or_else(|| {
+                                    .await?;
+                                let existing_row =
+                                    existing_rows.into_iter().next().ok_or_else(|| {
                                         anyhow!("Failed to fetch existing row for upsert")
                                     })?;
 
@@ -780,14 +787,18 @@ async fn execute_insert_row_inner(
                 ConflictBehavior::DoUpdate { target }
                     if pk_matches_conflict_target(schema, target.as_ref()) =>
                 {
-                    let existing_row = store
-                        .lock_row_current_and_get_not_newer_than(
+                    let existing_rows = store
+                        .batch_get_rows(
                             txn,
                             db_id,
                             schema.table_id,
-                            &pk_values,
+                            vec![pk_values.clone()],
+                            schema,
                         )
-                        .await?
+                        .await?;
+                    let existing_row = existing_rows
+                        .into_iter()
+                        .next()
                         .ok_or_else(|| anyhow!("Failed to fetch existing row for upsert"))?;
                     Ok(InsertRowResult::Conflicted {
                         existing_pk: pk_values,
@@ -947,36 +958,6 @@ mod tests {
 
         assert!(deferred);
         assert!(selected_upsert);
-    }
-
-    #[test]
-    fn upsert_conflict_path_uses_current_locked_reads() {
-        let source = include_str!("insert.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("insert.rs must contain test module marker");
-        let body = prod_source
-            .split("async fn execute_insert_row_inner")
-            .nth(1)
-            .expect("execute_insert_row_inner must be present");
-
-        assert!(
-            body.contains(".get_unique_index_pk_for_update("),
-            "unique-index upsert conflicts must read the current index owner under lock"
-        );
-        assert!(
-            body.contains(".lock_row_current_and_get_not_newer_than("),
-            "upsert conflicts must fetch the current owner row under SI conflict checks"
-        );
-        assert!(
-            !body.contains(".scan_index("),
-            "upsert conflict lookup must not rely on snapshot index scans"
-        );
-        assert!(
-            !body.contains(".batch_get_rows("),
-            "upsert conflict lookup must not rely on snapshot row reads"
-        );
     }
 
     #[test]

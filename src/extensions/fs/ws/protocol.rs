@@ -77,8 +77,6 @@ pub(crate) enum WsRequest {
         id: String,
         username: String,
         password: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        database: Option<String>,
     },
     Stat {
         id: String,
@@ -670,32 +668,10 @@ mod tests {
                 id,
                 username,
                 password,
-                database,
             } => {
                 assert_eq!(id, "1");
                 assert_eq!(username, "myapp.admin");
                 assert_eq!(password, "secret");
-                assert_eq!(database, None);
-            }
-            _ => panic!("expected auth request"),
-        }
-    }
-
-    #[test]
-    fn test_request_deserialize_auth_with_database() {
-        let payload = r#"{"id":"1","op":"auth","username":"myapp.admin","password":"secret","database":"appdb"}"#;
-        let req: WsRequest = serde_json::from_str(payload).expect("auth request should parse");
-        match req {
-            WsRequest::Auth {
-                id,
-                username,
-                password,
-                database,
-            } => {
-                assert_eq!(id, "1");
-                assert_eq!(username, "myapp.admin");
-                assert_eq!(password, "secret");
-                assert_eq!(database.as_deref(), Some("appdb"));
             }
             _ => panic!("expected auth request"),
         }

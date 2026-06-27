@@ -166,8 +166,6 @@ pub use crate::transaction::CheckLevel;
 #[doc(inline)]
 pub use crate::transaction::Client as TransactionClient;
 #[doc(inline)]
-pub use crate::transaction::LockCurrentResult;
-#[doc(inline)]
 pub use crate::transaction::Snapshot;
 #[doc(inline)]
 pub use crate::transaction::Transaction;

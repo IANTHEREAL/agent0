@@ -1,6 +1,5 @@
 pub mod active_txn_registry;
 pub mod config;
-pub(crate) mod database_lifecycle;
 pub mod engine;
 pub mod gc;
 pub mod metrics;

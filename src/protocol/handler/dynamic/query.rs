@@ -41,7 +41,6 @@ use super::super::errors::{
 use super::super::params::{count_sql_parameters, decode_parameters};
 use super::super::portal::{
     on_execute_with_tx_status_fix_with_guards, on_query_with_tx_status_fix,
-    DatabaseQueryOutputLifecycleGuard, QueryOutputLifecycleCheck,
 };
 use super::super::prepared::{PreparedExec, PreparedStatement};
 use super::super::resolve_copy_columns;
@@ -548,15 +547,6 @@ impl DynamicPgHandler {
                 })?;
             }
 
-            if session.transaction_read_only() {
-                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "25006".to_string(),
-                    "cannot execute COPY FROM in a read-only transaction".to_string(),
-                ))));
-            }
-
             let statement_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -785,21 +775,10 @@ impl SimpleQueryHandler for DynamicPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.begin_query_tracking(&query.query);
-        let state = self.auth();
-        let lifecycle_guard = {
-            let session = state.session.lock().await;
-            DatabaseQueryOutputLifecycleGuard::from_session(&session)
-        };
-        let memory_accountant = Some(state.executor.tenant_memory_accountant().clone());
-        let result = on_query_with_tx_status_fix(
-            self,
-            memory_accountant,
-            self.connection_id,
-            Some(&lifecycle_guard as &dyn QueryOutputLifecycleCheck),
-            client,
-            query,
-        )
-        .await;
+        let memory_accountant = Some(self.auth().executor.tenant_memory_accountant().clone());
+        let result =
+            on_query_with_tx_status_fix(self, memory_accountant, self.connection_id, client, query)
+                .await;
         let (in_txn, in_failed) = self.query_transaction_state().await;
         self.end_query_tracking(in_txn, in_failed);
         result
@@ -832,17 +811,6 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
         let state = self.auth();
         let executor = &state.executor;
-
-        let upper_query = query.trim_start().to_ascii_uppercase();
-        let lifecycle_exempt = upper_query.starts_with("ROLLBACK")
-            || upper_query.starts_with("COMMIT")
-            || upper_query.starts_with("END");
-        if !lifecycle_exempt && upper_query.starts_with("COPY") {
-            let mut session = state.session.lock().await;
-            if let Err(e) = session.ensure_current_database_alive_for_statement().await {
-                return Err(PgWireError::UserError(Box::new(executor_error_info(&e))));
-            }
-        }
 
         // Defense-in-depth: block COPY statements after idle-in-transaction timeout.
         // Checked before ALL COPY branches including parquet/fs9 paths.

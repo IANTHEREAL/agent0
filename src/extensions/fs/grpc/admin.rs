@@ -1,6 +1,8 @@
 //! Minimal FsPlaneAdmin client used to materialize JuiceFS volumes before
 //! handing a tenant to the fs9 data plane.
 
+#![cfg(fsplane_v2_generated)]
+
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};

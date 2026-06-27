@@ -528,17 +528,6 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         })?;
     info!("GC registry startup publish completed");
 
-    worker::database_lifecycle::publish_database_node_lease_once(&gc_store, &worker_config, true)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to publish database lifecycle node lease during startup: {}. \
-                 A SQL-serving db9 process must publish its node lease before it accepts traffic.",
-                e
-            )
-        })?;
-    info!("Database lifecycle node lease startup publish completed");
-
     // Note: we do NOT scan keyspaces at startup to detect S3-backed indexes
     // when HNSW_S3_BUCKET is unset. That check used get_client() which
     // bootstraps inactive tenants (format marker + postgres database) as a
@@ -559,26 +548,6 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
             .await;
         });
         info!("GC registry publisher started (unconditional, supervised)");
-        handle
-    };
-
-    let database_node_lease_handle = {
-        let lease_system_store = gc_store.clone();
-        let lease_tenant_store = store.clone();
-        let lease_keyspace = startup_keyspace.clone();
-        let lease_config = worker_config.clone();
-        let handle = tokio::spawn(async move {
-            supervised_background_loop("Database lifecycle node lease publisher", || {
-                worker::database_lifecycle::run_database_node_lease_publisher_loop(
-                    &lease_system_store,
-                    &lease_tenant_store,
-                    &lease_keyspace,
-                    &lease_config,
-                )
-            })
-            .await;
-        });
-        info!("Database lifecycle node lease publisher started (supervised)");
         handle
     };
 
@@ -962,7 +931,6 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         &mut connection_tasks,
         worker_runtime,
         startup_inventory_repair_handle,
-        database_node_lease_handle,
         publisher_handle,
         advancer_handle,
     )
@@ -1036,7 +1004,6 @@ async fn shutdown_server_runtime(
     connection_tasks: &mut ConnectionTaskRegistry,
     worker_runtime: Option<WorkerRuntimeHandles>,
     startup_inventory_repair_handle: JoinHandle<()>,
-    database_node_lease_handle: JoinHandle<()>,
     publisher_handle: JoinHandle<()>,
     advancer_handle: Option<JoinHandle<()>>,
 ) {
@@ -1047,7 +1014,6 @@ async fn shutdown_server_runtime(
     )
     .await;
     shutdown_worker_runtime(worker_runtime).await;
-    shutdown_database_lifecycle_runtime(gc_store, worker_config, database_node_lease_handle).await;
     shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle).await;
 }
 
@@ -1085,28 +1051,6 @@ fn spawn_startup_database_inventory_repair(
             }
         }
     })
-}
-
-async fn shutdown_database_lifecycle_runtime(
-    lifecycle_store: &storage::TikvStore,
-    worker_config: &worker::config::WorkerConfig,
-    database_node_lease_handle: JoinHandle<()>,
-) {
-    abort_task(
-        "Database lifecycle node lease publisher",
-        database_node_lease_handle,
-    )
-    .await;
-
-    match worker::database_lifecycle::clear_database_node_lease(lifecycle_store, worker_config)
-        .await
-    {
-        Ok(()) => info!("Cleared database lifecycle node lease during shutdown"),
-        Err(e) => warn!(
-            "Failed to clear database lifecycle node lease during shutdown: {}",
-            e
-        ),
-    }
 }
 
 async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
@@ -1417,33 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn database_node_lease_publish_happens_before_sql_and_fs_accept_traffic() {
-        let source = include_str!("main.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("main.rs must contain #[cfg(test)]");
-        let startup_publish = prod_source
-            .find("publish_database_node_lease_once(&gc_store, &worker_config, true)")
-            .expect("main.rs must publish database lifecycle node lease during startup");
-        let fs_listener_bind = prod_source
-            .find("TcpListener::bind((ws_listen_addr.as_str(), ws_port))")
-            .expect("main.rs must bind the fs9 websocket listener");
-        let pg_listener_bind = prod_source
-            .find("let listener = TcpListener::bind")
-            .expect("main.rs must bind the pgwire listener");
-
-        assert!(
-            startup_publish < fs_listener_bind,
-            "database lifecycle node lease startup publish must complete before fs9 accepts traffic"
-        );
-        assert!(
-            startup_publish < pg_listener_bind,
-            "database lifecycle node lease startup publish must complete before pgwire accepts traffic"
-        );
-    }
-
-    #[test]
     fn startup_inventory_repair_starts_after_pgwire_bind() {
         let source = include_str!("main.rs");
         let prod_source = source
@@ -1515,9 +1432,6 @@ mod tests {
         let shutdown_workers = shutdown_fn
             .find("shutdown_worker_runtime(worker_runtime).await")
             .expect("server shutdown must wait for worker runtime");
-        let shutdown_lifecycle = shutdown_fn
-            .find("shutdown_database_lifecycle_runtime")
-            .expect("server shutdown must stop database lifecycle runtime");
         let shutdown_gc = shutdown_fn
             .find("shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle)")
             .expect("server shutdown must stop GC runtime last");
@@ -1529,18 +1443,6 @@ mod tests {
         assert!(
             shutdown_workers < shutdown_gc,
             "server shutdown must quiesce worker runtime before clearing the local GC registry row"
-        );
-        assert!(
-            shutdown_connections < shutdown_lifecycle,
-            "server shutdown must quiesce connections before clearing database lifecycle node lease"
-        );
-        assert!(
-            shutdown_workers < shutdown_lifecycle,
-            "server shutdown must quiesce workers before clearing database lifecycle node lease"
-        );
-        assert!(
-            shutdown_lifecycle < shutdown_gc,
-            "server shutdown must clear database lifecycle node lease before clearing GC state"
         );
     }
 

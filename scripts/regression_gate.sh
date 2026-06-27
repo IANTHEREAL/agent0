@@ -22,7 +22,6 @@ DB9_PID=""
 CLUSTER_STARTED=0
 ORM_DATABASE=""
 ORM_DSN=""
-PYTHON_DATABASES=""
 
 RUN_UNIT=1
 START_ENV=1
@@ -144,29 +143,6 @@ print(urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragm
 PY
 }
 
-python_test_database_name() {
-  local index="$1"
-  local test_file="$2"
-  local base
-  base="$(basename "$test_file" .py)"
-  base="$(printf '%s' "$base" | tr '[:upper:]-' '[:lower:]_' | tr -cd 'a-z0-9_')"
-  base="${base:0:24}"
-  printf 'py_%s_%02d_%s\n' "${REPORT_TS//[-]/_}" "$index" "$base"
-}
-
-drop_database_best_effort() {
-  local database="$1"
-  local timeout_sec="${2:-45}"
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "${timeout_sec}s" \
-      psql "$REGRESSION_DSN" -v ON_ERROR_STOP=0 \
-      -c "DROP DATABASE IF EXISTS $database" >/dev/null 2>&1 || true
-  else
-    psql "$REGRESSION_DSN" -v ON_ERROR_STOP=0 \
-      -c "DROP DATABASE IF EXISTS $database" >/dev/null 2>&1 || true
-  fi
-}
-
 dsn_database_name() {
   local dsn="$1"
   python3 - "$dsn" <<'PY'
@@ -180,28 +156,6 @@ if path.startswith("/"):
     path = path[1:]
 print(unquote(path))
 PY
-}
-
-run_python_with_psycopg() {
-  if command -v uv >/dev/null 2>&1; then
-    uv run --with "psycopg[binary]" python "$@"
-  else
-    python3 "$@"
-  fi
-}
-
-PYTHON_TEST_TIMEOUT_SEC="${PYTHON_TEST_TIMEOUT_SEC:-240}"
-
-run_python_test_with_psycopg() {
-  if command -v timeout >/dev/null 2>&1; then
-    if command -v uv >/dev/null 2>&1; then
-      timeout "${PYTHON_TEST_TIMEOUT_SEC}s" uv run --with "psycopg[binary]" python "$@"
-    else
-      timeout "${PYTHON_TEST_TIMEOUT_SEC}s" python3 "$@"
-    fi
-  else
-    run_python_with_psycopg "$@"
-  fi
 }
 
 parse_manifest() {
@@ -542,10 +496,6 @@ cleanup() {
       -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" >/dev/null 2>&1 || true
   fi
 
-  for py_database in $PYTHON_DATABASES; do
-    drop_database_best_effort "$py_database" 20
-  done
-
   if [[ -n "$DB9_PID" ]] && kill -0 "$DB9_PID" 2>/dev/null; then
     echo "Stopping db9-server (PID: $DB9_PID)..."
     kill "$DB9_PID" 2>/dev/null || true
@@ -709,7 +659,7 @@ SMOKE_LOG="$REPORT_DIR/extended-smoke.log"
 echo "[4/$TOTAL_STEPS] Running extended protocol smoke test..."
 SMOKE_EXIT=0
 set +e
-run_python_with_psycopg "$SCRIPT_DIR/extended_protocol_smoke.py" --dsn "$PG_DSN" 2>&1 | tee "$SMOKE_LOG"
+python3 "$SCRIPT_DIR/extended_protocol_smoke.py" --dsn "$PG_DSN" 2>&1 | tee "$SMOKE_LOG"
 SMOKE_EXIT=${PIPESTATUS[0]}
 set -e
 echo ""
@@ -745,28 +695,12 @@ NEXT_STEP=6
 if [[ "${#PYTHON_TESTS[@]}" -gt 0 ]]; then
   echo "[$NEXT_STEP/$TOTAL_STEPS] Running Python multi-session tests (${#PYTHON_TESTS[@]} files)..."
   PYTHON_EXIT=0
-  PY_INDEX=0
   for py_test in "${PYTHON_TESTS[@]}"; do
-    PY_INDEX=$((PY_INDEX + 1))
-    PY_DATABASE="$(python_test_database_name "$PY_INDEX" "$py_test")"
-    PYTHON_DATABASES="$PYTHON_DATABASES $PY_DATABASE"
-    PY_DSN="$(build_dsn_with_database "$REGRESSION_DSN" "$PY_DATABASE")"
-    echo "  -> $py_test (database $PY_DATABASE, timeout ${PYTHON_TEST_TIMEOUT_SEC}s)"
-    if ! psql "$REGRESSION_DSN" -v ON_ERROR_STOP=1 \
-      -c "DROP DATABASE IF EXISTS $PY_DATABASE" \
-      -c "CREATE DATABASE $PY_DATABASE" >/dev/null; then
-      echo "ERROR: failed to create isolated Python test database '$PY_DATABASE'." | tee -a "$PYTHON_LOG"
-      PYTHON_EXIT=1
-      if [[ "$STOP_ON_ERROR" -eq 1 ]]; then
-        break
-      fi
-      continue
-    fi
+    echo "  -> $py_test"
     set +e
-    run_python_test_with_psycopg "$ROOT_DIR/$py_test" --dsn "$PY_DSN" 2>&1 | tee -a "$PYTHON_LOG"
+    python3 "$ROOT_DIR/$py_test" --dsn "$REGRESSION_DSN" 2>&1 | tee -a "$PYTHON_LOG"
     PY_RC=${PIPESTATUS[0]}
     set -e
-    drop_database_best_effort "$PY_DATABASE" 45
     if [[ "$PY_RC" -ne 0 ]]; then
       PYTHON_EXIT=1
       if [[ "$STOP_ON_ERROR" -eq 1 ]]; then

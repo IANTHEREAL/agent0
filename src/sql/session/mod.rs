@@ -163,11 +163,6 @@ pub struct Session {
     /// mutations that survive to COMMIT.
     pub(crate) transaction_activity_modified: bool,
     pub(crate) transaction_activity_modified_savepoints: Vec<ActivityModifiedSavepoint>,
-    /// True once the current transaction has taken the database lifecycle write
-    /// fence. This pessimistic lock is transaction-scoped and is acquired before
-    /// statements that can commit database changes run their own row locks or
-    /// mutations, so it is not savepoint-scoped.
-    transaction_database_write_fenced: bool,
     /// True when executing a multi-statement simple-query batch (implicit transaction).
     /// LOCAL mutations should persist across statements within the batch, matching
     /// PostgreSQL's implicit transaction semantics for multi-statement simple queries.
@@ -211,7 +206,6 @@ impl Session {
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
     ) -> anyhow::Result<Self> {
-        crate::worker::database_lifecycle::ensure_database_lifecycle_accepts_traffic()?;
         let settings = SessionSettings::new_with_defaults(
             default_statement_timeout_ms,
             default_idle_in_txn_timeout_ms,
@@ -270,7 +264,6 @@ impl Session {
             transaction_dirty_table_savepoints: Vec::new(),
             transaction_activity_modified: false,
             transaction_activity_modified_savepoints: Vec::new(),
-            transaction_database_write_fenced: false,
             in_implicit_batch: false,
             pending_notices: Vec::new(),
             local_session_auth_save: None,
@@ -292,7 +285,6 @@ impl Session {
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
     ) -> anyhow::Result<Self> {
-        crate::worker::database_lifecycle::ensure_database_lifecycle_accepts_traffic()?;
         let settings = SessionSettings::new_with_defaults(
             default_statement_timeout_ms,
             default_idle_in_txn_timeout_ms,
@@ -351,7 +343,6 @@ impl Session {
             transaction_dirty_table_savepoints: Vec::new(),
             transaction_activity_modified: false,
             transaction_activity_modified_savepoints: Vec::new(),
-            transaction_database_write_fenced: false,
             in_implicit_batch: false,
             pending_notices: Vec::new(),
             local_session_auth_save: None,
@@ -1133,30 +1124,6 @@ impl Session {
     #[allow(dead_code)] // framework: accessed via settings snapshot in DML executor
     pub(crate) fn dml_table_scan_max_rows(&self) -> usize {
         self.settings.dml_table_scan_max_rows()
-    }
-
-    pub(crate) fn transaction_read_only(&self) -> bool {
-        self.settings.transaction_read_only()
-    }
-
-    pub(crate) fn ensure_transaction_characteristics_change_allowed(
-        &self,
-        name: &str,
-    ) -> Result<()> {
-        let canonical = SessionSettings::canonical_setting_name(name);
-        if matches!(canonical, "transaction_isolation" | "transaction_read_only")
-            && self.is_in_transaction()
-            && self.has_executed_statement_in_transaction()
-        {
-            return Err(SqlError::ActiveSqlTransaction {
-                message: format!(
-                    "parameter \"{}\" cannot be changed after the first query in a transaction",
-                    canonical
-                ),
-            }
-            .into());
-        }
-        Ok(())
     }
 
     fn sync_plan_cache_settings(&mut self) {

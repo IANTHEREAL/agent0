@@ -56,15 +56,19 @@ pub(crate) async fn resolve_unique_index_conflict(
     // Bounded retries handle transient races with concurrent DML.
     for _ in 0..2 {
         let existing_pk = store
-            .get_unique_index_pk_for_update(
+            .scan_index(
                 txn,
                 db_id,
                 schema.table_id,
                 index.id,
                 idx_values,
+                true,
                 &pk_types,
+                Some(1),
             )
-            .await?;
+            .await?
+            .into_iter()
+            .next();
 
         let Some(existing_pk) = existing_pk else {
             // Entry disappeared between duplicate error and validation; retry insert.
@@ -90,11 +94,17 @@ pub(crate) async fn resolve_unique_index_conflict(
             return Ok(UniqueConflictResolution::Idempotent);
         }
 
-        let existing_row = store
-            .lock_row_current_and_get_not_newer_than(txn, db_id, schema.table_id, &existing_pk)
+        let existing_rows = store
+            .batch_get_rows(
+                txn,
+                db_id,
+                schema.table_id,
+                vec![existing_pk.clone()],
+                schema,
+            )
             .await?;
 
-        let stale = if let Some(mut existing_row) = existing_row {
+        let stale = if let Some(mut existing_row) = existing_rows.into_iter().next() {
             fill_row_defaults(&mut existing_row, schema)?;
             if !index_helpers::eval_index_predicate(index, schema, &existing_row)? {
                 true
@@ -124,7 +134,7 @@ pub(crate) async fn resolve_unique_index_conflict(
             .await?;
 
         match store
-            .recreate_deleted_index_entry(
+            .create_index_entry(
                 txn,
                 db_id,
                 schema.table_id,
@@ -159,36 +169,6 @@ mod tests {
     fn duplicate_error_matcher_detects_structured_error() {
         let e = crate::storage::unique_index_duplicate_error();
         assert!(is_unique_duplicate_error(&e));
-    }
-
-    #[test]
-    fn unique_conflict_resolution_uses_current_locked_reads() {
-        let source = include_str!("index_consistency.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("index_consistency.rs must contain test module marker");
-        let body = prod_source
-            .split("pub(crate) async fn resolve_unique_index_conflict")
-            .nth(1)
-            .expect("resolve_unique_index_conflict must be present");
-
-        assert!(
-            body.contains(".get_unique_index_pk_for_update("),
-            "unique conflict repair must lock-read the current unique index owner"
-        );
-        assert!(
-            body.contains(".lock_row_current_and_get_not_newer_than("),
-            "unique conflict repair must validate the current owner row under SI conflict checks"
-        );
-        assert!(
-            !body.contains(".scan_index("),
-            "unique conflict repair must not decide from a snapshot index scan"
-        );
-        assert!(
-            !body.contains(".batch_get_rows("),
-            "unique conflict repair must not decide from snapshot row reads"
-        );
     }
 
     #[test]

@@ -21,6 +21,8 @@
 //! tuned for cross-pod TCP+TLS throughput and are still appropriate for
 //! the v2 public listener.
 
+#![cfg(fsplane_v2_generated)]
+
 use std::sync::OnceLock;
 use std::time::Duration;
 

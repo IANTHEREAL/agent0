@@ -123,14 +123,6 @@ impl DynamicPgHandler {
             })?;
         }
 
-        if session.transaction_read_only() {
-            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-            return Err(user_error(
-                "25006",
-                "cannot execute COPY FROM in a read-only transaction",
-            ));
-        }
-
         // All fallible work after begin() is wrapped in an async block so that
         // every `?` is caught by the single cleanup site below.
         let result: PgWireResult<(usize, crate::session_context::TxnDirtyTableIds)> = async {
@@ -617,14 +609,6 @@ impl DynamicPgHandler {
                 .begin()
                 .await
                 .map_err(|e| user_error("XX000", e.to_string()))?;
-        }
-
-        if session.transaction_read_only() {
-            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-            return Err(user_error(
-                "25006",
-                "cannot execute COPY FROM in a read-only transaction",
-            ));
         }
 
         // All fallible work after begin() is wrapped in an async block so that

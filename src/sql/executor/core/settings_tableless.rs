@@ -231,7 +231,6 @@ pub(super) async fn try_execute_set_config_select(
         }));
     }
 
-    session.ensure_transaction_characteristics_change_allowed(&var_name)?;
     let applied = if is_local {
         session.set_local_setting(&var_name, new_value)?
     } else {

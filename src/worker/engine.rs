@@ -22,7 +22,7 @@ use anyhow::{anyhow, Result};
 pub(crate) use helpers::HNSW_GRAPH_MAX_BYTES;
 use helpers::{
     background_statement_extension_context, execute_hnsw_merge, parse_backfill_index_command,
-    parse_hnsw_merge_command, should_skip_frozen_merge,
+    parse_hnsw_merge_command, should_skip_frozen_merge, should_start_cic_backfill,
 };
 pub(crate) use helpers::{
     cleanup_hnsw_s3_graph_upload_after_failed_txn, hnsw_s3_graph_version_for_txn,
@@ -49,7 +49,6 @@ const STATEMENT_TIMEOUT_ERROR: &str = "canceling statement due to statement time
 /// shared with the specialized long-running paths via `LeaseCancel`.
 use crate::worker::CLAIM_CANCELLED_ERROR as CANCELLED_BY_ADMIN_ERROR;
 const WORKER_BGSQL_MAX_RETRY_ATTEMPTS: usize = 64;
-const WORKER_BGDDL_MAX_RETRY_ATTEMPTS: usize = 64;
 const REGISTRY_SWEEP_POLL_INTERVAL_SEC: u64 = 1;
 const REGISTRY_SWEEP_CATCHUP_PAGE_INTERVAL_SEC: u64 = 2;
 /// Convergent legacy `_worker_queue_` drain (design §II.8 M5). While stragglers
@@ -2863,48 +2862,21 @@ impl WorkerEngine {
         // BgDdl tasks (e.g. CREATE INDEX CONCURRENTLY backfill) are exempt from
         // statement_timeout — they legitimately run for extended periods.
         if entry.task_type == TaskType::BgDdl && entry.command.starts_with("__backfill_index ") {
-            for attempt in 0..WORKER_BGDDL_MAX_RETRY_ATTEMPTS {
-                let stmt_ts = now_epoch_ms();
-                let qctx = QueryContext::new(
-                    0,
-                    database_name.clone(),
-                    current_user.clone(),
-                    stmt_ts,
-                    tx_start_ms,
-                    timezone.clone(),
-                );
-                let mark_retryable_invalid = attempt + 1 == WORKER_BGDDL_MAX_RETRY_ATTEMPTS;
-                let result = query_context::with_scoped_query_context(
-                    &qctx,
-                    Self::execute_bg_ddl_backfill(
-                        &store,
-                        entry,
-                        &lease_cancel,
-                        mark_retryable_invalid,
-                    ),
-                )
-                .await;
-
-                match result {
-                    Ok(()) => return Ok(1),
-                    Err(e)
-                        if attempt + 1 < WORKER_BGDDL_MAX_RETRY_ATTEMPTS
-                            && is_retryable_tikv_error(&e) =>
-                    {
-                        tracing::info!(
-                            attempt = attempt + 1,
-                            max_attempts = WORKER_BGDDL_MAX_RETRY_ATTEMPTS,
-                            task_id = entry.task_id,
-                            "bg_ddl backfill hit transient storage conflict, retrying task"
-                        );
-                        worker_bgsql_backoff(attempt).await;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-
-            unreachable!("bg_ddl retry loop must return")
+            let stmt_ts = now_epoch_ms();
+            let qctx = QueryContext::new(
+                0,
+                database_name.clone(),
+                current_user.clone(),
+                stmt_ts,
+                tx_start_ms,
+                timezone.clone(),
+            );
+            query_context::with_scoped_query_context(
+                &qctx,
+                Self::execute_bg_ddl_backfill(&store, entry, &lease_cancel),
+            )
+            .await?;
+            return Ok(1);
         }
 
         let is_cron = entry.task_type == TaskType::Cron;
@@ -3085,7 +3057,6 @@ impl WorkerEngine {
         store: &Arc<TikvStore>,
         entry: &TaskQueueEntry,
         lease_cancel: &crate::worker::LeaseCancel,
-        mark_retryable_invalid: bool,
     ) -> Result<()> {
         let (table_name, index_name) = parse_backfill_index_command(&entry.command)?;
         let db_id = entry.db_id;
@@ -3121,19 +3092,13 @@ impl WorkerEngine {
             .find(|idx| idx.name == index_name)
             .cloned()
             .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
-        match index.state {
-            IndexState::Building | IndexState::WriteOnly => {}
-            IndexState::Ready | IndexState::Invalid => {
-                // Duplicate/stale queue entries are harmless once the CIC has
-                // reached a terminal state. WriteOnly is not terminal: a retry
-                // after phase 1 must resume from phase 2 instead of pretending
-                // the task is complete.
-                warn!(
-                    "Skipping CIC backfill task because index is already terminal: table={} index={} state={:?}",
-                    table_name, index_name, index.state
-                );
-                return Ok(());
-            }
+        if !should_start_cic_backfill(index.state) {
+            // Guard against duplicate/stale queue entries: CIC phases must start from Building.
+            warn!(
+                "Skipping CIC backfill task because index is not in Building state: table={} index={} state={:?}",
+                table_name, index_name, index.state
+            );
+            return Ok(());
         }
 
         // Lease fence at the start of every phase AND inside each phase's
@@ -3147,25 +3112,20 @@ impl WorkerEngine {
         // resume, so it must NOT be flipped to Invalid.
         lease_cancel.bail_if_cancelled()?;
 
-        // Phase 1 (Building): backfill and atomically flip to WriteOnly. A
-        // retry may re-enter here after phase 1 already committed; in that
-        // case the current state is WriteOnly and phase 1 must be skipped.
-        if index.state == IndexState::Building {
-            match ddl::backfill_index_by_name(
-                store,
-                db_id,
-                &table_name,
-                &index_name,
-                Some(IndexState::WriteOnly),
-                lease_cancel,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if is_claim_cancelled_error(&e) => return Err(e),
-                Err(e) if is_retryable_tikv_error(&e) && !mark_retryable_invalid => return Err(e),
-                Err(e) => return Err(mark_invalid(e).await),
-            }
+        // Phase 1 (Building): backfill and atomically flip to WriteOnly.
+        match ddl::backfill_index_by_name(
+            store,
+            db_id,
+            &table_name,
+            &index_name,
+            Some(IndexState::WriteOnly),
+            lease_cancel,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e) if is_claim_cancelled_error(&e) => return Err(e),
+            Err(e) => return Err(mark_invalid(e).await),
         }
 
         lease_cancel.bail_if_cancelled()?;
@@ -3183,7 +3143,6 @@ impl WorkerEngine {
         {
             Ok(()) => {}
             Err(e) if is_claim_cancelled_error(&e) => return Err(e),
-            Err(e) if is_retryable_tikv_error(&e) && !mark_retryable_invalid => return Err(e),
             Err(e) => return Err(mark_invalid(e).await),
         }
 
@@ -3202,7 +3161,6 @@ impl WorkerEngine {
         {
             Ok(()) => {}
             Err(e) if is_claim_cancelled_error(&e) => return Err(e),
-            Err(e) if is_retryable_tikv_error(&e) && !mark_retryable_invalid => return Err(e),
             Err(e) => return Err(mark_invalid(e).await),
         }
 

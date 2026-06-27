@@ -1,7 +1,7 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::sql::projection::fill_row_defaults;
 use crate::storage::backpressure::tikv_op;
-use crate::storage::{StorageError, WriteConflictReason};
 use crate::txn::configured_key_size_limit;
 
 const INDEX_SENTINEL_VALUE: &[u8] = &[0x01];
@@ -189,7 +189,7 @@ impl TikvStore {
     }
 
     #[inline]
-    pub(crate) fn index_key_has_null(values: &[Value]) -> bool {
+    fn index_key_has_null(values: &[Value]) -> bool {
         values.iter().any(|v| matches!(v, Value::Null))
     }
 
@@ -310,63 +310,18 @@ impl TikvStore {
         pk_values: &[Value],
         unique: bool,
     ) -> Result<usize> {
-        self.create_index_entry_inner(
-            txn, db_id, table_id, index_id, values, pk_values, unique, false,
-        )
-        .await
-    }
-
-    /// Re-create an index key that this same transaction already deleted.
-    ///
-    /// Unique indexes normally use TiKV's insert-if-absent assertion. When an
-    /// UPDATE deletes an old unique key and writes the same key with a new PK
-    /// value, the pre-transaction key still exists, so that assertion would
-    /// reject our own replacement. This narrow helper keeps that case explicit.
-    pub async fn recreate_deleted_index_entry(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_id: u64,
-        index_id: u64,
-        values: &[Value],
-        pk_values: &[Value],
-        unique: bool,
-    ) -> Result<usize> {
-        self.create_index_entry_inner(
-            txn, db_id, table_id, index_id, values, pk_values, unique, true,
-        )
-        .await
-    }
-
-    async fn create_index_entry_inner(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_id: u64,
-        index_id: u64,
-        values: &[Value],
-        pk_values: &[Value],
-        unique: bool,
-        replace_deleted_key: bool,
-    ) -> Result<usize> {
         let enforce_unique_lookup = unique && !Self::index_key_has_null(values);
         if enforce_unique_lookup {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
             check_index_key_size(&idx_key)?;
-            if !replace_deleted_key
-                && tikv_op!(txn.get_for_update(idx_key.clone()).await)?.is_some()
-            {
+            if tikv_op!(txn.get(idx_key.clone()).await)?.is_some() {
                 return Err(crate::storage::unique_index_duplicate_error());
             }
             let idx_val = encode_pk_values(pk_values);
             let bytes_written = idx_key.len() + idx_val.len();
-            if replace_deleted_key {
-                txn_put(txn, idx_key, idx_val).await?;
-            } else {
-                txn_insert(txn, idx_key, idx_val).await?;
-            }
+            txn_put(txn, idx_key, idx_val).await?;
             Ok(bytes_written)
         } else {
             let idx_key = self.key(&encode_index_key_v2(
@@ -394,8 +349,8 @@ impl TikvStore {
     /// exists in TiKV but is also in this set is not a real conflict (it
     /// will be freed by the same batch flush).  Pass `None` for INSERT/COPY.
     ///
-    /// Returns encoded mutations — caller is responsible for flushing via
-    /// `txn_batch_mutate_mixed`.
+    /// Returns the encoded `(key, value)` mutations — caller is responsible
+    /// for flushing via `txn_batch_mutate`.
     pub async fn create_index_entries_batch(
         &self,
         txn: &mut Transaction,
@@ -403,7 +358,7 @@ impl TikvStore {
         table_id: u64,
         entries: &[BatchIndexEntry],
         old_keys_being_deleted: Option<&HashSet<Vec<u8>>>,
-    ) -> Result<Vec<BatchMutation>> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
@@ -505,21 +460,13 @@ impl TikvStore {
             }
         }
 
-        // Collect mutations (caller flushes via txn_batch_mutate_mixed).
+        // Collect mutations (caller flushes via txn_batch_mutate).
         let mut mutations = Vec::with_capacity(unique_entries.len() + non_unique_entries.len());
         for ue in unique_entries {
-            let being_deleted = old_keys_being_deleted.is_some_and(|s| s.contains(&ue.idx_key));
-            if being_deleted {
-                mutations.push(BatchMutation::Put(ue.idx_key, ue.idx_val));
-            } else {
-                mutations.push(BatchMutation::Insert(ue.idx_key, ue.idx_val));
-            }
+            mutations.push((ue.idx_key, ue.idx_val));
         }
         for ne in non_unique_entries {
-            mutations.push(BatchMutation::Put(
-                ne.idx_key,
-                INDEX_SENTINEL_VALUE.to_vec(),
-            ));
+            mutations.push((ne.idx_key, INDEX_SENTINEL_VALUE.to_vec()));
         }
         Ok(mutations)
     }
@@ -665,39 +612,6 @@ impl TikvStore {
             kv_stats::record_index_scan_pairs(scanned_pairs);
             Ok(pks)
         }
-    }
-
-    /// Read the current owner of a non-NULL unique index key under a pessimistic
-    /// lock.
-    ///
-    /// This is intentionally narrower than `scan_index`: duplicate-key repair
-    /// must decide from the latest locked value, not from this transaction's
-    /// snapshot.
-    pub async fn get_unique_index_pk_for_update(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_id: u64,
-        index_id: u64,
-        values: &[Value],
-        pk_types: &[DataType],
-    ) -> Result<Option<Vec<Value>>> {
-        if pk_types.is_empty() {
-            return Err(anyhow!("PK types required for unique index lookup"));
-        }
-        if Self::index_key_has_null(values) {
-            return Ok(None);
-        }
-
-        let idx_key = self.key(&encode_index_key_v2(
-            db_id, table_id, index_id, values, None,
-        ));
-        check_index_key_size(&idx_key)?;
-
-        let Some(val) = tikv_op!(txn.get_for_update(idx_key).await)? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_pk_from_index_suffix(&val, pk_types)?))
     }
 
     /// Scan index by a prefix of the index values to get PKs.
@@ -913,8 +827,8 @@ impl TikvStore {
 
     /// Encode GIN index entry mutations without writing to TiKV.
     ///
-    /// Returns `(key, value)` pairs for batch collection; caller wraps them
-    /// as Put mutations before flushing through `txn_batch_mutate_mixed`.
+    /// Returns `(key, value)` pairs for batch collection; caller flushes
+    /// via `txn_batch_mutate`.
     pub fn encode_gin_index_mutations(
         &self,
         db_id: u64,
@@ -993,81 +907,55 @@ impl TikvStore {
         Ok(rows)
     }
 
-    /// Lock rows and reject if any row has been committed after this
-    /// transaction's start timestamp.
+    /// Batch get rows by PKs using TiKV's pessimistic read+lock path.
     ///
-    /// This is PostgreSQL-compatible SI write protection for UPDATE/DELETE:
-    /// once the statement has decided a snapshot row is a write target, the
-    /// row may be written only if TiKV can lock its current version without
-    /// observing a newer committed version.
-    pub async fn lock_rows_current_and_check_not_newer_than(
+    /// Unlike `batch_get_rows`, this uses `batch_get_for_update` so the caller
+    /// sees the latest committed row image while acquiring the lock in the same
+    /// round-trip. This closes the classic TOCTOU gap of:
+    ///   1. snapshot read old row
+    ///   2. later acquire lock
+    ///   3. still compute new value from stale row
+    pub async fn batch_get_rows_for_update(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         table_id: u64,
         pks: Vec<Vec<Value>>,
+        schema: &TableSchema,
         lock_timeout: Option<std::time::Duration>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Row>> {
+        let mut rows = Vec::with_capacity(pks.len());
+        let mut data_keys: Vec<Vec<u8>> = Vec::with_capacity(BATCH_GET_CHUNK_SIZE);
+
         for pk in &pks {
             let row_key = encode_pk_values(pk);
-            let data_key = self.key(&encode_data_key_v2(db_id, table_id, &row_key));
-            let lock = async {
-                tikv_op!(
-                    txn.lock_current_and_check_not_newer_than(data_key.clone())
-                        .await
+            data_keys.push(self.key(&encode_data_key_v2(db_id, table_id, &row_key)));
+
+            if data_keys.len() >= BATCH_GET_CHUNK_SIZE {
+                self.batch_get_rows_by_data_keys_for_update(
+                    txn,
+                    &data_keys,
+                    &mut rows,
+                    schema,
+                    lock_timeout,
                 )
-                .map_err(|e| anyhow!(e))
-            };
-            let result = match lock_timeout {
-                Some(timeout) => match tokio::time::timeout(timeout, lock).await {
-                    Ok(result) => result?,
-                    Err(_elapsed) => return Err(SqlError::LockTimeout.into()),
-                },
-                None => lock.await?,
-            };
-
-            if result.latest_commit_ts.is_some() {
-                return Err(StorageError::WriteConflict {
-                    reason: WriteConflictReason::Pessimistic,
-                }
-                .into());
+                .await?;
+                data_keys.clear();
             }
         }
 
-        Ok(())
-    }
-
-    /// Lock a row's current version and return it only when it has not changed
-    /// since the transaction start timestamp.
-    ///
-    /// Stale unique-index cleanup uses this to avoid deleting a currently valid
-    /// index entry based on an old transaction snapshot.
-    pub async fn lock_row_current_and_get_not_newer_than(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_id: u64,
-        pk_values: &[Value],
-    ) -> Result<Option<Row>> {
-        let row_key = encode_pk_values(pk_values);
-        let data_key = self.key(&encode_data_key_v2(db_id, table_id, &row_key));
-        let result = tikv_op!(
-            txn.lock_current_and_check_not_newer_than(data_key.clone())
-                .await
-        )
-        .map_err(|e| anyhow!(e))?;
-
-        if result.latest_commit_ts.is_some() {
-            return Err(StorageError::WriteConflict {
-                reason: WriteConflictReason::Pessimistic,
-            }
-            .into());
+        if !data_keys.is_empty() {
+            self.batch_get_rows_by_data_keys_for_update(
+                txn,
+                &data_keys,
+                &mut rows,
+                schema,
+                lock_timeout,
+            )
+            .await?;
         }
 
-        result
-            .value
-            .map(|value| deserialize_row(&value))
-            .transpose()
+        Ok(rows)
     }
 
     async fn batch_get_rows_by_data_keys(
@@ -1090,6 +978,68 @@ impl TikvStore {
             let key_ref: &Key = key.into();
             if let Some(val) = by_key.get(key_ref) {
                 out.push(deserialize_row(val)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn batch_get_rows_by_data_keys_for_update(
+        &self,
+        txn: &mut Transaction,
+        data_keys: &[Vec<u8>],
+        out: &mut Vec<Row>,
+        schema: &TableSchema,
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        kv_stats::record_batch_get_keys(data_keys.len());
+        let lock_fetch = async {
+            tikv_op!(txn.batch_get_for_update(data_keys.iter().cloned()).await)
+                .map_err(|e| anyhow!(e))
+        };
+        let pairs = match lock_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, lock_fetch).await {
+                Ok(result) => result?,
+                Err(_elapsed) => return Err(SqlError::LockTimeout.into()),
+            },
+            None => lock_fetch.await?,
+        };
+        // For clean tables (the caller skips this path once the table has
+        // already been dirtied in the current transaction), prefer the latest
+        // committed row image returned under lock. But rows inserted earlier in
+        // this same transaction are not yet committed and therefore absent from
+        // `batch_get_for_update`; fill only those missing keys from the txn
+        // buffer so intra-function read-your-own-writes still works.
+        let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
+
+        for pair in pairs {
+            let tikv_client::KvPair(key, value) = pair;
+            by_key.insert(key, value);
+        }
+
+        let missing_keys: Vec<Vec<u8>> = data_keys
+            .iter()
+            .filter(|key| {
+                let key_ref: &Key = (*key).into();
+                !by_key.contains_key(key_ref)
+            })
+            .cloned()
+            .collect();
+        if !missing_keys.is_empty() {
+            let buffered_pairs =
+                tikv_op!(txn.batch_get(missing_keys).await).map_err(|e| anyhow!(e))?;
+            for pair in buffered_pairs {
+                let tikv_client::KvPair(key, value) = pair;
+                by_key.insert(key, value);
+            }
+        }
+
+        for key in data_keys {
+            let key_ref: &Key = key.into();
+            if let Some(val) = by_key.get(key_ref) {
+                let mut row = deserialize_row(val)?;
+                fill_row_defaults(&mut row, schema)?;
+                out.push(row);
             }
         }
 
@@ -1269,25 +1219,6 @@ impl TikvStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unique_index_insert_checks_current_key_under_lock() {
-        let source = include_str!("indexes.rs");
-        let body = source
-            .split("async fn create_index_entry_inner(")
-            .nth(1)
-            .and_then(|rest| rest.split("/// Batch-create index entries").next())
-            .expect("create_index_entry_inner body must be present");
-
-        assert!(
-            body.contains("txn.get_for_update(idx_key.clone()).await"),
-            "unique index insert-if-absent must check the latest committed key under a pessimistic lock"
-        );
-        assert!(
-            !body.contains("txn.get(idx_key.clone()).await"),
-            "unique index insert-if-absent must not use a stale snapshot get"
-        );
-    }
 
     #[test]
     fn decode_non_unique_pk_from_index_key_roundtrip_single_pk() {

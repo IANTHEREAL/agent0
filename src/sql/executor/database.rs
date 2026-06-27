@@ -554,7 +554,7 @@ impl Executor {
         // drops from leaving stale external intents while preserving the
         // crash-safe handoff for successful drops on any SQL node.
         let mut hnsw_s3_db_id: Option<u64> = None;
-        if let Some(dropped) = dropped_result.as_ref() {
+        if let Some((db_id, _)) = dropped_result.as_ref() {
             let drop_txn_start_ts = {
                 let (txn, _, _) = session
                     .get_mut_txn_sequence_values_and_search_path()
@@ -563,7 +563,7 @@ impl Executor {
             };
             if let Err(e) = crate::worker::request_hnsw_s3_db_prefix_cleanup(
                 &keyspace,
-                dropped.db_id,
+                *db_id,
                 drop_txn_start_ts,
                 "drop_database",
             )
@@ -575,128 +575,16 @@ impl Executor {
                      (keyspace='{}', db_id={}): {}",
                     cmd.name,
                     keyspace,
-                    dropped.db_id,
+                    db_id,
                     e
                 ));
             }
-            hnsw_s3_db_id = Some(dropped.db_id);
+            hnsw_s3_db_id = Some(*db_id);
         }
 
         session.commit().await?;
 
-        if let Some(mut dropped) = dropped_result {
-            let db_id = dropped.db_id;
-            let fencing_epoch = dropped.fencing_epoch;
-            let active_ops = crate::sql::session::db_connections::db_connection_registry()
-                .active_operation_count(&keyspace, db_id) as u64;
-            let drain_allows_drop = match crate::worker::system_store() {
-                Ok(system_store) => {
-                    if let Err(e) =
-                        crate::worker::database_lifecycle::publish_database_drain_state_once(
-                            system_store,
-                            &keyspace,
-                            db_id,
-                            fencing_epoch,
-                            active_ops,
-                            active_ops == 0,
-                        )
-                        .await
-                    {
-                        warn!(
-                                "DROP DATABASE '{}': failed to publish local drain state for db_id={} epoch={}: {}",
-                                cmd.name, db_id, fencing_epoch, e
-                            );
-                        false
-                    } else {
-                        match crate::worker::database_lifecycle::database_read_drain_allows_drop(
-                            system_store,
-                            &keyspace,
-                            db_id,
-                            fencing_epoch,
-                        )
-                        .await
-                        {
-                            Ok(allows) => allows,
-                            Err(e) => {
-                                warn!(
-                                        "DROP DATABASE '{}': failed to evaluate node drain for db_id={} epoch={}: {}",
-                                        cmd.name, db_id, fencing_epoch, e
-                                    );
-                                false
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                            "DROP DATABASE '{}': worker system store unavailable for db_id={} lifecycle drain: {}",
-                            cmd.name, db_id, e
-                        );
-                    false
-                }
-            };
-
-            if !drain_allows_drop {
-                results.push(ExecuteResult::Notice {
-                    message: format!(
-                        "database \"{}\" is deleting; waiting for other db9 nodes to drain old work",
-                        cmd.name
-                    ),
-                    severity: "NOTICE".to_string(),
-                    sqlstate: "00000".to_string(),
-                });
-                dropped.dropping_guard.commit();
-                results.push(ExecuteResult::CommandComplete {
-                    tag: "DROP DATABASE",
-                });
-                return Ok(ExecuteResults(results));
-            }
-
-            let drop_claimed = match crate::worker::system_store() {
-                Ok(system_store) => {
-                    match crate::worker::database_lifecycle::claim_database_drop_coordinator(
-                        system_store,
-                        &keyspace,
-                        db_id,
-                        fencing_epoch,
-                    )
-                    .await
-                    {
-                        Ok(claimed) => claimed,
-                        Err(e) => {
-                            warn!(
-                                "DROP DATABASE '{}': failed to claim drop coordinator for db_id={} epoch={}: {}",
-                                cmd.name, db_id, fencing_epoch, e
-                            );
-                            false
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "DROP DATABASE '{}': worker system store unavailable for db_id={} drop claim: {}",
-                        cmd.name, db_id, e
-                    );
-                    false
-                }
-            };
-
-            if !drop_claimed {
-                results.push(ExecuteResult::Notice {
-                    message: format!(
-                        "database \"{}\" is deleting; another db9 node is finalizing the drop",
-                        cmd.name
-                    ),
-                    severity: "NOTICE".to_string(),
-                    sqlstate: "00000".to_string(),
-                });
-                dropped.dropping_guard.commit();
-                results.push(ExecuteResult::CommandComplete {
-                    tag: "DROP DATABASE",
-                });
-                return Ok(ExecuteResults(results));
-            }
-
+        if let Some((db_id, mut dropping_guard)) = dropped_result {
             // Step 1: Delete all HNSW text-format keys for this database.
             // HNSW keys use text format (d_{db_id}_hnsw_...) which falls
             // OUTSIDE the binary range that unsafe_destroy_range deletes.
@@ -816,48 +704,10 @@ impl Executor {
                 ),
             }
 
-            match self
-                .store()
-                .mark_database_dropped_if_fencing_epoch(db_id, fencing_epoch)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => warn!(
-                    "DROP DATABASE '{}': lifecycle was no longer FENCING at expected epoch for db_id={} epoch={}",
-                    cmd.name, db_id, fencing_epoch
-                ),
-                Err(e) => warn!(
-                    "DROP DATABASE '{}': failed to mark lifecycle DROPPED for db_id={} epoch={}: {}",
-                    cmd.name, db_id, fencing_epoch, e
-                ),
-            }
-
             // Step 4: Finalize the dropping guard — remove the registry entry.
             // This allows the (keyspace, db_id) to be reused if the same
             // database name is re-created.
-            match crate::worker::system_store() {
-                Ok(system_store) => {
-                    if let Err(e) =
-                        crate::worker::database_lifecycle::release_database_drop_coordinator_claim(
-                            system_store,
-                            &keyspace,
-                            db_id,
-                            fencing_epoch,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "DROP DATABASE '{}': failed to release drop coordinator claim for db_id={} epoch={}: {}",
-                            cmd.name, db_id, fencing_epoch, e
-                        );
-                    }
-                }
-                Err(e) => warn!(
-                    "DROP DATABASE '{}': worker system store unavailable while releasing drop claim for db_id={} epoch={}: {}",
-                    cmd.name, db_id, fencing_epoch, e
-                ),
-            }
-            dropped.dropping_guard.commit();
+            dropping_guard.commit();
         }
 
         results.push(ExecuteResult::CommandComplete {
@@ -992,7 +842,7 @@ mod tests {
             .next()
             .expect("database.rs must contain #[cfg(test)]");
         let cleanup_source = prod_source
-            .split("// Step 3.5: Reap worker-queue entries")
+            .split("match crate::worker::system_store()")
             .nth(1)
             .and_then(|rest| rest.split("// Step 4:").next())
             .expect("DROP DATABASE worker cleanup block must exist");
@@ -1013,63 +863,6 @@ mod tests {
         assert!(
             !reap_error_branch.contains("delete_worker_registry"),
             "worker cleanup failure branch must not delete the registry row"
-        );
-    }
-
-    #[test]
-    fn drop_database_waits_for_node_drain_before_physical_cleanup() {
-        let source = include_str!("database.rs");
-        let prod_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("database.rs must contain #[cfg(test)]");
-        let drop_fn = prod_source
-            .split("pub(crate) async fn execute_drop_database_cmd(")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("pub(crate) async fn execute_alter_database_cmd(")
-                    .next()
-            })
-            .expect("DROP DATABASE executor must exist before ALTER DATABASE executor");
-
-        let drain_gate = drop_fn
-            .find("database_read_drain_allows_drop")
-            .expect("DROP DATABASE must check cluster read drain before cleanup");
-        let draining_notice = drop_fn
-            .find("waiting for other db9 nodes to drain old work")
-            .expect("DROP DATABASE must report deleting instead of cleaning early");
-        let drop_claim = drop_fn
-            .find("claim_database_drop_coordinator")
-            .expect("DROP DATABASE must claim the per-db/epoch drop coordinator");
-        let hnsw_cleanup = drop_fn
-            .find("hnsw_db_prefix(db_id)")
-            .expect("DROP DATABASE must clean HNSW text keys");
-        let range_destroy = drop_fn
-            .find("unsafe_destroy_database_data(db_id)")
-            .expect("DROP DATABASE must destroy the tenant data range");
-        let epoch_mark = drop_fn
-            .find("mark_database_dropped_if_fencing_epoch(db_id, fencing_epoch)")
-            .expect("DROP DATABASE must mark DROPPED only through the epoch fence");
-
-        assert!(
-            drain_gate < hnsw_cleanup,
-            "DROP DATABASE must not delete HNSW keys before cluster drain succeeds"
-        );
-        assert!(
-            draining_notice < hnsw_cleanup,
-            "DROP DATABASE must return while FENCING instead of cleaning before drain"
-        );
-        assert!(
-            drop_claim < hnsw_cleanup,
-            "DROP DATABASE must claim the drop coordinator before physical cleanup"
-        );
-        assert!(
-            range_destroy < epoch_mark,
-            "DROP DATABASE must mark DROPPED only after physical range cleanup"
-        );
-        assert!(
-            !drop_fn.contains("mark_database_dropped(db_id)"),
-            "DROP DATABASE must not use the old non-epoch DROPPED marker"
         );
     }
 

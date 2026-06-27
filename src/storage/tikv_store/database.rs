@@ -1,199 +1,5 @@
 use super::*;
 use crate::storage::backpressure::tikv_op;
-use serde::{Deserialize, Serialize};
-
-const DATABASE_LIFECYCLE_FORMAT_V1: u8 = 1;
-const DATABASE_NODE_LEASE_FORMAT_V1: u8 = 1;
-const DATABASE_DRAIN_STATE_FORMAT_V1: u8 = 1;
-const DATABASE_DROP_CLAIM_FORMAT_V1: u8 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum DatabaseLifecycleState {
-    Active,
-    Fencing,
-    Dropped,
-    Purging,
-    Purged,
-}
-
-impl DatabaseLifecycleState {
-    fn is_active(self) -> bool {
-        matches!(self, Self::Active)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DatabaseLifecycle {
-    pub db_id: u64,
-    pub epoch: u64,
-    pub state: DatabaseLifecycleState,
-    pub created_at_ms: i64,
-    pub fence_ts_ms: Option<i64>,
-    pub drop_started_at_ms: Option<i64>,
-    pub drop_completed_at_ms: Option<i64>,
-    pub purge_job_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DatabaseNodeLease {
-    pub node_id: String,
-    pub generation: u64,
-    pub lease_until_ms: i64,
-    pub published_at_ms: i64,
-    pub accepts_sql: bool,
-}
-
-#[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-impl DatabaseNodeLease {
-    pub(crate) fn live_until_with_guard_ms(&self, guard_ms: i64) -> i64 {
-        self.lease_until_ms.saturating_add(guard_ms.max(0))
-    }
-
-    pub(crate) fn self_fence_deadline_ms(&self, guard_ms: i64) -> i64 {
-        self.lease_until_ms.saturating_sub(guard_ms.max(0))
-    }
-
-    pub(crate) fn is_live_at_ms(&self, now_ms: i64, guard_ms: i64) -> bool {
-        now_ms < self.live_until_with_guard_ms(guard_ms)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DatabaseDrainState {
-    pub keyspace: String,
-    pub db_id: u64,
-    pub epoch: u64,
-    pub node_id: String,
-    pub generation: u64,
-    pub observed_at_ms: i64,
-    pub active_old_epoch_ops: u64,
-    pub drained: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct DatabaseDropClaim {
-    keyspace: String,
-    db_id: u64,
-    epoch: u64,
-    node_id: String,
-    generation: u64,
-    claimed_at_ms: i64,
-    lease_until_ms: i64,
-}
-
-#[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-impl DatabaseDrainState {
-    pub(crate) fn is_drained(&self) -> bool {
-        self.drained && self.active_old_epoch_ops == 0
-    }
-}
-
-pub(crate) struct DroppedDatabaseMetadata {
-    pub db_id: u64,
-    pub fencing_epoch: u64,
-    pub dropping_guard: crate::sql::session::db_connections::DroppingGuard,
-}
-
-impl DatabaseLifecycle {
-    fn active(db_id: u64, created_at_ms: i64) -> Self {
-        Self {
-            db_id,
-            epoch: 1,
-            state: DatabaseLifecycleState::Active,
-            created_at_ms,
-            fence_ts_ms: None,
-            drop_started_at_ms: None,
-            drop_completed_at_ms: None,
-            purge_job_id: None,
-        }
-    }
-}
-
-fn now_epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX)
-}
-
-fn serialize_database_lifecycle(lifecycle: &DatabaseLifecycle) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(64);
-    out.push(DATABASE_LIFECYCLE_FORMAT_V1);
-    bincode::serialize_into(&mut out, lifecycle)
-        .context("Failed to serialize database lifecycle")?;
-    Ok(out)
-}
-
-fn deserialize_database_lifecycle(data: &[u8]) -> Result<DatabaseLifecycle> {
-    match data.split_first() {
-        Some((&DATABASE_LIFECYCLE_FORMAT_V1, rest)) => {
-            bincode::deserialize(rest).context("Failed to deserialize database lifecycle")
-        }
-        Some((version, _)) => Err(anyhow!(
-            "unknown database lifecycle format version {version}"
-        )),
-        None => Err(anyhow!("empty database lifecycle value")),
-    }
-}
-
-fn serialize_database_node_lease(lease: &DatabaseNodeLease) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(96);
-    out.push(DATABASE_NODE_LEASE_FORMAT_V1);
-    bincode::serialize_into(&mut out, lease).context("Failed to serialize database node lease")?;
-    Ok(out)
-}
-
-fn deserialize_database_node_lease(data: &[u8]) -> Result<DatabaseNodeLease> {
-    match data.split_first() {
-        Some((&DATABASE_NODE_LEASE_FORMAT_V1, rest)) => {
-            bincode::deserialize(rest).context("Failed to deserialize database node lease")
-        }
-        Some((version, _)) => Err(anyhow!(
-            "unknown database node lease format version {version}"
-        )),
-        None => Err(anyhow!("empty database node lease value")),
-    }
-}
-
-fn serialize_database_drain_state(state: &DatabaseDrainState) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(96);
-    out.push(DATABASE_DRAIN_STATE_FORMAT_V1);
-    bincode::serialize_into(&mut out, state).context("Failed to serialize database drain state")?;
-    Ok(out)
-}
-
-fn deserialize_database_drain_state(data: &[u8]) -> Result<DatabaseDrainState> {
-    match data.split_first() {
-        Some((&DATABASE_DRAIN_STATE_FORMAT_V1, rest)) => {
-            bincode::deserialize(rest).context("Failed to deserialize database drain state")
-        }
-        Some((version, _)) => Err(anyhow!(
-            "unknown database drain state format version {version}"
-        )),
-        None => Err(anyhow!("empty database drain state value")),
-    }
-}
-
-fn serialize_database_drop_claim(claim: &DatabaseDropClaim) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.push(DATABASE_DROP_CLAIM_FORMAT_V1);
-    bincode::serialize_into(&mut out, claim).context("Failed to serialize database drop claim")?;
-    Ok(out)
-}
-
-fn deserialize_database_drop_claim(data: &[u8]) -> Result<DatabaseDropClaim> {
-    match data.split_first() {
-        Some((&DATABASE_DROP_CLAIM_FORMAT_V1, rest)) => {
-            bincode::deserialize(rest).context("Failed to deserialize database drop claim")
-        }
-        Some((&version, _)) => Err(anyhow!(
-            "unknown database drop claim format version {version}"
-        )),
-        None => Err(anyhow!("empty database drop claim value")),
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefaultDatabaseRepairAction {
@@ -370,225 +176,10 @@ impl TikvStore {
         }
     }
 
-    async fn get_database_lifecycle(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-    ) -> Result<Option<DatabaseLifecycle>> {
-        let key = self.key(&encode_database_lifecycle_key(db_id));
-        match tikv_op!(txn.get(key).await)? {
-            Some(data) => Ok(Some(deserialize_database_lifecycle(&data)?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn put_database_lifecycle(
-        &self,
-        txn: &mut Transaction,
-        lifecycle: &DatabaseLifecycle,
-    ) -> Result<()> {
-        let key = self.key(&encode_database_lifecycle_key(lifecycle.db_id));
-        let data = serialize_database_lifecycle(lifecycle)?;
-        txn_put(txn, key, data).await
-    }
-
-    async fn get_database_lifecycle_for_update(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-    ) -> Result<Option<DatabaseLifecycle>> {
-        let key = self.key(&encode_database_lifecycle_key(db_id));
-        match tikv_op!(txn.get_for_update(key).await)? {
-            Some(data) => Ok(Some(deserialize_database_lifecycle(&data)?)),
-            None => Ok(None),
-        }
-    }
-
-    #[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-    pub(crate) async fn publish_database_node_lease(
-        &self,
-        txn: &mut Transaction,
-        lease: &DatabaseNodeLease,
-    ) -> Result<()> {
-        let key = self.key(&encode_database_node_lease_key(&lease.node_id));
-        let data = serialize_database_node_lease(lease)?;
-        txn_put(txn, key, data).await
-    }
-
-    #[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-    pub(crate) async fn delete_database_node_lease(
-        &self,
-        txn: &mut Transaction,
-        node_id: &str,
-    ) -> Result<()> {
-        let key = self.key(&encode_database_node_lease_key(node_id));
-        txn_delete(txn, key).await
-    }
-
-    #[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-    pub(crate) async fn list_database_node_leases(
-        &self,
-        txn: &mut Transaction,
-    ) -> Result<Vec<DatabaseNodeLease>> {
-        let prefix = encode_database_node_lease_prefix();
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
-
-        let mut leases = Vec::new();
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if key.starts_with(&prefix) {
-                leases.push(deserialize_database_node_lease(pair.value())?);
-            }
-        }
-        Ok(leases)
-    }
-
-    #[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-    pub(crate) async fn put_database_drain_state(
-        &self,
-        txn: &mut Transaction,
-        state: &DatabaseDrainState,
-    ) -> Result<()> {
-        let key = self.key(&encode_database_drain_state_key(
-            &state.keyspace,
-            state.db_id,
-            state.epoch,
-            &state.node_id,
-        ));
-        let data = serialize_database_drain_state(state)?;
-        txn_put(txn, key, data).await
-    }
-
-    #[allow(dead_code)] // Wired by the Phase 1C drop coordinator.
-    pub(crate) async fn list_database_drain_states(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-        epoch: u64,
-    ) -> Result<Vec<DatabaseDrainState>> {
-        let prefix = encode_database_drain_state_prefix(keyspace, db_id, epoch);
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
-
-        let mut states = Vec::new();
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if key.starts_with(&prefix) {
-                states.push(deserialize_database_drain_state(pair.value())?);
-            }
-        }
-        Ok(states)
-    }
-
-    pub(crate) async fn claim_database_drop_with_lease(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-        epoch: u64,
-        node_id: &str,
-        generation: u64,
-        now_ms: i64,
-        lease_ms: i64,
-    ) -> Result<bool> {
-        let key = self.key(&encode_database_drop_claim_key(keyspace, db_id, epoch));
-        if let Some(data) = tikv_op!(txn.get_for_update(key.clone()).await)? {
-            let existing = deserialize_database_drop_claim(&data)?;
-            let same_owner = existing.node_id == node_id && existing.generation == generation;
-            if !same_owner && existing.lease_until_ms > now_ms {
-                return Ok(false);
-            }
-        }
-
-        let claim = DatabaseDropClaim {
-            keyspace: keyspace.to_string(),
-            db_id,
-            epoch,
-            node_id: node_id.to_string(),
-            generation,
-            claimed_at_ms: now_ms,
-            lease_until_ms: now_ms.saturating_add(lease_ms.max(1)),
-        };
-        let data = serialize_database_drop_claim(&claim)?;
-        txn_put(txn, key, data).await?;
-        Ok(true)
-    }
-
-    pub(crate) async fn release_database_drop_claim_if_owner(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-        epoch: u64,
-        node_id: &str,
-        generation: u64,
-    ) -> Result<()> {
-        let key = self.key(&encode_database_drop_claim_key(keyspace, db_id, epoch));
-        let Some(data) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
-            return Ok(());
-        };
-        let existing = deserialize_database_drop_claim(&data)?;
-        if existing.node_id == node_id && existing.generation == generation {
-            txn_delete(txn, key).await?;
-        }
-        Ok(())
-    }
-
-    async fn database_active_in_txn(&self, txn: &mut Transaction, db_id: u64) -> Result<bool> {
-        let Some(def) = self.get_database_by_id(txn, db_id).await? else {
-            return Ok(false);
-        };
-        Ok(self
-            .get_database_lifecycle(txn, db_id)
-            .await?
-            .unwrap_or_else(|| DatabaseLifecycle::active(db_id, def.created_at))
-            .state
-            .is_active())
-    }
-
-    pub async fn database_active(&self, db_id: u64) -> Result<bool> {
-        #[cfg(test)]
-        if self.client.is_none() {
-            return Ok(true);
-        }
-
-        let mut txn = self.begin_optimistic().await?;
-        let result = self.database_active_in_txn(&mut txn, db_id).await;
-        txn.rollback().await.ok();
-        result
-    }
-
-    pub(crate) async fn database_fencing_epoch(&self, db_id: u64) -> Result<Option<u64>> {
-        let mut txn = self.begin_optimistic().await?;
-        let result = self
-            .get_database_lifecycle(&mut txn, db_id)
-            .await?
-            .filter(|lifecycle| lifecycle.state == DatabaseLifecycleState::Fencing)
-            .map(|lifecycle| lifecycle.epoch);
-        txn.rollback().await.ok();
-        Ok(result)
-    }
-
     /// Look up a database ID in its own short-lived transaction.
     pub async fn lookup_database_id(&self, db_name: &str) -> Result<Option<u64>> {
         let mut txn = self.begin_optimistic().await?;
-        let result = async {
-            let Some(db_id) = self.get_database_id(&mut txn, db_name).await? else {
-                return Ok(None);
-            };
-            if self.database_active_in_txn(&mut txn, db_id).await? {
-                Ok(Some(db_id))
-            } else {
-                Ok(None)
-            }
-        }
-        .await;
+        let result = self.get_database_id(&mut txn, db_name).await;
         if let Err(err) = txn.rollback().await {
             tracing::warn!(
                 "rollback failed after database lookup for '{}': {}",
@@ -693,11 +284,6 @@ impl TikvStore {
                     let data = bincode::serialize(&def)
                         .context("Failed to serialize database definition")?;
                     txn_put(&mut txn, id_key, data).await?;
-                    self.put_database_lifecycle(
-                        &mut txn,
-                        &DatabaseLifecycle::active(db_id, def.created_at),
-                    )
-                    .await?;
 
                     match tikv_op!(txn.commit().await) {
                         Ok(_) => {
@@ -766,10 +352,9 @@ impl TikvStore {
         }
     }
 
-    /// Lock the database metadata/lifecycle rows before committing background writes.
+    /// Lock the database metadata row before committing background writes.
     ///
-    /// DROP DATABASE first moves the lifecycle row out of ACTIVE, then removes
-    /// the database metadata row before destroying the database key range.
+    /// DROP DATABASE removes this row before destroying the database key range.
     /// A worker that writes tenant data after resolving the DB earlier in its
     /// execution must take this lock in the same transaction it is about to
     /// commit; otherwise it can recreate orphan keys after range destruction.
@@ -789,13 +374,13 @@ impl TikvStore {
     }
 
     /// Same liveness fence as `assert_database_alive_for_update`, but reports a
-    /// fencing/dropped database as `Ok(false)` instead of an error.
+    /// dropped database as `Ok(false)` instead of an error.
     ///
     /// Use this when a background re-enqueue must distinguish "the DB was
-    /// dropped, so produce no further work" (return `false` -> caller suppresses
-    /// the enqueue) from a genuine TiKV failure (return `Err` -> caller retries).
-    /// It takes `get_for_update` on both the database row and lifecycle row, so
-    /// the read conflicts with DROP DATABASE fencing just like the assert form.
+    /// dropped, so produce no further work" (return `false` → caller suppresses
+    /// the enqueue) from a genuine TiKV failure (return `Err` → caller retries).
+    /// It still takes `get_for_update` so the read conflicts with DROP DATABASE,
+    /// fencing the enqueue against a concurrent drop just like the assert form.
     pub async fn database_alive_for_update(
         &self,
         txn: &mut Transaction,
@@ -805,64 +390,8 @@ impl TikvStore {
         let Some(data) = tikv_op!(txn.get_for_update(key).await)? else {
             return Ok(false);
         };
-        let def: DatabaseDef =
+        let _: DatabaseDef =
             bincode::deserialize(&data).context("Failed to deserialize database definition")?;
-        Ok(self
-            .get_database_lifecycle_for_update(txn, db_id)
-            .await?
-            .unwrap_or_else(|| DatabaseLifecycle::active(db_id, def.created_at))
-            .state
-            .is_active())
-    }
-
-    async fn mark_database_fencing_for_update(
-        &self,
-        txn: &mut Transaction,
-        def: &DatabaseDef,
-    ) -> Result<DatabaseLifecycle> {
-        let now = now_epoch_ms();
-        let mut lifecycle = self
-            .get_database_lifecycle_for_update(txn, def.id)
-            .await?
-            .unwrap_or_else(|| DatabaseLifecycle::active(def.id, def.created_at));
-        if !lifecycle.state.is_active() {
-            return Err(anyhow!(
-                "database \"{}\" is already being dropped or has been dropped",
-                def.name
-            ));
-        }
-        lifecycle.epoch = lifecycle
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("database lifecycle epoch overflow for db_id {}", def.id))?;
-        lifecycle.state = DatabaseLifecycleState::Fencing;
-        lifecycle.fence_ts_ms = Some(now);
-        lifecycle.drop_started_at_ms = Some(now);
-        self.put_database_lifecycle(txn, &lifecycle).await?;
-        Ok(lifecycle)
-    }
-
-    pub(crate) async fn mark_database_dropped_if_fencing_epoch(
-        &self,
-        db_id: u64,
-        fencing_epoch: u64,
-    ) -> Result<bool> {
-        let mut txn = self.begin().await?;
-        let Some(mut lifecycle) = self
-            .get_database_lifecycle_for_update(&mut txn, db_id)
-            .await?
-        else {
-            txn.rollback().await.ok();
-            return Ok(false);
-        };
-        if lifecycle.state != DatabaseLifecycleState::Fencing || lifecycle.epoch != fencing_epoch {
-            txn.rollback().await.ok();
-            return Ok(false);
-        }
-        lifecycle.state = DatabaseLifecycleState::Dropped;
-        lifecycle.drop_completed_at_ms = Some(now_epoch_ms());
-        self.put_database_lifecycle(&mut txn, &lifecycle).await?;
-        tikv_op!(txn.commit().await)?;
         Ok(true)
     }
 
@@ -882,15 +411,7 @@ impl TikvStore {
             }
             let def: DatabaseDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize database")?;
-            let active = self
-                .get_database_lifecycle(txn, def.id)
-                .await?
-                .unwrap_or_else(|| DatabaseLifecycle::active(def.id, def.created_at))
-                .state
-                .is_active();
-            if active {
-                dbs.push(def);
-            }
+            dbs.push(def);
         }
         Ok(dbs)
     }
@@ -922,28 +443,18 @@ impl TikvStore {
 
         let mut dbs = Vec::new();
         let mut last_key = None;
-        let mut raw_count = 0usize;
         for pair in pairs {
-            raw_count += 1;
             let key: &[u8] = pair.key().as_ref().into();
             if !key.starts_with(&prefix) {
                 continue;
             }
             let def: DatabaseDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize database")?;
-            let active = self
-                .get_database_lifecycle(txn, def.id)
-                .await?
-                .unwrap_or_else(|| DatabaseLifecycle::active(def.id, def.created_at))
-                .state
-                .is_active();
-            if active {
-                dbs.push(def);
-            }
+            dbs.push(def);
             last_key = Some(key.to_vec());
         }
 
-        let next_cursor = if raw_count == limit { last_key } else { None };
+        let next_cursor = if dbs.len() == limit { last_key } else { None };
         Ok((dbs, next_cursor))
     }
 
@@ -973,8 +484,6 @@ impl TikvStore {
         let id_key = self.key(&encode_database_id_key(db_id));
         let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
         txn_put(txn, id_key, data).await?;
-        self.put_database_lifecycle(txn, &DatabaseLifecycle::active(db_id, def.created_at))
-            .await?;
 
         info!("Created database '{}' with ID {}", name, db_id);
         Ok(Some(def))
@@ -992,7 +501,7 @@ impl TikvStore {
         db_name: &str,
         if_exists: bool,
         current_database_id: u64,
-    ) -> Result<Option<DroppedDatabaseMetadata>> {
+    ) -> Result<Option<(u64, crate::sql::session::db_connections::DroppingGuard)>> {
         if db_name.eq_ignore_ascii_case("postgres")
             || db_name.eq_ignore_ascii_case("template0")
             || db_name.eq_ignore_ascii_case("template1")
@@ -1024,11 +533,6 @@ impl TikvStore {
             return Err(anyhow!("cannot drop the currently open database"));
         }
 
-        let def = self
-            .get_database_by_id(txn, db_id)
-            .await?
-            .ok_or_else(|| anyhow!("database \"{}\" metadata is inconsistent", db_name))?;
-
         // PostgreSQL 55006: atomically check no other sessions are connected
         // AND mark the database as "dropping" to block new connections.
         // The Mutex in the registry ensures no window between check and mark.
@@ -1036,23 +540,17 @@ impl TikvStore {
             .try_mark_dropping(self.keyspace().unwrap_or("default"), db_id)
             .map_err(|count| crate::sql::error::SqlError::ObjectInUse {
                 message: format!(
-                    "database \"{}\" is being accessed by {} other session(s) or operation(s)",
+                    "database \"{}\" is being accessed by {} other user(s)",
                     db_name, count
                 ),
             })?;
-
-        let lifecycle = self.mark_database_fencing_for_update(txn, &def).await?;
 
         txn_delete(txn, name_key).await?;
 
         let id_key = self.key(&encode_database_id_key(db_id));
         txn_delete(txn, id_key).await?;
 
-        Ok(Some(DroppedDatabaseMetadata {
-            db_id,
-            fencing_epoch: lifecycle.epoch,
-            dropping_guard,
-        }))
+        Ok(Some((db_id, dropping_guard)))
     }
 
     /// Rename a database (storage format v2).
@@ -1090,9 +588,6 @@ impl TikvStore {
 
         if db_id == current_database_id {
             return Err(anyhow!("cannot rename the currently open database"));
-        }
-        if !self.database_alive_for_update(txn, db_id).await? {
-            return Err(anyhow!("database \"{}\" is being dropped", old_name));
         }
 
         let new_key = self.key(&encode_database_name_key(new_name));
@@ -1133,9 +628,6 @@ impl TikvStore {
             }
             None => return Err(anyhow!("database \"{}\" does not exist", db_name)),
         };
-        if !self.database_alive_for_update(txn, db_id).await? {
-            return Err(anyhow!("database \"{}\" is being dropped", db_name));
-        }
 
         let id_key = self.key(&encode_database_id_key(db_id));
         let mut def = self
@@ -1310,121 +802,13 @@ mod tests {
         assert!(!tikv_error_contains_write_conflict(&err));
     }
 
-    #[test]
-    fn database_lifecycle_codec_is_versioned() {
-        let lifecycle = DatabaseLifecycle::active(42, 1234);
-        let data = serialize_database_lifecycle(&lifecycle).expect("serialize lifecycle");
-        assert_eq!(data.first().copied(), Some(DATABASE_LIFECYCLE_FORMAT_V1));
-        let decoded = deserialize_database_lifecycle(&data).expect("decode lifecycle");
-        assert_eq!(decoded, lifecycle);
-
-        let mut unknown = data;
-        unknown[0] = DATABASE_LIFECYCLE_FORMAT_V1 + 1;
-        let err = deserialize_database_lifecycle(&unknown).expect_err("unknown version rejected");
-        assert!(
-            err.to_string()
-                .contains("unknown database lifecycle format"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn database_node_lease_codec_and_guard_math_are_versioned() {
-        let lease = DatabaseNodeLease {
-            node_id: "node-a".to_string(),
-            generation: 9,
-            lease_until_ms: 10_000,
-            published_at_ms: 9_000,
-            accepts_sql: true,
-        };
-        let data = serialize_database_node_lease(&lease).expect("serialize node lease");
-        assert_eq!(data.first().copied(), Some(DATABASE_NODE_LEASE_FORMAT_V1));
-        let decoded = deserialize_database_node_lease(&data).expect("decode node lease");
-        assert_eq!(decoded, lease);
-
-        assert_eq!(lease.self_fence_deadline_ms(250), 9_750);
-        assert_eq!(lease.live_until_with_guard_ms(250), 10_250);
-        assert!(lease.is_live_at_ms(10_249, 250));
-        assert!(!lease.is_live_at_ms(10_250, 250));
-
-        let mut unknown = data;
-        unknown[0] = DATABASE_NODE_LEASE_FORMAT_V1 + 1;
-        let err = deserialize_database_node_lease(&unknown).expect_err("unknown version rejected");
-        assert!(
-            err.to_string()
-                .contains("unknown database node lease format"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn database_drain_state_codec_and_completion_rule_are_versioned() {
-        let mut state = DatabaseDrainState {
-            keyspace: "tenant-a".to_string(),
-            db_id: 42,
-            epoch: 3,
-            node_id: "node-a".to_string(),
-            generation: 9,
-            observed_at_ms: 10_100,
-            active_old_epoch_ops: 1,
-            drained: true,
-        };
-        assert!(
-            !state.is_drained(),
-            "active old-epoch work means the node is not drained yet"
-        );
-
-        state.active_old_epoch_ops = 0;
-        assert!(state.is_drained());
-
-        let data = serialize_database_drain_state(&state).expect("serialize drain state");
-        assert_eq!(data.first().copied(), Some(DATABASE_DRAIN_STATE_FORMAT_V1));
-        let decoded = deserialize_database_drain_state(&data).expect("decode drain state");
-        assert_eq!(decoded, state);
-
-        let mut unknown = data;
-        unknown[0] = DATABASE_DRAIN_STATE_FORMAT_V1 + 1;
-        let err = deserialize_database_drain_state(&unknown).expect_err("unknown version rejected");
-        assert!(
-            err.to_string()
-                .contains("unknown database drain state format"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn database_drop_claim_codec_and_claim_rules_are_versioned() {
-        let claim = DatabaseDropClaim {
-            keyspace: "tenant-a".to_string(),
-            db_id: 42,
-            epoch: 3,
-            node_id: "node-a".to_string(),
-            generation: 9,
-            claimed_at_ms: 10_000,
-            lease_until_ms: 40_000,
-        };
-        let data = serialize_database_drop_claim(&claim).expect("serialize drop claim");
-        assert_eq!(data.first().copied(), Some(DATABASE_DROP_CLAIM_FORMAT_V1));
-        let decoded = deserialize_database_drop_claim(&data).expect("decode drop claim");
-        assert_eq!(decoded, claim);
-
-        let mut unknown = data;
-        unknown[0] = DATABASE_DROP_CLAIM_FORMAT_V1 + 1;
-        let err = deserialize_database_drop_claim(&unknown).expect_err("unknown version rejected");
-        assert!(
-            err.to_string().contains("unknown database drop claim"),
-            "unexpected error: {err}"
-        );
-    }
-
     // ── Liveness fence behavior (#2: dropped-DB enqueue suppression) ─────────
     //
     // TiKV-backed; run with a reachable PD cluster (CI integration-tests job).
-    // Drives all database liveness branches: a live DB row with ACTIVE or
-    // legacy-missing lifecycle yields Ok(true); a FENCING lifecycle yields
-    // Ok(false) even while the DB row still exists; after the metadata row is
-    // deleted it also yields Ok(false) — NOT an Err — so background re-enqueue
-    // call sites can suppress work for a dropped DB.
+    // Drives BOTH branches of `database_alive_for_update`: a live DB row yields
+    // Ok(true); after the metadata row is deleted (exactly what DROP DATABASE
+    // does before destroying the data range) it yields Ok(false) — NOT an Err —
+    // so background re-enqueue call sites can suppress work for a dropped DB.
 
     async fn liveness_test_store(tag: &str) -> TikvStore {
         let pd_endpoints = std::env::var("PD_ENDPOINTS")
@@ -1478,30 +862,6 @@ mod tests {
                 .await
                 .expect("alive check must not error for a live DB");
             assert!(alive, "live DB metadata row must report alive == true");
-            txn.rollback().await.ok();
-        }
-
-        // FENCING lifecycle while the DB metadata row still exists → Ok(false).
-        {
-            let mut txn = store.begin().await.expect("begin");
-            let mut lifecycle = DatabaseLifecycle::active(db_id, 1234);
-            lifecycle.state = DatabaseLifecycleState::Fencing;
-            lifecycle.epoch = 2;
-            lifecycle.fence_ts_ms = Some(1235);
-            lifecycle.drop_started_at_ms = Some(1235);
-            store
-                .put_database_lifecycle(&mut txn, &lifecycle)
-                .await
-                .expect("put fencing lifecycle");
-            txn.commit().await.expect("commit");
-        }
-        {
-            let mut txn = store.begin().await.expect("begin");
-            let alive = store
-                .database_alive_for_update(&mut txn, db_id)
-                .await
-                .expect("fencing check must not error");
-            assert!(!alive, "FENCING DB lifecycle must report alive == false");
             txn.rollback().await.ok();
         }
 

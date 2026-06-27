@@ -160,12 +160,35 @@ impl Executor {
             rows = sorted_rows;
         }
 
-        // UPDATE must lock each matched snapshot row before computing SET
-        // values, and reject if TiKV observes a committed version newer than
-        // this transaction's start timestamp. The exact-key lock primitive
-        // treats rows already locked or written by this same transaction as
-        // local, preserving savepoint/read-your-writes behavior without
-        // skipping checks for unrelated rows in the same table.
+        // Refresh target rows via TiKV's read+lock path before evaluating the
+        // update. A plain lock acquired after the initial scan is insufficient:
+        // it prevents later writers from overtaking us, but we would still
+        // compute new values from a stale pre-lock snapshot (`read old value,
+        // then unconditional upsert`), which silently loses updates under
+        // concurrency. Re-reading under `batch_get_for_update` closes that
+        // gap and gives us the latest committed row image in deterministic PK
+        // order.
+        let txn_dirty_tables = crate::session_context::current_txn_dirty_table_ids();
+        let statement_dirty_tables = crate::session_context::current_statement_dirty_table_ids();
+        let table_dirty_in_txn = txn_dirty_tables.contains(&schema.table_id)
+            || statement_dirty_tables.contains(&schema.table_id);
+
+        if !rows.is_empty() && !table_dirty_in_txn {
+            let pk_list: Vec<Vec<Value>> = rows.iter().map(|r| schema.get_pk_values(r)).collect();
+            rows = self
+                .store()
+                .batch_get_rows_for_update(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    pk_list,
+                    &schema,
+                    qctx.lock_timeout,
+                )
+                .await?;
+            rows = fill_fetched_rows(rows, &schema)?;
+            append_ctid_to_rows(&mut rows);
+        }
 
         // Check whether BEFORE UPDATE triggers exist.  When they do,
         // we must execute per-row (triggers can veto, mutate, or query
@@ -247,16 +270,6 @@ impl Executor {
                         continue;
                     }
                 }
-
-                self.store()
-                    .lock_rows_current_and_check_not_newer_than(
-                        txn,
-                        db_id,
-                        schema.table_id,
-                        vec![schema.get_pk_values(r)],
-                        qctx.lock_timeout,
-                    )
-                    .await?;
 
                 let mut new_vals = r.values[..schema.columns.len()].to_vec();
                 for (col_idx, ref typed_expr) in &upd.assignments {
@@ -386,7 +399,7 @@ impl Executor {
             let mut all_delete_keys: Vec<Vec<u8>> = Vec::new();
             let mut all_new_btree_entries: Vec<BatchIndexEntry> = Vec::new();
             let mut all_new_gin_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let mut all_new_data_mutations: Vec<BatchMutation> = Vec::new();
+            let mut all_new_data_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
             // Track PK changes within the batch to handle PK-shifting
             // UPDATEs (e.g. `UPDATE t SET id = id - 1`).  Without this,
@@ -462,16 +475,6 @@ impl Executor {
                         continue;
                     }
                 }
-
-                self.store()
-                    .lock_rows_current_and_check_not_newer_than(
-                        txn,
-                        db_id,
-                        schema.table_id,
-                        vec![schema.get_pk_values(r)],
-                        qctx.lock_timeout,
-                    )
-                    .await?;
 
                 // Compute new row values (SET assignments + coercion).
                 let mut new_vals = r.values[..schema.columns.len()].to_vec();
@@ -556,7 +559,6 @@ impl Executor {
                 let old_pks = schema.get_pk_values(&old_row_stripped);
                 let new_pks = schema.get_pk_values(&new_row);
                 let pk_changed = old_pks != new_pks;
-                let mut new_data_key_requires_insert = false;
 
                 // PK collision check with intra-batch tracking.
                 //
@@ -567,7 +569,6 @@ impl Executor {
                 //  3. New PK exists in TiKV and is NOT being vacated → real collision
                 if pk_changed {
                     let new_pk_key = crate::storage::encode_pk_values(&new_pks);
-                    let new_pk_being_vacated = vacated_pks.contains(&new_pk_key);
 
                     // Case 1: intra-batch duplicate new PK.
                     if !claimed_new_pks.insert(new_pk_key.clone()) {
@@ -598,7 +599,7 @@ impl Executor {
 
                     // Cases 2 & 3: check TiKV unless another row in the
                     // batch is vacating this PK.
-                    if !new_pk_being_vacated {
+                    if !vacated_pks.contains(&new_pk_key) {
                         let existing = self
                             .store()
                             .batch_get_rows(
@@ -633,9 +634,8 @@ impl Executor {
                                 ),
                                 row_offset: None,
                             }
-                                .into());
+                            .into());
                         }
-                        new_data_key_requires_insert = true;
                     }
 
                     // Track this row's old PK as vacated.
@@ -686,12 +686,7 @@ impl Executor {
                     &new_pks,
                     &new_row,
                 )?;
-                let (data_key, data_value) = data_mutation;
-                if new_data_key_requires_insert {
-                    all_new_data_mutations.push(BatchMutation::Insert(data_key, data_value));
-                } else {
-                    all_new_data_mutations.push(BatchMutation::Put(data_key, data_value));
-                }
+                all_new_data_mutations.push(data_mutation);
 
                 // Track for HNSW, FK cascade, AFTER triggers, RETURNING.
                 if has_hnsw {
@@ -715,7 +710,7 @@ impl Executor {
             // On remaining conflicts, attempt resolve_unique_index_conflict
             // (handles stale entries), same as per-row path.
             let old_delete_key_set: HashSet<Vec<u8>> = all_delete_keys.iter().cloned().collect();
-            let mut index_kv_mutations: Vec<BatchMutation> = Vec::new();
+            let mut index_kv_mutations: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             if !all_new_btree_entries.is_empty() {
                 let mut pending = all_new_btree_entries;
                 loop {
@@ -806,8 +801,12 @@ impl Executor {
             for key in all_delete_keys {
                 all_mutations.push(BatchMutation::Delete(key));
             }
-            all_mutations.extend(all_new_data_mutations);
-            all_mutations.extend(index_kv_mutations);
+            for (key, value) in all_new_data_mutations {
+                all_mutations.push(BatchMutation::Put(key, value));
+            }
+            for (key, value) in index_kv_mutations {
+                all_mutations.push(BatchMutation::Put(key, value));
+            }
             for (key, value) in all_new_gin_mutations {
                 all_mutations.push(BatchMutation::Put(key, value));
             }
@@ -815,11 +814,7 @@ impl Executor {
             if !all_mutations.is_empty() {
                 // Sort by key bytes for deterministic chunk ordering,
                 // preventing deadlocks between concurrent batch ops.
-                all_mutations.sort_by(|a, b| {
-                    a.key()
-                        .cmp(b.key())
-                        .then_with(|| a.same_key_order().cmp(&b.same_key_order()))
-                });
+                all_mutations.sort_by(|a, b| a.key().cmp(b.key()));
                 crate::txn::txn_batch_mutate_mixed(txn, all_mutations).await?;
             }
 

@@ -25,6 +25,8 @@
 //! step is the only `.await` between caller intent and the RPC, so
 //! statement timeouts remain crisp.
 
+#![cfg(fsplane_v2_generated)]
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};

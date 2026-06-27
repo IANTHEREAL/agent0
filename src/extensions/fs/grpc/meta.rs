@@ -11,6 +11,8 @@
 //!   so downstream CAS checks (when they arrive) see the whole token;
 //!   callers MUST NOT decompose it (DESIGN.md §FileMeta.version).
 
+#![cfg(fsplane_v2_generated)]
+
 use crate::extensions::fs::backend::FsFileInfo;
 use crate::extensions::fs::grpc::proto::FileMeta;
 

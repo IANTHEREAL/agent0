@@ -382,16 +382,6 @@ impl Executor {
                                     }
                                 }
 
-                                self.store()
-                                    .lock_rows_current_and_check_not_newer_than(
-                                        txn,
-                                        db_id,
-                                        schema.table_id,
-                                        vec![existing_pk.clone()],
-                                        qctx.lock_timeout,
-                                    )
-                                    .await?;
-
                                 // Evaluate SET expressions.
                                 let mut updated_vals = existing_row.values.clone();
                                 for (col_idx, ref typed_expr) in assignments {
