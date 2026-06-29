@@ -34,6 +34,11 @@ const DEFAULT_STORAGE_SCAN_JITTER_SEC: u64 = 300;
 const DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS: u64 = 100;
 const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
+const DEFAULT_GC_REGISTRY_KEYSPACE: &str = "";
+const DEFAULT_DB_LIFECYCLE_KEYSPACE: &str = "";
+const DEFAULT_BG_KEYSPACE: &str = "";
+const DEFAULT_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC: u64 = 300;
+const MIN_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC: u64 = 30;
 
 // GC safepoint defaults — controls TiKV MVCC version cleanup.
 // Without periodic safepoint advancement, TiKV never GCs old MVCC versions,
@@ -46,6 +51,58 @@ const MIN_GC_SAFEPOINT_INTERVAL_SEC: u64 = 30;
 // via ActiveTxnRegistry; gc_life_time is not a timeout surrogate.
 const DEFAULT_GC_LIFE_TIME_SEC: u64 = 86400;
 const MIN_GC_LIFE_TIME_SEC: u64 = 600; // TiDB enforces minimum 10 minutes
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcRegistryMode {
+    Legacy,
+    Migrating,
+    New,
+}
+
+impl GcRegistryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Migrating => "migrating",
+            Self::New => "new",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(Self::Legacy),
+            "migrating" => Some(Self::Migrating),
+            "new" => Some(Self::New),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbLifecycleMode {
+    Legacy,
+    Migrating,
+    Fenced,
+}
+
+impl DbLifecycleMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Migrating => "migrating",
+            Self::Fenced => "fenced",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(Self::Legacy),
+            "migrating" => Some(Self::Migrating),
+            "fenced" => Some(Self::Fenced),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -74,7 +131,39 @@ pub struct WorkerConfig {
     pub storage_scan_jitter_sec: u64,
     pub storage_scan_pd_rate_limit_ms: u64,
     pub registry_reconcile_batch_size: usize,
+    /// Legacy worker/background keyspace. During Phase 0 all domain-specific
+    /// keyspaces alias this value unless explicitly overridden.
     pub system_keyspace: String,
+    /// Core GC registry keyspace. Startup GC publish is fail-fast against this
+    /// domain, which may later move physically away from `_sys_worker`.
+    ///
+    /// Empty means "inherit `system_keyspace`"; any non-empty value is an
+    /// explicit operator override, including `_sys_worker`.
+    pub gc_registry_keyspace: String,
+    /// Core DB lifecycle keyspace. Tenant incarnation, node lifecycle, and
+    /// drop/create correctness move here in Phase 2.
+    ///
+    /// Empty means "inherit `system_keyspace`"; any non-empty value is an
+    /// explicit operator override, including `_sys_worker`.
+    pub db_lifecycle_keyspace: String,
+    /// DB lifecycle migration mode. Legacy aliases the worker system keyspace.
+    /// Migrating physically writes lifecycle rows to `DB9_DB_LIFECYCLE_KEYSPACE`
+    /// while readers still tolerate pre-fence tenants with missing stamps.
+    /// Fenced is reserved until a durable cluster/version gate proves every
+    /// CREATE/DROP writer stamps tenant incarnation before visibility.
+    pub db_lifecycle_mode: DbLifecycleMode,
+    /// Interval for publishing this process's DB lifecycle process liveness.
+    /// In migrating mode this runs against the dedicated Core lifecycle keyspace.
+    pub db_lifecycle_publish_interval_sec: u64,
+    /// Degradable background/legacy worker keyspace.
+    ///
+    /// Empty means "inherit `system_keyspace`"; any non-empty value is an
+    /// explicit operator override, including `_sys_worker`.
+    pub bg_keyspace: String,
+    /// GC registry migration mode. Legacy reads/writes the worker system
+    /// keyspace; Migrating dual-writes and union-reads legacy + new; New
+    /// reads/writes only the dedicated Core GC keyspace.
+    pub gc_registry_mode: GcRegistryMode,
 
     // TiKV MVCC GC safepoint advancement
     pub gc_safepoint_enabled: bool,
@@ -112,6 +201,12 @@ impl Default for WorkerConfig {
             storage_scan_pd_rate_limit_ms: DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS,
             registry_reconcile_batch_size: DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
+            gc_registry_keyspace: DEFAULT_GC_REGISTRY_KEYSPACE.to_string(),
+            db_lifecycle_keyspace: DEFAULT_DB_LIFECYCLE_KEYSPACE.to_string(),
+            db_lifecycle_mode: DbLifecycleMode::Legacy,
+            db_lifecycle_publish_interval_sec: DEFAULT_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC,
+            bg_keyspace: DEFAULT_BG_KEYSPACE.to_string(),
+            gc_registry_mode: GcRegistryMode::Legacy,
 
             gc_safepoint_enabled: DEFAULT_GC_SAFEPOINT_ENABLED,
             gc_safepoint_interval_sec: DEFAULT_GC_SAFEPOINT_INTERVAL_SEC,
@@ -422,6 +517,61 @@ impl WorkerConfig {
         if let Ok(v) = env::var("DB9_WORKER_SYSTEM_KEYSPACE") {
             cfg.system_keyspace = v;
         }
+        if let Ok(v) = env::var("DB9_GC_REGISTRY_KEYSPACE") {
+            cfg.gc_registry_keyspace = v;
+        }
+        if let Ok(v) = env::var("DB9_DB_LIFECYCLE_KEYSPACE") {
+            cfg.db_lifecycle_keyspace = v;
+        }
+        if let Ok(v) = env::var("DB9_DB_LIFECYCLE_MODE") {
+            match DbLifecycleMode::parse(&v) {
+                Some(mode) => cfg.db_lifecycle_mode = mode,
+                None => {
+                    tracing::warn!(
+                        "DB9_DB_LIFECYCLE_MODE='{}' is not one of legacy|migrating|fenced; using legacy",
+                        v
+                    );
+                    cfg.db_lifecycle_mode = DbLifecycleMode::Legacy;
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC => {
+                    cfg.db_lifecycle_publish_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC,
+                        cfg.db_lifecycle_publish_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.db_lifecycle_publish_interval_sec
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_BG_KEYSPACE") {
+            cfg.bg_keyspace = v;
+        }
+        if let Ok(v) = env::var("DB9_GC_REGISTRY_MODE") {
+            match GcRegistryMode::parse(&v) {
+                Some(mode) => cfg.gc_registry_mode = mode,
+                None => {
+                    tracing::warn!(
+                        "DB9_GC_REGISTRY_MODE='{}' is not one of legacy|migrating|new; using legacy",
+                        v
+                    );
+                    cfg.gc_registry_mode = GcRegistryMode::Legacy;
+                }
+            }
+        }
 
         // GC safepoint configuration
         if let Ok(v) = env::var("DB9_GC_SAFEPOINT_ENABLED") {
@@ -505,6 +655,108 @@ impl WorkerConfig {
             );
         }
     }
+
+    pub fn domains_alias_legacy_system_keyspace(&self) -> bool {
+        self.effective_gc_registry_keyspace() == self.system_keyspace
+            && self.effective_db_lifecycle_keyspace() == self.system_keyspace
+            && self.effective_bg_keyspace() == self.system_keyspace
+    }
+
+    pub fn validate_worker_domain_config(&self) -> Result<(), String> {
+        let bg_keyspace = self.effective_bg_keyspace();
+        let gc_keyspace = self.effective_gc_registry_keyspace();
+        let lifecycle_keyspace = self.effective_db_lifecycle_keyspace();
+
+        if bg_keyspace != self.system_keyspace {
+            if bg_keyspace == gc_keyspace || bg_keyspace == lifecycle_keyspace {
+                return Err(format!(
+                    "DB9_BG_KEYSPACE='{}' must be physically separate from Core domains \
+                     (gc='{}', lifecycle='{}'). _sys_bg is degradable and must not alias \
+                     startup-critical metadata.",
+                    bg_keyspace, gc_keyspace, lifecycle_keyspace
+                ));
+            }
+            return Err(format!(
+                "DB9_BG_KEYSPACE split is not enabled yet. Legacy V2 worker queue execution \
+                 and DROP fencing still require DB9_BG_KEYSPACE to resolve to \
+                 DB9_WORKER_SYSTEM_KEYSPACE='{}' (got '{}'). Keep DB9_BG_KEYSPACE unset \
+                 until the BG ledger/dispatcher migration lands.",
+                self.system_keyspace, bg_keyspace
+            ));
+        }
+
+        match self.db_lifecycle_mode {
+            DbLifecycleMode::Legacy if lifecycle_keyspace != self.system_keyspace => {
+                return Err(format!(
+                    "DB9_DB_LIFECYCLE_MODE=legacy requires DB9_DB_LIFECYCLE_KEYSPACE \
+                     to resolve to DB9_WORKER_SYSTEM_KEYSPACE='{}' (got '{}'). \
+                     Use DB9_DB_LIFECYCLE_MODE=migrating for the Phase 2 physical split.",
+                    self.system_keyspace, lifecycle_keyspace
+                ));
+            }
+            DbLifecycleMode::Migrating if lifecycle_keyspace == self.system_keyspace => {
+                return Err(format!(
+                    "DB9_DB_LIFECYCLE_MODE=migrating requires DB9_DB_LIFECYCLE_KEYSPACE \
+                     to point at a distinct Core lifecycle keyspace, not the legacy \
+                     worker keyspace '{}'.",
+                    self.system_keyspace
+                ));
+            }
+            DbLifecycleMode::Fenced => {
+                return Err(
+                    "DB9_DB_LIFECYCLE_MODE=fenced is not enabled yet. Incarnation-fenced \
+                     lifecycle reads require a durable cluster/version gate proving every \
+                     CREATE/DROP DATABASE writer allocates and stamps tenant incarnation \
+                     before visibility; use migrating until that gate exists."
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        match self.gc_registry_mode {
+            GcRegistryMode::New => Err(
+                "DB9_GC_REGISTRY_MODE=new is not enabled yet. New-only GC registry reads \
+                 require a durable cluster/version gate proving every live SQL-serving \
+                 process publishes to the dedicated Core GC registry; use migrating until \
+                 that gate exists."
+                    .to_string(),
+            ),
+            GcRegistryMode::Legacy if gc_keyspace != self.system_keyspace => Err(format!(
+                "DB9_GC_REGISTRY_MODE=legacy requires DB9_GC_REGISTRY_KEYSPACE to resolve \
+                 to DB9_WORKER_SYSTEM_KEYSPACE='{}' (got '{}'). Use migrating for \
+                 the GC registry migration.",
+                self.system_keyspace, gc_keyspace
+            )),
+            GcRegistryMode::Migrating if gc_keyspace == self.system_keyspace => Err(format!(
+                "DB9_GC_REGISTRY_MODE={} requires DB9_GC_REGISTRY_KEYSPACE to point \
+                     at a distinct GC registry keyspace, not the legacy worker keyspace '{}'.",
+                self.gc_registry_mode.as_str(),
+                self.system_keyspace
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn effective_gc_registry_keyspace(&self) -> &str {
+        self.effective_domain_keyspace(&self.gc_registry_keyspace)
+    }
+
+    pub fn effective_db_lifecycle_keyspace(&self) -> &str {
+        self.effective_domain_keyspace(&self.db_lifecycle_keyspace)
+    }
+
+    pub fn effective_bg_keyspace(&self) -> &str {
+        self.effective_domain_keyspace(&self.bg_keyspace)
+    }
+
+    fn effective_domain_keyspace<'a>(&'a self, domain_keyspace: &'a str) -> &'a str {
+        if domain_keyspace.is_empty() {
+            &self.system_keyspace
+        } else {
+            domain_keyspace
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +797,12 @@ mod tests {
             "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS",
             "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE",
             "DB9_WORKER_SYSTEM_KEYSPACE",
+            "DB9_GC_REGISTRY_KEYSPACE",
+            "DB9_DB_LIFECYCLE_KEYSPACE",
+            "DB9_DB_LIFECYCLE_MODE",
+            "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC",
+            "DB9_BG_KEYSPACE",
+            "DB9_GC_REGISTRY_MODE",
         ];
 
         let saved: Vec<(String, Option<String>)> = keys
@@ -592,12 +850,279 @@ mod tests {
             DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE
         );
         assert_eq!(cfg.system_keyspace, DEFAULT_SYSTEM_KEYSPACE);
+        assert_eq!(cfg.gc_registry_keyspace, DEFAULT_GC_REGISTRY_KEYSPACE);
+        assert_eq!(cfg.db_lifecycle_keyspace, DEFAULT_DB_LIFECYCLE_KEYSPACE);
+        assert_eq!(cfg.db_lifecycle_mode, DbLifecycleMode::Legacy);
+        assert_eq!(
+            cfg.db_lifecycle_publish_interval_sec,
+            DEFAULT_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC
+        );
+        assert_eq!(cfg.bg_keyspace, DEFAULT_BG_KEYSPACE);
+        assert_eq!(cfg.gc_registry_mode, GcRegistryMode::Legacy);
+        assert_eq!(
+            cfg.effective_gc_registry_keyspace(),
+            DEFAULT_SYSTEM_KEYSPACE
+        );
+        assert_eq!(
+            cfg.effective_db_lifecycle_keyspace(),
+            DEFAULT_SYSTEM_KEYSPACE
+        );
+        assert_eq!(cfg.effective_bg_keyspace(), DEFAULT_SYSTEM_KEYSPACE);
+        assert!(cfg.domains_alias_legacy_system_keyspace());
 
         for (key, value) in saved {
             match value {
                 Some(v) => unsafe { env::set_var(key, v) },
                 None => unsafe { env::remove_var(key) },
             }
+        }
+    }
+
+    #[test]
+    fn from_env_splits_domain_keyspaces_with_legacy_alias_default() {
+        let _guard = test_lock().lock();
+
+        let keys = [
+            "DB9_WORKER_SYSTEM_KEYSPACE",
+            "DB9_GC_REGISTRY_KEYSPACE",
+            "DB9_DB_LIFECYCLE_KEYSPACE",
+            "DB9_DB_LIFECYCLE_MODE",
+            "DB9_BG_KEYSPACE",
+            "DB9_GC_REGISTRY_MODE",
+        ];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), env::var(k).ok()))
+            .collect();
+
+        unsafe {
+            env::set_var("DB9_WORKER_SYSTEM_KEYSPACE", "_sys_worker_custom");
+            env::set_var("DB9_GC_REGISTRY_KEYSPACE", "_sys_gc_registry_custom");
+            env::set_var("DB9_DB_LIFECYCLE_KEYSPACE", "_sys_db_lifecycle_custom");
+            env::set_var("DB9_DB_LIFECYCLE_MODE", "migrating");
+            env::set_var("DB9_BG_KEYSPACE", "_sys_bg_custom");
+            env::set_var("DB9_GC_REGISTRY_MODE", "migrating");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.system_keyspace, "_sys_worker_custom");
+        assert_eq!(cfg.gc_registry_keyspace, "_sys_gc_registry_custom");
+        assert_eq!(cfg.db_lifecycle_keyspace, "_sys_db_lifecycle_custom");
+        assert_eq!(cfg.db_lifecycle_mode, DbLifecycleMode::Migrating);
+        assert_eq!(cfg.bg_keyspace, "_sys_bg_custom");
+        assert_eq!(
+            cfg.effective_gc_registry_keyspace(),
+            "_sys_gc_registry_custom"
+        );
+        assert_eq!(
+            cfg.effective_db_lifecycle_keyspace(),
+            "_sys_db_lifecycle_custom"
+        );
+        assert_eq!(cfg.effective_bg_keyspace(), "_sys_bg_custom");
+        assert_eq!(cfg.gc_registry_mode, GcRegistryMode::Migrating);
+        assert!(!cfg.domains_alias_legacy_system_keyspace());
+
+        for (key, value) in saved {
+            match value {
+                Some(v) => unsafe { env::set_var(key, v) },
+                None => unsafe { env::remove_var(key) },
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_system_keyspace_override_keeps_domains_aliased_by_default() {
+        let cfg = WorkerConfig {
+            system_keyspace: "_sys_worker_test_alias".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.effective_gc_registry_keyspace(),
+            "_sys_worker_test_alias"
+        );
+        assert_eq!(
+            cfg.effective_db_lifecycle_keyspace(),
+            "_sys_worker_test_alias"
+        );
+        assert_eq!(cfg.effective_bg_keyspace(), "_sys_worker_test_alias");
+        assert!(cfg.domains_alias_legacy_system_keyspace());
+        assert!(cfg.validate_worker_domain_config().is_ok());
+    }
+
+    #[test]
+    fn explicit_default_keyspace_override_is_not_treated_as_alias_sentinel() {
+        let cfg = WorkerConfig {
+            system_keyspace: "_sys_bg_custom".to_string(),
+            gc_registry_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
+            db_lifecycle_keyspace: "_sys_bg_custom".to_string(),
+            bg_keyspace: "_sys_bg_custom".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.effective_gc_registry_keyspace(),
+            DEFAULT_SYSTEM_KEYSPACE
+        );
+        assert_eq!(cfg.effective_db_lifecycle_keyspace(), "_sys_bg_custom");
+        assert_eq!(cfg.effective_bg_keyspace(), "_sys_bg_custom");
+        assert!(!cfg.domains_alias_legacy_system_keyspace());
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_gc_split_without_migration_mode() {
+        let cfg = WorkerConfig {
+            gc_registry_keyspace: "_sys_gc_registry_test".to_string(),
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("legacy mode must reject GC split");
+        assert!(err.contains("DB9_GC_REGISTRY_MODE=legacy"));
+    }
+
+    #[test]
+    fn worker_domain_validation_allows_gc_migrating_split_only() {
+        let cfg = WorkerConfig {
+            gc_registry_keyspace: "_sys_gc_registry_test".to_string(),
+            gc_registry_mode: GcRegistryMode::Migrating,
+            ..Default::default()
+        };
+
+        assert!(cfg.validate_worker_domain_config().is_ok());
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_gc_new_only_until_cluster_gate() {
+        let cfg = WorkerConfig {
+            gc_registry_keyspace: "_sys_gc_registry_test".to_string(),
+            gc_registry_mode: GcRegistryMode::New,
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("new-only mode must wait for the cluster/version gate");
+        assert!(err.contains("DB9_GC_REGISTRY_MODE=new is not enabled yet"));
+        assert!(err.contains("durable cluster/version gate"));
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_gc_new_alias_to_legacy_worker() {
+        let cfg = WorkerConfig {
+            gc_registry_mode: GcRegistryMode::New,
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("new-only mode must wait for the cluster/version gate");
+        assert!(err.contains("DB9_GC_REGISTRY_MODE=new is not enabled yet"));
+        assert!(err.contains("durable cluster/version gate"));
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_bg_split_until_bg_ledger_lands() {
+        let cfg = WorkerConfig {
+            bg_keyspace: "_sys_bg_test".to_string(),
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("BG split must wait for the BG ledger/dispatcher migration");
+        assert!(err.contains("DB9_BG_KEYSPACE split is not enabled yet"));
+        assert!(err.contains("Legacy V2 worker queue execution"));
+        assert!(err.contains("BG ledger/dispatcher migration"));
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_bg_alias_to_split_core_domain() {
+        let cfg = WorkerConfig {
+            bg_keyspace: "_sys_gc_registry_test".to_string(),
+            gc_registry_keyspace: "_sys_gc_registry_test".to_string(),
+            gc_registry_mode: GcRegistryMode::Migrating,
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("BG must not alias a split Core keyspace");
+        assert!(err.contains("DB9_BG_KEYSPACE"));
+        assert!(err.contains("physically separate from Core domains"));
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_lifecycle_split_without_migrating_mode() {
+        let cfg = WorkerConfig {
+            db_lifecycle_keyspace: "_sys_db_lifecycle_test".to_string(),
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("DB lifecycle split must opt into migrating mode");
+        assert!(err.contains("DB9_DB_LIFECYCLE_MODE=legacy"));
+    }
+
+    #[test]
+    fn worker_domain_validation_allows_lifecycle_migrating_split() {
+        let cfg = WorkerConfig {
+            db_lifecycle_keyspace: "_sys_db_lifecycle_test".to_string(),
+            db_lifecycle_mode: DbLifecycleMode::Migrating,
+            ..Default::default()
+        };
+
+        assert!(cfg.validate_worker_domain_config().is_ok());
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_lifecycle_migrating_alias() {
+        let cfg = WorkerConfig {
+            db_lifecycle_mode: DbLifecycleMode::Migrating,
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("migrating mode must physically split lifecycle keyspace");
+        assert!(err.contains("DB9_DB_LIFECYCLE_MODE=migrating"));
+        assert!(err.contains("distinct Core lifecycle keyspace"));
+    }
+
+    #[test]
+    fn worker_domain_validation_rejects_lifecycle_fenced_until_cluster_gate() {
+        let cfg = WorkerConfig {
+            db_lifecycle_keyspace: "_sys_db_lifecycle_test".to_string(),
+            db_lifecycle_mode: DbLifecycleMode::Fenced,
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate_worker_domain_config()
+            .expect_err("fenced lifecycle mode must wait for cluster-version gate");
+        assert!(err.contains("DB9_DB_LIFECYCLE_MODE=fenced"));
+        assert!(err.contains("durable cluster/version gate"));
+    }
+
+    #[test]
+    fn from_env_invalid_gc_registry_mode_falls_back_to_legacy() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_GC_REGISTRY_MODE";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "split-now");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.gc_registry_mode, GcRegistryMode::Legacy);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
         }
     }
 
@@ -764,7 +1289,57 @@ mod tests {
         assert_eq!(cfg.storage_scan_jitter_sec, 300);
         assert_eq!(cfg.storage_scan_pd_rate_limit_ms, 100);
         assert_eq!(cfg.registry_reconcile_batch_size, 32);
+        assert_eq!(cfg.db_lifecycle_publish_interval_sec, 300);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
+        assert!(cfg.gc_registry_keyspace.is_empty());
+        assert!(cfg.bg_keyspace.is_empty());
+        assert_eq!(cfg.gc_registry_mode, GcRegistryMode::Legacy);
+        assert_eq!(cfg.effective_gc_registry_keyspace(), "_sys_worker");
+        assert_eq!(cfg.effective_bg_keyspace(), "_sys_worker");
+        assert!(cfg.domains_alias_legacy_system_keyspace());
+    }
+
+    #[test]
+    fn from_env_applies_db_lifecycle_publish_interval() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "45");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.db_lifecycle_publish_interval_sec, 45);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_keeps_default_db_lifecycle_publish_interval_when_below_minimum() {
+        let _guard = test_lock().lock();
+
+        let key = "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "29");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(
+            cfg.db_lifecycle_publish_interval_sec,
+            DEFAULT_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC
+        );
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
     }
 
     #[test]

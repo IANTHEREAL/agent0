@@ -1709,6 +1709,19 @@ impl TikvClientPool {
             .map(|e| e.active_connections.load(Ordering::Relaxed))
     }
 
+    /// Snapshot cached tenant stores without acquiring new keyspaces.
+    ///
+    /// Used by repair/reconcile loops that must cover tenants this process has
+    /// served, while avoiding a broad PD keyspace scan or side-effectful
+    /// bootstrap of inactive tenants.
+    pub(crate) async fn tenant_stores_snapshot(&self) -> Vec<(String, Arc<TikvStore>)> {
+        let tenants = self.tenants.read().await;
+        tenants
+            .iter()
+            .map(|(keyspace, entry)| (keyspace.clone(), entry.store.clone()))
+            .collect()
+    }
+
     /// Run a single eviction pass. Uses the idle-time index to find candidates
     /// in O(k) time where k is the number of due candidates, instead of scanning
     /// all tenants.
@@ -1941,6 +1954,10 @@ mod tests {
         assert!(
             acquire.contains("InventoryRepairSpawnMode::RetryOnly"),
             "fast-path cached tenant acquisition should retry exhausted repairs when due"
+        );
+        assert!(
+            source.contains("pub(crate) async fn tenant_stores_snapshot("),
+            "periodic reconcile must be able to repair tenant stores already served by this process"
         );
 
         let repair_helper = source

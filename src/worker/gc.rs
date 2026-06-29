@@ -1,19 +1,21 @@
 use crate::cron::config::CronConfig;
 use crate::pool::TikvClientPool;
-use crate::storage::worker::GcInstanceState;
+use crate::storage::worker::{GcInstanceState, GcPublishMode};
 use crate::storage::TikvStore;
-use crate::worker::config::WorkerConfig;
+use crate::worker::config::{GcRegistryMode, WorkerConfig};
 use crate::worker::executor_lease::WorkerExecutorLeaseCoordinator;
 use crate::worker::metrics::WorkerMetrics;
 use crate::worker::now_epoch_ms;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use pgwire::tokio::CancellationToken;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tikv_client::{Timestamp, TimestampExt};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod hnsw_impl;
 
@@ -25,6 +27,9 @@ const TSO_TIMEOUT_SEC: u64 = 30;
 /// PD-client retries. This keeps the advancer loop from getting wedged on a
 /// long retry storm even though individual PD requests already have timeouts.
 const SAFEPOINT_UPDATE_TIMEOUT_SEC: u64 = 30;
+/// Bound a single publisher attempt so a wedged TiKV/PD call cannot keep a
+/// SQL-serving process invisible past the self-fence deadline.
+const GC_REGISTRY_PUBLISH_TIMEOUT_SEC: u64 = 30;
 
 pub struct WorkerGc {
     system_store: Arc<TikvStore>,
@@ -36,6 +41,68 @@ pub struct WorkerGc {
 
 pub struct WorkerGcHandles {
     pub gc_loop_handle: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+pub struct GcRegistryStores {
+    legacy: Option<Arc<TikvStore>>,
+    new: Option<Arc<TikvStore>>,
+}
+
+impl GcRegistryStores {
+    pub fn new(legacy: Option<Arc<TikvStore>>, new: Option<Arc<TikvStore>>) -> Self {
+        Self { legacy, new }
+    }
+
+    fn legacy_store(&self) -> Result<&Arc<TikvStore>> {
+        self.legacy
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GC registry mode requires a legacy GC registry store"))
+    }
+
+    fn new_store(&self) -> Result<&Arc<TikvStore>> {
+        self.new
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GC registry mode requires a new GC registry store"))
+    }
+
+    fn clock_store(&self, mode: GcRegistryMode) -> Result<&TikvStore> {
+        match mode {
+            GcRegistryMode::Legacy => Ok(self.legacy_store()?.as_ref()),
+            GcRegistryMode::Migrating => Ok(self.new_store()?.as_ref()),
+            GcRegistryMode::New => Ok(self.new_store()?.as_ref()),
+        }
+    }
+
+    fn publish_targets(&self, mode: GcRegistryMode) -> Result<Vec<(&TikvStore, &'static str)>> {
+        match mode {
+            GcRegistryMode::Legacy => Ok(vec![(self.legacy_store()?.as_ref(), "legacy")]),
+            GcRegistryMode::Migrating => Ok(vec![
+                (self.legacy_store()?.as_ref(), "legacy"),
+                (self.new_store()?.as_ref(), "new"),
+            ]),
+            GcRegistryMode::New => Ok(vec![(self.new_store()?.as_ref(), "new")]),
+        }
+    }
+
+    fn scan_sources(&self, mode: GcRegistryMode) -> Result<Vec<(&TikvStore, &'static str)>> {
+        match mode {
+            GcRegistryMode::Legacy => Ok(vec![(self.legacy_store()?.as_ref(), "legacy")]),
+            GcRegistryMode::Migrating => Ok(vec![
+                (self.legacy_store()?.as_ref(), "legacy"),
+                (self.new_store()?.as_ref(), "new"),
+            ]),
+            GcRegistryMode::New => Ok(vec![(self.new_store()?.as_ref(), "new")]),
+        }
+    }
+}
+
+fn gc_publish_mode_for_registry_mode(mode: GcRegistryMode) -> GcPublishMode {
+    match mode {
+        GcRegistryMode::Legacy => GcPublishMode::OldOnly,
+        GcRegistryMode::Migrating => GcPublishMode::DualWrite,
+        GcRegistryMode::New => GcPublishMode::NewPrimary,
+    }
 }
 
 struct ClaimGcBatch {
@@ -99,10 +166,16 @@ impl WorkerGc {
 // ============================================================================
 
 /// GC registry publisher loop — UNCONDITIONAL for every SQL-serving process.
-/// Publishes this instance's min_start_ts to `_sys_worker` every interval.
-pub async fn run_gc_publisher_loop(store: &TikvStore, config: &WorkerConfig) {
+/// Publishes this instance's min_start_ts to the configured GC registry target(s).
+pub async fn run_gc_publisher_loop(
+    registry: &GcRegistryStores,
+    config: &WorkerConfig,
+    self_fence: CancellationToken,
+    last_successful_publish: Arc<Mutex<Instant>>,
+) {
     info!(
         interval_sec = config.gc_safepoint_interval_sec,
+        mode = config.gc_registry_mode.as_str(),
         "GC registry publisher started (unconditional)"
     );
 
@@ -115,27 +188,63 @@ pub async fn run_gc_publisher_loop(store: &TikvStore, config: &WorkerConfig) {
     let max_retry_delay = Duration::from_secs(config.gc_safepoint_interval_sec / 2);
     loop {
         interval.tick().await;
-        if let Err(e) = publish_gc_instance_state_once(store, config).await {
-            warn!("GC registry publish failed: {e}");
-            // Retry with exponential backoff instead of waiting a full interval.
-            // A single missed heartbeat at edge configs could make our row stale,
-            // so we retry promptly to keep the heartbeat alive.
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                tokio::time::sleep(backoff).await;
-                match publish_gc_instance_state_once(store, config).await {
-                    Ok(()) => {
-                        info!("GC registry publish succeeded after retry");
-                        break;
-                    }
-                    Err(retry_err) => {
-                        warn!(
-                            "GC registry publish retry failed (backoff={backoff:?}): {retry_err}"
-                        );
-                        backoff = (backoff * 2).min(max_retry_delay);
-                        if backoff >= max_retry_delay {
-                            warn!("GC registry publish retries exhausted; will retry on next tick");
+        match publish_gc_liveness_once_with_timeout(registry, config).await {
+            Ok(current_version) => {
+                record_gc_liveness_publish_success(&last_successful_publish);
+                metrics::counter!("db9_server_gc_liveness_publish_ok").increment(1);
+                reap_stale_gc_instance_states_after_publish(registry, config, current_version)
+                    .await;
+            }
+            Err(e) => {
+                metrics::counter!("db9_server_gc_liveness_publish_err").increment(1);
+                warn!("GC registry publish failed: {e}");
+                let last_success = read_gc_liveness_last_success(&last_successful_publish);
+                if gc_liveness_self_fence_elapsed(last_success, config) {
+                    trigger_gc_liveness_self_fence(&self_fence, last_success, config, &e);
+                    park_gc_publisher_after_self_fence().await;
+                }
+                // Retry with exponential backoff instead of waiting a full interval.
+                // A single missed heartbeat at edge configs could make our row stale,
+                // so we retry promptly to keep the heartbeat alive.
+                let mut backoff = Duration::from_secs(1);
+                loop {
+                    tokio::time::sleep(backoff).await;
+                    match publish_gc_liveness_once_with_timeout(registry, config).await {
+                        Ok(current_version) => {
+                            record_gc_liveness_publish_success(&last_successful_publish);
+                            metrics::counter!("db9_server_gc_liveness_publish_ok").increment(1);
+                            reap_stale_gc_instance_states_after_publish(
+                                registry,
+                                config,
+                                current_version,
+                            )
+                            .await;
+                            info!("GC registry publish succeeded after retry");
                             break;
+                        }
+                        Err(retry_err) => {
+                            metrics::counter!("db9_server_gc_liveness_publish_err").increment(1);
+                            warn!(
+                                "GC registry publish retry failed (backoff={backoff:?}): {retry_err}"
+                            );
+                            let last_success =
+                                read_gc_liveness_last_success(&last_successful_publish);
+                            if gc_liveness_self_fence_elapsed(last_success, config) {
+                                trigger_gc_liveness_self_fence(
+                                    &self_fence,
+                                    last_success,
+                                    config,
+                                    &retry_err,
+                                );
+                                park_gc_publisher_after_self_fence().await;
+                            }
+                            backoff = (backoff * 2).min(max_retry_delay);
+                            if backoff >= max_retry_delay {
+                                warn!(
+                                    "GC registry publish retries exhausted; will retry on next tick"
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -144,24 +253,132 @@ pub async fn run_gc_publisher_loop(store: &TikvStore, config: &WorkerConfig) {
     }
 }
 
+fn read_gc_liveness_last_success(clock: &Arc<Mutex<Instant>>) -> Instant {
+    *clock.lock()
+}
+
+fn record_gc_liveness_publish_success(clock: &Arc<Mutex<Instant>>) {
+    *clock.lock() = Instant::now();
+}
+
+async fn publish_gc_liveness_once_with_timeout(
+    registry: &GcRegistryStores,
+    config: &WorkerConfig,
+) -> Result<u64> {
+    tokio::time::timeout(
+        Duration::from_secs(GC_REGISTRY_PUBLISH_TIMEOUT_SEC),
+        publish_gc_instance_state(registry, config),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "GC registry publish timed out after {}s",
+            GC_REGISTRY_PUBLISH_TIMEOUT_SEC
+        )
+    })?
+}
+
+async fn reap_stale_gc_instance_states_after_publish(
+    registry: &GcRegistryStores,
+    config: &WorkerConfig,
+    current_version: u64,
+) {
+    if config.gc_safepoint_enabled {
+        return;
+    }
+
+    let sources = match registry.scan_sources(config.gc_registry_mode) {
+        Ok(sources) => sources,
+        Err(e) => {
+            warn!("GC registry stale-state reap source selection failed after publish: {e}");
+            return;
+        }
+    };
+
+    for (store, source) in sources {
+        match tokio::time::timeout(
+            Duration::from_secs(GC_REGISTRY_PUBLISH_TIMEOUT_SEC),
+            reap_stale_gc_instance_states(
+                store,
+                current_version,
+                heartbeat_timeout_sec(config),
+                source,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(
+                    source,
+                    "GC registry stale-state reap failed after publish: {e}"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    source,
+                    timeout_sec = GC_REGISTRY_PUBLISH_TIMEOUT_SEC,
+                    "GC registry stale-state reap timed out after publish"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn gc_liveness_self_fence_after(config: &WorkerConfig) -> Duration {
+    Duration::from_secs(config.gc_safepoint_interval_sec)
+}
+
+fn gc_liveness_self_fence_elapsed(last_successful_publish: Instant, config: &WorkerConfig) -> bool {
+    last_successful_publish.elapsed() >= gc_liveness_self_fence_after(config)
+}
+
+fn trigger_gc_liveness_self_fence(
+    self_fence: &CancellationToken,
+    last_successful_publish: Instant,
+    config: &WorkerConfig,
+    err: &anyhow::Error,
+) {
+    if !self_fence.is_cancelled() {
+        let stale_for_ms = last_successful_publish.elapsed().as_millis() as u64;
+        error!(
+            stale_for_ms,
+            self_fence_after_ms = gc_liveness_self_fence_after(config).as_millis() as u64,
+            error = %err,
+            "GC liveness publish failed past self-fence deadline; stopping SQL admission"
+        );
+        metrics::gauge!("db9_server_gc_self_fenced").set(1.0);
+        self_fence.cancel();
+    }
+}
+
+async fn park_gc_publisher_after_self_fence() {
+    // Keep this task parked until main's shutdown path aborts it. Returning
+    // would make the supervisor restart the publisher while the process is
+    // intentionally self-fenced.
+    std::future::pending::<()>().await;
+}
+
 /// Publish this process's GC registry row once.
 ///
 /// Startup uses this synchronously before the SQL listener begins accepting
 /// connections so the process participates in cluster GC coordination from the
 /// first served transaction.
 pub async fn publish_gc_instance_state_once(
-    store: &TikvStore,
+    registry: &GcRegistryStores,
     config: &WorkerConfig,
 ) -> Result<()> {
-    let current_version = publish_gc_instance_state(store, config).await?;
+    let current_version = publish_gc_instance_state(registry, config).await?;
     if !config.gc_safepoint_enabled {
-        reap_stale_gc_instance_states(
-            store,
-            current_version,
-            heartbeat_timeout_sec(config),
-            "publisher",
-        )
-        .await?;
+        for (store, source) in registry.scan_sources(config.gc_registry_mode)? {
+            reap_stale_gc_instance_states(
+                store,
+                current_version,
+                heartbeat_timeout_sec(config),
+                source,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -169,13 +386,14 @@ pub async fn publish_gc_instance_state_once(
 /// GC safepoint advancer loop — OPTIONAL, controlled by gc_safepoint_enabled.
 /// Reads all instances' states, computes global min, advances PD safepoint.
 pub async fn run_gc_advancer_loop(
-    store: &TikvStore,
+    registry: &GcRegistryStores,
     config: &WorkerConfig,
     metrics: &WorkerMetrics,
 ) {
     info!(
         interval_sec = config.gc_safepoint_interval_sec,
         life_time_sec = config.gc_life_time_sec,
+        mode = config.gc_registry_mode.as_str(),
         "GC safepoint advancer started"
     );
 
@@ -183,7 +401,7 @@ pub async fn run_gc_advancer_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        if let Err(e) = advance_gc_safepoint(store, config, metrics).await {
+        if let Err(e) = advance_gc_safepoint(registry, config, metrics).await {
             warn!("TiKV GC safepoint advance failed: {}", e);
             metrics
                 .gc_safepoint_advance_err
@@ -201,26 +419,34 @@ pub async fn run_gc_advancer_loop(
 /// error, timeout).  A leaked row with `None` is harmless — the advancer
 /// skips it during safepoint computation and the stale-row reaper will
 /// eventually delete it.
-pub async fn clear_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<()> {
+pub async fn clear_gc_instance_state(
+    registry: &GcRegistryStores,
+    config: &WorkerConfig,
+) -> Result<()> {
     // Phase 1: neutralize — publish None so the row cannot pin GC.
     let neutralize_result: Result<()> = async {
-        let client = store
+        let clock_store = registry.clock_store(config.gc_registry_mode)?;
+        let client = clock_store
             .transaction_client()
             .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
         let current_ts = client
             .current_timestamp_with_timeout(Duration::from_secs(TSO_TIMEOUT_SEC))
             .await
             .map_err(|e| anyhow::anyhow!("failed to get shutdown timestamp from PD: {}", e))?;
-        let mut txn = store.begin().await?;
-        store
-            .put_gc_instance_state(
-                &mut txn,
-                &config.gc_instance_id,
-                None, // no min_start_ts — row cannot clamp safepoint
-                current_ts.version(),
-            )
-            .await?;
-        txn.commit().await?;
+        let publish_mode = gc_publish_mode_for_registry_mode(config.gc_registry_mode);
+        for (store, _) in registry.publish_targets(config.gc_registry_mode)? {
+            let mut txn = store.begin().await?;
+            store
+                .put_gc_instance_state(
+                    &mut txn,
+                    &config.gc_instance_id,
+                    None, // no min_start_ts — row cannot clamp safepoint
+                    current_ts.version(),
+                    publish_mode,
+                )
+                .await?;
+            txn.commit().await?;
+        }
         Ok(())
     }
     .await;
@@ -233,16 +459,22 @@ pub async fn clear_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -
     }
 
     // Phase 2: delete — best-effort removal of the row.
-    let mut txn = store.begin().await?;
-    store
-        .delete_gc_instance_state(&mut txn, &config.gc_instance_id)
-        .await?;
-    txn.commit().await?;
+    for (store, _) in registry.publish_targets(config.gc_registry_mode)? {
+        let mut txn = store.begin().await?;
+        store
+            .delete_gc_instance_state(&mut txn, &config.gc_instance_id)
+            .await?;
+        txn.commit().await?;
+    }
     Ok(())
 }
 
-async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> Result<u64> {
-    let client = store
+async fn publish_gc_instance_state(
+    registry: &GcRegistryStores,
+    config: &WorkerConfig,
+) -> Result<u64> {
+    let clock_store = registry.clock_store(config.gc_registry_mode)?;
+    let client = clock_store
         .transaction_client()
         .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
 
@@ -260,26 +492,54 @@ async fn publish_gc_instance_state(store: &TikvStore, config: &WorkerConfig) -> 
 
     let local_min =
         crate::worker::active_txn_registry::global_registry().and_then(|r| r.min_start_ts());
+    let publish_mode = gc_publish_mode_for_registry_mode(config.gc_registry_mode);
 
-    let mut txn = store.begin().await?;
-    store
-        .put_gc_instance_state(
-            &mut txn,
-            &config.gc_instance_id,
-            local_min,
-            current_ts.version(),
-        )
-        .await?;
-    txn.commit().await?;
+    for (store, source) in registry.publish_targets(config.gc_registry_mode)? {
+        let mut txn = store.begin().await?;
+        store
+            .put_gc_instance_state(
+                &mut txn,
+                &config.gc_instance_id,
+                local_min,
+                current_ts.version(),
+                publish_mode,
+            )
+            .await?;
+        txn.commit().await?;
+        metrics::counter!("db9_server_gc_registry_publish_total", "source" => source).increment(1);
+    }
     Ok(current_ts.version())
 }
 
+async fn scan_gc_instance_states(store: &TikvStore) -> Result<Vec<GcInstanceState>> {
+    let mut txn = store.begin().await?;
+    let result = store.scan_gc_instance_states(&mut txn).await;
+    txn.rollback().await.ok();
+    result
+}
+
+async fn scan_gc_instance_states_from_sources(
+    registry: &GcRegistryStores,
+    mode: GcRegistryMode,
+) -> Result<Vec<GcInstanceState>> {
+    let mut all_states = Vec::new();
+    for (store, source) in registry.scan_sources(mode)? {
+        let states = scan_gc_instance_states(store)
+            .await
+            .with_context(|| format!("failed to read {source} GC registry source"))?;
+        metrics::gauge!("db9_server_gc_safepoint_sources_read", "source" => source).set(1.0);
+        all_states.extend(states);
+    }
+    Ok(all_states)
+}
+
 async fn advance_gc_safepoint(
-    store: &TikvStore,
+    registry: &GcRegistryStores,
     config: &WorkerConfig,
     metrics: &WorkerMetrics,
 ) -> Result<()> {
-    let client = store
+    let clock_store = registry.clock_store(config.gc_registry_mode)?;
+    let client = clock_store
         .transaction_client()
         .ok_or_else(|| anyhow::anyhow!("no TransactionClient available"))?;
 
@@ -293,14 +553,19 @@ async fn advance_gc_safepoint(
     // Read ALL instances' states from shared registry.
     let time_based_safepoint = compute_safepoint_version(current_version, config.gc_life_time_sec);
 
-    let all_states = {
-        let mut txn = store.begin().await?;
-        let states = store.scan_gc_instance_states(&mut txn).await?;
-        txn.rollback().await.ok();
-        states
-    };
+    let all_states =
+        scan_gc_instance_states_from_sources(registry, config.gc_registry_mode).await?;
 
     let hb_timeout = heartbeat_timeout_sec(config);
+
+    let old_only_publishers = live_old_only_gc_publishers(current_version, hb_timeout, &all_states);
+    metrics::gauge!("db9_server_gc_old_only_publishers").set(old_only_publishers.len() as f64);
+    if config.gc_registry_mode == GcRegistryMode::Migrating && !old_only_publishers.is_empty() {
+        debug!(
+            old_only_publishers = old_only_publishers.len(),
+            "GC registry new-only gate remains blocked by live old-only publishers"
+        );
+    }
 
     let effective_life_time_sec = effective_cluster_gc_life_time_sec(
         current_version,
@@ -346,16 +611,28 @@ async fn advance_gc_safepoint(
         }
     }
 
-    if let Err(e) = reap_stale_gc_instance_states_from_scan(
-        store,
-        current_version,
-        hb_timeout,
-        &all_states,
-        "advancer",
-    )
-    .await
-    {
-        warn!("GC registry stale-state reap failed: {}", e);
+    for (store, source) in registry.scan_sources(config.gc_registry_mode)? {
+        match scan_gc_instance_states(store).await {
+            Ok(states) => {
+                if let Err(e) = reap_stale_gc_instance_states_from_scan(
+                    store,
+                    current_version,
+                    hb_timeout,
+                    &states,
+                    source,
+                )
+                .await
+                {
+                    warn!("GC registry stale-state reap failed: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    source,
+                    "GC registry stale-state reap scan failed after safepoint source read: {}", e
+                );
+            }
+        }
     }
 
     if safepoint_version == 0 {
@@ -601,6 +878,21 @@ fn stale_gc_instance_ids(
     states
         .iter()
         .filter(|state| !is_live_gc_instance_state(current_version, heartbeat_timeout, state))
+        .map(|state| state.instance_id.clone())
+        .collect()
+}
+
+pub(crate) fn live_old_only_gc_publishers(
+    current_version: u64,
+    heartbeat_timeout: u64,
+    states: &[GcInstanceState],
+) -> Vec<String> {
+    states
+        .iter()
+        .filter(|state| {
+            is_live_gc_instance_state(current_version, heartbeat_timeout, state)
+                && state.publish_mode == GcPublishMode::OldOnly
+        })
         .map(|state| state.instance_id.clone())
         .collect()
 }

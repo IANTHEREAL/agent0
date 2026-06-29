@@ -294,18 +294,20 @@ impl Executor {
 
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let mut sys_txn = system_store.begin().await?;
-                    system_store
-                        .put_task_v2(&mut sys_txn, &entry, now_ms)
-                        .await?;
-                    system_store
-                        .update_registry_task_types(
+                    let enqueued = system_store
+                        .enqueue_registry_task_v2_unless_db_dropped(
                             &mut sys_txn,
-                            &keyspace,
-                            db_id,
+                            &entry,
+                            now_ms,
                             crate::worker::types::TASK_TYPE_BG_DDL,
-                            0,
                         )
                         .await?;
+                    if !enqueued {
+                        sys_txn.rollback().await.ok();
+                        return Err(anyhow!(
+                            "Cannot REFRESH MATERIALIZED VIEW CONCURRENTLY: database is being dropped"
+                        ));
+                    }
                     sys_txn.commit().await?;
                     crate::worker::wake_worker();
                 }

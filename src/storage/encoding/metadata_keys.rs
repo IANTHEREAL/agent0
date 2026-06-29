@@ -37,6 +37,7 @@ const DB_SYS_COLLATION_PREFIX: &[u8] = b"sys_collation_";
 const DB_SYS_POLICY_PREFIX: &[u8] = b"sys_policy_";
 const DB_SYS_NEXT_POLICY_OID: &[u8] = b"sys_next_policy_oid";
 const DB_SYS_STORAGE_STATS: &[u8] = b"sys_storage_stats";
+const DB_SYS_TENANT_INCARNATION: &[u8] = b"sys_tenant_incarnation";
 const DB_SYS_TSC_PREFIX: &[u8] = b"sys_tsc_";
 const DB_SYS_CRON_JOB_PREFIX_V2: &[u8] = b"sys_cron_job_";
 const DB_SYS_CRON_RUN_PREFIX_V2: &[u8] = b"sys_cron_run_";
@@ -61,6 +62,9 @@ pub(super) const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
 pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
 pub(super) const GC_INSTANCE_STATE_PREFIX: &[u8] = b"_gc_instance_";
+pub(super) const LIFECYCLE_PROCESS_LIVENESS_PREFIX: &[u8] = b"_lc_process_liveness_";
+pub(super) const LIFECYCLE_TENANT_INCARNATION_SEQ_KEY: &[u8] = b"_lc_incarnation_seq";
+pub(super) const LIFECYCLE_TENANT_PREFIX: &[u8] = b"_lc_tenant_";
 pub(super) const WORKER_BG_TASK_SEQ_PREFIX: &[u8] = b"_worker_bg_task_seq_";
 pub(super) const WORKER_EXECUTOR_LEASE_KEY: &[u8] = b"_worker_executor_lease";
 /// V2 due-queue (global). Same key STRUCTURE as `_worker_queue_` so the
@@ -94,6 +98,9 @@ pub(super) const WORKER_QUEUE_MIGRATION_LOCK_KEY: &[u8] = b"_wq_migration_lock";
 /// tombstone `get_for_update` conflict under pessimistic txns, so they cannot
 /// both commit. See issue #2628 (item 2) and design doc §K8.
 pub(super) const WORKER_DROPPED_DB_TOMBSTONE_PREFIX: &[u8] = b"_wq_dropped_db_";
+/// Durable pre-DROP enqueue fence. Written before tenant DROP metadata commit
+/// and finalized into `WORKER_DROPPED_DB_TOMBSTONE_PREFIX` after commit.
+pub(super) const WORKER_DROPPING_DB_INTENT_PREFIX: &[u8] = b"_wq_dropping_db_";
 /// HNSW S3 graph uploads that crossed the transactional boundary but have not
 /// yet been proven committed or aborted by GC.
 pub(super) const HNSW_S3_GRAPH_UPLOAD_INTENT_PREFIX: &[u8] = b"_hnsw_s3_graph_upload_intent_";
@@ -526,6 +533,51 @@ pub fn encode_worker_dropped_db_tombstone_key(keyspace: &str, db_id: u64) -> Vec
     key.push(b'_');
     key.extend_from_slice(&db_id.to_be_bytes());
     key
+}
+
+/// Encode a pre-DROP intent key (global, system store).
+///
+/// Same key identity as the final dropped-DB tombstone, but a different prefix
+/// so recovery can distinguish "DROP may still be committing" from "DROP is
+/// terminal".
+pub fn encode_worker_dropping_db_intent_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_DROPPING_DB_INTENT_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_DROPPING_DB_INTENT_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+pub fn encode_worker_dropping_db_intent_prefix() -> Vec<u8> {
+    WORKER_DROPPING_DB_INTENT_PREFIX.to_vec()
+}
+
+pub fn decode_worker_dropping_db_intent_key(key: &[u8]) -> Option<(String, u64)> {
+    if !key.starts_with(WORKER_DROPPING_DB_INTENT_PREFIX) {
+        return None;
+    }
+    let mut idx = WORKER_DROPPING_DB_INTENT_PREFIX.len();
+    if idx + 2 > key.len() {
+        return None;
+    }
+    let keyspace_len = u16::from_be_bytes([key[idx], key[idx + 1]]) as usize;
+    idx += 2;
+    if idx + keyspace_len + 1 + 8 != key.len() {
+        return None;
+    }
+    let keyspace = std::str::from_utf8(&key[idx..idx + keyspace_len])
+        .ok()?
+        .to_string();
+    idx += keyspace_len;
+    if key.get(idx) != Some(&b'_') {
+        return None;
+    }
+    idx += 1;
+    let db_id = u64::from_be_bytes(key[idx..idx + 8].try_into().ok()?);
+    Some((keyspace, db_id))
 }
 
 pub fn encode_hnsw_s3_graph_upload_intent_key(
@@ -987,6 +1039,16 @@ pub fn encode_gc_instance_state_prefix() -> Vec<u8> {
     GC_INSTANCE_STATE_PREFIX.to_vec()
 }
 
+/// Encode a DB lifecycle process-liveness key.
+/// Format: `_lc_process_liveness_{process_instance_id_bytes}`.
+pub fn encode_lifecycle_process_liveness_key(process_instance_id: &str) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(LIFECYCLE_PROCESS_LIVENESS_PREFIX.len() + process_instance_id.len());
+    key.extend_from_slice(LIFECYCLE_PROCESS_LIVENESS_PREFIX);
+    key.extend_from_slice(process_instance_id.as_bytes());
+    key
+}
+
 /// Encode a worker background result key (global).
 ///
 /// Format: `_worker_bg_result_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
@@ -1016,6 +1078,66 @@ pub fn encode_worker_bg_task_seq_key(keyspace: &str, db_id: u64) -> Vec<u8> {
     key.push(b'_');
     key.extend_from_slice(&db_id.to_be_bytes());
     key
+}
+
+/// Encode the tenant-local incarnation stamp.
+///
+/// This row lives in the tenant keyspace and is read inside tenant effect
+/// transactions. The lifecycle authority may live in a different Core keyspace,
+/// but effect correctness must use this same-keyspace stamp.
+pub fn encode_tenant_incarnation_key(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TENANT_INCARNATION);
+    key
+}
+
+/// Encode the global lifecycle incarnation allocator key.
+pub fn encode_lifecycle_tenant_incarnation_seq_key() -> Vec<u8> {
+    LIFECYCLE_TENANT_INCARNATION_SEQ_KEY.to_vec()
+}
+
+/// Encode a Core lifecycle tenant inventory row.
+///
+/// Format: `_lc_tenant_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}`.
+pub fn encode_lifecycle_tenant_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(LIFECYCLE_TENANT_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(LIFECYCLE_TENANT_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+#[allow(dead_code)]
+pub fn encode_lifecycle_tenant_prefix() -> Vec<u8> {
+    LIFECYCLE_TENANT_PREFIX.to_vec()
+}
+
+#[allow(dead_code)]
+pub fn decode_lifecycle_tenant_key(key: &[u8]) -> Option<(String, u64)> {
+    if !key.starts_with(LIFECYCLE_TENANT_PREFIX) {
+        return None;
+    }
+    let mut idx = LIFECYCLE_TENANT_PREFIX.len();
+    if idx + 2 > key.len() {
+        return None;
+    }
+    let keyspace_len = u16::from_be_bytes([key[idx], key[idx + 1]]) as usize;
+    idx += 2;
+    if idx + keyspace_len + 1 + 8 != key.len() {
+        return None;
+    }
+    let keyspace = std::str::from_utf8(&key[idx..idx + keyspace_len])
+        .ok()?
+        .to_string();
+    idx += keyspace_len;
+    if key.get(idx) != Some(&b'_') {
+        return None;
+    }
+    idx += 1;
+    let db_id = u64::from_be_bytes(key[idx..idx + 8].try_into().ok()?);
+    Some((keyspace, db_id))
 }
 
 // ============================================================================
@@ -1291,6 +1413,53 @@ mod tests {
         assert_ne!(key_a, key_b);
         assert_ne!(key_a, key_c);
         assert_ne!(key_b, key_c);
+    }
+
+    #[test]
+    fn tenant_incarnation_stamp_is_database_local_metadata() {
+        let key = encode_tenant_incarnation_key(42);
+        let db_prefix = encode_database_data_prefix(42);
+        let other_db_prefix = encode_database_data_prefix(43);
+
+        assert!(key.starts_with(&db_prefix));
+        assert!(!key.starts_with(&other_db_prefix));
+        assert!(key.ends_with(DB_SYS_TENANT_INCARNATION));
+    }
+
+    #[test]
+    fn lifecycle_tenant_key_roundtrips_and_is_global_core_inventory() {
+        let key = encode_lifecycle_tenant_key("tenant_a", 42);
+        assert!(key.starts_with(LIFECYCLE_TENANT_PREFIX));
+        assert_eq!(
+            decode_lifecycle_tenant_key(&key),
+            Some(("tenant_a".to_string(), 42))
+        );
+        assert_eq!(decode_lifecycle_tenant_key(b"_lc_tenant_bad"), None);
+    }
+
+    #[test]
+    fn lifecycle_process_liveness_is_separate_from_gc_liveness() {
+        let lifecycle = encode_lifecycle_process_liveness_key("node-1");
+        let gc = encode_gc_instance_state_key("node-1");
+
+        assert!(lifecycle.starts_with(LIFECYCLE_PROCESS_LIVENESS_PREFIX));
+        assert!(gc.starts_with(GC_INSTANCE_STATE_PREFIX));
+        assert_ne!(lifecycle, gc);
+    }
+
+    #[test]
+    fn dropping_db_intent_roundtrips_and_differs_from_final_tombstone() {
+        let intent = encode_worker_dropping_db_intent_key("tenant_a", 42);
+        let tombstone = encode_worker_dropped_db_tombstone_key("tenant_a", 42);
+
+        assert!(intent.starts_with(WORKER_DROPPING_DB_INTENT_PREFIX));
+        assert!(tombstone.starts_with(WORKER_DROPPED_DB_TOMBSTONE_PREFIX));
+        assert_ne!(intent, tombstone);
+        assert_eq!(
+            decode_worker_dropping_db_intent_key(&intent),
+            Some(("tenant_a".to_string(), 42))
+        );
+        assert_eq!(decode_worker_dropping_db_intent_key(&tombstone), None);
     }
 
     // ── V2 worker queue (issue #2576) ────────────────────────────────────

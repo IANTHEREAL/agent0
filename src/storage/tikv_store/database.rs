@@ -1,6 +1,32 @@
 use super::*;
 use crate::storage::backpressure::tikv_op;
 
+const TENANT_INCARNATION_STAMP_VALUE_VERSION: u8 = 1;
+const TENANT_INCARNATION_STAMP_VALUE_LEN: usize = 9;
+
+fn encode_tenant_incarnation_stamp_value(incarnation: u64) -> Vec<u8> {
+    let mut value = Vec::with_capacity(TENANT_INCARNATION_STAMP_VALUE_LEN);
+    value.push(TENANT_INCARNATION_STAMP_VALUE_VERSION);
+    value.extend_from_slice(&incarnation.to_be_bytes());
+    value
+}
+
+fn decode_tenant_incarnation_stamp_value(value: &[u8]) -> Result<u64> {
+    if value.len() != TENANT_INCARNATION_STAMP_VALUE_LEN {
+        return Err(anyhow!(
+            "invalid tenant incarnation stamp length: {}",
+            value.len()
+        ));
+    }
+    if value[0] != TENANT_INCARNATION_STAMP_VALUE_VERSION {
+        return Err(anyhow!(
+            "unsupported tenant incarnation stamp version: {}",
+            value[0]
+        ));
+    }
+    Ok(u64::from_be_bytes(value[1..9].try_into()?))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefaultDatabaseRepairAction {
     UseVisible(u64),
@@ -395,6 +421,79 @@ impl TikvStore {
         Ok(true)
     }
 
+    /// Lock and rewrite the live database metadata row.
+    ///
+    /// Dropping-intent repair uses this before clearing a stale live-DB intent:
+    /// the rewrite creates a tenant-store version that makes any older in-flight
+    /// DROP transaction conflict instead of committing after the system-store
+    /// fence has been removed.
+    pub async fn touch_database_alive_for_update(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<bool> {
+        let key = self.key(&encode_database_id_key(db_id));
+        let Some(data) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
+            return Ok(false);
+        };
+        let _: DatabaseDef =
+            bincode::deserialize(&data).context("Failed to deserialize database definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(true)
+    }
+
+    /// Write this database's tenant-local lifecycle incarnation stamp.
+    ///
+    /// The Core lifecycle allocator is outside the tenant keyspace, but worker
+    /// effects must validate ownership inside the same tenant transaction as
+    /// the effect. This stamp is that same-keyspace fence.
+    pub async fn put_tenant_incarnation_stamp(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        incarnation: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_tenant_incarnation_key(db_id));
+        txn_put(txn, key, encode_tenant_incarnation_stamp_value(incarnation)).await?;
+        Ok(())
+    }
+
+    /// Read the tenant-local incarnation stamp for this database.
+    #[allow(dead_code)]
+    pub async fn get_tenant_incarnation_stamp(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Option<u64>> {
+        let key = self.key(&encode_tenant_incarnation_key(db_id));
+        match tikv_op!(txn.get(key).await)? {
+            Some(value) => Ok(Some(decode_tenant_incarnation_stamp_value(&value)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_tenant_incarnation_stamp_for_update(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Option<u64>> {
+        let key = self.key(&encode_tenant_incarnation_key(db_id));
+        match tikv_op!(txn.get_for_update(key).await)? {
+            Some(value) => Ok(Some(decode_tenant_incarnation_stamp_value(&value)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn delete_tenant_incarnation_stamp(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_tenant_incarnation_key(db_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
     /// List all databases in the current keyspace (storage format v2).
     pub async fn list_databases(&self, txn: &mut Transaction) -> Result<Vec<DatabaseDef>> {
         let prefix = encode_database_id_prefix();
@@ -549,6 +648,7 @@ impl TikvStore {
 
         let id_key = self.key(&encode_database_id_key(db_id));
         txn_delete(txn, id_key).await?;
+        self.delete_tenant_incarnation_stamp(txn, db_id).await?;
 
         Ok(Some((db_id, dropping_guard)))
     }
@@ -663,6 +763,30 @@ mod tests {
 
     fn named_db(id: u64, name: &str) -> DatabaseDef {
         DatabaseDef::new(id, name.to_string(), "admin".to_string())
+    }
+
+    #[test]
+    fn tenant_incarnation_stamp_value_is_versioned() {
+        let encoded = encode_tenant_incarnation_stamp_value(123);
+        assert_eq!(encoded.len(), TENANT_INCARNATION_STAMP_VALUE_LEN);
+        assert_eq!(
+            decode_tenant_incarnation_stamp_value(&encoded).unwrap(),
+            123
+        );
+
+        let mut bad_version = encoded.clone();
+        bad_version[0] = 2;
+        assert!(decode_tenant_incarnation_stamp_value(&bad_version)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported tenant incarnation stamp version"));
+
+        assert!(
+            decode_tenant_incarnation_stamp_value(&encoded[..encoded.len() - 1])
+                .unwrap_err()
+                .to_string()
+                .contains("invalid tenant incarnation stamp length")
+        );
     }
 
     #[test]

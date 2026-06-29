@@ -548,6 +548,28 @@ fn test_flush_trigger_activations_clears_buffers_even_without_system_store() {
 }
 
 #[test]
+fn flush_trigger_activations_uses_terminal_tombstone_fence_only() {
+    let source = include_str!("mod.rs");
+    let flush_fn = source
+        .split("pub(crate) fn flush_trigger_activations(&self)")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("/// Flush accumulated HNSW merge requests")
+                .next()
+        })
+        .expect("flush_trigger_activations must exist before HNSW flush");
+
+    assert!(
+        flush_fn.contains("enqueue_registry_task_v2_unless_db_tombstoned"),
+        "committed AsyncTrigger work must only be suppressed by a terminal dropped-DB tombstone"
+    );
+    assert!(
+        !flush_fn.contains("enqueue_registry_task_v2_unless_db_dropped"),
+        "AsyncTrigger flush must not treat a transient dropping intent as terminal suppression"
+    );
+}
+
+#[test]
 fn test_hnsw_merge_task_id_is_stable_and_unique_for_common_pairs() {
     use crate::sql::hnsw::storage::hnsw_merge_task_id;
     let a = hnsw_merge_task_id(1, 1).unwrap();
@@ -606,7 +628,7 @@ fn test_flush_pending_hnsw_merges_clears_buffer_without_system_store() {
 }
 
 #[test]
-fn flush_pending_hnsw_merges_is_dropped_db_tombstone_fenced() {
+fn flush_pending_hnsw_merges_uses_fenced_singleton_registry_enqueue() {
     let source = include_str!("mod.rs");
     let flush_fn = source
         .split("pub(crate) fn flush_pending_hnsw_merges(&self)")
@@ -616,19 +638,22 @@ fn flush_pending_hnsw_merges_is_dropped_db_tombstone_fenced() {
                 .next()
         })
         .expect("flush_pending_hnsw_merges must exist");
-    let fence_pos = flush_fn
-        .find("dropped_db_tombstone_exists_for_update")
-        .expect("HNSW merge producer must fence on dropped-DB tombstone");
-    let put_pos = flush_fn
-        .find("put_singleton_task_v2(&mut txn, &entry, fire_time_ms)")
-        .expect("HNSW merge producer must write singleton queue row");
-    let registry_pos = flush_fn
-        .find("update_registry_task_types")
-        .expect("HNSW merge producer must update registry");
+    let helper_pos = flush_fn
+        .find("enqueue_singleton_registry_task_v2_unless_db_dropped")
+        .expect("HNSW merge producer must use the dropped-DB fenced singleton registry helper");
+    let task_type_pos = flush_fn
+        .find("TASK_TYPE_HNSW_MERGE")
+        .expect("HNSW merge producer must register the HNSW task type");
 
     assert!(
-        fence_pos < put_pos && put_pos < registry_pos,
-        "HNSW merge queue and registry writes must happen after the tombstone fence"
+        helper_pos < task_type_pos,
+        "HNSW merge queue and registry writes must happen through one fenced helper"
+    );
+    assert!(
+        !flush_fn.contains("put_singleton_task_v2(")
+            && !flush_fn.contains("update_registry_task_types(")
+            && !flush_fn.contains("dropped_db_tombstone_exists_for_update("),
+        "HNSW merge producer must not split the enqueue fence, singleton write, and registry update across manual calls"
     );
 }
 

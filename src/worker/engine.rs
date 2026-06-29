@@ -1212,9 +1212,8 @@ impl WorkerEngine {
     ) -> Result<(u32, u32)> {
         // 1. Existing cron entries (V2 identity index only). Reconciliation is
         //    bounded: it reads the per-(db, type) V2 index, never the global
-        //    due queue. The maintenance loop skips registry sweep while the
-        //    legacy V1 prefix is non-empty, so this sweep does not race a
-        //    backlog that has not yet been projected into V2.
+        //    due queue. Legacy V1 rows are inert residue in PR1 and are not
+        //    projected into V2 by the worker.
         let mut txn = self.system_store.begin().await?;
         let existing_rows = self
             .system_store
@@ -1259,8 +1258,7 @@ impl WorkerEngine {
         if !cron_enabled {
             tenant_txn.commit().await?;
             // Cron disabled but registry has cron bit — clean up bounded V2
-            // entries via the per-(db, type) index. The maintenance loop skips
-            // registry sweep while legacy V1 rows remain.
+            // entries via the per-(db, type) index.
             let total = existing_rows.len();
             if total > 0 {
                 let mut sys_txn = self.system_store.begin().await?;
@@ -1341,9 +1339,8 @@ impl WorkerEngine {
         }
 
         // 5. Cleanup bounded V2 orphans: queue entries whose job_id is not in
-        //    active jobs. The maintenance loop only reaches registry sweep
-        //    after the legacy prefix is empty, so the V2 identity index is the
-        //    complete orphan set — no global `_worker_queue_` scan is needed.
+        //    active jobs. Legacy V1 rows are never consulted here; they are not
+        //    execution candidates in the PR1 intermediate state.
         let orphan_rows: Vec<&WqIndexRow> = existing_rows
             .iter()
             .filter(|r| !active_job_ids.contains(&r.task_id))

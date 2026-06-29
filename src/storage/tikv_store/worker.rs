@@ -18,22 +18,123 @@ pub struct WqIndexRow {
     pub fire_time_ms: i64,
 }
 
-const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
+#[derive(Debug, Clone)]
+pub struct DroppingDbIntent {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub created_at_ms: i64,
+}
+
+const GC_INSTANCE_STATE_BASE_VALUE_LEN: usize = 17;
+const GC_INSTANCE_STATE_VALUE_LEN: usize = 18;
 const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
+const GC_INSTANCE_STATE_PUBLISH_MODE_OFFSET: usize = 17;
+const DROPPING_DB_INTENT_VALUE_LEN: usize = 8;
+const LIFECYCLE_PROCESS_LIVENESS_VALUE_VERSION: u8 = 1;
+const LIFECYCLE_TENANT_VALUE_VERSION: u8 = 1;
+const LIFECYCLE_TENANT_VALUE_LEN: usize = 18;
 const WORKER_QUEUE_SCHEMA_V2: u8 = 2;
 
-/// Published GC instance state read back from `_sys_worker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DroppedDbEnqueueFence {
+    None,
+    DroppingIntent,
+    Tombstone,
+}
+
+impl DroppedDbEnqueueFence {
+    fn is_fenced(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+fn decode_dropping_db_intent_created_at(value: &[u8]) -> i64 {
+    if value.len() == DROPPING_DB_INTENT_VALUE_LEN {
+        let bytes: [u8; DROPPING_DB_INTENT_VALUE_LEN] = value.try_into().unwrap_or_default();
+        i64::from_be_bytes(bytes)
+    } else {
+        0
+    }
+}
+
+/// Published GC instance state read back from the configured GC registry store.
 #[derive(Clone)]
 pub struct GcInstanceState {
     pub instance_id: String,
     pub min_start_ts: Option<u64>,
     pub updated_at_version: u64,
+    /// Publish protocol advertised by this SQL-serving process. Legacy rows
+    /// without this trailing byte decode as `OldOnly`, which fail-closed blocks
+    /// any future new-only GC registry cutover.
+    pub publish_mode: GcPublishMode,
     /// Legacy 25-byte row compatibility during mixed-version rollout.
     /// New-format rows do not publish this timeout tail.
     pub legacy_max_untracked_timeout_sec: Option<u64>,
 }
 
-fn encode_gc_instance_state_value(min_start_ts: Option<u64>, updated_at_version: u64) -> Vec<u8> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcPublishMode {
+    OldOnly,
+    DualWrite,
+    NewPrimary,
+}
+
+impl GcPublishMode {
+    fn encode(self) -> u8 {
+        match self {
+            Self::OldOnly => 0,
+            Self::DualWrite => 1,
+            Self::NewPrimary => 2,
+        }
+    }
+
+    fn decode(byte: u8) -> Self {
+        match byte {
+            1 => Self::DualWrite,
+            2 => Self::NewPrimary,
+            _ => Self::OldOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleTenantStatus {
+    Live,
+    Dropped,
+}
+
+impl LifecycleTenantStatus {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Live => 1,
+            Self::Dropped => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Live),
+            2 => Some(Self::Dropped),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct LifecycleTenantRecord {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub incarnation: u64,
+    pub status: LifecycleTenantStatus,
+    pub updated_at_version: u64,
+}
+
+fn encode_gc_instance_state_value(
+    min_start_ts: Option<u64>,
+    updated_at_version: u64,
+    publish_mode: GcPublishMode,
+) -> Vec<u8> {
     let mut data = Vec::with_capacity(GC_INSTANCE_STATE_VALUE_LEN);
     match min_start_ts {
         Some(ts) => {
@@ -46,11 +147,14 @@ fn encode_gc_instance_state_value(min_start_ts: Option<u64>, updated_at_version:
         }
     }
     data.extend_from_slice(&updated_at_version.to_be_bytes());
+    data.push(publish_mode.encode());
     data
 }
 
-fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64, Option<u64>)> {
-    if val.len() < GC_INSTANCE_STATE_VALUE_LEN {
+fn decode_gc_instance_state_value(
+    val: &[u8],
+) -> Option<(Option<u64>, u64, GcPublishMode, Option<u64>)> {
+    if val.len() < GC_INSTANCE_STATE_BASE_VALUE_LEN {
         return None;
     }
     let has_min = val[0] == 1;
@@ -65,7 +169,56 @@ fn decode_gc_instance_state_value(val: &[u8]) -> Option<(Option<u64>, u64, Optio
     } else {
         None
     };
-    Some((min_ts, updated_at, legacy_max_untracked_timeout_sec))
+    let publish_mode = if val.len() > LEGACY_GC_INSTANCE_STATE_VALUE_LEN {
+        GcPublishMode::decode(val[LEGACY_GC_INSTANCE_STATE_VALUE_LEN])
+    } else if val.len() > GC_INSTANCE_STATE_PUBLISH_MODE_OFFSET
+        && val.len() < LEGACY_GC_INSTANCE_STATE_VALUE_LEN
+    {
+        GcPublishMode::decode(val[GC_INSTANCE_STATE_PUBLISH_MODE_OFFSET])
+    } else {
+        GcPublishMode::OldOnly
+    };
+    Some((
+        min_ts,
+        updated_at,
+        publish_mode,
+        legacy_max_untracked_timeout_sec,
+    ))
+}
+
+fn encode_lifecycle_process_liveness_value(
+    updated_at_version: u64,
+    self_fence_after_ms: u64,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(17);
+    data.push(LIFECYCLE_PROCESS_LIVENESS_VALUE_VERSION);
+    data.extend_from_slice(&updated_at_version.to_be_bytes());
+    data.extend_from_slice(&self_fence_after_ms.to_be_bytes());
+    data
+}
+
+fn encode_lifecycle_tenant_value(
+    incarnation: u64,
+    status: LifecycleTenantStatus,
+    updated_at_version: u64,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(LIFECYCLE_TENANT_VALUE_LEN);
+    data.push(LIFECYCLE_TENANT_VALUE_VERSION);
+    data.push(status.encode());
+    data.extend_from_slice(&incarnation.to_be_bytes());
+    data.extend_from_slice(&updated_at_version.to_be_bytes());
+    data
+}
+
+#[allow(dead_code)]
+fn decode_lifecycle_tenant_value(value: &[u8]) -> Option<(u64, LifecycleTenantStatus, u64)> {
+    if value.len() != LIFECYCLE_TENANT_VALUE_LEN || value[0] != LIFECYCLE_TENANT_VALUE_VERSION {
+        return None;
+    }
+    let status = LifecycleTenantStatus::decode(value[1])?;
+    let incarnation = u64::from_be_bytes(value[2..10].try_into().ok()?);
+    let updated_at_version = u64::from_be_bytes(value[10..18].try_into().ok()?);
+    Some((incarnation, status, updated_at_version))
 }
 
 fn tikv_error_is_worker_claim_contention(err: &tikv_client::Error) -> bool {
@@ -105,7 +258,7 @@ impl TikvStore {
     // Registry methods
     // ========================================================================
 
-    pub async fn put_worker_registry(
+    async fn put_worker_registry(
         &self,
         txn: &mut Transaction,
         entry: &TaskRegistryEntry,
@@ -115,6 +268,42 @@ impl TikvStore {
             bincode::serialize(entry).context("Failed to serialize worker registry entry")?;
         txn_put(txn, key, data).await?;
         Ok(())
+    }
+
+    /// Best-effort inventory repair for maintenance paths.
+    ///
+    /// This deliberately uses non-locking fence reads: registry rows are repair
+    /// hints, not task truth, and taking a pessimistic lock on the per-DB
+    /// tombstone key for every live-database repair turns ordinary producers
+    /// into a hot lock. If a DROP races this write after the snapshot check, the
+    /// durable tombstone plus registry sweep will clean the stale hint.
+    pub async fn ensure_worker_registry_unless_db_dropped_best_effort(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskRegistryEntry,
+    ) -> Result<bool> {
+        match self
+            .dropped_db_enqueue_fence(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            DroppedDbEnqueueFence::None => {
+                if self
+                    .get_worker_registry(txn, &entry.keyspace, entry.db_id)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+                self.put_worker_registry(txn, entry).await?;
+                Ok(true)
+            }
+            DroppedDbEnqueueFence::Tombstone => Ok(false),
+            DroppedDbEnqueueFence::DroppingIntent => Err(anyhow!(
+                "database inventory registry write deferred by in-flight DROP intent for keyspace='{}' db_id={}",
+                entry.keyspace,
+                entry.db_id
+            )),
+        }
     }
 
     pub async fn get_worker_registry(
@@ -184,22 +373,20 @@ impl TikvStore {
 
         let mut entries = Vec::new();
         let mut last_key = None;
+        let mut scanned = 0usize;
         for pair in pairs {
+            scanned += 1;
             let key: &[u8] = pair.key().as_ref().into();
+            last_key = Some(key.to_vec());
             if !key.starts_with(&prefix) {
                 continue;
             }
             let entry: TaskRegistryEntry = bincode::deserialize(pair.value())
                 .context("Failed to deserialize worker registry entry")?;
             entries.push(entry);
-            last_key = Some(key.to_vec());
         }
 
-        let next_cursor = if entries.len() == limit {
-            last_key
-        } else {
-            None
-        };
+        let next_cursor = if scanned == limit { last_key } else { None };
         Ok((entries, next_cursor))
     }
 
@@ -233,10 +420,8 @@ impl TikvStore {
         keyspace: &str,
         db_id: u64,
     ) -> Result<usize> {
-        let mut tombstone_txn = self.begin().await?;
-        self.put_dropped_db_tombstone(&mut tombstone_txn, keyspace, db_id)
+        self.put_dropped_db_tombstone_with_retry(keyspace, db_id)
             .await?;
-        tombstone_txn.commit().await?;
 
         let deleted = self.reap_db_queue_entries(keyspace, db_id).await?;
 
@@ -276,26 +461,340 @@ impl TikvStore {
         Ok(())
     }
 
-    /// Read the dropped-DB tombstone under a WRITE LOCK (`get_for_update`). This
-    /// is the fence read every cross-store enqueue takes in the SAME system txn
-    /// as `put_task_v2`, so a concurrent DROP-reap that PUTs the tombstone and
-    /// this enqueue cannot both commit (pessimistic conflict on the tombstone
-    /// key). Returns `true` when the DB has been dropped → caller must suppress
-    /// the enqueue.
+    pub async fn put_dropping_db_intent(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_dropping_db_intent_key(keyspace, db_id));
+        txn_put(txn, key, created_at_ms.to_be_bytes().to_vec()).await?;
+        Ok(())
+    }
+
+    pub async fn delete_dropping_db_intent(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_dropping_db_intent_key(keyspace, db_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
+    pub async fn delete_dropping_db_intent_if_created_at(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        expected_created_at_ms: i64,
+    ) -> Result<bool> {
+        let key = self.key(&encode_worker_dropping_db_intent_key(keyspace, db_id));
+        let Some(value) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
+            return Ok(false);
+        };
+        if decode_dropping_db_intent_created_at(&value) != expected_created_at_ms {
+            return Ok(false);
+        }
+        txn_delete(txn, key).await?;
+        Ok(true)
+    }
+
+    pub async fn put_dropping_db_intent_with_retry(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        const INTENT_RETRY_ATTEMPTS: usize = 8;
+
+        let mut last_error = None;
+        for attempt in 0..INTENT_RETRY_ATTEMPTS {
+            let mut txn = self.begin().await?;
+            let put_result = self
+                .put_dropping_db_intent(&mut txn, keyspace, db_id, created_at_ms)
+                .await;
+            let result = match put_result {
+                Ok(()) => txn.commit().await.map_err(anyhow::Error::from),
+                Err(e) => {
+                    txn.rollback().await.ok();
+                    Err(e)
+                }
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < INTENT_RETRY_ATTEMPTS {
+                        let backoff_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("dropping-DB intent publish failed")))
+            .with_context(|| {
+                format!(
+                    "failed to publish dropping-DB intent for keyspace='{keyspace}' db_id={db_id}"
+                )
+            })
+    }
+
+    pub async fn delete_dropping_db_intent_if_created_at_with_retry(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        expected_created_at_ms: i64,
+    ) -> Result<bool> {
+        const INTENT_RETRY_ATTEMPTS: usize = 8;
+
+        let mut last_error = None;
+        for attempt in 0..INTENT_RETRY_ATTEMPTS {
+            let mut txn = self.begin().await?;
+            let delete_result = self
+                .delete_dropping_db_intent_if_created_at(
+                    &mut txn,
+                    keyspace,
+                    db_id,
+                    expected_created_at_ms,
+                )
+                .await;
+            let result = match delete_result {
+                Ok(deleted) => txn
+                    .commit()
+                    .await
+                    .map(|_| deleted)
+                    .map_err(anyhow::Error::from),
+                Err(e) => {
+                    txn.rollback().await.ok();
+                    Err(e)
+                }
+            };
+            match result {
+                Ok(deleted) => return Ok(deleted),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < INTENT_RETRY_ATTEMPTS {
+                        let backoff_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("dropping-DB intent conditional delete failed")))
+            .with_context(|| {
+                format!(
+                    "failed to conditionally delete dropping-DB intent for keyspace='{keyspace}' db_id={db_id}"
+                )
+            })
+    }
+
+    pub async fn finalize_dropping_db_intent_with_retry(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        const INTENT_RETRY_ATTEMPTS: usize = 8;
+
+        let mut last_error = None;
+        for attempt in 0..INTENT_RETRY_ATTEMPTS {
+            let mut txn = self.begin().await?;
+            let finalize_result = async {
+                self.put_dropped_db_tombstone(&mut txn, keyspace, db_id)
+                    .await?;
+                self.delete_dropping_db_intent(&mut txn, keyspace, db_id)
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            let result = match finalize_result {
+                Ok(()) => txn.commit().await.map_err(anyhow::Error::from),
+                Err(e) => {
+                    txn.rollback().await.ok();
+                    Err(e)
+                }
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < INTENT_RETRY_ATTEMPTS {
+                        let backoff_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("dropping-DB intent finalize failed")))
+            .with_context(|| {
+                format!(
+                    "failed to finalize dropping-DB intent for keyspace='{keyspace}' db_id={db_id}"
+                )
+            })
+    }
+
+    /// Publish the dropped-DB tombstone with bounded retry before any slow
+    /// post-DROP cleanup. If a producer wins the first tombstone contention, the
+    /// retry observes the now-serialized store state and installs the fence before
+    /// queue reap continues.
+    pub async fn put_dropped_db_tombstone_with_retry(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        const TOMBSTONE_RETRY_ATTEMPTS: usize = 8;
+
+        let mut last_error = None;
+        for attempt in 0..TOMBSTONE_RETRY_ATTEMPTS {
+            let mut txn = self.begin().await?;
+            let put_result = self
+                .put_dropped_db_tombstone(&mut txn, keyspace, db_id)
+                .await;
+            let result = match put_result {
+                Ok(()) => txn.commit().await.map_err(anyhow::Error::from),
+                Err(e) => {
+                    txn.rollback().await.ok();
+                    Err(e)
+                }
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < TOMBSTONE_RETRY_ATTEMPTS {
+                        let backoff_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("dropped-DB tombstone publish failed")))
+            .with_context(|| {
+                format!(
+                    "failed to publish dropped-DB tombstone for keyspace='{keyspace}' db_id={db_id}"
+                )
+            })
+    }
+
+    pub(crate) async fn dropped_db_enqueue_fence_for_update(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<DroppedDbEnqueueFence> {
+        let tombstone_key = self.key(&encode_worker_dropped_db_tombstone_key(keyspace, db_id));
+        if tikv_op!(txn.get_for_update(tombstone_key).await)?.is_some() {
+            return Ok(DroppedDbEnqueueFence::Tombstone);
+        }
+        let intent_key = self.key(&encode_worker_dropping_db_intent_key(keyspace, db_id));
+        if tikv_op!(txn.get_for_update(intent_key).await)?.is_some() {
+            return Ok(DroppedDbEnqueueFence::DroppingIntent);
+        }
+        Ok(DroppedDbEnqueueFence::None)
+    }
+
+    async fn dropped_db_enqueue_fence(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<DroppedDbEnqueueFence> {
+        let tombstone_key = self.key(&encode_worker_dropped_db_tombstone_key(keyspace, db_id));
+        if tikv_op!(txn.get(tombstone_key).await)?.is_some() {
+            return Ok(DroppedDbEnqueueFence::Tombstone);
+        }
+        let intent_key = self.key(&encode_worker_dropping_db_intent_key(keyspace, db_id));
+        if tikv_op!(txn.get(intent_key).await)?.is_some() {
+            return Ok(DroppedDbEnqueueFence::DroppingIntent);
+        }
+        Ok(DroppedDbEnqueueFence::None)
+    }
+
+    pub async fn dropped_db_enqueue_fence_exists_for_update(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<bool> {
+        Ok(self
+            .dropped_db_enqueue_fence_for_update(txn, keyspace, db_id)
+            .await?
+            .is_fenced())
+    }
+
+    /// Terminal dropped-DB fence only.
+    ///
+    /// This deliberately does NOT treat a pre-commit dropping intent as terminal:
+    /// DROP may still fail or roll back, and committed one-shot work such as
+    /// AsyncTrigger has no tenant-local outbox in this PR. If DROP really
+    /// commits, it publishes the tombstone before reaping V2 queue/index rows.
+    #[allow(dead_code)]
     pub async fn dropped_db_tombstone_exists_for_update(
         &self,
         txn: &mut Transaction,
         keyspace: &str,
         db_id: u64,
     ) -> Result<bool> {
-        let key = self.key(&encode_worker_dropped_db_tombstone_key(keyspace, db_id));
-        Ok(tikv_op!(txn.get_for_update(key).await)?.is_some())
+        let tombstone_key = self.key(&encode_worker_dropped_db_tombstone_key(keyspace, db_id));
+        Ok(tikv_op!(txn.get_for_update(tombstone_key).await)?.is_some())
     }
 
-    /// THE single cross-store enqueue path: fence on the dropped-DB tombstone
-    /// (`get_for_update`) and, only if the DB is NOT tombstoned, enqueue the task
-    /// — both in the caller's SAME system transaction. Returns whether the task
-    /// was enqueued (`false` = the DB was dropped, enqueue suppressed).
+    pub async fn scan_dropping_db_intents_page(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<DroppingDbIntent>, Option<Vec<u8>>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let prefix = encode_worker_dropping_db_intent_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0x00);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(Some(limit))).await)?;
+        let mut intents = Vec::new();
+        let mut last_key = None;
+        let mut scanned = 0usize;
+        for pair in pairs {
+            scanned += 1;
+            let key: &[u8] = pair.key().as_ref().into();
+            last_key = Some(key.to_vec());
+            let Some((keyspace, db_id)) = decode_worker_dropping_db_intent_key(key) else {
+                continue;
+            };
+            let created_at_ms = decode_dropping_db_intent_created_at(pair.value());
+            intents.push(DroppingDbIntent {
+                keyspace,
+                db_id,
+                created_at_ms,
+            });
+        }
+
+        let next_cursor = if scanned == limit { last_key } else { None };
+        Ok((intents, next_cursor))
+    }
+
+    /// THE single cross-store enqueue path: fence on the dropped-DB tombstone or
+    /// pre-commit dropping intent (`get_for_update`) and, only if the DB is NOT
+    /// fenced, enqueue the task — both in the caller's SAME system transaction.
+    /// Returns whether the task was enqueued (`false` = the DB was dropped or is
+    /// being dropped, enqueue suppressed).
     ///
     /// All cross-store next-fire producers (cron reconcile, post-exec next-fire,
     /// the SQL cron-enqueue path) MUST route through this so the proactive fence
@@ -312,7 +811,7 @@ impl TikvStore {
         fire_time_ms: i64,
     ) -> Result<bool> {
         if self
-            .dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)
             .await?
         {
             return Ok(false);
@@ -328,12 +827,119 @@ impl TikvStore {
         fire_time_ms: i64,
     ) -> Result<bool> {
         if self
-            .dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)
             .await?
         {
             return Ok(false);
         }
         self.put_singleton_task_v2(txn, entry, fire_time_ms).await
+    }
+
+    /// Fence the dropped-DB tombstone / dropping intent ONCE (`get_for_update`)
+    /// and, only if the DB is not fenced, write BOTH the `_sys_worker` registry
+    /// inventory bit AND the queue row — all in the caller's SAME system
+    /// transaction. Returns whether the task was enqueued (`false` = the DB was
+    /// dropped/being dropped, the whole enqueue suppressed).
+    ///
+    /// Why a dedicated helper: direct SQL producers write the registry inventory
+    /// row in addition to the queue row, and BOTH are `_sys_worker` rows that must
+    /// not survive for a dropped db_id. If the registry write were done before the
+    /// fence (or outside it), a strictly-sequential `DROP DATABASE` (which commits
+    /// the tombstone PUT, the registry delete, and the queue reap) followed by a
+    /// producer for that db_id would re-create a stale registry inventory row even
+    /// though the queue row is suppressed — degrading back to self-healing
+    /// registry-sweep cleanup and violating the "no stale `_sys_worker` row"
+    /// invariant. Folding the registry write under the SAME tombstone
+    /// `get_for_update` closes that gap: a concurrent DROP-reap (tombstone PUT)
+    /// and this enqueue serialize on the tombstone key, so exactly one commits,
+    /// and on retry the fence suppresses registry AND queue together.
+    pub async fn enqueue_registry_task_v2_unless_db_dropped(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+        task_type_bit: u8,
+    ) -> Result<bool> {
+        if entry.task_type.to_bitmask() != task_type_bit {
+            return Err(anyhow!(
+                "registry task bit {:?} does not match queue entry task type {:?}",
+                task_type_bit,
+                entry.task_type
+            ));
+        }
+        if self
+            .dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.update_registry_task_types(txn, &entry.keyspace, entry.db_id, task_type_bit, 0)
+            .await?;
+        self.put_task_v2(txn, entry, fire_time_ms).await?;
+        Ok(true)
+    }
+
+    /// One-shot post-commit producer path for work that cannot be reconstructed
+    /// from tenant state in this PR. A terminal tombstone suppresses it; a
+    /// transient dropping intent does not. If DROP commits, its tombstone+reap
+    /// path removes any race-won queue/registry rows before finalizing cleanup.
+    pub async fn enqueue_registry_task_v2_unless_db_tombstoned(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+        task_type_bit: u8,
+    ) -> Result<bool> {
+        if entry.task_type.to_bitmask() != task_type_bit {
+            return Err(anyhow!(
+                "registry task bit {:?} does not match queue entry task type {:?}",
+                task_type_bit,
+                entry.task_type
+            ));
+        }
+        if self
+            .dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.update_registry_task_types(txn, &entry.keyspace, entry.db_id, task_type_bit, 0)
+            .await?;
+        self.put_task_v2(txn, entry, fire_time_ms).await?;
+        Ok(true)
+    }
+
+    /// Singleton variant of `enqueue_registry_task_v2_unless_db_dropped`.
+    ///
+    /// If the singleton work already exists, this still refreshes the registry bit
+    /// under the same enqueue fence. A `false` return means either the DB was
+    /// fenced before any writes, or the singleton was already pending/claimed; in
+    /// both cases callers should commit/rollback according to their local flow and
+    /// must not attempt a raw enqueue fallback.
+    pub async fn enqueue_singleton_registry_task_v2_unless_db_dropped(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+        task_type_bit: u8,
+    ) -> Result<bool> {
+        if entry.task_type.to_bitmask() != task_type_bit {
+            return Err(anyhow!(
+                "registry task bit {:?} does not match queue entry task type {:?}",
+                task_type_bit,
+                entry.task_type
+            ));
+        }
+        if self
+            .dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        let enqueued = self.put_singleton_task_v2(txn, entry, fire_time_ms).await?;
+        self.update_registry_task_types(txn, &entry.keyspace, entry.db_id, task_type_bit, 0)
+            .await?;
+        Ok(enqueued)
     }
 
     /// SQL cron-enqueue path (`cron.schedule` / `cron.alter_job`): fence the
@@ -342,19 +948,6 @@ impl TikvStore {
     /// next-fire queue row — all in the caller's SAME system transaction. Returns
     /// whether the cron job was enqueued (`false` = the DB was dropped, the whole
     /// enqueue suppressed).
-    ///
-    /// Why a dedicated helper: the cron SQL path writes the registry inventory row
-    /// in addition to the queue row, and BOTH are `_sys_worker` rows that must not
-    /// survive for a dropped db_id. If the registry write were done before the
-    /// fence (or outside it), a strictly-sequential `DROP DATABASE` (which commits
-    /// the tombstone PUT, the registry delete, and the queue reap) followed by a
-    /// `cron.schedule` for that db_id would re-create a stale registry inventory row
-    /// even though the queue row is suppressed — degrading back to self-healing
-    /// registry-sweep cleanup and violating the "no stale `_sys_worker` row"
-    /// invariant (issue #2628 item 2). Folding the registry write under the SAME
-    /// tombstone `get_for_update` closes that gap: a concurrent DROP-reap (tombstone
-    /// PUT) and this enqueue serialize on the tombstone key, so exactly one commits,
-    /// and on retry the tombstone forces suppression of registry AND queue together.
     ///
     /// The two engine-side cross-store sites (cron reconcile, post-exec next-fire)
     /// do NOT touch the registry — they enqueue into an already-registered
@@ -365,19 +958,38 @@ impl TikvStore {
         entry: &TaskQueueEntry,
         fire_time_ms: i64,
     ) -> Result<bool> {
+        self.enqueue_registry_task_v2_unless_db_dropped(txn, entry, fire_time_ms, TASK_TYPE_CRON)
+            .await
+    }
+
+    /// Registry-only writer variant: fence the dropped-DB tombstone / dropping
+    /// intent (`get_for_update`) and only then mutate the `_sys_worker` registry
+    /// inventory row in the caller's SAME system transaction.
+    ///
+    /// Use this for DDL journal / HNSW registry inventory paths that do not create
+    /// a queue row at the same time. A raw registry bit update can resurrect a
+    /// registry row after DROP has tombstoned and reaped the DB, so the raw helper
+    /// stays private and production callers must use this fenced entry point.
+    pub async fn update_registry_task_types_unless_db_dropped(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        set_bits: u8,
+        clear_bits: u8,
+    ) -> Result<bool> {
         if self
-            .dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .dropped_db_enqueue_fence_exists_for_update(txn, keyspace, db_id)
             .await?
         {
             return Ok(false);
         }
-        self.update_registry_task_types(txn, &entry.keyspace, entry.db_id, TASK_TYPE_CRON, 0)
+        self.update_registry_task_types(txn, keyspace, db_id, set_bits, clear_bits)
             .await?;
-        self.put_task_v2(txn, entry, fire_time_ms).await?;
         Ok(true)
     }
 
-    pub async fn update_registry_task_types(
+    async fn update_registry_task_types(
         &self,
         txn: &mut Transaction,
         keyspace: &str,
@@ -525,22 +1137,20 @@ impl TikvStore {
 
         let mut intents = Vec::new();
         let mut last_key = None;
+        let mut scanned = 0usize;
         for pair in pairs {
+            scanned += 1;
             let key: &[u8] = pair.key().as_ref().into();
+            last_key = Some(key.to_vec());
             if !key.starts_with(&prefix) {
                 continue;
             }
             let intent = bincode::deserialize(pair.value())
                 .with_context(|| format!("Failed to deserialize {label}"))?;
             intents.push(intent);
-            last_key = Some(key.to_vec());
         }
 
-        let next_cursor = if intents.len() == limit {
-            last_key
-        } else {
-            None
-        };
+        let next_cursor = if scanned == limit { last_key } else { None };
         Ok((intents, next_cursor))
     }
 
@@ -705,7 +1315,7 @@ impl TikvStore {
     /// out-of-line payload, all in the SAME transaction. All production enqueue
     /// paths must use this so the three rows never drift apart within a
     /// committed transaction.
-    pub async fn put_task_v2(
+    async fn put_task_v2(
         &self,
         txn: &mut Transaction,
         entry: &TaskQueueEntry,
@@ -762,7 +1372,7 @@ impl TikvStore {
     /// older nonce. That leaves the newer row behind after successful cleanup and
     /// causes immediate redundant execution. Callers that deliberately want
     /// replacement semantics must use a non-deterministic key or delete first.
-    pub async fn put_singleton_task_v2(
+    async fn put_singleton_task_v2(
         &self,
         txn: &mut Transaction,
         entry: &TaskQueueEntry,
@@ -1583,19 +2193,209 @@ impl TikvStore {
     }
 
     // ========================================================================
+    // DB lifecycle methods (Core tenant identity and process liveness)
+    // ========================================================================
+
+    /// Publish this SQL process's DB lifecycle process-liveness probe.
+    ///
+    /// This is deliberately not the stable node lease / drain-state row. The
+    /// versioned value prevents a future lifecycle reader from mistaking this
+    /// scaffold-only process heartbeat for node-drain truth.
+    pub async fn put_lifecycle_process_liveness(
+        &self,
+        txn: &mut Transaction,
+        process_instance_id: &str,
+        updated_at_version: u64,
+        self_fence_after_ms: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_lifecycle_process_liveness_key(process_instance_id));
+        let data = encode_lifecycle_process_liveness_value(updated_at_version, self_fence_after_ms);
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    /// Delete this process's DB lifecycle process-liveness probe during graceful shutdown.
+    pub async fn delete_lifecycle_process_liveness(
+        &self,
+        txn: &mut Transaction,
+        process_instance_id: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_lifecycle_process_liveness_key(process_instance_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
+    /// Allocate a globally monotonic tenant incarnation from the Core lifecycle
+    /// domain. Callers must treat a successful allocation as consumed even if a
+    /// later tenant-local stamp fails; gaps are safe, reuse is not.
+    pub async fn allocate_lifecycle_tenant_incarnation(
+        &self,
+        txn: &mut Transaction,
+    ) -> Result<u64> {
+        const FIRST_TENANT_INCARNATION: u64 = 1;
+
+        let key = self.key(&encode_lifecycle_tenant_incarnation_seq_key());
+        let current = tikv_op!(txn.get_for_update(key.clone()).await)?;
+        let next = match current {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid lifecycle incarnation sequence format"))?;
+                u64::from_be_bytes(bytes)
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Lifecycle tenant incarnation overflow"))?
+            }
+            None => FIRST_TENANT_INCARNATION,
+        };
+        txn_put(txn, key, next.to_be_bytes().to_vec()).await?;
+        Ok(next)
+    }
+
+    /// Upsert the authoritative Core lifecycle inventory row for a tenant DB.
+    pub async fn put_lifecycle_tenant_record(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        incarnation: u64,
+        status: LifecycleTenantStatus,
+        updated_at_version: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_lifecycle_tenant_key(keyspace, db_id));
+        let value = encode_lifecycle_tenant_value(incarnation, status, updated_at_version);
+        txn_put(txn, key, value).await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_lifecycle_tenant_record(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<Option<LifecycleTenantRecord>> {
+        let key = self.key(&encode_lifecycle_tenant_key(keyspace, db_id));
+        let Some(value) = tikv_op!(txn.get(key).await)? else {
+            return Ok(None);
+        };
+        let (incarnation, status, updated_at_version) = decode_lifecycle_tenant_value(&value)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to decode lifecycle tenant record for keyspace='{}' db_id={}",
+                    keyspace,
+                    db_id
+                )
+            })?;
+        Ok(Some(LifecycleTenantRecord {
+            keyspace: keyspace.to_string(),
+            db_id,
+            incarnation,
+            status,
+            updated_at_version,
+        }))
+    }
+
+    pub async fn get_lifecycle_tenant_record_for_update(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<Option<LifecycleTenantRecord>> {
+        let key = self.key(&encode_lifecycle_tenant_key(keyspace, db_id));
+        let Some(value) = tikv_op!(txn.get_for_update(key).await)? else {
+            return Ok(None);
+        };
+        let (incarnation, status, updated_at_version) = decode_lifecycle_tenant_value(&value)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to decode lifecycle tenant record for keyspace='{}' db_id={}",
+                    keyspace,
+                    db_id
+                )
+            })?;
+        Ok(Some(LifecycleTenantRecord {
+            keyspace: keyspace.to_string(),
+            db_id,
+            incarnation,
+            status,
+            updated_at_version,
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub async fn scan_lifecycle_tenant_records_page(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<LifecycleTenantRecord>, Option<Vec<u8>>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let prefix = encode_lifecycle_tenant_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next = last_key.to_vec();
+                next.push(0x00);
+                next
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(Some(limit))).await)?;
+
+        let mut records = Vec::new();
+        let mut last_key = None;
+        let mut scanned = 0usize;
+        for pair in pairs {
+            scanned += 1;
+            let key: &[u8] = pair.key().as_ref().into();
+            last_key = Some(key.to_vec());
+            let Some((keyspace, db_id)) = decode_lifecycle_tenant_key(key) else {
+                continue;
+            };
+            let Some((incarnation, status, updated_at_version)) =
+                decode_lifecycle_tenant_value(pair.value())
+            else {
+                tracing::warn!(
+                    keyspace,
+                    db_id,
+                    "skipping malformed lifecycle tenant record"
+                );
+                continue;
+            };
+            records.push(LifecycleTenantRecord {
+                keyspace,
+                db_id,
+                incarnation,
+                status,
+                updated_at_version,
+            });
+        }
+
+        let next_cursor = if scanned == limit { last_key } else { None };
+        Ok((records, next_cursor))
+    }
+
+    // ========================================================================
     // GC instance state methods (shared cross-instance registry)
     // ========================================================================
 
-    /// GC instance state stored in `_sys_worker` for cross-instance coordination.
+    /// GC instance state stored in the configured registry for cross-instance coordination.
     pub async fn put_gc_instance_state(
         &self,
         txn: &mut Transaction,
         instance_id: &str,
         min_start_ts: Option<u64>,
         updated_at_version: u64,
+        publish_mode: GcPublishMode,
     ) -> Result<()> {
         let key = self.key(&encode_gc_instance_state_key(instance_id));
-        let data = encode_gc_instance_state_value(min_start_ts, updated_at_version);
+        let data = encode_gc_instance_state_value(min_start_ts, updated_at_version, publish_mode);
         txn_put(txn, key, data).await?;
         Ok(())
     }
@@ -1622,11 +2422,12 @@ impl TikvStore {
             return Ok(None);
         };
         Ok(decode_gc_instance_state_value(&data).map(
-            |(min_start_ts, updated_at_version, legacy_max_untracked_timeout_sec)| {
+            |(min_start_ts, updated_at_version, publish_mode, legacy_max_untracked_timeout_sec)| {
                 GcInstanceState {
                     instance_id: instance_id.to_string(),
                     min_start_ts,
                     updated_at_version,
+                    publish_mode,
                     legacy_max_untracked_timeout_sec,
                 }
             },
@@ -1654,13 +2455,14 @@ impl TikvStore {
 
             // Accept both the current 17-byte format and the older 25-byte
             // format that appended max_untracked_timeout_sec.
-            if let Some((min_ts, updated_at, legacy_max_untracked_timeout_sec)) =
+            if let Some((min_ts, updated_at, publish_mode, legacy_max_untracked_timeout_sec)) =
                 decode_gc_instance_state_value(pair.value())
             {
                 results.push(GcInstanceState {
                     instance_id,
                     min_start_ts: min_ts,
                     updated_at_version: updated_at,
+                    publish_mode,
                     legacy_max_untracked_timeout_sec,
                 });
             }
@@ -1689,21 +2491,45 @@ mod tests {
 
     #[test]
     fn gc_instance_state_value_round_trips_current_format() {
-        let encoded = encode_gc_instance_state_value(Some(123), 456);
+        let encoded = encode_gc_instance_state_value(Some(123), 456, GcPublishMode::DualWrite);
         assert_eq!(encoded.len(), GC_INSTANCE_STATE_VALUE_LEN);
         assert_eq!(
             decode_gc_instance_state_value(&encoded),
-            Some((Some(123), 456, None))
+            Some((Some(123), 456, GcPublishMode::DualWrite, None))
+        );
+    }
+
+    #[test]
+    fn test_gc_publish_mode_backward_compatibility() {
+        let mut encoded = Vec::new();
+        encoded.push(1);
+        encoded.extend_from_slice(&123u64.to_be_bytes());
+        encoded.extend_from_slice(&456u64.to_be_bytes());
+        assert_eq!(encoded.len(), GC_INSTANCE_STATE_BASE_VALUE_LEN);
+        assert_eq!(
+            decode_gc_instance_state_value(&encoded),
+            Some((Some(123), 456, GcPublishMode::OldOnly, None))
+        );
+
+        encoded.extend_from_slice(&789u64.to_be_bytes());
+        assert_eq!(encoded.len(), LEGACY_GC_INSTANCE_STATE_VALUE_LEN);
+        assert_eq!(
+            decode_gc_instance_state_value(&encoded),
+            Some((Some(123), 456, GcPublishMode::OldOnly, Some(789)))
         );
     }
 
     #[test]
     fn gc_instance_state_value_decodes_legacy_format_with_timeout_tail() {
-        let mut encoded = encode_gc_instance_state_value(Some(123), 456);
+        let mut encoded = Vec::new();
+        encoded.push(1);
+        encoded.extend_from_slice(&123u64.to_be_bytes());
+        encoded.extend_from_slice(&456u64.to_be_bytes());
         encoded.extend_from_slice(&789u64.to_be_bytes());
+        assert_eq!(encoded.len(), LEGACY_GC_INSTANCE_STATE_VALUE_LEN);
         assert_eq!(
             decode_gc_instance_state_value(&encoded),
-            Some((Some(123), 456, Some(789)))
+            Some((Some(123), 456, GcPublishMode::OldOnly, Some(789)))
         );
     }
 
@@ -1712,6 +2538,40 @@ mod tests {
         let prefix = b"_sys_worker_gc_instance_abc".to_vec();
         let end = gc_instance_state_scan_end(&prefix);
         assert_eq!(end, [prefix, vec![0xFF]].concat());
+    }
+
+    #[test]
+    fn lifecycle_process_liveness_value_is_versioned_scaffold_envelope() {
+        let encoded = encode_lifecycle_process_liveness_value(123, 60_000);
+        assert_eq!(encoded.len(), 17);
+        assert_eq!(encoded[0], LIFECYCLE_PROCESS_LIVENESS_VALUE_VERSION);
+        assert_eq!(u64::from_be_bytes(encoded[1..9].try_into().unwrap()), 123);
+        assert_eq!(
+            u64::from_be_bytes(encoded[9..17].try_into().unwrap()),
+            60_000
+        );
+    }
+
+    #[test]
+    fn lifecycle_tenant_value_is_versioned_authoritative_inventory_envelope() {
+        let encoded = encode_lifecycle_tenant_value(123, LifecycleTenantStatus::Live, 456);
+        assert_eq!(encoded.len(), LIFECYCLE_TENANT_VALUE_LEN);
+        assert_eq!(encoded[0], LIFECYCLE_TENANT_VALUE_VERSION);
+        assert_eq!(
+            decode_lifecycle_tenant_value(&encoded),
+            Some((123, LifecycleTenantStatus::Live, 456))
+        );
+
+        let dropped = encode_lifecycle_tenant_value(123, LifecycleTenantStatus::Dropped, 789);
+        assert_eq!(
+            decode_lifecycle_tenant_value(&dropped),
+            Some((123, LifecycleTenantStatus::Dropped, 789))
+        );
+
+        assert_eq!(decode_lifecycle_tenant_value(&encoded[..17]), None);
+        let mut bad_status = encoded.clone();
+        bad_status[1] = 99;
+        assert_eq!(decode_lifecycle_tenant_value(&bad_status), None);
     }
 
     #[test]
@@ -1739,12 +2599,17 @@ mod tests {
     fn raw_worker_registry_delete_is_not_public_api() {
         let source = include_str!("worker.rs");
         let prod_source = source
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("worker.rs must contain #[cfg(test)]");
+            .expect("worker.rs must contain #[cfg(test)] mod tests");
         assert!(
             !prod_source.contains("pub async fn delete_worker_registry"),
             "direct registry delete must stay private; production cleanup must go through the ordered helper"
+        );
+        assert!(
+            !prod_source.contains("pub async fn put_worker_registry")
+                && prod_source.contains("async fn put_worker_registry"),
+            "direct registry put must stay private; production writers must go through fenced helpers"
         );
     }
 
@@ -1752,9 +2617,9 @@ mod tests {
     fn storage_dirty_marker_producers_are_removed() {
         let source = include_str!("worker.rs");
         let prod_source = source
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("worker.rs must contain #[cfg(test)]");
+            .expect("worker.rs must contain #[cfg(test)] mod tests");
         assert!(
             !prod_source.contains("mark_storage_size_dirty")
                 && !prod_source.contains("get_storage_size_dirty_marker")
@@ -1769,14 +2634,222 @@ mod tests {
             .and_then(|rest| rest.split("/// SQL cron-enqueue path").next())
             .expect("dropped-DB fenced singleton helper must exist");
         let singleton_fence_pos = singleton_fn
-            .find("dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)")
-            .expect("fenced singleton helper must check the tombstone");
+            .find("dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)")
+            .expect("fenced singleton helper must check the dropping/tombstone fence");
         let singleton_put_pos = singleton_fn
             .find("put_singleton_task_v2(txn, entry, fire_time_ms)")
             .expect("fenced singleton helper must delegate to singleton enqueue");
         assert!(
             singleton_fence_pos < singleton_put_pos,
             "fenced singleton enqueue must check tombstone before writing queue rows"
+        );
+    }
+
+    #[test]
+    fn registry_enqueue_helpers_fence_before_registry_and_queue_writes() {
+        let source = include_str!("worker.rs");
+        let registry_fn = source
+            .split("pub async fn enqueue_registry_task_v2_unless_db_dropped")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// Singleton variant of `enqueue_registry_task_v2_unless_db_dropped`")
+                    .next()
+            })
+            .expect("registry enqueue helper must exist");
+        let fence_pos = registry_fn
+            .find("dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)")
+            .expect("registry enqueue helper must check the dropping/tombstone fence");
+        let registry_pos = registry_fn
+            .find("update_registry_task_types(txn, &entry.keyspace, entry.db_id, task_type_bit, 0)")
+            .expect("registry enqueue helper must update the registry inventory");
+        let put_pos = registry_fn
+            .find("put_task_v2(txn, entry, fire_time_ms)")
+            .expect("registry enqueue helper must write the queue row");
+        assert!(
+            fence_pos < registry_pos && registry_pos < put_pos,
+            "registry enqueue helper must take the enqueue fence before writing registry and queue rows"
+        );
+
+        let singleton_fn = source
+            .split("pub async fn enqueue_singleton_registry_task_v2_unless_db_dropped")
+            .nth(1)
+            .and_then(|rest| rest.split("/// SQL cron-enqueue path").next())
+            .expect("singleton registry enqueue helper must exist");
+        let singleton_fence_pos = singleton_fn
+            .find("dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)")
+            .expect("singleton registry helper must check the dropping/tombstone fence");
+        let singleton_put_pos = singleton_fn
+            .find("put_singleton_task_v2(txn, entry, fire_time_ms)")
+            .expect("singleton registry helper must use singleton enqueue");
+        let singleton_registry_pos = singleton_fn
+            .find("update_registry_task_types(txn, &entry.keyspace, entry.db_id, task_type_bit, 0)")
+            .expect("singleton registry helper must update the registry inventory");
+        assert!(
+            singleton_fence_pos < singleton_put_pos && singleton_put_pos < singleton_registry_pos,
+            "singleton registry enqueue helper must fence first, then enqueue/dedupe, then refresh registry"
+        );
+    }
+
+    #[test]
+    fn one_shot_registry_enqueue_helper_uses_terminal_tombstone_only() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn enqueue_registry_task_v2_unless_db_tombstoned")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("/// Singleton variant of `enqueue_registry_task_v2_unless_db_dropped`")
+                    .next()
+            })
+            .expect("tombstone-only one-shot registry helper must exist");
+        let tombstone_pos = helper
+            .find("dropped_db_tombstone_exists_for_update(txn, &entry.keyspace, entry.db_id)")
+            .expect("one-shot helper must check only the terminal tombstone");
+        let registry_pos = helper
+            .find("update_registry_task_types(txn, &entry.keyspace, entry.db_id, task_type_bit, 0)")
+            .expect("one-shot helper must update registry inventory");
+        let put_pos = helper
+            .find("put_task_v2(txn, entry, fire_time_ms)")
+            .expect("one-shot helper must write the queue row");
+
+        assert!(
+            tombstone_pos < registry_pos && registry_pos < put_pos,
+            "one-shot helper must check the terminal tombstone before registry and queue writes"
+        );
+        assert!(
+            !helper.contains("dropped_db_enqueue_fence_exists_for_update")
+                && !helper.contains("DroppingIntent"),
+            "one-shot helper must not permanently suppress committed work on a transient dropping intent"
+        );
+    }
+
+    #[test]
+    fn registry_only_helper_fences_before_registry_write() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn update_registry_task_types_unless_db_dropped")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn update_registry_task_types").next())
+            .expect("fenced registry-only helper must exist");
+        let fence_pos = helper
+            .find("dropped_db_enqueue_fence_exists_for_update(txn, keyspace, db_id)")
+            .expect("registry-only helper must check the dropping/tombstone fence");
+        let update_pos = helper
+            .find("update_registry_task_types(txn, keyspace, db_id, set_bits, clear_bits)")
+            .expect("registry-only helper must delegate to raw registry update");
+        assert!(
+            fence_pos < update_pos,
+            "registry-only helper must take the enqueue fence before writing registry rows"
+        );
+    }
+
+    #[test]
+    fn raw_v2_enqueue_and_registry_primitives_are_not_public_api() {
+        let source = include_str!("worker.rs");
+        let prod_source = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("worker.rs must contain #[cfg(test)] mod tests");
+        assert!(
+            !prod_source.contains("pub async fn put_task_v2(")
+                && prod_source.contains("async fn put_task_v2("),
+            "raw V2 enqueue must stay private; production callers must use fenced helpers"
+        );
+        assert!(
+            !prod_source.contains("pub async fn put_singleton_task_v2(")
+                && prod_source.contains("async fn put_singleton_task_v2("),
+            "raw singleton V2 enqueue must stay private; production callers must use fenced helpers"
+        );
+        assert!(
+            !prod_source.contains("pub async fn update_registry_task_types(")
+                && prod_source.contains("async fn update_registry_task_types("),
+            "raw registry bit update must stay private; production callers must use the fenced registry helper"
+        );
+    }
+
+    #[test]
+    fn sql_worker_task_producers_do_not_call_raw_v2_enqueue_or_registry_update() {
+        let sources = [
+            include_str!("../../sql/executor/core/mod.rs"),
+            include_str!("../../sql/executor/dml_analyzed/mod.rs"),
+            include_str!("../../sql/ddl/create_index.rs"),
+            include_str!("../../sql/executor/bg_sql.rs"),
+            include_str!("../../sql/executor/procedure/materialized_views.rs"),
+            include_str!("../../sql/ddl/create_table.rs"),
+        ];
+
+        for source in sources {
+            assert!(
+                !source.contains(".put_task_v2(") && !source.contains(".put_singleton_task_v2("),
+                "SQL worker producers must route through dropped-DB fenced enqueue helpers"
+            );
+            assert!(
+                !source.contains(".update_registry_task_types("),
+                "SQL worker registry-only producers must route through the dropped-DB fenced registry helper"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_scan_cursor_advances_on_physical_rows() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn scan_lifecycle_tenant_records_page")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split(
+                    "// ========================================================================",
+                )
+                .next()
+            })
+            .expect("lifecycle tenant scan helper must exist");
+        let scanned_pos = helper
+            .find("scanned += 1")
+            .expect("lifecycle scan must count physical rows");
+        let last_key_pos = helper
+            .find("last_key = Some(key.to_vec())")
+            .expect("lifecycle scan must advance cursor from physical keys");
+        let decode_pos = helper
+            .find("decode_lifecycle_tenant_key(key)")
+            .expect("lifecycle scan must decode tenant keys");
+
+        assert!(
+            scanned_pos < decode_pos && last_key_pos < decode_pos,
+            "lifecycle scan must advance physical cursor before malformed rows can be skipped"
+        );
+        assert!(
+            helper.contains("let next_cursor = if scanned == limit"),
+            "lifecycle scan continuation must depend on scanned physical rows, not decoded record count"
+        );
+    }
+
+    #[test]
+    fn registry_and_intent_scans_advance_cursor_on_physical_rows() {
+        let source = include_str!("worker.rs");
+        let registry_scan = source
+            .split("pub async fn scan_worker_registry_page")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn delete_worker_registry").next())
+            .expect("worker registry scan helper must exist");
+        assert!(
+            registry_scan.contains("scanned += 1")
+                && registry_scan.contains("let next_cursor = if scanned == limit"),
+            "worker registry scan cursor must be based on physical rows scanned"
+        );
+
+        let intent_scan = source
+            .split("async fn scan_external_intent_page")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split(
+                    "// ========================================================================",
+                )
+                .next()
+            })
+            .expect("external object intent scan helper must exist");
+        assert!(
+            intent_scan.contains("scanned += 1")
+                && intent_scan.contains("let next_cursor = if scanned == limit"),
+            "external object intent scan cursor must be based on physical rows scanned"
         );
     }
 
@@ -1874,7 +2947,7 @@ mod tests {
     fn singleton_enqueue_checks_pending_and_claim_before_put() {
         let source = include_str!("worker.rs");
         let helper = source
-            .split("pub async fn put_singleton_task_v2")
+            .split("async fn put_singleton_task_v2")
             .nth(1)
             .and_then(|rest| rest.split("pub async fn delete_task_v2").next())
             .expect("singleton enqueue helper must exist before delete_task_v2");

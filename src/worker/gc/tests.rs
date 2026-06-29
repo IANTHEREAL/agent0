@@ -59,6 +59,7 @@ fn cluster_safepoint_ignores_stale_instances() {
         instance_id: "stale".to_string(),
         min_start_ts: Some(time_based.saturating_sub(10_000)),
         updated_at_version: stale_version,
+        publish_mode: GcPublishMode::DualWrite,
         legacy_max_untracked_timeout_sec: None,
     }];
 
@@ -80,12 +81,14 @@ fn cluster_safepoint_clamps_to_oldest_live_transaction() {
             instance_id: "a".to_string(),
             min_start_ts: Some((9_500_000u64 << 18) + 7),
             updated_at_version: live_updated_at,
+            publish_mode: GcPublishMode::DualWrite,
             legacy_max_untracked_timeout_sec: None,
         },
         GcInstanceState {
             instance_id: "b".to_string(),
             min_start_ts: Some((9_300_000u64 << 18) + 9),
             updated_at_version: live_updated_at,
+            publish_mode: GcPublishMode::DualWrite,
             legacy_max_untracked_timeout_sec: None,
         },
     ];
@@ -109,12 +112,14 @@ fn stale_gc_instance_ids_only_returns_stale_rows() {
             instance_id: "live".to_string(),
             min_start_ts: None,
             updated_at_version: live_updated_at,
+            publish_mode: GcPublishMode::DualWrite,
             legacy_max_untracked_timeout_sec: None,
         },
         GcInstanceState {
             instance_id: "stale".to_string(),
             min_start_ts: Some((9_300_000u64 << 18) + 9),
             updated_at_version: stale_updated_at,
+            publish_mode: GcPublishMode::DualWrite,
             legacy_max_untracked_timeout_sec: None,
         },
     ];
@@ -122,6 +127,58 @@ fn stale_gc_instance_ids_only_returns_stale_rows() {
     assert_eq!(
         stale_gc_instance_ids(current_version, hb_timeout, &states),
         vec!["stale".to_string()]
+    );
+}
+
+#[test]
+fn e2e_old_only_publisher_blocks_new_mode() {
+    let current_version = 10_000_000u64 << 18;
+    let hb_timeout = 600;
+    let stale_updated_at = compute_safepoint_version(current_version, hb_timeout).saturating_sub(1);
+    let states = vec![
+        GcInstanceState {
+            instance_id: "old-live".to_string(),
+            min_start_ts: None,
+            updated_at_version: current_version,
+            publish_mode: GcPublishMode::OldOnly,
+            legacy_max_untracked_timeout_sec: None,
+        },
+        GcInstanceState {
+            instance_id: "dual-live".to_string(),
+            min_start_ts: None,
+            updated_at_version: current_version,
+            publish_mode: GcPublishMode::DualWrite,
+            legacy_max_untracked_timeout_sec: None,
+        },
+        GcInstanceState {
+            instance_id: "old-stale".to_string(),
+            min_start_ts: None,
+            updated_at_version: stale_updated_at,
+            publish_mode: GcPublishMode::OldOnly,
+            legacy_max_untracked_timeout_sec: None,
+        },
+    ];
+
+    assert_eq!(
+        live_old_only_gc_publishers(current_version, hb_timeout, &states),
+        vec!["old-live".to_string()],
+        "only live old-only publishers should block a future new-only GC registry gate"
+    );
+}
+
+#[test]
+fn gc_publish_mode_tracks_registry_mode() {
+    assert_eq!(
+        gc_publish_mode_for_registry_mode(GcRegistryMode::Legacy),
+        GcPublishMode::OldOnly
+    );
+    assert_eq!(
+        gc_publish_mode_for_registry_mode(GcRegistryMode::Migrating),
+        GcPublishMode::DualWrite
+    );
+    assert_eq!(
+        gc_publish_mode_for_registry_mode(GcRegistryMode::New),
+        GcPublishMode::NewPrimary
     );
 }
 
@@ -134,6 +191,7 @@ fn cluster_gc_life_time_honors_live_legacy_timeout_floor() {
         instance_id: "legacy".to_string(),
         min_start_ts: None,
         updated_at_version: current_version,
+        publish_mode: GcPublishMode::OldOnly,
         legacy_max_untracked_timeout_sec: Some(3_600),
     }];
 
@@ -157,6 +215,7 @@ fn cluster_gc_life_time_ignores_stale_legacy_timeout_floor() {
         instance_id: "stale-legacy".to_string(),
         min_start_ts: None,
         updated_at_version: stale_updated_at,
+        publish_mode: GcPublishMode::OldOnly,
         legacy_max_untracked_timeout_sec: Some(3_600),
     }];
 
@@ -392,6 +451,134 @@ fn gc_stale_reaper_rechecks_current_row_before_delete() {
 }
 
 #[test]
+fn gc_registry_store_targets_follow_legacy_and_migrating_modes() {
+    let legacy = crate::storage::TikvStore::new_stub();
+    let new = crate::storage::TikvStore::new_stub();
+    let registry = GcRegistryStores::new(Some(legacy), Some(new.clone()));
+
+    assert_eq!(
+        registry
+            .publish_targets(GcRegistryMode::Legacy)
+            .expect("legacy targets")
+            .len(),
+        1
+    );
+    assert_eq!(
+        registry
+            .publish_targets(GcRegistryMode::Migrating)
+            .expect("migrating targets")
+            .len(),
+        2,
+        "migrating mode must dual-write legacy + new GC registries"
+    );
+    assert_eq!(
+        registry
+            .scan_sources(GcRegistryMode::Migrating)
+            .expect("migrating sources")
+            .len(),
+        2,
+        "migrating mode must union-read legacy + new GC registries"
+    );
+    assert_eq!(
+        registry
+            .publish_targets(GcRegistryMode::New)
+            .expect("new-only targets")
+            .len(),
+        1,
+        "new-only mode must publish only to the dedicated GC registry"
+    );
+    let new_only = GcRegistryStores::new(None, Some(new));
+    assert_eq!(
+        new_only
+            .scan_sources(GcRegistryMode::New)
+            .expect("new-only sources")
+            .len(),
+        1,
+        "new-only mode must not require the legacy _sys_worker source"
+    );
+}
+
+#[test]
+fn gc_migration_advancer_uses_fail_closed_source_scan() {
+    let source = include_str!("../gc.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("gc.rs must contain #[cfg(test)]");
+    let advance_fn = prod_source
+        .split("async fn advance_gc_safepoint")
+        .nth(1)
+        .and_then(|rest| rest.split("impl WorkerGc").next())
+        .expect("advance_gc_safepoint must exist before WorkerGc impl");
+
+    assert!(
+        advance_fn.contains(
+            "scan_gc_instance_states_from_sources(registry, config.gc_registry_mode).await?"
+        ),
+        "advancer must fail closed if any configured GC registry source cannot be read"
+    );
+}
+
+#[test]
+fn gc_advancer_observes_old_only_publishers_for_new_mode_gate() {
+    let source = include_str!("../gc.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("gc.rs must contain #[cfg(test)]");
+    let advance_fn = prod_source
+        .split("async fn advance_gc_safepoint")
+        .nth(1)
+        .and_then(|rest| rest.split("impl WorkerGc").next())
+        .expect("advance_gc_safepoint must exist before WorkerGc impl");
+
+    assert!(
+        advance_fn.contains("live_old_only_gc_publishers(")
+            && advance_fn.contains("db9_server_gc_old_only_publishers"),
+        "advancer must read publish_mode and expose live old-only publisher count for the future New gate"
+    );
+}
+
+#[test]
+fn gc_publisher_self_fences_before_heartbeat_expires() {
+    let cfg = WorkerConfig {
+        gc_safepoint_interval_sec: 30,
+        ..Default::default()
+    };
+
+    assert!(
+        gc_liveness_self_fence_after(&cfg).as_secs() < heartbeat_timeout_sec(&cfg),
+        "a publisher that cannot refresh liveness must stop serving before advancers can treat it as dead"
+    );
+
+    let source = include_str!("../gc.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("gc.rs must contain #[cfg(test)]");
+    assert!(
+        prod_source.contains("self_fence.cancel()")
+            && prod_source.contains("db9_server_gc_self_fenced"),
+        "publisher failure past the deadline must trigger the process self-fence"
+    );
+    assert!(
+        prod_source.contains("last_successful_publish: Arc<Mutex<Instant>>")
+            && prod_source.contains("read_gc_liveness_last_success")
+            && !prod_source.contains("let mut last_successful_publish = Instant::now()"),
+        "the GC self-fence clock must be shared outside the supervised future so restarts cannot reset the deadline"
+    );
+    assert!(
+        prod_source.contains("GC_REGISTRY_PUBLISH_TIMEOUT_SEC")
+            && prod_source.contains("publish_gc_liveness_once_with_timeout"),
+        "publisher self-fence must also cover wedged publish attempts, not only returned errors"
+    );
+    assert!(
+        prod_source.contains("reap_stale_gc_instance_states_after_publish"),
+        "post-publish stale reaping must stay separate from the liveness success path"
+    );
+}
+
+#[test]
 fn gc_registry_loops_do_not_add_startup_jitter() {
     let source = include_str!("../gc.rs");
     let prod_source = source
@@ -594,6 +781,7 @@ fn live_state(instance_id: &str, min_start_ts: Option<u64>, updated_at_ms: u64) 
         instance_id: instance_id.to_string(),
         min_start_ts,
         updated_at_version: tso(updated_at_ms),
+        publish_mode: GcPublishMode::DualWrite,
         legacy_max_untracked_timeout_sec: None,
     }
 }
@@ -796,6 +984,7 @@ fn e2e_stale_instance_row_does_not_block_gc_advancement() {
         instance_id: "inst-b".to_string(),
         min_start_ts: Some(tso(1_000_000)), // very old start_ts
         updated_at_version: tso(1_000_000), // very old heartbeat
+        publish_mode: GcPublishMode::DualWrite,
         legacy_max_untracked_timeout_sec: None,
     };
 
@@ -897,6 +1086,7 @@ fn e2e_missed_heartbeat_exposes_live_txn_to_gc() {
         instance_id: "inst-stuck".to_string(),
         min_start_ts: Some(txn_start_ts),
         updated_at_version: tso(publish_time_ms),
+        publish_mode: GcPublishMode::DualWrite,
         legacy_max_untracked_timeout_sec: None,
     };
 
@@ -954,6 +1144,7 @@ fn e2e_missed_heartbeat_boundary_exact_life_time_edge() {
         instance_id: "inst-edge".to_string(),
         min_start_ts: Some(txn_start_ts),
         updated_at_version: tso(publish_time_ms),
+        publish_mode: GcPublishMode::DualWrite,
         legacy_max_untracked_timeout_sec: None,
     };
 
@@ -990,6 +1181,7 @@ fn e2e_missed_heartbeat_multi_instance_one_stale_exposes_its_txn() {
         instance_id: "inst-a".to_string(),
         min_start_ts: Some(txn_a),
         updated_at_version: tso(10_000_000),
+        publish_mode: GcPublishMode::DualWrite,
         legacy_max_untracked_timeout_sec: None,
     };
     // inst-b: live (just heartbeated)

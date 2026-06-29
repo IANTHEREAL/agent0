@@ -604,18 +604,16 @@ impl Executor {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as i64;
-                    store.put_task_v2(&mut txn, &entry, now_ms).await?;
-                    store
-                        .update_registry_task_types(
+                    let enqueued = store
+                        .enqueue_registry_task_v2_unless_db_dropped(
                             &mut txn,
-                            &keyspace,
-                            db_id,
+                            &entry,
+                            now_ms,
                             crate::worker::types::TASK_TYPE_AUTO_ANALYZE,
-                            0,
                         )
                         .await?;
                     txn.commit().await?;
-                    Ok(true)
+                    Ok(enqueued)
                 } else {
                     txn.rollback().await.ok();
                     Ok(false)

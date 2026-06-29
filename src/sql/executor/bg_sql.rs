@@ -95,12 +95,18 @@ async fn execute_bg_launch(
     );
 
     let mut sys_txn = system_store.begin().await?;
-    system_store
-        .put_task_v2(&mut sys_txn, &entry, fire_time)
+    let enqueued = system_store
+        .enqueue_registry_task_v2_unless_db_dropped(
+            &mut sys_txn,
+            &entry,
+            fire_time,
+            TASK_TYPE_BG_SQL,
+        )
         .await?;
-    system_store
-        .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_SQL, 0)
-        .await?;
+    if !enqueued {
+        sys_txn.rollback().await.ok();
+        return Err(anyhow!("pg_background_launch: database is being dropped"));
+    }
     sys_txn.commit().await?;
     crate::worker::wake_worker();
 

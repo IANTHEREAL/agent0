@@ -3,6 +3,7 @@ pub mod config;
 pub mod engine;
 pub mod executor_lease;
 pub mod gc;
+pub mod lifecycle;
 pub mod metrics;
 pub(crate) mod pd_region_stats;
 pub mod types;
@@ -115,13 +116,18 @@ impl LeaseCancel {
 
 const DATABASE_INVENTORY_PAGE_SIZE: usize = 256;
 
-/// Always-on worker system store for `_sys_worker` metadata.
+/// Background/legacy worker system store for worker metadata.
 ///
-/// This handle is required by SQL-serving processes even when worker execution
-/// is disabled, because foreground DDL/DML producers must still write durable
-/// recovery metadata. Execution gating lives in `WORKER_EXECUTION_ENABLED`,
-/// not in the presence of this handle.
+/// This handle is not the GC registry handle once the domains split. Execution
+/// gating lives in `WORKER_EXECUTION_ENABLED`, not in the presence of this
+/// handle.
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
+/// Core DB lifecycle store for tenant incarnation and lifecycle metadata.
+///
+/// This must stay separate from the degradable background worker store: SQL
+/// serving and background effect validation depend on lifecycle identity even
+/// when background dispatch is disabled or unavailable.
+static DB_LIFECYCLE_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
 static WORKER_EXECUTION_ENABLED: AtomicBool = AtomicBool::new(false);
 
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
@@ -211,23 +217,46 @@ pub(crate) fn now_epoch_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Set the global system store. Called once during startup.
+/// Set the global background/legacy worker store. Called once when the
+/// degradable background domain is available during startup.
 pub fn set_system_store(store: Arc<TikvStore>) {
     SYSTEM_STORE.set(store).ok(); // Ignore if already set
 }
 
-/// Get the global system store. Production startup sets this unconditionally;
-/// tests may still observe None when they call producer helpers directly.
+/// Set the global Core DB lifecycle store. Called once during startup before
+/// SQL admission opens.
+pub fn set_db_lifecycle_store(store: Arc<TikvStore>) {
+    DB_LIFECYCLE_STORE.set(store).ok(); // Ignore if already set
+}
+
+/// Get the global background/legacy worker store. Returns `None` when the
+/// degradable background domain is unavailable; direct background APIs should
+/// error and opportunistic producers should skip/defer in that mode.
 pub fn get_system_store() -> Option<&'static Arc<TikvStore>> {
     SYSTEM_STORE.get()
 }
 
-/// Get the always-on system store, failing closed if startup did not initialize
-/// the required `_sys_worker` handle.
+/// Get the global Core DB lifecycle store.
+pub fn get_db_lifecycle_store() -> Option<&'static Arc<TikvStore>> {
+    DB_LIFECYCLE_STORE.get()
+}
+
+/// Get the background/legacy worker store, failing closed when a caller cannot
+/// proceed without durable background metadata.
 pub fn system_store() -> Result<&'static Arc<TikvStore>> {
     get_system_store().ok_or_else(|| {
         anyhow::anyhow!(
             "worker system store is not initialized; recovery metadata cannot be written"
+        )
+    })
+}
+
+/// Get the Core DB lifecycle store, failing closed when tenant lifecycle
+/// identity cannot be read or written.
+pub fn db_lifecycle_store() -> Result<&'static Arc<TikvStore>> {
+    get_db_lifecycle_store().ok_or_else(|| {
+        anyhow::anyhow!(
+            "DB lifecycle store is not initialized; tenant lifecycle identity cannot be written"
         )
     })
 }
@@ -350,19 +379,14 @@ pub async fn register_database_inventory(
         let mut sys_txn = system_store.begin().await?;
         for db in databases {
             if system_store
-                .get_worker_registry(&mut sys_txn, &keyspace, db.id)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            system_store
-                .put_worker_registry(
+                .ensure_worker_registry_unless_db_dropped_best_effort(
                     &mut sys_txn,
                     &TaskRegistryEntry::new(keyspace.clone(), db.id),
                 )
-                .await?;
-            registered += 1;
+                .await?
+            {
+                registered += 1;
+            }
         }
         sys_txn.commit().await?;
 
@@ -382,21 +406,12 @@ pub async fn ensure_database_inventory_row(
 ) -> Result<bool> {
     let keyspace = canonical_registry_keyspace(keyspace);
     let mut sys_txn = system_store.begin().await?;
-    let registered = if system_store
-        .get_worker_registry(&mut sys_txn, &keyspace, db_id)
-        .await?
-        .is_none()
-    {
-        system_store
-            .put_worker_registry(
-                &mut sys_txn,
-                &TaskRegistryEntry::new(keyspace.clone(), db_id),
-            )
-            .await?;
-        true
-    } else {
-        false
-    };
+    let registered = system_store
+        .ensure_worker_registry_unless_db_dropped_best_effort(
+            &mut sys_txn,
+            &TaskRegistryEntry::new(keyspace.clone(), db_id),
+        )
+        .await?;
     sys_txn.commit().await?;
     Ok(registered)
 }
@@ -654,50 +669,134 @@ pub(crate) async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &s
     ))
 }
 
-/// Initialize the always-on system store. This is the SINGLE canonical
-/// system-store init used by BOTH production startup and tests/integration —
-/// there is no second "test-only" init that could diverge from production.
-///
-/// Initialization enables the V2 worker-queue schema marker in O(1). It must
-/// not drain historical legacy `_worker_queue_` rows on the startup/readiness
-/// path. Production now requires that retired V1 prefix to be empty before
-/// running without the drain.
+/// Initialize one system metadata domain. When requested, this enables the V2
+/// worker-queue schema marker and verifies the retired V1 prefix is empty
+/// before production runs without the old drain.
+async fn init_system_domain_store(
+    pd_endpoints: Vec<String>,
+    keyspace: &str,
+    label: &str,
+    enable_worker_queue_schema_v2: bool,
+) -> Result<Arc<TikvStore>> {
+    info!("Initializing {} store for keyspace: {}", label, keyspace);
+
+    if let Err(e) = ensure_system_keyspace(&pd_endpoints, keyspace).await {
+        warn!(
+            "Failed to ensure {} keyspace '{}': {}. Proceeding with direct init.",
+            label, keyspace, e
+        );
+    }
+
+    let store = TikvStore::new_system(pd_endpoints, keyspace)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to initialize {} keyspace '{}'; refusing fallback",
+                label, keyspace
+            )
+        })?;
+    if enable_worker_queue_schema_v2 {
+        store
+            .ensure_worker_queue_schema_v2()
+            .await
+            .context("failed to enable worker queue schema V2")?;
+        store
+            .ensure_legacy_worker_queue_retired()
+            .await
+            .context("legacy V1 worker queue retirement preflight failed")?;
+        info!("Worker queue V2 schema enabled; legacy V1 prefix verified empty");
+    }
+    let store = Arc::new(store);
+    info!("{} store initialized successfully", label);
+    Ok(store)
+}
+
+/// Initialize the fail-fast GC registry store. This is Core metadata and must
+/// not silently fall back to the worker/background keyspace once split.
 pub async fn init_gc_registry_store(
     pd_endpoints: Vec<String>,
     config: &WorkerConfig,
 ) -> Result<Arc<TikvStore>> {
-    info!(
-        "Initializing GC registry store for keyspace: {}",
-        config.system_keyspace
-    );
+    let (gc_keyspace, enable_worker_queue_schema_v2) = gc_registry_store_init_plan(config);
+    init_system_domain_store(
+        pd_endpoints,
+        gc_keyspace,
+        "GC registry",
+        enable_worker_queue_schema_v2,
+    )
+    .await
+}
 
-    if let Err(e) = ensure_system_keyspace(&pd_endpoints, &config.system_keyspace).await {
-        warn!(
-            "Failed to ensure GC registry keyspace '{}': {}. Proceeding with direct init.",
-            config.system_keyspace, e
-        );
-    }
+/// Initialize the legacy GC registry source in `DB9_WORKER_SYSTEM_KEYSPACE`.
+///
+/// This is intentionally separate from [`init_worker_system_store`]. During
+/// the BG split, legacy GC liveness may still be fail-fast Core metadata in the
+/// old worker keyspace while background dispatch state moves to `_sys_bg` and
+/// becomes degradable.
+pub async fn init_legacy_gc_registry_store(
+    pd_endpoints: Vec<String>,
+    config: &WorkerConfig,
+) -> Result<Arc<TikvStore>> {
+    init_system_domain_store(
+        pd_endpoints,
+        legacy_gc_registry_store_init_keyspace(config),
+        "legacy GC registry",
+        legacy_gc_registry_enables_worker_queue_schema_v2(config),
+    )
+    .await
+}
 
-    let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to initialize isolated system keyspace '{}'; refusing fallback",
-                config.system_keyspace
-            )
-        })?;
-    store
-        .ensure_worker_queue_schema_v2()
-        .await
-        .context("failed to enable worker queue schema V2")?;
-    store
-        .ensure_legacy_worker_queue_retired()
-        .await
-        .context("legacy V1 worker queue retirement preflight failed")?;
-    info!("Worker queue V2 schema enabled; legacy V1 prefix verified empty");
-    let store = Arc::new(store);
-    info!("GC registry store initialized successfully");
-    Ok(store)
+/// Initialize the fail-fast DB lifecycle store. This is Core metadata and must
+/// not silently fall back to background worker state once tenant incarnation /
+/// lifecycle rows move out of the legacy worker keyspace.
+pub async fn init_db_lifecycle_store(
+    pd_endpoints: Vec<String>,
+    config: &WorkerConfig,
+) -> Result<Arc<TikvStore>> {
+    init_system_domain_store(
+        pd_endpoints,
+        db_lifecycle_store_init_keyspace(config),
+        "DB lifecycle",
+        false,
+    )
+    .await
+}
+
+/// Initialize the background/legacy worker system store. This remains the home
+/// of existing `_wq_*` rows until the new `_sys_bg` ledger is active.
+pub async fn init_worker_system_store(
+    pd_endpoints: Vec<String>,
+    config: &WorkerConfig,
+) -> Result<Arc<TikvStore>> {
+    init_system_domain_store(
+        pd_endpoints,
+        worker_system_store_init_keyspace(config),
+        "background worker",
+        true,
+    )
+    .await
+}
+
+fn gc_registry_store_init_plan(config: &WorkerConfig) -> (&str, bool) {
+    let gc_keyspace = config.effective_gc_registry_keyspace();
+    let enable_worker_queue_schema_v2 = gc_keyspace == config.effective_bg_keyspace();
+    (gc_keyspace, enable_worker_queue_schema_v2)
+}
+
+fn worker_system_store_init_keyspace(config: &WorkerConfig) -> &str {
+    config.effective_bg_keyspace()
+}
+
+fn legacy_gc_registry_store_init_keyspace(config: &WorkerConfig) -> &str {
+    &config.system_keyspace
+}
+
+fn legacy_gc_registry_enables_worker_queue_schema_v2(config: &WorkerConfig) -> bool {
+    config.system_keyspace == config.effective_bg_keyspace()
+}
+
+fn db_lifecycle_store_init_keyspace(config: &WorkerConfig) -> &str {
+    config.effective_db_lifecycle_keyspace()
 }
 
 #[cfg(test)]
@@ -893,23 +992,36 @@ mod tests {
     #[test]
     fn production_init_does_not_reference_legacy_queue_drain() {
         let source = include_str!("mod.rs");
-        let init_fn = source
-            .split("pub async fn init_gc_registry_store")
+        let domain_init = source
+            .split("async fn init_system_domain_store")
             .nth(1)
-            .and_then(|rest| rest.split("#[cfg(test)]").next())
-            .expect("init_gc_registry_store must exist before tests");
+            .and_then(|rest| {
+                rest.split("/// Initialize the fail-fast GC registry store")
+                    .next()
+            })
+            .expect("init_system_domain_store must exist before GC store init");
+        let worker_init = source
+            .split("pub async fn init_worker_system_store")
+            .nth(1)
+            .and_then(|rest| rest.split("fn gc_registry_store_init_plan").next())
+            .expect("init_worker_system_store must exist before config helpers");
         assert!(
-            init_fn.contains("ensure_worker_queue_schema_v2"),
-            "startup must still enable the V2 worker queue schema marker"
+            domain_init.contains("if enable_worker_queue_schema_v2")
+                && domain_init.contains("ensure_worker_queue_schema_v2"),
+            "system-domain startup must still enable the V2 worker queue schema marker when requested"
         );
         assert!(
-            init_fn.contains("ensure_legacy_worker_queue_retired"),
+            domain_init.contains("ensure_legacy_worker_queue_retired"),
             "startup must fail fast if retired legacy V1 worker queue rows still exist"
         );
         assert!(
-            !init_fn.contains("drain_legacy_worker_queue_batch")
-                && !init_fn.contains("legacy_worker_queue_is_empty")
-                && !init_fn.contains("seed_legacy_worker_queue_entry_for_test"),
+            worker_init.contains("\"background worker\"") && worker_init.contains("true,"),
+            "background worker store init must request the V2 worker queue schema marker"
+        );
+        assert!(
+            !domain_init.contains("drain_legacy_worker_queue_batch")
+                && !domain_init.contains("legacy_worker_queue_is_empty")
+                && !domain_init.contains("seed_legacy_worker_queue_entry_for_test"),
             "startup must not read, migrate, or project retired V1 worker queue rows"
         );
     }

@@ -2,7 +2,8 @@ use super::super::{ExecuteResult, ExecuteResults, Session};
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
 use crate::sql::error::SqlError;
-use anyhow::{anyhow, Result};
+use crate::storage::LifecycleTenantStatus;
+use anyhow::{anyhow, Context, Result};
 use tikv_client::TimestampExt;
 use tracing::warn;
 
@@ -24,6 +25,13 @@ enum AlterDatabaseCommand {
     Rename { old_name: String, new_name: String },
     Owner { name: String, new_owner: String },
 }
+
+type CreateDatabaseLifecycleLive = (u64, u64);
+type CreateDatabaseTxnResult = (
+    Vec<ExecuteResult>,
+    Option<u64>,
+    Option<CreateDatabaseLifecycleLive>,
+);
 
 fn is_reserved_database_name(name: &str) -> bool {
     matches!(name, "postgres" | "template0" | "template1")
@@ -420,11 +428,11 @@ impl Executor {
             ));
         }
 
-        let system_store = crate::worker::system_store()?.clone();
+        let lifecycle_store = crate::worker::db_lifecycle_store()?.clone();
         let keyspace = self.tenant_keyspace().to_string();
 
         session.begin().await?;
-        let result: Result<(Vec<ExecuteResult>, Option<u64>)> = async {
+        let result: Result<CreateDatabaseTxnResult> = async {
             let owner = cmd
                 .owner
                 .clone()
@@ -439,6 +447,17 @@ impl Executor {
                 .store()
                 .create_database(txn, &cmd.name, &owner, cmd.if_not_exists)
                 .await?;
+
+            let mut lifecycle_live = None;
+            if let Some(def) = created.as_ref() {
+                let incarnation =
+                    crate::worker::lifecycle::allocate_tenant_incarnation(&lifecycle_store).await?;
+                self.store()
+                    .put_tenant_incarnation_stamp(txn, def.id, incarnation)
+                    .await?;
+                lifecycle_live = Some((def.id, incarnation));
+            }
+
             let registry_db_id = match created.as_ref() {
                 Some(def) => Some(def.id),
                 None => self.store().get_database_id(txn, &cmd.name).await?,
@@ -455,11 +474,11 @@ impl Executor {
             results.push(ExecuteResult::CommandComplete {
                 tag: "CREATE DATABASE",
             });
-            Ok((results, registry_db_id))
+            Ok((results, registry_db_id, lifecycle_live))
         }
         .await;
 
-        let (results, registry_db_id) = match result {
+        let (results, registry_db_id, lifecycle_live) = match result {
             Ok(value) => value,
             Err(e) => {
                 session.rollback().await?;
@@ -467,7 +486,29 @@ impl Executor {
             }
         };
 
-        if let Some(db_id) = registry_db_id {
+        session.commit().await?;
+
+        if let Some((db_id, incarnation)) = lifecycle_live {
+            if let Err(e) = crate::worker::lifecycle::publish_tenant_lifecycle_status(
+                &lifecycle_store,
+                &keyspace,
+                db_id,
+                incarnation,
+                LifecycleTenantStatus::Live,
+            )
+            .await
+            {
+                warn!(
+                    "CREATE DATABASE lifecycle Live publish failed for database '{}' \
+                     (keyspace='{}', db_id={}, incarnation={}): {}",
+                    cmd.name, keyspace, db_id, incarnation, e
+                );
+            }
+        }
+
+        if let (Some(system_store), Some(db_id)) =
+            (crate::worker::get_system_store(), registry_db_id)
+        {
             if let Err(e) = crate::worker::ensure_database_inventory_row_with_retry(
                 system_store.as_ref(),
                 &keyspace,
@@ -476,19 +517,13 @@ impl Executor {
             )
             .await
             {
-                session.rollback().await?;
-                return Err(anyhow!(
+                warn!(
                     "CREATE DATABASE worker inventory registration failed for database '{}' \
                      (keyspace='{}', db_id={}): {}",
-                    cmd.name,
-                    keyspace,
-                    db_id,
-                    e
-                ));
+                    cmd.name, keyspace, db_id, e
+                );
             }
         }
-
-        session.commit().await?;
         Ok(ExecuteResults(results))
     }
 
@@ -512,15 +547,41 @@ impl Executor {
             ));
         }
 
-        session.begin().await?;
-
         let keyspace = self.tenant_keyspace().to_string();
+
+        let lifecycle_store = crate::worker::db_lifecycle_store()?.clone();
+
+        session.begin().await?;
 
         let result: Result<_> = async {
             let current_db_id = session.current_database_id();
             let (txn, _sequence_values, _search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
+
+            let lifecycle_incarnation = match self.store().get_database_id(txn, &cmd.name).await? {
+                Some(db_id) => {
+                    match self
+                        .store()
+                        .get_tenant_incarnation_stamp_for_update(txn, db_id)
+                        .await?
+                    {
+                        Some(incarnation) => Some(incarnation),
+                        None => {
+                            let incarnation =
+                                crate::worker::lifecycle::allocate_tenant_incarnation(
+                                    &lifecycle_store,
+                                )
+                                .await?;
+                            self.store()
+                                .put_tenant_incarnation_stamp(txn, db_id, incarnation)
+                                .await?;
+                            Some(incarnation)
+                        }
+                    }
+                }
+                None => None,
+            };
 
             let dropped = self
                 .store()
@@ -535,11 +596,11 @@ impl Executor {
                     sqlstate: "00000".to_string(),
                 });
             }
-            Ok((dropped, results))
+            Ok((dropped, lifecycle_incarnation, results))
         }
         .await;
 
-        let (dropped_result, mut results) = match result {
+        let (dropped_result, lifecycle_incarnation, mut results) = match result {
             Ok(result) => result,
             Err(e) => {
                 session.rollback().await?;
@@ -582,7 +643,165 @@ impl Executor {
             hnsw_s3_db_id = Some(*db_id);
         }
 
-        session.commit().await?;
+        let drop_system_store = if dropped_result.is_some() {
+            match crate::worker::system_store() {
+                Ok(store) => Some(store.clone()),
+                Err(e) => {
+                    session.rollback().await?;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut dropping_intent_created_at_ms = None;
+        if let Some((db_id, _)) = dropped_result.as_ref() {
+            let system_store = drop_system_store
+                .as_ref()
+                .expect("DROP system store prechecked before tenant commit");
+            let intent_created_at_ms = crate::worker::now_epoch_ms();
+            if let Err(e) = system_store
+                .put_dropping_db_intent_with_retry(&keyspace, *db_id, intent_created_at_ms)
+                .await
+                .with_context(|| {
+                    format!(
+                        "DROP DATABASE '{}' could not publish dropping intent \
+                         (keyspace='{}', db_id={})",
+                        cmd.name, keyspace, db_id
+                    )
+                })
+            {
+                session.rollback().await?;
+                return Err(e);
+            }
+            dropping_intent_created_at_ms = Some(intent_created_at_ms);
+        }
+
+        let mut tenant_commit_error: Option<anyhow::Error> = None;
+        if let Err(e) = session.commit().await {
+            let mut committed_despite_error = false;
+            if let (Some((db_id, _)), Some(_system_store), Some(_intent_created_at_ms)) = (
+                dropped_result.as_ref(),
+                drop_system_store.as_ref(),
+                dropping_intent_created_at_ms,
+            ) {
+                let db_still_exists = async {
+                    let mut txn = self.store().begin().await?;
+                    let exists = self
+                        .store()
+                        .get_database_by_id(&mut txn, *db_id)
+                        .await?
+                        .is_some();
+                    txn.rollback().await.ok();
+                    Ok::<bool, anyhow::Error>(exists)
+                }
+                .await;
+                match db_still_exists {
+                    Ok(true) => {
+                        warn!(
+                            "DROP DATABASE '{}' tenant commit failed and DB still exists \
+                             (keyspace='{}', db_id={}); retaining dropping intent because \
+                             commit errors can be outcome-unknown and repair owns stale-intent cleanup",
+                            cmd.name, keyspace, db_id
+                        );
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "DROP DATABASE '{}' tenant commit returned an error but DB metadata \
+                             is already gone (keyspace='{}', db_id={}); treating DROP as \
+                             committed for cleanup/lifecycle repair while returning the original error",
+                            cmd.name, keyspace, db_id
+                        );
+                        committed_despite_error = true;
+                    }
+                    Err(read_err) => {
+                        warn!(
+                            "DROP DATABASE '{}' tenant commit returned an error and outcome \
+                             could not be resolved (keyspace='{}', db_id={}): {}; retaining \
+                             dropping intent for repair",
+                            cmd.name, keyspace, db_id, read_err
+                        );
+                    }
+                }
+            }
+            if committed_despite_error {
+                tenant_commit_error = Some(e);
+            } else {
+                session.rollback().await.ok();
+                return Err(e);
+            }
+        }
+
+        if let Some((db_id, _)) = dropped_result.as_ref() {
+            let system_store = drop_system_store
+                .as_ref()
+                .expect("DROP system store prechecked before tenant commit");
+
+            let worker_cleanup_done = match system_store
+                .reap_db_queue_entries_then_delete_worker_registry(&keyspace, *db_id)
+                .await
+            {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(
+                            "DROP DATABASE '{}': reaped {} worker queue entries for db_id={}",
+                            cmd.name,
+                            n,
+                            db_id
+                        );
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        "DROP DATABASE '{}' committed tenant metadata deletion but could not \
+                         reap worker queue/registry rows for db_id={}; continuing physical \
+                         data cleanup and retaining dropping intent/worker registry for retry: {}",
+                        cmd.name, db_id, e
+                    );
+                    false
+                }
+            };
+
+            if worker_cleanup_done {
+                if let Err(e) = system_store
+                    .finalize_dropping_db_intent_with_retry(&keyspace, *db_id)
+                    .await
+                {
+                    warn!(
+                        "DROP DATABASE '{}' committed tenant metadata deletion and reaped \
+                         worker rows, but could not finalize the dropped-DB tombstone for \
+                         db_id={}; continuing physical data cleanup and retaining dropping intent for retry: {}",
+                        cmd.name, db_id, e
+                    );
+                }
+            }
+
+            if let Some(incarnation) = lifecycle_incarnation {
+                if let Err(e) = crate::worker::lifecycle::publish_tenant_lifecycle_status(
+                    &lifecycle_store,
+                    &keyspace,
+                    *db_id,
+                    incarnation,
+                    LifecycleTenantStatus::Dropped,
+                )
+                .await
+                {
+                    warn!(
+                        "DROP DATABASE '{}' lifecycle Dropped publish failed \
+                         (keyspace='{}', db_id={}, incarnation={}): {}",
+                        cmd.name, keyspace, db_id, incarnation, e
+                    );
+                }
+            } else {
+                warn!(
+                    "DROP DATABASE '{}' has no tenant incarnation stamp \
+                     (keyspace='{}', db_id={}); lifecycle drop inventory not published",
+                    cmd.name, keyspace, db_id
+                );
+            }
+        }
 
         if let Some((db_id, mut dropping_guard)) = dropped_result {
             // Step 1: Delete all HNSW text-format keys for this database.
@@ -657,57 +876,15 @@ impl Executor {
                 );
             }
 
-            // Step 3.5: Reap worker-queue entries for this database from the
-            // global system keyspace. The binary-format range destroyed in
-            // Step 3 only covers `d_{db_id}_*`; cron/bg/trigger queue entries
-            // live under the global worker prefixes and would otherwise leak.
-            // Bounded prefix scan of the V2 identity index, no global
-            // due-queue scan. Legacy `_worker_queue_` rows are intentionally
-            // not scanned here: startup now enables V2 in O(1), and the
-            // maintenance loop drains V1 rows later in bounded batches. If a
-            // stale legacy row is projected after this reap, worker execution
-            // resolves the db_id before dispatch and skips tasks for dropped
-            // databases. See issue #2576.
-            // MUST use tenant_keyspace() (the logical tenant string every
-            // enqueue site embeds as entry.keyspace), NOT store().keyspace()
-            // — the latter is the API-v2 connection keyspace, which for the
-            // default tenant is "DEFAULT" while queue rows are keyed under
-            // "default", so the reap prefix would never match and leak them.
-            match crate::worker::system_store() {
-                Ok(system_store) => {
-                    // Self-contained + batched: manages its own bounded transactions.
-                    // Keep the registry row if queue cleanup fails; the registry sweep
-                    // uses it as the durable retry target for orphaned worker rows.
-                    match system_store
-                        .reap_db_queue_entries_then_delete_worker_registry(&keyspace, db_id)
-                        .await
-                    {
-                        Ok(n) => {
-                            if n > 0 {
-                                tracing::info!(
-                                    "DROP DATABASE '{}': reaped {} worker queue entries for db_id={}",
-                                    cmd.name,
-                                    n,
-                                    db_id
-                                );
-                            }
-                        }
-                        Err(e) => warn!(
-                            "DROP DATABASE '{}': worker cleanup failed for db_id={}; retaining registry row for retry: {}",
-                            cmd.name, db_id, e
-                        ),
-                    }
-                }
-                Err(e) => warn!(
-                    "DROP DATABASE '{}': worker system store unavailable for db_id={} cleanup: {}",
-                    cmd.name, db_id, e
-                ),
-            }
-
             // Step 4: Finalize the dropping guard — remove the registry entry.
             // This allows the (keyspace, db_id) to be reused if the same
             // database name is re-created.
             dropping_guard.commit();
+        }
+
+        if let Some(e) = tenant_commit_error {
+            session.rollback().await.ok();
+            return Err(e);
         }
 
         results.push(ExecuteResult::CommandComplete {
@@ -841,11 +1018,18 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("database.rs must contain #[cfg(test)]");
-        let cleanup_source = prod_source
-            .split("match crate::worker::system_store()")
+        let drop_fn = prod_source
+            .split("pub(crate) async fn execute_drop_database_cmd(")
             .nth(1)
-            .and_then(|rest| rest.split("// Step 4:").next())
+            .and_then(|rest| {
+                rest.split("pub(crate) async fn execute_alter_database_cmd(")
+                    .next()
+            })
+            .expect("DROP DATABASE executor must exist before ALTER DATABASE executor");
+        let cleanup_pos = drop_fn
+            .find("reap_db_queue_entries_then_delete_worker_registry")
             .expect("DROP DATABASE worker cleanup block must exist");
+        let cleanup_source = &drop_fn[cleanup_pos..];
 
         assert!(
             cleanup_source.contains("reap_db_queue_entries_then_delete_worker_registry"),
@@ -853,16 +1037,139 @@ mod tests {
         );
 
         let reap_error_branch = cleanup_source
-            .split("Err(e) => warn!(")
+            .split("Err(e) => {")
             .nth(1)
             .expect("DROP DATABASE worker cleanup error branch must exist");
         assert!(
-            reap_error_branch.contains("retaining registry row for retry"),
+            reap_error_branch.contains("retaining dropping intent/worker registry for retry"),
             "worker cleanup failures must leave the registry row as retry inventory"
         );
         assert!(
             !reap_error_branch.contains("delete_worker_registry"),
             "worker cleanup failure branch must not delete the registry row"
+        );
+    }
+
+    #[test]
+    fn drop_database_resolves_lifecycle_store_before_opening_session_txn() {
+        let source = include_str!("database.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("database.rs must contain #[cfg(test)]");
+        let drop_fn = prod_source
+            .split("pub(crate) async fn execute_drop_database_cmd(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) async fn execute_alter_database_cmd(")
+                    .next()
+            })
+            .expect("DROP DATABASE executor must exist before ALTER DATABASE executor");
+        let lifecycle_store_pos = drop_fn
+            .find("db_lifecycle_store()?.clone()")
+            .expect("DROP DATABASE must resolve lifecycle store");
+        let begin_pos = drop_fn
+            .find("session.begin().await?")
+            .expect("DROP DATABASE must open a session transaction");
+        assert!(
+            lifecycle_store_pos < begin_pos,
+            "fallible lifecycle-store lookup must happen before session.begin(), or an early error can leave the session transaction open"
+        );
+    }
+
+    #[test]
+    fn drop_database_publishes_precommit_worker_fence_then_finalizes_tombstone() {
+        let source = include_str!("database.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("database.rs must contain #[cfg(test)]");
+        let drop_fn = prod_source
+            .split("pub(crate) async fn execute_drop_database_cmd(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) async fn execute_alter_database_cmd(")
+                    .next()
+            })
+            .expect("DROP DATABASE executor must exist before ALTER DATABASE executor");
+
+        let metadata_drop_pos = drop_fn
+            .find("drop_database_metadata")
+            .expect("DROP DATABASE must delete tenant metadata");
+        let precommit_intent_pos = drop_fn
+            .find("put_dropping_db_intent_with_retry")
+            .expect("DROP DATABASE must publish a pre-commit worker enqueue fence");
+        let commit_pos = drop_fn
+            .find("session.commit().await")
+            .expect("DROP DATABASE must commit tenant metadata deletion");
+        let tombstone_pos = drop_fn[commit_pos..]
+            .find("finalize_dropping_db_intent_with_retry")
+            .map(|offset| commit_pos + offset)
+            .expect("DROP DATABASE must finalize the dropping intent into a tombstone after tenant commit");
+        let lifecycle_pos = drop_fn
+            .find("LifecycleTenantStatus::Dropped")
+            .expect("DROP DATABASE must publish lifecycle Dropped inventory");
+        let s3_cleanup_pos = drop_fn
+            .find("complete_hnsw_s3_db_prefix_cleanup_for_dropped_db")
+            .expect("DROP DATABASE must run HNSW S3 cleanup");
+        let range_destroy_pos = drop_fn
+            .find("unsafe_destroy_database_data")
+            .expect("DROP DATABASE must destroy the database key range");
+        let worker_reap_pos = drop_fn
+            .find("reap_db_queue_entries_then_delete_worker_registry")
+            .expect("DROP DATABASE must still reap old worker rows");
+
+        assert!(
+            metadata_drop_pos < precommit_intent_pos
+                && precommit_intent_pos < commit_pos
+                && commit_pos < worker_reap_pos
+                && worker_reap_pos < tombstone_pos
+                && tombstone_pos < lifecycle_pos
+                && tombstone_pos < s3_cleanup_pos
+                && worker_reap_pos < range_destroy_pos,
+            "DROP DATABASE must publish the worker enqueue fence before tenant commit, reap worker rows before deleting the dropping-intent retry handle, and finalize before lifecycle/physical cleanup"
+        );
+        assert!(
+            drop_fn
+                .split("if let Err(e) = session.commit().await")
+                .nth(1)
+                .and_then(|rest| rest.split("if let Some((db_id, _)) = dropped_result.as_ref()").next())
+                .is_some_and(|branch| branch.contains("get_database_by_id")
+                    && branch.contains("session.rollback().await.ok()")
+                    && !branch.contains("delete_dropping_db_intent_if_created_at_with_retry")
+                    && branch.contains("committed for cleanup/lifecycle repair")
+                    && branch.contains("retaining dropping intent")),
+            "tenant commit errors must not delete the only pre-commit fence; if metadata is already gone, post-commit cleanup/lifecycle still runs before returning the original error"
+        );
+        assert!(
+            drop_fn
+                .split("if let Some(e) = tenant_commit_error")
+                .nth(1)
+                .and_then(|rest| rest.split("return Err(e);").next())
+                .is_some_and(|branch| branch.contains("session.rollback().await.ok()")),
+            "ambiguous-success DROP must clear the autocommit session transaction state before returning the original commit error"
+        );
+        assert!(
+            drop_fn
+                .split("put_dropping_db_intent_with_retry")
+                .nth(1)
+                .and_then(|rest| rest.split("session.commit().await").next())
+                .is_some_and(|branch| branch.contains("session.rollback().await?")
+                    && branch.contains("return Err(e);")),
+            "if the pre-commit dropping-intent publish fails, DROP DATABASE must roll back the active tenant transaction before returning"
+        );
+        let tombstone_failure_branch = drop_fn
+            .split("continuing physical")
+            .nth(1)
+            .expect("cleanup/finalize failure must warn that physical cleanup continues");
+        assert!(
+            tombstone_failure_branch.contains("retaining dropping intent"),
+            "post-commit worker cleanup/finalize failure must retain dropping intent as retry inventory"
+        );
+        let tombstone_to_destroy = &drop_fn[tombstone_pos..range_destroy_pos];
+        assert!(
+            !tombstone_to_destroy.contains(".with_context(||"),
+            "post-commit tombstone finalize failure must not return before physical data cleanup"
         );
     }
 
@@ -889,7 +1196,7 @@ mod tests {
             .find("drop_database_metadata")
             .expect("DROP DATABASE must perform metadata preflight/drop");
         let commit_pos = drop_fn
-            .find("session.commit().await?")
+            .find("session.commit().await")
             .expect("DROP DATABASE must commit tenant metadata deletion");
         assert!(
             metadata_drop_pos < intent_pos,
@@ -924,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn create_database_registers_worker_inventory_before_commit() {
+    fn create_database_stamps_tenant_before_commit_then_publishes_lifecycle() {
         let source = include_str!("database.rs");
         let prod_source = source
             .split("#[cfg(test)]")
@@ -939,25 +1246,82 @@ mod tests {
             })
             .expect("CREATE DATABASE executor must exist before DROP DATABASE executor");
 
-        let register_pos = create_fn
-            .find("ensure_database_inventory_row_with_retry")
-            .expect("CREATE DATABASE must register a worker inventory row");
+        let allocate_pos = create_fn
+            .find("allocate_tenant_incarnation")
+            .expect("CREATE DATABASE must allocate a tenant incarnation for new DBs");
+        let stamp_pos = create_fn
+            .find("put_tenant_incarnation_stamp")
+            .expect("CREATE DATABASE must write tenant-local incarnation stamp");
+        let live_pos = create_fn
+            .find("LifecycleTenantStatus::Live")
+            .expect("CREATE DATABASE must publish lifecycle Live inventory");
         let commit_pos = create_fn
             .find("session.commit().await?")
             .expect("CREATE DATABASE must commit the tenant transaction");
         assert!(
-            register_pos < commit_pos,
-            "worker inventory row must be written before the CREATE DATABASE tenant commit"
+            allocate_pos < stamp_pos && stamp_pos < commit_pos && commit_pos < live_pos,
+            "CREATE DATABASE must stamp tenant identity before commit, then publish repairable lifecycle inventory after commit"
         );
 
-        let register_error_branch = create_fn
+        let registry_pos = create_fn
+            .find("ensure_database_inventory_row_with_retry")
+            .expect("CREATE DATABASE should still best-effort populate legacy worker inventory");
+        assert!(
+            commit_pos < registry_pos,
+            "legacy worker inventory must be best-effort after tenant commit, not a foreground commit dependency"
+        );
+
+        let registry_block = create_fn
             .split("if let Err(e) = crate::worker::ensure_database_inventory_row_with_retry")
             .nth(1)
-            .and_then(|rest| rest.split("session.commit().await?").next())
-            .expect("CREATE DATABASE inventory registration error branch must precede commit");
+            .expect("CREATE DATABASE inventory registration block must exist");
         assert!(
-            register_error_branch.contains("session.rollback().await?"),
-            "inventory registration failure must roll back the still-open tenant transaction"
+            !registry_block.contains("session.rollback().await?"),
+            "legacy worker inventory failure must not roll back an already-committed CREATE DATABASE"
+        );
+    }
+
+    #[test]
+    fn drop_database_deletes_stamp_before_commit_then_publishes_lifecycle_drop() {
+        let source = include_str!("database.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("database.rs must contain #[cfg(test)]");
+        let drop_fn = prod_source
+            .split("pub(crate) async fn execute_drop_database_cmd(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(crate) async fn execute_alter_database_cmd(")
+                    .next()
+            })
+            .expect("DROP DATABASE executor must exist before ALTER DATABASE executor");
+
+        let stamp_read_pos = drop_fn
+            .find("get_tenant_incarnation_stamp_for_update")
+            .expect("DROP DATABASE must lock tenant-local incarnation before deleting metadata");
+        let allocate_pos = drop_fn
+            .find("allocate_tenant_incarnation")
+            .expect("DROP DATABASE must allocate an incarnation for unstamped pre-upgrade DBs");
+        let stamp_put_pos = drop_fn
+            .find("put_tenant_incarnation_stamp")
+            .expect("DROP DATABASE must stamp unstamped pre-upgrade DBs before metadata deletion");
+        let metadata_drop_pos = drop_fn
+            .find("drop_database_metadata")
+            .expect("DROP DATABASE must delete tenant metadata");
+        let dropped_status_pos = drop_fn
+            .find("LifecycleTenantStatus::Dropped")
+            .expect("DROP DATABASE must publish lifecycle Dropped inventory");
+        let commit_pos = drop_fn
+            .find("session.commit().await")
+            .expect("DROP DATABASE must commit tenant metadata deletion");
+        assert!(
+            stamp_read_pos < metadata_drop_pos
+                && allocate_pos < metadata_drop_pos
+                && stamp_put_pos < metadata_drop_pos
+                && metadata_drop_pos < commit_pos
+                && commit_pos < dropped_status_pos,
+            "DROP DATABASE must establish tenant identity before deleting metadata, then publish repairable lifecycle Dropped after commit"
         );
     }
 

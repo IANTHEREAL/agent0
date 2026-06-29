@@ -795,14 +795,19 @@ pub async fn create_table_from_stream(
     let ss = crate::worker::system_store()?;
     let ks = crate::worker::canonical_registry_keyspace(store.keyspace().unwrap_or("default"));
     let mut sys_txn = ss.begin().await?;
-    ss.update_registry_task_types(
-        &mut sys_txn,
-        &ks,
-        db_id,
-        crate::worker::types::TASK_TYPE_DDL_JOURNAL,
-        0,
-    )
-    .await?;
+    let registered = ss
+        .update_registry_task_types_unless_db_dropped(
+            &mut sys_txn,
+            &ks,
+            db_id,
+            crate::worker::types::TASK_TYPE_DDL_JOURNAL,
+            0,
+        )
+        .await?;
+    if !registered {
+        sys_txn.rollback().await.ok();
+        return Err(anyhow!("Cannot CREATE TABLE AS: database is being dropped"));
+    }
     sys_txn.commit().await?;
 
     use futures::StreamExt;

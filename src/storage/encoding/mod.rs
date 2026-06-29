@@ -30,17 +30,19 @@ pub use data_keys::{
     encode_index_range_end_v2, encode_index_range_start_v2, encode_pk_values, encode_prefix_end,
     encode_schema_prefix, encode_table_data_range_v2, encode_table_index_range_v2,
 };
-#[cfg(test)]
 pub use metadata_keys::{
-    decode_worker_queue_fire_time, decode_worker_queue_task_type, encode_worker_queue_key,
-    encode_worker_queue_scan_end,
-};
-pub use metadata_keys::{
-    decode_wq_due_v2_fire_time, decode_wq_index_key, encode_worker_queue_migration_lock_key,
+    decode_lifecycle_tenant_key, decode_worker_dropping_db_intent_key, decode_wq_due_v2_fire_time,
+    decode_wq_index_key, encode_worker_dropping_db_intent_key,
+    encode_worker_dropping_db_intent_prefix, encode_worker_queue_migration_lock_key,
     encode_worker_queue_prefix, encode_worker_queue_schema_version_key, encode_wq_due_v2_key,
     encode_wq_due_v2_prefix, encode_wq_due_v2_scan_end, encode_wq_index_key,
     encode_wq_index_prefix_db, encode_wq_index_prefix_db_type, encode_wq_index_prefix_keyspace,
     encode_wq_index_prefix_task, encode_wq_payload_v2_key,
+};
+#[cfg(test)]
+pub use metadata_keys::{
+    decode_worker_queue_fire_time, decode_worker_queue_task_type, encode_worker_queue_key,
+    encode_worker_queue_scan_end,
 };
 pub use metadata_keys::{
     encode_collation_key_v2, encode_collation_prefix_v2, encode_cron_active_key_v2,
@@ -54,20 +56,22 @@ pub use metadata_keys::{
     encode_gc_instance_state_key, encode_gc_instance_state_prefix,
     encode_hnsw_s3_db_prefix_cleanup_intent_key, encode_hnsw_s3_db_prefix_cleanup_intent_prefix,
     encode_hnsw_s3_graph_upload_intent_key, encode_hnsw_s3_graph_upload_intent_prefix,
-    encode_matview_bindings_key_v2, encode_matview_bindings_prefix_v2, encode_matview_key_v2,
-    encode_matview_prefix_v2, encode_migration_key, encode_migration_prefix,
-    encode_next_cron_job_id_key_v2, encode_next_cron_run_id_key_v2,
-    encode_next_function_oid_key_v2, encode_next_policy_oid_key_v2, encode_next_schema_oid_key_v2,
-    encode_next_sequence_oid_key_v2, encode_next_table_id_key_v2, encode_next_trigger_oid_key_v2,
-    encode_next_type_oid_key_v2, encode_next_view_oid_key_v2, encode_policy_key_v2,
-    encode_policy_prefix_v2, encode_policy_table_prefix_v2, encode_procedure_key_v2,
-    encode_procedure_prefix_v2, encode_relname_key_v2, encode_schema_def_key_v2,
-    encode_schema_def_prefix_v2, encode_schema_key_v2, encode_schema_prefix_v2,
-    encode_sequence_def_key_v2, encode_sequence_def_prefix_v2, encode_sequence_value_key_v2,
-    encode_stats_column_key, encode_stats_column_prefix, encode_stats_header_key,
-    encode_stats_key_v2, encode_storage_stats_key_v2, encode_table_sequence_value_key_v2,
-    encode_trigger_key_v2, encode_trigger_prefix_v2, encode_trigger_table_prefix_v2,
-    encode_tsc_key_v2, encode_type_key_v2, encode_type_prefix_v2, encode_view_bindings_key_v2,
+    encode_lifecycle_process_liveness_key, encode_lifecycle_tenant_incarnation_seq_key,
+    encode_lifecycle_tenant_key, encode_lifecycle_tenant_prefix, encode_matview_bindings_key_v2,
+    encode_matview_bindings_prefix_v2, encode_matview_key_v2, encode_matview_prefix_v2,
+    encode_migration_key, encode_migration_prefix, encode_next_cron_job_id_key_v2,
+    encode_next_cron_run_id_key_v2, encode_next_function_oid_key_v2, encode_next_policy_oid_key_v2,
+    encode_next_schema_oid_key_v2, encode_next_sequence_oid_key_v2, encode_next_table_id_key_v2,
+    encode_next_trigger_oid_key_v2, encode_next_type_oid_key_v2, encode_next_view_oid_key_v2,
+    encode_policy_key_v2, encode_policy_prefix_v2, encode_policy_table_prefix_v2,
+    encode_procedure_key_v2, encode_procedure_prefix_v2, encode_relname_key_v2,
+    encode_schema_def_key_v2, encode_schema_def_prefix_v2, encode_schema_key_v2,
+    encode_schema_prefix_v2, encode_sequence_def_key_v2, encode_sequence_def_prefix_v2,
+    encode_sequence_value_key_v2, encode_stats_column_key, encode_stats_column_prefix,
+    encode_stats_header_key, encode_stats_key_v2, encode_storage_stats_key_v2,
+    encode_table_sequence_value_key_v2, encode_tenant_incarnation_key, encode_trigger_key_v2,
+    encode_trigger_prefix_v2, encode_trigger_table_prefix_v2, encode_tsc_key_v2,
+    encode_type_key_v2, encode_type_prefix_v2, encode_view_bindings_key_v2,
     encode_view_bindings_prefix_v2, encode_view_key_v2, encode_view_prefix_v2,
     encode_worker_bg_result_key, encode_worker_bg_task_seq_key, encode_worker_claim_key,
     encode_worker_claim_prefix, encode_worker_dropped_db_tombstone_key,

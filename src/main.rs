@@ -39,15 +39,16 @@ mod worker;
 
 use crate::config::ServerConfig;
 use anyhow::Result;
+use parking_lot::Mutex;
 use pgwire::tokio::{process_socket, CancellationToken};
 use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;
 use socket2::{SockRef, TcpKeepalive};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, TryAcquireError};
 use tokio::task::{Id as TaskId, JoinHandle, JoinSet};
@@ -63,6 +64,8 @@ const DEFAULT_TOKIO_STACK_MB: usize = 8;
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const STARTUP_INVENTORY_REPAIR_RETRY_DELAY: Duration = Duration::from_secs(5);
+const DATABASE_INVENTORY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const DROPPING_DB_INTENT_LIVE_CLEAR_AFTER_MS: i64 = 10 * 60 * 1000;
 
 struct WorkerRuntimeHandles {
     engine_handle: JoinHandle<()>,
@@ -499,19 +502,128 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     worker::active_txn_registry::set_global_registry(active_txn_registry.clone());
 
     let worker_config = worker::config::WorkerConfig::from_env();
+    info!(
+        legacy_system_keyspace = %worker_config.system_keyspace,
+        gc_registry_keyspace = %worker_config.effective_gc_registry_keyspace(),
+        db_lifecycle_keyspace = %worker_config.effective_db_lifecycle_keyspace(),
+        db_lifecycle_mode = worker_config.db_lifecycle_mode.as_str(),
+        bg_keyspace = %worker_config.effective_bg_keyspace(),
+        domains_alias_legacy = worker_config.domains_alias_legacy_system_keyspace(),
+        gc_registry_mode = worker_config.gc_registry_mode.as_str(),
+        "Worker metadata domain configuration loaded"
+    );
+    worker_config
+        .validate_worker_domain_config()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // GC registry store — init unconditionally. Fail-fast if unavailable.
-    let gc_store = worker::init_gc_registry_store(pd_addrs.clone(), &worker_config)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to initialize GC registry store: {}. \
-                 Every SQL-serving db9 process must participate in the GC registry.",
-                e
-            )
-        })?;
-    worker::set_system_store(gc_store.clone());
-    worker::set_worker_execution_enabled(worker_config.enabled);
+    let legacy_gc_store = match worker_config.gc_registry_mode {
+        worker::config::GcRegistryMode::Legacy | worker::config::GcRegistryMode::Migrating => Some(
+            worker::init_legacy_gc_registry_store(pd_addrs.clone(), &worker_config)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to initialize legacy GC registry store: {}. \
+                         GC registry legacy/migrating modes require the legacy Core source \
+                         before a SQL-serving process can accept traffic.",
+                        e
+                    )
+                })?,
+        ),
+        worker::config::GcRegistryMode::New => None,
+    };
+
+    let db_lifecycle_store = if worker_config.effective_db_lifecycle_keyspace()
+        == worker_config.system_keyspace.as_str()
+    {
+        if let Some(store) = &legacy_gc_store {
+            store.clone()
+        } else {
+            worker::init_db_lifecycle_store(pd_addrs.clone(), &worker_config)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to initialize DB lifecycle store: {}. \
+                         DB lifecycle is Core metadata and must be available \
+                         fail-fast before a SQL-serving process can accept traffic.",
+                        e
+                    )
+                })?
+        }
+    } else {
+        worker::init_db_lifecycle_store(pd_addrs.clone(), &worker_config)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to initialize DB lifecycle store: {}. \
+                     DB lifecycle is Core metadata and must be available \
+                     fail-fast before a SQL-serving process can accept traffic.",
+                    e
+                )
+            })?
+    };
+
+    let bg_keyspace_split =
+        worker_config.effective_bg_keyspace() != worker_config.system_keyspace.as_str();
+    let bg_domain_store = if !bg_keyspace_split && legacy_gc_store.is_some() {
+        legacy_gc_store.clone()
+    } else {
+        match worker::init_worker_system_store(pd_addrs.clone(), &worker_config).await {
+            Ok(store) => Some(store),
+            Err(e) => {
+                warn!(
+                    bg_keyspace = %worker_config.effective_bg_keyspace(),
+                    error = %e,
+                    "Background worker domain unavailable during startup; SQL will start with dispatch disabled"
+                );
+                ::metrics::gauge!("db9_server_bg_domain_available").set(0.0);
+                None
+            }
+        }
+    };
+    if bg_domain_store.is_some() {
+        ::metrics::gauge!("db9_server_bg_domain_available").set(1.0);
+    } else {
+        ::metrics::gauge!("db9_server_bg_domain_available").set(0.0);
+    }
+
+    let legacy_v2_system_store = if bg_keyspace_split {
+        None
+    } else {
+        bg_domain_store.clone()
+    };
+    if let Some(system_store) = &legacy_v2_system_store {
+        worker::set_system_store(system_store.clone());
+    }
+    worker::set_db_lifecycle_store(db_lifecycle_store.clone());
+
+    let new_gc_store = match worker_config.gc_registry_mode {
+        worker::config::GcRegistryMode::Legacy => None,
+        worker::config::GcRegistryMode::Migrating | worker::config::GcRegistryMode::New => Some(
+            worker::init_gc_registry_store(pd_addrs.clone(), &worker_config)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to initialize GC registry store: {}. \
+                         Every SQL-serving db9 process must participate in the GC registry.",
+                        e
+                    )
+                })?,
+        ),
+    };
+    let gc_registry = worker::gc::GcRegistryStores::new(legacy_gc_store.clone(), new_gc_store);
+    let worker_execution_enabled = worker_config.enabled && legacy_v2_system_store.is_some();
+    worker::set_worker_execution_enabled(worker_execution_enabled);
+    if worker_config.enabled && bg_keyspace_split {
+        warn!(
+            bg_keyspace = %worker_config.effective_bg_keyspace(),
+            legacy_system_keyspace = %worker_config.system_keyspace,
+            "DB9_WORKER_ENABLED=true but legacy V2 worker execution is disabled while BG is split; legacy rows remain inert migration input"
+        );
+    } else if worker_config.enabled && !worker_execution_enabled {
+        warn!(
+            "DB9_WORKER_ENABLED=true but the background domain is unavailable; worker execution is disabled for this process"
+        );
+    }
 
     // Validate GC config UNCONDITIONALLY — even if this node doesn't advance
     // the safepoint, another node in the cluster might. This only checks
@@ -519,7 +631,7 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // and worker transactions are protected by direct registry tracking.
     worker_config.validate_gc_config();
 
-    worker::gc::publish_gc_instance_state_once(&gc_store, &worker_config)
+    worker::gc::publish_gc_instance_state_once(&gc_registry, &worker_config)
         .await
         .map_err(|e| {
             anyhow::anyhow!(
@@ -529,6 +641,7 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
             )
         })?;
     info!("GC registry startup publish completed");
+    let gc_last_successful_publish = Arc::new(Mutex::new(Instant::now()));
 
     // Note: we do NOT scan keyspaces at startup to detect S3-backed indexes
     // when HNSW_S3_BUCKET is unset. That check used get_client() which
@@ -538,14 +651,23 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // "HNSW index requires S3 storage. Set HNSW_S3_BUCKET to enable."
 
     // GC registry publisher — UNCONDITIONAL. Runs on every SQL-serving node.
-    // Publishes this instance's min_start_ts to _sys_worker every interval.
+    // Publishes this instance's min_start_ts to the GC registry domain every interval.
     // This is NOT inside any if-block — it always runs.
+    let gc_self_fence = CancellationToken::new();
+    let lifecycle_self_fence = CancellationToken::new();
     let publisher_handle = {
-        let publisher_store = gc_store.clone();
+        let publisher_registry = gc_registry.clone();
         let publisher_config = worker_config.clone();
+        let publisher_self_fence = gc_self_fence.clone();
+        let publisher_last_successful_publish = gc_last_successful_publish.clone();
         let handle = tokio::spawn(async move {
             supervised_background_loop("GC publisher", || {
-                worker::gc::run_gc_publisher_loop(&publisher_store, &publisher_config)
+                worker::gc::run_gc_publisher_loop(
+                    &publisher_registry,
+                    &publisher_config,
+                    publisher_self_fence.clone(),
+                    publisher_last_successful_publish.clone(),
+                )
             })
             .await;
         });
@@ -558,14 +680,14 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // from shared registry, computes global min, advances PD safepoint.
     // ================================================================
     let advancer_handle = if worker_config.gc_safepoint_enabled {
-        let advancer_store = gc_store.clone();
+        let advancer_registry = gc_registry.clone();
         let advancer_config = worker_config.clone();
         let advancer_metrics = Arc::new(worker::metrics::WorkerMetrics::new());
         let advancer_metrics_clone = advancer_metrics.clone();
         let handle = tokio::spawn(async move {
             supervised_background_loop("GC advancer", || {
                 worker::gc::run_gc_advancer_loop(
-                    &advancer_store,
+                    &advancer_registry,
                     &advancer_config,
                     &advancer_metrics_clone,
                 )
@@ -581,8 +703,10 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     // ================================================================
     // Worker engine: OPTIONAL — cron, triggers, HNSW, DDL, BgSql.
     // ================================================================
-    let worker_runtime = if worker_config.enabled {
-        let system_store = gc_store.clone();
+    let worker_runtime = if worker_execution_enabled {
+        let system_store = legacy_v2_system_store
+            .clone()
+            .expect("worker execution is enabled only when the legacy V2 store initialized");
         let executor_lease = Arc::new(worker::executor_lease::WorkerExecutorLeaseCoordinator::new(
             system_store.clone(),
             worker_config.clone(),
@@ -842,13 +966,84 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
         }
     }
 
-    let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?;
+    if let Err(e) = worker::lifecycle::publish_lifecycle_process_liveness_once(
+        &db_lifecycle_store,
+        &worker_config,
+    )
+    .await
+    {
+        if let Err(clear_err) =
+            worker::lifecycle::clear_lifecycle_process_liveness(&db_lifecycle_store, &worker_config)
+                .await
+        {
+            warn!(
+                "Failed to clear DB lifecycle process liveness after startup publish error: {}",
+                clear_err
+            );
+        }
+        return Err(anyhow::anyhow!(
+            "Failed to publish DB lifecycle process liveness during startup: {}. \
+             A SQL-serving db9 process must publish lifecycle liveness before it accepts traffic.",
+            e
+        ));
+    }
+    info!("DB lifecycle process-liveness startup publish completed");
+    let lifecycle_last_successful_publish = Arc::new(Mutex::new(Instant::now()));
+
+    let listener = match TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            if let Err(clear_err) = worker::lifecycle::clear_lifecycle_process_liveness(
+                &db_lifecycle_store,
+                &worker_config,
+            )
+            .await
+            {
+                warn!(
+                    "Failed to clear DB lifecycle process liveness after pgwire bind error: {}",
+                    clear_err
+                );
+            }
+            return Err(e.into());
+        }
+    };
     info!("PostgreSQL server listening on {}", listener.local_addr()?);
-    let startup_inventory_repair_handle = spawn_startup_database_inventory_repair(
-        gc_store.clone(),
+
+    let lifecycle_publisher_handle = {
+        let publisher_store = db_lifecycle_store.clone();
+        let publisher_config = worker_config.clone();
+        let publisher_self_fence = lifecycle_self_fence.clone();
+        let publisher_last_successful_publish = lifecycle_last_successful_publish.clone();
+        let handle = tokio::spawn(async move {
+            supervised_background_loop("DB lifecycle publisher", || {
+                worker::lifecycle::run_lifecycle_publisher_loop(
+                    publisher_store.clone(),
+                    publisher_config.clone(),
+                    publisher_self_fence.clone(),
+                    publisher_last_successful_publish.clone(),
+                )
+            })
+            .await;
+        });
+        info!("DB lifecycle process-liveness publisher started (unconditional, supervised)");
+        handle
+    };
+
+    let database_inventory_reconcile_handle = spawn_database_inventory_reconcile(
+        legacy_v2_system_store.clone(),
         store.clone(),
+        client_pool.clone(),
+        db_lifecycle_store.clone(),
         startup_keyspace.clone(),
     );
+    let dropping_intent_repair_handle = legacy_v2_system_store.clone().map(|worker_system_store| {
+        spawn_dropping_intent_repair(
+            worker_system_store,
+            client_pool.clone(),
+            256,
+            STARTUP_INVENTORY_REPAIR_RETRY_DELAY,
+        )
+    });
     let connect_host: &str = if pg_listen_addr == "0.0.0.0" {
         "127.0.0.1"
     } else if pg_listen_addr == "::" {
@@ -867,84 +1062,111 @@ async fn async_main(cli_args: cli::CliArgs, tokio_worker_threads: usize) -> Resu
     info!("Max connections: {}", max_connections);
 
     let mut shutdown = std::pin::pin!(shutdown_signal());
-    let serve_result: Result<()> = loop {
-        connection_tasks.reap_finished();
-        let (socket, peer_addr) = tokio::select! {
-            shutdown_reason = &mut shutdown => {
-                match shutdown_reason {
-                    Ok(reason) => {
-                        info!("Shutdown signal received: {}", reason);
-                        break Ok(());
+    let serve_result: Result<()> = if gc_self_fence.is_cancelled() {
+        Err(anyhow::anyhow!(
+            "GC liveness self-fence triggered before pgwire accept loop started"
+        ))
+    } else if lifecycle_self_fence.is_cancelled() {
+        Err(anyhow::anyhow!(
+            "DB lifecycle self-fence triggered before pgwire accept loop started"
+        ))
+    } else {
+        loop {
+            connection_tasks.reap_finished();
+            let (socket, peer_addr) = tokio::select! {
+                biased;
+                shutdown_reason = &mut shutdown => {
+                    match shutdown_reason {
+                        Ok(reason) => {
+                            info!("Shutdown signal received: {}", reason);
+                            break Ok(());
+                        }
+                        Err(e) => break Err(e),
                     }
-                    Err(e) => break Err(e),
                 }
-            }
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok(connection) => connection,
-                    Err(e) => break Err(e.into()),
+                _ = gc_self_fence.cancelled() => {
+                    break Err(anyhow::anyhow!(
+                        "GC liveness self-fence triggered; shutting down SQL admission"
+                    ));
                 }
-            }
-        };
-        let accept_config = server_config.read().clone();
+                _ = lifecycle_self_fence.cancelled() => {
+                    break Err(anyhow::anyhow!(
+                        "DB lifecycle self-fence triggered; shutting down SQL admission"
+                    ));
+                }
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok(connection) => connection,
+                        Err(e) => break Err(e.into()),
+                    }
+                }
+            };
+            let accept_config = server_config.read().clone();
 
-        if let Err(e) = configure_pgwire_socket_keepalive(&socket, &accept_config) {
-            warn!("Failed to configure TCP keepalive for {}: {}", peer_addr, e);
+            if let Err(e) = configure_pgwire_socket_keepalive(&socket, &accept_config) {
+                warn!("Failed to configure TCP keepalive for {}: {}", peer_addr, e);
+            }
+
+            let permit = match conn_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(TryAcquireError::NoPermits) => {
+                    warn!(
+                        "Connection limit reached (max {}), rejecting {}",
+                        max_connections, peer_addr
+                    );
+                    ::metrics::counter!("db9_server_connections_rejected_total").increment(1);
+                    tokio::spawn(async move {
+                        reject_over_limit(socket).await;
+                    });
+                    continue;
+                }
+                Err(TryAcquireError::Closed) => {
+                    tracing::error!("Connection semaphore closed unexpectedly");
+                    break Ok(());
+                }
+            };
+
+            // Metrics: only count connections that acquired a permit (not rejected ones).
+            ::metrics::counter!("db9_server_connections_accepted_total").increment(1);
+            let conn_gauge = metrics::GaugeGuard::increment("db9_server_connections_active");
+
+            let tls_acceptor = tls_acceptor.clone();
+            let client_pool = client_pool.clone();
+            let default_keyspace = default_keyspace.clone();
+
+            let factory = DynamicHandlerFactory::new_with_pool(
+                client_pool,
+                default_keyspace,
+                server_config.clone(),
+            );
+            let cancel_token = factory.cancel_token();
+
+            connection_tasks.spawn(cancel_token.clone(), async move {
+                let _permit = permit; // held for connection lifetime
+                let _conn_gauge = conn_gauge; // decrements on drop (RAII)
+                if let Err(e) =
+                    process_socket(socket, tls_acceptor, factory, Some(cancel_token)).await
+                {
+                    ::metrics::counter!("db9_server_connection_errors_total").increment(1);
+                    tracing::error!("Connection error: {}", e);
+                }
+            });
         }
-
-        let permit = match conn_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => {
-                warn!(
-                    "Connection limit reached (max {}), rejecting {}",
-                    max_connections, peer_addr
-                );
-                ::metrics::counter!("db9_server_connections_rejected_total").increment(1);
-                tokio::spawn(async move {
-                    reject_over_limit(socket).await;
-                });
-                continue;
-            }
-            Err(TryAcquireError::Closed) => {
-                tracing::error!("Connection semaphore closed unexpectedly");
-                break Ok(());
-            }
-        };
-
-        // Metrics: only count connections that acquired a permit (not rejected ones).
-        ::metrics::counter!("db9_server_connections_accepted_total").increment(1);
-        let conn_gauge = metrics::GaugeGuard::increment("db9_server_connections_active");
-
-        let tls_acceptor = tls_acceptor.clone();
-        let client_pool = client_pool.clone();
-        let default_keyspace = default_keyspace.clone();
-
-        let factory = DynamicHandlerFactory::new_with_pool(
-            client_pool,
-            default_keyspace,
-            server_config.clone(),
-        );
-        let cancel_token = factory.cancel_token();
-
-        connection_tasks.spawn(cancel_token.clone(), async move {
-            let _permit = permit; // held for connection lifetime
-            let _conn_gauge = conn_gauge; // decrements on drop (RAII)
-            if let Err(e) = process_socket(socket, tls_acceptor, factory, Some(cancel_token)).await
-            {
-                ::metrics::counter!("db9_server_connection_errors_total").increment(1);
-                tracing::error!("Connection error: {}", e);
-            }
-        });
     };
 
+    let gc_self_fenced = gc_self_fence.is_cancelled();
     shutdown_server_runtime(
-        &gc_store,
+        &gc_registry,
+        &db_lifecycle_store,
         &worker_config,
         &mut connection_tasks,
         worker_runtime,
-        startup_inventory_repair_handle,
+        dropping_intent_repair_handle,
+        database_inventory_reconcile_handle,
+        lifecycle_publisher_handle,
         publisher_handle,
         advancer_handle,
+        gc_self_fenced,
     )
     .await;
     serve_result
@@ -1011,44 +1233,172 @@ async fn reject_over_limit(mut socket: tokio::net::TcpStream) {
 }
 
 async fn shutdown_server_runtime(
-    gc_store: &storage::TikvStore,
+    gc_registry: &worker::gc::GcRegistryStores,
+    db_lifecycle_store: &storage::TikvStore,
     worker_config: &worker::config::WorkerConfig,
     connection_tasks: &mut ConnectionTaskRegistry,
     worker_runtime: Option<WorkerRuntimeHandles>,
-    startup_inventory_repair_handle: JoinHandle<()>,
+    dropping_intent_repair_handle: Option<JoinHandle<()>>,
+    database_inventory_reconcile_handle: JoinHandle<()>,
+    lifecycle_publisher_handle: JoinHandle<()>,
     publisher_handle: JoinHandle<()>,
     advancer_handle: Option<JoinHandle<()>>,
+    gc_self_fenced: bool,
 ) {
     connection_tasks.shutdown().await;
     abort_task(
-        "Startup database inventory repair",
-        startup_inventory_repair_handle,
+        "Database inventory reconcile",
+        database_inventory_reconcile_handle,
     )
     .await;
+    if let Some(handle) = dropping_intent_repair_handle {
+        abort_task("Dropping-DB intent repair", handle).await;
+    }
     shutdown_worker_runtime(worker_runtime).await;
-    shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle).await;
+    shutdown_lifecycle_runtime(
+        db_lifecycle_store,
+        worker_config,
+        lifecycle_publisher_handle,
+    )
+    .await;
+    shutdown_gc_runtime(
+        gc_registry,
+        worker_config,
+        publisher_handle,
+        advancer_handle,
+        gc_self_fenced,
+    )
+    .await;
 }
 
-fn spawn_startup_database_inventory_repair(
-    gc_store: Arc<storage::TikvStore>,
-    tenant_store: Arc<storage::TikvStore>,
+fn spawn_database_inventory_reconcile(
+    system_store: Option<Arc<storage::TikvStore>>,
+    startup_tenant_store: Arc<storage::TikvStore>,
+    client_pool: Arc<TikvClientPool>,
+    db_lifecycle_store: Arc<storage::TikvStore>,
     startup_keyspace: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut attempt = 0_u64;
         loop {
             attempt += 1;
-            match worker::register_database_inventory(&gc_store, &tenant_store, &startup_keyspace)
-                .await
-            {
-                Ok(registered) => {
+            let result = async {
+                let mut tenants = Vec::new();
+                let mut seen = HashSet::new();
+                seen.insert(startup_keyspace.clone());
+                tenants.push((startup_keyspace.clone(), startup_tenant_store.clone()));
+                for (keyspace, store) in client_pool.tenant_stores_snapshot().await {
+                    if seen.insert(keyspace.clone()) {
+                        tenants.push((keyspace, store));
+                    }
+                }
+
+                let mut registered = 0usize;
+                let mut lifecycle_backfilled = 0usize;
+                let mut lifecycle_dropped_repaired = 0usize;
+                let mut failed_keyspaces = 0usize;
+                let mut first_error: Option<anyhow::Error> = None;
+                let keyspace_count = tenants.len();
+
+                for (keyspace, tenant_store) in tenants {
+                    let repair_result = async {
+                        let registered = if let Some(system_store) = &system_store {
+                            worker::register_database_inventory(
+                                system_store,
+                                &tenant_store,
+                                &keyspace,
+                            )
+                            .await?
+                        } else {
+                            0
+                        };
+                        let lifecycle_backfilled =
+                            worker::lifecycle::backfill_tenant_lifecycle_inventory(
+                                &db_lifecycle_store,
+                                &tenant_store,
+                                &keyspace,
+                            )
+                            .await?;
+                        let lifecycle_dropped_repaired =
+                            worker::lifecycle::repair_dropped_tenant_lifecycle_inventory(
+                                &db_lifecycle_store,
+                                &tenant_store,
+                                &keyspace,
+                            )
+                            .await?;
+                        Ok::<_, anyhow::Error>((
+                            registered,
+                            lifecycle_backfilled,
+                            lifecycle_dropped_repaired,
+                        ))
+                    }
+                    .await;
+
+                    match repair_result {
+                        Ok((
+                            keyspace_registered,
+                            keyspace_lifecycle_backfilled,
+                            keyspace_lifecycle_dropped_repaired,
+                        )) => {
+                            registered = registered.saturating_add(keyspace_registered);
+                            lifecycle_backfilled =
+                                lifecycle_backfilled.saturating_add(keyspace_lifecycle_backfilled);
+                            lifecycle_dropped_repaired = lifecycle_dropped_repaired
+                                .saturating_add(keyspace_lifecycle_dropped_repaired);
+                        }
+                        Err(e) => {
+                            failed_keyspaces = failed_keyspaces.saturating_add(1);
+                            warn!(
+                                keyspace = %keyspace,
+                                attempt,
+                                error = %e,
+                                "Database inventory reconcile failed for tenant keyspace"
+                            );
+                            if first_error.is_none() {
+                                first_error = Some(e);
+                            }
+                        }
+                    }
+                }
+
+                if failed_keyspaces > 0 {
+                    return Err(anyhow::anyhow!(
+                        "database inventory reconcile failed for {}/{} keyspaces: {}",
+                        failed_keyspaces,
+                        keyspace_count,
+                        first_error
+                            .as_ref()
+                            .expect("failed_keyspaces > 0 implies first_error is set")
+                    ));
+                }
+
+                Ok::<_, anyhow::Error>((
+                    registered,
+                    lifecycle_backfilled,
+                    lifecycle_dropped_repaired,
+                    keyspace_count,
+                ))
+            }
+            .await;
+            match result {
+                Ok((
+                    registered,
+                    lifecycle_backfilled,
+                    lifecycle_dropped_repaired,
+                    keyspace_count,
+                )) => {
                     info!(
                         keyspace = %startup_keyspace,
+                        keyspace_count,
                         registered,
+                        lifecycle_backfilled,
+                        lifecycle_dropped_repaired,
+                        bg_inventory_available = system_store.is_some(),
                         attempt,
-                        "Startup database inventory repair completed"
+                        next_reconcile_seconds = DATABASE_INVENTORY_RECONCILE_INTERVAL.as_secs(),
+                        "Database inventory reconcile completed"
                     );
-                    return;
+                    tokio::time::sleep(DATABASE_INVENTORY_RECONCILE_INTERVAL).await;
                 }
                 Err(e) => {
                     warn!(
@@ -1056,13 +1406,149 @@ fn spawn_startup_database_inventory_repair(
                         attempt,
                         retry_delay_seconds = STARTUP_INVENTORY_REPAIR_RETRY_DELAY.as_secs(),
                         error = %e,
-                        "Startup database inventory repair failed; retrying"
+                        "Database inventory reconcile failed; retrying"
                     );
                     tokio::time::sleep(STARTUP_INVENTORY_REPAIR_RETRY_DELAY).await;
                 }
             }
         }
     })
+}
+
+fn spawn_dropping_intent_repair(
+    system_store: Arc<storage::TikvStore>,
+    pool: Arc<TikvClientPool>,
+    batch_size: usize,
+    interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            match repair_dropping_db_intents_once(
+                &system_store,
+                &pool,
+                cursor.as_deref(),
+                batch_size,
+            )
+            .await
+            {
+                Ok(next_cursor) => {
+                    cursor = next_cursor;
+                    if cursor.is_none() {
+                        tokio::time::sleep(interval).await;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Dropping-DB intent repair failed; retrying after {}s: {}",
+                        interval.as_secs(),
+                        e
+                    );
+                    tokio::time::sleep(interval).await;
+                }
+            }
+        }
+    })
+}
+
+async fn repair_dropping_db_intents_once(
+    system_store: &Arc<storage::TikvStore>,
+    pool: &Arc<TikvClientPool>,
+    start_after: Option<&[u8]>,
+    batch_size: usize,
+) -> Result<Option<Vec<u8>>> {
+    let (intents, next_cursor) = {
+        let mut txn = system_store.begin().await?;
+        let page = system_store
+            .scan_dropping_db_intents_page(&mut txn, start_after, batch_size.max(1))
+            .await?;
+        txn.rollback().await.ok();
+        page
+    };
+
+    let now_ms = worker::now_epoch_ms();
+    for intent in intents {
+        let keyspace = intent.keyspace.clone();
+        let db_id = intent.db_id;
+        let result = async {
+            let handle = pool.acquire(Some(keyspace.clone())).await?;
+            let store = handle.store().clone();
+            let db_exists = {
+                let mut txn = store.begin().await?;
+                let exists = store.get_database_by_id(&mut txn, db_id).await?.is_some();
+                txn.rollback().await.ok();
+                exists
+            };
+            drop(handle);
+
+            if db_exists {
+                if now_ms.saturating_sub(intent.created_at_ms)
+                    >= DROPPING_DB_INTENT_LIVE_CLEAR_AFTER_MS
+                {
+                    let handle = pool.acquire(Some(keyspace.clone())).await?;
+                    let store = handle.store().clone();
+                    let mut tenant_txn = store.begin().await?;
+                    let touched = store
+                        .touch_database_alive_for_update(&mut tenant_txn, db_id)
+                        .await?;
+                    if touched {
+                        tenant_txn.commit().await?;
+                        let deleted = system_store
+                            .delete_dropping_db_intent_if_created_at_with_retry(
+                                &keyspace,
+                                db_id,
+                                intent.created_at_ms,
+                            )
+                            .await?;
+                        if deleted {
+                            warn!(
+                                keyspace = %keyspace,
+                                db_id,
+                                created_at_ms = intent.created_at_ms,
+                                "Cleared stale dropping-DB intent for live database after tenant row touch"
+                            );
+                        }
+                    } else {
+                        tenant_txn.rollback().await.ok();
+                    }
+                    drop(handle);
+                }
+                tracing::debug!(
+                    keyspace = %keyspace,
+                    db_id,
+                    created_at_ms = intent.created_at_ms,
+                    "Retaining dropping-DB intent while tenant DB still exists"
+                );
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            let reaped = system_store
+                .reap_db_queue_entries_then_delete_worker_registry(&keyspace, db_id)
+                .await?;
+            system_store
+                .finalize_dropping_db_intent_with_retry(&keyspace, db_id)
+                .await?;
+            info!(
+                keyspace = %keyspace,
+                db_id,
+                reaped,
+                "Finalized dropping-DB intent for missing database"
+            );
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            warn!(
+                keyspace = %intent.keyspace,
+                db_id = intent.db_id,
+                "Dropping-DB intent repair failed: {}",
+                e
+            );
+        }
+    }
+
+    Ok(next_cursor)
 }
 
 async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
@@ -1112,18 +1598,44 @@ async fn shutdown_worker_runtime(worker_runtime: Option<WorkerRuntimeHandles>) {
     executor_lease.release_if_owned().await;
 }
 
+async fn shutdown_lifecycle_runtime(
+    db_lifecycle_store: &storage::TikvStore,
+    worker_config: &worker::config::WorkerConfig,
+    lifecycle_publisher_handle: JoinHandle<()>,
+) {
+    abort_task("DB lifecycle publisher", lifecycle_publisher_handle).await;
+
+    match worker::lifecycle::clear_lifecycle_process_liveness(db_lifecycle_store, worker_config)
+        .await
+    {
+        Ok(()) => info!("Cleared local DB lifecycle process liveness during shutdown"),
+        Err(e) => warn!(
+            "Failed to clear local DB lifecycle process liveness during shutdown: {}",
+            e
+        ),
+    }
+}
+
 async fn shutdown_gc_runtime(
-    gc_store: &storage::TikvStore,
+    gc_registry: &worker::gc::GcRegistryStores,
     worker_config: &worker::config::WorkerConfig,
     publisher_handle: JoinHandle<()>,
     advancer_handle: Option<JoinHandle<()>>,
+    skip_gc_registry_clear: bool,
 ) {
     abort_task("GC registry publisher", publisher_handle).await;
     if let Some(handle) = advancer_handle {
         abort_task("GC safepoint advancer", handle).await;
     }
 
-    match worker::gc::clear_gc_instance_state(gc_store, worker_config).await {
+    if skip_gc_registry_clear {
+        warn!(
+            "Skipping GC registry row clear after GC self-fence; preserving last min_start_ts clamp until heartbeat timeout"
+        );
+        return;
+    }
+
+    match worker::gc::clear_gc_instance_state(gc_registry, worker_config).await {
         Ok(()) => info!("Cleared local GC registry state during shutdown"),
         Err(e) => warn!(
             "Failed to clear local GC registry state during shutdown: {}",
@@ -1368,10 +1880,10 @@ mod tests {
             .next()
             .expect("main.rs must contain #[cfg(test)]");
         let startup_publish = prod_source
-            .find("publish_gc_instance_state_once(&gc_store, &worker_config)")
+            .find("publish_gc_instance_state_once(&gc_registry, &worker_config)")
             .expect("main.rs must publish GC registry state during startup");
         let listener_bind = prod_source
-            .find("let listener = TcpListener::bind")
+            .find("let listener = match TcpListener::bind")
             .expect("main.rs must bind the pgwire listener");
 
         assert!(
@@ -1381,38 +1893,79 @@ mod tests {
     }
 
     #[test]
-    fn startup_inventory_repair_starts_after_pgwire_bind() {
+    fn database_inventory_reconcile_starts_after_pgwire_bind_and_repeats_for_cached_tenants() {
         let source = include_str!("main.rs");
         let prod_source = source
             .split("#[cfg(test)]")
             .next()
             .expect("main.rs must contain #[cfg(test)]");
         let listener_bind = prod_source
-            .find("let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?")
+            .find(
+                "let listener = match TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await",
+            )
             .expect("main.rs must bind the pgwire listener");
         let repair_spawn = prod_source
-            .find("spawn_startup_database_inventory_repair(")
-            .expect("startup inventory repair must be spawned");
+            .find("spawn_database_inventory_reconcile(")
+            .expect("database inventory reconcile must be spawned");
         let repair_call = prod_source
             .find("worker::register_database_inventory(")
-            .expect("startup inventory repair must still call register_database_inventory");
+            .expect("database inventory reconcile must still call register_database_inventory");
         let repair_fn = prod_source
-            .split("fn spawn_startup_database_inventory_repair(")
+            .split("fn spawn_database_inventory_reconcile(")
             .nth(1)
-            .and_then(|rest| rest.split("async fn shutdown_worker_runtime").next())
-            .expect("startup inventory repair helper must exist before shutdown_worker_runtime");
+            .and_then(|rest| rest.split("fn spawn_dropping_intent_repair").next())
+            .expect("database inventory reconcile helper must exist before dropping-intent repair");
 
         assert!(
             listener_bind < repair_spawn,
-            "startup inventory repair must not start before pgwire binds"
+            "database inventory reconcile must not start before pgwire binds"
         );
         assert!(
             !repair_fn.contains("ensure_current_executor"),
-            "startup inventory repair is per startup keyspace and must not be gated by the global worker executor lease"
+            "database inventory reconcile must not be gated by the global worker executor lease"
         );
         assert!(
             repair_spawn < repair_call,
             "register_database_inventory must run from the spawned repair task, not inline before bind"
+        );
+        assert!(
+            repair_fn.contains("client_pool.tenant_stores_snapshot().await"),
+            "database inventory reconcile must repair cached non-default tenant keyspaces, not only the startup keyspace"
+        );
+        assert!(
+            repair_fn.contains("backfill_tenant_lifecycle_inventory")
+                && repair_fn.contains("repair_dropped_tenant_lifecycle_inventory"),
+            "database inventory reconcile must repair lifecycle inventory for every repaired keyspace"
+        );
+        assert!(
+            repair_fn.contains("DATABASE_INVENTORY_RECONCILE_INTERVAL")
+                && !repair_fn.contains("return;"),
+            "database inventory reconcile must keep repairing post-CREATE registry misses after the initial startup pass"
+        );
+    }
+
+    #[test]
+    fn dropping_intent_repair_is_tied_to_legacy_v2_store_not_worker_execution() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+        let repair_spawn = prod_source
+            .find("let dropping_intent_repair_handle = legacy_v2_system_store")
+            .expect("dropping intent repair must be spawned from legacy V2 store presence");
+        let connect_host = prod_source
+            .find("let connect_host")
+            .expect("serve startup must compute connect_host after background repair setup");
+        let repair_block = &prod_source[repair_spawn..connect_host];
+
+        assert!(
+            repair_block.contains("spawn_dropping_intent_repair("),
+            "dropping intent repair must be spawned when the legacy V2 store exists"
+        );
+        assert!(
+            !repair_block.contains("worker_execution_enabled"),
+            "dropping intent repair is part of the enqueue fence subsystem and must not be disabled when worker execution is enabled"
         );
     }
 
@@ -1433,7 +1986,7 @@ mod tests {
             .find("abort_task(\"GC registry publisher\", publisher_handle)")
             .expect("shutdown must stop the publisher loop");
         let clear_state = shutdown_fn
-            .find("clear_gc_instance_state(gc_store, worker_config)")
+            .find("clear_gc_instance_state(gc_registry, worker_config)")
             .expect("shutdown must clear the local GC registry row");
 
         assert!(
@@ -1462,7 +2015,7 @@ mod tests {
             .find("shutdown_worker_runtime(worker_runtime).await")
             .expect("server shutdown must wait for worker runtime");
         let shutdown_gc = shutdown_fn
-            .find("shutdown_gc_runtime(gc_store, worker_config, publisher_handle, advancer_handle)")
+            .find("shutdown_gc_runtime(\n        gc_registry,\n        worker_config,\n        publisher_handle,\n        advancer_handle,\n        gc_self_fenced,")
             .expect("server shutdown must stop GC runtime last");
 
         assert!(
@@ -1472,6 +2025,50 @@ mod tests {
         assert!(
             shutdown_workers < shutdown_gc,
             "server shutdown must quiesce worker runtime before clearing the local GC registry row"
+        );
+    }
+
+    #[test]
+    fn gc_self_fence_shutdown_preserves_gc_registry_row() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+
+        let main_shutdown_call = prod_source
+            .split("let gc_self_fenced = gc_self_fence.is_cancelled();")
+            .nth(1)
+            .and_then(|rest| rest.split("serve_result").next())
+            .expect("main.rs must record GC self-fence state before shutdown");
+        assert!(
+            main_shutdown_call.contains("shutdown_server_runtime(")
+                && main_shutdown_call.contains("gc_self_fenced,"),
+            "server shutdown must pass the GC self-fence flag into runtime cleanup"
+        );
+
+        let shutdown_gc_fn = prod_source
+            .split("async fn shutdown_gc_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn supervised_background_loop").next())
+            .expect("main.rs must define shutdown_gc_runtime before supervisor");
+        let skip_branch = shutdown_gc_fn
+            .split("if skip_gc_registry_clear {")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("match worker::gc::clear_gc_instance_state")
+                    .next()
+            })
+            .expect("GC shutdown must have a self-fence branch before row clear");
+
+        assert!(
+            skip_branch.contains("Skipping GC registry row clear after GC self-fence")
+                && skip_branch.contains("return;"),
+            "GC self-fence shutdown must stop GC loops but return before clearing the row"
+        );
+        assert!(
+            !skip_branch.contains("clear_gc_instance_state"),
+            "GC self-fence shutdown must not publish None or delete the GC registry row"
         );
     }
 
@@ -1501,6 +2098,27 @@ mod tests {
         assert!(
             supervisor_fn.contains("catch_unwind"),
             "supervised_background_loop must use catch_unwind to restart on panic"
+        );
+    }
+
+    #[test]
+    fn supervised_liveness_publishers_share_self_fence_clocks_across_restarts() {
+        let source = include_str!("main.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must contain #[cfg(test)]");
+
+        assert!(
+            prod_source.contains("let gc_last_successful_publish = Arc::new(Mutex::new(Instant::now()))")
+                && prod_source.contains("publisher_last_successful_publish.clone()"),
+            "GC publisher must keep its last successful publish clock outside the supervised future"
+        );
+        assert!(
+            prod_source.contains("let lifecycle_last_successful_publish = Arc::new(Mutex::new(Instant::now()))")
+                && prod_source.contains("worker::lifecycle::run_lifecycle_publisher_loop(")
+                && prod_source.contains("publisher_last_successful_publish.clone()"),
+            "lifecycle publisher must keep its last successful publish clock outside the supervised future"
         );
     }
 

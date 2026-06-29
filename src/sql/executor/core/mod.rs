@@ -306,15 +306,11 @@ impl Executor {
                                 );
                                 let fire_time = chrono::Utc::now().timestamp_millis();
                                 system_store
-                                    .put_task_v2(&mut txn, &entry, fire_time)
-                                    .await?;
-                                system_store
-                                    .update_registry_task_types(
+                                    .enqueue_registry_task_v2_unless_db_tombstoned(
                                         &mut txn,
-                                        &trigger.keyspace,
-                                        trigger.db_id,
+                                        &entry,
+                                        fire_time,
                                         crate::worker::types::TASK_TYPE_ASYNC_TRIGGER,
-                                        0,
                                     )
                                     .await?;
                             }
@@ -430,27 +426,12 @@ impl Executor {
                     // fresh entries from legacy entries with default nonce=0.
                     entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
                     let mut txn = system_store.begin().await?;
-                    if system_store
-                        .dropped_db_tombstone_exists_for_update(
-                            &mut txn,
-                            &merge.keyspace,
-                            merge.db_id,
-                        )
-                        .await?
-                    {
-                        txn.rollback().await.ok();
-                        return Ok(());
-                    }
                     system_store
-                        .put_singleton_task_v2(&mut txn, &entry, fire_time_ms)
-                        .await?;
-                    system_store
-                        .update_registry_task_types(
+                        .enqueue_singleton_registry_task_v2_unless_db_dropped(
                             &mut txn,
-                            &merge.keyspace,
-                            merge.db_id,
+                            &entry,
+                            fire_time_ms,
                             crate::worker::types::TASK_TYPE_HNSW_MERGE,
-                            0,
                         )
                         .await?;
                     txn.commit().await?;

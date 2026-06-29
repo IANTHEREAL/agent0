@@ -320,8 +320,8 @@ async fn build_hnsw_index(
     {
         let system_store = crate::worker::system_store()?;
         let mut sys_txn = system_store.begin().await?;
-        system_store
-            .update_registry_task_types(
+        let registered = system_store
+            .update_registry_task_types_unless_db_dropped(
                 &mut sys_txn,
                 keyspace,
                 db_id,
@@ -329,6 +329,10 @@ async fn build_hnsw_index(
                 0,
             )
             .await?;
+        if !registered {
+            sys_txn.rollback().await.ok();
+            return Err(anyhow!("Cannot CREATE INDEX: database is being dropped"));
+        }
         sys_txn.commit().await?;
     }
 
@@ -953,12 +957,20 @@ pub async fn execute_create_index(
             );
             let now_ms = chrono::Utc::now().timestamp_millis();
             let mut sys_txn = system_store.begin().await?;
-            system_store
-                .put_task_v2(&mut sys_txn, &entry, now_ms)
+            let enqueued = system_store
+                .enqueue_registry_task_v2_unless_db_dropped(
+                    &mut sys_txn,
+                    &entry,
+                    now_ms,
+                    TASK_TYPE_BG_DDL,
+                )
                 .await?;
-            system_store
-                .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_DDL, 0)
-                .await?;
+            if !enqueued {
+                sys_txn.rollback().await.ok();
+                return Err(anyhow!(
+                    "Cannot CREATE INDEX CONCURRENTLY: database is being dropped"
+                ));
+            }
             sys_txn.commit().await?;
             // Wake the worker immediately so CIC does not wait for the poll interval.
             crate::worker::wake_worker();
@@ -997,14 +1009,19 @@ pub async fn execute_create_index(
         // worker sweep even if no other task type is registered for this database.
         let ss = crate::worker::system_store()?;
         let mut sys_txn = ss.begin().await?;
-        ss.update_registry_task_types(
-            &mut sys_txn,
-            keyspace,
-            db_id,
-            crate::worker::types::TASK_TYPE_DDL_JOURNAL,
-            0,
-        )
-        .await?;
+        let registered = ss
+            .update_registry_task_types_unless_db_dropped(
+                &mut sys_txn,
+                keyspace,
+                db_id,
+                crate::worker::types::TASK_TYPE_DDL_JOURNAL,
+                0,
+            )
+            .await?;
+        if !registered {
+            sys_txn.rollback().await.ok();
+            return Err(anyhow!("Cannot CREATE INDEX: database is being dropped"));
+        }
         sys_txn.commit().await?;
         Some(id)
     } else {

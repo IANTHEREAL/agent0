@@ -904,7 +904,7 @@ fn worker_execution_loops_are_gated_by_executor_lease() {
 
     let main_source = include_str!("../../main.rs");
     let worker_runtime = main_source
-        .split("let worker_runtime = if worker_config.enabled")
+        .split("let worker_runtime = if worker_execution_enabled")
         .nth(1)
         .and_then(|rest| rest.split("// Export snapshot janitor").next())
         .expect("main.rs must wire worker runtime");
@@ -1827,7 +1827,7 @@ async fn setup_cron_finalize_fixture_cmd(
     let (queue_key, descriptor) = {
         let mut txn = system_store.begin().await.unwrap();
         system_store
-            .put_task_v2(&mut txn, &entry, fire_time_ms)
+            .enqueue_task_v2_unless_db_dropped(&mut txn, &entry, fire_time_ms)
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -2193,7 +2193,7 @@ async fn cluster_already_terminal_minute_still_requeues_next_fire() {
         .with_schedule(job.schedule.clone());
         let mut txn = system_store.begin().await.unwrap();
         system_store
-            .put_task_v2(&mut txn, &entry, fire_time_ms)
+            .enqueue_task_v2_unless_db_dropped(&mut txn, &entry, fire_time_ms)
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -2734,7 +2734,7 @@ async fn orphan_cron_nextfire_for_dropped_db_is_skipped_and_reaped() {
     let (queue_key, descriptor) = {
         let mut txn = system_store.begin().await.unwrap();
         system_store
-            .put_task_v2(&mut txn, &entry, fire_time_ms)
+            .enqueue_task_v2_unless_db_dropped(&mut txn, &entry, fire_time_ms)
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -4293,6 +4293,15 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         // [bootstrap] One-time auth bootstrap at startup; single write + commit.
         "main",
         "async_main",
+        // [repair] Disabled-worker DROP-intent repair uses bounded page reads and
+        // immediate per-intent commits/rollbacks; it never holds a worker snapshot
+        // across task execution.
+        "repair_dropping_db_intents_once",
+        // ── worker/gc.rs ──
+
+        // [lookup] GC registry reader for safepoint computation; bounded scan +
+        // immediate rollback, not a long-lived worker transaction.
+        "scan_gc_instance_states",
         // ── protocol/handler/dynamic/startup.rs ──
 
         // [bootstrap] Per-connection auth bootstrap (idempotent); single write + commit.
