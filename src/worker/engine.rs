@@ -53,40 +53,12 @@ use crate::worker::CLAIM_CANCELLED_ERROR as CANCELLED_BY_ADMIN_ERROR;
 const WORKER_BGSQL_MAX_RETRY_ATTEMPTS: usize = 64;
 const REGISTRY_SWEEP_POLL_INTERVAL_SEC: u64 = 1;
 const REGISTRY_SWEEP_CATCHUP_PAGE_INTERVAL_SEC: u64 = 2;
-/// Convergent legacy `_worker_queue_` drain (design §II.8 M5). While stragglers
-/// are still being migrated, drain a bounded batch every this many seconds.
-const LEGACY_DRAIN_ACTIVE_INTERVAL_SEC: u64 = 5;
-/// Once the legacy queue has been observed EMPTY for `LEGACY_DRAIN_GRACE_EMPTY_SWEEPS`
-/// consecutive probes, fall back to this slower cadence. The drain NEVER stops —
-/// an OLD binary may still write V1 rows during a rolling deploy — but the
-/// steady-state cost is only a single 1-key empty-range probe at this interval.
-const LEGACY_DRAIN_IDLE_INTERVAL_SEC: u64 = 300;
-/// Grace window: number of consecutive empty probes before downshifting to the
-/// idle cadence. A straggler V1 row resets the streak and re-arms active drain.
-const LEGACY_DRAIN_GRACE_EMPTY_SWEEPS: u32 = 3;
-/// Per-tick batch budget so one drain tick never holds the maintenance loop on
-/// an unbounded backlog: at most this many bounded batches are migrated per tick;
-/// the remainder is picked up on the next tick (still convergent).
-const LEGACY_DRAIN_MAX_BATCHES_PER_TICK: u32 = 8;
 const REGISTRY_SWEEP_RECOVERY_BACKOFF_SEC: u64 = 30;
 const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
 const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5;
 const DISABLED_CHECK_THRESHOLD: u32 = 5;
 const CIC_REPAIR_TABLE_PAGE_SIZE: usize = 256;
 const HNSW_DIRTY_MARKER_PAGE_SIZE: usize = 256;
-
-/// Pacing for the convergent legacy `_worker_queue_` drain (design §II.8 M5).
-/// Active while stragglers are still being seen; downshifts to a cheap periodic
-/// empty-range probe once the queue has been empty for the grace window. The
-/// drain NEVER stops — a downshift only widens the interval — so an old binary
-/// that resumes writing V1 rows during a rolling deploy is always caught.
-fn legacy_drain_interval(empty_streak: u32) -> Duration {
-    if empty_streak >= LEGACY_DRAIN_GRACE_EMPTY_SWEEPS {
-        Duration::from_secs(LEGACY_DRAIN_IDLE_INTERVAL_SEC)
-    } else {
-        Duration::from_secs(LEGACY_DRAIN_ACTIVE_INTERVAL_SEC)
-    }
-}
 
 async fn worker_bgsql_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -120,11 +92,6 @@ struct RegistrySweepState {
     missing_database_seen: HashSet<(String, u64)>,
     cic_table_cursors: HashMap<(String, u64), Vec<u8>>,
     hnsw_dirty_cursors: HashMap<(String, u64), Vec<u8>>,
-    /// Convergent legacy `_worker_queue_` drain state (design §II.8 M5).
-    /// `legacy_drain_last_at` paces the drain; `legacy_drain_empty_streak`
-    /// counts consecutive empty probes for the grace-window downshift.
-    legacy_drain_last_at: Option<Instant>,
-    legacy_drain_empty_streak: u32,
 }
 
 impl Default for RegistrySweepState {
@@ -140,8 +107,6 @@ impl Default for RegistrySweepState {
             missing_database_seen: HashSet::new(),
             cic_table_cursors: HashMap::new(),
             hnsw_dirty_cursors: HashMap::new(),
-            legacy_drain_last_at: None,
-            legacy_drain_empty_streak: 0,
         }
     }
 }
@@ -434,33 +399,8 @@ impl WorkerEngine {
                     if !self.executor_lease.ensure_current_executor().await {
                         continue;
                     }
-                    if let Err(e) = self.legacy_queue_drain_tick().await {
-                        if is_retryable_tikv_error(&e) {
-                            debug!(
-                                "Worker legacy queue drain contended; another worker likely drained this batch first: {}",
-                                e
-                            );
-                        } else {
-                            warn!("Worker legacy queue drain error: {}", e);
-                        }
-                    }
-                    match self.system_store.legacy_worker_queue_is_empty().await {
-                        Ok(true) => {
-                            if let Err(e) = self.registry_sweep_tick().await {
-                                warn!("Worker registry sweep error: {}", e);
-                            }
-                        }
-                        Ok(false) => {
-                            debug!(
-                                "Skipping worker registry sweep while legacy V1 queue backlog drains"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Worker legacy queue empty probe failed; skipping registry sweep: {}",
-                                e
-                            );
-                        }
+                    if let Err(e) = self.registry_sweep_tick().await {
+                        warn!("Worker registry sweep error: {}", e);
                     }
                 }
             }
@@ -744,84 +684,6 @@ impl WorkerEngine {
             .store(observed, Ordering::Relaxed);
         metrics::gauge!("db9_server_hnsw_pending_indexes_observed").set(observed as f64);
         metrics::counter!("db9_server_worker_sweep_cycles_completed_total").increment(1);
-    }
-
-    /// Convergent background drain of legacy `_worker_queue_` rows (design
-    /// §II.8 M5).
-    ///
-    /// Startup only enables the V2 schema marker. Any legacy rows from before
-    /// the upgrade, plus any rolling-deploy stragglers from OLD binaries, are
-    /// projected into V2 here in BOUNDED batches. Once the legacy queue is
-    /// observed empty across a grace window, this downshifts to a cheap
-    /// empty-range probe — and it NEVER stops, because an old binary may write
-    /// a fresh V1 row at any time in the window.
-    ///
-    /// Bounded by construction (issue #2576 invariant): each active sweep does
-    /// at most `LEGACY_DRAIN_MAX_BATCHES_PER_TICK` page-sized batch migrations;
-    /// the converged path is a single 1-key probe. This is NOT a per-operation
-    /// or per-tick global scan — only this maintenance-loop step touches the
-    /// legacy layer, and the V2-only enqueue/dequeue hot paths never do.
-    async fn legacy_queue_drain_tick(&self) -> Result<()> {
-        let now = Instant::now();
-        {
-            let state = self.registry_sweep_state.lock().await;
-            let interval = legacy_drain_interval(state.legacy_drain_empty_streak);
-            if state
-                .legacy_drain_last_at
-                .is_some_and(|last| now.duration_since(last) < interval)
-            {
-                return Ok(());
-            }
-        }
-
-        // Drain bounded batches until the legacy queue is empty or the per-tick
-        // budget is spent. Each batch migrates V1 -> V2 (due/index/payload) and
-        // deletes the V1 keys in the SAME transaction.
-        let mut migrated_total = 0usize;
-        let mut batches = 0u32;
-        let mut drained_to_empty = false;
-        while batches < LEGACY_DRAIN_MAX_BATCHES_PER_TICK {
-            let batch = self.system_store.drain_legacy_worker_queue_batch().await?;
-            batches += 1;
-            migrated_total += batch.migrated;
-            if batch.drained == 0 {
-                drained_to_empty = true;
-                break;
-            }
-        }
-
-        // If the budget was spent without emptying, confirm whether more remains
-        // so the grace streak is not advanced prematurely.
-        if !drained_to_empty {
-            drained_to_empty = self.system_store.legacy_worker_queue_is_empty().await?;
-        }
-
-        {
-            let mut state = self.registry_sweep_state.lock().await;
-            state.legacy_drain_last_at = Some(now);
-            if drained_to_empty {
-                state.legacy_drain_empty_streak = state.legacy_drain_empty_streak.saturating_add(1);
-            } else {
-                // A straggler appeared: re-arm aggressive draining.
-                state.legacy_drain_empty_streak = 0;
-            }
-        }
-
-        if migrated_total > 0 {
-            self.metrics
-                .legacy_queue_drained
-                .fetch_add(migrated_total as u64, Ordering::Relaxed);
-            metrics::counter!("db9_server_worker_legacy_queue_drained_total")
-                .increment(migrated_total as u64);
-            info!(
-                migrated = migrated_total,
-                batches, "Worker drained legacy V1 worker-queue stragglers into V2"
-            );
-            // New V2 due rows are now visible to the tick; nudge it.
-            crate::worker::wake_worker();
-        }
-
-        Ok(())
     }
 
     async fn registry_sweep_should_skip(
@@ -1933,9 +1795,9 @@ impl WorkerEngine {
     /// Core implementation of claim_and_execute, parameterized over the finalize
     /// function so tests can inject failures in the real code path.
     ///
-    /// Handles V2 descriptors. Legacy `_worker_queue_` rows become visible here
-    /// only after the bounded drain projects them into V2. A post-claim
-    /// existence re-check closes the
+    /// Handles V2 descriptors only. Retired legacy `_worker_queue_` rows are
+    /// not migrated or executed by production workers. A post-claim existence
+    /// re-check closes the
     /// read-before/claim-after-release window: if the entry was deleted by
     /// another replica (or unschedule / DROP DATABASE reap) since the tick
     /// scanned it, we release the claim and skip rather than re-execute.

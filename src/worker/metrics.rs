@@ -44,11 +44,6 @@ pub struct WorkerMetrics {
     /// Counter: cumulative sweeper enqueue failures (system store write errors).
     pub hnsw_sweep_enqueue_errors: AtomicU64,
 
-    /// Counter: cumulative legacy V1 `_worker_queue_` rows migrated into V2 by
-    /// the convergent background drain (design §II.8 M5). Steady state is 0
-    /// increments once a rolling deploy completes and old binaries stop writing.
-    pub legacy_queue_drained: AtomicU64,
-
     /// Gauge: last successfully reported TiKV GC safepoint (TSO version).
     pub gc_safepoint_last_version: AtomicU64,
     /// Counter: successful GC safepoint advancements.
@@ -87,7 +82,6 @@ impl WorkerMetrics {
             hnsw_sweep_enqueued: AtomicU64::new(0),
             hnsw_scan_deltas_applied: AtomicU64::new(0),
             hnsw_sweep_enqueue_errors: AtomicU64::new(0),
-            legacy_queue_drained: AtomicU64::new(0),
 
             gc_safepoint_last_version: AtomicU64::new(0),
             gc_safepoint_advance_ok: AtomicU64::new(0),

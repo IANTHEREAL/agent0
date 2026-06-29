@@ -21,29 +21,6 @@ pub struct WqIndexRow {
 const GC_INSTANCE_STATE_VALUE_LEN: usize = 17;
 const LEGACY_GC_INSTANCE_STATE_VALUE_LEN: usize = 25;
 const WORKER_QUEUE_SCHEMA_V2: u8 = 2;
-/// Max rows migrated by ONE `drain_legacy_worker_queue_batch` call. Exposed at
-/// crate scope so the worker engine's drain-tick budget-cap orchestration test
-/// can compute the exact per-tick migration ceiling
-/// (`LEGACY_DRAIN_MAX_BATCHES_PER_TICK * WORKER_QUEUE_MIGRATION_BATCH`).
-pub(crate) const WORKER_QUEUE_MIGRATION_BATCH: u32 = 256;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WorkerQueueDrainBatch {
-    pub migrated: usize,
-    pub drained: usize,
-}
-
-enum LegacyWorkerQueueDrainRow {
-    Migratable {
-        key: Vec<u8>,
-        fire_time_ms: i64,
-        entry: TaskQueueEntry,
-    },
-    Corrupt {
-        key: Vec<u8>,
-        reason: String,
-    },
-}
 
 /// Published GC instance state read back from `_sys_worker`.
 #[derive(Clone)]
@@ -113,30 +90,6 @@ fn tikv_error_is_worker_claim_contention(err: &tikv_client::Error) -> bool {
     }
 }
 
-fn classify_legacy_worker_queue_row_for_drain(
-    key: &[u8],
-    value: &[u8],
-) -> LegacyWorkerQueueDrainRow {
-    let Some(fire_time_ms) = decode_worker_queue_fire_time(key) else {
-        return LegacyWorkerQueueDrainRow::Corrupt {
-            key: key.to_vec(),
-            reason: "missing fire_time_ms in legacy worker queue key".to_string(),
-        };
-    };
-
-    match TaskQueueEntry::deserialize_compat(value) {
-        Ok(entry) => LegacyWorkerQueueDrainRow::Migratable {
-            key: key.to_vec(),
-            fire_time_ms,
-            entry,
-        },
-        Err(e) => LegacyWorkerQueueDrainRow::Corrupt {
-            key: key.to_vec(),
-            reason: format!("failed to deserialize legacy worker queue entry: {e}"),
-        },
-    }
-}
-
 fn gc_instance_state_scan_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     end.push(0xFF);
@@ -145,27 +98,6 @@ fn gc_instance_state_scan_end(prefix: &[u8]) -> Vec<u8> {
 
 fn worker_queue_schema_is_v2(value: Option<&[u8]>) -> bool {
     value.is_some_and(|bytes| bytes.first().copied() == Some(WORKER_QUEUE_SCHEMA_V2))
-}
-
-fn migrated_legacy_worker_nonce(entry: &TaskQueueEntry, fire_time_ms: i64) -> u64 {
-    fn mix(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    let mut hash = 0xcbf29ce484222325u64;
-    mix(&mut hash, entry.keyspace.as_bytes());
-    mix(&mut hash, &entry.db_id.to_be_bytes());
-    mix(&mut hash, &entry.task_id.to_be_bytes());
-    mix(&mut hash, &[entry.task_type.to_bitmask()]);
-    mix(&mut hash, &fire_time_ms.to_be_bytes());
-    if hash == 0 {
-        1
-    } else {
-        hash
-    }
 }
 
 impl TikvStore {
@@ -722,156 +654,29 @@ impl TikvStore {
         Ok(())
     }
 
-    /// Cheap empty-range probe for the legacy (`_worker_queue_`) layer: a single
-    /// 1-key scan. The converged steady state of the background drain costs only
-    /// this probe, so the drain never imposes a global scan once stragglers stop
-    /// appearing.
-    pub async fn legacy_worker_queue_is_empty(&self) -> Result<bool> {
-        let mut txn = self.begin().await?;
-        let empty = !self.legacy_queue_has_entries(&mut txn).await?;
-        txn.rollback().await.ok();
-        Ok(empty)
-    }
-
-    /// Drain ONE bounded batch (≤ `WORKER_QUEUE_MIGRATION_BATCH`) of due legacy
-    /// (`_worker_queue_`) rows. Valid rows are migrated to V2 by writing their
-    /// V2 due/index/payload rows and deleting their V1 keys in the SAME batch
-    /// transaction. Corrupt rows are warned and deleted so one poison V1 row
-    /// cannot wedge the convergent background drain or registry sweep.
+    /// Fail-fast retirement gate for the pre-V2 `_worker_queue_` family.
     ///
-    /// This is the single convergent primitive used by the periodic background
-    /// drain (maintenance loop). It is BOUNDED (one page-sized batch per call),
-    /// never a per-operation or
-    /// per-tick global scan: the V2-only enqueue/dequeue hot paths never touch
-    /// the legacy layer (issue #2576 invariant). Because new producers only ever
-    /// write V2, repeated calls strictly drain the legacy layer toward empty.
-    pub async fn drain_legacy_worker_queue_batch(&self) -> Result<WorkerQueueDrainBatch> {
+    /// The V1 drain/projection path is intentionally removed. To avoid silently
+    /// stranding a historical V1 backlog, startup must prove the retired prefix
+    /// is empty with a bounded 1-key probe before running without the drain.
+    pub async fn ensure_legacy_worker_queue_retired(&self) -> Result<()> {
         let mut txn = self.begin().await?;
-        let rows = self
-            .scan_due_legacy_bytesafe(&mut txn, i64::MAX, WORKER_QUEUE_MIGRATION_BATCH)
-            .await?;
-        if rows.is_empty() {
-            txn.rollback().await.ok();
-            return Ok(WorkerQueueDrainBatch::default());
+        let prefix = encode_worker_queue_prefix();
+        let upper = encode_prefix_end(&prefix);
+        let range: BoundRange = (prefix.clone()..upper).into();
+        let first_key = tikv_op!(txn.scan_keys(range, 1).await)?
+            .map(Vec::from)
+            .find(|key| key.starts_with(&prefix));
+        txn.rollback().await.ok();
+
+        if let Some(key) = first_key {
+            return Err(anyhow!(
+                "legacy V1 worker queue row remains under _worker_queue_ \
+                 (first_key_len={}); run a version with the V1-to-V2 drain or \
+                 explicit cleanup before retiring the V1 drain",
+                key.len()
+            ));
         }
-
-        let mut batch = WorkerQueueDrainBatch::default();
-        for row in rows {
-            batch.drained += 1;
-            let (legacy_key, fire_time_ms, mut entry) = match row {
-                LegacyWorkerQueueDrainRow::Migratable {
-                    key,
-                    fire_time_ms,
-                    entry,
-                } => (key, fire_time_ms, entry),
-                LegacyWorkerQueueDrainRow::Corrupt { key, reason } => {
-                    tracing::warn!(
-                        key_len = key.len(),
-                        reason,
-                        "Dropping corrupt legacy worker queue row during V1-to-V2 drain"
-                    );
-                    self.delete_worker_queue_entry(&mut txn, &key).await?;
-                    continue;
-                }
-            };
-            if entry.task_type.uses_deterministic_queue_key() {
-                // Deterministic task types REQUIRE singleton semantics: a rolling
-                // deploy can let an OLD binary write a V1 deterministic row AFTER
-                // a NEW node already enqueued/claimed the V2 singleton. Migrating
-                // such a row with raw `put_task_v2` would either overwrite the
-                // live descriptor under a new nonce (cleanup's nonce check then
-                // skips deletion → re-run) or create a second descriptor at a
-                // different `fire_time_ms` (two workers run the same logical
-                // singleton). Route through the IDENTICAL singleton guard that
-                // every producer uses (`put_singleton_task_v2`): if a pending or
-                // claimed V2 row already represents this logical task, drop the
-                // V1 key WITHOUT writing another descriptor; otherwise write the
-                // one V2 singleton and drop the V1 key — same batch txn.
-                if entry.nonce == 0 {
-                    entry.nonce = migrated_legacy_worker_nonce(&entry, fire_time_ms);
-                }
-                self.put_singleton_task_v2(&mut txn, &entry, fire_time_ms)
-                    .await?;
-            } else {
-                self.put_task_v2(&mut txn, &entry, fire_time_ms).await?;
-            }
-            self.delete_worker_queue_entry(&mut txn, &legacy_key)
-                .await?;
-            batch.migrated += 1;
-        }
-        txn.commit().await?;
-        Ok(batch)
-    }
-
-    /// Seed a single legacy (`_worker_queue_`) entry, simulating durable state
-    /// written by a pre-V2 binary before an upgrade. Test-only: production
-    /// paths never write the legacy layout. Used by the production-startup
-    /// migration behavioral test (`worker::mod::tests`).
-    #[cfg(test)]
-    pub async fn seed_legacy_worker_queue_entry_for_test(
-        &self,
-        entry: &TaskQueueEntry,
-        fire_time_ms: i64,
-    ) -> Result<()> {
-        let legacy_key = encode_worker_queue_key(
-            entry.priority,
-            fire_time_ms,
-            entry.task_type.to_bitmask(),
-            &entry.keyspace,
-            entry.db_id,
-            entry.task_id,
-        )?;
-        let mut txn = self.begin().await?;
-        txn_put(
-            &mut txn,
-            self.key(&legacy_key),
-            bincode::serialize(entry).context("serialize legacy worker queue entry")?,
-        )
-        .await?;
-        txn.commit().await?;
-        Ok(())
-    }
-
-    /// Seed many legacy (`_worker_queue_`) entries in batched transactions,
-    /// simulating a large backlog left by a pre-V2 binary. Test-only; used by the
-    /// drain-tick budget-cap orchestration test where seeding one txn per row
-    /// would be prohibitively slow. Each `(entry, fire_time_ms)` becomes one V1
-    /// key; rows are committed in chunks of `chunk_size`.
-    #[cfg(test)]
-    pub async fn seed_legacy_worker_queue_entries_for_test(
-        &self,
-        entries: &[(TaskQueueEntry, i64)],
-        chunk_size: usize,
-    ) -> Result<()> {
-        let chunk_size = chunk_size.max(1);
-        for chunk in entries.chunks(chunk_size) {
-            let mut txn = self.begin().await?;
-            for (entry, fire_time_ms) in chunk {
-                let legacy_key = encode_worker_queue_key(
-                    entry.priority,
-                    *fire_time_ms,
-                    entry.task_type.to_bitmask(),
-                    &entry.keyspace,
-                    entry.db_id,
-                    entry.task_id,
-                )?;
-                txn_put(
-                    &mut txn,
-                    self.key(&legacy_key),
-                    bincode::serialize(entry).context("serialize legacy worker queue entry")?,
-                )
-                .await?;
-            }
-            txn.commit().await?;
-        }
-        Ok(())
-    }
-
-    /// Delete a single due-queue key (legacy `_worker_queue_`). Used by the
-    /// bounded V1-to-V2 compatibility drain and test-only compatibility checks.
-    /// Normal production queue paths are V2-only.
-    async fn delete_worker_queue_entry(&self, txn: &mut Transaction, key: &[u8]) -> Result<()> {
-        txn_delete(txn, key.to_vec()).await?;
         Ok(())
     }
 
@@ -1315,108 +1120,8 @@ impl TikvStore {
         Ok(results)
     }
 
-    /// Byte-safe scan of due LEGACY (`_worker_queue_`) entries: fetch exactly
-    /// one key/value pair per RPC. Used only by the bounded V1-to-V2 background
-    /// drain.
-    async fn scan_due_legacy_bytesafe(
-        &self,
-        txn: &mut Transaction,
-        now_ms: i64,
-        limit: u32,
-    ) -> Result<Vec<LegacyWorkerQueueDrainRow>> {
-        let mut results = Vec::new();
-        if limit == 0 {
-            return Ok(results);
-        }
-        let due_exclusive = now_ms.saturating_add(1);
-        for priority in 0u8..=255 {
-            if results.len() >= limit as usize {
-                break;
-            }
-            let mut start = encode_worker_queue_prefix();
-            start.push(priority);
-            let end = encode_worker_queue_scan_end(priority, due_exclusive)?;
-            let mut cursor = start.clone();
-            while results.len() < limit as usize {
-                let range: BoundRange = (cursor.clone()..end.clone()).into();
-                let mut pairs = tikv_op!(txn.scan(range, 1).await)?;
-                let Some(pair) = pairs.next() else {
-                    break;
-                };
-                let key: &[u8] = pair.key().as_ref().into();
-                if !key.starts_with(&start) {
-                    break;
-                }
-                let key = key.to_vec();
-                results.push(classify_legacy_worker_queue_row_for_drain(
-                    &key,
-                    pair.value(),
-                ));
-                cursor = key;
-                cursor.push(0);
-            }
-        }
-        Ok(results)
-    }
-
-    /// Cheap existence check for any legacy (`_worker_queue_`) entry: a single
-    /// 1-key scan. Used by the convergent background drain's empty-range probe
-    /// (`legacy_worker_queue_is_empty`) and by compatibility tests. It is NOT a
-    /// per-operation gate on any enqueue/dequeue hot path — those are V2-only
-    /// (issue #2576 invariant); only the bounded maintenance-loop drain consults
-    /// it.
-    async fn legacy_queue_has_entries(&self, txn: &mut Transaction) -> Result<bool> {
-        let prefix = encode_worker_queue_prefix();
-        let end = encode_prefix_end(&prefix);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let keys: Vec<Vec<u8>> = tikv_op!(txn.scan_keys(range, 1).await)?
-            .map(Vec::from)
-            .collect();
-        Ok(keys.iter().any(|k| k.starts_with(&prefix)))
-    }
-
-    /// Byte-safe scan of legacy (`_worker_queue_`) entries matching `pred`.
-    /// Test-only: production V1 compatibility is handled by the startup schema
-    /// migration and normal task/db-targeted paths are V2-only.
-    #[cfg(test)]
-    async fn scan_legacy_filtered<F>(
-        &self,
-        txn: &mut Transaction,
-        mut pred: F,
-    ) -> Result<Vec<(Vec<u8>, TaskQueueEntry)>>
-    where
-        F: FnMut(&TaskQueueEntry) -> bool,
-    {
-        let prefix = encode_worker_queue_prefix();
-        let upper = encode_prefix_end(&prefix);
-
-        let mut out = Vec::new();
-        let mut cursor = prefix.clone();
-        loop {
-            let range: BoundRange = (cursor.clone()..upper.clone()).into();
-            let mut pairs = tikv_op!(txn.scan(range, 1).await)?;
-            let Some(pair) = pairs.next() else {
-                break;
-            };
-            let key: &[u8] = pair.key().as_ref().into();
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let key = key.to_vec();
-            let entry = TaskQueueEntry::deserialize_compat(pair.value())
-                .context("Failed to deserialize worker queue entry")?;
-            if pred(&entry) {
-                out.push((key.clone(), entry));
-            }
-            cursor = key;
-            cursor.push(0);
-        }
-        Ok(out)
-    }
-
-    /// Delete every queue entry for one task across V2 and test-seeded legacy.
-    /// Test-only guard; production SQL hot paths use `delete_task_v2_by_identity`
-    /// and leave legacy rows to the bounded compatibility drain.
+    /// Delete every V2 queue entry for one task. Test-only guard used by queue
+    /// storage tests; production SQL hot paths use `delete_task_v2_by_identity`.
     #[cfg(test)]
     pub async fn delete_task_all_layers(
         &self,
@@ -1443,48 +1148,11 @@ impl TikvStore {
             .await?;
             deleted += 1;
         }
-        if self.legacy_queue_has_entries(txn).await? {
-            let rows = self
-                .scan_legacy_filtered(txn, |e| {
-                    e.task_id == task_id
-                        && e.db_id == db_id
-                        && e.keyspace == keyspace
-                        && e.task_type == task_type
-                })
-                .await?;
-            for (key, _) in rows {
-                self.delete_worker_queue_entry(txn, &key).await?;
-                deleted += 1;
-            }
-        }
         Ok(deleted)
     }
 
-    /// Legacy (`_worker_queue_`) entries for one (keyspace, db_id, task_type),
-    /// as `(legacy_due_key, task_id)`. Test-only guard; production paths must
-    /// not call this helper because it scans the whole legacy queue.
-    #[cfg(test)]
-    pub async fn legacy_entries_for_db_type(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-        task_type: TaskType,
-    ) -> Result<Vec<(Vec<u8>, i64)>> {
-        if !self.legacy_queue_has_entries(txn).await? {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .scan_legacy_filtered(txn, |e| {
-                e.task_type == task_type && e.db_id == db_id && e.keyspace == keyspace
-            })
-            .await?;
-        Ok(rows.into_iter().map(|(key, e)| (key, e.task_id)).collect())
-    }
-
     /// Whether any pending queue entry exists for one task. V2-only by contract:
-    /// legacy rows are projected by the bounded background drain, not by
-    /// targeted production paths.
+    /// production no longer reads or projects legacy `_worker_queue_` rows.
     pub async fn task_has_pending(
         &self,
         txn: &mut Transaction,
@@ -2151,31 +1819,54 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_legacy_worker_queue_row_is_classified_for_drain() {
-        let key = crate::storage::encoding::encode_worker_queue_key(
-            128,
-            1_234_567_890,
-            TaskType::Cron.to_bitmask(),
-            "default",
-            7,
-            42,
-        )
-        .expect("legacy key");
+    fn legacy_v1_drain_projection_is_removed() {
+        let source = include_str!("worker.rs");
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("worker.rs must contain tests");
+        for forbidden in [
+            "drain_legacy_worker_queue_batch",
+            "scan_due_legacy_bytesafe",
+            "legacy_worker_queue_is_empty",
+            "legacy_queue_has_entries",
+            "scan_legacy_filtered",
+            "delete_worker_queue_entry",
+            "LegacyWorkerQueueDrainRow",
+            "classify_legacy_worker_queue_row_for_drain",
+            "migrated_legacy_worker_nonce",
+        ] {
+            assert!(
+                !prod_source.contains(forbidden),
+                "legacy V1 queue drain/projection must stay removed from production code: {forbidden}"
+            );
+        }
+    }
 
-        match classify_legacy_worker_queue_row_for_drain(&key, b"not-bincode") {
-            LegacyWorkerQueueDrainRow::Corrupt {
-                key: row_key,
-                reason,
-            } => {
-                assert_eq!(row_key, key);
-                assert!(
-                    reason.contains("deserialize"),
-                    "corrupt row reason should identify the decode failure: {reason}"
-                );
-            }
-            LegacyWorkerQueueDrainRow::Migratable { .. } => {
-                panic!("garbage legacy row must not be treated as migratable")
-            }
+    #[test]
+    fn legacy_v1_retirement_preflight_is_bounded_and_non_migrating() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn ensure_legacy_worker_queue_retired")
+            .nth(1)
+            .and_then(|rest| rest.split("// V2 secondary index").next())
+            .expect("legacy V1 retirement preflight helper must exist");
+
+        assert!(
+            helper.contains("encode_worker_queue_prefix") && helper.contains("scan_keys(range, 1)"),
+            "retirement preflight must be a bounded 1-key legacy-prefix probe"
+        );
+        for forbidden in [
+            "put_task_v2",
+            "put_singleton_task_v2",
+            "delete_worker_queue_entry",
+            "delete_task_v2",
+            "TaskQueueEntry::deserialize_compat",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "retirement preflight must not migrate, execute, delete, or decode V1 rows: {forbidden}"
+            );
         }
     }
 
@@ -2208,7 +1899,7 @@ mod tests {
         let helper = source
             .split("pub async fn ensure_worker_queue_schema_v2")
             .nth(1)
-            .and_then(|rest| rest.split("/// Cheap empty-range probe").next())
+            .and_then(|rest| rest.split("// V2 secondary index").next())
             .expect("worker queue schema enablement helper must exist");
 
         assert!(
@@ -2394,34 +2085,6 @@ mod tests {
             .expect("init system store")
     }
 
-    async fn raw_worker_test_store(tag: &str) -> Arc<TikvStore> {
-        let pd_endpoints = std::env::var("PD_ENDPOINTS")
-            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let system_keyspace = format!(
-            "_sys_wq_{tag}_test_{}_{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        // `new_system` connects with `with_keyspace`, which requires the keyspace
-        // to already exist in PD (the vendored client does NOT auto-create it).
-        // Pre-create it with the canonical PD-API helper, mirroring what
-        // `init_gc_registry_store` (used by `v2_test_store`) does — otherwise the
-        // connect fails with "keyspace does not exist".
-        crate::worker::ensure_system_keyspace(&pd_endpoints, &system_keyspace)
-            .await
-            .expect("pre-create raw worker test keyspace in PD");
-        Arc::new(
-            TikvStore::new_system(pd_endpoints, &system_keyspace)
-                .await
-                .expect("init raw system store"),
-        )
-    }
-
     fn unique_ks(tag: &str) -> String {
         format!(
             "ks_{tag}_{}_{}",
@@ -2505,311 +2168,6 @@ mod tests {
             128,
         )
         .with_schedule("*/5 * * * *".to_string())
-    }
-
-    /// Convergent drain (design §II.8 M5): a legacy V1 row that exists after
-    /// this node has latched `_wq_schema_version = 2` must still be migrated to
-    /// V2 by the periodic background drain, not stranded by V2-only consumers.
-    #[tokio::test]
-    #[ignore = "requires TiKV / PD cluster"]
-    async fn convergent_drain_migrates_straggler_v1_rows_written_after_v2_marker() {
-        // init_gc_registry_store latches the V2 marker without draining legacy
-        // rows — exactly the production startup state.
-        let store = v2_test_store().await;
-        let ks = unique_ks("drain");
-        let db_id = 9u64;
-
-        // This fresh test keyspace has no legacy queue yet: drain is a no-op
-        // empty probe.
-        assert!(
-            store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("empty probe"),
-            "fresh system keyspace should start without legacy rows"
-        );
-        assert_eq!(
-            store
-                .drain_legacy_worker_queue_batch()
-                .await
-                .expect("drain empty")
-                .migrated,
-            0,
-            "draining an empty legacy queue migrates nothing"
-        );
-
-        // Simulate an OLD binary writing a V1 row AFTER the V2 marker is set.
-        let entry = cron_entry(&ks, db_id, 314, "SELECT 1");
-        let fire = crate::worker::now_epoch_ms() - 60_000;
-        store
-            .seed_legacy_worker_queue_entry_for_test(&entry, fire)
-            .await
-            .expect("seed straggler V1 row");
-        assert!(
-            !store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("non-empty probe"),
-            "straggler V1 row must be observed by the empty probe"
-        );
-
-        // The V2-only tick scan must NOT yet see it (it is still a V1 row).
-        let mut txn = store.begin().await.unwrap();
-        let due_before = store.scan_due_v2(&mut txn, i64::MAX, 1000).await.unwrap();
-        txn.rollback().await.ok();
-        assert!(
-            !due_before
-                .iter()
-                .any(|(_, d)| d.keyspace == ks && d.task_id == 314),
-            "straggler is invisible to the V2-only tick before the drain"
-        );
-
-        // One convergent drain batch migrates the straggler.
-        let migrated = store
-            .drain_legacy_worker_queue_batch()
-            .await
-            .expect("drain straggler")
-            .migrated;
-        assert_eq!(migrated, 1, "drain must migrate exactly the one straggler");
-
-        // Legacy queue is now empty (converged) and the row is visible to V2.
-        assert!(
-            store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("converged probe"),
-            "legacy queue must be empty after the straggler is drained"
-        );
-        let mut txn = store.begin().await.unwrap();
-        let due_after = store.scan_due_v2(&mut txn, i64::MAX, 1000).await.unwrap();
-        txn.rollback().await.ok();
-        assert!(
-            due_after.iter().any(|(_, d)| d.keyspace == ks
-                && d.task_id == 314
-                && d.task_type == TaskType::Cron),
-            "drained straggler must be visible to the V2-only tick"
-        );
-
-        // Cleanup.
-        let mut txn = store.begin().await.unwrap();
-        store
-            .delete_task_all_layers(&mut txn, &ks, db_id, 314, TaskType::Cron)
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-    }
-
-    fn hnsw_merge_entry(ks: &str, db_id: u64, task_id: i64) -> TaskQueueEntry {
-        TaskQueueEntry::new(
-            ks.to_string(),
-            db_id,
-            task_id,
-            TaskType::HnswMerge,
-            String::new(),
-            "system".to_string(),
-            128,
-        )
-    }
-
-    /// Convergent drain + singleton contract (design §II.8 M5): a rolling deploy
-    /// can let an OLD binary write a V1 deterministic (`HnswMerge`) row AFTER a
-    /// NEW node already enqueued the V2 singleton. Draining that straggler must
-    /// NOT create a second V2 descriptor (raw `put_task_v2` would) — it must
-    /// route through the SAME singleton guard producers use and simply drop the
-    /// V1 key, leaving exactly one V2 representation.
-    #[tokio::test]
-    #[ignore = "requires TiKV / PD cluster"]
-    async fn drain_preserves_singleton_for_deterministic_straggler_when_v2_exists() {
-        let store = v2_test_store().await;
-        let ks = unique_ks("det_dup");
-        let db_id = 21u64;
-        let task_id = 7i64;
-
-        // A NEW node already enqueued the V2 singleton via the producer path.
-        let v2_entry = {
-            let mut e = hnsw_merge_entry(&ks, db_id, task_id);
-            e.nonce = 0xA1B2C3D4;
-            e
-        };
-        let v2_fire = crate::worker::now_epoch_ms() - 30_000;
-        let mut txn = store.begin().await.unwrap();
-        assert!(
-            store
-                .put_singleton_task_v2(&mut txn, &v2_entry, v2_fire)
-                .await
-                .unwrap(),
-            "first singleton enqueue must write the descriptor"
-        );
-        txn.commit().await.unwrap();
-
-        // Snapshot the live V2 descriptor (identity + nonce) before the drain.
-        let before = {
-            let mut txn = store.begin().await.unwrap();
-            let rows = store
-                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
-                .await
-                .unwrap();
-            txn.rollback().await.ok();
-            rows
-        };
-        assert_eq!(before.len(), 1, "exactly one V2 descriptor before drain");
-        let before_fire = before[0].fire_time_ms;
-        assert_eq!(
-            before_fire, v2_fire,
-            "V2 descriptor at the producer fire_time"
-        );
-
-        // An OLD binary writes a V1 deterministic straggler for the SAME logical
-        // task at a DIFFERENT fire_time (nonce 0 — the pre-V2 layout).
-        let straggler = hnsw_merge_entry(&ks, db_id, task_id);
-        let straggler_fire = before_fire + 5_000;
-        store
-            .seed_legacy_worker_queue_entry_for_test(&straggler, straggler_fire)
-            .await
-            .expect("seed deterministic straggler V1 row");
-        assert!(
-            !store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("non-empty probe"),
-            "straggler V1 row must be observed before the drain"
-        );
-
-        // Drain the straggler.
-        let migrated = store
-            .drain_legacy_worker_queue_batch()
-            .await
-            .expect("drain straggler")
-            .migrated;
-        assert_eq!(migrated, 1, "drain removes exactly the one V1 straggler");
-
-        // The V1 key is gone (converged).
-        assert!(
-            store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("converged probe"),
-            "legacy queue must be empty after draining the straggler"
-        );
-
-        // Singleton preserved: STILL exactly one V2 descriptor, unchanged — no
-        // second row at `straggler_fire`, no nonce overwrite.
-        let after = {
-            let mut txn = store.begin().await.unwrap();
-            let rows = store
-                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
-                .await
-                .unwrap();
-            txn.rollback().await.ok();
-            rows
-        };
-        assert_eq!(
-            after.len(),
-            1,
-            "draining a deterministic straggler must NOT create a second V2 descriptor"
-        );
-        assert_eq!(
-            after[0].fire_time_ms, before_fire,
-            "the surviving descriptor must be the original V2 singleton, not the straggler's fire_time"
-        );
-
-        // Cleanup.
-        let mut txn = store.begin().await.unwrap();
-        store
-            .delete_task_all_layers(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-    }
-
-    /// The complementary case: when NO V2 row exists for the logical
-    /// deterministic task, draining the legacy V1 straggler must materialize
-    /// EXACTLY ONE V2 singleton (and drop the V1 key).
-    #[tokio::test]
-    #[ignore = "requires TiKV / PD cluster"]
-    async fn drain_creates_single_singleton_for_deterministic_straggler_when_no_v2() {
-        let store = v2_test_store().await;
-        let ks = unique_ks("det_new");
-        let db_id = 22u64;
-        let task_id = 9i64;
-
-        // No V2 row exists yet.
-        let mut txn = store.begin().await.unwrap();
-        assert!(
-            store
-                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
-                .await
-                .unwrap()
-                .is_empty(),
-            "no V2 descriptor must exist before the drain"
-        );
-        txn.rollback().await.ok();
-
-        // OLD binary wrote a V1 deterministic straggler (nonce 0).
-        let straggler = hnsw_merge_entry(&ks, db_id, task_id);
-        let straggler_fire = crate::worker::now_epoch_ms() - 10_000;
-        store
-            .seed_legacy_worker_queue_entry_for_test(&straggler, straggler_fire)
-            .await
-            .expect("seed deterministic straggler V1 row");
-
-        // Drain materializes the singleton.
-        let migrated = store
-            .drain_legacy_worker_queue_batch()
-            .await
-            .expect("drain straggler")
-            .migrated;
-        assert_eq!(migrated, 1, "drain removes exactly the one V1 straggler");
-        assert!(
-            store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("converged probe"),
-            "legacy queue must be empty after the drain"
-        );
-
-        // Exactly one V2 singleton now exists, at the straggler's fire_time, with
-        // a non-zero migrated nonce (V2 deterministic rows require a nonce).
-        let after = {
-            let mut txn = store.begin().await.unwrap();
-            let rows = store
-                .index_rows_for_task(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
-                .await
-                .unwrap();
-            txn.rollback().await.ok();
-            rows
-        };
-        assert_eq!(
-            after.len(),
-            1,
-            "draining a deterministic straggler with no V2 must create exactly one V2 singleton"
-        );
-        assert_eq!(
-            after[0].fire_time_ms, straggler_fire,
-            "the materialized singleton keeps the straggler's fire_time"
-        );
-
-        let mut txn = store.begin().await.unwrap();
-        let due = store.scan_due_v2(&mut txn, i64::MAX, 1000).await.unwrap();
-        txn.rollback().await.ok();
-        let descriptor = due
-            .iter()
-            .find(|(_, d)| d.keyspace == ks && d.task_id == task_id)
-            .map(|(_, d)| d)
-            .expect("migrated descriptor present in the V2 due scan");
-        assert_eq!(descriptor.task_type, TaskType::HnswMerge);
-        assert_ne!(
-            descriptor.nonce, 0,
-            "migrated deterministic singleton must carry a non-zero nonce"
-        );
-
-        // Cleanup.
-        let mut txn = store.begin().await.unwrap();
-        store
-            .delete_task_all_layers(&mut txn, &ks, db_id, task_id, TaskType::HnswMerge)
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -3142,132 +2500,6 @@ mod tests {
             .await
             .unwrap();
         txn.commit().await.unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires TiKV / PD cluster"]
-    async fn schema_enablement_defers_legacy_entry_to_bounded_drain() {
-        let store = raw_worker_test_store("legacy_migrate").await;
-        let ks = unique_ks("legacy");
-        let db_id = 1u64;
-        let fire = 5_000i64;
-
-        // Seed a LEGACY entry directly (simulating a pre-V2 binary's write).
-        let entry = cron_entry(&ks, db_id, 21, "SELECT pg_sleep(1)");
-        let legacy_key = encode_worker_queue_key(
-            entry.priority,
-            fire,
-            TaskType::Cron.to_bitmask(),
-            &ks,
-            db_id,
-            21,
-        )
-        .unwrap();
-        let mut txn = store.begin().await.unwrap();
-        txn_put(
-            &mut txn,
-            store.key(&legacy_key),
-            bincode::serialize(&entry).unwrap(),
-        )
-        .await
-        .unwrap();
-        txn.commit().await.unwrap();
-
-        let mut txn = store.begin().await.unwrap();
-        assert!(store.legacy_queue_has_entries(&mut txn).await.unwrap());
-        let due = store
-            .scan_due_legacy_bytesafe(&mut txn, i64::MAX, 1000)
-            .await
-            .unwrap();
-        assert!(
-            due.iter().any(|row| match row {
-                LegacyWorkerQueueDrainRow::Migratable { entry, .. } =>
-                    entry.keyspace == ks
-                        && entry.task_id == 21
-                        && entry.command == "SELECT pg_sleep(1)",
-                LegacyWorkerQueueDrainRow::Corrupt { .. } => false,
-            })
-        );
-        let legacy_cron = store
-            .legacy_entries_for_db_type(&mut txn, &ks, db_id, TaskType::Cron)
-            .await
-            .unwrap();
-        assert!(
-            legacy_cron.iter().any(|(_, jid)| *jid == 21),
-            "legacy_entries_for_db_type must still find the seeded legacy cron job"
-        );
-        assert!(
-            store
-                .index_rows_for_task(&mut txn, &ks, db_id, 21, TaskType::Cron)
-                .await
-                .unwrap()
-                .is_empty(),
-            "legacy entry must NOT be present in the V2 index"
-        );
-        txn.rollback().await.ok();
-
-        store.ensure_worker_queue_schema_v2().await.unwrap();
-
-        let mut txn = store.begin().await.unwrap();
-        assert!(
-            store.legacy_queue_has_entries(&mut txn).await.unwrap(),
-            "schema enablement must not drain legacy rows"
-        );
-        assert!(
-            store
-                .index_rows_for_task(&mut txn, &ks, db_id, 21, TaskType::Cron)
-                .await
-                .unwrap()
-                .is_empty(),
-            "schema enablement must not project legacy rows into V2"
-        );
-        txn.rollback().await.ok();
-
-        let migrated = store
-            .drain_legacy_worker_queue_batch()
-            .await
-            .unwrap()
-            .migrated;
-        assert_eq!(migrated, 1);
-
-        let mut txn = store.begin().await.unwrap();
-        assert!(!store.legacy_queue_has_entries(&mut txn).await.unwrap());
-        assert!(store
-            .task_has_pending(&mut txn, &ks, db_id, 21, TaskType::Cron)
-            .await
-            .unwrap());
-        let rows = store
-            .index_rows_for_task(&mut txn, &ks, db_id, 21, TaskType::Cron)
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.len(),
-            1,
-            "bounded drain must write the V2 identity index"
-        );
-        let payload = store
-            .get_task_payload_v2(&mut txn, TaskType::Cron.to_bitmask(), &ks, db_id, 21, fire)
-            .await
-            .unwrap()
-            .expect("cron payload must be split out during bounded drain");
-        assert_eq!(payload.command, "SELECT pg_sleep(1)");
-        txn.rollback().await.ok();
-
-        let mut txn = store.begin().await.unwrap();
-        let deleted = store
-            .delete_task_all_layers(&mut txn, &ks, db_id, 21, TaskType::Cron)
-            .await
-            .unwrap();
-        txn.commit().await.unwrap();
-        assert!(deleted >= 1);
-
-        let mut txn = store.begin().await.unwrap();
-        assert!(!store.legacy_queue_has_entries(&mut txn).await.unwrap());
-        assert!(!store
-            .task_has_pending(&mut txn, &ks, db_id, 21, TaskType::Cron)
-            .await
-            .unwrap());
-        txn.rollback().await.ok();
     }
 
     #[tokio::test]

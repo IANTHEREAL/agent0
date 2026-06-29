@@ -660,7 +660,8 @@ pub(crate) async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &s
 ///
 /// Initialization enables the V2 worker-queue schema marker in O(1). It must
 /// not drain historical legacy `_worker_queue_` rows on the startup/readiness
-/// path; those rows are projected into V2 by the bounded maintenance-loop drain.
+/// path. Production now requires that retired V1 prefix to be empty before
+/// running without the drain.
 pub async fn init_gc_registry_store(
     pd_endpoints: Vec<String>,
     config: &WorkerConfig,
@@ -689,7 +690,11 @@ pub async fn init_gc_registry_store(
         .ensure_worker_queue_schema_v2()
         .await
         .context("failed to enable worker queue schema V2")?;
-    info!("Worker queue V2 schema enabled; legacy backlog drains after startup");
+    store
+        .ensure_legacy_worker_queue_retired()
+        .await
+        .context("legacy V1 worker queue retirement preflight failed")?;
+    info!("Worker queue V2 schema enabled; legacy V1 prefix verified empty");
     let store = Arc::new(store);
     info!("GC registry store initialized successfully");
     Ok(store)
@@ -885,105 +890,27 @@ mod tests {
         );
     }
 
-    /// Behavioral regression for the readiness-safe V2 schema enablement path.
-    /// Seeds a legacy `_worker_queue_` row, runs the SAME init function that
-    /// `main.rs` calls at startup (`init_gc_registry_store`), and asserts init
-    /// does not drain the row. The bounded drain then projects it to V2.
-    #[tokio::test]
-    #[ignore = "requires TiKV / PD cluster"]
-    async fn production_init_defers_legacy_worker_queue_rows_to_bounded_drain() {
-        use crate::worker::types::{TaskQueueEntry, TaskType};
-
-        let pd_endpoints = std::env::var("PD_ENDPOINTS")
-            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let system_keyspace = format!(
-            "_sys_worker_prodinit_{}_{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let cfg = WorkerConfig {
-            enabled: true,
-            system_keyspace,
-            ..Default::default()
-        };
-
-        // `new_system` connects with `with_keyspace`, which requires the keyspace
-        // to already exist in PD (the vendored client does NOT auto-create it).
-        // Pre-create it with the canonical PD-API helper that `init_gc_registry_store`
-        // uses, so this promoted CI test does not fail at connect.
-        ensure_system_keyspace(&pd_endpoints, &cfg.system_keyspace)
-            .await
-            .expect("pre-create production-init test keyspace in PD");
-        // Seed a legacy V1 row directly (pre-upgrade durable state) on a raw
-        // store handle that has NOT enabled the V2 marker yet.
-        let raw = std::sync::Arc::new(
-            TikvStore::new_system(pd_endpoints.clone(), &cfg.system_keyspace)
-                .await
-                .expect("raw system store init"),
-        );
-        let entry = TaskQueueEntry::new(
-            "default".to_string(),
-            7,
-            42,
-            TaskType::Cron,
-            "SELECT 1".to_string(),
-            "admin".to_string(),
-            128,
-        )
-        .with_schedule("* * * * *".to_string());
-        let fire_time_ms = crate::worker::now_epoch_ms() - 60_000;
-        raw.seed_legacy_worker_queue_entry_for_test(&entry, fire_time_ms)
-            .await
-            .expect("seed legacy V1 row");
-
-        // Run the EXACT production startup init (the one main.rs calls).
-        let store = init_gc_registry_store(pd_endpoints, &cfg)
-            .await
-            .expect("production init must succeed");
-
+    #[test]
+    fn production_init_does_not_reference_legacy_queue_drain() {
+        let source = include_str!("mod.rs");
+        let init_fn = source
+            .split("pub async fn init_gc_registry_store")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("init_gc_registry_store must exist before tests");
         assert!(
-            !store
-                .legacy_worker_queue_is_empty()
-                .await
-                .expect("legacy empty probe"),
-            "production init must not drain legacy queue rows before readiness"
+            init_fn.contains("ensure_worker_queue_schema_v2"),
+            "startup must still enable the V2 worker queue schema marker"
         );
-
-        // The legacy row is not V2-visible until the bounded drain projects it.
-        let mut txn = store.begin().await.expect("begin");
-        let due = store
-            .scan_due_v2(&mut txn, i64::MAX, 1000)
-            .await
-            .expect("scan_due_v2");
-        txn.rollback().await.ok();
         assert!(
-            !due.iter()
-                .any(|(_, d)| d.task_id == 42 && d.db_id == 7 && d.task_type == TaskType::Cron),
-            "production init must not synchronously migrate the legacy row into V2"
+            init_fn.contains("ensure_legacy_worker_queue_retired"),
+            "startup must fail fast if retired legacy V1 worker queue rows still exist"
         );
-
-        let migrated = store
-            .drain_legacy_worker_queue_batch()
-            .await
-            .expect("bounded drain")
-            .migrated;
-        assert_eq!(migrated, 1, "bounded drain must migrate the legacy row");
-
-        let mut txn = store.begin().await.expect("begin");
-        let due = store
-            .scan_due_v2(&mut txn, i64::MAX, 1000)
-            .await
-            .expect("scan_due_v2 after drain");
-        txn.rollback().await.ok();
         assert!(
-            due.iter()
-                .any(|(_, d)| d.task_id == 42 && d.db_id == 7 && d.task_type == TaskType::Cron),
-            "bounded drain must make the legacy row visible to V2"
+            !init_fn.contains("drain_legacy_worker_queue_batch")
+                && !init_fn.contains("legacy_worker_queue_is_empty")
+                && !init_fn.contains("seed_legacy_worker_queue_entry_for_test"),
+            "startup must not read, migrate, or project retired V1 worker queue rows"
         );
     }
 }

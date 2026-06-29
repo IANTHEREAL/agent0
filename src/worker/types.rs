@@ -387,6 +387,7 @@ impl TaskQueueEntry {
     }
 
     /// Deserialize queue entry with backward compatibility for pre-nonce payloads.
+    #[cfg(test)]
     pub fn deserialize_compat(bytes: &[u8]) -> std::result::Result<Self, Box<bincode::ErrorKind>> {
         match bincode::deserialize::<TaskQueueEntry>(bytes) {
             Ok(entry) => Ok(entry),
@@ -568,8 +569,8 @@ impl TaskDescriptorV2 {
     }
 }
 
-/// A due item read by the worker tick. Legacy `_worker_queue_` rows are migrated
-/// before polling starts, so execution only hydrates V2 descriptors.
+/// A due item read by the worker tick. Production no longer migrates legacy
+/// `_worker_queue_` rows, so execution only hydrates V2 descriptors.
 #[derive(Debug, Clone)]
 pub enum DueItem {
     V2(TaskDescriptorV2),

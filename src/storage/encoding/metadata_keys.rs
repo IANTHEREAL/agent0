@@ -78,8 +78,9 @@ pub(super) const WORKER_PAYLOAD_V2_PREFIX: &[u8] = b"_wq_payload_v2_";
 /// never reads the (potentially large) due-queue value. See issue #2576.
 pub(super) const WORKER_QUEUE_INDEX_V2_PREFIX: &[u8] = b"_wq_idx_v2_";
 /// Worker queue storage schema version. Version 2 means normal production
-/// paths are V2-enabled/V2-only; legacy `_worker_queue_` rows, if any, are
-/// compatibility backlog for the bounded background drain.
+/// paths are V2-only. Legacy `_worker_queue_` rows are never migrated,
+/// executed, or written by production code; startup may still run a bounded
+/// retirement preflight on the prefix so deletion cannot silently strand rows.
 pub(super) const WORKER_QUEUE_SCHEMA_VERSION_KEY: &[u8] = b"_wq_schema_version";
 /// Legacy startup-migration lock from the old V1-to-V2 drain protocol. New
 /// startup code ignores/clears it so a stale lock cannot block readiness.
@@ -575,10 +576,8 @@ pub fn encode_hnsw_s3_db_prefix_cleanup_intent_prefix() -> Vec<u8> {
 /// Priority byte comes first so lower values (higher priority) sort first.
 /// Fire time uses memcomparable encoding so earlier times sort first (handles negative values correctly).
 ///
-/// Production no longer *writes* V1 keys (all enqueues go through the V2 layout
-/// via `put_task_v2`); it only reads/migrates pre-existing V1 keys, for which
-/// `encode_worker_queue_prefix` / `_scan_end` / `decode_worker_queue_fire_time`
-/// suffice. This full encoder is retained for tests that seed legacy entries.
+/// Production no longer writes, reads, or migrates V1 keys. This full encoder
+/// is retained only for tests that assert the retired key format stays isolated.
 #[cfg(test)]
 pub fn encode_worker_queue_key(
     priority: u8,
@@ -624,15 +623,17 @@ fn encode_due_key_with_prefix(
     Ok(key)
 }
 
-/// Encode the prefix for all worker queue keys (global).
+/// Encode the prefix for all legacy V1 worker queue keys (global). Production
+/// uses this only for the bounded retirement preflight, never for migration or
+/// execution.
 pub fn encode_worker_queue_prefix() -> Vec<u8> {
     WORKER_QUEUE_PREFIX.to_vec()
 }
 
-/// Encode the exclusive upper bound for a LEGACY worker queue range scan.
-/// Used by the worker tick's byte-safe legacy dequeue during the V2 migration
-/// window (`scan_due_legacy_bytesafe`).
+/// Encode the exclusive upper bound for a legacy V1 worker queue range scan.
+/// Test-only: production no longer scans or migrates the retired V1 queue.
 /// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}` (no keyspace/db_id/task_id)
+#[cfg(test)]
 pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Result<Vec<u8>> {
     encode_due_scan_end_with_prefix(WORKER_QUEUE_PREFIX, priority, fire_time_ms)
 }
@@ -732,10 +733,8 @@ pub fn encode_wq_payload_v2_key(
     Ok(key)
 }
 
-/// Decode fire_time_ms from a worker queue key.
-///
-/// Used by worker claim logic so a claim is bound to the exact queue entry
-/// being executed, not to the worker's current wall-clock minute.
+/// Decode fire_time_ms from a legacy V1 worker queue key.
+#[cfg(test)]
 pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
     use memcomparable::Deserializer;
     if key.len() < WORKER_QUEUE_PREFIX.len() + 1 + 8 {
