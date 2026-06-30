@@ -5,10 +5,11 @@ use crate::sql::rls::cache::RlsPolicyCache;
 use crate::sql::stats::TableStatsCache;
 use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use parking_lot::Mutex as StdMutex;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -25,6 +26,38 @@ type IdleIndex = StdMutex<BTreeSet<(u64, String)>>;
 
 /// How long an idle tenant (zero connections) stays cached before eviction.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TenantKeyspaceMissing {
+    keyspace: String,
+}
+
+impl TenantKeyspaceMissing {
+    fn new(keyspace: impl Into<String>) -> Self {
+        Self {
+            keyspace: keyspace.into(),
+        }
+    }
+
+    pub(crate) fn keyspace(&self) -> &str {
+        &self.keyspace
+    }
+}
+
+impl fmt::Display for TenantKeyspaceMissing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Tenant '{}' does not exist", self.keyspace)
+    }
+}
+
+impl std::error::Error for TenantKeyspaceMissing {}
+
+pub(crate) fn missing_tenant_keyspace(error: &anyhow::Error) -> Option<&str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TenantKeyspaceMissing>())
+        .map(TenantKeyspaceMissing::keyspace)
+}
 
 /// How often the reaper scans for idle tenants.
 const DEFAULT_REAPER_INTERVAL: Duration = Duration::from_secs(30);
@@ -1665,7 +1698,7 @@ impl TikvClientPool {
             Err(e) => {
                 let err_str = format!("{:?}", e);
                 if err_str.contains("keyspace does not exist") {
-                    return Err(anyhow!("Tenant '{}' does not exist", key));
+                    return Err(TenantKeyspaceMissing::new(key).into());
                 }
                 return Err(e);
             }
@@ -1918,6 +1951,30 @@ mod tests {
         assert!(
             !locks.contains_key(keyspace),
             "creation lock must be removed after failed create_store"
+        );
+    }
+
+    #[test]
+    fn missing_tenant_error_is_typed_and_preserves_message() {
+        use anyhow::Context;
+
+        let err: anyhow::Error = TenantKeyspaceMissing::new("db9_tenant_missing").into();
+        assert_eq!(
+            err.to_string(),
+            "Tenant 'db9_tenant_missing' does not exist"
+        );
+        assert_eq!(missing_tenant_keyspace(&err), Some("db9_tenant_missing"));
+
+        let err = Err::<(), _>(TenantKeyspaceMissing::new("db9_tenant_wrapped"))
+            .context("tenant acquire failed")
+            .expect_err("must wrap missing tenant");
+        assert_eq!(missing_tenant_keyspace(&err), Some("db9_tenant_wrapped"));
+
+        let plain = anyhow::anyhow!("Tenant 'db9_tenant_text' does not exist");
+        assert_eq!(
+            missing_tenant_keyspace(&plain),
+            None,
+            "classification must use the typed pool error, not message text"
         );
     }
 

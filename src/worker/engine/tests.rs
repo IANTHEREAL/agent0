@@ -652,6 +652,105 @@ fn worker_tick_does_not_wait_for_dispatched_tasks() {
 }
 
 #[test]
+fn missing_tenant_registry_sweep_reaps_instead_of_backoff() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let sweep = prod_source
+        .split("async fn registry_sweep_tick(&self)")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn finish_registry_sweep_cycle").next())
+        .expect("registry_sweep_tick must exist before finish_registry_sweep_cycle");
+    let missing_arm = sweep
+        .split("Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) =>")
+        .nth(1)
+        .and_then(|rest| rest.split("Err(e) =>").next())
+        .expect(
+            "registry sweep tenant acquire must handle missing tenants before transient errors",
+        );
+
+    assert!(
+        missing_arm.contains("reap_missing_tenant_worker_state")
+            && missing_arm.contains("registry_sweep_record_registry_deleted")
+            && missing_arm.contains("processed += 1"),
+        "missing-tenant registry entries must be reaped and counted as processed"
+    );
+    assert!(
+        !missing_arm.contains("registry_sweep_record_failure"),
+        "missing tenant is permanent orphan state and must not enter sweep backoff"
+    );
+}
+
+#[test]
+fn missing_tenant_claim_paths_reap_before_retry_cleanup() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let core = prod_source
+        .split("async fn claim_and_execute_core")
+        .nth(1)
+        .and_then(|rest| rest.split("fn derive_claim_context").next())
+        .expect("claim_and_execute_core must exist before derive_claim_context");
+
+    let cron_claim = core
+        .split("Self::claim_and_record_cron_run(")
+        .nth(1)
+        .and_then(|rest| rest.split("} else {").next())
+        .expect("cron claim branch must exist");
+    assert!(
+        cron_claim.contains("Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace)")
+            && cron_claim.contains("reap_missing_tenant_worker_state")
+            && cron_claim.contains("return Ok(())"),
+        "missing tenant during cron pre-execution claim must reap and stop, not bubble as a retryable task error"
+    );
+
+    let post_execute = core
+        .split("drop(_lease_guard);")
+        .nth(1)
+        .and_then(|rest| rest.split("let still_owned =").next())
+        .expect("post-execute missing-tenant guard must run before ownership cleanup");
+    assert!(
+        post_execute.contains("Self::is_missing_tenant_error(e, &entry.keyspace)")
+            && post_execute.contains("reap_missing_tenant_worker_state")
+            && post_execute.contains("return Ok(())"),
+        "missing tenant from execute_task must reap before ordinary failure cleanup or HNSW retry backoff"
+    );
+}
+
+#[test]
+fn missing_tenant_orphan_reap_helper_orders_queue_registry_before_claim_delete() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let helper = prod_source
+        .split("async fn reap_missing_tenant_worker_state(")
+        .nth(1)
+        .and_then(|rest| rest.split("/// Pure classifier").next())
+        .expect("missing-tenant reap helper must exist before lease-renew classifier");
+    let reap = helper
+        .find("reap_db_queue_entries_then_delete_worker_registry")
+        .expect("helper must reuse ordered per-db queue+registry reap");
+    let claim_delete = helper
+        .find("delete_worker_claim_if_owned")
+        .expect("helper must delete the current owned claim");
+    assert!(
+        reap < claim_delete,
+        "missing-tenant cleanup must write the tombstone and delete queue/registry before releasing the current claim"
+    );
+    assert!(
+        helper.contains("db9_server_worker_orphan_task_deleted_total")
+            && helper.contains("db9_server_worker_orphan_registry_deleted_total"),
+        "missing-tenant cleanup must emit distinct orphan cleanup metrics"
+    );
+}
+
+#[test]
 fn storage_size_scan_uses_pd_region_stats_not_tenant_kv_scan() {
     let source = include_str!("../engine.rs");
     let prod_source = source
@@ -4449,6 +4548,9 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "hydrate_entry_or_release",
         // [claim] Release a just-won claim: single key delete + immediate commit.
         "release_claim",
+        // [finalize] Missing-tenant orphan cleanup reuses the bounded per-db
+        // queue+registry reap, then deletes one currently owned claim.
+        "reap_missing_tenant_worker_state",
         // [claim] Per-renewal txn: get_for_update own claim + put + immediate
         // commit (or rollback). Each renewal is independent and short-lived —
         // it does not hold a snapshot across the task's execution.

@@ -4,7 +4,7 @@ use crate::cron::types::{CronJob, CronRun, CronRunState, CronRunStatus};
 use crate::cron::worker::gc_database;
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
-use crate::pool::TikvClientPool;
+use crate::pool::{missing_tenant_keyspace, TikvClientPool};
 use crate::sql::ddl;
 use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
@@ -232,6 +232,14 @@ enum PostClaimPresence {
     /// The due key was deleted since the tick scanned it; the just-won claim was
     /// released and the caller must skip (return Ok).
     ReleasedSkip,
+}
+
+#[derive(Clone, Copy)]
+struct MissingTenantClaimCleanup<'a> {
+    task_id: i64,
+    fire_time_ms: i64,
+    task_type: TaskType,
+    worker_id: &'a str,
 }
 
 fn storage_scan_interval_ms(interval_sec: u64) -> i64 {
@@ -839,6 +847,25 @@ impl WorkerEngine {
                 Ok(handle) => {
                     touched_keyspaces.insert(entry.keyspace.clone());
                     handle
+                }
+                Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) => {
+                    let reaped = Self::reap_missing_tenant_worker_state(
+                        &self.system_store,
+                        &entry.keyspace,
+                        entry.db_id,
+                        None,
+                    )
+                    .await?;
+                    self.registry_sweep_record_registry_deleted(&backoff_key)
+                        .await;
+                    processed += 1;
+                    info!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        reaped,
+                        "Worker registry sweep removed missing-tenant worker inventory"
+                    );
+                    continue;
                 }
                 Err(e) => {
                     self.registry_sweep_record_failure(&backoff_key).await;
@@ -2316,6 +2343,74 @@ impl WorkerEngine {
         Ok(())
     }
 
+    fn is_missing_tenant_error(error: &anyhow::Error, keyspace: &str) -> bool {
+        missing_tenant_keyspace(error) == Some(keyspace)
+    }
+
+    async fn reap_missing_tenant_worker_state(
+        system_store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+        claim: Option<MissingTenantClaimCleanup<'_>>,
+    ) -> Result<usize> {
+        let task_type_label = claim
+            .map(|claim| claim.task_type.as_str())
+            .unwrap_or("registry");
+
+        let reaped = system_store
+            .reap_db_queue_entries_then_delete_worker_registry(keyspace, db_id)
+            .await?;
+
+        if let Some(claim) = claim {
+            let mut txn = system_store.begin().await?;
+            let owned = system_store
+                .delete_worker_claim_if_owned(
+                    &mut txn,
+                    keyspace,
+                    db_id,
+                    claim.task_id,
+                    claim.fire_time_ms,
+                    claim.task_type,
+                    claim.worker_id,
+                )
+                .await?;
+            txn.commit().await?;
+            if !owned {
+                warn!(
+                    keyspace,
+                    db_id,
+                    task_id = claim.task_id,
+                    fire_time_ms = claim.fire_time_ms,
+                    task_type = claim.task_type.as_str(),
+                    "Missing-tenant worker orphan cleanup found claim already gone or taken over"
+                );
+            }
+        }
+
+        if reaped > 0 {
+            metrics::counter!(
+                "db9_server_worker_orphan_task_deleted_total",
+                "reason" => "missing_tenant",
+                "task_type" => task_type_label,
+            )
+            .increment(reaped as u64);
+        }
+        metrics::counter!(
+            "db9_server_worker_orphan_registry_deleted_total",
+            "reason" => "missing_tenant",
+        )
+        .increment(1);
+
+        warn!(
+            keyspace,
+            db_id,
+            reaped,
+            task_type = task_type_label,
+            "Reaped worker state for missing tenant keyspace"
+        );
+        Ok(reaped)
+    }
+
     /// Pure classifier mapping a renewal-txn result onto a `LeaseRenewOutcome`.
     ///
     /// This holds the three pieces of wiring the original bug got wrong, in ONE
@@ -2610,14 +2705,33 @@ impl WorkerEngine {
 
         let (cron_run, keep_queue_entry, should_requeue_cron) = if entry.task_type == TaskType::Cron
         {
-            Self::claim_and_record_cron_run(
+            match Self::claim_and_record_cron_run(
                 pool,
                 &entry,
                 scheduled_minute,
                 cron_control_floor_ms,
                 config.cron_job_timeout_ms,
             )
-            .await?
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) => {
+                    Self::reap_missing_tenant_worker_state(
+                        system_store,
+                        &entry.keyspace,
+                        entry.db_id,
+                        Some(MissingTenantClaimCleanup {
+                            task_id: entry.task_id,
+                            fire_time_ms: queue_fire_time_ms,
+                            task_type: entry.task_type,
+                            worker_id: &config.worker_id,
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             (None, false, false)
         };
@@ -2707,6 +2821,24 @@ impl WorkerEngine {
         // the claim until it deletes it explicitly, and runs on the same node,
         // so it does not depend on the lease.
         drop(_lease_guard);
+
+        if let Err(e) = &exec_result {
+            if Self::is_missing_tenant_error(e, &entry.keyspace) {
+                Self::reap_missing_tenant_worker_state(
+                    system_store,
+                    &entry.keyspace,
+                    entry.db_id,
+                    Some(MissingTenantClaimCleanup {
+                        task_id: entry.task_id,
+                        fire_time_ms: queue_fire_time_ms,
+                        task_type: entry.task_type,
+                        worker_id: &config.worker_id,
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
 
         // Commit-adjacent ownership fence (claim-lease lifecycle, design §K4).
         // finalize_cron_run commits TERMINAL tenant cron state (terminal CronRun
