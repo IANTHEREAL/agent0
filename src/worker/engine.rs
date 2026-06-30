@@ -1049,8 +1049,10 @@ impl WorkerEngine {
         }
     }
 
-    async fn run_storage_scan_derived_if_due(
-        &self,
+    async fn run_storage_scan_derived_for_target(
+        system_store: &Arc<TikvStore>,
+        pool: &Arc<TikvClientPool>,
+        config: &WorkerConfig,
         store: &Arc<TikvStore>,
         keyspace: &str,
         db_id: u64,
@@ -1071,21 +1073,22 @@ impl WorkerEngine {
         let applied_work_id =
             latest_storage_scan_applied_work_id(store, db_id, tenant_incarnation).await?;
         let current_work_id = storage_scan_work_id_at_least_after(
-            storage_scan_work_id(now_ms, self.config.storage_scan_interval_sec),
+            storage_scan_work_id(now_ms, config.storage_scan_interval_sec),
             applied_work_id,
         );
-        let stats_due = self.storage_scan_due(store, db_id).await?;
-        let claim = self
-            .claim_storage_scan_derived_run(
-                keyspace,
-                db_id,
-                tenant_incarnation,
-                current_work_id,
-                stats_due,
-                now_ms,
-                self.pool.pd_endpoints().len(),
-            )
-            .await?;
+        let stats_due = Self::storage_scan_due_for_store(config, store, db_id).await?;
+        let claim = Self::claim_storage_scan_derived_run(
+            system_store,
+            config,
+            keyspace,
+            db_id,
+            tenant_incarnation,
+            current_work_id,
+            stats_due,
+            now_ms,
+            pool.pd_endpoints().len(),
+        )
+        .await?;
         let Some((work_id, attempt, _token_id)) = claim else {
             return Ok(false);
         };
@@ -1096,11 +1099,11 @@ impl WorkerEngine {
             db_id,
             tenant_incarnation,
             work_id,
-            self.pool.pd_endpoints(),
-            self.config.storage_scan_pd_rate_limit_ms,
+            pool.pd_endpoints(),
+            config.storage_scan_pd_rate_limit_ms,
             &crate::worker::LeaseCancel::none(),
             Some(&StorageScanOwnerFence {
-                system_store: self.system_store.clone(),
+                system_store: system_store.clone(),
                 keyspace: keyspace.to_string(),
                 db_id,
                 tenant_incarnation,
@@ -1110,7 +1113,9 @@ impl WorkerEngine {
         )
         .await;
 
-        self.finish_storage_scan_derived_run(
+        Self::finish_storage_scan_derived_run(
+            system_store,
+            config,
             keyspace,
             db_id,
             tenant_incarnation,
@@ -1122,8 +1127,54 @@ impl WorkerEngine {
         Ok(true)
     }
 
-    async fn storage_scan_capacity_token_is_live(
+    async fn run_storage_scan_derived_if_due(
         &self,
+        store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<bool> {
+        Self::run_storage_scan_derived_for_target(
+            &self.system_store,
+            &self.pool,
+            &self.config,
+            store,
+            keyspace,
+            db_id,
+        )
+        .await
+    }
+
+    async fn storage_scan_due_for_store(
+        config: &WorkerConfig,
+        store: &Arc<TikvStore>,
+        db_id: u64,
+    ) -> Result<bool> {
+        use crate::storage_stats::deserialize_storage_stats;
+
+        let mut txn = store.begin().await?;
+        let alive = store.database_alive_for_update(&mut txn, db_id).await?;
+        if !alive {
+            txn.rollback().await.ok();
+            return Ok(false);
+        }
+        let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
+        let data = txn.get(stats_key).await?;
+        txn.rollback().await.ok();
+
+        let Some(data) = data else {
+            return Ok(true);
+        };
+        let Some(stats) = deserialize_storage_stats(&data) else {
+            return Ok(true);
+        };
+        let interval_ms = i64::try_from(config.storage_scan_interval_sec)
+            .unwrap_or(i64::MAX / 1000)
+            .saturating_mul(1000);
+        Ok(now_epoch_ms().saturating_sub(stats.scanned_at_ms) >= interval_ms)
+    }
+
+    async fn storage_scan_capacity_token_is_live(
+        system_store: &Arc<TikvStore>,
         txn: &mut tikv_client::Transaction,
         token_id: u16,
         token: &StorageScanCapacityToken,
@@ -1138,8 +1189,7 @@ impl WorkerEngine {
             }
         }
 
-        let state = self
-            .system_store
+        let state = system_store
             .get_storage_scan_bg_state_for_update(txn, &token.keyspace, token.db_id)
             .await?;
         Ok(state.as_ref().is_some_and(|state| {
@@ -1148,38 +1198,38 @@ impl WorkerEngine {
     }
 
     async fn claim_storage_scan_capacity_token(
-        &self,
+        system_store: &Arc<TikvStore>,
+        config: &WorkerConfig,
         txn: &mut tikv_client::Transaction,
         current_state: Option<&StorageScanBgState>,
         token: &StorageScanCapacityToken,
         now_ms: i64,
     ) -> Result<Option<u16>> {
-        for token_id in 0..self.config.storage_scan_derived_capacity {
-            let existing = self
-                .system_store
+        for token_id in 0..config.storage_scan_derived_capacity {
+            let existing = system_store
                 .get_storage_scan_capacity_token_for_update(txn, token_id)
                 .await?;
             let Some(existing) = existing else {
-                self.system_store
+                system_store
                     .put_storage_scan_capacity_token(txn, token_id, token)
                     .await?;
                 return Ok(Some(token_id));
             };
 
-            if self
-                .storage_scan_capacity_token_is_live(
-                    txn,
-                    token_id,
-                    &existing,
-                    current_state,
-                    now_ms,
-                )
-                .await?
+            if Self::storage_scan_capacity_token_is_live(
+                system_store,
+                txn,
+                token_id,
+                &existing,
+                current_state,
+                now_ms,
+            )
+            .await?
             {
                 continue;
             }
 
-            self.system_store
+            system_store
                 .put_storage_scan_capacity_token(txn, token_id, token)
                 .await?;
             return Ok(Some(token_id));
@@ -1188,7 +1238,8 @@ impl WorkerEngine {
     }
 
     async fn claim_storage_scan_derived_run(
-        &self,
+        system_store: &Arc<TikvStore>,
+        config: &WorkerConfig,
         keyspace: &str,
         db_id: u64,
         tenant_incarnation: u64,
@@ -1197,10 +1248,9 @@ impl WorkerEngine {
         now_ms: i64,
         pd_endpoint_count: usize,
     ) -> Result<Option<(i64, u32, u16)>> {
-        let mut txn = self.system_store.begin().await?;
+        let mut txn = system_store.begin().await?;
         let result = async {
-            let existing = self
-                .system_store
+            let existing = system_store
                 .get_storage_scan_bg_state_for_update(&mut txn, keyspace, db_id)
                 .await?;
             let mut attempt = 0u32;
@@ -1245,10 +1295,8 @@ impl WorkerEngine {
                 return Ok(None);
             }
 
-            let lease_until_ms = now_ms.saturating_add(storage_scan_derived_lease_ms(
-                &self.config,
-                pd_endpoint_count,
-            ));
+            let lease_until_ms =
+                now_ms.saturating_add(storage_scan_derived_lease_ms(config, pd_endpoint_count));
             let token = StorageScanCapacityToken {
                 keyspace: keyspace.to_string(),
                 db_id,
@@ -1257,9 +1305,15 @@ impl WorkerEngine {
                 attempt,
                 lease_until_ms,
             };
-            let Some(token_id) = self
-                .claim_storage_scan_capacity_token(&mut txn, existing.as_ref(), &token, now_ms)
-                .await?
+            let Some(token_id) = Self::claim_storage_scan_capacity_token(
+                system_store,
+                config,
+                &mut txn,
+                existing.as_ref(),
+                &token,
+                now_ms,
+            )
+            .await?
             else {
                 return Ok(None);
             };
@@ -1280,7 +1334,7 @@ impl WorkerEngine {
                     .unwrap_or(-1),
                 capacity_token_id: Some(token_id),
             };
-            self.system_store
+            system_store
                 .put_storage_scan_bg_state(&mut txn, &running)
                 .await?;
             Ok(Some((work_id, attempt, token_id)))
@@ -1304,7 +1358,8 @@ impl WorkerEngine {
     }
 
     async fn finish_storage_scan_derived_run(
-        &self,
+        system_store: &Arc<TikvStore>,
+        config: &WorkerConfig,
         keyspace: &str,
         db_id: u64,
         tenant_incarnation: u64,
@@ -1313,9 +1368,8 @@ impl WorkerEngine {
         effect: Result<StorageScanEffectOutcome>,
     ) -> Result<()> {
         let now_ms = now_epoch_ms();
-        let mut txn = self.system_store.begin().await?;
-        let state = self
-            .system_store
+        let mut txn = system_store.begin().await?;
+        let state = system_store
             .get_storage_scan_bg_state_for_update(&mut txn, keyspace, db_id)
             .await?;
         let Some(state) = state else {
@@ -1333,7 +1387,7 @@ impl WorkerEngine {
         }
 
         if let Some(token_id) = state.capacity_token_id {
-            self.system_store
+            system_store
                 .delete_storage_scan_capacity_token(&mut txn, token_id)
                 .await?;
         }
@@ -1344,9 +1398,9 @@ impl WorkerEngine {
                     state,
                     work_id,
                     now_ms,
-                    self.config.storage_scan_interval_sec,
+                    config.storage_scan_interval_sec,
                 );
-                self.system_store
+                system_store
                     .put_storage_scan_bg_state(&mut txn, &next)
                     .await?;
                 txn.commit().await?;
@@ -1355,7 +1409,7 @@ impl WorkerEngine {
             Ok(
                 StorageScanEffectOutcome::TargetGone | StorageScanEffectOutcome::StaleIncarnation,
             ) => {
-                self.system_store
+                system_store
                     .delete_storage_scan_bg_state(&mut txn, keyspace, db_id)
                     .await?;
                 txn.commit().await?;
@@ -1379,7 +1433,7 @@ impl WorkerEngine {
                     capacity_token_id: None,
                     ..state
                 };
-                self.system_store
+                system_store
                     .put_storage_scan_bg_state(&mut txn, &next)
                     .await?;
                 txn.commit().await?;
@@ -2572,6 +2626,7 @@ impl WorkerEngine {
             };
 
             let result = Self::execute_task(
+                system_store,
                 pool,
                 config,
                 &entry,
@@ -2585,6 +2640,7 @@ impl WorkerEngine {
             result
         } else {
             Self::execute_task(
+                system_store,
                 pool,
                 config,
                 &entry,
@@ -3246,6 +3302,7 @@ impl WorkerEngine {
     }
 
     async fn execute_task(
+        system_store: &Arc<TikvStore>,
         pool: &Arc<TikvClientPool>,
         config: &WorkerConfig,
         entry: &TaskQueueEntry,
@@ -3286,10 +3343,18 @@ impl WorkerEngine {
 
         if entry.task_type == TaskType::StorageSizeScan {
             if config.storage_scan_derived_active {
-                let system_store = crate::worker::system_store()?.clone();
                 request_storage_scan_refresh(
                     system_store.as_ref(),
                     store.as_ref(),
+                    &entry.keyspace,
+                    entry.db_id,
+                )
+                .await?;
+                Self::run_storage_scan_derived_for_target(
+                    system_store,
+                    pool,
+                    config,
+                    &store,
                     &entry.keyspace,
                     entry.db_id,
                 )

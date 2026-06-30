@@ -143,6 +143,7 @@ async fn execute_refresh_storage_stats(
             db_id,
         )
         .await?;
+        crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
     } else {
         crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
     }
@@ -299,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_storage_stats_requests_derived_state_when_active() {
+    fn refresh_storage_stats_requests_derived_state_and_queue_nudge_when_active() {
         let source = include_str!("bg_sql.rs");
         let refresh = source
             .split("async fn execute_refresh_storage_stats(")
@@ -310,16 +311,28 @@ mod tests {
         let active = refresh
             .find("WorkerConfig::from_env().storage_scan_derived_active")
             .expect("refresh must check derived StorageScan active flag");
-        let derived = refresh
+        let active_branch = refresh[active..]
+            .split("} else {")
+            .next()
+            .expect("active derived branch must exist before fallback branch");
+        let derived = active_branch
             .find("request_storage_scan_refresh")
             .expect("active refresh must write derived StorageScan state directly");
-        let legacy = refresh
+        let nudge = active_branch
             .find("enqueue_storage_scan")
-            .expect("inactive refresh must keep legacy V2 enqueue fallback");
+            .expect("active refresh must enqueue a StorageSizeScan nudge");
+        let fallback = refresh
+            .split("} else {")
+            .nth(1)
+            .expect("inactive fallback branch must exist");
+        assert!(
+            fallback.contains("enqueue_storage_scan(system_store, keyspace, db_id).await?"),
+            "inactive refresh must keep legacy V2 enqueue fallback"
+        );
 
         assert!(
-            active < derived && derived < legacy,
-            "manual refresh must not enqueue legacy V2 before requesting derived state"
+            derived < nudge,
+            "manual refresh must request derived state before enqueueing the nudge"
         );
     }
 

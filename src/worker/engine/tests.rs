@@ -802,12 +802,15 @@ fn legacy_v2_storage_scan_converts_to_derived_refresh_when_active() {
     let refresh = branch
         .find("request_storage_scan_refresh")
         .expect("active legacy StorageSizeScan must nudge derived state");
+    let derived_run = branch
+        .find("run_storage_scan_derived_for_target")
+        .expect("active legacy StorageSizeScan nudge must execute through derived claim/effect");
     let legacy = branch
         .find("execute_storage_size_scan(")
         .expect("inactive StorageSizeScan must keep legacy V2 executor");
     assert!(
-        active < refresh && refresh < legacy,
-        "active legacy V2 StorageSizeScan rows must be collapsed into derived state, not executed directly"
+        active < refresh && refresh < derived_run && derived_run < legacy,
+        "active legacy V2 StorageSizeScan rows must execute through the derived state machine, not the legacy scanner"
     );
 }
 
@@ -4451,6 +4454,9 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "reconcile_incomplete_cic_indexes_for_db_safe",
         // [lookup] Point read of persisted storage stats; immediate rollback.
         "storage_scan_due",
+        // [lookup] Static form of storage_scan_due used by queue nudges; same
+        // point read + immediate rollback, no snapshot crosses PD work.
+        "storage_scan_due_for_store",
         // [lookup] Point read of tenant-local applied marker; immediate rollback.
         "latest_storage_scan_applied_work_id",
         // [claim] StorageScan state claim + bounded capacity-token repair in one
