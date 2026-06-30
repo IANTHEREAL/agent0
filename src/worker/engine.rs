@@ -62,6 +62,7 @@ const CIC_REPAIR_TABLE_PAGE_SIZE: usize = 256;
 const HNSW_DIRTY_MARKER_PAGE_SIZE: usize = 256;
 const PD_REGION_STATS_HTTP_TIMEOUT_MS: i64 = 5_000;
 const STORAGE_SCAN_DERIVED_LEASE_COMMIT_GRACE_MS: i64 = 30_000;
+const STORAGE_SCAN_REFRESH_NUDGE_COMMAND: &str = "__storage_scan_refresh_nudge";
 
 async fn worker_bgsql_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -135,6 +136,32 @@ impl RegistrySweepKind {
             Self::StorageScan => "storage_scan",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageScanQueueMode {
+    Singleton,
+    RefreshNudge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageScanDerivedSkipReason {
+    NoLifecycleIdentity,
+    NotDue,
+    AlreadyRunning,
+    CapacityFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageScanDerivedClaim {
+    Started { work_id: i64, attempt: u32 },
+    Skipped(StorageScanDerivedSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageScanDerivedRunOutcome {
+    Ran,
+    Skipped(StorageScanDerivedSkipReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1081,7 +1108,7 @@ impl WorkerEngine {
         store: &Arc<TikvStore>,
         keyspace: &str,
         db_id: u64,
-    ) -> Result<bool> {
+    ) -> Result<StorageScanDerivedRunOutcome> {
         let lifecycle_store = crate::worker::db_lifecycle_store()?.clone();
         let Some(tenant_incarnation) = crate::worker::lifecycle::ensure_tenant_lifecycle_identity(
             &lifecycle_store,
@@ -1091,7 +1118,9 @@ impl WorkerEngine {
         )
         .await?
         else {
-            return Ok(false);
+            return Ok(StorageScanDerivedRunOutcome::Skipped(
+                StorageScanDerivedSkipReason::NoLifecycleIdentity,
+            ));
         };
 
         let now_ms = now_epoch_ms();
@@ -1114,8 +1143,11 @@ impl WorkerEngine {
             pool.pd_endpoints().len(),
         )
         .await?;
-        let Some((work_id, attempt, _token_id)) = claim else {
-            return Ok(false);
+        let (work_id, attempt) = match claim {
+            StorageScanDerivedClaim::Started { work_id, attempt } => (work_id, attempt),
+            StorageScanDerivedClaim::Skipped(reason) => {
+                return Ok(StorageScanDerivedRunOutcome::Skipped(reason));
+            }
         };
 
         let effect = execute_storage_size_scan_derived(
@@ -1149,7 +1181,7 @@ impl WorkerEngine {
             effect,
         )
         .await?;
-        Ok(true)
+        Ok(StorageScanDerivedRunOutcome::Ran)
     }
 
     async fn run_storage_scan_derived_if_due(
@@ -1158,7 +1190,7 @@ impl WorkerEngine {
         keyspace: &str,
         db_id: u64,
     ) -> Result<bool> {
-        Self::run_storage_scan_derived_for_target(
+        let outcome = Self::run_storage_scan_derived_for_target(
             &self.system_store,
             &self.pool,
             &self.config,
@@ -1166,7 +1198,8 @@ impl WorkerEngine {
             keyspace,
             db_id,
         )
-        .await
+        .await?;
+        Ok(matches!(outcome, StorageScanDerivedRunOutcome::Ran))
     }
 
     async fn storage_scan_due_for_store(
@@ -1272,7 +1305,7 @@ impl WorkerEngine {
         stats_due: bool,
         now_ms: i64,
         pd_endpoint_count: usize,
-    ) -> Result<Option<(i64, u32, u16)>> {
+    ) -> Result<StorageScanDerivedClaim> {
         let mut txn = system_store.begin().await?;
         let result = async {
             let existing = system_store
@@ -1289,7 +1322,9 @@ impl WorkerEngine {
                     && state.status == StorageScanBgStateStatus::Running
                     && state.lease_until_ms > now_ms
                 {
-                    return Ok(None);
+                    return Ok(StorageScanDerivedClaim::Skipped(
+                        StorageScanDerivedSkipReason::AlreadyRunning,
+                    ));
                 }
 
                 if state.tenant_incarnation == tenant_incarnation
@@ -1300,7 +1335,9 @@ impl WorkerEngine {
                 } else if state.tenant_incarnation == tenant_incarnation {
                     attempt = state.attempt;
                     if state.work_id > 0 && state.run_after_ms > now_ms {
-                        return Ok(None);
+                        return Ok(StorageScanDerivedClaim::Skipped(
+                            StorageScanDerivedSkipReason::NotDue,
+                        ));
                     }
                     if due_by_state && state.work_id > 0 {
                         work_id = state.work_id;
@@ -1311,13 +1348,17 @@ impl WorkerEngine {
                         );
                     }
                     if state.last_done_work_id >= work_id && !due_by_state {
-                        return Ok(None);
+                        return Ok(StorageScanDerivedClaim::Skipped(
+                            StorageScanDerivedSkipReason::NotDue,
+                        ));
                     }
                 }
             }
 
             if !stats_due && !due_by_state {
-                return Ok(None);
+                return Ok(StorageScanDerivedClaim::Skipped(
+                    StorageScanDerivedSkipReason::NotDue,
+                ));
             }
 
             let lease_until_ms =
@@ -1340,7 +1381,9 @@ impl WorkerEngine {
             )
             .await?
             else {
-                return Ok(None);
+                return Ok(StorageScanDerivedClaim::Skipped(
+                    StorageScanDerivedSkipReason::CapacityFull,
+                ));
             };
 
             let running = StorageScanBgState {
@@ -1362,13 +1405,13 @@ impl WorkerEngine {
             system_store
                 .put_storage_scan_bg_state(&mut txn, &running)
                 .await?;
-            Ok(Some((work_id, attempt, token_id)))
+            Ok(StorageScanDerivedClaim::Started { work_id, attempt })
         }
         .await;
 
         match result {
             Ok(value) => {
-                if value.is_some() {
+                if matches!(value, StorageScanDerivedClaim::Started { .. }) {
                     txn.commit().await?;
                 } else {
                     txn.rollback().await.ok();
@@ -3514,14 +3557,17 @@ impl WorkerEngine {
 
         if entry.task_type == TaskType::StorageSizeScan {
             if config.storage_scan_derived_active {
-                request_storage_scan_refresh(
-                    system_store.as_ref(),
-                    store.as_ref(),
-                    &entry.keyspace,
-                    entry.db_id,
-                )
-                .await?;
-                Self::run_storage_scan_derived_for_target(
+                let force_refresh = storage_scan_entry_is_refresh_nudge(entry);
+                if force_refresh {
+                    request_storage_scan_refresh(
+                        system_store.as_ref(),
+                        store.as_ref(),
+                        &entry.keyspace,
+                        entry.db_id,
+                    )
+                    .await?;
+                }
+                let outcome = Self::run_storage_scan_derived_for_target(
                     system_store,
                     pool,
                     config,
@@ -3530,6 +3576,21 @@ impl WorkerEngine {
                     entry.db_id,
                 )
                 .await?;
+                if matches!(
+                    outcome,
+                    StorageScanDerivedRunOutcome::Skipped(
+                        StorageScanDerivedSkipReason::CapacityFull
+                    )
+                ) && force_refresh
+                {
+                    enqueue_storage_scan_nudge_at(
+                        system_store.as_ref(),
+                        &entry.keyspace,
+                        entry.db_id,
+                        storage_scan_retry_after_ms(now_epoch_ms(), 0),
+                    )
+                    .await?;
+                }
                 return Ok(0);
             }
             execute_storage_size_scan(
@@ -4439,7 +4500,38 @@ pub(crate) async fn enqueue_storage_scan(
     keyspace: &str,
     db_id: u64,
 ) -> Result<()> {
-    enqueue_storage_scan_at(system_store, keyspace, db_id, 0).await
+    enqueue_storage_scan_at(
+        system_store,
+        keyspace,
+        db_id,
+        0,
+        StorageScanQueueMode::Singleton,
+    )
+    .await
+}
+
+pub(crate) async fn enqueue_storage_scan_nudge(
+    system_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+) -> Result<()> {
+    enqueue_storage_scan_nudge_at(system_store, keyspace, db_id, 0).await
+}
+
+async fn enqueue_storage_scan_nudge_at(
+    system_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+    fire_time: i64,
+) -> Result<()> {
+    enqueue_storage_scan_at(
+        system_store,
+        keyspace,
+        db_id,
+        fire_time,
+        StorageScanQueueMode::RefreshNudge,
+    )
+    .await
 }
 
 async fn enqueue_storage_scan_with_jitter(
@@ -4456,7 +4548,14 @@ async fn enqueue_storage_scan_with_jitter(
         rand::thread_rng().gen_range(0..=jitter_sec.saturating_mul(1000))
     };
     let fire_time = now_epoch_ms().saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
-    enqueue_storage_scan_at(system_store, keyspace, db_id, fire_time).await
+    enqueue_storage_scan_at(
+        system_store,
+        keyspace,
+        db_id,
+        fire_time,
+        StorageScanQueueMode::Singleton,
+    )
+    .await
 }
 
 async fn enqueue_storage_scan_at(
@@ -4464,34 +4563,111 @@ async fn enqueue_storage_scan_at(
     keyspace: &str,
     db_id: u64,
     fire_time: i64,
+    mode: StorageScanQueueMode,
 ) -> Result<()> {
     use rand::Rng;
 
+    let command = match mode {
+        StorageScanQueueMode::Singleton => String::new(),
+        StorageScanQueueMode::RefreshNudge => STORAGE_SCAN_REFRESH_NUDGE_COMMAND.to_string(),
+    };
     let mut entry = TaskQueueEntry::new(
         keyspace.to_string(),
         db_id,
         db_id as i64,
         TaskType::StorageSizeScan,
-        String::new(),
+        command,
         "system".to_string(),
         200, // low priority — background housekeeping
     );
     entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
     let mut txn = system_store.begin().await?;
-    if !system_store
-        .enqueue_singleton_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)
-        .await?
-    {
+    let enqueued = match mode {
+        StorageScanQueueMode::Singleton => {
+            system_store
+                .enqueue_singleton_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)
+                .await?
+        }
+        StorageScanQueueMode::RefreshNudge => {
+            delete_storage_scan_refresh_nudges(system_store, &mut txn, keyspace, db_id).await?;
+            system_store
+                .enqueue_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)
+                .await?
+        }
+    };
+    if !enqueued {
         txn.rollback().await.ok();
         debug!(
             keyspace,
-            db_id, "Storage size scan already pending or database dropped; skipping enqueue"
+            db_id,
+            ?mode,
+            "Storage size scan enqueue suppressed"
         );
         return Ok(());
     }
     txn.commit().await?;
     crate::worker::wake_worker();
     Ok(())
+}
+
+async fn delete_storage_scan_refresh_nudges(
+    system_store: &TikvStore,
+    txn: &mut tikv_client::Transaction,
+    keyspace: &str,
+    db_id: u64,
+) -> Result<usize> {
+    let rows = system_store
+        .index_rows_for_task(
+            txn,
+            keyspace,
+            db_id,
+            db_id as i64,
+            TaskType::StorageSizeScan,
+        )
+        .await?;
+    let mut deleted = 0usize;
+    for row in rows {
+        let Some(bytes) = txn.get(row.due_key.clone()).await? else {
+            continue;
+        };
+        let descriptor = match TaskDescriptorV2::decode(&bytes) {
+            Ok(descriptor) => descriptor,
+            Err(e) => {
+                warn!(
+                    keyspace,
+                    db_id,
+                    fire_time_ms = row.fire_time_ms,
+                    "Skipping undecodable StorageSizeScan row while coalescing refresh nudges: {}",
+                    e
+                );
+                continue;
+            }
+        };
+        let is_refresh_nudge = descriptor
+            .inline
+            .as_ref()
+            .is_some_and(|payload| payload.command == STORAGE_SCAN_REFRESH_NUDGE_COMMAND);
+        if is_refresh_nudge {
+            system_store
+                .delete_task_v2(
+                    txn,
+                    &row.due_key,
+                    &row.keyspace,
+                    row.db_id,
+                    row.task_type,
+                    row.task_id,
+                    row.fire_time_ms,
+                )
+                .await?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+fn storage_scan_entry_is_refresh_nudge(entry: &TaskQueueEntry) -> bool {
+    entry.task_type == TaskType::StorageSizeScan
+        && entry.command == STORAGE_SCAN_REFRESH_NUDGE_COMMAND
 }
 
 async fn execute_storage_size_scan_derived(

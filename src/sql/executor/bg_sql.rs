@@ -143,7 +143,7 @@ async fn execute_refresh_storage_stats(
             db_id,
         )
         .await?;
-        crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
+        crate::worker::engine::enqueue_storage_scan_nudge(system_store, keyspace, db_id).await?;
     } else {
         crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
     }
@@ -319,7 +319,7 @@ mod tests {
             .find("request_storage_scan_refresh")
             .expect("active refresh must write derived StorageScan state directly");
         let nudge = active_branch
-            .find("enqueue_storage_scan")
+            .find("enqueue_storage_scan_nudge")
             .expect("active refresh must enqueue a StorageSizeScan nudge");
         let fallback = refresh
             .split("} else {")

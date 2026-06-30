@@ -781,7 +781,7 @@ fn storage_scan_active_sweep_claims_derived_state_not_v2_queue() {
 }
 
 #[test]
-fn legacy_v2_storage_scan_converts_to_derived_refresh_when_active() {
+fn legacy_v2_storage_scan_refreshes_derived_state_only_for_marked_nudge_when_active() {
     let source = include_str!("../engine.rs");
     let prod_source = source
         .split("#[cfg(test)]")
@@ -799,18 +799,26 @@ fn legacy_v2_storage_scan_converts_to_derived_refresh_when_active() {
     let active = branch
         .find("config.storage_scan_derived_active")
         .expect("legacy StorageSizeScan execution must check derived active flag");
+    let marker = branch
+        .find("storage_scan_entry_is_refresh_nudge(entry)")
+        .expect(
+            "active StorageSizeScan dispatch must distinguish refresh nudges from periodic rows",
+        );
+    let gated_refresh = branch
+        .find("if force_refresh")
+        .expect("derived refresh state update must be gated to refresh nudges");
     let refresh = branch
         .find("request_storage_scan_refresh")
-        .expect("active legacy StorageSizeScan must nudge derived state");
+        .expect("active StorageSizeScan refresh nudges must request derived state refresh");
     let derived_run = branch
         .find("run_storage_scan_derived_for_target")
-        .expect("active legacy StorageSizeScan nudge must execute through derived claim/effect");
+        .expect("active StorageSizeScan rows must execute through derived claim/effect");
     let legacy = branch
         .find("execute_storage_size_scan(")
         .expect("inactive StorageSizeScan must keep legacy V2 executor");
     assert!(
-        active < refresh && refresh < derived_run && derived_run < legacy,
-        "active legacy V2 StorageSizeScan rows must execute through the derived state machine, not the legacy scanner"
+        active < marker && marker < gated_refresh && gated_refresh < refresh && refresh < derived_run && derived_run < legacy,
+        "active legacy V2 StorageSizeScan rows must run through the derived state machine, but only marked refresh nudges may force a derived refresh"
     );
 }
 
@@ -1378,7 +1386,7 @@ fn deterministic_queue_cleanup_uses_task_type_contract() {
 }
 
 #[test]
-fn storage_scan_enqueue_uses_kernel_singleton_helper() {
+fn storage_scan_periodic_enqueue_is_singleton_but_manual_nudge_is_marked_immediate() {
     let source = include_str!("../engine.rs");
     let prod_source = source
         .split("#[cfg(test)]")
@@ -1399,7 +1407,114 @@ fn storage_scan_enqueue_uses_kernel_singleton_helper() {
     );
     assert!(
         enqueue_fn.contains(".enqueue_singleton_task_v2_unless_db_dropped("),
-        "StorageSizeScan is a singleton maintenance task and must fence on dropped-DB tombstones before enqueue"
+        "periodic StorageSizeScan enqueue must remain singleton to avoid sweep-driven queue buildup"
+    );
+
+    let nudge_fn = prod_source
+        .split("pub(crate) async fn enqueue_storage_scan_nudge(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn enqueue_storage_scan_with_jitter")
+                .next()
+        })
+        .expect("enqueue_storage_scan_nudge must exist before jitter enqueue");
+    assert!(
+        nudge_fn.contains("enqueue_storage_scan_nudge_at(system_store, keyspace, db_id, 0)"),
+        "manual StorageSizeScan refresh must enqueue an immediate nudge, not singleton dedupe"
+    );
+
+    let enqueue_at = prod_source
+        .split("async fn enqueue_storage_scan_at(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(crate) async fn request_storage_scan_refresh")
+                .next()
+        })
+        .expect("enqueue_storage_scan_at must exist before request_storage_scan_refresh");
+    assert!(
+        enqueue_at.contains("StorageScanQueueMode::Singleton")
+            && enqueue_at.contains(".enqueue_singleton_task_v2_unless_db_dropped(")
+            && enqueue_at.contains("StorageScanQueueMode::RefreshNudge")
+            && enqueue_at.contains("STORAGE_SCAN_REFRESH_NUDGE_COMMAND")
+            && enqueue_at.contains("delete_storage_scan_refresh_nudges")
+            && enqueue_at.contains(".enqueue_task_v2_unless_db_dropped("),
+        "storage scan enqueue must keep periodic singleton semantics while coalescing marked manual nudges"
+    );
+    let coalesce = enqueue_at
+        .find("delete_storage_scan_refresh_nudges")
+        .expect("refresh nudge enqueue must delete older refresh nudges");
+    let raw_nudge_put = enqueue_at
+        .find(".enqueue_task_v2_unless_db_dropped(")
+        .expect("refresh nudge enqueue must write through the fenced raw task helper");
+    assert!(
+        coalesce < raw_nudge_put,
+        "refresh nudge enqueue must coalesce stale refresh rows before writing the replacement nudge"
+    );
+}
+
+#[test]
+fn storage_scan_capacity_full_replaces_nudge_before_cleanup() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let storage_scan_dispatch = prod_source
+        .split("if entry.task_type == TaskType::StorageSizeScan")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("if entry.task_type == TaskType::HnswMerge")
+                .next()
+        })
+        .expect("StorageSizeScan dispatch must precede HNSW dispatch");
+    let capacity_check = storage_scan_dispatch
+        .find("StorageScanDerivedSkipReason::CapacityFull")
+        .expect("StorageSizeScan dispatch must detect capacity-full derived skips");
+    let capacity_branch = &storage_scan_dispatch[capacity_check..];
+    let refresh_gate = capacity_branch
+        .find("&& force_refresh")
+        .expect("capacity-full retry must only preserve manual refresh nudges");
+    let retry_delay = capacity_branch
+        .find("storage_scan_retry_after_ms(now_epoch_ms(), 0)")
+        .expect("capacity-full StorageSizeScan dispatch must delay retry instead of hot-looping");
+    let nudge = capacity_branch
+        .find("enqueue_storage_scan_nudge_at")
+        .expect(
+            "capacity-full StorageSizeScan dispatch must replace refresh nudges with a delayed row",
+        );
+    assert!(
+        refresh_gate < nudge && nudge < retry_delay,
+        "capacity-full derived claim must preserve manual refresh nudges with a delayed retry before generic nonce-CAS cleanup runs"
+    );
+}
+
+#[test]
+fn storage_scan_refresh_nudge_coalescer_deletes_only_marked_nudges() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let helper = prod_source
+        .split("async fn delete_storage_scan_refresh_nudges(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn storage_scan_entry_is_refresh_nudge").next())
+        .expect("delete_storage_scan_refresh_nudges must exist before refresh-nudge detector");
+
+    assert!(
+        helper.contains(".index_rows_for_task(")
+            && helper.contains("TaskType::StorageSizeScan")
+            && helper.contains("match TaskDescriptorV2::decode")
+            && helper.contains("Err(e)")
+            && helper.contains("Skipping undecodable StorageSizeScan row while coalescing refresh nudges")
+            && helper.contains("continue;")
+            && helper.contains("payload.command == STORAGE_SCAN_REFRESH_NUDGE_COMMAND")
+            && helper.contains(".delete_task_v2("),
+        "refresh nudge coalescer must skip undecodable rows, inspect the due descriptor command marker, and delete only marked refresh rows"
+    );
+    assert!(
+        !helper.contains("map_err(|e| anyhow!(\"Failed to deserialize V2 descriptor: {e}\"))?"),
+        "refresh nudge coalescing is best-effort and must not hard-fail on undecodable forward-version rows"
     );
 }
 
@@ -1450,6 +1565,69 @@ async fn enqueue_storage_scan_skips_existing_pending_task_without_nonce_churn() 
     );
 }
 
+#[tokio::test]
+#[ignore = "requires TiKV / PD cluster"]
+async fn manual_storage_scan_nudge_bypasses_future_singleton_row() {
+    let pd_endpoints = std::env::var("PD_ENDPOINTS")
+        .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let system_keyspace = format!(
+        "_sys_storage_nudge_test_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let cfg = crate::worker::config::WorkerConfig {
+        enabled: true,
+        system_keyspace,
+        ..Default::default()
+    };
+    let system_store = crate::worker::init_gc_registry_store(pd_endpoints, &cfg)
+        .await
+        .expect("init system store");
+
+    let keyspace = format!(
+        "storage_nudge_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let db_id = 77_u64;
+    let future_fire_time = crate::worker::now_epoch_ms() + 3_600_000;
+
+    enqueue_storage_scan_at(
+        &system_store,
+        &keyspace,
+        db_id,
+        future_fire_time,
+        StorageScanQueueMode::Singleton,
+    )
+    .await
+    .expect("future singleton enqueue");
+    assert_eq!(
+        storage_scan_fire_times(&system_store, &keyspace, db_id).await,
+        vec![future_fire_time],
+        "fixture should start with one future periodic row"
+    );
+
+    enqueue_storage_scan_nudge(&system_store, &keyspace, db_id)
+        .await
+        .expect("manual nudge enqueue");
+    let fire_times = storage_scan_fire_times(&system_store, &keyspace, db_id).await;
+    assert!(
+        fire_times.contains(&0) && fire_times.contains(&future_fire_time),
+        "manual refresh must add an immediate due row instead of being swallowed by the future singleton row: {fire_times:?}"
+    );
+    let due_rows = storage_scan_due_rows(&system_store, &keyspace, db_id).await;
+    assert!(
+        due_rows.contains(&(0, STORAGE_SCAN_REFRESH_NUDGE_COMMAND.to_string()))
+            && due_rows.contains(&(future_fire_time, String::new())),
+        "manual refresh row must be marked separately from the future periodic row: {due_rows:?}"
+    );
+}
+
 async fn storage_scan_nonce(system_store: &TikvStore, keyspace: &str, db_id: u64) -> u64 {
     let mut txn = system_store.begin().await.expect("begin txn");
     let due = system_store
@@ -1483,6 +1661,61 @@ async fn storage_scan_nonce(system_store: &TikvStore, keyspace: &str, db_id: u64
     assert_eq!(rows.len(), 1, "there must be exactly one queue index row");
     txn.rollback().await.ok();
     storage_scans[0].1.nonce
+}
+
+async fn storage_scan_fire_times(system_store: &TikvStore, keyspace: &str, db_id: u64) -> Vec<i64> {
+    let mut txn = system_store.begin().await.expect("begin txn");
+    let rows = system_store
+        .index_rows_for_task(
+            &mut txn,
+            keyspace,
+            db_id,
+            db_id as i64,
+            TaskType::StorageSizeScan,
+        )
+        .await
+        .expect("read queue index rows");
+    txn.rollback().await.ok();
+    let mut fire_times = rows
+        .into_iter()
+        .map(|row| row.fire_time_ms)
+        .collect::<Vec<_>>();
+    fire_times.sort_unstable();
+    fire_times
+}
+
+async fn storage_scan_due_rows(
+    system_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+) -> Vec<(i64, String)> {
+    let mut txn = system_store.begin().await.expect("begin txn");
+    let due = system_store
+        .scan_due_v2(&mut txn, i64::MAX, 1000)
+        .await
+        .expect("scan due queue");
+    txn.rollback().await.ok();
+    let mut rows = due
+        .into_iter()
+        .filter(|(_, descriptor)| {
+            descriptor.keyspace == keyspace
+                && descriptor.db_id == db_id
+                && descriptor.task_id == db_id as i64
+                && descriptor.task_type == TaskType::StorageSizeScan
+        })
+        .map(|(key, descriptor)| {
+            let command = descriptor
+                .inline
+                .expect("StorageSizeScan descriptor must keep inline payload")
+                .command;
+            (
+                crate::storage::decode_wq_due_v2_fire_time(&key).expect("due key fire time"),
+                command,
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
 }
 
 #[test]
@@ -4498,8 +4731,10 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "execute_bg_ddl_backfill",
         // [enqueue] Single put to system store queue + commit.
         "enqueue_storage_scan",
-        // [enqueue] Shared storage-scan enqueue helper; writes one singleton
-        // queue entry in the system store, then commits or rolls back.
+        // [enqueue] Manual refresh nudge: single immediate queue put + commit.
+        "enqueue_storage_scan_nudge",
+        // [enqueue] Shared storage-scan enqueue helper; writes one queue entry
+        // in the system store, then commits or rolls back.
         "enqueue_storage_scan_at",
         // [pd lookup + finalize] PD HTTP stats lookup, then one short tenant
         // stats-key write with immediate commit.
