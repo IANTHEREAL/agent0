@@ -297,40 +297,39 @@ Old S3 graph versions are cleaned up by a periodic GC sweep, not by inline
 deletion after merge. This is **mandatory** — without it, leaked objects
 accumulate unboundedly (~144 GB/month at scale).
 
-**Implementation:** New method `sweep_hnsw_s3_orphans()` in `src/worker/gc.rs`,
+**Implementation:** New method `sweep_hnsw_s3_orphans_for_entry()` in `src/worker/gc.rs`,
 running alongside the existing `run_hnsw_sweep_loop()` on a configurable
 interval (default: 600s).
 
 ### Retention policy
 
-**Time-based + lineage guard.** GC deletes an object only when both conditions
-are met:
+**Safepoint marker + lineage guard.** GC never deletes committed S3 graph
+objects based on `LastModified` or wall-clock age. When a version or prefix
+becomes reclaimable, the worker writes a durable TiKV marker sealed with the
+current PD timestamp (`delete_after_safepoint`). The S3 delete happens only
+after TiKV's GC safepoint has advanced past that sealed timestamp.
 
-1. The version is outside the live lineage:
-   - `version < meta.graph_version - 1` (stale history), or
-   - `version > meta.graph_version` (future/orphan version), or
-   - `meta.graph_version == 0 && version > 0` (TRUNCATE reset left old S3 objects)
-2. `S3 LastModified < now - retention_window`
+This ties external-object cleanup to the same MVCC boundary as TiKV versions:
+if TiKV has not reclaimed old versions yet, a reader may still see metadata
+that references the S3 object. TiKV safepoint advancement is governed by
+`gc_life_time_sec` (default: 86400s), but the S3 sweep consumes the safepoint
+itself instead of reimplementing the retention window with object timestamps.
 
-The retention window must match TiKV's MVCC snapshot lifetime to prevent
-deleting a version that an in-flight reader might still reference via an
-old MVCC snapshot:
+The lineage guard is:
 
-```
-retention_window = gc_life_time_sec    (default: 86400s = 24h)
-```
-
-**Why `gc_life_time_sec`, not `statement_timeout`:** `statement_timeout`
-is a per-session GUC — users can `SET statement_timeout = '30min'` or
-`0` (unlimited). The GC worker runs outside any session. The correct
-upper bound on MVCC snapshot lifetime is `gc_life_time_sec` from
-`WorkerConfig` (`config.rs:53`), which controls when TiKV reclaims old
-MVCC versions. If TiKV hasn't reclaimed the version, a reader might
-still see it.
-
-The lineage guard keeps N and N-1 for normal live indexes, while still allowing
-GC to reclaim reset/orphaned versions after TRUNCATE or failed writes once the
-MVCC window has elapsed.
+1. `version == meta.graph_version`: current live graph; keep it and clear any
+   stale retired-version marker.
+2. `version < meta.graph_version`: historical retired graph; write/use a
+   per-version retired marker and delete after the safepoint crosses it.
+3. `version > meta.graph_version`: future/speculative upload; leave it alone
+   and clear any stale retired-version marker.
+4. `meta.dropped_at IS NOT NULL` or `meta.graph_version == 0`: write/use a
+   prefix marker and delete the whole index prefix after the safepoint crosses
+   it. Dropped metadata is removed only after the prefix delete succeeds.
+5. No metadata and no durable prefix marker: leave objects untouched. They may
+   belong to an uncommitted explicit transaction; durable upload intents own
+   cleanup for abandoned writer-owned uploads once the source transaction is
+   below the TiKV GC safepoint.
 
 ### Batched LIST for cost efficiency
 
@@ -339,40 +338,64 @@ Per-index LIST is too expensive at scale (20K indexes × $0.005/1K requests
 
 ```
 for each (keyspace, db_id) in worker_registry:
-  # One LIST per database, not per index
-  all_objects = s3.list_objects(prefix="{prefix}/{hex(ks)}/{db}/")
+  continuation = None
+  metas = {}
+  prefix_deleted = {}
 
-  # Build map: (table_id, index_id) → [objects]
-  index_objects = group_by(all_objects, extract_table_index_from_key)
+  loop:
+    # One paged LIST stream per database, not per index.
+    page = s3.list_objects_page(prefix="{prefix}/{hex(ks)}/{db}/", continuation)
+    index_objects = group_by(page.objects, extract_table_index_from_key,
+                             skip_prefixes=prefix_deleted)
 
-  # Load all HNSW metas for this database
-  metas = read_all_hnsw_metas(db_id)
+    # Point-read only metadata for indexes seen on this page.
+    missing = index_objects.keys - metas.keys
+    metas += read_hnsw_metas_for_indexes(db_id, missing)
 
-  for each (table_id, index_id), objects in index_objects:
-    meta = metas.get((table_id, index_id))
-    if meta is None:
-      # No meta at all (legacy pre-tombstone, or tombstone already GC'd).
-      # Conservative: use LastModified (safe for legacy objects).
-      for each object in objects:
-        if object.last_modified < now - retention_window:
-          s3.delete_object(object)
-    elif meta.dropped_at is not None:
-      # Tombstoned index: use DROP TIME as reference (not LastModified!).
-      # LastModified = upload time (can be weeks old for quiet indexes).
-      # dropped_at = actual DDL time. This is the MVCC-safe boundary.
-      if now - meta.dropped_at > retention_window:
-        s3.delete_objects(objects)       # all versions, unconditionally
-        txn_delete(hnsw_meta_key)        # clean up the tombstone
-    else:
-      current = metas[(table_id, index_id)].graph_version
+    for each (table_id, index_id), objects in index_objects:
+      meta = metas.get((table_id, index_id))
+      prefix_marker = read_hnsw_s3_prefix_gc_marker(table_id, index_id)
+
+      if prefix_marker exists:
+        if meta is live and meta.graph_version > 0:
+          delete stale prefix_marker
+        elif gc_safepoint >= prefix_marker.delete_after_safepoint:
+          s3.delete_prefix(table_id, index_id)
+          delete prefix_marker and retired-version markers
+          if meta is dropped: delete hnsw_meta tombstone
+          prefix_deleted.add((table_id, index_id))
+          continue
+
+      if meta is None:
+        # Could be an uncommitted explicit transaction; upload-intent GC owns
+        # abandoned writer-owned uploads.
+        continue
+      if meta.dropped_at is not None or meta.graph_version == 0:
+        write prefix_marker(delete_after_safepoint = current_pd_tso)
+        continue
+
       for each object in objects:
         v = parse version from key
-        if v outside live lineage AND object.last_modified < now - retention_window:
-          s3.delete_object(object)
+        if v == meta.graph_version:
+          delete stale retired-version marker if present
+        elif v > meta.graph_version:
+          # Future/speculative upload; never infer retirement from LIST alone.
+          delete stale retired-version marker if present
+        else:
+          marker = read_hnsw_s3_retired_version_marker(v)
+          if marker is missing:
+            write retired-version marker(delete_after_safepoint = current_pd_tso)
+          elif gc_safepoint >= marker.delete_after_safepoint:
+            s3.delete_graph(v)
+            delete retired-version marker
+
+    continuation = page.next_continuation_token
+    if continuation is None: break
 ```
 
-Cost at database-level batching: 1K databases × 4320 cycles/month ×
-$0.005/1K = ~$22/month.
+Base cost at database-level batching when each database fits one LIST page:
+1K databases × 4320 cycles/month × $0.005/1K = ~$22/month. Large database
+prefixes scale by page count, still avoiding per-index LIST fanout.
 
 ## Interaction with Frozen Guard (#1970)
 
@@ -664,7 +687,7 @@ pub struct HnswMeta {
   MVCC retention window.
 
 **`src/worker/gc.rs`** — S3 GC sweep
-- New method `sweep_hnsw_s3_orphans()`.
+- New method `sweep_hnsw_s3_orphans_for_entry()`.
 - Runs on configurable interval (default 600s).
 - Lists S3 objects per index prefix, deletes versions < current - 1.
 
@@ -703,12 +726,13 @@ pub struct HnswMeta {
 - `drop.rs`, `tables.rs`: NO S3 cleanup on DROP/TRUNCATE. S3 objects
   become orphans, cleaned by GC. This preserves MVCC consistency for
   concurrent readers that still see the old meta via snapshot.
-- `gc.rs`: `sweep_hnsw_s3_orphans()` — batched LIST per database.
-  For live indexes: keep N and N-1, and delete only versions outside the live
-  lineage after `LastModified < now - gc_life_time_sec`. For dropped indexes
-  (not in metas): delete objects where `LastModified < now - gc_life_time_sec`
-  (NOT immediate — respects MVCC window). Runs alongside existing HNSW sweep
-  loop.
+- `gc.rs`: `sweep_hnsw_s3_orphans_for_entry()` — paged LIST per database.
+  For live indexes: keep the current graph, leave future/speculative uploads
+  untouched, and retire older versions through durable safepoint markers. For
+  dropped/truncated indexes: write a prefix marker and delete the prefix only
+  after TiKV's GC safepoint crosses the marker. Objects with no metadata and no
+  durable cleanup marker are left untouched; upload-intent GC owns abandoned
+  writer-owned uploads. Runs alongside the existing HNSW sweep loop.
 
 ### Phase 5: Tests
 
@@ -779,7 +803,7 @@ rejected challenges, providing an audit trail of design evolution.
 
 **Confirmed fixes (7):**
 1. Deferred version deletion — old S3 versions cleaned by GC only, not inline after merge (reader NoSuchKey race)
-2. Mandatory S3 GC sweep — `sweep_hnsw_s3_orphans()` in `worker/gc.rs`
+2. Mandatory S3 GC sweep — `sweep_hnsw_s3_orphans_for_entry()` in `worker/gc.rs`
 3. Keyspace hex-encoding — `tenant_id` has no char validation, follow fs9 `encode_s3_key_component`
 4. S3 operation timeout — 30s operation, 10s per attempt
 5. `delete_prefix()` API — for DROP INDEX/TABLE post-commit cleanup

@@ -4532,8 +4532,6 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "reap_stale_gc_instance_states",
         // [lookup] Delete stale GC instance rows (bounded) + commit.
         "reap_stale_gc_instance_states_from_scan",
-        // [lookup] Read all HNSW metas for S3 GC sweep; bounded scan + rollback.
-        "read_all_hnsw_metas",
         // [lookup] Point-read HNSW metas referenced by one S3 page + rollback.
         "read_hnsw_metas_for_indexes",
         // [reconcile] Bounded system-store intent pages plus tenant point reads/S3 cleanup.

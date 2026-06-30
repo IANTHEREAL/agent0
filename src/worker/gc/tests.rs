@@ -1230,8 +1230,8 @@ fn hnsw_s3_entry_sweep_uses_paged_object_listing() {
     let entry_fn = source
         .split("pub(crate) async fn sweep_hnsw_s3_orphans_for_entry")
         .nth(1)
-        .and_then(|rest| rest.split("async fn read_all_hnsw_metas").next())
-        .expect("sweep_hnsw_s3_orphans_for_entry must exist before read_all_hnsw_metas");
+        .and_then(|rest| rest.split("async fn read_hnsw_metas_for_indexes").next())
+        .expect("sweep_hnsw_s3_orphans_for_entry must exist before read_hnsw_metas_for_indexes");
 
     assert!(
         entry_fn.contains("list_objects_page"),
@@ -1246,8 +1246,7 @@ fn hnsw_s3_entry_sweep_uses_paged_object_listing() {
         "paged HNSW S3 sweep must advance through S3 continuation tokens"
     );
     assert!(
-        entry_fn.contains("read_hnsw_metas_for_indexes")
-            && !entry_fn.contains("read_all_hnsw_metas"),
+        entry_fn.contains("read_hnsw_metas_for_indexes"),
         "production HNSW S3 sweep must point-read metas for indexes seen in the current S3 page"
     );
 }
@@ -1259,10 +1258,10 @@ fn hnsw_s3_external_object_gc_uses_durable_intents() {
         .split("pub(super) async fn cleanup_hnsw_s3_external_object_intents")
         .nth(1)
         .and_then(|rest| {
-            rest.split("/// Sweep orphaned HNSW S3 graph objects.")
+            rest.split("pub(crate) async fn sweep_hnsw_s3_orphans_for_entry")
                 .next()
         })
-        .expect("external object intent GC must exist before legacy S3 sweep");
+        .expect("external object intent GC must exist before the entry sweep");
 
     assert!(
         intent_fn.contains("scan_hnsw_s3_graph_upload_intents_page"),

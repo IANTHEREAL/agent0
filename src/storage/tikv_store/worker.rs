@@ -2360,34 +2360,6 @@ impl TikvStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn get_lifecycle_tenant_record(
-        &self,
-        txn: &mut Transaction,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<Option<LifecycleTenantRecord>> {
-        let key = self.key(&encode_lifecycle_tenant_key(keyspace, db_id));
-        let Some(value) = tikv_op!(txn.get(key).await)? else {
-            return Ok(None);
-        };
-        let (incarnation, status, updated_at_version) = decode_lifecycle_tenant_value(&value)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Failed to decode lifecycle tenant record for keyspace='{}' db_id={}",
-                    keyspace,
-                    db_id
-                )
-            })?;
-        Ok(Some(LifecycleTenantRecord {
-            keyspace: keyspace.to_string(),
-            db_id,
-            incarnation,
-            status,
-            updated_at_version,
-        }))
-    }
-
     pub async fn get_lifecycle_tenant_record_for_update(
         &self,
         txn: &mut Transaction,

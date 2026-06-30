@@ -1654,14 +1654,6 @@ impl WorkerEngine {
                 }
 
                 let due = self.storage_scan_due(store, entry.db_id).await?;
-                if self.config.storage_scan_derived_shadow {
-                    debug!(
-                        keyspace = %entry.keyspace,
-                        db_id = entry.db_id,
-                        due,
-                        "StorageSizeScan derived scheduler shadow observation"
-                    );
-                }
                 if due {
                     enqueue_storage_scan_with_jitter(
                         &self.system_store,

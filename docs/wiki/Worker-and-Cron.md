@@ -163,10 +163,11 @@ pub struct WorkerGc {
 }
 
 impl WorkerGc {
-    pub fn new(
+    pub fn new_with_executor_lease(
         system_store: Arc<TikvStore>,
         pool: Arc<TikvClientPool>,
         config: WorkerConfig,
+        executor_lease: Arc<WorkerExecutorLeaseCoordinator>,
     ) -> Self;
 
     pub async fn run(&self);  // GC loop on 10-minute interval (never returns)

@@ -33,7 +33,6 @@ const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
 const DEFAULT_STORAGE_SCAN_JITTER_SEC: u64 = 300;
 const DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS: u64 = 100;
 const DEFAULT_STORAGE_SCAN_DERIVED_ACTIVE: bool = false;
-const DEFAULT_STORAGE_SCAN_DERIVED_SHADOW: bool = false;
 const DEFAULT_STORAGE_SCAN_DERIVED_CAPACITY: u16 = 1;
 const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
@@ -134,7 +133,6 @@ pub struct WorkerConfig {
     pub storage_scan_jitter_sec: u64,
     pub storage_scan_pd_rate_limit_ms: u64,
     pub storage_scan_derived_active: bool,
-    pub storage_scan_derived_shadow: bool,
     pub storage_scan_derived_capacity: u16,
     pub registry_reconcile_batch_size: usize,
     /// Legacy worker/background keyspace. During Phase 0 all domain-specific
@@ -206,7 +204,6 @@ impl Default for WorkerConfig {
             storage_scan_jitter_sec: DEFAULT_STORAGE_SCAN_JITTER_SEC,
             storage_scan_pd_rate_limit_ms: DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS,
             storage_scan_derived_active: DEFAULT_STORAGE_SCAN_DERIVED_ACTIVE,
-            storage_scan_derived_shadow: DEFAULT_STORAGE_SCAN_DERIVED_SHADOW,
             storage_scan_derived_capacity: DEFAULT_STORAGE_SCAN_DERIVED_CAPACITY,
             registry_reconcile_batch_size: DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
@@ -426,10 +423,6 @@ impl WorkerConfig {
         parse_bool_var(
             "DB9_STORAGE_SCAN_DERIVED_ACTIVE",
             &mut cfg.storage_scan_derived_active,
-        );
-        parse_bool_var(
-            "DB9_STORAGE_SCAN_DERIVED_SHADOW",
-            &mut cfg.storage_scan_derived_shadow,
         );
         if let Ok(v) = env::var("DB9_STORAGE_SCAN_DERIVED_CAPACITY") {
             match v.parse::<u16>() {
@@ -690,7 +683,6 @@ mod tests {
             "DB9_WORKER_STORAGE_SCAN_JITTER_SEC",
             "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS",
             "DB9_STORAGE_SCAN_DERIVED_ACTIVE",
-            "DB9_STORAGE_SCAN_DERIVED_SHADOW",
             "DB9_STORAGE_SCAN_DERIVED_CAPACITY",
             "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE",
             "DB9_WORKER_SYSTEM_KEYSPACE",
@@ -745,10 +737,6 @@ mod tests {
         assert_eq!(
             cfg.storage_scan_derived_active,
             DEFAULT_STORAGE_SCAN_DERIVED_ACTIVE
-        );
-        assert_eq!(
-            cfg.storage_scan_derived_shadow,
-            DEFAULT_STORAGE_SCAN_DERIVED_SHADOW
         );
         assert_eq!(
             cfg.storage_scan_derived_capacity,
@@ -1284,23 +1272,19 @@ mod tests {
         let _guard = test_lock().lock();
 
         let active_key = "DB9_STORAGE_SCAN_DERIVED_ACTIVE";
-        let shadow_key = "DB9_STORAGE_SCAN_DERIVED_SHADOW";
         let capacity_key = "DB9_STORAGE_SCAN_DERIVED_CAPACITY";
         let saved = [
             (active_key, env::var(active_key).ok()),
-            (shadow_key, env::var(shadow_key).ok()),
             (capacity_key, env::var(capacity_key).ok()),
         ];
 
         unsafe {
             env::set_var(active_key, "true");
-            env::set_var(shadow_key, "on");
             env::set_var(capacity_key, "3");
         }
 
         let cfg = WorkerConfig::from_env();
         assert!(cfg.storage_scan_derived_active);
-        assert!(cfg.storage_scan_derived_shadow);
         assert_eq!(cfg.storage_scan_derived_capacity, 3);
 
         for (key, value) in saved {
