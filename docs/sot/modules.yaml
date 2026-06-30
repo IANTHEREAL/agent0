@@ -365,7 +365,9 @@ modules:
     scope:
       - worker task lifecycle and coordination
       - cron scheduling and catalog exposure
-      - HNSW sweep/merge background behavior
+      - StorageSizeScan derived-state scheduling
+      - HNSW sweep/merge background behavior, including descriptor retry backoff
+      - bounded DDL journal recovery
     non_goals:
       - 'general SQL semantics (authoritative: `sql-engine`)'
       - 'worker/cron key layout details (authoritative: `storage-format`)'

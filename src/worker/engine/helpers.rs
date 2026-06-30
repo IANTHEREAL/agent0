@@ -390,10 +390,10 @@ pub(super) async fn execute_hnsw_merge(
                 .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
 
             // 1. Read meta with pessimistic lock.
-            // get_for_update is the last line of defense against duplicate merge
-            // execution. Worker claims are now bound to the exact queue entry, but
-            // manual requeue / operator mistakes must still not let two merges
-            // compute the same next graph_version from a stale snapshot.
+            // get_for_update on the HNSW meta key is the primary per-index merge
+            // serialization guard. Worker claims and descriptor backoff reduce
+            // duplicate dispatch, but this lock is the source of truth for
+            // graph_version and delta application ordering.
             let meta_key = hnsw_meta_key(db_id, table_id, index_id);
             let dirty_key = hnsw_dirty_key(db_id, table_id, index_id);
             let dirty_marker_at_start = txn.get(dirty_key.clone()).await?;

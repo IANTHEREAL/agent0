@@ -30,9 +30,7 @@ const MIN_SWEEP_PAGE_INTERVAL_SEC: u64 = 1;
 // old 30-min all-tenant scan while still self-healing within the same day.
 const DEFAULT_STORAGE_SCAN_INTERVAL_SEC: u64 = 21_600;
 const MIN_STORAGE_SCAN_INTERVAL_SEC: u64 = 60;
-const DEFAULT_STORAGE_SCAN_JITTER_SEC: u64 = 300;
 const DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS: u64 = 100;
-const DEFAULT_STORAGE_SCAN_DERIVED_ACTIVE: bool = false;
 const DEFAULT_STORAGE_SCAN_DERIVED_CAPACITY: u16 = 1;
 const DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE: usize = DEFAULT_MAX_CONCURRENT_JOBS;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
@@ -130,9 +128,7 @@ pub struct WorkerConfig {
     pub registry_sweep_interval_sec: u64,
     pub sweep_page_interval_sec: u64,
     pub storage_scan_interval_sec: u64,
-    pub storage_scan_jitter_sec: u64,
     pub storage_scan_pd_rate_limit_ms: u64,
-    pub storage_scan_derived_active: bool,
     pub storage_scan_derived_capacity: u16,
     pub registry_reconcile_batch_size: usize,
     /// Legacy worker/background keyspace. During Phase 0 all domain-specific
@@ -201,9 +197,7 @@ impl Default for WorkerConfig {
             registry_sweep_interval_sec: DEFAULT_REGISTRY_SWEEP_INTERVAL_SEC,
             sweep_page_interval_sec: DEFAULT_SWEEP_PAGE_INTERVAL_SEC,
             storage_scan_interval_sec: DEFAULT_STORAGE_SCAN_INTERVAL_SEC,
-            storage_scan_jitter_sec: DEFAULT_STORAGE_SCAN_JITTER_SEC,
             storage_scan_pd_rate_limit_ms: DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS,
-            storage_scan_derived_active: DEFAULT_STORAGE_SCAN_DERIVED_ACTIVE,
             storage_scan_derived_capacity: DEFAULT_STORAGE_SCAN_DERIVED_CAPACITY,
             registry_reconcile_batch_size: DEFAULT_REGISTRY_RECONCILE_BATCH_SIZE,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
@@ -411,18 +405,9 @@ impl WorkerConfig {
             "s",
         );
         parse_u64_warn(
-            "DB9_WORKER_STORAGE_SCAN_JITTER_SEC",
-            &mut cfg.storage_scan_jitter_sec,
-            "s",
-        );
-        parse_u64_warn(
             "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS",
             &mut cfg.storage_scan_pd_rate_limit_ms,
             "ms",
-        );
-        parse_bool_var(
-            "DB9_STORAGE_SCAN_DERIVED_ACTIVE",
-            &mut cfg.storage_scan_derived_active,
         );
         if let Ok(v) = env::var("DB9_STORAGE_SCAN_DERIVED_CAPACITY") {
             match v.parse::<u16>() {
@@ -680,9 +665,7 @@ mod tests {
             "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC",
             "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC",
             "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC",
-            "DB9_WORKER_STORAGE_SCAN_JITTER_SEC",
             "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS",
-            "DB9_STORAGE_SCAN_DERIVED_ACTIVE",
             "DB9_STORAGE_SCAN_DERIVED_CAPACITY",
             "DB9_WORKER_REGISTRY_RECONCILE_BATCH_SIZE",
             "DB9_WORKER_SYSTEM_KEYSPACE",
@@ -729,14 +712,9 @@ mod tests {
             cfg.storage_scan_interval_sec,
             DEFAULT_STORAGE_SCAN_INTERVAL_SEC
         );
-        assert_eq!(cfg.storage_scan_jitter_sec, DEFAULT_STORAGE_SCAN_JITTER_SEC);
         assert_eq!(
             cfg.storage_scan_pd_rate_limit_ms,
             DEFAULT_STORAGE_SCAN_PD_RATE_LIMIT_MS
-        );
-        assert_eq!(
-            cfg.storage_scan_derived_active,
-            DEFAULT_STORAGE_SCAN_DERIVED_ACTIVE
         );
         assert_eq!(
             cfg.storage_scan_derived_capacity,
@@ -1183,7 +1161,6 @@ mod tests {
         assert_eq!(cfg.registry_sweep_interval_sec, 60);
         assert_eq!(cfg.sweep_page_interval_sec, 30);
         assert_eq!(cfg.storage_scan_interval_sec, 21_600);
-        assert_eq!(cfg.storage_scan_jitter_sec, 300);
         assert_eq!(cfg.storage_scan_pd_rate_limit_ms, 100);
         assert_eq!(cfg.registry_reconcile_batch_size, 32);
         assert_eq!(cfg.db_lifecycle_publish_interval_sec, 300);
@@ -1240,27 +1217,19 @@ mod tests {
     }
 
     #[test]
-    fn from_env_applies_storage_scan_jitter_and_pd_rate_limit() {
+    fn from_env_applies_storage_scan_pd_rate_limit() {
         let _guard = test_lock().lock();
 
-        let jitter_key = "DB9_WORKER_STORAGE_SCAN_JITTER_SEC";
         let rate_key = "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS";
-        let jitter_saved = env::var(jitter_key).ok();
         let rate_saved = env::var(rate_key).ok();
 
         unsafe {
-            env::set_var(jitter_key, "17");
             env::set_var(rate_key, "250");
         }
 
         let cfg = WorkerConfig::from_env();
-        assert_eq!(cfg.storage_scan_jitter_sec, 17);
         assert_eq!(cfg.storage_scan_pd_rate_limit_ms, 250);
 
-        match jitter_saved {
-            Some(v) => unsafe { env::set_var(jitter_key, v) },
-            None => unsafe { env::remove_var(jitter_key) },
-        }
         match rate_saved {
             Some(v) => unsafe { env::set_var(rate_key, v) },
             None => unsafe { env::remove_var(rate_key) },
@@ -1268,30 +1237,22 @@ mod tests {
     }
 
     #[test]
-    fn from_env_applies_storage_scan_derived_flags() {
+    fn from_env_applies_storage_scan_derived_capacity() {
         let _guard = test_lock().lock();
 
-        let active_key = "DB9_STORAGE_SCAN_DERIVED_ACTIVE";
         let capacity_key = "DB9_STORAGE_SCAN_DERIVED_CAPACITY";
-        let saved = [
-            (active_key, env::var(active_key).ok()),
-            (capacity_key, env::var(capacity_key).ok()),
-        ];
+        let saved = env::var(capacity_key).ok();
 
         unsafe {
-            env::set_var(active_key, "true");
             env::set_var(capacity_key, "3");
         }
 
         let cfg = WorkerConfig::from_env();
-        assert!(cfg.storage_scan_derived_active);
         assert_eq!(cfg.storage_scan_derived_capacity, 3);
 
-        for (key, value) in saved {
-            match value {
-                Some(v) => unsafe { env::set_var(key, v) },
-                None => unsafe { env::remove_var(key) },
-            }
+        match saved {
+            Some(v) => unsafe { env::set_var(capacity_key, v) },
+            None => unsafe { env::remove_var(capacity_key) },
         }
     }
 

@@ -3,8 +3,8 @@
 //! Non-atomic DDL operations (CREATE INDEX, CTAS) that span multiple TiKV
 //! transactions record their intent in this journal *before* starting the
 //! multi-batch work.  On successful completion the journal entry is deleted.
-//! If the server crashes mid-operation, the startup reconciliation pass
-//! (`reconcile_ddl_journal`) cleans up orphaned data using the journal.
+//! If the server crashes mid-operation, worker registry sweep reconciliation
+//! cleans up orphaned data using the journal.
 
 use super::*;
 use crate::storage::backpressure::tikv_op;
@@ -66,25 +66,51 @@ impl TikvStore {
         Ok(())
     }
 
-    /// Scan all DDL journal entries for a given database.
-    pub async fn scan_ddl_journal(
+    /// Scan one bounded page of DDL journal entries for a given database.
+    ///
+    /// `start_after` is the raw key returned as the previous page cursor. The
+    /// returned cursor is also a raw key and is `None` at the end of the prefix.
+    pub async fn scan_ddl_journal_page(
         &self,
         txn: &mut Transaction,
         db_id: u64,
-    ) -> Result<Vec<DdlJournalEntry>> {
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<DdlJournalEntry>, Option<Vec<u8>>)> {
         let prefix = self.key(&encode_ddl_journal_prefix(db_id));
         let end = crate::storage::encoding::encode_prefix_end(&prefix);
-        let range: BoundRange = (prefix.clone()..end).into();
-        // Journal entries are few (one per in-flight DDL), so a small limit suffices.
-        let pairs = tikv_op!(txn.scan(range, 1024).await)?;
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next = last_key.to_vec();
+                next.push(0);
+                next
+            }
+            None => prefix.clone(),
+        };
+        let limit = limit.max(1).min(u32::MAX as usize) as u32;
+        let range: BoundRange = (start..end).into();
+        let pairs = tikv_op!(txn.scan(range, limit).await)?;
 
         let mut entries = Vec::new();
+        let mut scanned = 0usize;
+        let mut last_key = None;
         for pair in pairs {
+            let key: Vec<u8> = pair.key().clone().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            scanned += 1;
+            last_key = Some(key);
             let entry: DdlJournalEntry = bincode::deserialize(pair.value())
                 .context("Failed to deserialize DDL journal entry")?;
             entries.push(entry);
         }
-        Ok(entries)
+        let next_cursor = if scanned == limit as usize {
+            last_key
+        } else {
+            None
+        };
+        Ok((entries, next_cursor))
     }
 
     /// Delete one batch of keys in a range. Returns the next cursor position,
@@ -120,6 +146,24 @@ impl TikvStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ddl_journal_page_scan_is_cursor_bounded() {
+        let source = include_str!("ddl_journal.rs");
+        let helper = source
+            .split("pub async fn scan_ddl_journal_page(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn delete_key_range_batch").next())
+            .expect("scan_ddl_journal_page must exist before delete_key_range_batch");
+
+        assert!(
+            helper.contains("start_after: Option<&[u8]>")
+                && helper.contains("let limit = limit.max(1).min(u32::MAX as usize) as u32")
+                && helper.contains("scanned += 1")
+                && helper.contains("let next_cursor = if scanned == limit as usize"),
+            "DDL journal page scan must be bounded and return a physical-row cursor"
+        );
+    }
 
     #[test]
     fn ddl_journal_entry_serialization_round_trip() {

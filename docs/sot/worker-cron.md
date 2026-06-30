@@ -42,15 +42,27 @@
   - Evidence: `src/worker/active_txn_registry.rs`, `src/worker/gc.rs`, `src/worker/engine.rs`.
 
 - **[Stable] Shipped task types**
-  - The current task model includes `Cron`, `AsyncTrigger`, `AutoAnalyze`, `BgDdl`, `BgSql`, and `HnswMerge`.
+  - The current task model includes `Cron`, `AsyncTrigger`, `AutoAnalyze`, `BgDdl`, `BgSql`, `HnswMerge`, and `StorageSizeScan`.
   - Evidence: `src/worker/types.rs`, `src/worker/engine.rs`.
+
+- **[Stable] StorageSizeScan derived state**
+  - Storage-size accounting uses the derived-state path; there is no legacy V2 execution fallback.
+  - The derived path is owned by a worker-system state row plus capacity token; progress advances only after tenant storage stats and the applied marker commit.
+  - Any leftover V2 `StorageSizeScan` row is treated only as a compatibility input and is executed through the derived state machine before normal queue cleanup removes it.
+  - Evidence: `src/worker/config.rs`, `src/worker/types.rs`, `src/worker/engine.rs`.
 
 - **[Stable] HNSW sweep is independent from regular GC**
   - Worker GC runs two timer loops:
     - orphan-claim / cron cleanup;
     - HNSW delta backlog sweep that discovers pending merges and enqueues `HnswMerge` tasks.
   - A long HNSW sweep MUST NOT block normal claim/orphan GC cadence.
-  - Evidence: `src/worker/gc.rs`.
+  - Failed `HnswMerge` work is retried by moving the same deterministic V2 descriptor to a future due time with per-index exponential backoff; dirty markers remain the recovery truth.
+  - Evidence: `src/worker/gc.rs`, `src/worker/engine.rs`, `src/worker/types.rs`.
+
+- **[Stable] DDL journal recovery is bounded**
+  - Registry sweep scans DDL journal entries by page.
+  - Large CREATE INDEX / CTAS orphan ranges are cleaned one range-delete batch per journal entry visit; the tenant-local journal entry remains the durable resume point until final metadata cleanup succeeds.
+  - Evidence: `src/worker/engine.rs`, `src/storage/tikv_store/ddl_journal.rs`.
 
 - **[Stable] Background execution identity**
   - Background jobs execute using the stored user identity associated with the task/registry entry, not an anonymous superuser bypass.
@@ -89,6 +101,6 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/185_worker_cron_queue.sql`
 
 ## Change Management
-- Any change to worker task types, claiming rules, GC behavior, cron scheduling, or HNSW background merge behavior MUST update this document and the corresponding `docs/sot/modules.yaml` entry.
+- Any change to worker task types, claiming rules, GC behavior, cron scheduling, StorageSizeScan derived behavior, or HNSW background merge behavior MUST update this document and the corresponding `docs/sot/modules.yaml` entry.
 - Breaking changes require DR/ADR per #368 rules.
 - Reference: https://github.com/c4pt0r/db9/issues/368

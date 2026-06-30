@@ -193,12 +193,6 @@ impl TaskType {
         matches!(self, TaskType::HnswMerge | TaskType::StorageSizeScan)
     }
 
-    /// Whether a failed deterministic task should leave its due row in place
-    /// for another worker/capability profile to retry.
-    pub fn keeps_deterministic_queue_entry_on_failure(self) -> bool {
-        matches!(self, TaskType::HnswMerge)
-    }
-
     /// Convert bitmask value to TaskType (returns first matching type)
     #[allow(dead_code)] // forward-compat: bitmask API for task type serialization
     pub fn from_bitmask(mask: u8) -> Option<Self> {
@@ -493,19 +487,20 @@ impl TaskQueueEntry {
 // kept inline in the descriptor so no extra round-trip is needed.
 // ============================================================================
 
-/// On-disk format version for V2 descriptor/payload values. bincode is NOT
+/// On-disk format versions for V2 descriptor/payload values. bincode is NOT
 /// self-describing, so `#[serde(default)]` does not make a trailing field
 /// optional on decode. Any future change to `TaskDescriptorV2`/`TaskPayloadV2`
 /// MUST bump this version and branch in `decode`; an unknown version is a hard,
 /// explicit error rather than a silent mis-decode.
 pub const WQ_FORMAT_V1: u8 = 1;
+pub const WQ_FORMAT_V2: u8 = 2;
 
-/// Encode a value as `[WQ_FORMAT_V1][bincode(value)]`.
+/// Encode a value as `[WQ_FORMAT_V2][bincode(value)]`.
 fn encode_versioned<T: Serialize>(
     value: &T,
 ) -> std::result::Result<Vec<u8>, Box<bincode::ErrorKind>> {
     let mut out = Vec::with_capacity(64);
-    out.push(WQ_FORMAT_V1);
+    out.push(WQ_FORMAT_V2);
     bincode::serialize_into(&mut out, value)?;
     Ok(out)
 }
@@ -515,7 +510,9 @@ fn decode_versioned<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
 ) -> std::result::Result<T, Box<bincode::ErrorKind>> {
     match bytes.split_first() {
-        Some((&WQ_FORMAT_V1, rest)) => bincode::deserialize(rest),
+        Some((&version, rest)) if version == WQ_FORMAT_V1 || version == WQ_FORMAT_V2 => {
+            bincode::deserialize(rest)
+        }
         Some((v, _)) => Err(Box::new(bincode::ErrorKind::Custom(format!(
             "unknown V2 worker-queue format version {v}"
         )))),
@@ -552,6 +549,9 @@ pub struct TaskDescriptorV2 {
     pub task_type: TaskType,
     pub priority: u8,
     pub nonce: u64,
+    /// Per-descriptor retry count carried across deterministic descriptor
+    /// reschedules. It is currently used by HNSW merge backoff.
+    pub attempt: u32,
     /// `Some` for exempt task types (command kept inline); `None` for split
     /// types whose payload lives in `_wq_payload_v2_`.
     pub inline: Option<TaskPayloadV2>,
@@ -562,13 +562,45 @@ impl TaskDescriptorV2 {
         encode_versioned(self)
     }
     pub fn decode(bytes: &[u8]) -> std::result::Result<Self, Box<bincode::ErrorKind>> {
-        decode_versioned(bytes)
+        match bytes.split_first() {
+            Some((&WQ_FORMAT_V2, rest)) => bincode::deserialize(rest),
+            Some((&WQ_FORMAT_V1, rest)) => {
+                #[derive(Deserialize)]
+                struct TaskDescriptorV1 {
+                    keyspace: String,
+                    db_id: u64,
+                    task_id: i64,
+                    task_type: TaskType,
+                    priority: u8,
+                    nonce: u64,
+                    inline: Option<TaskPayloadV2>,
+                }
+
+                let old: TaskDescriptorV1 = bincode::deserialize(rest)?;
+                Ok(Self {
+                    keyspace: old.keyspace,
+                    db_id: old.db_id,
+                    task_id: old.task_id,
+                    task_type: old.task_type,
+                    priority: old.priority,
+                    nonce: old.nonce,
+                    attempt: 0,
+                    inline: old.inline,
+                })
+            }
+            Some((v, _)) => Err(Box::new(bincode::ErrorKind::Custom(format!(
+                "unknown V2 worker-queue format version {v}"
+            )))),
+            None => Err(Box::new(bincode::ErrorKind::Custom(
+                "empty V2 worker-queue value".to_string(),
+            ))),
+        }
     }
 
-    /// Split an enqueue request into (descriptor, optional out-of-line payload).
-    /// Split task types return `(descriptor{inline:None}, Some(payload))`;
-    /// exempt types return `(descriptor{inline:Some(..)}, None)`.
-    pub fn split_from_entry(entry: &TaskQueueEntry) -> (Self, Option<TaskPayloadV2>) {
+    pub fn split_from_entry_with_attempt(
+        entry: &TaskQueueEntry,
+        attempt: u32,
+    ) -> (Self, Option<TaskPayloadV2>) {
         let payload = TaskPayloadV2 {
             command: entry.command.clone(),
             username: entry.username.clone(),
@@ -583,6 +615,7 @@ impl TaskDescriptorV2 {
                     task_type: entry.task_type,
                     priority: entry.priority,
                     nonce: entry.nonce,
+                    attempt,
                     inline: None,
                 },
                 Some(payload),
@@ -596,6 +629,7 @@ impl TaskDescriptorV2 {
                     task_type: entry.task_type,
                     priority: entry.priority,
                     nonce: entry.nonce,
+                    attempt,
                     inline: Some(payload),
                 },
                 None,
@@ -654,6 +688,11 @@ impl DueItem {
     pub fn task_type(&self) -> TaskType {
         match self {
             DueItem::V2(d) => d.task_type,
+        }
+    }
+    pub fn attempt(&self) -> u32 {
+        match self {
+            DueItem::V2(d) => d.attempt,
         }
     }
 }
@@ -840,7 +879,7 @@ mod tests {
     #[test]
     fn split_type_moves_command_out_of_descriptor_and_roundtrips() {
         let entry = sample_entry(TaskType::Cron, "SELECT pg_sleep(1)");
-        let (descriptor, payload) = TaskDescriptorV2::split_from_entry(&entry);
+        let (descriptor, payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 0);
         // Command/username/schedule are NOT in the descriptor.
         assert!(descriptor.inline.is_none());
         assert!(descriptor.needs_payload());
@@ -851,6 +890,7 @@ mod tests {
         // Identity + nonce preserved.
         assert_eq!(descriptor.task_id, 42);
         assert_eq!(descriptor.nonce, 99);
+        assert_eq!(descriptor.attempt, 0);
 
         let rebuilt = descriptor.into_entry(Some(payload)).expect("hydrate");
         assert_eq!(rebuilt.command, "SELECT pg_sleep(1)");
@@ -863,7 +903,7 @@ mod tests {
     #[test]
     fn exempt_type_keeps_command_inline_no_payload() {
         let entry = sample_entry(TaskType::HnswMerge, "__hnsw_merge 1 2");
-        let (descriptor, payload) = TaskDescriptorV2::split_from_entry(&entry);
+        let (descriptor, payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 0);
         assert!(payload.is_none(), "exempt type must not produce a payload");
         assert!(!descriptor.needs_payload());
         // Hydrates from inline alone (no external payload).
@@ -873,9 +913,22 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_attempt_roundtrips_without_entering_task_entry() {
+        let entry = sample_entry(TaskType::HnswMerge, "__hnsw_merge 1 2");
+        let (descriptor, payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 3);
+        assert!(payload.is_none());
+        assert_eq!(descriptor.attempt, 3);
+        let bytes = descriptor.encode().unwrap();
+        let decoded = TaskDescriptorV2::decode(&bytes).unwrap();
+        assert_eq!(decoded.attempt, 3);
+        let due = DueItem::V2(decoded);
+        assert_eq!(due.attempt(), 3);
+    }
+
+    #[test]
     fn split_descriptor_without_payload_is_corrupt() {
         let entry = sample_entry(TaskType::BgSql, "SELECT 1");
-        let (descriptor, _payload) = TaskDescriptorV2::split_from_entry(&entry);
+        let (descriptor, _payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 0);
         // A payload-bearing descriptor with no payload supplied is unrecoverable.
         assert!(descriptor.into_entry(None).is_none());
     }
@@ -886,7 +939,7 @@ mod tests {
         // bounded even when the command is huge, so a due scan never bloats.
         let huge = "x".repeat(4 * 1024 * 1024); // 4 MiB command
         let entry = sample_entry(TaskType::Cron, &huge);
-        let (descriptor, _payload) = TaskDescriptorV2::split_from_entry(&entry);
+        let (descriptor, _payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 0);
         let encoded = bincode::serialize(&descriptor).unwrap();
         assert!(
             encoded.len() < 1024,
@@ -898,15 +951,15 @@ mod tests {
     #[test]
     fn versioned_codec_roundtrips_and_rejects_unknown_version() {
         let entry = sample_entry(TaskType::Cron, "SELECT 1");
-        let (descriptor, payload) = TaskDescriptorV2::split_from_entry(&entry);
+        let (descriptor, payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 0);
         let payload = payload.unwrap();
 
         // Version byte is the leading byte; round-trips.
         let d_bytes = descriptor.encode().unwrap();
-        assert_eq!(d_bytes[0], WQ_FORMAT_V1);
+        assert_eq!(d_bytes[0], WQ_FORMAT_V2);
         assert_eq!(TaskDescriptorV2::decode(&d_bytes).unwrap().task_id, 42);
         let p_bytes = payload.encode().unwrap();
-        assert_eq!(p_bytes[0], WQ_FORMAT_V1);
+        assert_eq!(p_bytes[0], WQ_FORMAT_V2);
         assert_eq!(TaskPayloadV2::decode(&p_bytes).unwrap().command, "SELECT 1");
 
         // Unknown version / empty are hard errors (not silent mis-decode).
@@ -914,6 +967,39 @@ mod tests {
         bad[0] = 0xEE;
         assert!(TaskDescriptorV2::decode(&bad).is_err());
         assert!(TaskDescriptorV2::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn descriptor_v1_decode_defaults_attempt_to_zero() {
+        #[derive(Serialize)]
+        struct TaskDescriptorV1 {
+            keyspace: String,
+            db_id: u64,
+            task_id: i64,
+            task_type: TaskType,
+            priority: u8,
+            nonce: u64,
+            inline: Option<TaskPayloadV2>,
+        }
+
+        let entry = sample_entry(TaskType::HnswMerge, "__hnsw_merge 1 2");
+        let (descriptor, _payload) = TaskDescriptorV2::split_from_entry_with_attempt(&entry, 0);
+        let old = TaskDescriptorV1 {
+            keyspace: descriptor.keyspace,
+            db_id: descriptor.db_id,
+            task_id: descriptor.task_id,
+            task_type: descriptor.task_type,
+            priority: descriptor.priority,
+            nonce: descriptor.nonce,
+            inline: descriptor.inline,
+        };
+        let mut bytes = vec![WQ_FORMAT_V1];
+        bincode::serialize_into(&mut bytes, &old).unwrap();
+
+        let decoded = TaskDescriptorV2::decode(&bytes).unwrap();
+        assert_eq!(decoded.task_type, TaskType::HnswMerge);
+        assert_eq!(decoded.attempt, 0);
+        assert_eq!(decoded.inline.unwrap().command, "__hnsw_merge 1 2");
     }
 
     #[test]
@@ -1350,9 +1436,6 @@ mod tests {
                 "{tt:?} must use unconditional delete, not nonce compare-delete"
             );
         }
-
-        assert!(TaskType::HnswMerge.keeps_deterministic_queue_entry_on_failure());
-        assert!(!TaskType::StorageSizeScan.keeps_deterministic_queue_entry_on_failure());
     }
 
     /// New-format entries (with nonce) must also round-trip correctly through

@@ -1413,9 +1413,20 @@ impl TikvStore {
         entry: &TaskQueueEntry,
         fire_time_ms: i64,
     ) -> Result<()> {
+        self.put_task_v2_with_attempt(txn, entry, fire_time_ms, 0)
+            .await
+    }
+
+    async fn put_task_v2_with_attempt(
+        &self,
+        txn: &mut Transaction,
+        entry: &TaskQueueEntry,
+        fire_time_ms: i64,
+        attempt: u32,
+    ) -> Result<()> {
         validate_task_v2_enqueue(entry)?;
         let task_type = entry.task_type.to_bitmask();
-        let (descriptor, payload) = TaskDescriptorV2::split_from_entry(entry);
+        let (descriptor, payload) = TaskDescriptorV2::split_from_entry_with_attempt(entry, attempt);
 
         let due_key = self.key(&encode_wq_due_v2_key(
             entry.priority,
@@ -1454,6 +1465,59 @@ impl TikvStore {
         // Value = priority byte, enough to reconstruct the exact due key.
         txn_put(txn, index_key, vec![entry.priority]).await?;
         Ok(())
+    }
+
+    /// Move a failed HNSW singleton descriptor to a future due key while
+    /// preserving its logical identity and per-index retry count. This is the
+    /// narrow retry-state mechanism for HNSW: dirty markers remain the work
+    /// truth, and the merge meta lock remains the execution guard.
+    pub async fn reschedule_failed_hnsw_merge_task_v2_unless_db_dropped(
+        &self,
+        txn: &mut Transaction,
+        due_key: &[u8],
+        entry: &TaskQueueEntry,
+        old_fire_time_ms: i64,
+        next_fire_time_ms: i64,
+        next_attempt: u32,
+    ) -> Result<bool> {
+        if entry.task_type != TaskType::HnswMerge {
+            return Err(anyhow!(
+                "HNSW retry reschedule requires HnswMerge task, got {:?}",
+                entry.task_type
+            ));
+        }
+
+        let Some(current_bytes) = txn.get(due_key.to_vec()).await? else {
+            return Ok(false);
+        };
+        let current_nonce = TaskDescriptorV2::decode(&current_bytes)
+            .map(|d| d.nonce)
+            .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?;
+        if current_nonce != entry.nonce {
+            return Ok(false);
+        }
+
+        self.delete_task_v2(
+            txn,
+            due_key,
+            &entry.keyspace,
+            entry.db_id,
+            entry.task_type.to_bitmask(),
+            entry.task_id,
+            old_fire_time_ms,
+        )
+        .await?;
+
+        if self
+            .dropped_db_enqueue_fence_exists_for_update(txn, &entry.keyspace, entry.db_id)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        self.put_task_v2_with_attempt(txn, entry, next_fire_time_ms, next_attempt)
+            .await?;
+        Ok(true)
     }
 
     /// Enqueue a deterministic-key task only if no pending/claimed row already
@@ -1802,11 +1866,12 @@ impl TikvStore {
                 // Skip (don't abort) on a single undecodable descriptor: this is
                 // the GLOBAL tick scan, so aborting on one poison row would wedge
                 // the worker for ALL tenants every poll. The undecodable case is
-                // latent today (only this binary writes `_wq_due_v2_`, always
-                // WQ_FORMAT_V1) but would arise if a future binary wrote a newer
-                // descriptor version while an older reader is still in the fleet
-                // during a forward rolling deploy. Hard-error semantics are kept
-                // for the post-claim hydration of the specific entry to execute.
+                // latent today (only this binary writes `_wq_due_v2_` using the
+                // current worker-queue format) but would arise if a future binary
+                // wrote a newer descriptor version while an older reader is still
+                // in the fleet during a forward rolling deploy. Hard-error
+                // semantics are kept for the post-claim hydration of the specific
+                // entry to execute.
                 match TaskDescriptorV2::decode(pair.value()) {
                     Ok(descriptor) => results.push((key.to_vec(), descriptor)),
                     Err(e) => {
@@ -2499,12 +2564,20 @@ impl TikvStore {
         token_id: u16,
     ) -> Result<Option<StorageScanCapacityToken>> {
         let key = self.key(&encode_worker_bg_storage_scan_capacity_key(token_id));
-        let Some(value) = tikv_op!(txn.get_for_update(key).await)? else {
+        let Some(value) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
             return Ok(None);
         };
-        decode_storage_scan_capacity_token_value(&value)
-            .map(Some)
-            .ok_or_else(|| anyhow!("Failed to decode StorageSizeScan capacity token {token_id}"))
+        if let Some(token) = decode_storage_scan_capacity_token_value(&value) {
+            return Ok(Some(token));
+        }
+
+        tracing::warn!(
+            token_id,
+            value_len = value.len(),
+            "deleting malformed StorageSizeScan capacity token so it can be re-derived"
+        );
+        txn_delete(txn, key).await?;
+        Ok(None)
     }
 
     pub async fn put_storage_scan_capacity_token(
@@ -2787,6 +2860,51 @@ mod tests {
 
         let truncated = &encoded[..encoded.len() - 1];
         assert_eq!(decode_storage_scan_capacity_token_value(truncated), None);
+    }
+
+    #[test]
+    fn malformed_storage_scan_capacity_token_is_repairable_projection() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn get_storage_scan_capacity_token_for_update(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub async fn put_storage_scan_capacity_token")
+                    .next()
+            })
+            .expect("get_storage_scan_capacity_token_for_update must exist before put helper");
+
+        assert!(
+            helper.contains("decode_storage_scan_capacity_token_value(&value)")
+                && helper.contains("txn_delete(txn, key).await?")
+                && helper.contains("Ok(None)")
+                && !helper.contains("Failed to decode StorageSizeScan capacity token"),
+            "malformed StorageScan capacity tokens must be deleted and re-derived, not wedge capacity"
+        );
+    }
+
+    #[test]
+    fn hnsw_retry_reschedule_is_nonce_cas_protected() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn reschedule_failed_hnsw_merge_task_v2_unless_db_dropped(")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Enqueue a deterministic-key task").next())
+            .expect("HNSW retry reschedule helper must exist before singleton enqueue");
+        let nonce_check = helper
+            .find("current_nonce != entry.nonce")
+            .expect("HNSW retry reschedule must compare the current descriptor nonce");
+        let delete = helper
+            .find("self.delete_task_v2(")
+            .expect("HNSW retry reschedule must delete the processed descriptor");
+        let put = helper
+            .find("self.put_task_v2_with_attempt")
+            .expect("HNSW retry reschedule must write the future retry descriptor");
+
+        assert!(
+            nonce_check < delete && delete < put,
+            "HNSW retry reschedule must read-compare before deleting/replacing the due row"
+        );
     }
 
     #[test]
@@ -3507,6 +3625,126 @@ mod tests {
         let mut txn = store.begin().await.unwrap();
         store
             .delete_task_all_layers(&mut txn, &ks, db_id, 7, TaskType::Cron)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn failed_hnsw_merge_reschedule_moves_due_row_and_increments_attempt() {
+        let store = v2_test_store().await;
+        let ks = unique_ks("hnsw_retry");
+        let db_id = 1u64;
+        let mut entry = TaskQueueEntry::new(
+            ks.clone(),
+            db_id,
+            42,
+            TaskType::HnswMerge,
+            "__hnsw_merge 1 2".to_string(),
+            "system".to_string(),
+            192,
+        );
+        entry.nonce = 7;
+        let old_fire = 1_000i64;
+        let next_fire = 91_000i64;
+
+        let old_key = {
+            let mut txn = store.begin().await.unwrap();
+            store.put_task_v2(&mut txn, &entry, old_fire).await.unwrap();
+            txn.commit().await.unwrap();
+
+            let mut txn = store.begin().await.unwrap();
+            let due = store.scan_due_v2(&mut txn, old_fire, 1000).await.unwrap();
+            let (key, descriptor) = due
+                .into_iter()
+                .find(|(_, d)| d.keyspace == ks && d.task_id == entry.task_id)
+                .expect("old HNSW descriptor must be due");
+            assert_eq!(descriptor.attempt, 0);
+            txn.rollback().await.ok();
+            key
+        };
+
+        let mut overwritten = entry.clone();
+        overwritten.nonce = 8;
+        let mut txn = store.begin().await.unwrap();
+        store
+            .put_task_v2(&mut txn, &overwritten, old_fire)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().await.unwrap();
+        assert!(!store
+            .reschedule_failed_hnsw_merge_task_v2_unless_db_dropped(
+                &mut txn, &old_key, &entry, old_fire, next_fire, 1,
+            )
+            .await
+            .unwrap());
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().await.unwrap();
+        let still_due = store.scan_due_v2(&mut txn, old_fire, 1000).await.unwrap();
+        let (_key, descriptor) = still_due
+            .iter()
+            .find(|(_, d)| d.keyspace == ks && d.task_id == entry.task_id)
+            .expect("overwritten HNSW descriptor must survive stale reschedule");
+        assert_eq!(descriptor.nonce, overwritten.nonce);
+        assert_eq!(descriptor.attempt, 0);
+        txn.rollback().await.ok();
+
+        let mut txn = store.begin().await.unwrap();
+        assert!(store
+            .reschedule_failed_hnsw_merge_task_v2_unless_db_dropped(
+                &mut txn,
+                &old_key,
+                &overwritten,
+                old_fire,
+                next_fire,
+                1,
+            )
+            .await
+            .unwrap());
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().await.unwrap();
+        let old_due = store.scan_due_v2(&mut txn, old_fire, 1000).await.unwrap();
+        assert!(
+            !old_due
+                .iter()
+                .any(|(_, d)| d.keyspace == ks && d.task_id == overwritten.task_id),
+            "failed HNSW merge must not remain immediately due"
+        );
+        let future_due = store.scan_due_v2(&mut txn, next_fire, 1000).await.unwrap();
+        let (_key, descriptor) = future_due
+            .iter()
+            .find(|(_, d)| d.keyspace == ks && d.task_id == overwritten.task_id)
+            .expect("future HNSW retry descriptor must exist");
+        assert_eq!(descriptor.attempt, 1);
+        assert_eq!(descriptor.nonce, overwritten.nonce);
+        let rows = store
+            .index_rows_for_task(
+                &mut txn,
+                &ks,
+                db_id,
+                overwritten.task_id,
+                TaskType::HnswMerge,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fire_time_ms, next_fire);
+        txn.rollback().await.ok();
+
+        let mut txn = store.begin().await.unwrap();
+        store
+            .delete_task_all_layers(
+                &mut txn,
+                &ks,
+                db_id,
+                overwritten.task_id,
+                TaskType::HnswMerge,
+            )
             .await
             .unwrap();
         txn.commit().await.unwrap();
