@@ -1440,6 +1440,20 @@ fn storage_scan_periodic_enqueue_is_singleton_but_manual_nudge_is_marked_immedia
             && enqueue_at.contains(".enqueue_task_v2_unless_db_dropped("),
         "storage scan enqueue must keep periodic singleton semantics while coalescing marked manual nudges"
     );
+    assert_eq!(
+        STORAGE_SCAN_PERIODIC_PRIORITY, 200,
+        "periodic StorageSizeScan remains low-priority background housekeeping"
+    );
+    assert!(
+        STORAGE_SCAN_REFRESH_NUDGE_PRIORITY < 128,
+        "manual refresh nudges must dispatch ahead of cron backlog"
+    );
+    assert!(
+        enqueue_at.contains("StorageScanQueueMode::Singleton => STORAGE_SCAN_PERIODIC_PRIORITY")
+            && enqueue_at
+                .contains("StorageScanQueueMode::RefreshNudge => STORAGE_SCAN_REFRESH_NUDGE_PRIORITY"),
+        "StorageSizeScan enqueue must assign separate priorities for periodic rows and manual refresh nudges"
+    );
     let coalesce = enqueue_at
         .find("delete_storage_scan_refresh_nudges")
         .expect("refresh nudge enqueue must delete older refresh nudges");
