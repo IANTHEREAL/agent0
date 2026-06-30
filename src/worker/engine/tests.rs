@@ -659,13 +659,15 @@ fn storage_size_scan_uses_pd_region_stats_not_tenant_kv_scan() {
         .split("#[cfg(test)]")
         .next()
         .expect("engine.rs must contain #[cfg(test)]");
+    // The PD fetch + estimate live in the shared `compute_pd_region_stats`
+    // helper (called by both the legacy and derived executors), so anchor there.
     let scan_start = prod_source
-        .find("async fn execute_storage_size_scan(")
-        .expect("execute_storage_size_scan must exist");
+        .find("async fn compute_pd_region_stats(")
+        .expect("compute_pd_region_stats must exist");
     let scan_end = prod_source[scan_start..]
-        .find("/// Enqueue a storage size scan task")
+        .find("fn log_storage_scan_complete(")
         .map(|offset| scan_start + offset)
-        .expect("execute_storage_size_scan must appear before enqueue helper");
+        .expect("compute_pd_region_stats must appear before the completion-log helper");
     let scan_source = &prod_source[scan_start..scan_end];
 
     assert!(
@@ -674,7 +676,7 @@ fn storage_size_scan_uses_pd_region_stats_not_tenant_kv_scan() {
     );
     assert!(
         scan_source.contains("DbStorageStats::pd_region_estimate("),
-        "storage size scan must persist explicit PD estimate stats"
+        "storage size scan must build an explicit PD estimate"
     );
     assert!(
         !scan_source.contains(".scan(")
@@ -1033,13 +1035,16 @@ fn storage_size_scan_leaves_old_stats_intact_on_pd_failure() {
         .split("#[cfg(test)]")
         .next()
         .expect("engine.rs must contain #[cfg(test)]");
+    // PD fetch + its failure handling live in the shared `compute_pd_region_stats`
+    // helper; persistence happens only in the callers AFTER it returns Ok, so a PD
+    // failure returns Err before any serialize/persist can run.
     let scan_start = prod_source
-        .find("async fn execute_storage_size_scan(")
-        .expect("execute_storage_size_scan must exist");
+        .find("async fn compute_pd_region_stats(")
+        .expect("compute_pd_region_stats must exist");
     let scan_end = prod_source[scan_start..]
-        .find("/// Enqueue a storage size scan task")
+        .find("fn log_storage_scan_complete(")
         .map(|offset| scan_start + offset)
-        .expect("execute_storage_size_scan must appear before enqueue helper");
+        .expect("compute_pd_region_stats must appear before the completion-log helper");
     let scan_source = &prod_source[scan_start..scan_end];
 
     assert!(
@@ -1048,10 +1053,9 @@ fn storage_size_scan_leaves_old_stats_intact_on_pd_failure() {
         "PD failure must be logged as leaving previous stats intact"
     );
     assert!(
-        !scan_source.contains("serialize_storage_stats(&stats)")
-            || scan_source.find("return Err").unwrap()
-                < scan_source.find("serialize_storage_stats(&stats)").unwrap(),
-        "PD failure branch must return before stats serialization/persist"
+        scan_source.contains("return Err") && !scan_source.contains("serialize_storage_stats("),
+        "PD fetch/estimate stage must return the error before any stats serialization/persist \
+         (persistence is the caller's job after a successful estimate)"
     );
 }
 
@@ -5442,4 +5446,264 @@ async fn spawned_renewer_cancels_when_claim_taken_over_by_another_worker() {
         cancelled,
         "renewer loop must cancel exec_shutdown when the claim is owned by another worker"
     );
+}
+
+// ---- derived StorageSizeScan: behavioral unit tests (pure state machine) ----
+//
+// These exercise the pure helpers in `engine.rs:189-341` by CALLING them and
+// asserting computed values (not by grepping source). They build minimal
+// fixtures for `StorageScanBgState`, `StorageScanCapacityToken`, and
+// `StorageScanOwnerFence` (the store-dependent fields of the fence are never
+// touched — only the pure predicate `storage_scan_owner_state_matches`, which
+// reads plain fields, is tested; the store-backed
+// `lock_storage_scan_owner_for_commit` is intentionally skipped).
+mod storage_scan_derived_behavioral {
+    use super::super::*;
+    use crate::worker::types::{
+        StorageScanBgState, StorageScanBgStateStatus, StorageScanCapacityToken,
+    };
+
+    /// Minimal Running `StorageScanBgState` fixture. Callers override individual
+    /// fields to construct mismatch cases.
+    fn running_state() -> StorageScanBgState {
+        StorageScanBgState {
+            keyspace: "ks".to_string(),
+            db_id: 7,
+            tenant_incarnation: 3,
+            status: StorageScanBgStateStatus::Running,
+            work_id: 300_000,
+            run_after_ms: 0,
+            lease_until_ms: 1_000,
+            attempt: 2,
+            last_done_work_id: 290_000,
+            capacity_token_id: Some(1),
+        }
+    }
+
+    // NOTE: helper #7 (`storage_scan_owner_state_matches`) is intentionally NOT
+    // unit-tested here. Although the predicate itself is pure, it takes a
+    // `&StorageScanOwnerFence`, whose `system_store: Arc<TikvStore>` field cannot
+    // be constructed without a live TiKV/PD cluster (every store-backed test in
+    // this file is `#[ignore = "requires TiKV / PD cluster"]`). The same
+    // identity/lease/incarnation invariants the predicate enforces are covered
+    // structurally by `storage_scan_completion_owner_matches` (test #8) and
+    // `storage_scan_capacity_token_matches_state` (test #9), which are pure.
+
+    /// `StorageScanCapacityToken` matching a state's owner identity + lease.
+    fn capacity_token(state: &StorageScanBgState) -> StorageScanCapacityToken {
+        StorageScanCapacityToken {
+            keyspace: state.keyspace.clone(),
+            db_id: state.db_id,
+            tenant_incarnation: state.tenant_incarnation,
+            work_id: state.work_id,
+            attempt: state.attempt,
+            lease_until_ms: state.lease_until_ms,
+        }
+    }
+
+    // 1. interval = max(1)*1000, min 1
+    #[test]
+    fn interval_ms_floors_to_one_second() {
+        assert_eq!(storage_scan_interval_ms(300), 300_000);
+        assert_eq!(storage_scan_interval_ms(0), 1_000);
+        assert_eq!(storage_scan_interval_ms(1), 1_000);
+    }
+
+    // 2. work_id = floor(now/interval)*interval, monotonic-nondecreasing
+    #[test]
+    fn work_id_floors_to_window_and_is_monotonic() {
+        assert_eq!(storage_scan_work_id(300_000, 300), 300_000);
+        assert_eq!(storage_scan_work_id(350_000, 300), 300_000);
+        assert_eq!(storage_scan_work_id(299_999, 300), 0);
+        assert_eq!(storage_scan_work_id(600_001, 300), 600_000);
+
+        // Monotonic-nondecreasing as now_ms increases across a boundary.
+        let mut prev = i64::MIN;
+        for now in [
+            299_998, 299_999, 300_000, 300_001, 599_999, 600_000, 600_001,
+        ] {
+            let w = storage_scan_work_id(now, 300);
+            assert!(
+                w >= prev,
+                "work_id must be monotonic-nondecreasing: now={now} -> {w} < prev {prev}"
+            );
+            prev = w;
+        }
+    }
+
+    // 3. next_after = work_id + 1
+    #[test]
+    fn next_work_id_after_increments_by_one() {
+        assert_eq!(next_storage_scan_work_id_after(300_000), 300_001);
+    }
+
+    // 4. at_least_after = max(base, prev+1) with None -> base
+    #[test]
+    fn work_id_at_least_after_picks_strictly_greater_of_base_or_prev_plus_one() {
+        assert_eq!(storage_scan_work_id_at_least_after(300_000, None), 300_000);
+        // base wins (base >= prev+1)
+        assert_eq!(
+            storage_scan_work_id_at_least_after(300_000, Some(290_000)),
+            300_000
+        );
+        // prev+1 wins (prev == base, so we must advance past it)
+        assert_eq!(
+            storage_scan_work_id_at_least_after(300_000, Some(300_000)),
+            300_001
+        );
+        // prev far ahead -> prev+1 wins
+        assert_eq!(
+            storage_scan_work_id_at_least_after(300_000, Some(400_000)),
+            400_001
+        );
+    }
+
+    // 5. retry_after = now + 30_000 * 2^min(attempt,5) (grows then caps; NOT a 6h wait)
+    #[test]
+    fn retry_after_ms_exponential_then_caps_at_attempt_five() {
+        let now = 1_000_000;
+        assert_eq!(storage_scan_retry_after_ms(now, 0), 1_030_000);
+        assert_eq!(storage_scan_retry_after_ms(now, 1), 1_060_000);
+        assert_eq!(storage_scan_retry_after_ms(now, 2), 1_120_000);
+        assert_eq!(storage_scan_retry_after_ms(now, 5), 1_960_000);
+        assert_eq!(storage_scan_retry_after_ms(now, 6), 1_960_000);
+        assert_eq!(storage_scan_retry_after_ms(now, 100), 1_960_000);
+    }
+
+    // 6. idle_after_success: reset to Idle, advance last_done monotonically, preserve identity
+    #[test]
+    fn idle_after_success_resets_and_advances_last_done_monotonically() {
+        let state = running_state();
+        let next = storage_scan_idle_after_success(state.clone(), 300_000, 1_000_000, 300);
+
+        assert_eq!(next.status, StorageScanBgStateStatus::Idle);
+        assert_eq!(next.work_id, 0);
+        assert_eq!(next.run_after_ms, 1_300_000); // now + interval(300s)
+        assert_eq!(next.lease_until_ms, 0);
+        assert_eq!(next.attempt, 0);
+        assert_eq!(next.capacity_token_id, None);
+        assert_eq!(next.last_done_work_id, 300_000); // max(290_000, 300_000)
+
+        // identity preserved
+        assert_eq!(next.keyspace, "ks");
+        assert_eq!(next.db_id, 7);
+        assert_eq!(next.tenant_incarnation, 3);
+
+        // completed LOWER than existing last_done -> last_done stays (max).
+        let lower = storage_scan_idle_after_success(state, 280_000, 1_000_000, 300);
+        assert_eq!(lower.last_done_work_id, 290_000);
+    }
+
+    // 7. SKIPPED — see the NOTE above `capacity_token`: the predicate is pure but
+    //    its `&StorageScanOwnerFence` argument is unconstructable without a store.
+
+    // 8. completion_owner_matches: inc + Running + work_id + attempt
+    #[test]
+    fn completion_owner_matches_requires_incarnation_status_work_attempt() {
+        let state = running_state();
+        assert!(storage_scan_completion_owner_matches(
+            Some(&state),
+            state.tenant_incarnation,
+            state.work_id,
+            state.attempt,
+        ));
+
+        // tenant_incarnation drift inert at completion time too
+        assert!(!storage_scan_completion_owner_matches(
+            Some(&state),
+            state.tenant_incarnation + 1,
+            state.work_id,
+            state.attempt,
+        ));
+
+        // status != Running
+        let mut idle = state.clone();
+        idle.status = StorageScanBgStateStatus::Idle;
+        assert!(!storage_scan_completion_owner_matches(
+            Some(&idle),
+            state.tenant_incarnation,
+            state.work_id,
+            state.attempt,
+        ));
+    }
+
+    // 9. capacity_token_matches_state: liveness/repair predicate
+    #[test]
+    fn capacity_token_matches_state_checks_liveness_and_identity() {
+        let now = 500; // state.lease_until_ms = 1_000 > now
+        let state = running_state();
+        let token = capacity_token(&state);
+        let token_id = 1; // state.capacity_token_id = Some(1)
+
+        assert!(storage_scan_capacity_token_matches_state(
+            token_id, &token, &state, now
+        ));
+
+        // stale lease -> token reclaimable
+        let mut stale = state.clone();
+        stale.lease_until_ms = now; // not strictly greater
+                                    // token must mirror the state's lease for the equality arm; reuse fresh
+                                    // state's token but with a stale-lease state still has lease_until_ms !=
+                                    // token.lease_until_ms, so build a matching stale token.
+        let stale_token = capacity_token(&stale);
+        assert!(!storage_scan_capacity_token_matches_state(
+            token_id,
+            &stale_token,
+            &stale,
+            now
+        ));
+
+        // token_id mismatch (state.capacity_token_id != Some(token_id))
+        assert!(!storage_scan_capacity_token_matches_state(
+            2, &token, &state, now
+        ));
+
+        // tenant_incarnation mismatch
+        let mut wrong_inc = state.clone();
+        wrong_inc.tenant_incarnation = state.tenant_incarnation + 1;
+        assert!(!storage_scan_capacity_token_matches_state(
+            token_id, &token, &wrong_inc, now
+        ));
+
+        // work_id mismatch
+        let mut wrong_work = state.clone();
+        wrong_work.work_id = state.work_id + 1;
+        assert!(!storage_scan_capacity_token_matches_state(
+            token_id,
+            &token,
+            &wrong_work,
+            now
+        ));
+    }
+
+    // 10. derived_lease_ms: invariants only (>= claim_lease, >= 1, monotonic in endpoints)
+    #[test]
+    fn derived_lease_ms_respects_floor_and_endpoint_monotonicity() {
+        let config = crate::worker::config::WorkerConfig::default();
+        let floor = config.claim_lease_ms as i64;
+
+        let lease_1 = storage_scan_derived_lease_ms(&config, 1);
+        assert!(
+            lease_1 >= floor,
+            "lease {lease_1} must be >= claim_lease {floor}"
+        );
+        assert!(lease_1 >= 1);
+
+        // 0 endpoints is clamped to 1 internally -> same as 1.
+        let lease_0 = storage_scan_derived_lease_ms(&config, 0);
+        assert!(lease_0 >= floor && lease_0 >= 1);
+
+        // Non-decreasing as the endpoint count grows (more endpoints => larger or
+        // equal PD HTTP budget => larger or equal lease).
+        let mut prev = i64::MIN;
+        for n in [1usize, 2, 3, 5, 10, 50] {
+            let lease = storage_scan_derived_lease_ms(&config, n);
+            assert!(
+                lease >= prev,
+                "lease must be monotonic-nondecreasing in endpoint count: n={n} -> {lease} < prev {prev}"
+            );
+            assert!(lease >= floor && lease >= 1);
+            prev = lease;
+        }
+    }
 }

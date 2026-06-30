@@ -1054,7 +1054,6 @@ impl WorkerEngine {
         store: &Arc<TikvStore>,
         keyspace: &str,
         db_id: u64,
-        force: bool,
     ) -> Result<bool> {
         let lifecycle_store = crate::worker::db_lifecycle_store()?.clone();
         let Some(tenant_incarnation) = crate::worker::lifecycle::ensure_tenant_lifecycle_identity(
@@ -1075,7 +1074,7 @@ impl WorkerEngine {
             storage_scan_work_id(now_ms, self.config.storage_scan_interval_sec),
             applied_work_id,
         );
-        let stats_due = force || self.storage_scan_due(store, db_id).await?;
+        let stats_due = self.storage_scan_due(store, db_id).await?;
         let claim = self
             .claim_storage_scan_derived_run(
                 keyspace,
@@ -1570,13 +1569,8 @@ impl WorkerEngine {
         {
             let result = async {
                 if self.config.storage_scan_derived_active {
-                    self.run_storage_scan_derived_if_due(
-                        store,
-                        &entry.keyspace,
-                        entry.db_id,
-                        false,
-                    )
-                    .await?;
+                    self.run_storage_scan_derived_if_due(store, &entry.keyspace, entry.db_id)
+                        .await?;
                     return Ok::<(), anyhow::Error>(());
                 }
 
@@ -4049,24 +4043,32 @@ where
     }
 }
 
-/// Execute a storage size scan for a single database.
+/// The PD Region storage estimate produced by the shared pre-persist block that
+/// both `execute_storage_size_scan` and `execute_storage_size_scan_derived` run
+/// before they diverge into their (different) persist/validation paths.
+struct StorageScanComputed {
+    pd: crate::worker::pd_region_stats::DatabasePdRegionStats,
+    stats: crate::storage_stats::DbStorageStats,
+    /// Wall-clock at the moment the estimate was computed; the derived path
+    /// stamps this into the applied marker as `applied_at_ms`.
+    scanned_at_ms: i64,
+    scan_duration_ms: i64,
+}
+
+/// Rate-limit, fetch PD Region stats, and build the storage estimate.
 ///
-/// Uses PD Region stats over DB9's encoded database key range. PD returns a
-/// whole-Region physical/MVCC estimate in MiB; this path intentionally does not
-/// provide exact data/index/table breakdowns and does not fall back to a tenant
-/// KV scan on PD failure.
-async fn execute_storage_size_scan(
-    store: &Arc<TikvStore>,
+/// This is the verbatim pre-persist block shared by both storage-scan executors:
+/// the PD rate-limit wait, the region-stats fetch (with its err counter/warn/
+/// context), the `pd_region_estimate` build, and the lease-loss fence. It is the
+/// only place the two executors agree, so it lives here once. The persist and
+/// validation steps differ between the two and stay in the callers.
+async fn compute_pd_region_stats(
     keyspace: &str,
     db_id: u64,
     pd_endpoints: &[String],
     pd_rate_limit_ms: u64,
     lease_cancel: &crate::worker::LeaseCancel,
-) -> Result<()> {
-    use crate::storage_stats::{
-        global_storage_stats_cache, serialize_storage_stats, DbStorageStats,
-    };
-
+) -> Result<StorageScanComputed> {
     let scan_start = std::time::Instant::now();
     crate::worker::pd_region_stats::enforce_pd_stats_rate_limit(pd_rate_limit_ms).await;
     let pd = match crate::worker::pd_region_stats::fetch_database_region_stats(
@@ -4096,7 +4098,7 @@ async fn execute_storage_size_scan(
     let scan_duration_ms = scan_start.elapsed().as_millis() as i64;
     let scanned_at_ms = now_epoch_ms();
 
-    let stats = DbStorageStats::pd_region_estimate(
+    let stats = crate::storage_stats::DbStorageStats::pd_region_estimate(
         db_id,
         pd.stats.total_bytes_estimate(),
         pd.stats.count,
@@ -4111,6 +4113,66 @@ async fn execute_storage_size_scan(
     // the stats persist so the new owner can re-run it. Returning here leaves the
     // task for the new owner exactly as the generic run_with_guards path bails.
     lease_cancel.bail_if_cancelled()?;
+
+    Ok(StorageScanComputed {
+        pd,
+        stats,
+        scanned_at_ms,
+        scan_duration_ms,
+    })
+}
+
+/// The identical completion `info!` both storage-scan executors emit once the
+/// stats have been persisted.
+fn log_storage_scan_complete(
+    keyspace: &str,
+    db_id: u64,
+    pd: &crate::worker::pd_region_stats::DatabasePdRegionStats,
+    scan_duration_ms: i64,
+) {
+    info!(
+        db_id,
+        keyspace,
+        keyspace_id = pd.keyspace_id,
+        region_count = pd.stats.count,
+        empty_region_count = pd.stats.empty_count,
+        storage_size_mib = pd.stats.storage_size_mib,
+        storage_keys = pd.stats.storage_keys,
+        total_bytes_estimate = pd.stats.total_bytes_estimate(),
+        scan_duration_ms,
+        "Storage size PD Region estimate complete"
+    );
+}
+
+/// Execute a storage size scan for a single database.
+///
+/// Uses PD Region stats over DB9's encoded database key range. PD returns a
+/// whole-Region physical/MVCC estimate in MiB; this path intentionally does not
+/// provide exact data/index/table breakdowns and does not fall back to a tenant
+/// KV scan on PD failure.
+async fn execute_storage_size_scan(
+    store: &Arc<TikvStore>,
+    keyspace: &str,
+    db_id: u64,
+    pd_endpoints: &[String],
+    pd_rate_limit_ms: u64,
+    lease_cancel: &crate::worker::LeaseCancel,
+) -> Result<()> {
+    use crate::storage_stats::{global_storage_stats_cache, serialize_storage_stats};
+
+    let StorageScanComputed {
+        pd,
+        stats,
+        scanned_at_ms: _,
+        scan_duration_ms,
+    } = compute_pd_region_stats(
+        keyspace,
+        db_id,
+        pd_endpoints,
+        pd_rate_limit_ms,
+        lease_cancel,
+    )
+    .await?;
 
     let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
     let stats_value = serialize_storage_stats(&stats);
@@ -4128,18 +4190,7 @@ async fn execute_storage_size_scan(
     )
     .increment(1);
 
-    info!(
-        db_id,
-        keyspace,
-        keyspace_id = pd.keyspace_id,
-        region_count = pd.stats.count,
-        empty_region_count = pd.stats.empty_count,
-        storage_size_mib = pd.stats.storage_size_mib,
-        storage_keys = pd.stats.storage_keys,
-        total_bytes_estimate = pd.stats.total_bytes_estimate(),
-        scan_duration_ms,
-        "Storage size PD Region estimate complete"
-    );
+    log_storage_scan_complete(keyspace, db_id, &pd, scan_duration_ms);
 
     Ok(())
 }
@@ -4218,9 +4269,7 @@ async fn execute_storage_size_scan_derived(
     lease_cancel: &crate::worker::LeaseCancel,
     owner_fence: Option<&StorageScanOwnerFence>,
 ) -> Result<StorageScanEffectOutcome> {
-    use crate::storage_stats::{
-        global_storage_stats_cache, serialize_storage_stats, DbStorageStats,
-    };
+    use crate::storage_stats::{global_storage_stats_cache, serialize_storage_stats};
 
     {
         let mut precheck_txn = store.begin().await?;
@@ -4255,46 +4304,19 @@ async fn execute_storage_size_scan_derived(
         precheck_txn.rollback().await.ok();
     }
 
-    let scan_start = std::time::Instant::now();
-    crate::worker::pd_region_stats::enforce_pd_stats_rate_limit(pd_rate_limit_ms).await;
-    let pd = match crate::worker::pd_region_stats::fetch_database_region_stats(
-        pd_endpoints,
-        keyspace,
-        db_id,
-    )
-    .await
-    {
-        Ok(pd) => pd,
-        Err(e) => {
-            metrics::counter!(
-                "db9_server_worker_storage_pd_region_stats_total",
-                "result" => "err",
-            )
-            .increment(1);
-            warn!(
-                keyspace,
-                db_id,
-                "PD Region storage stats failed; leaving previous storage stats intact: {}",
-                e
-            );
-            return Err(e.context("PD Region storage stats failed"));
-        }
-    };
-
-    let scan_duration_ms = scan_start.elapsed().as_millis() as i64;
-    let scanned_at_ms = now_epoch_ms();
-
-    let stats = DbStorageStats::pd_region_estimate(
-        db_id,
-        pd.stats.total_bytes_estimate(),
-        pd.stats.count,
-        pd.stats.empty_count,
-        pd.stats.storage_keys,
+    let StorageScanComputed {
+        pd,
+        stats,
         scanned_at_ms,
         scan_duration_ms,
-    );
-
-    lease_cancel.bail_if_cancelled()?;
+    } = compute_pd_region_stats(
+        keyspace,
+        db_id,
+        pd_endpoints,
+        pd_rate_limit_ms,
+        lease_cancel,
+    )
+    .await?;
 
     let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
     let stats_value = serialize_storage_stats(&stats);
@@ -4363,18 +4385,7 @@ async fn execute_storage_size_scan_derived(
     )
     .increment(1);
 
-    info!(
-        db_id,
-        keyspace,
-        keyspace_id = pd.keyspace_id,
-        region_count = pd.stats.count,
-        empty_region_count = pd.stats.empty_count,
-        storage_size_mib = pd.stats.storage_size_mib,
-        storage_keys = pd.stats.storage_keys,
-        total_bytes_estimate = pd.stats.total_bytes_estimate(),
-        scan_duration_ms,
-        "Storage size PD Region estimate complete"
-    );
+    log_storage_scan_complete(keyspace, db_id, &pd, scan_duration_ms);
 
     Ok(StorageScanEffectOutcome::Applied)
 }
