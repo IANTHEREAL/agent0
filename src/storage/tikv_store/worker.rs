@@ -2480,18 +2480,21 @@ impl TikvStore {
         db_id: u64,
     ) -> Result<Option<StorageScanBgState>> {
         let key = self.key(&encode_worker_bg_storage_scan_state_key(keyspace, db_id));
-        let Some(value) = tikv_op!(txn.get_for_update(key).await)? else {
+        let Some(value) = tikv_op!(txn.get_for_update(key.clone()).await)? else {
             return Ok(None);
         };
-        decode_storage_scan_bg_state_value(keyspace, db_id, &value)
-            .map(Some)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Failed to decode StorageSizeScan bg state for keyspace='{}' db_id={}",
-                    keyspace,
-                    db_id
-                )
-            })
+        if let Some(state) = decode_storage_scan_bg_state_value(keyspace, db_id, &value) {
+            return Ok(Some(state));
+        }
+
+        tracing::warn!(
+            keyspace,
+            db_id,
+            value_len = value.len(),
+            "deleting malformed StorageSizeScan bg state so it can be re-derived"
+        );
+        txn_delete(txn, key).await?;
+        Ok(None)
     }
 
     pub async fn put_storage_scan_bg_state(
@@ -2773,6 +2776,23 @@ mod tests {
         assert_eq!(
             decode_storage_scan_bg_state_value("ks", 7, &bad_status),
             None
+        );
+    }
+
+    #[test]
+    fn malformed_storage_scan_bg_state_is_repairable_projection() {
+        let source = include_str!("worker.rs");
+        let helper = source
+            .split("pub async fn get_storage_scan_bg_state_for_update(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn put_storage_scan_bg_state").next())
+            .expect("get_storage_scan_bg_state_for_update must exist before put helper");
+
+        assert!(
+            helper.contains("decode_storage_scan_bg_state_value(keyspace, db_id, &value)")
+                && helper.contains("txn_delete(txn, key).await?")
+                && helper.contains("Ok(None)"),
+            "malformed derived StorageScan state must be deleted and re-derived, not returned as a hard scheduler error"
         );
     }
 

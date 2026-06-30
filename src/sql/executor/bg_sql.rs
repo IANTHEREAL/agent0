@@ -33,7 +33,7 @@ pub(crate) fn try_execute_bg_sql_function(
 }
 
 pub(crate) async fn execute_bg_sql_function(
-    _store: &Arc<TikvStore>,
+    store: &Arc<TikvStore>,
     _txn: &mut Transaction,
     db_id: u64,
     current_user: &str,
@@ -48,7 +48,7 @@ pub(crate) async fn execute_bg_sql_function(
         }
         "PG_BACKGROUND_RESULT" => Some(execute_bg_result(keyspace, db_id, args).await),
         "DB9_REFRESH_STORAGE_STATS" => {
-            Some(execute_refresh_storage_stats(db_id, current_user, keyspace).await)
+            Some(execute_refresh_storage_stats(Some(store), db_id, current_user, keyspace).await)
         }
         _ => None,
     }
@@ -114,6 +114,7 @@ async fn execute_bg_launch(
 }
 
 async fn execute_refresh_storage_stats(
+    store: Option<&Arc<TikvStore>>,
     db_id: u64,
     current_user: &str,
     keyspace: &str,
@@ -132,7 +133,19 @@ async fn execute_refresh_storage_stats(
     let system_store = get_system_store()
         .ok_or_else(|| anyhow!("db9_refresh_storage_stats: worker system store not available"))?;
 
-    crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
+    if crate::worker::config::WorkerConfig::from_env().storage_scan_derived_active {
+        let store = store
+            .ok_or_else(|| anyhow!("db9_refresh_storage_stats: tenant store not available"))?;
+        crate::worker::engine::request_storage_scan_refresh(
+            system_store,
+            store.as_ref(),
+            keyspace,
+            db_id,
+        )
+        .await?;
+    } else {
+        crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
+    }
 
     Ok(Value::Text("storage scan enqueued".to_string()))
 }
@@ -269,7 +282,7 @@ mod tests {
     /// confirming the CAS allocator is the sole task_id source.
     #[tokio::test]
     async fn execute_refresh_storage_stats_requires_superuser() {
-        let err = execute_refresh_storage_stats(1, "regular_user", "ks")
+        let err = execute_refresh_storage_stats(None, 1, "regular_user", "ks")
             .await
             .unwrap_err()
             .to_string();
@@ -278,11 +291,36 @@ mod tests {
 
     #[tokio::test]
     async fn execute_refresh_storage_stats_requires_worker_engine() {
-        let err = execute_refresh_storage_stats(1, "admin", "ks")
+        let err = execute_refresh_storage_stats(None, 1, "admin", "ks")
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("worker engine not available"));
+    }
+
+    #[test]
+    fn refresh_storage_stats_requests_derived_state_when_active() {
+        let source = include_str!("bg_sql.rs");
+        let refresh = source
+            .split("async fn execute_refresh_storage_stats(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn execute_bg_result").next())
+            .expect("execute_refresh_storage_stats must exist before execute_bg_result");
+
+        let active = refresh
+            .find("WorkerConfig::from_env().storage_scan_derived_active")
+            .expect("refresh must check derived StorageScan active flag");
+        let derived = refresh
+            .find("request_storage_scan_refresh")
+            .expect("active refresh must write derived StorageScan state directly");
+        let legacy = refresh
+            .find("enqueue_storage_scan")
+            .expect("inactive refresh must keep legacy V2 enqueue fallback");
+
+        assert!(
+            active < derived && derived < legacy,
+            "manual refresh must not enqueue legacy V2 before requesting derived state"
+        );
     }
 
     #[tokio::test]
