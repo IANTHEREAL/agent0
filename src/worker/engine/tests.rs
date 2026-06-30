@@ -717,6 +717,316 @@ fn storage_scan_sweep_uses_interval_due_with_jitter_not_dirty_marker() {
 }
 
 #[test]
+fn storage_scan_failure_backoff_is_recovery_not_refresh_cadence() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let backoff = prod_source
+        .split("fn registry_sweep_kind_backoff_interval")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn registry_sweep_db_missing_should_delete")
+                .next()
+        })
+        .expect("registry_sweep_kind_backoff_interval must exist before DB-missing helper");
+
+    assert!(
+        backoff.contains("RegistrySweepKind::StorageScan => REGISTRY_SWEEP_RECOVERY_BACKOFF_SEC"),
+        "StorageScan failure backoff must be a recovery retry, not the normal refresh cadence"
+    );
+    assert!(
+        !backoff.contains("RegistrySweepKind::StorageScan => self.config.storage_scan_interval_sec"),
+        "storage_scan_interval_sec is the refresh cadence and must not be reused as failure retry backoff"
+    );
+}
+
+#[test]
+fn storage_scan_active_sweep_claims_derived_state_not_v2_queue() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let entry_fn = prod_source
+        .split("async fn process_registry_sweep_entry(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn record_registry_sweep_kind_result")
+                .next()
+        })
+        .expect("process_registry_sweep_entry must exist before result recorder");
+
+    let active = entry_fn
+        .find("self.config.storage_scan_derived_active")
+        .expect("storage scan sweep must gate derived mode with the active flag");
+    let derived = entry_fn
+        .find("run_storage_scan_derived_if_due")
+        .expect("active storage scan sweep must claim derived state");
+    let legacy = entry_fn
+        .find("enqueue_storage_scan_with_jitter")
+        .expect("inactive storage scan sweep must retain legacy V2 fallback");
+
+    assert!(
+        active < derived && derived < legacy,
+        "active derived StorageSizeScan must return before legacy V2 enqueue fallback"
+    );
+    assert!(
+        entry_fn.contains("return Ok::<(), anyhow::Error>(());"),
+        "active derived StorageSizeScan branch must not fall through to V2 enqueue"
+    );
+}
+
+#[test]
+fn legacy_v2_storage_scan_converts_to_derived_refresh_when_active() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let branch = prod_source
+        .split("if entry.task_type == TaskType::StorageSizeScan {")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("if entry.task_type == TaskType::HnswMerge")
+                .next()
+        })
+        .expect("StorageSizeScan execute_task branch must exist before HNSW branch");
+
+    let active = branch
+        .find("config.storage_scan_derived_active")
+        .expect("legacy StorageSizeScan execution must check derived active flag");
+    let refresh = branch
+        .find("request_storage_scan_refresh")
+        .expect("active legacy StorageSizeScan must nudge derived state");
+    let legacy = branch
+        .find("execute_storage_size_scan(")
+        .expect("inactive StorageSizeScan must keep legacy V2 executor");
+    assert!(
+        active < refresh && refresh < legacy,
+        "active legacy V2 StorageSizeScan rows must be collapsed into derived state, not executed directly"
+    );
+}
+
+#[test]
+fn storage_scan_derived_claim_uses_and_repairs_capacity_tokens() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let claim = prod_source
+        .split("async fn claim_storage_scan_derived_run(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn finish_storage_scan_derived_run")
+                .next()
+        })
+        .expect("claim_storage_scan_derived_run must exist before finish");
+    let capacity = prod_source
+        .split("async fn claim_storage_scan_capacity_token(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn claim_storage_scan_derived_run").next())
+        .expect("capacity-token claim helper must exist before state claim");
+
+    assert!(
+        claim.contains("claim_storage_scan_capacity_token")
+            && claim.contains("capacity_token_id: Some(token_id)"),
+        "derived StorageSizeScan must reserve capacity before moving state to Running"
+    );
+    assert!(
+        capacity.contains("storage_scan_capacity_token_is_live")
+            && capacity.contains("put_storage_scan_capacity_token"),
+        "capacity tokens must be repaired from authoritative state, not treated as permanent leases"
+    );
+}
+
+#[test]
+fn storage_scan_finish_releases_capacity_token_on_every_terminal_path() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let finish = prod_source
+        .split("async fn finish_storage_scan_derived_run(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn process_registry_sweep_entry").next())
+        .expect("finish_storage_scan_derived_run must exist before process_registry_sweep_entry");
+    let release = finish
+        .find("delete_storage_scan_capacity_token")
+        .expect("finish must release the capacity token");
+    let outcome_match = finish
+        .find("match effect")
+        .expect("finish must branch on effect outcome");
+
+    assert!(
+        release < outcome_match && finish.contains("capacity_token_id: None"),
+        "finish must release capacity before success, stale-target, and retry state transitions"
+    );
+}
+
+#[test]
+fn storage_scan_derived_failure_retry_is_state_owned() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let finish = prod_source
+        .split("async fn finish_storage_scan_derived_run(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn process_registry_sweep_entry").next())
+        .expect("finish_storage_scan_derived_run must exist before process_registry_sweep_entry");
+    let err_branch = finish
+        .split("Err(e) => {")
+        .nth(1)
+        .expect("finish must handle effect errors");
+
+    assert!(
+        err_branch.contains("run_after_ms: storage_scan_retry_after_ms(now_ms, attempt)")
+            && err_branch.contains("put_storage_scan_bg_state")
+            && err_branch.contains("txn.commit().await?")
+            && err_branch.contains("Ok(())"),
+        "derived effect failures must persist retry state and return success to the registry sweep"
+    );
+}
+
+#[test]
+fn storage_scan_derived_pending_retry_blocks_auto_due_until_run_after() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let claim = prod_source
+        .split("async fn claim_storage_scan_derived_run(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn finish_storage_scan_derived_run")
+                .next()
+        })
+        .expect("claim_storage_scan_derived_run must exist before finish");
+    let retry_gate = claim
+        .find("state.work_id > 0 && state.run_after_ms > now_ms")
+        .expect("pending retry state must gate claim attempts");
+    let stats_due_gate = claim
+        .find("if !stats_due && !due_by_state")
+        .expect("claim must still consider ordinary auto due state");
+
+    assert!(
+        retry_gate < stats_due_gate,
+        "pending derived retry/manual state must be respected before automatic stats_due can claim"
+    );
+}
+
+#[test]
+fn storage_scan_derived_effect_validates_incarnation_and_applied_marker() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let effect = prod_source
+        .split("async fn execute_storage_size_scan_derived(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(crate) async fn request_storage_scan_refresh")
+                .next()
+        })
+        .expect("derived StorageSizeScan effect must exist before refresh helper");
+
+    assert!(
+        effect
+            .matches("get_tenant_incarnation_stamp_for_update")
+            .count()
+            >= 2,
+        "derived effect must validate tenant incarnation before PD work and again at commit time"
+    );
+    assert!(
+        effect.contains("get_storage_scan_applied_marker_for_update")
+            && effect.contains("put_storage_scan_applied_marker"),
+        "derived effect must use tenant-local applied markers for idempotent progress"
+    );
+    assert!(
+        effect.contains("lock_storage_scan_owner_for_commit")
+            && effect.contains("persist_txn.commit().await"),
+        "derived effect must re-check scheduler ownership immediately before committing tenant effects"
+    );
+}
+
+#[test]
+fn storage_scan_capacity_token_liveness_requires_matching_running_state() {
+    let token = StorageScanCapacityToken {
+        keyspace: "ks".to_string(),
+        db_id: 7,
+        tenant_incarnation: 11,
+        work_id: 21,
+        attempt: 2,
+        lease_until_ms: 100,
+    };
+    let state = StorageScanBgState {
+        keyspace: "ks".to_string(),
+        db_id: 7,
+        tenant_incarnation: 11,
+        status: StorageScanBgStateStatus::Running,
+        work_id: 21,
+        run_after_ms: 1,
+        lease_until_ms: 100,
+        attempt: 2,
+        last_done_work_id: 20,
+        capacity_token_id: Some(0),
+    };
+
+    assert!(storage_scan_capacity_token_matches_state(
+        0, &token, &state, 99
+    ));
+    assert!(
+        !storage_scan_capacity_token_matches_state(0, &token, &state, 100),
+        "expired state leases must not keep capacity busy"
+    );
+
+    let mut wrong_token = token.clone();
+    wrong_token.work_id = 22;
+    assert!(
+        !storage_scan_capacity_token_matches_state(0, &wrong_token, &state, 99),
+        "stale capacity-token payload must be repairable from authoritative state"
+    );
+
+    let mut idle_state = state.clone();
+    idle_state.status = StorageScanBgStateStatus::Idle;
+    assert!(
+        !storage_scan_capacity_token_matches_state(0, &token, &idle_state, 99),
+        "idle state rows must not hold capacity"
+    );
+}
+
+#[test]
+fn storage_scan_success_advances_progress_after_completed_work() {
+    let state = StorageScanBgState {
+        keyspace: "ks".to_string(),
+        db_id: 7,
+        tenant_incarnation: 11,
+        status: StorageScanBgStateStatus::Running,
+        work_id: 21,
+        run_after_ms: 1,
+        lease_until_ms: 100,
+        attempt: 3,
+        last_done_work_id: 20,
+        capacity_token_id: Some(0),
+    };
+
+    let idle = storage_scan_idle_after_success(state, 21, 1_000, 60);
+    assert_eq!(idle.status, StorageScanBgStateStatus::Idle);
+    assert_eq!(idle.work_id, 0);
+    assert_eq!(idle.last_done_work_id, 21);
+    assert_eq!(idle.run_after_ms, 61_000);
+    assert_eq!(idle.attempt, 0);
+    assert_eq!(idle.capacity_token_id, None);
+}
+
+#[test]
 fn storage_size_scan_leaves_old_stats_intact_on_pd_failure() {
     let source = include_str!("../engine.rs");
     let prod_source = source
@@ -4137,6 +4447,14 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "reconcile_incomplete_cic_indexes_for_db_safe",
         // [lookup] Point read of persisted storage stats; immediate rollback.
         "storage_scan_due",
+        // [lookup] Point read of tenant-local applied marker; immediate rollback.
+        "latest_storage_scan_applied_work_id",
+        // [claim] StorageScan state claim + bounded capacity-token repair in one
+        // system txn; no snapshot is held across PD work.
+        "claim_storage_scan_derived_run",
+        // [finalize] StorageScan state update + capacity-token release in one
+        // system txn after the effect has completed.
+        "finish_storage_scan_derived_run",
         // [claim] Pessimistic claim attempt: 1 key check + commit.
         "claim_and_execute_core",
         // [claim] Release a just-won claim: single key delete + immediate commit.
@@ -4167,6 +4485,12 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         // [pd lookup + finalize] PD HTTP stats lookup, then one short tenant
         // stats-key write with immediate commit.
         "execute_storage_size_scan",
+        // [pd lookup + finalize] Derived path uses short precheck/finalize tenant
+        // txns; the scheduler owner fence txn itself registers with GC.
+        "execute_storage_size_scan_derived",
+        // [enqueue] Manual/legacy refresh nudge writes one derived state row and
+        // registry bit in a single system txn.
+        "request_storage_scan_refresh",
         // [reconcile] Scans DDL journal + cleans orphaned data in batches with txn rotation.
         "reconcile_ddl_journal_for_db",
         // ── worker/engine/helpers.rs ──

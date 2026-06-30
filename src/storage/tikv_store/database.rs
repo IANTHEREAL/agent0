@@ -3,6 +3,8 @@ use crate::storage::backpressure::tikv_op;
 
 const TENANT_INCARNATION_STAMP_VALUE_VERSION: u8 = 1;
 const TENANT_INCARNATION_STAMP_VALUE_LEN: usize = 9;
+const STORAGE_SCAN_APPLIED_MARKER_VALUE_VERSION: u8 = 1;
+const STORAGE_SCAN_APPLIED_MARKER_VALUE_LEN: usize = 25;
 
 fn encode_tenant_incarnation_stamp_value(incarnation: u64) -> Vec<u8> {
     let mut value = Vec::with_capacity(TENANT_INCARNATION_STAMP_VALUE_LEN);
@@ -25,6 +27,39 @@ fn decode_tenant_incarnation_stamp_value(value: &[u8]) -> Result<u64> {
         ));
     }
     Ok(u64::from_be_bytes(value[1..9].try_into()?))
+}
+
+fn encode_storage_scan_applied_marker_value(
+    marker: crate::worker::types::StorageScanAppliedMarker,
+) -> Vec<u8> {
+    let mut value = Vec::with_capacity(STORAGE_SCAN_APPLIED_MARKER_VALUE_LEN);
+    value.push(STORAGE_SCAN_APPLIED_MARKER_VALUE_VERSION);
+    value.extend_from_slice(&marker.tenant_incarnation.to_be_bytes());
+    value.extend_from_slice(&marker.work_id.to_be_bytes());
+    value.extend_from_slice(&marker.applied_at_ms.to_be_bytes());
+    value
+}
+
+fn decode_storage_scan_applied_marker_value(
+    value: &[u8],
+) -> Result<crate::worker::types::StorageScanAppliedMarker> {
+    if value.len() != STORAGE_SCAN_APPLIED_MARKER_VALUE_LEN {
+        return Err(anyhow!(
+            "invalid StorageSizeScan applied marker length: {}",
+            value.len()
+        ));
+    }
+    if value[0] != STORAGE_SCAN_APPLIED_MARKER_VALUE_VERSION {
+        return Err(anyhow!(
+            "unsupported StorageSizeScan applied marker version: {}",
+            value[0]
+        ));
+    }
+    Ok(crate::worker::types::StorageScanAppliedMarker {
+        tenant_incarnation: u64::from_be_bytes(value[1..9].try_into()?),
+        work_id: i64::from_be_bytes(value[9..17].try_into()?),
+        applied_at_ms: i64::from_be_bytes(value[17..25].try_into()?),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,6 +529,41 @@ impl TikvStore {
         Ok(())
     }
 
+    pub async fn get_storage_scan_applied_marker(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Option<crate::worker::types::StorageScanAppliedMarker>> {
+        let key = self.key(&encode_storage_scan_applied_marker_key(db_id));
+        match tikv_op!(txn.get(key).await)? {
+            Some(value) => Ok(Some(decode_storage_scan_applied_marker_value(&value)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_storage_scan_applied_marker_for_update(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Option<crate::worker::types::StorageScanAppliedMarker>> {
+        let key = self.key(&encode_storage_scan_applied_marker_key(db_id));
+        match tikv_op!(txn.get_for_update(key).await)? {
+            Some(value) => Ok(Some(decode_storage_scan_applied_marker_value(&value)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn put_storage_scan_applied_marker(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        marker: crate::worker::types::StorageScanAppliedMarker,
+    ) -> Result<()> {
+        let key = self.key(&encode_storage_scan_applied_marker_key(db_id));
+        txn_put(txn, key, encode_storage_scan_applied_marker_value(marker)).await?;
+        Ok(())
+    }
+
     /// List all databases in the current keyspace (storage format v2).
     pub async fn list_databases(&self, txn: &mut Transaction) -> Result<Vec<DatabaseDef>> {
         let prefix = encode_database_id_prefix();
@@ -786,6 +856,36 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("invalid tenant incarnation stamp length")
+        );
+    }
+
+    #[test]
+    fn storage_scan_applied_marker_value_is_versioned() {
+        let marker = crate::worker::types::StorageScanAppliedMarker {
+            tenant_incarnation: 7,
+            work_id: 9,
+            applied_at_ms: 11,
+        };
+        let encoded = encode_storage_scan_applied_marker_value(marker);
+        assert_eq!(encoded.len(), STORAGE_SCAN_APPLIED_MARKER_VALUE_LEN);
+        assert_eq!(encoded[0], STORAGE_SCAN_APPLIED_MARKER_VALUE_VERSION);
+        assert_eq!(
+            decode_storage_scan_applied_marker_value(&encoded).unwrap(),
+            marker
+        );
+
+        let mut bad_version = encoded.clone();
+        bad_version[0] = 2;
+        assert!(decode_storage_scan_applied_marker_value(&bad_version)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported StorageSizeScan applied marker version"));
+
+        assert!(
+            decode_storage_scan_applied_marker_value(&encoded[..encoded.len() - 1])
+                .unwrap_err()
+                .to_string()
+                .contains("invalid StorageSizeScan applied marker length")
         );
     }
 

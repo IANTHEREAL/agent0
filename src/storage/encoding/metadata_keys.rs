@@ -37,6 +37,7 @@ const DB_SYS_COLLATION_PREFIX: &[u8] = b"sys_collation_";
 const DB_SYS_POLICY_PREFIX: &[u8] = b"sys_policy_";
 const DB_SYS_NEXT_POLICY_OID: &[u8] = b"sys_next_policy_oid";
 const DB_SYS_STORAGE_STATS: &[u8] = b"sys_storage_stats";
+const DB_SYS_STORAGE_SCAN_APPLIED: &[u8] = b"sys_storage_scan_applied";
 const DB_SYS_TENANT_INCARNATION: &[u8] = b"sys_tenant_incarnation";
 const DB_SYS_TSC_PREFIX: &[u8] = b"sys_tsc_";
 const DB_SYS_CRON_JOB_PREFIX_V2: &[u8] = b"sys_cron_job_";
@@ -61,6 +62,8 @@ pub(super) const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
 pub(super) const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
 pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
+pub(super) const WORKER_BG_STORAGE_SCAN_STATE_PREFIX: &[u8] = b"_bg_storage_scan_state_";
+pub(super) const WORKER_BG_STORAGE_SCAN_CAPACITY_PREFIX: &[u8] = b"_bg_storage_scan_capacity_";
 pub(super) const GC_INSTANCE_STATE_PREFIX: &[u8] = b"_gc_instance_";
 pub(super) const LIFECYCLE_PROCESS_LIVENESS_PREFIX: &[u8] = b"_lc_process_liveness_";
 pub(super) const LIFECYCLE_TENANT_INCARNATION_SEQ_KEY: &[u8] = b"_lc_incarnation_seq";
@@ -1091,6 +1094,13 @@ pub fn encode_tenant_incarnation_key(db_id: u64) -> Vec<u8> {
     key
 }
 
+/// Encode the tenant-local StorageSizeScan applied marker.
+pub fn encode_storage_scan_applied_marker_key(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_STORAGE_SCAN_APPLIED);
+    key
+}
+
 /// Encode the global lifecycle incarnation allocator key.
 pub fn encode_lifecycle_tenant_incarnation_seq_key() -> Vec<u8> {
     LIFECYCLE_TENANT_INCARNATION_SEQ_KEY.to_vec()
@@ -1138,6 +1148,28 @@ pub fn decode_lifecycle_tenant_key(key: &[u8]) -> Option<(String, u64)> {
     idx += 1;
     let db_id = u64::from_be_bytes(key[idx..idx + 8].try_into().ok()?);
     Some((keyspace, db_id))
+}
+
+/// Encode the StorageSizeScan derived state row.
+///
+/// PR2 intentionally starts with one StorageSizeScan-specific state row per
+/// database instead of introducing a generic ledger family for every class.
+pub fn encode_worker_bg_storage_scan_state_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_BG_STORAGE_SCAN_STATE_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_BG_STORAGE_SCAN_STATE_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+pub fn encode_worker_bg_storage_scan_capacity_key(token_id: u16) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_BG_STORAGE_SCAN_CAPACITY_PREFIX.len() + 2);
+    key.extend_from_slice(WORKER_BG_STORAGE_SCAN_CAPACITY_PREFIX);
+    key.extend_from_slice(&token_id.to_be_bytes());
+    key
 }
 
 // ============================================================================

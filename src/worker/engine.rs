@@ -10,6 +10,7 @@ use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
+use crate::storage::worker::DroppedDbEnqueueFence;
 use crate::storage::{CronClaimOutcome, TikvStore, WqIndexRow};
 use crate::worker::config::WorkerConfig;
 use crate::worker::executor_lease::WorkerExecutorLeaseCoordinator;
@@ -59,6 +60,8 @@ const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5;
 const DISABLED_CHECK_THRESHOLD: u32 = 5;
 const CIC_REPAIR_TABLE_PAGE_SIZE: usize = 256;
 const HNSW_DIRTY_MARKER_PAGE_SIZE: usize = 256;
+const PD_REGION_STATS_HTTP_TIMEOUT_MS: i64 = 5_000;
+const STORAGE_SCAN_DERIVED_LEASE_COMMIT_GRACE_MS: i64 = 30_000;
 
 async fn worker_bgsql_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -149,6 +152,192 @@ impl RegistrySweepKindKey {
             kind,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageScanEffectOutcome {
+    Applied,
+    AlreadyApplied,
+    TargetGone,
+    StaleIncarnation,
+}
+
+struct StorageScanOwnerFence {
+    system_store: Arc<TikvStore>,
+    keyspace: String,
+    db_id: u64,
+    tenant_incarnation: u64,
+    work_id: i64,
+    attempt: u32,
+}
+
+struct StorageScanOwnerTxn {
+    txn: tikv_client::Transaction,
+    guard: Option<crate::worker::active_txn_registry::ActiveTxnGuard>,
+}
+
+impl StorageScanOwnerTxn {
+    async fn rollback(&mut self) {
+        if self.txn.rollback().await.is_err() {
+            if let Some(guard) = self.guard.as_mut() {
+                guard.quarantine();
+            }
+        }
+    }
+}
+
+fn storage_scan_interval_ms(interval_sec: u64) -> i64 {
+    i64::try_from(interval_sec.max(1))
+        .unwrap_or(i64::MAX / 1000)
+        .saturating_mul(1000)
+        .max(1)
+}
+
+fn storage_scan_work_id(now_ms: i64, interval_sec: u64) -> i64 {
+    let interval_ms = storage_scan_interval_ms(interval_sec);
+    now_ms.div_euclid(interval_ms).saturating_mul(interval_ms)
+}
+
+fn next_storage_scan_work_id_after(work_id: i64) -> i64 {
+    work_id.saturating_add(1)
+}
+
+fn storage_scan_work_id_at_least_after(base_work_id: i64, previous_work_id: Option<i64>) -> i64 {
+    previous_work_id
+        .map(next_storage_scan_work_id_after)
+        .map(|floor| base_work_id.max(floor))
+        .unwrap_or(base_work_id)
+}
+
+fn storage_scan_retry_after_ms(now_ms: i64, attempt: u32) -> i64 {
+    let shift = attempt.min(5);
+    let backoff_ms = 30_000_i64.saturating_mul(1_i64 << shift);
+    now_ms.saturating_add(backoff_ms)
+}
+
+fn storage_scan_derived_lease_ms(config: &WorkerConfig, pd_endpoint_count: usize) -> i64 {
+    let endpoint_count = i64::try_from(pd_endpoint_count.max(1)).unwrap_or(i64::MAX / 10_000);
+    let pd_http_budget_ms = PD_REGION_STATS_HTTP_TIMEOUT_MS
+        .saturating_mul(2)
+        .saturating_mul(endpoint_count);
+    let pd_budget_ms = i64::try_from(config.storage_scan_pd_rate_limit_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_add(pd_http_budget_ms)
+        .saturating_add(STORAGE_SCAN_DERIVED_LEASE_COMMIT_GRACE_MS);
+    (config.claim_lease_ms as i64).max(pd_budget_ms).max(1)
+}
+
+fn storage_scan_owner_state_matches(
+    state: Option<&StorageScanBgState>,
+    fence: &StorageScanOwnerFence,
+    now_ms: i64,
+) -> bool {
+    state.is_some_and(|state| {
+        state.keyspace == fence.keyspace
+            && state.db_id == fence.db_id
+            && state.tenant_incarnation == fence.tenant_incarnation
+            && state.status == StorageScanBgStateStatus::Running
+            && state.work_id == fence.work_id
+            && state.attempt == fence.attempt
+            && state.lease_until_ms > now_ms
+    })
+}
+
+fn storage_scan_completion_owner_matches(
+    state: Option<&StorageScanBgState>,
+    tenant_incarnation: u64,
+    work_id: i64,
+    attempt: u32,
+) -> bool {
+    state.is_some_and(|state| {
+        state.tenant_incarnation == tenant_incarnation
+            && state.status == StorageScanBgStateStatus::Running
+            && state.work_id == work_id
+            && state.attempt == attempt
+    })
+}
+
+fn storage_scan_capacity_token_matches_state(
+    token_id: u16,
+    token: &StorageScanCapacityToken,
+    state: &StorageScanBgState,
+    now_ms: i64,
+) -> bool {
+    state.keyspace == token.keyspace
+        && state.db_id == token.db_id
+        && state.tenant_incarnation == token.tenant_incarnation
+        && state.status == StorageScanBgStateStatus::Running
+        && state.work_id == token.work_id
+        && state.attempt == token.attempt
+        && state.lease_until_ms == token.lease_until_ms
+        && state.capacity_token_id == Some(token_id)
+        && state.lease_until_ms > now_ms
+}
+
+fn storage_scan_idle_after_success(
+    state: StorageScanBgState,
+    completed_work_id: i64,
+    now_ms: i64,
+    interval_sec: u64,
+) -> StorageScanBgState {
+    let last_done_work_id = state.last_done_work_id.max(completed_work_id);
+    StorageScanBgState {
+        status: StorageScanBgStateStatus::Idle,
+        work_id: 0,
+        run_after_ms: now_ms.saturating_add(storage_scan_interval_ms(interval_sec)),
+        lease_until_ms: 0,
+        attempt: 0,
+        last_done_work_id,
+        capacity_token_id: None,
+        ..state
+    }
+}
+
+async fn lock_storage_scan_owner_for_commit(
+    fence: &StorageScanOwnerFence,
+) -> Result<StorageScanOwnerTxn> {
+    let mut txn = fence.system_store.begin().await?;
+    let mut guard = crate::worker::active_txn_registry::global_registry()
+        .map(|registry| registry.track_worker_txn(txn.start_timestamp().version()));
+    let state_result = fence
+        .system_store
+        .get_storage_scan_bg_state_for_update(&mut txn, &fence.keyspace, fence.db_id)
+        .await;
+    let state = match state_result {
+        Ok(state) => state,
+        Err(e) => {
+            if txn.rollback().await.is_err() {
+                if let Some(guard) = guard.as_mut() {
+                    guard.quarantine();
+                }
+            }
+            return Err(e);
+        }
+    };
+    if !storage_scan_owner_state_matches(state.as_ref(), fence, now_epoch_ms()) {
+        if txn.rollback().await.is_err() {
+            if let Some(guard) = guard.as_mut() {
+                guard.quarantine();
+            }
+        }
+        return Err(anyhow!(CANCELLED_BY_ADMIN_ERROR));
+    }
+    Ok(StorageScanOwnerTxn { txn, guard })
+}
+
+async fn latest_storage_scan_applied_work_id(
+    store: &TikvStore,
+    db_id: u64,
+    tenant_incarnation: u64,
+) -> Result<Option<i64>> {
+    let mut txn = store.begin().await?;
+    let marker = store
+        .get_storage_scan_applied_marker(&mut txn, db_id)
+        .await?;
+    txn.rollback().await.ok();
+    Ok(marker
+        .filter(|marker| marker.tenant_incarnation == tenant_incarnation)
+        .map(|marker| marker.work_id))
 }
 
 struct RegistrySweepBackoff {
@@ -789,7 +978,7 @@ impl WorkerEngine {
             RegistrySweepKind::HnswDelta | RegistrySweepKind::HnswS3 => {
                 self.config.hnsw_sweep_interval_sec.max(1)
             }
-            RegistrySweepKind::StorageScan => self.config.storage_scan_interval_sec.max(1),
+            RegistrySweepKind::StorageScan => REGISTRY_SWEEP_RECOVERY_BACKOFF_SEC,
         }
     }
 
@@ -857,6 +1046,346 @@ impl WorkerEngine {
             state.hnsw_dirty_cursors.insert(key, cursor);
         } else {
             state.hnsw_dirty_cursors.remove(&key);
+        }
+    }
+
+    async fn run_storage_scan_derived_if_due(
+        &self,
+        store: &Arc<TikvStore>,
+        keyspace: &str,
+        db_id: u64,
+        force: bool,
+    ) -> Result<bool> {
+        let lifecycle_store = crate::worker::db_lifecycle_store()?.clone();
+        let Some(tenant_incarnation) = crate::worker::lifecycle::ensure_tenant_lifecycle_identity(
+            &lifecycle_store,
+            store,
+            keyspace,
+            db_id,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+
+        let now_ms = now_epoch_ms();
+        let applied_work_id =
+            latest_storage_scan_applied_work_id(store, db_id, tenant_incarnation).await?;
+        let current_work_id = storage_scan_work_id_at_least_after(
+            storage_scan_work_id(now_ms, self.config.storage_scan_interval_sec),
+            applied_work_id,
+        );
+        let stats_due = force || self.storage_scan_due(store, db_id).await?;
+        let claim = self
+            .claim_storage_scan_derived_run(
+                keyspace,
+                db_id,
+                tenant_incarnation,
+                current_work_id,
+                stats_due,
+                now_ms,
+                self.pool.pd_endpoints().len(),
+            )
+            .await?;
+        let Some((work_id, attempt, _token_id)) = claim else {
+            return Ok(false);
+        };
+
+        let effect = execute_storage_size_scan_derived(
+            store,
+            keyspace,
+            db_id,
+            tenant_incarnation,
+            work_id,
+            self.pool.pd_endpoints(),
+            self.config.storage_scan_pd_rate_limit_ms,
+            &crate::worker::LeaseCancel::none(),
+            Some(&StorageScanOwnerFence {
+                system_store: self.system_store.clone(),
+                keyspace: keyspace.to_string(),
+                db_id,
+                tenant_incarnation,
+                work_id,
+                attempt,
+            }),
+        )
+        .await;
+
+        self.finish_storage_scan_derived_run(
+            keyspace,
+            db_id,
+            tenant_incarnation,
+            work_id,
+            attempt,
+            effect,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn storage_scan_capacity_token_is_live(
+        &self,
+        txn: &mut tikv_client::Transaction,
+        token_id: u16,
+        token: &StorageScanCapacityToken,
+        current_state: Option<&StorageScanBgState>,
+        now_ms: i64,
+    ) -> Result<bool> {
+        if let Some(state) = current_state {
+            if state.keyspace == token.keyspace && state.db_id == token.db_id {
+                return Ok(storage_scan_capacity_token_matches_state(
+                    token_id, token, state, now_ms,
+                ));
+            }
+        }
+
+        let state = self
+            .system_store
+            .get_storage_scan_bg_state_for_update(txn, &token.keyspace, token.db_id)
+            .await?;
+        Ok(state.as_ref().is_some_and(|state| {
+            storage_scan_capacity_token_matches_state(token_id, token, state, now_ms)
+        }))
+    }
+
+    async fn claim_storage_scan_capacity_token(
+        &self,
+        txn: &mut tikv_client::Transaction,
+        current_state: Option<&StorageScanBgState>,
+        token: &StorageScanCapacityToken,
+        now_ms: i64,
+    ) -> Result<Option<u16>> {
+        for token_id in 0..self.config.storage_scan_derived_capacity {
+            let existing = self
+                .system_store
+                .get_storage_scan_capacity_token_for_update(txn, token_id)
+                .await?;
+            let Some(existing) = existing else {
+                self.system_store
+                    .put_storage_scan_capacity_token(txn, token_id, token)
+                    .await?;
+                return Ok(Some(token_id));
+            };
+
+            if self
+                .storage_scan_capacity_token_is_live(
+                    txn,
+                    token_id,
+                    &existing,
+                    current_state,
+                    now_ms,
+                )
+                .await?
+            {
+                continue;
+            }
+
+            self.system_store
+                .put_storage_scan_capacity_token(txn, token_id, token)
+                .await?;
+            return Ok(Some(token_id));
+        }
+        Ok(None)
+    }
+
+    async fn claim_storage_scan_derived_run(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        tenant_incarnation: u64,
+        current_work_id: i64,
+        stats_due: bool,
+        now_ms: i64,
+        pd_endpoint_count: usize,
+    ) -> Result<Option<(i64, u32, u16)>> {
+        let mut txn = self.system_store.begin().await?;
+        let result = async {
+            let existing = self
+                .system_store
+                .get_storage_scan_bg_state_for_update(&mut txn, keyspace, db_id)
+                .await?;
+            let mut attempt = 0u32;
+            let mut work_id = current_work_id;
+            let due_by_state = existing
+                .as_ref()
+                .is_some_and(|state| state.run_after_ms <= now_ms);
+
+            if let Some(state) = existing.as_ref() {
+                if state.tenant_incarnation == tenant_incarnation
+                    && state.status == StorageScanBgStateStatus::Running
+                    && state.lease_until_ms > now_ms
+                {
+                    return Ok(None);
+                }
+
+                if state.tenant_incarnation == tenant_incarnation
+                    && state.status == StorageScanBgStateStatus::Running
+                {
+                    work_id = state.work_id;
+                    attempt = state.attempt.saturating_add(1);
+                } else if state.tenant_incarnation == tenant_incarnation {
+                    attempt = state.attempt;
+                    if state.work_id > 0 && state.run_after_ms > now_ms {
+                        return Ok(None);
+                    }
+                    if due_by_state && state.work_id > 0 {
+                        work_id = state.work_id;
+                    } else {
+                        work_id = storage_scan_work_id_at_least_after(
+                            work_id,
+                            Some(state.last_done_work_id),
+                        );
+                    }
+                    if state.last_done_work_id >= work_id && !due_by_state {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            if !stats_due && !due_by_state {
+                return Ok(None);
+            }
+
+            let lease_until_ms = now_ms.saturating_add(storage_scan_derived_lease_ms(
+                &self.config,
+                pd_endpoint_count,
+            ));
+            let token = StorageScanCapacityToken {
+                keyspace: keyspace.to_string(),
+                db_id,
+                tenant_incarnation,
+                work_id,
+                attempt,
+                lease_until_ms,
+            };
+            let Some(token_id) = self
+                .claim_storage_scan_capacity_token(&mut txn, existing.as_ref(), &token, now_ms)
+                .await?
+            else {
+                return Ok(None);
+            };
+
+            let running = StorageScanBgState {
+                keyspace: keyspace.to_string(),
+                db_id,
+                tenant_incarnation,
+                status: StorageScanBgStateStatus::Running,
+                work_id,
+                run_after_ms: now_ms,
+                lease_until_ms,
+                attempt,
+                last_done_work_id: existing
+                    .as_ref()
+                    .filter(|state| state.tenant_incarnation == tenant_incarnation)
+                    .map(|state| state.last_done_work_id)
+                    .unwrap_or(-1),
+                capacity_token_id: Some(token_id),
+            };
+            self.system_store
+                .put_storage_scan_bg_state(&mut txn, &running)
+                .await?;
+            Ok(Some((work_id, attempt, token_id)))
+        }
+        .await;
+
+        match result {
+            Ok(value) => {
+                if value.is_some() {
+                    txn.commit().await?;
+                } else {
+                    txn.rollback().await.ok();
+                }
+                Ok(value)
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
+    async fn finish_storage_scan_derived_run(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        tenant_incarnation: u64,
+        work_id: i64,
+        attempt: u32,
+        effect: Result<StorageScanEffectOutcome>,
+    ) -> Result<()> {
+        let now_ms = now_epoch_ms();
+        let mut txn = self.system_store.begin().await?;
+        let state = self
+            .system_store
+            .get_storage_scan_bg_state_for_update(&mut txn, keyspace, db_id)
+            .await?;
+        let Some(state) = state else {
+            txn.rollback().await.ok();
+            return Ok(());
+        };
+        if !storage_scan_completion_owner_matches(
+            Some(&state),
+            tenant_incarnation,
+            work_id,
+            attempt,
+        ) {
+            txn.rollback().await.ok();
+            return Ok(());
+        }
+
+        if let Some(token_id) = state.capacity_token_id {
+            self.system_store
+                .delete_storage_scan_capacity_token(&mut txn, token_id)
+                .await?;
+        }
+
+        match effect {
+            Ok(StorageScanEffectOutcome::Applied | StorageScanEffectOutcome::AlreadyApplied) => {
+                let next = storage_scan_idle_after_success(
+                    state,
+                    work_id,
+                    now_ms,
+                    self.config.storage_scan_interval_sec,
+                );
+                self.system_store
+                    .put_storage_scan_bg_state(&mut txn, &next)
+                    .await?;
+                txn.commit().await?;
+                Ok(())
+            }
+            Ok(
+                StorageScanEffectOutcome::TargetGone | StorageScanEffectOutcome::StaleIncarnation,
+            ) => {
+                self.system_store
+                    .delete_storage_scan_bg_state(&mut txn, keyspace, db_id)
+                    .await?;
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    keyspace,
+                    db_id,
+                    work_id,
+                    attempt,
+                    retry_after_ms = storage_scan_retry_after_ms(now_ms, attempt),
+                    "StorageSizeScan derived effect failed; retry state persisted: {}",
+                    e
+                );
+                let next = StorageScanBgState {
+                    status: StorageScanBgStateStatus::Idle,
+                    run_after_ms: storage_scan_retry_after_ms(now_ms, attempt),
+                    lease_until_ms: 0,
+                    attempt: attempt.saturating_add(1),
+                    capacity_token_id: None,
+                    ..state
+                };
+                self.system_store
+                    .put_storage_scan_bg_state(&mut txn, &next)
+                    .await?;
+                txn.commit().await?;
+                Ok(())
+            }
         }
     }
 
@@ -1040,7 +1569,27 @@ impl WorkerEngine {
             .await
         {
             let result = async {
-                if self.storage_scan_due(store, entry.db_id).await? {
+                if self.config.storage_scan_derived_active {
+                    self.run_storage_scan_derived_if_due(
+                        store,
+                        &entry.keyspace,
+                        entry.db_id,
+                        false,
+                    )
+                    .await?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+
+                let due = self.storage_scan_due(store, entry.db_id).await?;
+                if self.config.storage_scan_derived_shadow {
+                    debug!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        due,
+                        "StorageSizeScan derived scheduler shadow observation"
+                    );
+                }
+                if due {
                     enqueue_storage_scan_with_jitter(
                         &self.system_store,
                         &entry.keyspace,
@@ -2742,6 +3291,17 @@ impl WorkerEngine {
         let lease_cancel = crate::worker::LeaseCancel::new(shutdown_signal.clone());
 
         if entry.task_type == TaskType::StorageSizeScan {
+            if config.storage_scan_derived_active {
+                let system_store = crate::worker::system_store()?.clone();
+                request_storage_scan_refresh(
+                    system_store.as_ref(),
+                    store.as_ref(),
+                    &entry.keyspace,
+                    entry.db_id,
+                )
+                .await?;
+                return Ok(0);
+            }
             execute_storage_size_scan(
                 &store,
                 &entry.keyspace,
@@ -3642,6 +4202,275 @@ async fn enqueue_storage_scan_at(
         );
         return Ok(());
     }
+    txn.commit().await?;
+    crate::worker::wake_worker();
+    Ok(())
+}
+
+async fn execute_storage_size_scan_derived(
+    store: &Arc<TikvStore>,
+    keyspace: &str,
+    db_id: u64,
+    expected_tenant_incarnation: u64,
+    work_id: i64,
+    pd_endpoints: &[String],
+    pd_rate_limit_ms: u64,
+    lease_cancel: &crate::worker::LeaseCancel,
+    owner_fence: Option<&StorageScanOwnerFence>,
+) -> Result<StorageScanEffectOutcome> {
+    use crate::storage_stats::{
+        global_storage_stats_cache, serialize_storage_stats, DbStorageStats,
+    };
+
+    {
+        let mut precheck_txn = store.begin().await?;
+        if !store
+            .database_alive_for_update(&mut precheck_txn, db_id)
+            .await?
+        {
+            precheck_txn.rollback().await.ok();
+            return Ok(StorageScanEffectOutcome::TargetGone);
+        }
+        match store
+            .get_tenant_incarnation_stamp_for_update(&mut precheck_txn, db_id)
+            .await?
+        {
+            Some(stamp) if stamp == expected_tenant_incarnation => {}
+            Some(_) | None => {
+                precheck_txn.rollback().await.ok();
+                return Ok(StorageScanEffectOutcome::StaleIncarnation);
+            }
+        }
+        if store
+            .get_storage_scan_applied_marker(&mut precheck_txn, db_id)
+            .await?
+            .is_some_and(|marker| {
+                marker.tenant_incarnation == expected_tenant_incarnation
+                    && marker.work_id >= work_id
+            })
+        {
+            precheck_txn.rollback().await.ok();
+            return Ok(StorageScanEffectOutcome::AlreadyApplied);
+        }
+        precheck_txn.rollback().await.ok();
+    }
+
+    let scan_start = std::time::Instant::now();
+    crate::worker::pd_region_stats::enforce_pd_stats_rate_limit(pd_rate_limit_ms).await;
+    let pd = match crate::worker::pd_region_stats::fetch_database_region_stats(
+        pd_endpoints,
+        keyspace,
+        db_id,
+    )
+    .await
+    {
+        Ok(pd) => pd,
+        Err(e) => {
+            metrics::counter!(
+                "db9_server_worker_storage_pd_region_stats_total",
+                "result" => "err",
+            )
+            .increment(1);
+            warn!(
+                keyspace,
+                db_id,
+                "PD Region storage stats failed; leaving previous storage stats intact: {}",
+                e
+            );
+            return Err(e.context("PD Region storage stats failed"));
+        }
+    };
+
+    let scan_duration_ms = scan_start.elapsed().as_millis() as i64;
+    let scanned_at_ms = now_epoch_ms();
+
+    let stats = DbStorageStats::pd_region_estimate(
+        db_id,
+        pd.stats.total_bytes_estimate(),
+        pd.stats.count,
+        pd.stats.empty_count,
+        pd.stats.storage_keys,
+        scanned_at_ms,
+        scan_duration_ms,
+    );
+
+    lease_cancel.bail_if_cancelled()?;
+
+    let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
+    let stats_value = serialize_storage_stats(&stats);
+    let mut persist_txn = store.begin().await?;
+    if !store
+        .database_alive_for_update(&mut persist_txn, db_id)
+        .await?
+    {
+        persist_txn.rollback().await.ok();
+        return Ok(StorageScanEffectOutcome::TargetGone);
+    }
+    match store
+        .get_tenant_incarnation_stamp_for_update(&mut persist_txn, db_id)
+        .await?
+    {
+        Some(stamp) if stamp == expected_tenant_incarnation => {}
+        Some(_) | None => {
+            persist_txn.rollback().await.ok();
+            return Ok(StorageScanEffectOutcome::StaleIncarnation);
+        }
+    }
+    if store
+        .get_storage_scan_applied_marker_for_update(&mut persist_txn, db_id)
+        .await?
+        .is_some_and(|marker| {
+            marker.tenant_incarnation == expected_tenant_incarnation && marker.work_id >= work_id
+        })
+    {
+        persist_txn.rollback().await.ok();
+        return Ok(StorageScanEffectOutcome::AlreadyApplied);
+    }
+
+    crate::txn::txn_put(&mut persist_txn, stats_key, stats_value).await?;
+    store
+        .put_storage_scan_applied_marker(
+            &mut persist_txn,
+            db_id,
+            StorageScanAppliedMarker {
+                tenant_incarnation: expected_tenant_incarnation,
+                work_id,
+                applied_at_ms: scanned_at_ms,
+            },
+        )
+        .await?;
+
+    let mut owner_txn = match owner_fence {
+        Some(fence) => match lock_storage_scan_owner_for_commit(fence).await {
+            Ok(txn) => Some(txn),
+            Err(e) => {
+                persist_txn.rollback().await.ok();
+                return Err(e);
+            }
+        },
+        None => None,
+    };
+    let commit_result = persist_txn.commit().await;
+    if let Some(owner_txn) = owner_txn.as_mut() {
+        owner_txn.rollback().await;
+    }
+    commit_result?;
+
+    global_storage_stats_cache().put(keyspace, db_id, stats);
+    metrics::counter!(
+        "db9_server_worker_storage_pd_region_stats_total",
+        "result" => "ok",
+    )
+    .increment(1);
+
+    info!(
+        db_id,
+        keyspace,
+        keyspace_id = pd.keyspace_id,
+        region_count = pd.stats.count,
+        empty_region_count = pd.stats.empty_count,
+        storage_size_mib = pd.stats.storage_size_mib,
+        storage_keys = pd.stats.storage_keys,
+        total_bytes_estimate = pd.stats.total_bytes_estimate(),
+        scan_duration_ms,
+        "Storage size PD Region estimate complete"
+    );
+
+    Ok(StorageScanEffectOutcome::Applied)
+}
+
+pub(crate) async fn request_storage_scan_refresh(
+    system_store: &TikvStore,
+    tenant_store: &TikvStore,
+    keyspace: &str,
+    db_id: u64,
+) -> Result<()> {
+    let lifecycle_store = crate::worker::db_lifecycle_store()?.clone();
+    let Some(tenant_incarnation) = crate::worker::lifecycle::ensure_tenant_lifecycle_identity(
+        &lifecycle_store,
+        tenant_store,
+        keyspace,
+        db_id,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let now_ms = now_epoch_ms();
+    let applied_work_id =
+        latest_storage_scan_applied_work_id(tenant_store, db_id, tenant_incarnation).await?;
+    let mut txn = system_store.begin().await?;
+    match system_store
+        .dropped_db_enqueue_fence_for_update(&mut txn, keyspace, db_id)
+        .await?
+    {
+        DroppedDbEnqueueFence::None => {
+            if !system_store
+                .update_registry_task_types_unless_db_dropped(
+                    &mut txn,
+                    keyspace,
+                    db_id,
+                    TaskType::StorageSizeScan.to_bitmask(),
+                    0,
+                )
+                .await?
+            {
+                txn.rollback().await.ok();
+                return Ok(());
+            }
+        }
+        DroppedDbEnqueueFence::Tombstone => {
+            txn.rollback().await.ok();
+            return Ok(());
+        }
+        DroppedDbEnqueueFence::DroppingIntent => {
+            txn.rollback().await.ok();
+            return Err(anyhow!(
+                "storage scan refresh deferred by in-flight DROP intent for keyspace='{}' db_id={}",
+                keyspace,
+                db_id
+            ));
+        }
+    }
+
+    let existing = system_store
+        .get_storage_scan_bg_state_for_update(&mut txn, keyspace, db_id)
+        .await?;
+    if existing.as_ref().is_some_and(|state| {
+        state.tenant_incarnation == tenant_incarnation
+            && state.status == StorageScanBgStateStatus::Running
+            && state.lease_until_ms > now_ms
+    }) {
+        txn.rollback().await.ok();
+        crate::worker::wake_worker();
+        return Ok(());
+    }
+
+    let current = existing
+        .as_ref()
+        .filter(|state| state.tenant_incarnation == tenant_incarnation);
+    let mut work_id = storage_scan_work_id_at_least_after(now_ms, applied_work_id);
+    if let Some(state) = current {
+        work_id = storage_scan_work_id_at_least_after(work_id, Some(state.work_id));
+        work_id = storage_scan_work_id_at_least_after(work_id, Some(state.last_done_work_id));
+    }
+
+    let state = StorageScanBgState {
+        keyspace: keyspace.to_string(),
+        db_id,
+        tenant_incarnation,
+        status: StorageScanBgStateStatus::Idle,
+        work_id,
+        run_after_ms: now_ms,
+        lease_until_ms: 0,
+        attempt: current.map(|state| state.attempt).unwrap_or(0),
+        last_done_work_id: current.map(|state| state.last_done_work_id).unwrap_or(-1),
+        capacity_token_id: None,
+    };
+    system_store
+        .put_storage_scan_bg_state(&mut txn, &state)
+        .await?;
     txn.commit().await?;
     crate::worker::wake_worker();
     Ok(())

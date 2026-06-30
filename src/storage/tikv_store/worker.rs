@@ -1,7 +1,8 @@
 use super::*;
 use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{
-    HnswS3DbPrefixCleanupIntent, HnswS3GraphUploadIntent, TaskDescriptorV2, TaskPayloadV2,
+    HnswS3DbPrefixCleanupIntent, HnswS3GraphUploadIntent, StorageScanBgState,
+    StorageScanBgStateStatus, StorageScanCapacityToken, TaskDescriptorV2, TaskPayloadV2,
     TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim, WorkerExecutorLease,
     WorkerExecutorLeaseResult, TASK_TYPE_CRON,
 };
@@ -34,6 +35,9 @@ const LIFECYCLE_PROCESS_LIVENESS_VALUE_VERSION: u8 = 1;
 const LIFECYCLE_TENANT_VALUE_VERSION: u8 = 1;
 const LIFECYCLE_TENANT_VALUE_LEN: usize = 18;
 const WORKER_QUEUE_SCHEMA_V2: u8 = 2;
+const STORAGE_SCAN_BG_STATE_VALUE_VERSION: u8 = 1;
+const STORAGE_SCAN_BG_STATE_VALUE_LEN: usize = 48;
+const STORAGE_SCAN_CAPACITY_TOKEN_VALUE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DroppedDbEnqueueFence {
@@ -219,6 +223,92 @@ fn decode_lifecycle_tenant_value(value: &[u8]) -> Option<(u64, LifecycleTenantSt
     let incarnation = u64::from_be_bytes(value[2..10].try_into().ok()?);
     let updated_at_version = u64::from_be_bytes(value[10..18].try_into().ok()?);
     Some((incarnation, status, updated_at_version))
+}
+
+fn encode_storage_scan_bg_state_value(state: &StorageScanBgState) -> Vec<u8> {
+    let mut data = Vec::with_capacity(STORAGE_SCAN_BG_STATE_VALUE_LEN);
+    data.push(STORAGE_SCAN_BG_STATE_VALUE_VERSION);
+    data.push(state.status.encode());
+    data.extend_from_slice(&state.tenant_incarnation.to_be_bytes());
+    data.extend_from_slice(&state.work_id.to_be_bytes());
+    data.extend_from_slice(&state.run_after_ms.to_be_bytes());
+    data.extend_from_slice(&state.lease_until_ms.to_be_bytes());
+    data.extend_from_slice(&state.attempt.to_be_bytes());
+    data.extend_from_slice(&state.last_done_work_id.to_be_bytes());
+    data.extend_from_slice(&state.capacity_token_id.unwrap_or(u16::MAX).to_be_bytes());
+    data
+}
+
+fn decode_storage_scan_bg_state_value(
+    keyspace: &str,
+    db_id: u64,
+    value: &[u8],
+) -> Option<StorageScanBgState> {
+    if value.len() != STORAGE_SCAN_BG_STATE_VALUE_LEN
+        || value[0] != STORAGE_SCAN_BG_STATE_VALUE_VERSION
+    {
+        return None;
+    }
+    let token_id = u16::from_be_bytes(value[46..48].try_into().ok()?);
+    Some(StorageScanBgState {
+        keyspace: keyspace.to_string(),
+        db_id,
+        status: StorageScanBgStateStatus::decode(value[1])?,
+        tenant_incarnation: u64::from_be_bytes(value[2..10].try_into().ok()?),
+        work_id: i64::from_be_bytes(value[10..18].try_into().ok()?),
+        run_after_ms: i64::from_be_bytes(value[18..26].try_into().ok()?),
+        lease_until_ms: i64::from_be_bytes(value[26..34].try_into().ok()?),
+        attempt: u32::from_be_bytes(value[34..38].try_into().ok()?),
+        last_done_work_id: i64::from_be_bytes(value[38..46].try_into().ok()?),
+        capacity_token_id: (token_id != u16::MAX).then_some(token_id),
+    })
+}
+
+fn encode_storage_scan_capacity_token_value(token: &StorageScanCapacityToken) -> Vec<u8> {
+    let mut data = Vec::with_capacity(1 + 2 + token.keyspace.len() + 8 + 8 + 8 + 4 + 8);
+    data.push(STORAGE_SCAN_CAPACITY_TOKEN_VALUE_VERSION);
+    data.extend_from_slice(&(token.keyspace.len() as u16).to_be_bytes());
+    data.extend_from_slice(token.keyspace.as_bytes());
+    data.extend_from_slice(&token.db_id.to_be_bytes());
+    data.extend_from_slice(&token.tenant_incarnation.to_be_bytes());
+    data.extend_from_slice(&token.work_id.to_be_bytes());
+    data.extend_from_slice(&token.attempt.to_be_bytes());
+    data.extend_from_slice(&token.lease_until_ms.to_be_bytes());
+    data
+}
+
+fn decode_storage_scan_capacity_token_value(value: &[u8]) -> Option<StorageScanCapacityToken> {
+    if value.len() < 1 + 2 + 8 + 8 + 8 + 4 + 8
+        || value[0] != STORAGE_SCAN_CAPACITY_TOKEN_VALUE_VERSION
+    {
+        return None;
+    }
+    let keyspace_len = u16::from_be_bytes([value[1], value[2]]) as usize;
+    let mut idx = 3;
+    if idx + keyspace_len + 8 + 8 + 8 + 4 + 8 != value.len() {
+        return None;
+    }
+    let keyspace = std::str::from_utf8(&value[idx..idx + keyspace_len])
+        .ok()?
+        .to_string();
+    idx += keyspace_len;
+    let db_id = u64::from_be_bytes(value[idx..idx + 8].try_into().ok()?);
+    idx += 8;
+    let tenant_incarnation = u64::from_be_bytes(value[idx..idx + 8].try_into().ok()?);
+    idx += 8;
+    let work_id = i64::from_be_bytes(value[idx..idx + 8].try_into().ok()?);
+    idx += 8;
+    let attempt = u32::from_be_bytes(value[idx..idx + 4].try_into().ok()?);
+    idx += 4;
+    let lease_until_ms = i64::from_be_bytes(value[idx..idx + 8].try_into().ok()?);
+    Some(StorageScanCapacityToken {
+        keyspace,
+        db_id,
+        tenant_incarnation,
+        work_id,
+        attempt,
+        lease_until_ms,
+    })
 }
 
 fn tikv_error_is_worker_claim_contention(err: &tikv_client::Error) -> bool {
@@ -426,6 +516,8 @@ impl TikvStore {
         let deleted = self.reap_db_queue_entries(keyspace, db_id).await?;
 
         let mut txn = self.begin().await?;
+        self.delete_storage_scan_bg_state(&mut txn, keyspace, db_id)
+            .await?;
         self.delete_worker_registry(&mut txn, keyspace, db_id)
             .await?;
         txn.commit().await?;
@@ -2381,6 +2473,86 @@ impl TikvStore {
         Ok((records, next_cursor))
     }
 
+    pub async fn get_storage_scan_bg_state_for_update(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<Option<StorageScanBgState>> {
+        let key = self.key(&encode_worker_bg_storage_scan_state_key(keyspace, db_id));
+        let Some(value) = tikv_op!(txn.get_for_update(key).await)? else {
+            return Ok(None);
+        };
+        decode_storage_scan_bg_state_value(keyspace, db_id, &value)
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to decode StorageSizeScan bg state for keyspace='{}' db_id={}",
+                    keyspace,
+                    db_id
+                )
+            })
+    }
+
+    pub async fn put_storage_scan_bg_state(
+        &self,
+        txn: &mut Transaction,
+        state: &StorageScanBgState,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_bg_storage_scan_state_key(
+            &state.keyspace,
+            state.db_id,
+        ));
+        txn_put(txn, key, encode_storage_scan_bg_state_value(state)).await?;
+        Ok(())
+    }
+
+    pub async fn delete_storage_scan_bg_state(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_bg_storage_scan_state_key(keyspace, db_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
+    pub async fn get_storage_scan_capacity_token_for_update(
+        &self,
+        txn: &mut Transaction,
+        token_id: u16,
+    ) -> Result<Option<StorageScanCapacityToken>> {
+        let key = self.key(&encode_worker_bg_storage_scan_capacity_key(token_id));
+        let Some(value) = tikv_op!(txn.get_for_update(key).await)? else {
+            return Ok(None);
+        };
+        decode_storage_scan_capacity_token_value(&value)
+            .map(Some)
+            .ok_or_else(|| anyhow!("Failed to decode StorageSizeScan capacity token {token_id}"))
+    }
+
+    pub async fn put_storage_scan_capacity_token(
+        &self,
+        txn: &mut Transaction,
+        token_id: u16,
+        token: &StorageScanCapacityToken,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_bg_storage_scan_capacity_key(token_id));
+        txn_put(txn, key, encode_storage_scan_capacity_token_value(token)).await?;
+        Ok(())
+    }
+
+    pub async fn delete_storage_scan_capacity_token(
+        &self,
+        txn: &mut Transaction,
+        token_id: u16,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_bg_storage_scan_capacity_key(token_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
     // ========================================================================
     // GC instance state methods (shared cross-instance registry)
     // ========================================================================
@@ -2572,6 +2744,57 @@ mod tests {
         let mut bad_status = encoded.clone();
         bad_status[1] = 99;
         assert_eq!(decode_lifecycle_tenant_value(&bad_status), None);
+    }
+
+    #[test]
+    fn storage_scan_bg_state_value_round_trips_capacity_owner() {
+        let state = StorageScanBgState {
+            keyspace: "ks".to_string(),
+            db_id: 7,
+            tenant_incarnation: 11,
+            status: StorageScanBgStateStatus::Running,
+            work_id: 21,
+            run_after_ms: 31,
+            lease_until_ms: 41,
+            attempt: 3,
+            last_done_work_id: 13,
+            capacity_token_id: Some(2),
+        };
+        let encoded = encode_storage_scan_bg_state_value(&state);
+        assert_eq!(encoded.len(), STORAGE_SCAN_BG_STATE_VALUE_LEN);
+        assert_eq!(encoded[0], STORAGE_SCAN_BG_STATE_VALUE_VERSION);
+        assert_eq!(
+            decode_storage_scan_bg_state_value("ks", 7, &encoded),
+            Some(state)
+        );
+
+        let mut bad_status = encoded.clone();
+        bad_status[1] = 99;
+        assert_eq!(
+            decode_storage_scan_bg_state_value("ks", 7, &bad_status),
+            None
+        );
+    }
+
+    #[test]
+    fn storage_scan_capacity_token_value_round_trips_owner() {
+        let token = StorageScanCapacityToken {
+            keyspace: "tenant_a".to_string(),
+            db_id: 9,
+            tenant_incarnation: 17,
+            work_id: 23,
+            attempt: 5,
+            lease_until_ms: 99,
+        };
+        let encoded = encode_storage_scan_capacity_token_value(&token);
+        assert_eq!(encoded[0], STORAGE_SCAN_CAPACITY_TOKEN_VALUE_VERSION);
+        assert_eq!(
+            decode_storage_scan_capacity_token_value(&encoded),
+            Some(token)
+        );
+
+        let truncated = &encoded[..encoded.len() - 1];
+        assert_eq!(decode_storage_scan_capacity_token_value(truncated), None);
     }
 
     #[test]

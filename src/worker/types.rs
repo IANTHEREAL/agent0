@@ -70,6 +70,65 @@ impl HnswS3DbPrefixCleanupIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageScanBgStateStatus {
+    Idle,
+    Running,
+}
+
+impl StorageScanBgStateStatus {
+    pub(crate) fn encode(self) -> u8 {
+        match self {
+            Self::Idle => 1,
+            Self::Running => 2,
+        }
+    }
+
+    pub(crate) fn decode(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Idle),
+            2 => Some(Self::Running),
+            _ => None,
+        }
+    }
+}
+
+/// StorageSizeScan's first derived-state canary row.
+///
+/// This is intentionally one row per `(keyspace, db_id, tenant_incarnation)`.
+/// `work_id` is the stable logical effect id and progress advances only after
+/// the PD stats effect has committed in the tenant keyspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageScanBgState {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub tenant_incarnation: u64,
+    pub status: StorageScanBgStateStatus,
+    pub work_id: i64,
+    pub run_after_ms: i64,
+    pub lease_until_ms: i64,
+    pub attempt: u32,
+    pub last_done_work_id: i64,
+    pub capacity_token_id: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageScanCapacityToken {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub tenant_incarnation: u64,
+    pub work_id: i64,
+    pub attempt: u32,
+    pub lease_until_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageScanAppliedMarker {
+    pub tenant_incarnation: u64,
+    pub work_id: i64,
+    pub applied_at_ms: i64,
+}
+
 // ============================================================================
 // TaskType Enum
 // ============================================================================
