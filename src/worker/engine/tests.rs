@@ -681,6 +681,24 @@ fn missing_tenant_registry_sweep_reaps_instead_of_backoff() {
         !missing_arm.contains("registry_sweep_record_failure"),
         "missing tenant is permanent orphan state and must not enter sweep backoff"
     );
+
+    let runtime_missing_arm = sweep
+        .split(".process_registry_sweep_entry(entry, &store, &cron_config)")
+        .nth(1)
+        .and_then(|rest| rest.split("Err(e) =>").next())
+        .expect("registry sweep tenant-store errors must have a missing-tenant arm");
+    assert!(
+        runtime_missing_arm.contains("Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace)")
+            && runtime_missing_arm.contains("drop(handle)")
+            && runtime_missing_arm.contains("reap_missing_tenant_worker_state")
+            && runtime_missing_arm.contains("registry_sweep_record_registry_deleted")
+            && runtime_missing_arm.contains("processed += 1"),
+        "cached tenant-store missing-keyspace errors must reap registry state instead of entering entry backoff"
+    );
+    assert!(
+        !runtime_missing_arm.contains("registry_sweep_record_failure"),
+        "cached tenant-store missing-keyspace errors must not enter registry sweep backoff"
+    );
 }
 
 #[test]
@@ -719,6 +737,31 @@ fn missing_tenant_claim_paths_reap_before_retry_cleanup() {
             && post_execute.contains("return Ok(())"),
         "missing tenant from execute_task must reap before ordinary failure cleanup or HNSW retry backoff"
     );
+
+    let finalize_guard = core
+        .split("let finalize_result =")
+        .nth(1)
+        .and_then(|rest| rest.split("// Cleanup: delete OUR worker claim").next())
+        .expect("finalize missing-tenant guard must run before ordinary cleanup");
+    assert!(
+        finalize_guard.contains("Self::is_missing_tenant_error(e, &entry.keyspace)")
+            && finalize_guard.contains("reap_missing_tenant_worker_state")
+            && finalize_guard.contains("return Ok(())"),
+        "missing tenant from cron finalize must reap before ordinary cleanup or retry"
+    );
+
+    let requeue_guard = core
+        .split("Self::requeue_next_cron_fire(system_store, pool, &mut txn, &entry)")
+        .nth(1)
+        .and_then(|rest| rest.split("Self::record_bg_sql_result").next())
+        .expect("cron requeue missing-tenant guard must exist before bg result recording");
+    assert!(
+        requeue_guard.contains("Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace)")
+            && requeue_guard.contains("txn.rollback().await.ok()")
+            && requeue_guard.contains("reap_missing_tenant_worker_state")
+            && requeue_guard.contains("return Ok(())"),
+        "missing tenant from cron next-fire requeue must rollback cleanup and reap instead of retrying"
+    );
 }
 
 #[test]
@@ -747,6 +790,53 @@ fn missing_tenant_orphan_reap_helper_orders_queue_registry_before_claim_delete()
         helper.contains("db9_server_worker_orphan_task_deleted_total")
             && helper.contains("db9_server_worker_orphan_registry_deleted_total"),
         "missing-tenant cleanup must emit distinct orphan cleanup metrics"
+    );
+    assert!(
+        helper.contains("pool.evict_missing_tenant(keyspace).await"),
+        "missing-tenant cleanup must evict cached tenant clients before future acquires can reuse them"
+    );
+}
+
+#[test]
+fn missing_tenant_registry_sweep_kind_errors_escape_kind_backoff() {
+    let source = include_str!("../engine.rs");
+    let prod_source = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs must contain #[cfg(test)]");
+    let process_entry = prod_source
+        .split("async fn process_registry_sweep_entry(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn record_registry_sweep_kind_result")
+                .next()
+        })
+        .expect("process_registry_sweep_entry must exist before kind result helper");
+    assert!(
+        process_entry
+            .matches("if Self::is_missing_tenant_error(&e, &entry.keyspace)")
+            .count()
+            >= 3,
+        "cursor-based registry sweep probes must propagate missing-tenant errors instead of recording kind backoff"
+    );
+
+    let kind_helper = prod_source
+        .split("async fn record_registry_sweep_kind_result(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn reconcile_incomplete_cic_indexes_for_db_safe")
+                .next()
+        })
+        .expect("record_registry_sweep_kind_result must exist before CIC reconcile");
+    let missing_check = kind_helper
+        .find("if Self::is_missing_tenant_error(&e, &entry.keyspace)")
+        .expect("kind helper must check missing-tenant errors");
+    let kind_backoff = kind_helper
+        .find("registry_sweep_record_kind_failure")
+        .expect("kind helper must still back off transient subsystem errors");
+    assert!(
+        missing_check < kind_backoff && kind_helper.contains("return Err(e);"),
+        "shared registry sweep kind helper must let missing-tenant errors escape before kind backoff"
     );
 }
 

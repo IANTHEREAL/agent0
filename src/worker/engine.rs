@@ -4,7 +4,7 @@ use crate::cron::types::{CronJob, CronRun, CronRunState, CronRunStatus};
 use crate::cron::worker::gc_database;
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
-use crate::pool::{missing_tenant_keyspace, TikvClientPool};
+use crate::pool::{is_missing_tenant_keyspace, TikvClientPool};
 use crate::sql::ddl;
 use crate::sql::executor::core::retry::is_retryable_tikv_error;
 use crate::sql::parse_sql;
@@ -851,6 +851,7 @@ impl WorkerEngine {
                 Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) => {
                     let reaped = Self::reap_missing_tenant_worker_state(
                         &self.system_store,
+                        &self.pool,
                         &entry.keyspace,
                         entry.db_id,
                         None,
@@ -890,6 +891,27 @@ impl WorkerEngine {
                     page_hnsw_enqueued += outcome.hnsw_enqueued as u64;
                     page_hnsw_enqueue_errors += outcome.hnsw_enqueue_errors as u64;
                     self.registry_sweep_record_success(&backoff_key).await;
+                }
+                Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) => {
+                    drop(handle);
+                    let reaped = Self::reap_missing_tenant_worker_state(
+                        &self.system_store,
+                        &self.pool,
+                        &entry.keyspace,
+                        entry.db_id,
+                        None,
+                    )
+                    .await?;
+                    self.registry_sweep_record_registry_deleted(&backoff_key)
+                        .await;
+                    processed += 1;
+                    info!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        reaped,
+                        "Worker registry sweep removed missing-tenant worker inventory after tenant-store error"
+                    );
+                    continue;
                 }
                 Err(e) => {
                     self.registry_sweep_record_failure(&backoff_key).await;
@@ -1671,7 +1693,7 @@ impl WorkerEngine {
             }
             .await;
             self.record_registry_sweep_kind_result(entry, kind, result)
-                .await;
+                .await?;
         }
 
         let kind = RegistrySweepKind::Cic;
@@ -1697,6 +1719,9 @@ impl WorkerEngine {
                         .await;
                 }
                 Err(e) => {
+                    if Self::is_missing_tenant_error(&e, &entry.keyspace) {
+                        return Err(e);
+                    }
                     self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
                         .await;
                     warn!(
@@ -1733,6 +1758,9 @@ impl WorkerEngine {
                         .await;
                 }
                 Err(e) => {
+                    if Self::is_missing_tenant_error(&e, &entry.keyspace) {
+                        return Err(e);
+                    }
                     self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
                         .await;
                     warn!(
@@ -1777,6 +1805,9 @@ impl WorkerEngine {
                         .await;
                 }
                 Err(e) => {
+                    if Self::is_missing_tenant_error(&e, &entry.keyspace) {
+                        return Err(e);
+                    }
                     self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
                         .await;
                     warn!(
@@ -1801,7 +1832,7 @@ impl WorkerEngine {
                     .sweep_hnsw_s3_orphans_for_entry(entry, store)
                     .await;
                 self.record_registry_sweep_kind_result(entry, kind, result)
-                    .await;
+                    .await?;
             }
         }
 
@@ -1817,7 +1848,7 @@ impl WorkerEngine {
             }
             .await;
             self.record_registry_sweep_kind_result(entry, kind, result)
-                .await;
+                .await?;
         }
 
         Ok(outcome)
@@ -1828,13 +1859,17 @@ impl WorkerEngine {
         entry: &TaskRegistryEntry,
         kind: RegistrySweepKind,
         result: Result<()>,
-    ) {
+    ) -> Result<()> {
         match result {
             Ok(()) => {
                 self.registry_sweep_record_kind_success(&entry.keyspace, entry.db_id, kind)
                     .await;
+                Ok(())
             }
             Err(e) => {
+                if Self::is_missing_tenant_error(&e, &entry.keyspace) {
+                    return Err(e);
+                }
                 self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
                     .await;
                 warn!(
@@ -1844,6 +1879,7 @@ impl WorkerEngine {
                     "Worker registry sweep task failed: {}",
                     e
                 );
+                Ok(())
             }
         }
     }
@@ -2344,11 +2380,12 @@ impl WorkerEngine {
     }
 
     fn is_missing_tenant_error(error: &anyhow::Error, keyspace: &str) -> bool {
-        missing_tenant_keyspace(error) == Some(keyspace)
+        is_missing_tenant_keyspace(error, keyspace)
     }
 
     async fn reap_missing_tenant_worker_state(
         system_store: &Arc<TikvStore>,
+        pool: &Arc<TikvClientPool>,
         keyspace: &str,
         db_id: u64,
         claim: Option<MissingTenantClaimCleanup<'_>>,
@@ -2356,6 +2393,7 @@ impl WorkerEngine {
         let task_type_label = claim
             .map(|claim| claim.task_type.as_str())
             .unwrap_or("registry");
+        let evicted_cached_tenant = pool.evict_missing_tenant(keyspace).await;
 
         let reaped = system_store
             .reap_db_queue_entries_then_delete_worker_registry(keyspace, db_id)
@@ -2405,6 +2443,7 @@ impl WorkerEngine {
             keyspace,
             db_id,
             reaped,
+            evicted_cached_tenant,
             task_type = task_type_label,
             "Reaped worker state for missing tenant keyspace"
         );
@@ -2718,6 +2757,7 @@ impl WorkerEngine {
                 Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) => {
                     Self::reap_missing_tenant_worker_state(
                         system_store,
+                        pool,
                         &entry.keyspace,
                         entry.db_id,
                         Some(MissingTenantClaimCleanup {
@@ -2826,6 +2866,7 @@ impl WorkerEngine {
             if Self::is_missing_tenant_error(e, &entry.keyspace) {
                 Self::reap_missing_tenant_worker_state(
                     system_store,
+                    pool,
                     &entry.keyspace,
                     entry.db_id,
                     Some(MissingTenantClaimCleanup {
@@ -2915,6 +2956,24 @@ impl WorkerEngine {
         if let Err(ref e) = finalize_result {
             warn!("finalize_cron_run failed: {e}; proceeding with cleanup");
         }
+        if let Err(e) = &finalize_result {
+            if Self::is_missing_tenant_error(e, &entry.keyspace) {
+                Self::reap_missing_tenant_worker_state(
+                    system_store,
+                    pool,
+                    &entry.keyspace,
+                    entry.db_id,
+                    Some(MissingTenantClaimCleanup {
+                        task_id: entry.task_id,
+                        fire_time_ms: queue_fire_time_ms,
+                        task_type: entry.task_type,
+                        worker_id: &config.worker_id,
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
 
         // Cleanup: delete OUR worker claim, manage queue entry, requeue next
         // cron fire. This block ALWAYS runs regardless of finalize_result.
@@ -2983,7 +3042,31 @@ impl WorkerEngine {
         // `load_next_cron_queue_entry`'s own tenant fence + the dropped-DB tombstone
         // fence on the enqueue below.
         if entry.task_type == TaskType::Cron && should_requeue_cron && finalize_result.is_ok() {
-            Self::requeue_next_cron_fire(system_store, pool, &mut txn, &entry).await?;
+            match Self::requeue_next_cron_fire(system_store, pool, &mut txn, &entry).await {
+                Ok(()) => {}
+                Err(e) if Self::is_missing_tenant_error(&e, &entry.keyspace) => {
+                    txn.rollback().await.ok();
+                    drop(txn);
+                    Self::reap_missing_tenant_worker_state(
+                        system_store,
+                        pool,
+                        &entry.keyspace,
+                        entry.db_id,
+                        Some(MissingTenantClaimCleanup {
+                            task_id: entry.task_id,
+                            fire_time_ms: queue_fire_time_ms,
+                            task_type: entry.task_type,
+                            worker_id: &config.worker_id,
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    txn.rollback().await.ok();
+                    return Err(e);
+                }
+            }
         }
 
         Self::record_bg_sql_result(system_store, &mut txn, &entry, &exec_result).await?;

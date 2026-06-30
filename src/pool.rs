@@ -59,6 +59,14 @@ pub(crate) fn missing_tenant_keyspace(error: &anyhow::Error) -> Option<&str> {
         .map(TenantKeyspaceMissing::keyspace)
 }
 
+pub(crate) fn is_missing_tenant_keyspace(error: &anyhow::Error, keyspace: &str) -> bool {
+    if let Some(missing_keyspace) = missing_tenant_keyspace(error) {
+        return missing_keyspace == keyspace;
+    }
+
+    format!("{:?}", error).contains("keyspace does not exist")
+}
+
 /// How often the reaper scans for idle tenants.
 const DEFAULT_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const TENANT_INVENTORY_REPAIR_RETRY_DELAY: Duration = Duration::from_secs(60);
@@ -1742,6 +1750,15 @@ impl TikvClientPool {
             .map(|e| e.active_connections.load(Ordering::Relaxed))
     }
 
+    fn evict_per_keyspace_caches(keyspace: &str) {
+        crate::auth::invalidate_initialized(keyspace);
+        crate::sql::fts_tokenizers::evict_user_tsc_keyspace(keyspace);
+        crate::extensions::embedding::evict_embedding_semaphore(keyspace);
+        crate::extensions::http::evict_http_limiter(keyspace);
+        crate::extensions::parquet::limits::evict_parquet_limiter(keyspace);
+        admission_budget_registry().evict(keyspace);
+    }
+
     /// Snapshot cached tenant stores without acquiring new keyspaces.
     ///
     /// Used by repair/reconcile loops that must cover tenants this process has
@@ -1817,12 +1834,7 @@ impl TikvClientPool {
             let mut locks = self.creation_locks.write().await;
             for ks in &evicted {
                 locks.remove(ks);
-                crate::auth::invalidate_initialized(ks);
-                crate::sql::fts_tokenizers::evict_user_tsc_keyspace(ks);
-                crate::extensions::embedding::evict_embedding_semaphore(ks);
-                crate::extensions::http::evict_http_limiter(ks);
-                crate::extensions::parquet::limits::evict_parquet_limiter(ks);
-                admission_budget_registry().evict(ks);
+                Self::evict_per_keyspace_caches(ks);
             }
         }
 
@@ -1858,12 +1870,34 @@ impl TikvClientPool {
             locks.remove(keyspace);
             drop(locks);
 
-            crate::auth::invalidate_initialized(keyspace);
-            crate::sql::fts_tokenizers::evict_user_tsc_keyspace(keyspace);
-            crate::extensions::embedding::evict_embedding_semaphore(keyspace);
-            crate::extensions::http::evict_http_limiter(keyspace);
-            crate::extensions::parquet::limits::evict_parquet_limiter(keyspace);
-            admission_budget_registry().evict(keyspace);
+            Self::evict_per_keyspace_caches(keyspace);
+        }
+
+        removed
+    }
+
+    /// Evict a cached tenant after TiKV reports the keyspace no longer exists.
+    ///
+    /// Unlike idle eviction, this removes the pool entry even while other handles
+    /// still hold Arcs to the old store. Those handles may still fail their
+    /// in-flight work, but future acquires must not keep reusing the stale client.
+    pub(crate) async fn evict_missing_tenant(&self, keyspace: &str) -> bool {
+        let removed = {
+            let mut tenants = self.tenants.write().await;
+            tenants.remove(keyspace).is_some()
+        };
+
+        if removed {
+            {
+                let mut idx = self.idle_index.lock();
+                idx.retain(|(_, ks)| ks != keyspace);
+            }
+
+            let mut locks = self.creation_locks.write().await;
+            locks.remove(keyspace);
+            drop(locks);
+
+            Self::evict_per_keyspace_caches(keyspace);
         }
 
         removed
@@ -1975,6 +2009,62 @@ mod tests {
             missing_tenant_keyspace(&plain),
             None,
             "classification must use the typed pool error, not message text"
+        );
+    }
+
+    #[test]
+    fn runtime_tikv_keyspace_missing_error_uses_known_tenant_context() {
+        use anyhow::Context;
+
+        let raw = anyhow::anyhow!("KvError: keyspace does not exist");
+        assert!(is_missing_tenant_keyspace(&raw, "db9_tenant_cached"));
+
+        let wrapped = Err::<(), _>(anyhow::anyhow!(
+            "region request failed: keyspace does not exist"
+        ))
+        .context("tenant-store operation failed")
+        .expect_err("must wrap raw TiKV error");
+        assert!(is_missing_tenant_keyspace(&wrapped, "db9_tenant_cached"));
+
+        let typed_other: anyhow::Error = TenantKeyspaceMissing::new("db9_tenant_other").into();
+        assert!(
+            !is_missing_tenant_keyspace(&typed_other, "db9_tenant_cached"),
+            "typed missing-tenant errors must still match the specific tenant"
+        );
+
+        let plain = anyhow::anyhow!("Tenant 'db9_tenant_cached' does not exist");
+        assert!(
+            !is_missing_tenant_keyspace(&plain, "db9_tenant_cached"),
+            "generic tenant text must not be treated as a TiKV keyspace-missing runtime error"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_missing_tenant_removes_cached_active_entry() {
+        let pool = TikvClientPool::new_with_timeouts(
+            vec!["127.0.0.1:2379".to_string()],
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+        let keyspace = "db9_tenant_cached_missing";
+        let entry = pool.inject_entry(keyspace).await;
+        let handle = make_handle(&entry);
+
+        assert_eq!(pool.tenant_count().await, 1);
+        assert_eq!(pool.connections_for(keyspace).await, Some(1));
+
+        assert!(
+            pool.evict_missing_tenant(keyspace).await,
+            "missing-tenant eviction must drop cached entries even while a stale handle is active"
+        );
+        assert_eq!(pool.tenant_count().await, 0);
+        assert_eq!(pool.connections_for(keyspace).await, None);
+
+        drop(handle);
+        assert_eq!(pool.tenant_count().await, 0);
+        assert!(
+            !pool.evict_missing_tenant(keyspace).await,
+            "evicting an already-removed tenant should be a no-op"
         );
     }
 
