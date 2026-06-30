@@ -186,6 +186,31 @@ impl StorageScanOwnerTxn {
     }
 }
 
+/// Per-claim deadlines and identity derived from the worker-queue key, the due
+/// descriptor, and the worker config. Pure derivation (no I/O) extracted from
+/// `claim_and_execute_core` so the orchestrator reads as a linear sequence.
+struct ClaimContext {
+    queue_fire_time_ms: i64,
+    scheduled_minute: i64,
+    task_type: TaskType,
+    claim_keyspace: String,
+    claim_db_id: u64,
+    claim_task_id: i64,
+    legacy_orphan_timeout_ms: i64,
+    cron_control_floor_ms: i64,
+    claim_lease_ms: i64,
+    claim: WorkerClaim,
+}
+
+/// Result of the post-claim existence re-check in `claim_and_execute_core`.
+enum PostClaimPresence {
+    /// The due key still exists; proceed to hydrate and execute.
+    Present,
+    /// The due key was deleted since the tick scanned it; the just-won claim was
+    /// released and the caller must skip (return Ok).
+    ReleasedSkip,
+}
+
 fn storage_scan_interval_ms(interval_sec: u64) -> i64 {
     i64::try_from(interval_sec.max(1))
         .unwrap_or(i64::MAX / 1000)
@@ -2418,30 +2443,21 @@ impl WorkerEngine {
         ) -> Fut,
         Fut: Future<Output = Result<()>> + Send,
     {
-        let queue_fire_time_ms = crate::storage::decode_wq_due_v2_fire_time(&queue_key)
-            .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
-        let scheduled_minute = queue_fire_time_ms.div_euclid(60_000);
-        let task_type = due.task_type();
-        let (claim_keyspace, claim_db_id, claim_task_id) =
-            (due.keyspace().to_string(), due.db_id(), due.task_id());
-        // Worker-queue SYSTEM-claim orphan timeout: a fallback for legacy claims
-        // without an explicit lease. The live run renews its claim via the lease
-        // keeper, so this stays the raw control timeout (it gates the queue claim,
-        // not the cron control deadline).
-        let legacy_orphan_timeout_ms = (config.orphan_timeout_sec as i64).saturating_mul(1000);
-        // Cron CONTROL/ACTIVE floor: the FROZEN orphan deadline must cover the
-        // full legitimate EXECUTION window. With no per-job `max_runtime_ms` that
-        // window is `cron_job_timeout_ms`, not the bare `orphan_timeout_sec`, so
-        // the floor is the effective `max(orphan_timeout, cron_job_timeout)` — the
-        // SAME single-source helper the GC reaper view uses (no second copy that
-        // can drift). The per-claim path then takes a further `max` with
-        // `job.max_runtime_ms` inside `cron_effective_orphan_deadline_ms`.
-        let cron_control_floor_ms = crate::worker::gc::effective_cron_orphan_floor_ms(
-            config.orphan_timeout_sec,
-            config.cron_job_timeout_ms,
-        );
-        let claim_lease_ms = config.claim_lease_ms as i64;
-        let claim = WorkerClaim::with_lease(config.worker_id.clone(), task_type, claim_lease_ms);
+        // P1: derive the per-claim deadlines and identity from the queue key,
+        // due descriptor, and config (corrupted-key decode failures bail here).
+        let ctx = Self::derive_claim_context(&queue_key, &due, config)?;
+        let ClaimContext {
+            queue_fire_time_ms,
+            scheduled_minute,
+            task_type,
+            claim_keyspace,
+            claim_db_id,
+            claim_task_id,
+            legacy_orphan_timeout_ms,
+            cron_control_floor_ms,
+            claim_lease_ms: _claim_lease_ms,
+            claim,
+        } = ctx;
 
         let mut txn = system_store.begin().await?;
         let claimed = system_store
@@ -2464,96 +2480,38 @@ impl WorkerEngine {
         }
         txn.commit().await?;
 
-        // Post-claim existence re-check: if the due key was deleted since the
-        // tick scanned it — by another replica that executed it first, by
-        // unschedule, or by a DROP DATABASE reap — do NOT execute. This makes
-        // execution at-most-once across concurrent replicas (the shared claim
-        // alone only blocks *simultaneous* execution, not read-before /
-        // claim-after-release re-execution).
-        let still_present = {
-            let mut rtxn = system_store.begin().await?;
-            let present = rtxn.get(queue_key.clone()).await?.is_some();
-            rtxn.rollback().await.ok();
-            present
-        };
-        if !still_present {
-            Self::release_claim(
-                system_store,
-                &claim_keyspace,
-                claim_db_id,
-                claim_task_id,
-                queue_fire_time_ms,
-                task_type,
-            )
-            .await?;
-            return Ok(());
+        // P3: post-claim existence re-check + release-on-absent.
+        match Self::recheck_present_or_release(
+            system_store,
+            &queue_key,
+            &claim_keyspace,
+            claim_db_id,
+            claim_task_id,
+            queue_fire_time_ms,
+            task_type,
+        )
+        .await?
+        {
+            PostClaimPresence::Present => {}
+            PostClaimPresence::ReleasedSkip => return Ok(()),
         }
 
-        // Hydrate the full entry now that we own the claim and confirmed it
-        // exists. Split V2 types fetch the command/username/schedule out-of-line
-        // by exact identity.
-        let entry: TaskQueueEntry = match due {
-            DueItem::V2(descriptor) => {
-                let payload = if descriptor.needs_payload() {
-                    let mut ptxn = system_store.begin().await?;
-                    let p = system_store
-                        .get_task_payload_v2(
-                            &mut ptxn,
-                            task_type.to_bitmask(),
-                            &claim_keyspace,
-                            claim_db_id,
-                            claim_task_id,
-                            queue_fire_time_ms,
-                        )
-                        .await?;
-                    ptxn.rollback().await.ok();
-                    p
-                } else {
-                    None
-                };
-                match descriptor.into_entry(payload) {
-                    Some(e) => e,
-                    None => {
-                        // Descriptor present but payload missing. put_task_v2 /
-                        // delete_task_v2 write/remove descriptor+index+payload
-                        // atomically, so the normal cause is a concurrent delete
-                        // that already removed the descriptor too (no-op below).
-                        // If instead the descriptor genuinely persists without a
-                        // payload (corruption), tear down the orphaned
-                        // descriptor+index here so we do NOT re-claim it every
-                        // tick forever; then release the claim and skip.
-                        let mut ctxn = system_store.begin().await?;
-                        system_store
-                            .delete_task_v2(
-                                &mut ctxn,
-                                &queue_key,
-                                &claim_keyspace,
-                                claim_db_id,
-                                task_type.to_bitmask(),
-                                claim_task_id,
-                                queue_fire_time_ms,
-                            )
-                            .await?;
-                        system_store
-                            .delete_worker_claim(
-                                &mut ctxn,
-                                &claim_keyspace,
-                                claim_db_id,
-                                claim_task_id,
-                                queue_fire_time_ms,
-                                task_type,
-                            )
-                            .await?;
-                        ctxn.commit().await?;
-                        warn!(
-                            "V2 task payload missing after claim; cleaned orphaned descriptor and skipped: \
-                             keyspace={} db_id={} task_id={} type={:?} fire_time={}",
-                            claim_keyspace, claim_db_id, claim_task_id, task_type, queue_fire_time_ms
-                        );
-                        return Ok(());
-                    }
-                }
-            }
+        // P4: hydrate the full entry, tearing down an orphaned descriptor (and
+        // releasing the claim) if its payload is missing.
+        let entry: TaskQueueEntry = match Self::hydrate_entry_or_release(
+            system_store,
+            &queue_key,
+            due,
+            &claim_keyspace,
+            claim_db_id,
+            claim_task_id,
+            queue_fire_time_ms,
+            task_type,
+        )
+        .await?
+        {
+            Some(entry) => entry,
+            None => return Ok(()),
         };
 
         let (cron_run, keep_queue_entry, should_requeue_cron) = if entry.task_type == TaskType::Cron
@@ -2767,48 +2725,16 @@ impl WorkerEngine {
             return Ok(());
         }
 
-        if !keep_queue_entry {
-            if entry.task_type.uses_deterministic_queue_key() {
-                // Deterministic-key tasks can be overwritten by a later enqueue
-                // while a worker still holds the old claim. Read-compare-delete
-                // ensures cleanup only removes the descriptor it processed.
-                //
-                // HNSW merge additionally keeps the row on failure so a worker
-                // with the right capability can retry. Other deterministic tasks
-                // delete the exact processed descriptor even after failure.
-                if exec_result.is_ok()
-                    || !entry.task_type.keeps_deterministic_queue_entry_on_failure()
-                {
-                    if let Some(current_bytes) = txn.get(queue_key.clone()).await? {
-                        let current_nonce = TaskDescriptorV2::decode(&current_bytes)
-                            .map(|d| d.nonce)
-                            .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?;
-                        if current_nonce == entry.nonce {
-                            Self::delete_due_entry(
-                                system_store,
-                                &mut txn,
-                                &queue_key,
-                                &entry,
-                                queue_fire_time_ms,
-                            )
-                            .await?;
-                        }
-                        // nonce mismatch → DML overwrote → skip delete, next tick handles it
-                    }
-                }
-            } else {
-                // Non-deterministic queue keys are unique per logical due row, so
-                // cleanup can delete the exact scanned key unconditionally.
-                Self::delete_due_entry(
-                    system_store,
-                    &mut txn,
-                    &queue_key,
-                    &entry,
-                    queue_fire_time_ms,
-                )
-                .await?;
-            }
-        }
+        Self::delete_queue_entry_after_exec(
+            system_store,
+            &mut txn,
+            &queue_key,
+            &entry,
+            queue_fire_time_ms,
+            keep_queue_entry,
+            exec_result.is_ok(),
+        )
+        .await?;
 
         // Requeue the next cron fire whenever the claimed minute is DONE
         // (`should_requeue_cron`): we ran/took-over the fire, OR the claim observed
@@ -2830,46 +2756,295 @@ impl WorkerEngine {
         // `load_next_cron_queue_entry`'s own tenant fence + the dropped-DB tombstone
         // fence on the enqueue below.
         if entry.task_type == TaskType::Cron && should_requeue_cron && finalize_result.is_ok() {
-            // The next-fire decision must cross the SAME DB-liveness fence that
-            // finalize uses. The database metadata row lives in the TENANT
-            // keyspace (not this system_store txn), so the fence is taken inside
-            // load_next_cron_queue_entry's own tenant txn via
-            // assert_database_alive_for_update: a dropped/!alive DB makes it
-            // return None, so no next entry is written into the global queue.
-            //
-            // The cross-store residual (a DROP committing between that tenant
-            // fence and this system commit) is now PREVENTED, not merely
-            // self-healing (issue #2628 item 2): the enqueue routes through
-            // enqueue_task_v2_unless_db_dropped, which takes get_for_update on
-            // the durable dropped-DB tombstone (written by DROP's reap in the
-            // SYSTEM store) in THIS SAME system txn as put_task_v2. The reap's
-            // tombstone put and this enqueue then conflict under pessimistic
-            // txns — at most one commits, and a retry sees the tombstone and
-            // suppresses — so no stale next-fire row survives for a dropped db.
-            if let Some(next_entry) = Self::load_next_cron_queue_entry(pool, &entry).await? {
-                if let Some(schedule) = next_entry.schedule.as_deref() {
-                    if let Ok(next_fire) = compute_next_fire_time(schedule) {
-                        // Cross-store fence: tombstone get_for_update +
-                        // put_task_v2 in this SAME system txn (issue #2628 item
-                        // 2). A DROP-reap that committed the tombstone (or races
-                        // this commit) conflicts on the tombstone key, so no
-                        // stale next-fire row survives for a dropped db_id.
+            Self::requeue_next_cron_fire(system_store, pool, &mut txn, &entry).await?;
+        }
+
+        Self::record_bg_sql_result(system_store, &mut txn, &entry, &exec_result).await?;
+
+        txn.commit().await?;
+
+        // Propagate finalize error AFTER cleanup succeeds.
+        finalize_result?;
+
+        Self::record_task_outcome(system_store, metrics, &entry, &exec_result).await;
+
+        Ok(())
+    }
+
+    /// P1: derive the per-claim deadlines and identity from the queue key, due
+    /// descriptor, and config. Pure derivation; the only failure is a corrupted
+    /// queue key whose fire_time cannot be decoded.
+    fn derive_claim_context(
+        queue_key: &[u8],
+        due: &DueItem,
+        config: &WorkerConfig,
+    ) -> Result<ClaimContext> {
+        let queue_fire_time_ms = crate::storage::decode_wq_due_v2_fire_time(queue_key)
+            .ok_or_else(|| anyhow!("corrupted worker queue key: missing fire_time_ms"))?;
+        let scheduled_minute = queue_fire_time_ms.div_euclid(60_000);
+        let task_type = due.task_type();
+        let (claim_keyspace, claim_db_id, claim_task_id) =
+            (due.keyspace().to_string(), due.db_id(), due.task_id());
+        // Worker-queue SYSTEM-claim orphan timeout: a fallback for legacy claims
+        // without an explicit lease. The live run renews its claim via the lease
+        // keeper, so this stays the raw control timeout (it gates the queue claim,
+        // not the cron control deadline).
+        let legacy_orphan_timeout_ms = (config.orphan_timeout_sec as i64).saturating_mul(1000);
+        // Cron CONTROL/ACTIVE floor: the FROZEN orphan deadline must cover the
+        // full legitimate EXECUTION window. With no per-job `max_runtime_ms` that
+        // window is `cron_job_timeout_ms`, not the bare `orphan_timeout_sec`, so
+        // the floor is the effective `max(orphan_timeout, cron_job_timeout)` — the
+        // SAME single-source helper the GC reaper view uses (no second copy that
+        // can drift). The per-claim path then takes a further `max` with
+        // `job.max_runtime_ms` inside `cron_effective_orphan_deadline_ms`.
+        let cron_control_floor_ms = crate::worker::gc::effective_cron_orphan_floor_ms(
+            config.orphan_timeout_sec,
+            config.cron_job_timeout_ms,
+        );
+        let claim_lease_ms = config.claim_lease_ms as i64;
+        let claim = WorkerClaim::with_lease(config.worker_id.clone(), task_type, claim_lease_ms);
+
+        Ok(ClaimContext {
+            queue_fire_time_ms,
+            scheduled_minute,
+            task_type,
+            claim_keyspace,
+            claim_db_id,
+            claim_task_id,
+            legacy_orphan_timeout_ms,
+            cron_control_floor_ms,
+            claim_lease_ms,
+            claim,
+        })
+    }
+
+    /// P3: post-claim existence re-check. If the due key was deleted since the
+    /// tick scanned it — by another replica that executed it first, by
+    /// unschedule, or by a DROP DATABASE reap — do NOT execute. This makes
+    /// execution at-most-once across concurrent replicas (the shared claim
+    /// alone only blocks *simultaneous* execution, not read-before /
+    /// claim-after-release re-execution). On absence, release the just-won claim
+    /// and tell the caller to skip.
+    async fn recheck_present_or_release(
+        system_store: &Arc<TikvStore>,
+        queue_key: &[u8],
+        claim_keyspace: &str,
+        claim_db_id: u64,
+        claim_task_id: i64,
+        queue_fire_time_ms: i64,
+        task_type: TaskType,
+    ) -> Result<PostClaimPresence> {
+        let still_present = {
+            let mut rtxn = system_store.begin().await?;
+            let present = rtxn.get(queue_key.to_vec()).await?.is_some();
+            rtxn.rollback().await.ok();
+            present
+        };
+        if !still_present {
+            Self::release_claim(
+                system_store,
+                claim_keyspace,
+                claim_db_id,
+                claim_task_id,
+                queue_fire_time_ms,
+                task_type,
+            )
+            .await?;
+            return Ok(PostClaimPresence::ReleasedSkip);
+        }
+        Ok(PostClaimPresence::Present)
+    }
+
+    /// P4: hydrate the full entry now that we own the claim and confirmed it
+    /// exists. Split V2 types fetch the command/username/schedule out-of-line by
+    /// exact identity. Returns `None` (and releases the claim) when the
+    /// descriptor is orphaned (present without a payload): tear it down so we do
+    /// NOT re-claim it every tick forever, then skip.
+    #[allow(clippy::too_many_arguments)]
+    async fn hydrate_entry_or_release(
+        system_store: &Arc<TikvStore>,
+        queue_key: &[u8],
+        due: DueItem,
+        claim_keyspace: &str,
+        claim_db_id: u64,
+        claim_task_id: i64,
+        queue_fire_time_ms: i64,
+        task_type: TaskType,
+    ) -> Result<Option<TaskQueueEntry>> {
+        let entry: TaskQueueEntry = match due {
+            DueItem::V2(descriptor) => {
+                let payload = if descriptor.needs_payload() {
+                    let mut ptxn = system_store.begin().await?;
+                    let p = system_store
+                        .get_task_payload_v2(
+                            &mut ptxn,
+                            task_type.to_bitmask(),
+                            claim_keyspace,
+                            claim_db_id,
+                            claim_task_id,
+                            queue_fire_time_ms,
+                        )
+                        .await?;
+                    ptxn.rollback().await.ok();
+                    p
+                } else {
+                    None
+                };
+                match descriptor.into_entry(payload) {
+                    Some(e) => e,
+                    None => {
+                        // Descriptor present but payload missing. put_task_v2 /
+                        // delete_task_v2 write/remove descriptor+index+payload
+                        // atomically, so the normal cause is a concurrent delete
+                        // that already removed the descriptor too (no-op below).
+                        // If instead the descriptor genuinely persists without a
+                        // payload (corruption), tear down the orphaned
+                        // descriptor+index here so we do NOT re-claim it every
+                        // tick forever; then release the claim and skip.
+                        let mut ctxn = system_store.begin().await?;
                         system_store
-                            .enqueue_task_v2_unless_db_dropped(&mut txn, &next_entry, next_fire)
+                            .delete_task_v2(
+                                &mut ctxn,
+                                queue_key,
+                                claim_keyspace,
+                                claim_db_id,
+                                task_type.to_bitmask(),
+                                claim_task_id,
+                                queue_fire_time_ms,
+                            )
                             .await?;
+                        system_store
+                            .delete_worker_claim(
+                                &mut ctxn,
+                                claim_keyspace,
+                                claim_db_id,
+                                claim_task_id,
+                                queue_fire_time_ms,
+                                task_type,
+                            )
+                            .await?;
+                        ctxn.commit().await?;
+                        warn!(
+                            "V2 task payload missing after claim; cleaned orphaned descriptor and skipped: \
+                             keyspace={} db_id={} task_id={} type={:?} fire_time={}",
+                            claim_keyspace, claim_db_id, claim_task_id, task_type, queue_fire_time_ms
+                        );
+                        return Ok(None);
                     }
                 }
             }
-        }
+        };
+        Ok(Some(entry))
+    }
 
+    /// Cleanup tail: delete the processed due row unless a live run holds it
+    /// (`keep_queue_entry`). Deterministic-key tasks read-compare-delete on the
+    /// task-type contract; non-deterministic keys delete unconditionally. Writes
+    /// into the caller's cleanup `txn` (no commit here).
+    async fn delete_queue_entry_after_exec(
+        system_store: &Arc<TikvStore>,
+        txn: &mut tikv_client::Transaction,
+        queue_key: &[u8],
+        entry: &TaskQueueEntry,
+        queue_fire_time_ms: i64,
+        keep_queue_entry: bool,
+        exec_ok: bool,
+    ) -> Result<()> {
+        if !keep_queue_entry {
+            if entry.task_type.uses_deterministic_queue_key() {
+                // Deterministic-key tasks can be overwritten by a later enqueue
+                // while a worker still holds the old claim. Read-compare-delete
+                // ensures cleanup only removes the descriptor it processed.
+                //
+                // HNSW merge additionally keeps the row on failure so a worker
+                // with the right capability can retry. Other deterministic tasks
+                // delete the exact processed descriptor even after failure.
+                if exec_ok || !entry.task_type.keeps_deterministic_queue_entry_on_failure() {
+                    if let Some(current_bytes) = txn.get(queue_key.to_vec()).await? {
+                        let current_nonce = TaskDescriptorV2::decode(&current_bytes)
+                            .map(|d| d.nonce)
+                            .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?;
+                        if current_nonce == entry.nonce {
+                            Self::delete_due_entry(
+                                system_store,
+                                txn,
+                                queue_key,
+                                entry,
+                                queue_fire_time_ms,
+                            )
+                            .await?;
+                        }
+                        // nonce mismatch → DML overwrote → skip delete, next tick handles it
+                    }
+                }
+            } else {
+                // Non-deterministic queue keys are unique per logical due row, so
+                // cleanup can delete the exact scanned key unconditionally.
+                Self::delete_due_entry(system_store, txn, queue_key, entry, queue_fire_time_ms)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cleanup tail: enqueue the cron job's NEXT fire into the caller's cleanup
+    /// `txn`. Only called when the claimed minute is DONE and finalize succeeded
+    /// (see the gate at the call site).
+    async fn requeue_next_cron_fire(
+        system_store: &Arc<TikvStore>,
+        pool: &Arc<TikvClientPool>,
+        txn: &mut tikv_client::Transaction,
+        entry: &TaskQueueEntry,
+    ) -> Result<()> {
+        // The next-fire decision must cross the SAME DB-liveness fence that
+        // finalize uses. The database metadata row lives in the TENANT
+        // keyspace (not this system_store txn), so the fence is taken inside
+        // load_next_cron_queue_entry's own tenant txn via
+        // assert_database_alive_for_update: a dropped/!alive DB makes it
+        // return None, so no next entry is written into the global queue.
+        //
+        // The cross-store residual (a DROP committing between that tenant
+        // fence and this system commit) is now PREVENTED, not merely
+        // self-healing (issue #2628 item 2): the enqueue routes through
+        // enqueue_task_v2_unless_db_dropped, which takes get_for_update on
+        // the durable dropped-DB tombstone (written by DROP's reap in the
+        // SYSTEM store) in THIS SAME system txn as put_task_v2. The reap's
+        // tombstone put and this enqueue then conflict under pessimistic
+        // txns — at most one commits, and a retry sees the tombstone and
+        // suppresses — so no stale next-fire row survives for a dropped db.
+        if let Some(next_entry) = Self::load_next_cron_queue_entry(pool, entry).await? {
+            if let Some(schedule) = next_entry.schedule.as_deref() {
+                if let Ok(next_fire) = compute_next_fire_time(schedule) {
+                    // Cross-store fence: tombstone get_for_update +
+                    // put_task_v2 in this SAME system txn (issue #2628 item
+                    // 2). A DROP-reap that committed the tombstone (or races
+                    // this commit) conflicts on the tombstone key, so no
+                    // stale next-fire row survives for a dropped db_id.
+                    system_store
+                        .enqueue_task_v2_unless_db_dropped(txn, &next_entry, next_fire)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Cleanup tail: record the BgSql result text into the caller's cleanup
+    /// `txn`. No-op for non-BgSql task types.
+    async fn record_bg_sql_result(
+        system_store: &Arc<TikvStore>,
+        txn: &mut tikv_client::Transaction,
+        entry: &TaskQueueEntry,
+        exec_result: &Result<usize>,
+    ) -> Result<()> {
         if entry.task_type == TaskType::BgSql {
-            let result_text = match &exec_result {
+            let result_text = match exec_result {
                 Ok(_) => "OK".to_string(),
                 Err(e) => format!("ERROR: {}", e),
             };
             system_store
                 .put_bg_result(
-                    &mut txn,
+                    txn,
                     &entry.keyspace,
                     entry.db_id,
                     entry.task_id,
@@ -2877,12 +3052,18 @@ impl WorkerEngine {
                 )
                 .await?;
         }
+        Ok(())
+    }
 
-        txn.commit().await?;
-
-        // Propagate finalize error AFTER cleanup succeeds.
-        finalize_result?;
-
+    /// Post-commit result recording: metrics, async-trigger queue-depth
+    /// sampling + trigger event, and the completion/failure log line. Runs after
+    /// the cleanup txn commits and never affects correctness.
+    async fn record_task_outcome(
+        system_store: &Arc<TikvStore>,
+        metrics: &Arc<WorkerMetrics>,
+        entry: &TaskQueueEntry,
+        exec_result: &Result<usize>,
+    ) {
         match exec_result {
             Ok(_) => {
                 metrics.record_task_result(entry.task_type, true);
@@ -2905,7 +3086,7 @@ impl WorkerEngine {
                     entry.keyspace, entry.db_id, entry.task_id, entry.task_type
                 );
             }
-            Err(ref e) => {
+            Err(e) => {
                 metrics.record_task_result(entry.task_type, false);
                 if entry.task_type == crate::worker::types::TaskType::AsyncTrigger {
                     crate::metrics::record_trigger_event(&entry.keyspace, "failed");
@@ -2927,8 +3108,6 @@ impl WorkerEngine {
                 );
             }
         }
-
-        Ok(())
     }
 
     /// Returns `(cron_run, keep_queue_entry, requeue_next_fire)`:

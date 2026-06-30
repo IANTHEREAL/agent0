@@ -4467,6 +4467,15 @@ fn all_long_lived_worker_txns_must_register_with_gc_safepoint() {
         "finish_storage_scan_derived_run",
         // [claim] Pessimistic claim attempt: 1 key check + commit.
         "claim_and_execute_core",
+        // [lookup] Post-claim existence re-check extracted from
+        // claim_and_execute_core: single point read + immediate rollback (then a
+        // short release_claim on absence). No snapshot held across execution.
+        "recheck_present_or_release",
+        // [lookup] Entry hydration extracted from claim_and_execute_core: a short
+        // payload point-read + immediate rollback, plus (only on an orphaned
+        // descriptor) a bounded descriptor+claim teardown + immediate commit.
+        // No snapshot held across task execution.
+        "hydrate_entry_or_release",
         // [claim] Release a just-won claim: single key delete + immediate commit.
         "release_claim",
         // [claim] Per-renewal txn: get_for_update own claim + put + immediate

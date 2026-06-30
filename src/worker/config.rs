@@ -232,6 +232,103 @@ fn parse_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// Read `var` as a `u64`, clamping to `min`. On a value below `min` or a
+/// non-integer value, leave `*current` unchanged and emit the exact same
+/// `warn!` text the hand-written blocks used. `unit` is the trailing unit
+/// suffix in the message ("ms" or "s").
+fn parse_u64_min(var: &str, current: &mut u64, min: u64, unit: &str) {
+    if let Ok(v) = env::var(var) {
+        match v.parse::<u64>() {
+            Ok(parsed) if parsed >= min => {
+                *current = parsed;
+            }
+            Ok(parsed) => {
+                tracing::warn!(
+                    "{}={} is below minimum {}{}; using default {}{}",
+                    var,
+                    parsed,
+                    min,
+                    unit,
+                    *current,
+                    unit
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "{}='{}' is not a valid integer; using default {}{}",
+                    var,
+                    v,
+                    *current,
+                    unit
+                );
+            }
+        }
+    }
+}
+
+/// Read `var` as a `u64` with no minimum. On a non-integer value, leave
+/// `*current` unchanged and emit the exact same `warn!` text the hand-written
+/// blocks used. `unit` is the trailing unit suffix in the message ("ms" or "s").
+fn parse_u64_warn(var: &str, current: &mut u64, unit: &str) {
+    if let Ok(v) = env::var(var) {
+        match v.parse::<u64>() {
+            Ok(parsed) => *current = parsed,
+            Err(_) => {
+                tracing::warn!(
+                    "{}='{}' is not a valid integer; using default {}{}",
+                    var,
+                    v,
+                    *current,
+                    unit
+                );
+            }
+        }
+    }
+}
+
+/// Read `var` as a positive `u64`, leaving `*current` unchanged on a missing,
+/// non-integer, or non-positive value. Silent (no `warn!`) — matches the
+/// `.parse().ok().filter(|n| *n > 0).unwrap_or(...)` blocks.
+fn parse_positive_u64(var: &str, current: &mut u64) {
+    if let Ok(v) = env::var(var) {
+        *current = v.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(*current);
+    }
+}
+
+/// Read `var` as a positive `usize`, leaving `*current` unchanged on a missing,
+/// non-integer, or non-positive value. Silent (no `warn!`).
+fn parse_positive_usize(var: &str, current: &mut usize) {
+    if let Ok(v) = env::var(var) {
+        *current = v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(*current);
+    }
+}
+
+/// Read `var` as a positive `usize` parsed through a `u64` and capped at
+/// `u32::MAX`, leaving `*current` unchanged on a missing, non-integer, or
+/// non-positive value. Silent (no `warn!`) — matches the `gc_batch_size` block.
+fn parse_positive_usize_u32capped(var: &str, current: &mut usize) {
+    if let Ok(v) = env::var(var) {
+        *current = v
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(|n| n.min(u32::MAX as u64) as usize)
+            .unwrap_or(*current);
+    }
+}
+
+/// Read `var` as a boolean via [`parse_bool`], leaving `*current` unchanged on
+/// a missing or unrecognized value. Silent (no `warn!`).
+fn parse_bool_var(var: &str, current: &mut bool) {
+    if let Ok(v) = env::var(var) {
+        *current = parse_bool(&v).unwrap_or(*current);
+    }
+}
+
 impl WorkerConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
@@ -249,273 +346,91 @@ impl WorkerConfig {
                 }
             }
         }
-        if let Ok(v) = env::var("DB9_WORKER_POLL_MS") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_POLL_MS => {
-                    cfg.poll_ms = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_POLL_MS={} is below minimum {}ms; using default {}ms",
-                        parsed,
-                        MIN_POLL_MS,
-                        cfg.poll_ms
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_POLL_MS='{}' is not a valid integer; using default {}ms",
-                        v,
-                        cfg.poll_ms
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_MAX_CONCURRENT_JOBS") {
-            cfg.max_concurrent_jobs = v
-                .parse::<usize>()
-                .ok()
-                .filter(|n| *n > 0)
-                .unwrap_or(cfg.max_concurrent_jobs);
-        }
+        parse_u64_min("DB9_WORKER_POLL_MS", &mut cfg.poll_ms, MIN_POLL_MS, "ms");
+        parse_positive_usize(
+            "DB9_WORKER_MAX_CONCURRENT_JOBS",
+            &mut cfg.max_concurrent_jobs,
+        );
         if let Ok(v) = env::var("DB9_WORKER_ID") {
             cfg.worker_id = v;
         }
-        if let Ok(v) = env::var("DB9_WORKER_STATEMENT_TIMEOUT_MS") {
-            match v.parse::<u64>() {
-                Ok(parsed) => cfg.statement_timeout_ms = parsed,
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_STATEMENT_TIMEOUT_MS='{}' is not a valid integer; using default {}ms",
-                        v,
-                        cfg.statement_timeout_ms
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_CRON_JOB_TIMEOUT_MS") {
-            match v.parse::<u64>() {
-                Ok(parsed) => cfg.cron_job_timeout_ms = parsed,
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_CRON_JOB_TIMEOUT_MS='{}' is not a valid integer; using default {}ms",
-                        v,
-                        cfg.cron_job_timeout_ms
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_ORPHAN_TIMEOUT_SEC") {
-            cfg.orphan_timeout_sec = v
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .unwrap_or(cfg.orphan_timeout_sec);
-        }
-        if let Ok(v) = env::var("DB9_WORKER_CLAIM_LEASE_MS") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_CLAIM_LEASE_MS => {
-                    cfg.claim_lease_ms = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_CLAIM_LEASE_MS={} is below minimum {}ms; using default {}ms",
-                        parsed,
-                        MIN_CLAIM_LEASE_MS,
-                        cfg.claim_lease_ms
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_CLAIM_LEASE_MS='{}' is not a valid integer; using default {}ms",
-                        v,
-                        cfg.claim_lease_ms
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_EXECUTOR_LEASE_MS") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_EXECUTOR_LEASE_MS => {
-                    cfg.executor_lease_ms = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_EXECUTOR_LEASE_MS={} is below minimum {}ms; using default {}ms",
-                        parsed,
-                        MIN_EXECUTOR_LEASE_MS,
-                        cfg.executor_lease_ms
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_EXECUTOR_LEASE_MS='{}' is not a valid integer; using default {}ms",
-                        v,
-                        cfg.executor_lease_ms
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_GC_BATCH_SIZE") {
-            cfg.gc_batch_size = v
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .map(|n| n.min(u32::MAX as u64) as usize)
-                .unwrap_or(cfg.gc_batch_size);
-        }
-        if let Ok(v) = env::var("DB9_AUTO_ANALYZE_ENABLED") {
-            cfg.auto_analyze_enabled = parse_bool(&v).unwrap_or(cfg.auto_analyze_enabled);
-        }
-        if let Ok(v) = env::var("DB9_AUTO_ANALYZE_THRESHOLD") {
-            cfg.auto_analyze_threshold = v
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .unwrap_or(cfg.auto_analyze_threshold);
-        }
-        if let Ok(v) = env::var("DB9_WORKER_GC_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_GC_INTERVAL_SEC => {
-                    cfg.gc_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_GC_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_GC_INTERVAL_SEC,
-                        cfg.gc_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_GC_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.gc_interval_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_HNSW_SWEEP_INTERVAL_SEC => {
-                    cfg.hnsw_sweep_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_HNSW_SWEEP_INTERVAL_SEC,
-                        cfg.hnsw_sweep_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.hnsw_sweep_interval_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_REGISTRY_SWEEP_INTERVAL_SEC => {
-                    cfg.registry_sweep_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_REGISTRY_SWEEP_INTERVAL_SEC,
-                        cfg.registry_sweep_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.registry_sweep_interval_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_SWEEP_PAGE_INTERVAL_SEC => {
-                    cfg.sweep_page_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_SWEEP_PAGE_INTERVAL_SEC,
-                        cfg.sweep_page_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.sweep_page_interval_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_STORAGE_SCAN_INTERVAL_SEC => {
-                    cfg.storage_scan_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_STORAGE_SCAN_INTERVAL_SEC,
-                        cfg.storage_scan_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.storage_scan_interval_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_STORAGE_SCAN_JITTER_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) => cfg.storage_scan_jitter_sec = parsed,
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_STORAGE_SCAN_JITTER_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.storage_scan_jitter_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS") {
-            match v.parse::<u64>() {
-                Ok(parsed) => cfg.storage_scan_pd_rate_limit_ms = parsed,
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS='{}' is not a valid integer; using default {}ms",
-                        v,
-                        cfg.storage_scan_pd_rate_limit_ms
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_STORAGE_SCAN_DERIVED_ACTIVE") {
-            cfg.storage_scan_derived_active =
-                parse_bool(&v).unwrap_or(cfg.storage_scan_derived_active);
-        }
-        if let Ok(v) = env::var("DB9_STORAGE_SCAN_DERIVED_SHADOW") {
-            cfg.storage_scan_derived_shadow =
-                parse_bool(&v).unwrap_or(cfg.storage_scan_derived_shadow);
-        }
+        parse_u64_warn(
+            "DB9_WORKER_STATEMENT_TIMEOUT_MS",
+            &mut cfg.statement_timeout_ms,
+            "ms",
+        );
+        parse_u64_warn(
+            "DB9_CRON_JOB_TIMEOUT_MS",
+            &mut cfg.cron_job_timeout_ms,
+            "ms",
+        );
+        parse_positive_u64("DB9_WORKER_ORPHAN_TIMEOUT_SEC", &mut cfg.orphan_timeout_sec);
+        parse_u64_min(
+            "DB9_WORKER_CLAIM_LEASE_MS",
+            &mut cfg.claim_lease_ms,
+            MIN_CLAIM_LEASE_MS,
+            "ms",
+        );
+        parse_u64_min(
+            "DB9_WORKER_EXECUTOR_LEASE_MS",
+            &mut cfg.executor_lease_ms,
+            MIN_EXECUTOR_LEASE_MS,
+            "ms",
+        );
+        parse_positive_usize_u32capped("DB9_WORKER_GC_BATCH_SIZE", &mut cfg.gc_batch_size);
+        parse_bool_var("DB9_AUTO_ANALYZE_ENABLED", &mut cfg.auto_analyze_enabled);
+        parse_positive_u64(
+            "DB9_AUTO_ANALYZE_THRESHOLD",
+            &mut cfg.auto_analyze_threshold,
+        );
+        parse_u64_min(
+            "DB9_WORKER_GC_INTERVAL_SEC",
+            &mut cfg.gc_interval_sec,
+            MIN_GC_INTERVAL_SEC,
+            "s",
+        );
+        parse_u64_min(
+            "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC",
+            &mut cfg.hnsw_sweep_interval_sec,
+            MIN_HNSW_SWEEP_INTERVAL_SEC,
+            "s",
+        );
+        parse_u64_min(
+            "DB9_WORKER_REGISTRY_SWEEP_INTERVAL_SEC",
+            &mut cfg.registry_sweep_interval_sec,
+            MIN_REGISTRY_SWEEP_INTERVAL_SEC,
+            "s",
+        );
+        parse_u64_min(
+            "DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC",
+            &mut cfg.sweep_page_interval_sec,
+            MIN_SWEEP_PAGE_INTERVAL_SEC,
+            "s",
+        );
+        parse_u64_min(
+            "DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC",
+            &mut cfg.storage_scan_interval_sec,
+            MIN_STORAGE_SCAN_INTERVAL_SEC,
+            "s",
+        );
+        parse_u64_warn(
+            "DB9_WORKER_STORAGE_SCAN_JITTER_SEC",
+            &mut cfg.storage_scan_jitter_sec,
+            "s",
+        );
+        parse_u64_warn(
+            "DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS",
+            &mut cfg.storage_scan_pd_rate_limit_ms,
+            "ms",
+        );
+        parse_bool_var(
+            "DB9_STORAGE_SCAN_DERIVED_ACTIVE",
+            &mut cfg.storage_scan_derived_active,
+        );
+        parse_bool_var(
+            "DB9_STORAGE_SCAN_DERIVED_SHADOW",
+            &mut cfg.storage_scan_derived_shadow,
+        );
         if let Ok(v) = env::var("DB9_STORAGE_SCAN_DERIVED_CAPACITY") {
             match v.parse::<u16>() {
                 Ok(parsed) if parsed > 0 => cfg.storage_scan_derived_capacity = parsed,
@@ -564,28 +479,12 @@ impl WorkerConfig {
                 }
             }
         }
-        if let Ok(v) = env::var("DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC => {
-                    cfg.db_lifecycle_publish_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC,
-                        cfg.db_lifecycle_publish_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.db_lifecycle_publish_interval_sec
-                    );
-                }
-            }
-        }
+        parse_u64_min(
+            "DB9_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC",
+            &mut cfg.db_lifecycle_publish_interval_sec,
+            MIN_DB_LIFECYCLE_PUBLISH_INTERVAL_SEC,
+            "s",
+        );
         if let Ok(v) = env::var("DB9_BG_KEYSPACE") {
             cfg.bg_keyspace = v;
         }
@@ -603,53 +502,19 @@ impl WorkerConfig {
         }
 
         // GC safepoint configuration
-        if let Ok(v) = env::var("DB9_GC_SAFEPOINT_ENABLED") {
-            cfg.gc_safepoint_enabled = parse_bool(&v).unwrap_or(cfg.gc_safepoint_enabled);
-        }
-        if let Ok(v) = env::var("DB9_GC_SAFEPOINT_INTERVAL_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_GC_SAFEPOINT_INTERVAL_SEC => {
-                    cfg.gc_safepoint_interval_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_GC_SAFEPOINT_INTERVAL_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_GC_SAFEPOINT_INTERVAL_SEC,
-                        cfg.gc_safepoint_interval_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_GC_SAFEPOINT_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.gc_safepoint_interval_sec
-                    );
-                }
-            }
-        }
-        if let Ok(v) = env::var("DB9_GC_LIFE_TIME_SEC") {
-            match v.parse::<u64>() {
-                Ok(parsed) if parsed >= MIN_GC_LIFE_TIME_SEC => {
-                    cfg.gc_life_time_sec = parsed;
-                }
-                Ok(parsed) => {
-                    tracing::warn!(
-                        "DB9_GC_LIFE_TIME_SEC={} is below minimum {}s; using default {}s",
-                        parsed,
-                        MIN_GC_LIFE_TIME_SEC,
-                        cfg.gc_life_time_sec
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "DB9_GC_LIFE_TIME_SEC='{}' is not a valid integer; using default {}s",
-                        v,
-                        cfg.gc_life_time_sec
-                    );
-                }
-            }
-        }
+        parse_bool_var("DB9_GC_SAFEPOINT_ENABLED", &mut cfg.gc_safepoint_enabled);
+        parse_u64_min(
+            "DB9_GC_SAFEPOINT_INTERVAL_SEC",
+            &mut cfg.gc_safepoint_interval_sec,
+            MIN_GC_SAFEPOINT_INTERVAL_SEC,
+            "s",
+        );
+        parse_u64_min(
+            "DB9_GC_LIFE_TIME_SEC",
+            &mut cfg.gc_life_time_sec,
+            MIN_GC_LIFE_TIME_SEC,
+            "s",
+        );
 
         tracing::info!(
             "Worker config loaded: DB9_WORKER_ENABLED raw='{}', resolved={}",
