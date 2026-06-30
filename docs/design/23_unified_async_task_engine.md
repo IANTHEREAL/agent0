@@ -203,7 +203,7 @@ struct TaskQueueEntry {
     command: String,        // SQL to execute
     username: String,       // execution identity
     schedule: Option<String>, // cron expression (Cron type only)
-    priority: u8,           // 0-255, higher priority executes first
+    priority: u8,           // 0-255; lower numeric values execute first
 }
 ```
 

@@ -1008,6 +1008,8 @@ production path may write or delete a subset.
 | AutoAnalyze | 128 | 0 | `table_id as i64` | no (**change**: today fire=now; becomes deterministic singleton) |
 | AsyncTrigger (event) | 200 | `outbox.created_at_ms` | `outbox_id` | yes |
 
+Lower numeric priority values sort and dispatch first.
+
 `uses_deterministic_queue_key()` returns true for StorageSizeScan, HnswMerge,
 AutoAnalyze. Cron, BgSql, BgDdl keep their existing event identities and
 priorities unchanged.

@@ -1528,6 +1528,16 @@ mod tests {
     }
 
     #[test]
+    fn wq_due_v2_lower_priority_values_sort_first() {
+        let refresh_nudge = encode_wq_due_v2_key(64, 2_000, 1, "t", 1, 1).unwrap();
+        let foreground = encode_wq_due_v2_key(128, 1_000, 1, "t", 1, 2).unwrap();
+        let background_storage_scan = encode_wq_due_v2_key(200, 0, 1, "t", 1, 3).unwrap();
+
+        assert!(refresh_nudge < foreground);
+        assert!(foreground < background_storage_scan);
+    }
+
+    #[test]
     fn wq_due_v2_scan_end_bounds_priority_band() {
         let end = encode_wq_due_v2_scan_end(5, 1000).unwrap();
         let inside = encode_wq_due_v2_key(5, 1000, 1, "k", 1, 2).unwrap();

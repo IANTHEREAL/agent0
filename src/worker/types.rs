@@ -412,7 +412,7 @@ pub struct TaskQueueEntry {
     pub username: String,
     #[serde(default)]
     pub schedule: Option<String>, // cron expression (only for Cron type)
-    pub priority: u8, // 0-255, higher priority executes first
+    pub priority: u8, // 0-255; lower numeric values execute first
     #[serde(default)] // backward compat: existing entries deserialize as 0
     pub nonce: u64,
 }
