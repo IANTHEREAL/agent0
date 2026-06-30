@@ -59,14 +59,10 @@ const SWEEP_BACKOFF_BASE_INTERVALS: u32 = 1;
 const SWEEP_BACKOFF_MAX_SHIFT: u32 = 5;
 const DISABLED_CHECK_THRESHOLD: u32 = 5;
 const CIC_REPAIR_TABLE_PAGE_SIZE: usize = 256;
+const DDL_JOURNAL_PAGE_SIZE: usize = 16;
 const HNSW_DIRTY_MARKER_PAGE_SIZE: usize = 256;
 const PD_REGION_STATS_HTTP_TIMEOUT_MS: i64 = 5_000;
 const STORAGE_SCAN_DERIVED_LEASE_COMMIT_GRACE_MS: i64 = 30_000;
-const STORAGE_SCAN_REFRESH_NUDGE_COMMAND: &str = "__storage_scan_refresh_nudge";
-const STORAGE_SCAN_PERIODIC_PRIORITY: u8 = 200;
-// Lower numeric queue priority is dispatched earlier. Manual refresh is a
-// user-visible request and must not sit behind background cron maintenance.
-const STORAGE_SCAN_REFRESH_NUDGE_PRIORITY: u8 = 64;
 
 async fn worker_bgsql_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -99,6 +95,7 @@ struct RegistrySweepState {
     kind_backoff: HashMap<RegistrySweepKindKey, RegistrySweepBackoff>,
     missing_database_seen: HashSet<(String, u64)>,
     cic_table_cursors: HashMap<(String, u64), Vec<u8>>,
+    ddl_journal_cursors: HashMap<(String, u64), Vec<u8>>,
     hnsw_dirty_cursors: HashMap<(String, u64), Vec<u8>>,
 }
 
@@ -114,6 +111,7 @@ impl Default for RegistrySweepState {
             kind_backoff: HashMap::new(),
             missing_database_seen: HashSet::new(),
             cic_table_cursors: HashMap::new(),
+            ddl_journal_cursors: HashMap::new(),
             hnsw_dirty_cursors: HashMap::new(),
         }
     }
@@ -140,12 +138,6 @@ impl RegistrySweepKind {
             Self::StorageScan => "storage_scan",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageScanQueueMode {
-    Singleton,
-    RefreshNudge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +263,12 @@ fn storage_scan_retry_after_ms(now_ms: i64, attempt: u32) -> i64 {
     now_ms.saturating_add(backoff_ms)
 }
 
+fn hnsw_merge_retry_after_ms(now_ms: i64, attempt: u32) -> i64 {
+    let shift = attempt.min(5);
+    let backoff_ms = 30_000_i64.saturating_mul(1_i64 << shift);
+    now_ms.saturating_add(backoff_ms)
+}
+
 fn storage_scan_derived_lease_ms(config: &WorkerConfig, pd_endpoint_count: usize) -> i64 {
     let endpoint_count = i64::try_from(pd_endpoint_count.max(1)).unwrap_or(i64::MAX / 10_000);
     let pd_http_budget_ms = PD_REGION_STATS_HTTP_TIMEOUT_MS
@@ -346,6 +344,32 @@ fn storage_scan_idle_after_success(
         last_done_work_id,
         capacity_token_id: None,
         ..state
+    }
+}
+
+fn storage_scan_idle_after_capacity_full(
+    existing: Option<&StorageScanBgState>,
+    keyspace: &str,
+    db_id: u64,
+    tenant_incarnation: u64,
+    work_id: i64,
+    now_ms: i64,
+    attempt: u32,
+) -> StorageScanBgState {
+    StorageScanBgState {
+        keyspace: keyspace.to_string(),
+        db_id,
+        tenant_incarnation,
+        status: StorageScanBgStateStatus::Idle,
+        work_id,
+        run_after_ms: storage_scan_retry_after_ms(now_ms, attempt),
+        lease_until_ms: 0,
+        attempt: attempt.saturating_add(1),
+        last_done_work_id: existing
+            .filter(|state| state.tenant_incarnation == tenant_incarnation)
+            .map(|state| state.last_done_work_id)
+            .unwrap_or(-1),
+        capacity_token_id: None,
     }
 }
 
@@ -1053,6 +1077,7 @@ impl WorkerEngine {
         state.entry_backoff.remove(key);
         state.missing_database_seen.remove(key);
         state.cic_table_cursors.remove(key);
+        state.ddl_journal_cursors.remove(key);
         state.hnsw_dirty_cursors.remove(key);
         state.kind_backoff.retain(|kind_key, _| {
             kind_key.keyspace.as_str() != key.0.as_str() || kind_key.db_id != key.1
@@ -1079,6 +1104,29 @@ impl WorkerEngine {
             state.cic_table_cursors.insert(key, cursor);
         } else {
             state.cic_table_cursors.remove(&key);
+        }
+    }
+
+    async fn ddl_journal_cursor(&self, keyspace: &str, db_id: u64) -> Option<Vec<u8>> {
+        let state = self.registry_sweep_state.lock().await;
+        state
+            .ddl_journal_cursors
+            .get(&(keyspace.to_string(), db_id))
+            .cloned()
+    }
+
+    async fn record_ddl_journal_cursor(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+        next_cursor: Option<Vec<u8>>,
+    ) {
+        let mut state = self.registry_sweep_state.lock().await;
+        let key = (keyspace.to_string(), db_id);
+        if let Some(cursor) = next_cursor {
+            state.ddl_journal_cursors.insert(key, cursor);
+        } else {
+            state.ddl_journal_cursors.remove(&key);
         }
     }
 
@@ -1385,6 +1433,18 @@ impl WorkerEngine {
             )
             .await?
             else {
+                let next = storage_scan_idle_after_capacity_full(
+                    existing.as_ref(),
+                    keyspace,
+                    db_id,
+                    tenant_incarnation,
+                    work_id,
+                    now_ms,
+                    attempt,
+                );
+                system_store
+                    .put_storage_scan_bg_state(&mut txn, &next)
+                    .await?;
                 return Ok(StorageScanDerivedClaim::Skipped(
                     StorageScanDerivedSkipReason::CapacityFull,
                 ));
@@ -1415,7 +1475,13 @@ impl WorkerEngine {
 
         match result {
             Ok(value) => {
-                if matches!(value, StorageScanDerivedClaim::Started { .. }) {
+                if matches!(
+                    value,
+                    StorageScanDerivedClaim::Started { .. }
+                        | StorageScanDerivedClaim::Skipped(
+                            StorageScanDerivedSkipReason::CapacityFull
+                        )
+                ) {
                     txn.commit().await?;
                 } else {
                     txn.rollback().await.ok();
@@ -1622,11 +1688,35 @@ impl WorkerEngine {
             .registry_sweep_kind_should_skip(&entry.keyspace, entry.db_id, kind)
             .await
         {
-            let result = self
-                .reconcile_ddl_journal_for_db(store, &entry.keyspace, entry.db_id)
-                .await;
-            self.record_registry_sweep_kind_result(entry, kind, result)
-                .await;
+            let ddl_cursor = self.ddl_journal_cursor(&entry.keyspace, entry.db_id).await;
+            match self
+                .reconcile_ddl_journal_for_db(
+                    store,
+                    &entry.keyspace,
+                    entry.db_id,
+                    ddl_cursor.as_deref(),
+                    DDL_JOURNAL_PAGE_SIZE,
+                )
+                .await
+            {
+                Ok(next_cursor) => {
+                    self.record_ddl_journal_cursor(&entry.keyspace, entry.db_id, next_cursor)
+                        .await;
+                    self.registry_sweep_record_kind_success(&entry.keyspace, entry.db_id, kind)
+                        .await;
+                }
+                Err(e) => {
+                    self.registry_sweep_record_kind_failure(&entry.keyspace, entry.db_id, kind)
+                        .await;
+                    warn!(
+                        keyspace = %entry.keyspace,
+                        db_id = entry.db_id,
+                        kind = kind.label(),
+                        "Worker registry sweep task failed: {}",
+                        e
+                    );
+                }
+            }
         }
 
         let kind = RegistrySweepKind::HnswDelta;
@@ -1694,22 +1784,8 @@ impl WorkerEngine {
             .await
         {
             let result = async {
-                if self.config.storage_scan_derived_active {
-                    self.run_storage_scan_derived_if_due(store, &entry.keyspace, entry.db_id)
-                        .await?;
-                    return Ok::<(), anyhow::Error>(());
-                }
-
-                let due = self.storage_scan_due(store, entry.db_id).await?;
-                if due {
-                    enqueue_storage_scan_with_jitter(
-                        &self.system_store,
-                        &entry.keyspace,
-                        entry.db_id,
-                        self.config.storage_scan_jitter_sec,
-                    )
+                self.run_storage_scan_derived_if_due(store, &entry.keyspace, entry.db_id)
                     .await?;
-                }
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -1830,37 +1906,6 @@ impl WorkerEngine {
                 Err(e)
             }
         }
-    }
-
-    async fn storage_scan_due(&self, store: &Arc<TikvStore>, db_id: u64) -> Result<bool> {
-        use crate::storage_stats::deserialize_storage_stats;
-
-        let mut txn = store.begin().await?;
-        // Cross-store liveness fence (same class as reconcile_cron_for_db): the
-        // due-decision reads tenant stats but enqueue_storage_scan writes into
-        // the global system_store queue. Take get_for_update on the tenant DB
-        // row so a DROP DATABASE that already removed the metadata makes us
-        // report "not due", suppressing the enqueue. Any orphan from the
-        // irreducible cross-store window is self-healing via the worker tick.
-        let alive = store.database_alive_for_update(&mut txn, db_id).await?;
-        if !alive {
-            txn.rollback().await.ok();
-            return Ok(false);
-        }
-        let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
-        let data = txn.get(stats_key).await?;
-        txn.rollback().await.ok();
-
-        let Some(data) = data else {
-            return Ok(true);
-        };
-        let Some(stats) = deserialize_storage_stats(&data) else {
-            return Ok(true);
-        };
-        let interval_ms = i64::try_from(self.config.storage_scan_interval_sec)
-            .unwrap_or(i64::MAX / 1000)
-            .saturating_mul(1000);
-        Ok(now_epoch_ms().saturating_sub(stats.scanned_at_ms) >= interval_ms)
     }
 
     /// Reconcile cron jobs for a single (keyspace, db_id).
@@ -2043,12 +2088,16 @@ impl WorkerEngine {
         store: &Arc<TikvStore>,
         keyspace: &str,
         db_id: u64,
-    ) -> Result<()> {
+        start_after: Option<&[u8]>,
+        page_size: usize,
+    ) -> Result<Option<Vec<u8>>> {
         use crate::storage::DdlOperation;
 
-        // Scan journal entries in a read transaction.
+        // Scan one bounded journal page in a read transaction.
         let mut scan_txn = store.begin().await?;
-        let journal_entries = store.scan_ddl_journal(&mut scan_txn, db_id).await?;
+        let (journal_entries, next_cursor) = store
+            .scan_ddl_journal_page(&mut scan_txn, db_id, start_after, page_size)
+            .await?;
         scan_txn.commit().await?;
 
         if journal_entries.is_empty() {
@@ -2061,11 +2110,13 @@ impl WorkerEngine {
             // clear, leaving the new entry undiscoverable after a crash.
             // The cost of the stale bit is one cheap empty journal scan per
             // startup per affected database — acceptable.
-            return Ok(());
+            return Ok(next_cursor);
         }
 
-        // Process each entry in its own transaction to avoid exceeding TiKV
-        // transaction size limits when multiple large orphans exist.
+        let mut completed = 0usize;
+        // Process each entry in its own bounded transaction. Large orphan ranges
+        // delete at most one batch per visit; the journal entry remains as the
+        // durable resume point for the next sweep cycle.
         for jentry in &journal_entries {
             let mut txn = store.begin().await?;
             match &jentry.operation {
@@ -2076,24 +2127,25 @@ impl WorkerEngine {
                     index_range_start,
                     index_range_end,
                 } => {
-                    // Delete orphaned index keys in batches, rotating the
-                    // transaction between batches to stay within TiKV limits.
-                    let mut cursor = index_range_start.clone();
-                    loop {
-                        let next = store
-                            .delete_key_range_batch(&mut txn, cursor, index_range_end)
+                    let next = store
+                        .delete_key_range_batch(
+                            &mut txn,
+                            index_range_start.clone(),
+                            index_range_end,
+                        )
+                        .await?;
+                    if let Some(next_range_cursor) = next {
+                        store
+                            .assert_database_alive_for_update(&mut txn, db_id)
                             .await?;
-                        match next {
-                            Some(next_cursor) => {
-                                store
-                                    .assert_database_alive_for_update(&mut txn, db_id)
-                                    .await?;
-                                txn.commit().await?;
-                                txn = store.begin().await?;
-                                cursor = next_cursor;
-                            }
-                            None => break,
-                        }
+                        txn.commit().await?;
+                        debug!(
+                            table_id,
+                            index_id,
+                            next_range_cursor = ?next_range_cursor,
+                            "DDL journal: cleaned one bounded batch of orphaned index data"
+                        );
+                        continue;
                     }
                     // Release the index name reservation so the name can be reused.
                     // Note: txn_delete is a no-op for missing keys, so this only
@@ -2108,6 +2160,7 @@ impl WorkerEngine {
                         .assert_database_alive_for_update(&mut txn, db_id)
                         .await?;
                     txn.commit().await?;
+                    completed += 1;
                     info!(
                         "DDL journal: cleaned up orphaned index data (table_id={}, index_id={}, name={}) in db_id={}",
                         table_id, index_id, index_name, db_id
@@ -2117,27 +2170,26 @@ impl WorkerEngine {
                     table_id,
                     table_name,
                 } => {
-                    // Delete data rows in batches with transaction rotation to
-                    // stay within TiKV mutation limits (CTAS can produce
-                    // arbitrarily many committed rows before crash).
+                    // Delete at most one data-row batch per visit. CTAS can
+                    // produce arbitrarily many committed rows before crash, so
+                    // the journal entry itself remains the durable resume point.
                     use crate::storage::encode_table_data_range_v2;
                     let (data_start, data_end) = encode_table_data_range_v2(db_id, *table_id);
-                    let mut cursor = data_start;
-                    loop {
-                        let next = store
-                            .delete_key_range_batch(&mut txn, cursor, &data_end)
+                    let next = store
+                        .delete_key_range_batch(&mut txn, data_start, &data_end)
+                        .await?;
+                    if let Some(next_range_cursor) = next {
+                        store
+                            .assert_database_alive_for_update(&mut txn, db_id)
                             .await?;
-                        match next {
-                            Some(next_cursor) => {
-                                store
-                                    .assert_database_alive_for_update(&mut txn, db_id)
-                                    .await?;
-                                txn.commit().await?;
-                                txn = store.begin().await?;
-                                cursor = next_cursor;
-                            }
-                            None => break,
-                        }
+                        txn.commit().await?;
+                        debug!(
+                            table_id,
+                            table_name,
+                            next_range_cursor = ?next_range_cursor,
+                            "DDL journal: cleaned one bounded batch of orphaned CTAS rows"
+                        );
+                        continue;
                     }
                     // Drop owned sequences (e.g. _rowid_seq) before dropping
                     // the table — drop_table() does not clean these up.
@@ -2173,6 +2225,7 @@ impl WorkerEngine {
                         .assert_database_alive_for_update(&mut txn, db_id)
                         .await?;
                     txn.commit().await?;
+                    completed += 1;
                     info!(
                         "DDL journal: cleaned up orphaned CTAS table '{}' in db_id={}",
                         table_name, db_id
@@ -2194,12 +2247,13 @@ impl WorkerEngine {
         // set regardless so a later sweep cycle retries those entries.
 
         info!(
-            "DDL journal: recovered {} incomplete operations in keyspace={} db_id={}",
-            journal_entries.len(),
+            "DDL journal: recovered {} incomplete operations in keyspace={} db_id={} (scanned {})",
+            completed,
             keyspace,
-            db_id
+            db_id,
+            journal_entries.len()
         );
-        Ok(())
+        Ok(next_cursor)
     }
     async fn claim_and_execute(
         system_store: &Arc<TikvStore>,
@@ -2537,6 +2591,7 @@ impl WorkerEngine {
 
         // P4: hydrate the full entry, tearing down an orphaned descriptor (and
         // releasing the claim) if its payload is missing.
+        let descriptor_attempt = due.attempt();
         let entry: TaskQueueEntry = match Self::hydrate_entry_or_release(
             system_store,
             &queue_key,
@@ -2770,6 +2825,7 @@ impl WorkerEngine {
             &queue_key,
             &entry,
             queue_fire_time_ms,
+            descriptor_attempt,
             keep_queue_entry,
             exec_result.is_ok(),
         )
@@ -2986,35 +3042,62 @@ impl WorkerEngine {
         queue_key: &[u8],
         entry: &TaskQueueEntry,
         queue_fire_time_ms: i64,
+        descriptor_attempt: u32,
         keep_queue_entry: bool,
         exec_ok: bool,
     ) -> Result<()> {
+        if !keep_queue_entry && entry.task_type == TaskType::HnswMerge && !exec_ok {
+            let now_ms = now_epoch_ms();
+            let next_fire_time_ms = hnsw_merge_retry_after_ms(now_ms, descriptor_attempt);
+            let next_attempt = descriptor_attempt.saturating_add(1);
+            let rescheduled = system_store
+                .reschedule_failed_hnsw_merge_task_v2_unless_db_dropped(
+                    txn,
+                    queue_key,
+                    entry,
+                    queue_fire_time_ms,
+                    next_fire_time_ms,
+                    next_attempt,
+                )
+                .await?;
+            if rescheduled {
+                debug!(
+                    keyspace = %entry.keyspace,
+                    db_id = entry.db_id,
+                    task_id = entry.task_id,
+                    attempt = descriptor_attempt,
+                    next_attempt,
+                    next_fire_time_ms,
+                    "HNSW merge failed; rescheduled with per-index backoff"
+                );
+            }
+            return Ok(());
+        }
+
         if !keep_queue_entry {
             if entry.task_type.uses_deterministic_queue_key() {
                 // Deterministic-key tasks can be overwritten by a later enqueue
                 // while a worker still holds the old claim. Read-compare-delete
                 // ensures cleanup only removes the descriptor it processed.
-                //
-                // HNSW merge additionally keeps the row on failure so a worker
-                // with the right capability can retry. Other deterministic tasks
-                // delete the exact processed descriptor even after failure.
-                if exec_ok || !entry.task_type.keeps_deterministic_queue_entry_on_failure() {
-                    if let Some(current_bytes) = txn.get(queue_key.to_vec()).await? {
-                        let current_nonce = TaskDescriptorV2::decode(&current_bytes)
+                // HNSW failure is handled above by moving the descriptor to a
+                // future due key with per-index backoff, so every remaining
+                // deterministic outcome deletes the exact processed descriptor.
+                if let Some(current_bytes) = txn.get(queue_key.to_vec()).await? {
+                    let current_nonce =
+                        TaskDescriptorV2::decode(&current_bytes)
                             .map(|d| d.nonce)
                             .map_err(|e| anyhow!("Failed to deserialize V2 descriptor: {e}"))?;
-                        if current_nonce == entry.nonce {
-                            Self::delete_due_entry(
-                                system_store,
-                                txn,
-                                queue_key,
-                                entry,
-                                queue_fire_time_ms,
-                            )
-                            .await?;
-                        }
-                        // nonce mismatch → DML overwrote → skip delete, next tick handles it
+                    if current_nonce == entry.nonce {
+                        Self::delete_due_entry(
+                            system_store,
+                            txn,
+                            queue_key,
+                            entry,
+                            queue_fire_time_ms,
+                        )
+                        .await?;
                     }
+                    // nonce mismatch → DML overwrote → skip delete, next tick handles it
                 }
             } else {
                 // Non-deterministic queue keys are unique per logical due row, so
@@ -3560,53 +3643,16 @@ impl WorkerEngine {
         let lease_cancel = crate::worker::LeaseCancel::new(shutdown_signal.clone());
 
         if entry.task_type == TaskType::StorageSizeScan {
-            if config.storage_scan_derived_active {
-                let force_refresh = storage_scan_entry_is_refresh_nudge(entry);
-                if force_refresh {
-                    request_storage_scan_refresh(
-                        system_store.as_ref(),
-                        store.as_ref(),
-                        &entry.keyspace,
-                        entry.db_id,
-                    )
-                    .await?;
-                }
-                let outcome = Self::run_storage_scan_derived_for_target(
-                    system_store,
-                    pool,
-                    config,
-                    &store,
-                    &entry.keyspace,
-                    entry.db_id,
-                )
-                .await?;
-                if matches!(
-                    outcome,
-                    StorageScanDerivedRunOutcome::Skipped(
-                        StorageScanDerivedSkipReason::CapacityFull
-                    )
-                ) && force_refresh
-                {
-                    enqueue_storage_scan_nudge_at(
-                        system_store.as_ref(),
-                        &entry.keyspace,
-                        entry.db_id,
-                        storage_scan_retry_after_ms(now_epoch_ms(), 0),
-                    )
-                    .await?;
-                }
-                return Ok(0);
-            }
-            execute_storage_size_scan(
+            Self::run_storage_scan_derived_for_target(
+                system_store,
+                pool,
+                config,
                 &store,
                 &entry.keyspace,
                 entry.db_id,
-                pool.pd_endpoints(),
-                config.storage_scan_pd_rate_limit_ms,
-                &lease_cancel,
             )
             .await?;
-            return Ok(1);
+            return Ok(0);
         }
 
         if entry.task_type == TaskType::HnswMerge && entry.command.starts_with("__hnsw_merge ") {
@@ -4344,9 +4390,8 @@ where
     }
 }
 
-/// The PD Region storage estimate produced by the shared pre-persist block that
-/// both `execute_storage_size_scan` and `execute_storage_size_scan_derived` run
-/// before they diverge into their (different) persist/validation paths.
+/// The PD Region storage estimate produced before derived StorageSizeScan
+/// persists its tenant effect.
 struct StorageScanComputed {
     pd: crate::worker::pd_region_stats::DatabasePdRegionStats,
     stats: crate::storage_stats::DbStorageStats,
@@ -4358,11 +4403,9 @@ struct StorageScanComputed {
 
 /// Rate-limit, fetch PD Region stats, and build the storage estimate.
 ///
-/// This is the verbatim pre-persist block shared by both storage-scan executors:
-/// the PD rate-limit wait, the region-stats fetch (with its err counter/warn/
-/// context), the `pd_region_estimate` build, and the lease-loss fence. It is the
-/// only place the two executors agree, so it lives here once. The persist and
-/// validation steps differ between the two and stay in the callers.
+/// This keeps the PD rate-limit wait, region-stats fetch, estimate build, and
+/// lease-loss fence in one place. Tenant persistence and validation stay in the
+/// derived caller.
 async fn compute_pd_region_stats(
     keyspace: &str,
     db_id: u64,
@@ -4423,8 +4466,7 @@ async fn compute_pd_region_stats(
     })
 }
 
-/// The identical completion `info!` both storage-scan executors emit once the
-/// stats have been persisted.
+/// Completion `info!` emitted once StorageScan stats have been persisted.
 fn log_storage_scan_complete(
     keyspace: &str,
     db_id: u64,
@@ -4443,239 +4485,6 @@ fn log_storage_scan_complete(
         scan_duration_ms,
         "Storage size PD Region estimate complete"
     );
-}
-
-/// Execute a storage size scan for a single database.
-///
-/// Uses PD Region stats over DB9's encoded database key range. PD returns a
-/// whole-Region physical/MVCC estimate in MiB; this path intentionally does not
-/// provide exact data/index/table breakdowns and does not fall back to a tenant
-/// KV scan on PD failure.
-async fn execute_storage_size_scan(
-    store: &Arc<TikvStore>,
-    keyspace: &str,
-    db_id: u64,
-    pd_endpoints: &[String],
-    pd_rate_limit_ms: u64,
-    lease_cancel: &crate::worker::LeaseCancel,
-) -> Result<()> {
-    use crate::storage_stats::{global_storage_stats_cache, serialize_storage_stats};
-
-    let StorageScanComputed {
-        pd,
-        stats,
-        scanned_at_ms: _,
-        scan_duration_ms,
-    } = compute_pd_region_stats(
-        keyspace,
-        db_id,
-        pd_endpoints,
-        pd_rate_limit_ms,
-        lease_cancel,
-    )
-    .await?;
-
-    let stats_key = crate::storage::encode_storage_stats_key_v2(db_id);
-    let stats_value = serialize_storage_stats(&stats);
-    let mut persist_txn = store.begin().await?;
-    crate::txn::txn_put(&mut persist_txn, stats_key, stats_value).await?;
-    store
-        .assert_database_alive_for_update(&mut persist_txn, db_id)
-        .await?;
-    persist_txn.commit().await?;
-
-    global_storage_stats_cache().put(keyspace, db_id, stats);
-    metrics::counter!(
-        "db9_server_worker_storage_pd_region_stats_total",
-        "result" => "ok",
-    )
-    .increment(1);
-
-    log_storage_scan_complete(keyspace, db_id, &pd, scan_duration_ms);
-
-    Ok(())
-}
-
-/// Enqueue a storage size scan task for a specific database.
-///
-/// Called by `db9_refresh_storage_stats()` and by the bounded registry sweep.
-pub(crate) async fn enqueue_storage_scan(
-    system_store: &TikvStore,
-    keyspace: &str,
-    db_id: u64,
-) -> Result<()> {
-    enqueue_storage_scan_at(
-        system_store,
-        keyspace,
-        db_id,
-        0,
-        StorageScanQueueMode::Singleton,
-    )
-    .await
-}
-
-pub(crate) async fn enqueue_storage_scan_nudge(
-    system_store: &TikvStore,
-    keyspace: &str,
-    db_id: u64,
-) -> Result<()> {
-    enqueue_storage_scan_nudge_at(system_store, keyspace, db_id, 0).await
-}
-
-async fn enqueue_storage_scan_nudge_at(
-    system_store: &TikvStore,
-    keyspace: &str,
-    db_id: u64,
-    fire_time: i64,
-) -> Result<()> {
-    enqueue_storage_scan_at(
-        system_store,
-        keyspace,
-        db_id,
-        fire_time,
-        StorageScanQueueMode::RefreshNudge,
-    )
-    .await
-}
-
-async fn enqueue_storage_scan_with_jitter(
-    system_store: &TikvStore,
-    keyspace: &str,
-    db_id: u64,
-    jitter_sec: u64,
-) -> Result<()> {
-    use rand::Rng;
-
-    let delay_ms = if jitter_sec == 0 {
-        0
-    } else {
-        rand::thread_rng().gen_range(0..=jitter_sec.saturating_mul(1000))
-    };
-    let fire_time = now_epoch_ms().saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
-    enqueue_storage_scan_at(
-        system_store,
-        keyspace,
-        db_id,
-        fire_time,
-        StorageScanQueueMode::Singleton,
-    )
-    .await
-}
-
-async fn enqueue_storage_scan_at(
-    system_store: &TikvStore,
-    keyspace: &str,
-    db_id: u64,
-    fire_time: i64,
-    mode: StorageScanQueueMode,
-) -> Result<()> {
-    use rand::Rng;
-
-    let command = match mode {
-        StorageScanQueueMode::Singleton => String::new(),
-        StorageScanQueueMode::RefreshNudge => STORAGE_SCAN_REFRESH_NUDGE_COMMAND.to_string(),
-    };
-    let priority = match mode {
-        StorageScanQueueMode::Singleton => STORAGE_SCAN_PERIODIC_PRIORITY,
-        StorageScanQueueMode::RefreshNudge => STORAGE_SCAN_REFRESH_NUDGE_PRIORITY,
-    };
-    let mut entry = TaskQueueEntry::new(
-        keyspace.to_string(),
-        db_id,
-        db_id as i64,
-        TaskType::StorageSizeScan,
-        command,
-        "system".to_string(),
-        priority,
-    );
-    entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
-    let mut txn = system_store.begin().await?;
-    let enqueued = match mode {
-        StorageScanQueueMode::Singleton => {
-            system_store
-                .enqueue_singleton_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)
-                .await?
-        }
-        StorageScanQueueMode::RefreshNudge => {
-            delete_storage_scan_refresh_nudges(system_store, &mut txn, keyspace, db_id).await?;
-            system_store
-                .enqueue_task_v2_unless_db_dropped(&mut txn, &entry, fire_time)
-                .await?
-        }
-    };
-    if !enqueued {
-        txn.rollback().await.ok();
-        debug!(
-            keyspace,
-            db_id,
-            ?mode,
-            "Storage size scan enqueue suppressed"
-        );
-        return Ok(());
-    }
-    txn.commit().await?;
-    crate::worker::wake_worker();
-    Ok(())
-}
-
-async fn delete_storage_scan_refresh_nudges(
-    system_store: &TikvStore,
-    txn: &mut tikv_client::Transaction,
-    keyspace: &str,
-    db_id: u64,
-) -> Result<usize> {
-    let rows = system_store
-        .index_rows_for_task(
-            txn,
-            keyspace,
-            db_id,
-            db_id as i64,
-            TaskType::StorageSizeScan,
-        )
-        .await?;
-    let mut deleted = 0usize;
-    for row in rows {
-        let Some(bytes) = txn.get(row.due_key.clone()).await? else {
-            continue;
-        };
-        let descriptor = match TaskDescriptorV2::decode(&bytes) {
-            Ok(descriptor) => descriptor,
-            Err(e) => {
-                warn!(
-                    keyspace,
-                    db_id,
-                    fire_time_ms = row.fire_time_ms,
-                    "Skipping undecodable StorageSizeScan row while coalescing refresh nudges: {}",
-                    e
-                );
-                continue;
-            }
-        };
-        let is_refresh_nudge = descriptor
-            .inline
-            .as_ref()
-            .is_some_and(|payload| payload.command == STORAGE_SCAN_REFRESH_NUDGE_COMMAND);
-        if is_refresh_nudge {
-            system_store
-                .delete_task_v2(
-                    txn,
-                    &row.due_key,
-                    &row.keyspace,
-                    row.db_id,
-                    row.task_type,
-                    row.task_id,
-                    row.fire_time_ms,
-                )
-                .await?;
-            deleted += 1;
-        }
-    }
-    Ok(deleted)
-}
-
-fn storage_scan_entry_is_refresh_nudge(entry: &TaskQueueEntry) -> bool {
-    entry.task_type == TaskType::StorageSizeScan
-        && entry.command == STORAGE_SCAN_REFRESH_NUDGE_COMMAND
 }
 
 async fn execute_storage_size_scan_derived(

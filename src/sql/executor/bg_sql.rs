@@ -133,20 +133,15 @@ async fn execute_refresh_storage_stats(
     let system_store = get_system_store()
         .ok_or_else(|| anyhow!("db9_refresh_storage_stats: worker system store not available"))?;
 
-    if crate::worker::config::WorkerConfig::from_env().storage_scan_derived_active {
-        let store = store
-            .ok_or_else(|| anyhow!("db9_refresh_storage_stats: tenant store not available"))?;
-        crate::worker::engine::request_storage_scan_refresh(
-            system_store,
-            store.as_ref(),
-            keyspace,
-            db_id,
-        )
-        .await?;
-        crate::worker::engine::enqueue_storage_scan_nudge(system_store, keyspace, db_id).await?;
-    } else {
-        crate::worker::engine::enqueue_storage_scan(system_store, keyspace, db_id).await?;
-    }
+    let store =
+        store.ok_or_else(|| anyhow!("db9_refresh_storage_stats: tenant store not available"))?;
+    crate::worker::engine::request_storage_scan_refresh(
+        system_store,
+        store.as_ref(),
+        keyspace,
+        db_id,
+    )
+    .await?;
 
     Ok(Value::Text("storage scan enqueued".to_string()))
 }
@@ -300,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_storage_stats_requests_derived_state_and_queue_nudge_when_active() {
+    fn refresh_storage_stats_requests_derived_state_without_legacy_queue() {
         let source = include_str!("bg_sql.rs");
         let refresh = source
             .split("async fn execute_refresh_storage_stats(")
@@ -308,32 +303,21 @@ mod tests {
             .and_then(|rest| rest.split("async fn execute_bg_result").next())
             .expect("execute_refresh_storage_stats must exist before execute_bg_result");
 
-        let active = refresh
-            .find("WorkerConfig::from_env().storage_scan_derived_active")
-            .expect("refresh must check derived StorageScan active flag");
-        let active_branch = refresh[active..]
-            .split("} else {")
-            .next()
-            .expect("active derived branch must exist before fallback branch");
-        let derived = active_branch
+        assert!(
+            !refresh.contains("WorkerConfig::from_env()"),
+            "refresh must not reparse env after startup"
+        );
+        assert!(
+            !refresh.contains("storage_scan_derived_active"),
+            "refresh must not retain a StorageScan legacy/derived mode fork"
+        );
+        assert!(
+            !refresh.contains("enqueue_storage_scan"),
+            "refresh must not enqueue legacy StorageSizeScan queue rows"
+        );
+        refresh
             .find("request_storage_scan_refresh")
             .expect("active refresh must write derived StorageScan state directly");
-        let nudge = active_branch
-            .find("enqueue_storage_scan_nudge")
-            .expect("active refresh must enqueue a StorageSizeScan nudge");
-        let fallback = refresh
-            .split("} else {")
-            .nth(1)
-            .expect("inactive fallback branch must exist");
-        assert!(
-            fallback.contains("enqueue_storage_scan(system_store, keyspace, db_id).await?"),
-            "inactive refresh must keep legacy V2 enqueue fallback"
-        );
-
-        assert!(
-            derived < nudge,
-            "manual refresh must request derived state before enqueueing the nudge"
-        );
     }
 
     #[tokio::test]

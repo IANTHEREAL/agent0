@@ -61,7 +61,10 @@ SELECT 'multi_update' AS test, id FROM hnsw_2l ORDER BY v <-> '[1.0, 0.0, 0.0]' 
 
 -- ================================================================
 -- Cleanup (retry: DROP may conflict with HNSW merge lock — #2058)
--- S3 mode merge is slower; wait for it to finish.
+-- S3 mode merge is slower; wait for it to finish. Keep the correctness
+-- assertions above under the normal session settings, but let cleanup wait
+-- out the merge fence instead of failing the regression gate on timeout.
 -- ================================================================
+SET statement_timeout = 0;
 SELECT pg_sleep(8);
 DROP TABLE IF EXISTS hnsw_2l;

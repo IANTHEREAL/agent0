@@ -129,6 +129,9 @@
 | `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | `src/worker/config.rs` | Base threshold used by current auto-analyze policy. |
 | `DB9_WORKER_GC_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`. |
 | `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Independent cadence for HNSW delta sweep/enqueue. Also runs S3 GC when `HNSW_S3_BUCKET` is set. |
+| `DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC` | `21600` | `src/worker/config.rs`, `src/worker/engine.rs` | StorageSizeScan freshness interval in seconds; minimum effective value is `60`. |
+| `DB9_WORKER_STORAGE_SCAN_PD_RATE_LIMIT_MS` | `100` | `src/worker/config.rs`, `src/worker/engine.rs` | Per-PD-endpoint delay while collecting region stats. |
+| `DB9_STORAGE_SCAN_DERIVED_CAPACITY` | `1` | `src/worker/config.rs`, `src/worker/engine.rs` | Cluster-wide StorageSizeScan derived capacity token count; invalid or zero values keep the default. |
 | `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | `src/worker/config.rs` | Keyspace holding background task metadata. |
 | `DB9_GC_SAFEPOINT_ENABLED` | `true` | `src/worker/config.rs`, `src/worker/gc.rs` | Enables PD safepoint advancement. |
 | `DB9_GC_SAFEPOINT_INTERVAL_SEC` | `300` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`; must remain below `DB9_GC_LIFE_TIME_SEC` on every SQL-serving node because GC registry heartbeats are unconditional. |

@@ -125,7 +125,7 @@ actually correct, and names what is deliberately rejected.
 | --- | --- | --- | --- |
 | Inventory | This database may need a visit | `_sys_worker` row | **No** — the one load-bearing object |
 | Diagnostic hint | Breadcrumb of which features touched this db | `task_types` bits | Yes — no consumer may branch on it |
-| Executable work | A task that can be claimed and run | worker queue V2 | Singleton maintenance: yes (re-derived by probe). Event tasks (cron fire, trigger event, bgsql): no — protected by enqueue protocol |
+| Executable work | A task that can be claimed and run | worker queue V2, or feature-owned derived state for StorageSizeScan | Singleton maintenance: yes (re-derived by probe). Event tasks (cron fire, trigger event, bgsql): no — protected by enqueue protocol |
 | Leased claim | One worker owns one task attempt until lease expiry | worker claims | Yes — expiry re-opens the task |
 | Feature truth | The durable condition being reconciled | tenant store / queue / S3, per feature | Defined per feature |
 
@@ -358,10 +358,12 @@ ClaimHandle::renew() / ClaimHandle::complete()   // identity+nonce-checked
 - `enqueue_singleton` assigns a fresh non-zero nonce internally (no call-site
   `rand` rituals) and **checks pending/claimed state inside the same
   transaction as the write**: if the singleton is already pending or claimed,
-  it does not overwrite. (Live gap: the storage-scan sweep enqueues on stats
-  staleness alone, so every cycle rewrites the claimed task's nonce, the
-  finishing worker's identity check then leaves the row, and each big-database
-  scan is followed by one guaranteed redundant scan.)
+  it does not overwrite. StorageSizeScan is the first maintenance class moved
+  off this singleton queue: the registry sweep claims a feature-owned state
+  row, reserves StorageScan capacity, performs the tenant effect, and advances
+  progress only after the tenant commit. Any pre-existing V2 StorageSizeScan
+  row is consumed through that same derived path and then removed by normal
+  queue cleanup.
 - `complete()` is read-compare-delete on identity+nonce so an older attempt
   can never delete a newer logical task.
 - Multi-entry tasks (cron schedules, trigger events, bgsql requests) keep
@@ -486,7 +488,7 @@ loop:
     probe ddl journal prefix        -> repair entries (fenced txns)
     probe trigger outbox prefix     -> re-enqueue leftovers (event identity)
     probe cron enabled + catalog    -> reconcile queue entries, history GC
-    probe stats freshness           -> enqueue_singleton(storage scan)
+    probe stats freshness           -> claim/run derived storage scan
     walk = bounded_observation_walk(handle)
     walk.hnsw_pending               -> enqueue_singleton(hnsw merge)
     walk.cic_incomplete             -> repair iff no pending/claimed BgDdl task
@@ -543,7 +545,8 @@ probe: bounded journal prefix scan, every visit
 producer obligation: ensure_row fail-closed before journal-dependent commit
 enqueue identity: none (direct fenced repair during the visit)
 execution guard: per-entry repair transactions are liveness-fenced
-boundedness: per-entry txns; batched range deletes with txn rotation
+boundedness: paged journal scan; each visit deletes at most one orphan range
+  batch per journal entry, leaving the journal entry as durable resume state
 failure scope: DDL journal kind
 delivery: effectively exactly-once (repair is idempotent and fenced)
 ```
@@ -587,8 +590,9 @@ truth: tenant-local HNSW delta/meta state
 probe: shared observation walk (existence probe per index), every visit
 producer obligation: none beyond inventory row (DML hot path writes nothing
   to the system store — unchanged)
-enqueue identity: singleton per (table, index) merge target
-execution guard: merge transaction get_for_update on HNSW meta (existing)
+enqueue identity: singleton per (table, index) merge target; failed descriptors
+  are moved to a future due key with per-index exponential backoff
+execution guard: merge transaction get_for_update on HNSW meta (primary)
 boundedness: walk budget; delta probe is scan(limit=1)
 failure scope: HNSW delta kind
 delivery: at-least-once enqueue; merge idempotent under meta lock
@@ -613,16 +617,18 @@ delivery: best-effort external cleanup; deletes are idempotent
 
 ```text
 feature: storage size scan
-truth: persisted stats freshness + queue pending/claimed state
+truth: persisted stats freshness + tenant-local applied marker
 probe: stats freshness read, every visit
-producer obligation: none (sweep-driven; SQL function may also enqueue)
-enqueue identity: singleton per (keyspace, db_id) via enqueue_singleton
-  (pending/claimed checked in-transaction — fixes the redundant-rescan churn)
-execution guard: none needed (scan output overwrite is idempotent)
-boundedness: one enqueue decision per visit; execution paginates with its own
-  budget and rate limit
-failure scope: storage scan kind / task execution
-delivery: at-least-once; idempotent
+producer obligation: none for periodic refresh; SQL refresh writes derived
+  state and ensures the registry row
+enqueue identity: none; derived state is one row per
+  (keyspace, db_id, tenant_incarnation)
+execution guard: derived owner state + tenant incarnation/applied-marker checks;
+  owner state is locked again immediately before tenant commit
+boundedness: one claim/effect decision per visit; PD stats calls are globally
+  capacity-limited and rate-limited
+failure scope: storage scan kind
+delivery: at-least-once; progress advances only after the tenant effect commits
 ```
 
 ### Cron
@@ -813,7 +819,7 @@ Feature:
 - DDL journal entries recovered;
 - trigger outbox rows replayed vs fast-path enqueued;
 - HNSW pending indexes observed per full cycle; S3 objects listed/deleted;
-- storage scans enqueued vs skipped-pending;
+- storage scans claimed, skipped, and retried;
 - cron jobs reconciled, history rows GC'd;
 - CIC states repaired vs skipped-pending.
 
@@ -860,8 +866,8 @@ Kernel — inventory:
 Queue:
 
 - Repeated singleton reconciliation against a pending or claimed task leaves
-  exactly one logical task and does not change its nonce (no redundant
-  storage-scan after completion).
+  exactly one logical task and does not change its nonce. StorageScan does not
+  use singleton reconciliation; it is derived-state owned.
 - Completing an older deterministic attempt cannot delete a newer singleton
   task.
 - Cron/event tasks are never collapsed by singleton identity.
@@ -1003,16 +1009,16 @@ production path may write or delete a subset.
 
 | Task type | priority | fire_time_ms | task_id | payload split |
 | --- | --- | --- | --- | --- |
-| StorageSizeScan | 200 | 0 | `db_id as i64` | no |
-| HnswMerge | 192 | 0 | `hnsw_merge_task_id(table_id, index_id)` | no |
-| AutoAnalyze | 128 | 0 | `table_id as i64` | no (**change**: today fire=now; becomes deterministic singleton) |
+| HnswMerge | 192 | 0 initially; retry due time after failure | `hnsw_merge_task_id(table_id, index_id)` | no |
+| AutoAnalyze | 128 | enqueue time | `table_id as i64` | no |
 | AsyncTrigger (event) | 200 | `outbox.created_at_ms` | `outbox_id` | yes |
 
 Lower numeric priority values sort and dispatch first.
 
-`uses_deterministic_queue_key()` returns true for StorageSizeScan, HnswMerge,
-AutoAnalyze. Cron, BgSql, BgDdl keep their existing event identities and
-priorities unchanged.
+`uses_deterministic_queue_key()` returns true for HnswMerge and for
+StorageSizeScan only to let leftover V2 rows be nonce-cleaned after they are
+converted into derived execution. AutoAnalyze, Cron, BgSql, and BgDdl keep their
+existing event identities and priorities unchanged.
 
 ## II.3 Core types
 
@@ -1130,8 +1136,10 @@ side, this covers the lease side).
 `complete`, one transaction:
 
 1. `delete(claim_key)`.
-2. If the task type keeps its row on failure (`HnswMerge`) and outcome is
-   failure → skip row deletion.
+2. If the task is a failed `HnswMerge`, delete the processed descriptor and
+   write the same logical task at a future retry `fire_time_ms` with
+   `descriptor.attempt + 1`; dirty markers remain the truth and the HNSW meta
+   lock remains the primary execution guard.
 3. Else if deterministic type: `get(due_key)`; decode the current nonce
    (descriptor for V2, `deserialize_compat` for legacy); delete the due
    entry **only if** `current_nonce == processed_nonce`.
@@ -1223,16 +1231,19 @@ per entry:
    `reap_queue_then_delete`; clear all in-memory state for the key.
 5. Probes, each wrapped in its per-kind backoff (failure of one never skips
    another):
-   a. **DDL journal**: scan journal prefix; repair each entry in its own
-      fenced transaction(s) with batched range deletes (existing logic).
+   a. **DDL journal**: scan one journal page; for each entry, repair one
+      fenced orphan range-delete batch or complete the final small metadata
+      cleanup. Unfinished entries remain in the journal as durable resume state.
    b. **Trigger outbox**: scan outbox prefix (batch
       `outbox_replay_batch`); for each row `enqueue_event` (deterministic
       identity → idempotent), then delete the outbox row in a fenced tenant
       txn after the enqueue commits.
    c. **Cron**: `is_cron_enabled`; reconcile catalog vs `_wq_idx_v2_` rows
       (enqueue missing, delete orphans), then bounded history GC.
-   d. **Storage scan**: read stats freshness; stale →
-      `enqueue_singleton(StorageSizeScan)`.
+   d. **Storage scan**: read stats freshness and claim/run the StorageScan
+      derived state row directly. Manual refreshes write derived state and
+      ensure the registry row; they do not enqueue legacy `StorageSizeScan`
+      V2 rows.
    e. **Observation walk** (A3) → for each pending HNSW index:
       `enqueue_singleton`-equivalent merge enqueue; for each transitional
       CIC index with no pending/claimed BgDdl task: mark Invalid in a fenced
@@ -1341,7 +1352,7 @@ New knobs (env → field, default, constraint):
 Existing knobs unchanged: `DB9_WORKER_ENABLED`, `DB9_WORKER_POLL_MS`
 (60000), `DB9_WORKER_MAX_CONCURRENT_JOBS` (32),
 `DB9_WORKER_SWEEP_PAGE_INTERVAL_SEC` (30, min 1),
-`DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC` (1800), registry page size
+`DB9_WORKER_STORAGE_SCAN_INTERVAL_SEC` (21600), registry page size
 (= max_concurrent_jobs), GC knobs. `DB9_WORKER_ORPHAN_TIMEOUT_SEC` (300) is
 demoted to the legacy-claim compat window and deleted in the cleanup PR.
 
@@ -1451,7 +1462,7 @@ has no S3 client to drive them behaviorally.
 | T3 | renewal loss cancels | delete the claim out from under a renewal loop → cancel fires before the next tenant commit |
 | T4 | takeover | expired claim + live due row → second worker acquires and executes exactly once |
 | T5 | fence | start a worker txn writing rows; DROP the database; worker commit → `DatabaseDropped`; destroyed range contains no keys afterwards |
-| T6 | singleton no-churn | claimed StorageSizeScan + 5 sweep enqueues → `AlreadyPending`, nonce unchanged, completion deletes the row, no second scan |
+| T6 | derived no-churn | running StorageScan derived state + 5 sweep visits → no legacy singleton overwrite, one owner remains, no redundant scan after completion |
 | T7 | identity check | enqueue singleton, overwrite legitimately after completion-in-flight → old `complete` does not delete the newer row |
 | T8 | bit independence | inventory row with `task_types=0` + journal entry + pending HNSW delta + Building index + cron job → all four discovered in one cycle |
 | T9 | outbox crash replay | commit DML writing outbox row, skip fast path → sweep enqueues and the trigger runs; row deleted after |
@@ -1480,7 +1491,7 @@ has no S3 client to drive them behaviorally.
    ordering verified. Un-ignores T5, T18.
 4. **PR-3 sweep + inventory.** `kernel/inventory.rs`, `kernel/queue.rs`,
    CanonicalKeyspace at all entry points; sweep: unconditional probes,
-   shared walk, alias migration, singleton storage-scan/auto-analyze,
+   shared walk, alias migration, derived storage-scan, singleton auto-analyze,
    cycle-interval rename. Un-ignores T6, T8, T11–T16.
 5. **PR-4 outbox.** `triggers/outbox.rs`, producer txn write, fast path,
    sweep replay; spawn path removed. Un-ignores T9–T10.
@@ -1518,7 +1529,8 @@ format destructively.
     rolling-deploy migration, test matrix T1–T18, and the PR plan.
 12. (v2.1) Claim takeover on expired lease at `acquire` time (recovery no
     longer waits for the GC pass); renewal refreshes `claimed_at` for
-    mixed-version GC safety; AutoAnalyze becomes a deterministic singleton.
+    mixed-version GC safety. AutoAnalyze remains an event-time V2 queue entry
+    until its own migration changes the code and this contract together.
 
 ## Adoption Order
 
