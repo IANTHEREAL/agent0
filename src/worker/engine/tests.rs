@@ -765,6 +765,33 @@ fn missing_tenant_claim_paths_reap_before_retry_cleanup() {
 }
 
 #[test]
+fn background_sql_keyspace_missing_text_is_not_missing_tenant_cleanup() {
+    use anyhow::Context;
+
+    let user_sql_error = anyhow::anyhow!("keyspace does not exist");
+    assert!(
+        !WorkerEngine::is_missing_tenant_error(&user_sql_error, "tenant_a"),
+        "user-controlled SQL errors, including PL/pgSQL RAISE EXCEPTION text, must remain ordinary task failures"
+    );
+
+    let wrapped_user_sql_error = Err::<(), _>(anyhow::anyhow!("ERROR: keyspace does not exist"))
+        .context("background SQL task failed")
+        .expect_err("must wrap simulated SQL failure");
+    assert!(
+        !WorkerEngine::is_missing_tenant_error(&wrapped_user_sql_error, "tenant_a"),
+        "background SQL task text must not reap or tombstone a live tenant"
+    );
+
+    let tikv_error = anyhow::Error::new(tikv_client::Error::KvError {
+        message: "keyspace does not exist".to_string(),
+    });
+    assert!(
+        WorkerEngine::is_missing_tenant_error(&tikv_error, "tenant_a"),
+        "typed TiKV keyspace errors should still trigger dropped-tenant repair"
+    );
+}
+
+#[test]
 fn missing_tenant_orphan_reap_helper_orders_queue_registry_before_claim_delete() {
     let source = include_str!("../engine.rs");
     let prod_source = source

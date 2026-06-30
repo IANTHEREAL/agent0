@@ -52,6 +52,8 @@ impl fmt::Display for TenantKeyspaceMissing {
 
 impl std::error::Error for TenantKeyspaceMissing {}
 
+const TIKV_KEYSPACE_MISSING_MESSAGE: &str = "keyspace does not exist";
+
 pub(crate) fn missing_tenant_keyspace(error: &anyhow::Error) -> Option<&str> {
     error
         .chain()
@@ -64,7 +66,31 @@ pub(crate) fn is_missing_tenant_keyspace(error: &anyhow::Error, keyspace: &str) 
         return missing_keyspace == keyspace;
     }
 
-    format!("{:?}", error).contains("keyspace does not exist")
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(|tikv_error| tikv_error_is_keyspace_missing(tikv_error, keyspace))
+    })
+}
+
+fn tikv_error_is_keyspace_missing(error: &tikv_client::Error, keyspace: &str) -> bool {
+    match error {
+        tikv_client::Error::KeyspaceNotFound(missing_keyspace) => missing_keyspace == keyspace,
+        tikv_client::Error::KvError { message }
+        | tikv_client::Error::InternalError { message }
+        | tikv_client::Error::StringError(message) => {
+            message.contains(TIKV_KEYSPACE_MISSING_MESSAGE)
+        }
+        tikv_client::Error::UndeterminedError(inner)
+        | tikv_client::Error::PessimisticLockError { inner, .. } => {
+            tikv_error_is_keyspace_missing(inner, keyspace)
+        }
+        tikv_client::Error::ExtractedErrors(errors)
+        | tikv_client::Error::MultipleKeyErrors(errors) => errors
+            .iter()
+            .any(|nested| tikv_error_is_keyspace_missing(nested, keyspace)),
+        _ => false,
+    }
 }
 
 /// How often the reaper scans for idle tenants.
@@ -1705,7 +1731,7 @@ impl TikvClientPool {
             Ok(s) => s,
             Err(e) => {
                 let err_str = format!("{:?}", e);
-                if err_str.contains("keyspace does not exist") {
+                if err_str.contains(TIKV_KEYSPACE_MISSING_MESSAGE) {
                     return Err(TenantKeyspaceMissing::new(key).into());
                 }
                 return Err(e);
@@ -2013,18 +2039,61 @@ mod tests {
     }
 
     #[test]
-    fn runtime_tikv_keyspace_missing_error_uses_known_tenant_context() {
+    fn runtime_keyspace_missing_requires_tikv_error_provenance() {
         use anyhow::Context;
 
         let raw = anyhow::anyhow!("KvError: keyspace does not exist");
-        assert!(is_missing_tenant_keyspace(&raw, "db9_tenant_cached"));
+        assert!(
+            !is_missing_tenant_keyspace(&raw, "db9_tenant_cached"),
+            "user-controlled text must not be treated as a TiKV keyspace-missing runtime error"
+        );
 
         let wrapped = Err::<(), _>(anyhow::anyhow!(
             "region request failed: keyspace does not exist"
         ))
         .context("tenant-store operation failed")
-        .expect_err("must wrap raw TiKV error");
-        assert!(is_missing_tenant_keyspace(&wrapped, "db9_tenant_cached"));
+        .expect_err("must wrap plain error text");
+        assert!(
+            !is_missing_tenant_keyspace(&wrapped, "db9_tenant_cached"),
+            "plain anyhow chains must not trigger missing-tenant cleanup"
+        );
+
+        let tikv_missing = anyhow::Error::new(tikv_client::Error::KvError {
+            message: "keyspace does not exist".to_string(),
+        });
+        assert!(
+            is_missing_tenant_keyspace(&tikv_missing, "db9_tenant_cached"),
+            "typed TiKV keyspace errors should still repair cached missing tenants"
+        );
+
+        let wrapped_tikv = Err::<(), _>(tikv_client::Error::ExtractedErrors(vec![
+            tikv_client::Error::StringError("transient retry".to_string()),
+            tikv_client::Error::UndeterminedError(Box::new(tikv_client::Error::KvError {
+                message: "keyspace does not exist".to_string(),
+            })),
+        ]))
+        .context("tenant-store operation failed")
+        .expect_err("must wrap typed TiKV error");
+        assert!(
+            is_missing_tenant_keyspace(&wrapped_tikv, "db9_tenant_cached"),
+            "nested typed TiKV keyspace errors should still be classified"
+        );
+
+        let named_tikv_missing = anyhow::Error::new(tikv_client::Error::KeyspaceNotFound(
+            "db9_tenant_cached".into(),
+        ));
+        assert!(
+            is_missing_tenant_keyspace(&named_tikv_missing, "db9_tenant_cached"),
+            "named TiKV keyspace errors should match the expected tenant"
+        );
+
+        let named_tikv_other = anyhow::Error::new(tikv_client::Error::KeyspaceNotFound(
+            "db9_tenant_other".into(),
+        ));
+        assert!(
+            !is_missing_tenant_keyspace(&named_tikv_other, "db9_tenant_cached"),
+            "named TiKV keyspace errors must not reap a different tenant"
+        );
 
         let typed_other: anyhow::Error = TenantKeyspaceMissing::new("db9_tenant_other").into();
         assert!(
