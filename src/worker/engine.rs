@@ -63,6 +63,10 @@ const HNSW_DIRTY_MARKER_PAGE_SIZE: usize = 256;
 const PD_REGION_STATS_HTTP_TIMEOUT_MS: i64 = 5_000;
 const STORAGE_SCAN_DERIVED_LEASE_COMMIT_GRACE_MS: i64 = 30_000;
 const STORAGE_SCAN_REFRESH_NUDGE_COMMAND: &str = "__storage_scan_refresh_nudge";
+const STORAGE_SCAN_PERIODIC_PRIORITY: u8 = 200;
+// Lower numeric queue priority is dispatched earlier. Manual refresh is a
+// user-visible request and must not sit behind background cron maintenance.
+const STORAGE_SCAN_REFRESH_NUDGE_PRIORITY: u8 = 64;
 
 async fn worker_bgsql_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -4571,6 +4575,10 @@ async fn enqueue_storage_scan_at(
         StorageScanQueueMode::Singleton => String::new(),
         StorageScanQueueMode::RefreshNudge => STORAGE_SCAN_REFRESH_NUDGE_COMMAND.to_string(),
     };
+    let priority = match mode {
+        StorageScanQueueMode::Singleton => STORAGE_SCAN_PERIODIC_PRIORITY,
+        StorageScanQueueMode::RefreshNudge => STORAGE_SCAN_REFRESH_NUDGE_PRIORITY,
+    };
     let mut entry = TaskQueueEntry::new(
         keyspace.to_string(),
         db_id,
@@ -4578,7 +4586,7 @@ async fn enqueue_storage_scan_at(
         TaskType::StorageSizeScan,
         command,
         "system".to_string(),
-        200, // low priority — background housekeeping
+        priority,
     );
     entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
     let mut txn = system_store.begin().await?;
